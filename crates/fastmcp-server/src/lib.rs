@@ -5740,6 +5740,38 @@ fn take_live_http_session(
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
+async fn take_live_http_session_async(
+    cx: &Cx,
+    session: &LiveHttpSession,
+    request_cancellation: Option<&McpRequestCancellation>,
+) -> LiveHttpSessionTake {
+    loop {
+        {
+            let mut slot = session
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if request_cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+                return LiveHttpSessionTake::Cancelled;
+            }
+            if session.closing.load(Ordering::Acquire)
+                || cx.is_cancel_requested()
+                || !session.cancellation.legacy_lifecycle.is_live()
+            {
+                return LiveHttpSessionTake::Unavailable;
+            }
+            if let Some(owned) = slot.take() {
+                return LiveHttpSessionTake::Acquired(Box::new(owned));
+            }
+        }
+        // Caller-owned async handlers must stay on the inbound runtime, but
+        // waiting for this serialized session must yield that reactor so a
+        // reverse response or cancellation connection can still run.
+        asupersync::time::sleep(cx.now(), HTTP_ACCEPT_CANCEL_POLL).await;
+    }
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn restore_live_http_session(
     session: &LiveHttpSession,
     mut owned: ServerHttpSession,
@@ -5812,6 +5844,106 @@ fn legacy_http_blocking_dispatch_pool() -> asupersync::runtime::BlockingPoolHand
         asupersync::runtime::BlockingPool::new(0, MAX_LEGACY_HTTP_BLOCKING_DISPATCH_THREADS)
     })
     .handle()
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+struct LegacyHttpBlockingTaskGuard(asupersync::runtime::BlockingTaskHandle);
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+impl Drop for LegacyHttpBlockingTaskGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+enum LegacyHttpBlockingDispatchOutcome {
+    Response(HttpResponse),
+    Panicked,
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+async fn quarantine_panicked_live_http_session(
+    cx: &Cx,
+    sessions: &LiveHttpSessionRegistry,
+    session_id: &str,
+) {
+    let session = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+    if let Some(session) = session {
+        session.closing.store(true, Ordering::Release);
+        session.session_available.notify_all();
+        session.cancellation.cancel_all_admitted_requests();
+        session.legacy_pending_requests.cancel_all();
+        let owned = session
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut owned) = owned {
+            owned.close(cx).await;
+        }
+    }
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+async fn run_live_http_legacy_blocking_dispatch<F>(
+    cx: &Cx,
+    sessions: &LiveHttpSessionRegistry,
+    panic_session_id: Option<String>,
+    blocking_dispatch_permit: LegacyHttpBlockingDispatchPermit,
+    dispatch: F,
+) -> Result<HttpResponse, ()>
+where
+    F: FnOnce(Cx) -> HttpResponse + Send + 'static,
+{
+    let panic_sessions = Arc::clone(sessions);
+    let mut dispatch = cx
+        .spawn(move |dispatch_cx| async move {
+            let blocking_cx = dispatch_cx.clone();
+            let (dispatch_sender, mut dispatch_receiver) = asupersync::channel::oneshot::channel();
+            let blocking_dispatch = legacy_http_blocking_dispatch_pool().spawn(move || {
+                let _blocking_dispatch_permit = blocking_dispatch_permit;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(blocking_cx)
+                }))
+                .map_or_else(
+                    |_| LegacyHttpBlockingDispatchOutcome::Panicked,
+                    LegacyHttpBlockingDispatchOutcome::Response,
+                );
+                let _ = dispatch_sender.send_blocking(outcome);
+            });
+            let blocking_dispatch_guard = LegacyHttpBlockingTaskGuard(blocking_dispatch);
+            // A claimed blocking task cannot be force-stopped. Keep this
+            // region child alive until the pool records terminal completion,
+            // even after its Cx has been cancelled. The worker sends before
+            // it returns, so observing `is_done` establishes that the final
+            // channel drain cannot race an in-flight send.
+            while !blocking_dispatch_guard.0.is_done() {
+                asupersync::time::sleep(dispatch_cx.now(), Duration::from_millis(1)).await;
+            }
+            let outcome = dispatch_receiver.try_recv().ok();
+            drop(blocking_dispatch_guard);
+            match outcome {
+                Some(LegacyHttpBlockingDispatchOutcome::Response(response)) => response,
+                Some(LegacyHttpBlockingDispatchOutcome::Panicked) => {
+                    if let Some(session_id) = panic_session_id.as_deref() {
+                        quarantine_panicked_live_http_session(
+                            &dispatch_cx,
+                            &panic_sessions,
+                            session_id,
+                        )
+                        .await;
+                    }
+                    HttpResponse::internal_error()
+                }
+                None => HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+            }
+        })
+        .map_err(|_| ())?;
+    dispatch.join(cx).await.map_err(|_| ())
 }
 
 /// One response-body-owned modern HTTP session.
@@ -7844,7 +7976,19 @@ impl ServerHttpSession {
         cx: &Cx,
         request: HttpRequest,
     ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
-        self.handle_with_modern_request_cancellation_async(cx, request, None)
+        self.handle_with_modern_request_cancellation_async(cx, request, None, false)
+            .await
+            .map_err(ServerHttpEndpointError::from_internal)
+    }
+
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    async fn handle_preclassified_unmatched_legacy_response(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+        _verified: IngressVerifiedLegacyResponse,
+    ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
+        self.handle_with_modern_request_cancellation_async(cx, request, None, true)
             .await
             .map_err(ServerHttpEndpointError::from_internal)
     }
@@ -7861,6 +8005,7 @@ impl ServerHttpSession {
             cx,
             request,
             modern_request_cancellation,
+            false,
         ))
     }
 
@@ -7869,6 +8014,7 @@ impl ServerHttpSession {
         cx: &Cx,
         request: HttpRequest,
         modern_request_cancellation: Option<McpRequestCancellation>,
+        legacy_response_preclassified_unmatched: bool,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let transport_authorization = match transport_authorization_from_http_request(&request) {
             Ok(authorization) => authorization,
@@ -7879,6 +8025,7 @@ impl ServerHttpSession {
             request,
             transport_authorization,
             modern_request_cancellation,
+            legacy_response_preclassified_unmatched,
         )
         .await
     }
@@ -7896,6 +8043,7 @@ impl ServerHttpSession {
                 request,
                 transport_authorization,
                 modern_request_cancellation,
+                false,
             ),
         )
     }
@@ -7906,6 +8054,7 @@ impl ServerHttpSession {
         request: HttpRequest,
         transport_authorization: TransportAuthorization,
         modern_request_cancellation: Option<McpRequestCancellation>,
+        legacy_response_preclassified_unmatched: bool,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         self.reap_modern_dispatches();
         let mut request = request;
@@ -7980,7 +8129,13 @@ impl ServerHttpSession {
             };
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
-        if is_legacy {
+        let ingress_verified_legacy_response = legacy_response_preclassified_unmatched
+            && matches!(
+                legacy_post_admission,
+                Some(Legacy2024HttpPostEnvelope::Response(_))
+            );
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
+        if is_legacy && !ingress_verified_legacy_response {
             let admitted_request = match &legacy_post_admission {
                 Some(Legacy2024HttpPostEnvelope::ClientMessage(request)) => Some(request),
                 _ => None,
@@ -7993,6 +8148,18 @@ impl ServerHttpSession {
                 Ok(receipt) => receipt,
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
             };
+            if matches!(
+                legacy_post_admission,
+                Some(Legacy2024HttpPostEnvelope::Response(_))
+            ) && !self
+                .legacy_session
+                .principal_binding()
+                .verify_existing(receipt.fingerprint.clone())
+            {
+                return Ok(ServerHttpEndpointResponse::Immediate(
+                    native_http_authentication_rejection(),
+                ));
+            }
             // GET `/sse` has no JSON-RPC body, so the receipt cannot be
             // committed onto a later POST. Retain the opener fingerprint so
             // `install_legacy_generation` can bind the session owner. POST
@@ -8045,7 +8212,11 @@ impl ServerHttpSession {
             let result = lifecycle
                 .commit_if_live(|| {
                     self.selected_era.get_or_insert(ProtocolEra::Legacy2024);
-                    self.handle_legacy_reverse_response(response)
+                    if legacy_response_preclassified_unmatched {
+                        self.handle_unmatched_legacy_reverse_response(response)
+                    } else {
+                        self.handle_legacy_reverse_response(response)
+                    }
                 })
                 .unwrap_or_else(|| {
                     ServerHttpEndpointResponse::Immediate(HttpResponse::new(
@@ -8351,6 +8522,14 @@ impl ServerHttpSession {
             return ServerHttpEndpointResponse::Immediate(HttpResponse::new(HttpStatus::ACCEPTED));
         }
 
+        self.handle_unmatched_legacy_reverse_response(response)
+    }
+
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    fn handle_unmatched_legacy_reverse_response(
+        &mut self,
+        response: JsonRpcResponse,
+    ) -> ServerHttpEndpointResponse {
         let accepted_by_adapter = self.legacy_adapter.as_mut().is_some_and(|adapter| {
             legacy_adapter_accept_response(adapter, self.legacy_binding, &response)
         });
@@ -10398,17 +10577,41 @@ fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointRespons
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IngressVerifiedLegacyResponse;
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveHttpLegacyDispatchMode {
+    Blocking,
+    BlockingPreclassifiedResponse(IngressVerifiedLegacyResponse),
+    CallerOwnedAsync,
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+enum LiveHttpLegacyIngress {
+    Dispatch {
+        admission: Option<HttpLegacyRequestAdmissionGuard>,
+        mode: LiveHttpLegacyDispatchMode,
+    },
+    Immediate(HttpResponse),
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 fn admit_live_http_legacy_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     legacy_sessions: &LiveHttpSessionRegistry,
     request: &HttpRequest,
     transport_authorization: &TransportAuthorization,
-) -> Result<(Option<HttpLegacyRequestAdmissionGuard>, bool), HttpResponse> {
+) -> Result<LiveHttpLegacyIngress, HttpResponse> {
     if request.method != HttpMethod::Post
         || request.path != endpoint.server.http_config.legacy_message_path
     {
-        return Ok((None, false));
+        return Ok(LiveHttpLegacyIngress::Dispatch {
+            admission: None,
+            mode: LiveHttpLegacyDispatchMode::Blocking,
+        });
     }
     let Some(session_id) = request.query.get("session_id") else {
         return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
@@ -10425,24 +10628,74 @@ fn admit_live_http_legacy_request(
         &session.cancellation.http_session_id,
         session.cancellation.max_body_size,
     )?;
-    let Legacy2024HttpPostEnvelope::ClientMessage(request) = admitted else {
-        // Correlated responses must reach `PendingRequests` without queueing
-        // behind the blocking handler that emitted the reverse request.
-        return Ok((None, true));
+    let Legacy2024HttpPostEnvelope::ClientMessage(message) = admitted else {
+        let Legacy2024HttpPostEnvelope::Response(response) = admitted else {
+            unreachable!("legacy POST admission has exactly two envelope variants");
+        };
+        let auth_probe = JsonRpcRequest::new("legacy/sse", None, RequestId::Number(0));
+        let receipt = session.cancellation.server.preauthenticate_http_request(
+            cx,
+            &auth_probe,
+            transport_authorization,
+        )?;
+        if !session
+            .cancellation
+            .session_principal
+            .verify_existing(receipt.fingerprint)
+        {
+            return Err(native_http_authentication_rejection());
+        }
+        // Route a correlated response on the connection reactor before it can
+        // queue behind the blocking handler that emitted the reverse request.
+        // An unmatched response must still enter the serialized fallback, but
+        // that condvar wait belongs on the bounded bridge pool rather than the
+        // caller-owned reactor; otherwise the peer cannot post cancellation.
+        let disposition = session
+            .cancellation
+            .legacy_lifecycle
+            .commit_if_live(|| {
+                session
+                    .legacy_pending_requests
+                    .route_response_with_disposition(&response)
+            })
+            .ok_or_else(|| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE))?;
+        return if matches!(
+            disposition,
+            bidirectional::PendingResponseDisposition::Delivered
+                | bidirectional::PendingResponseDisposition::RetiredGeneric
+        ) {
+            Ok(LiveHttpLegacyIngress::Immediate(HttpResponse::new(
+                HttpStatus::ACCEPTED,
+            )))
+        } else {
+            Ok(LiveHttpLegacyIngress::Dispatch {
+                admission: None,
+                mode: LiveHttpLegacyDispatchMode::BlockingPreclassifiedResponse(
+                    IngressVerifiedLegacyResponse,
+                ),
+            })
+        };
     };
-    let framework_control_notification = request.id.is_none()
-        && matches!(
-            request.method.as_str(),
-            "notifications/initialized" | "notifications/cancelled"
-        );
-    let dispatch_inline = framework_control_notification
-        || endpoint
-            .server
-            .router
-            .legacy_request_uses_transport_owned_async_dispatch(&request);
+    if message.id.is_none() && message.method == "notifications/cancelled" {
+        return Ok(LiveHttpLegacyIngress::Immediate(
+            session
+                .cancellation
+                .handle(cx, request)
+                .unwrap_or_else(HttpResponse::bad_request),
+        ));
+    }
+    let dispatch_mode = if endpoint
+        .server
+        .router
+        .legacy_request_uses_transport_owned_async_dispatch(&message)
+    {
+        LiveHttpLegacyDispatchMode::CallerOwnedAsync
+    } else {
+        LiveHttpLegacyDispatchMode::Blocking
+    };
     let receipt = session.cancellation.server.preauthenticate_http_request(
         cx,
-        &request,
+        &message,
         transport_authorization,
     )?;
     let admission = session
@@ -10450,14 +10703,17 @@ fn admit_live_http_legacy_request(
         .legacy_lifecycle
         .commit_if_live(|| {
             session.cancellation.admissions.admit(
-                &request,
+                &message,
                 &session.cancellation.session_principal,
                 receipt.fingerprint,
             )
         })
         .ok_or_else(|| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE))?
         .map_err(|()| HttpResponse::bad_request())?;
-    Ok((admission, dispatch_inline))
+    Ok(LiveHttpLegacyIngress::Dispatch {
+        admission,
+        mode: dispatch_mode,
+    })
 }
 
 fn protocol_admission_error_response(
@@ -10664,6 +10920,7 @@ fn dispatch_http_request(
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
     legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
+    legacy_dispatch_mode: LiveHttpLegacyDispatchMode,
 ) -> HttpResponse {
     block_on(dispatch_http_request_async(
         cx,
@@ -10672,6 +10929,7 @@ fn dispatch_http_request(
         modern_sessions,
         request,
         legacy_admission,
+        legacy_dispatch_mode,
     ))
 }
 
@@ -10683,6 +10941,7 @@ async fn dispatch_http_request_async(
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
     legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
+    legacy_dispatch_mode: LiveHttpLegacyDispatchMode,
 ) -> HttpResponse {
     let is_legacy_message = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.legacy_message_path;
@@ -10717,28 +10976,6 @@ async fn dispatch_http_request_async(
                 .cancellation
                 .handle(cx, &request)
                 .unwrap_or_else(HttpResponse::bad_request);
-        }
-        // Do not wait for the serialized session mutex when this POST is the
-        // exact response to a server-originated legacy request. The original
-        // POST can be inside an application handler synchronously awaiting
-        // this response, so waiting here would form a self-deadlock. Routing
-        // through `PendingRequests` consumes only its independently owned
-        // correlation entry; adapter/session mutation remains below.
-        if let Legacy2024HttpPostEnvelope::Response(response) = &admitted {
-            let Some(disposition) = session.cancellation.legacy_lifecycle.commit_if_live(|| {
-                session
-                    .legacy_pending_requests
-                    .route_response_with_disposition(response)
-            }) else {
-                return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
-            };
-            if matches!(
-                disposition,
-                bidirectional::PendingResponseDisposition::Delivered
-                    | bidirectional::PendingResponseDisposition::RetiredGeneric
-            ) {
-                return HttpResponse::new(HttpStatus::ACCEPTED);
-            }
         }
         // The connection creates this authority before queueing the blocking
         // dispatch. Direct embedding callers create it here instead. In both
@@ -10791,7 +11028,15 @@ async fn dispatch_http_request_async(
             }
             Legacy2024HttpPostEnvelope::Response(_) => None,
         };
-        let mut owned = match take_live_http_session(cx, &session, request_cancellation.as_ref()) {
+        let session_take = if matches!(
+            legacy_dispatch_mode,
+            LiveHttpLegacyDispatchMode::CallerOwnedAsync
+        ) {
+            take_live_http_session_async(cx, &session, request_cancellation.as_ref()).await
+        } else {
+            take_live_http_session(cx, &session, request_cancellation.as_ref())
+        };
+        let mut owned = match session_take {
             LiveHttpSessionTake::Acquired(owned) => *owned,
             LiveHttpSessionTake::Cancelled => {
                 return HttpResponse::new(HttpStatus::ACCEPTED);
@@ -10800,10 +11045,16 @@ async fn dispatch_http_request_async(
                 return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
             }
         };
-        let response = owned
-            .handle_async(cx, request)
-            .await
-            .map_err(|_| HttpResponse::bad_request());
+        let response = if let LiveHttpLegacyDispatchMode::BlockingPreclassifiedResponse(verified) =
+            legacy_dispatch_mode
+        {
+            owned
+                .handle_preclassified_unmatched_legacy_response(cx, request, verified)
+                .await
+        } else {
+            owned.handle_async(cx, request).await
+        }
+        .map_err(|_| HttpResponse::bad_request());
         let closing_dispatches = restore_live_http_session(&session, owned);
         for mut dispatch in closing_dispatches {
             let _ = dispatch.join(cx).await;
@@ -11049,10 +11300,10 @@ async fn serve_http_connection(
     if !is_legacy_sse {
         // Admit correlated legacy work before dispatch. The captured guard
         // keeps this authority live while ordinary requests use synchronous
-        // isolation; responses, exact framework control notifications, and
-        // handlers frozen as async stay inline so they cannot queue behind
-        // work they must unblock.
-        let (legacy_admission, dispatch_inline) = match admit_live_http_legacy_request(
+        // isolation. Matching reverse responses are consumed during ingress;
+        // cancellation is handled there too. Handlers frozen as async remain
+        // on the caller runtime, with a yielding session-acquisition path.
+        let ingress = match admit_live_http_legacy_request(
             cx,
             &endpoint,
             &legacy_sessions,
@@ -11065,10 +11316,20 @@ async fn serve_http_connection(
                 return;
             }
         };
+        let (legacy_admission, legacy_dispatch_mode) = match ingress {
+            LiveHttpLegacyIngress::Dispatch { admission, mode } => (admission, mode),
+            LiveHttpLegacyIngress::Immediate(response) => {
+                let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
+                return;
+            }
+        };
         if request.method == HttpMethod::Post
             && request.path == endpoint.server.http_config.legacy_message_path
         {
-            if dispatch_inline {
+            if matches!(
+                legacy_dispatch_mode,
+                LiveHttpLegacyDispatchMode::CallerOwnedAsync
+            ) {
                 let response = dispatch_http_request_async(
                     cx,
                     &endpoint,
@@ -11076,6 +11337,7 @@ async fn serve_http_connection(
                     &modern_sessions,
                     request,
                     legacy_admission,
+                    legacy_dispatch_mode,
                 )
                 .await;
                 let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
@@ -11094,40 +11356,32 @@ async fn serve_http_connection(
                 .await;
                 return;
             };
-            // Embedders are not required to configure a blocking pool. Attach
-            // the server's bounded bridge pool to this derived authority so
-            // `spawn_blocking` cannot silently fall back to running a sync
-            // handler on the connection reactor. The permit bounds active and
-            // queued bridge work independently of the pool's internal queue.
-            let blocking_cx = cx
-                .clone()
-                .with_blocking_pool_handle(Some(legacy_http_blocking_dispatch_pool()));
-            let mut dispatch = match blocking_cx.spawn_blocking(move |dispatch_cx| {
-                let _blocking_dispatch_permit = blocking_dispatch_permit;
-                dispatch_http_request(
-                    &dispatch_cx,
-                    &dispatch_endpoint,
-                    &dispatch_legacy_sessions,
-                    &dispatch_modern_sessions,
-                    request,
-                    legacy_admission,
-                )
-            }) {
-                Ok(dispatch) => dispatch,
-                Err(_) => {
-                    let _ = send_h1_response(
-                        cx,
-                        &listener_shutdown,
-                        &mut framed,
-                        HttpResponse::internal_error(),
+            // Keep the direct pool handle inside a real request-region child.
+            // This avoids `Cx::spawn_blocking`'s documented inline fallback,
+            // while the outer TaskHandle still binds listener quiescence to
+            // the pool task's actual terminal state.
+            let panic_session_id = request.query.get("session_id").cloned();
+            let response = match run_live_http_legacy_blocking_dispatch(
+                cx,
+                &legacy_sessions,
+                panic_session_id,
+                blocking_dispatch_permit,
+                move |blocking_cx| {
+                    dispatch_http_request(
+                        &blocking_cx,
+                        &dispatch_endpoint,
+                        &dispatch_legacy_sessions,
+                        &dispatch_modern_sessions,
+                        request,
+                        legacy_admission,
+                        legacy_dispatch_mode,
                     )
-                    .await;
-                    return;
-                }
-            };
-            let response = match dispatch.join(cx).await {
+                },
+            )
+            .await
+            {
                 Ok(response) => response,
-                Err(_) => HttpResponse::internal_error(),
+                Err(()) => HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
             };
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
@@ -11139,6 +11393,7 @@ async fn serve_http_connection(
             &modern_sessions,
             request,
             legacy_admission,
+            LiveHttpLegacyDispatchMode::Blocking,
         )
         .await;
         let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
@@ -22745,6 +23000,7 @@ mod lib_unit_tests {
 
     async fn open_live_legacy_http_session(
         address: SocketAddr,
+        headers: &[(&str, &str)],
     ) -> Result<(AsyncTcpStream, String, Vec<u8>), String> {
         let cx = Cx::current()
             .expect("the test runtime must install an ambient Cx for legacy HTTP SSE setup");
@@ -22753,8 +23009,15 @@ mod lib_unit_tests {
             .await
             .map_err(|_| live_http_test_timeout("legacy HTTP SSE connection"))?
             .map_err(|error| format!("legacy HTTP SSE connect failed: {error}"))?;
+        let mut extra_headers = String::new();
+        for (name, value) in headers {
+            extra_headers.push_str(name);
+            extra_headers.push_str(": ");
+            extra_headers.push_str(value);
+            extra_headers.push_str("\r\n");
+        }
         let request = format!(
-            "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+            "GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n{extra_headers}\r\n"
         );
         asupersync::time::timeout_at(deadline, stream.write_all(request.as_bytes()))
             .await
@@ -30212,6 +30475,32 @@ mod lib_unit_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingLegacyHttpAuthProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AuthProvider for CountingLegacyHttpAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let access = request
+                .access_token()
+                .ok_or_else(|| McpError::new(McpErrorCode::ResourceForbidden, "missing bearer"))?;
+            if access.token.as_str() == "alpha" {
+                Ok(AuthContext::with_subject("alice"))
+            } else {
+                Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "unrecognized bearer",
+                ))
+            }
+        }
+    }
+
     fn modern_http_json_tool_request(name: &str, id: i64) -> HttpRequest {
         let request = JsonRpcRequest::new(
             "tools/call",
@@ -34916,6 +35205,7 @@ mod lib_unit_tests {
             &modern_sessions,
             extension_tasks_get_http_request(LEGACY_PROTOCOL_VERSION),
             None,
+            LiveHttpLegacyDispatchMode::Blocking,
         );
 
         assert_eq!(response.status, HttpStatus::BAD_REQUEST);
@@ -39375,12 +39665,26 @@ mod lib_unit_tests {
         cx: &Cx,
         wrong_reverse_response_id: bool,
         plant_exact_admission_negatives: bool,
+        reverse_response_token: Option<&'static str>,
     ) -> Result<(), String> {
         const INITIALIZE_ID: i64 = 842;
         const TOOL_CALL_ID: i64 = 843;
 
-        let bound = Server::new("live-http-legacy-reverse-response", "1.0.0")
-            .tool(LiveLegacyRuntimeConnectionTool)
+        let server = Server::new("live-http-legacy-reverse-response", "1.0.0")
+            .tool(LiveLegacyRuntimeConnectionTool);
+        let server = if reverse_response_token.is_some() {
+            let verifier = StaticTokenVerifier::new([
+                ("alpha", AuthContext::with_subject("alice")),
+                ("beta", AuthContext::with_subject("bob")),
+            ])
+            .map_err(|error| format!("legacy reverse-response verifier failed: {error}"))?
+            .with_allowed_schemes(["Bearer"])
+            .map_err(|error| format!("legacy reverse-response scheme failed: {error}"))?;
+            server.auth_provider(TokenAuthProvider::new(verifier))
+        } else {
+            server
+        };
+        let bound = server
             .build()
             .bind_http(cx, "127.0.0.1:0")
             .await
@@ -39391,8 +39695,11 @@ mod lib_unit_tests {
         let caller_cx = cx.clone();
         let mut client = cx
             .spawn(move |client_cx| async move {
+                let opener_headers = reverse_response_token
+                    .map(|_| vec![("Authorization", "Bearer alpha")])
+                    .unwrap_or_default();
                 let (mut sse, session_id, mut received) =
-                    open_live_legacy_http_session(address).await?;
+                    open_live_legacy_http_session(address, &opener_headers).await?;
                 for request in [
                     JsonRpcRequest::new(
                         "initialize",
@@ -39413,7 +39720,11 @@ mod lib_unit_tests {
                     })?;
                     let response = live_http_exchange(
                         address,
-                        live_http_post(&format!("/messages?session_id={session_id}"), &body, &[]),
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &body,
+                            &opener_headers,
+                        ),
                     )
                     .await?;
                     if !response.starts_with(b"HTTP/1.1 202") {
@@ -39437,7 +39748,7 @@ mod lib_unit_tests {
                 let tool_call_request = live_http_post(
                     &format!("/messages?session_id={session_id}"),
                     &tool_call_body,
-                    &[],
+                    &opener_headers,
                 );
                 let mut tool_call = client_cx
                     .spawn(move |_tool_call_cx| async move {
@@ -39525,7 +39836,11 @@ mod lib_unit_tests {
                             live_http_post(
                                 &format!("/messages?session_id={session_id}"),
                                 &body,
-                                &headers,
+                                if opener_headers.is_empty() {
+                                    &headers
+                                } else {
+                                    &opener_headers
+                                },
                             ),
                         )
                         .await?;
@@ -39540,10 +39855,16 @@ mod lib_unit_tests {
                 let reverse_body = serde_json::to_vec(&reverse_response).map_err(|error| {
                     format!("legacy sampling reverse response did not serialize: {error}")
                 })?;
+                let reverse_authorization = reverse_response_token
+                    .map(|token| format!("Bearer {token}"));
+                let reverse_headers = reverse_authorization
+                    .as_deref()
+                    .map(|authorization| vec![("Authorization", authorization)])
+                    .unwrap_or_default();
                 let reverse_post = live_http_post(
                     &format!("/messages?session_id={session_id}"),
                     &reverse_body,
-                    &[],
+                    &reverse_headers,
                 );
                 let mut reverse_post = client_cx
                     .spawn(move |_reverse_cx| async move { live_http_exchange(address, reverse_post).await })
@@ -39580,7 +39901,7 @@ mod lib_unit_tests {
                         live_http_post(
                             &format!("/messages?session_id={session_id}"),
                             &cancellation_body,
-                            &[],
+                            &opener_headers,
                         ),
                     )
                     .await?;
@@ -39599,7 +39920,38 @@ mod lib_unit_tests {
                     let reverse_response = reverse_post.join(&client_cx).await.map_err(|error| {
                         format!("legacy sampling reverse-response POST failed: {error:?}")
                     })??;
-                    if !reverse_response.starts_with(b"HTTP/1.1 202") {
+                    if reverse_response_token == Some("beta") {
+                        if !reverse_response.starts_with(b"HTTP/1.1 401") {
+                            return Err(format!(
+                                "foreign-principal reverse response was not rejected before mutation: {reverse_response:?}"
+                            ));
+                        }
+                        asupersync::time::sleep(
+                            client_cx.now(),
+                            Duration::from_millis(100),
+                        )
+                        .await;
+                        if !matches!(tool_call.try_join(), Ok(None)) {
+                            return Err(
+                                "foreign-principal reverse response settled the pending handler"
+                                    .to_string(),
+                            );
+                        }
+                        let owned_retry = live_http_exchange(
+                            address,
+                            live_http_post(
+                                &format!("/messages?session_id={session_id}"),
+                                &reverse_body,
+                                &opener_headers,
+                            ),
+                        )
+                        .await?;
+                        if !owned_retry.starts_with(b"HTTP/1.1 202") {
+                            return Err(format!(
+                                "opener-principal reverse-response retry was not accepted: {owned_retry:?}"
+                            ));
+                        }
+                    } else if !reverse_response.starts_with(b"HTTP/1.1 202") {
                         return Err(format!(
                             "matching reverse-response POST was not accepted: {reverse_response:?}"
                         ));
@@ -39641,14 +39993,14 @@ mod lib_unit_tests {
     #[test]
     fn live_http_legacy_reverse_response_bypasses_the_originating_session_mutex() {
         run_live_http_test(|cx| async move {
-            live_http_legacy_reverse_response_post_probe(&cx, false, false).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, None).await
         });
     }
 
     #[test]
     fn live_http_legacy_reverse_response_exact_admission_precedes_pending_mutation() {
         run_live_http_test(|cx| async move {
-            live_http_legacy_reverse_response_post_probe(&cx, false, true).await
+            live_http_legacy_reverse_response_post_probe(&cx, false, true, None).await
         });
     }
 
@@ -39657,7 +40009,196 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             // This differs from the positive only in the reverse-response
             // correlation ID, so it must not complete the waiting handler.
-            live_http_legacy_reverse_response_post_probe(&cx, true, false).await
+            live_http_legacy_reverse_response_post_probe(&cx, true, false, None).await
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_reverse_response_accepts_opener_principal() {
+        run_live_http_test(|cx| async move {
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("alpha")).await
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation() {
+        run_live_http_test(|cx| async move {
+            // The only behavioral change from the authenticated positive is
+            // the bearer principal on the first reverse-response POST.
+            live_http_legacy_reverse_response_post_probe(&cx, false, false, Some("beta")).await
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_unmatched_response_uses_one_auth_provider_evaluation() {
+        run_live_http_test(|cx| async move {
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("legacy-response-auth-receipt", "1.0.0")
+                .auth_provider(CountingLegacyHttpAuthProvider {
+                    calls: Arc::clone(&provider_calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("legacy auth-receipt bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("legacy auth-receipt address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let client_provider_calls = Arc::clone(&provider_calls);
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let (stream, session_id, _) = open_live_legacy_http_session(
+                        address,
+                        &[("Authorization", "Bearer alpha")],
+                    )
+                    .await?;
+                    if client_provider_calls.load(Ordering::Acquire) != 1 {
+                        return Err(
+                            "legacy SSE opener did not evaluate its provider exactly once"
+                                .to_owned(),
+                        );
+                    }
+                    let unmatched = JsonRpcResponse::success(
+                        RequestId::Number(9_999),
+                        serde_json::json!({"ignored": true}),
+                    );
+                    let body = serde_json::to_vec(&unmatched).map_err(|error| {
+                        format!("unmatched legacy response did not serialize: {error}")
+                    })?;
+                    let response = live_http_exchange(
+                        address,
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &body,
+                            &[("Authorization", "Bearer alpha")],
+                        ),
+                    )
+                    .await?;
+                    if !response.starts_with(b"HTTP/1.1 400") {
+                        return Err(format!(
+                            "unmatched legacy response did not reach its serialized rejection: {response:?}"
+                        ));
+                    }
+                    if client_provider_calls.load(Ordering::Acquire) != 2 {
+                        return Err(
+                            "serialized unmatched-response fallback re-evaluated authentication"
+                                .to_owned(),
+                        );
+                    }
+                    drop(stream);
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("legacy unmatched auth-receipt probe complete"),
+                    );
+                    Ok::<(), String>(())
+                })
+                .map_err(|error| format!("legacy auth-receipt client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("legacy auth-receipt client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("legacy auth-receipt server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "legacy unmatched auth receipt").await
+        });
+    }
+
+    async fn live_http_legacy_blocking_bridge_probe(
+        cx: &Cx,
+        plant_dispatch_panic: bool,
+    ) -> Result<(), String> {
+        let endpoint = Server::new("legacy-panic-quarantine", "1.0.0")
+            .build_http_endpoint("http://legacy.test")
+            .map_err(|error| format!("dual-era endpoint did not build: {error}"))?;
+        let mut owned = endpoint
+            .open_session(cx)
+            .map_err(|error| format!("legacy HTTP session did not open: {error}"))?;
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = owned
+            .handle(cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .map_err(|error| format!("legacy SSE admission failed: {error}"))?
+        else {
+            return Err("legacy GET did not return an SSE response body".to_owned());
+        };
+        let _ = stream
+            .recv_event(cx)
+            .map_err(|error| format!("legacy SSE endpoint advertisement failed: {error}"))?;
+        let session_id = owned.legacy_session_id().to_owned();
+        let shell = Arc::new(LiveHttpSession {
+            cancellation: owned.cancellation_control(),
+            legacy_pending_requests: Arc::clone(&owned.legacy_pending_requests),
+            session: Mutex::new(Some(owned)),
+            session_available: Condvar::new(),
+            closing: AtomicBool::new(false),
+        });
+        let sessions = Arc::new(Mutex::new(HashMap::from([(
+            session_id.clone(),
+            Arc::clone(&shell),
+        )])));
+        let permit = try_reserve_legacy_http_blocking_dispatch()
+            .ok_or_else(|| "legacy blocking bridge test could not reserve capacity".to_owned())?;
+
+        let response = run_live_http_legacy_blocking_dispatch(
+            cx,
+            &sessions,
+            Some(session_id.clone()),
+            permit,
+            move |_blocking_cx| {
+                assert!(
+                    !plant_dispatch_panic,
+                    "planted legacy HTTP blocking-dispatch panic"
+                );
+                HttpResponse::ok()
+            },
+        )
+        .await
+        .map_err(|()| "legacy blocking bridge region did not settle".to_owned())?;
+
+        let remains_routable = sessions
+            .lock()
+            .map_err(|_| "quarantine registry lock was poisoned".to_owned())?
+            .contains_key(&session_id);
+        if plant_dispatch_panic {
+            if response.status != HttpStatus::INTERNAL_SERVER_ERROR
+                || remains_routable
+                || !shell.closing.load(Ordering::Acquire)
+                || shell.cancellation.legacy_lifecycle.is_live()
+                || stream.try_recv_event(cx).is_ok()
+                || !matches!(
+                    take_live_http_session(cx, &shell, None),
+                    LiveHttpSessionTake::Unavailable
+                )
+            {
+                return Err(
+                    "panicked bridge did not map to 500 and quarantine only its session shell"
+                        .to_owned(),
+                );
+            }
+        } else if response.status != HttpStatus::OK
+            || !remains_routable
+            || shell.closing.load(Ordering::Acquire)
+        {
+            return Err("successful bridge dispatch mutated session admission state".to_owned());
+        }
+        drop(stream);
+        Ok(())
+    }
+
+    #[test]
+    fn live_http_legacy_blocking_bridge_returns_dispatch_response() {
+        run_live_http_test(
+            |cx| async move { live_http_legacy_blocking_bridge_probe(&cx, false).await },
+        );
+    }
+
+    #[test]
+    fn live_http_legacy_blocking_bridge_maps_panic_and_quarantines_session_shell() {
+        run_live_http_test(|cx| async move {
+            // This differs from the positive only in the closure's planted
+            // panic, exercising the production pool/catch/settlement path.
+            live_http_legacy_blocking_bridge_probe(&cx, true).await
         });
     }
 
@@ -40029,7 +40570,8 @@ mod lib_unit_tests {
                 }
 
                 let _server_cancellation = CancelServerOnDrop(caller_cx.clone());
-                let (mut sse, session_id, mut received) = open_live_legacy_http_session(address).await?;
+                let (mut sse, session_id, mut received) =
+                    open_live_legacy_http_session(address, &[]).await?;
                 let session = legacy_sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -40287,7 +40829,7 @@ mod lib_unit_tests {
             let mut client = cx
                 .spawn(move |client_cx| async move {
                     let (mut sse, session_id, mut received) =
-                        open_live_legacy_http_session(address).await?;
+                        open_live_legacy_http_session(address, &[]).await?;
                     let session = legacy_sessions
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -40675,8 +41217,8 @@ mod lib_unit_tests {
         let mut client = cx
             .spawn(move |client_cx| async move {
                 let (originating_sse, session_id, _) =
-                    open_live_legacy_http_session(address).await?;
-                let (other_sse, _, _) = open_live_legacy_http_session(address).await?;
+                    open_live_legacy_http_session(address, &[]).await?;
+                let (other_sse, _, _) = open_live_legacy_http_session(address, &[]).await?;
                 for request in [
                     JsonRpcRequest::new(
                         "initialize",
@@ -40854,7 +41396,7 @@ mod lib_unit_tests {
         let started_by_client = Arc::clone(&started);
         let mut client = cx
             .spawn(move |client_cx| async move {
-                let (sse, session_id, _) = open_live_legacy_http_session(address).await?;
+                let (sse, session_id, _) = open_live_legacy_http_session(address, &[]).await?;
                 for request in [
                     JsonRpcRequest::new(
                         "initialize",
