@@ -14,7 +14,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT%20with%20rider-blue.svg" alt="MIT License with rider">
-  <img src="https://img.shields.io/badge/rust-nightly--2026--08--20-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/rust-nightly--2026--08--25-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
   <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
@@ -327,7 +327,7 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ### From crates.io (current 0.8.0 package)
 
-The `0.8.0` package was published on 2026-08-27. Publication does
+The `0.8.0` package was published on 2026-08-29. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 

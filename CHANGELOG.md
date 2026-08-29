@@ -8,7 +8,7 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.8.0)
 
-## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-27 (GitHub Release)
+## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-29 (GitHub Release)
 
 Pre-1.0 minor release making caller-owned asupersync contexts explicit across
 library connection and server-runner boundaries. This release does **not**
