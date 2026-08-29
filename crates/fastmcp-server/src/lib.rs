@@ -115,7 +115,7 @@ pub use handler::{
     FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
     FinalRoots, FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler, ResourceHandler,
-    ToolErrorKind, ToolHandler, create_context_with_progress,
+    ToolErrorKind, ToolExecutionMode, ToolHandler, create_context_with_progress,
     create_context_with_progress_and_senders, promote_legacy_prompt_messages,
     promote_legacy_resource_contents, promote_legacy_tool_content,
 };
@@ -5767,6 +5767,53 @@ type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>
 const MODERN_HTTP_RESPONSE_BODY_TTL: Duration = Duration::from_mins(15);
 const MODERN_HTTP_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Process-wide bounds for synchronous exact-2024 HTTP dispatch bridges.
+///
+/// `Cx::spawn_blocking` deliberately runs inline when an embedding runtime has
+/// no blocking pool. That deterministic fallback is useful in the lab, but a
+/// live listener must not let one synchronous handler occupy the reactor that
+/// accepts its cancellation or reverse-response POST. This lazy Asupersync
+/// pool supplies only that missing blocking authority; it does not own an
+/// async runtime or any transport task.
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+const MAX_LEGACY_HTTP_BLOCKING_DISPATCH_THREADS: usize = 64;
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+const MAX_LEGACY_HTTP_BLOCKING_DISPATCHES: usize = 256;
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+static LEGACY_HTTP_BLOCKING_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+struct LegacyHttpBlockingDispatchPermit;
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+impl Drop for LegacyHttpBlockingDispatchPermit {
+    fn drop(&mut self) {
+        LEGACY_HTTP_BLOCKING_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn try_reserve_legacy_http_blocking_dispatch() -> Option<LegacyHttpBlockingDispatchPermit> {
+    LEGACY_HTTP_BLOCKING_DISPATCHES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MAX_LEGACY_HTTP_BLOCKING_DISPATCHES).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| LegacyHttpBlockingDispatchPermit)
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn legacy_http_blocking_dispatch_pool() -> asupersync::runtime::BlockingPoolHandle {
+    static POOL: std::sync::OnceLock<asupersync::runtime::BlockingPool> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        asupersync::runtime::BlockingPool::new(0, MAX_LEGACY_HTTP_BLOCKING_DISPATCH_THREADS)
+    })
+    .handle()
+}
+
 /// One response-body-owned modern HTTP session.
 ///
 /// Modern Streamable HTTP has no listener-visible session identifier. This
@@ -10357,11 +10404,11 @@ fn admit_live_http_legacy_request(
     legacy_sessions: &LiveHttpSessionRegistry,
     request: &HttpRequest,
     transport_authorization: &TransportAuthorization,
-) -> Result<Option<HttpLegacyRequestAdmissionGuard>, HttpResponse> {
+) -> Result<(Option<HttpLegacyRequestAdmissionGuard>, bool), HttpResponse> {
     if request.method != HttpMethod::Post
         || request.path != endpoint.server.http_config.legacy_message_path
     {
-        return Ok(None);
+        return Ok((None, false));
     }
     let Some(session_id) = request.query.get("session_id") else {
         return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
@@ -10379,14 +10426,26 @@ fn admit_live_http_legacy_request(
         session.cancellation.max_body_size,
     )?;
     let Legacy2024HttpPostEnvelope::ClientMessage(request) = admitted else {
-        return Ok(None);
+        // Correlated responses must reach `PendingRequests` without queueing
+        // behind the blocking handler that emitted the reverse request.
+        return Ok((None, true));
     };
+    let framework_control_notification = request.id.is_none()
+        && matches!(
+            request.method.as_str(),
+            "notifications/initialized" | "notifications/cancelled"
+        );
+    let dispatch_inline = framework_control_notification
+        || endpoint
+            .server
+            .router
+            .legacy_request_uses_transport_owned_async_dispatch(&request);
     let receipt = session.cancellation.server.preauthenticate_http_request(
         cx,
         &request,
         transport_authorization,
     )?;
-    session
+    let admission = session
         .cancellation
         .legacy_lifecycle
         .commit_if_live(|| {
@@ -10397,7 +10456,8 @@ fn admit_live_http_legacy_request(
             )
         })
         .ok_or_else(|| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE))?
-        .map_err(|()| HttpResponse::bad_request())
+        .map_err(|()| HttpResponse::bad_request())?;
+    Ok((admission, dispatch_inline))
 }
 
 fn protocol_admission_error_response(
@@ -10680,7 +10740,7 @@ async fn dispatch_http_request_async(
                 return HttpResponse::new(HttpStatus::ACCEPTED);
             }
         }
-        // The connection creates this authority before entering async
+        // The connection creates this authority before queueing the blocking
         // dispatch. Direct embedding callers create it here instead. In both
         // cases it remains live through the serialized adapter/session mutex,
         // active guard, and response finalization.
@@ -10987,11 +11047,12 @@ async fn serve_http_connection(
         return;
     }
     if !is_legacy_sse {
-        // Admit correlated legacy work before the request-owned handler
-        // future is polled on this connection `Cx`. The captured guard keeps
-        // this exact authority alive while dispatch takes the session slot
-        // and awaits the handler instead of `block_on`.
-        let legacy_admission = match admit_live_http_legacy_request(
+        // Admit correlated legacy work before dispatch. The captured guard
+        // keeps this authority live while ordinary requests use synchronous
+        // isolation; responses, exact framework control notifications, and
+        // handlers frozen as async stay inline so they cannot queue behind
+        // work they must unblock.
+        let (legacy_admission, dispatch_inline) = match admit_live_http_legacy_request(
             cx,
             &endpoint,
             &legacy_sessions,
@@ -11007,20 +11068,67 @@ async fn serve_http_connection(
         if request.method == HttpMethod::Post
             && request.path == endpoint.server.http_config.legacy_message_path
         {
-            // Keep request dispatch on the listener's structured runtime.
-            // Moving it into a nested blocking executor can starve a
-            // current-thread runtime's sibling SSE writer while the handler
-            // awaits a reverse sampling or roots response published through
-            // that writer.
-            let response = dispatch_http_request_async(
-                cx,
-                &endpoint,
-                &legacy_sessions,
-                &modern_sessions,
-                request,
-                legacy_admission,
-            )
-            .await;
+            if dispatch_inline {
+                let response = dispatch_http_request_async(
+                    cx,
+                    &endpoint,
+                    &legacy_sessions,
+                    &modern_sessions,
+                    request,
+                    legacy_admission,
+                )
+                .await;
+                let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
+                return;
+            }
+            let dispatch_endpoint = Arc::clone(&endpoint);
+            let dispatch_legacy_sessions = Arc::clone(&legacy_sessions);
+            let dispatch_modern_sessions = Arc::clone(&modern_sessions);
+            let Some(blocking_dispatch_permit) = try_reserve_legacy_http_blocking_dispatch() else {
+                let _ = send_h1_response(
+                    cx,
+                    &listener_shutdown,
+                    &mut framed,
+                    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+                )
+                .await;
+                return;
+            };
+            // Embedders are not required to configure a blocking pool. Attach
+            // the server's bounded bridge pool to this derived authority so
+            // `spawn_blocking` cannot silently fall back to running a sync
+            // handler on the connection reactor. The permit bounds active and
+            // queued bridge work independently of the pool's internal queue.
+            let blocking_cx = cx
+                .clone()
+                .with_blocking_pool_handle(Some(legacy_http_blocking_dispatch_pool()));
+            let mut dispatch = match blocking_cx.spawn_blocking(move |dispatch_cx| {
+                let _blocking_dispatch_permit = blocking_dispatch_permit;
+                dispatch_http_request(
+                    &dispatch_cx,
+                    &dispatch_endpoint,
+                    &dispatch_legacy_sessions,
+                    &dispatch_modern_sessions,
+                    request,
+                    legacy_admission,
+                )
+            }) {
+                Ok(dispatch) => dispatch,
+                Err(_) => {
+                    let _ = send_h1_response(
+                        cx,
+                        &listener_shutdown,
+                        &mut framed,
+                        HttpResponse::internal_error(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let response = match dispatch.join(cx).await {
+                Ok(response) => response,
+                Err(_) => HttpResponse::internal_error(),
+            };
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
         }

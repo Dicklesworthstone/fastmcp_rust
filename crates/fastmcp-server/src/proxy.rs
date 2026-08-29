@@ -494,7 +494,8 @@ pub struct ProxyLegacyHttpRequest {
     handle: LegacyHttpRequest,
 }
 
-/// Prepared exact-2024 HTTP start that can POST after the route mutex drops.
+/// Prepared exact-2024 HTTP start that can POST on the inbound request `Cx`
+/// after the route mutex drops.
 #[cfg(feature = "legacy-2024-11-05")]
 pub struct PreparedLegacyHttpStart {
     request: CoreRequest,
@@ -502,7 +503,6 @@ pub struct PreparedLegacyHttpStart {
     parameters: serde_json::Value,
     request_id: RequestId,
     receiver: Arc<LegacySsePersistentReceiver>,
-    cx: Cx,
 }
 
 /// Prepared exact-2024 stdio start that can yield after the route mutex drops.
@@ -5285,7 +5285,6 @@ impl ProxyBackend for ProxyHttpClient {
             parameters,
             request_id,
             receiver,
-            cx: self.cx.clone(),
         }))
     }
 
@@ -7944,7 +7943,7 @@ impl ProxyClient {
             let handle = prepared
                 .receiver
                 .start_request(
-                    &prepared.cx,
+                    ctx.cx(),
                     &prepared.method,
                     prepared.parameters,
                     prepared.request_id,
@@ -8397,7 +8396,7 @@ impl ProxyClient {
             let handle = prepared
                 .receiver
                 .start_request(
-                    &prepared.cx,
+                    ctx.cx(),
                     &prepared.method,
                     prepared.parameters,
                     prepared.request_id,
@@ -9572,6 +9571,10 @@ impl ToolHandler for ProxyToolHandler {
         self.final_tool
             .as_ref()
             .map(|_tool| UpstreamFinalToolSchemaRegistration::exact_proxy())
+    }
+
+    fn execution_mode(&self) -> crate::ToolExecutionMode {
+        crate::ToolExecutionMode::Async
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {

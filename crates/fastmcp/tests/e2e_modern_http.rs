@@ -43,8 +43,9 @@ use fastmcp_rust::{
     ModernHttpResponseStream, Outcome, Prompt, PromptArgument, PromptHandler, PromptMessage,
     ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider,
-    TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolHandler, auto, caching, core,
-    legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
+    TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolExecutionMode, ToolHandler, auto,
+    caching, core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool,
+    transform,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
@@ -1107,6 +1108,10 @@ impl ToolHandler for PublicHttpComposeTool {
         Err(McpError::invalid_request(
             "compose-sync-hook: compose must run through the request-owned final async hook",
         ))
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
     }
 
     fn call_async_in_request<'a>(
@@ -28129,6 +28134,10 @@ impl ToolHandler for PublicHttpSampleTool {
         ))
     }
 
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
+    }
+
     fn call_async<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -28669,6 +28678,10 @@ impl ToolHandler for PublicHttpLegacyRootsTool {
         Err(McpError::internal_error(
             "public-http-e2e-legacy-roots is request-owned async",
         ))
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
     }
 
     fn call_async<'a>(
@@ -31014,6 +31027,10 @@ impl ToolHandler for PublicHttpLegacyWaitTool {
             return Err(McpError::request_cancelled());
         }
         Ok(vec![Content::text("waited")])
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Async
     }
 
     fn call_async_in_request<'a>(

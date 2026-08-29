@@ -11,39 +11,48 @@
 //! can discover the I/O driver via `Cx::current()` without us having to
 //! build a context out of band.
 
+use std::cell::OnceCell;
 use std::future::Future;
-use std::sync::OnceLock;
 
 use asupersync::runtime::Runtime;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 
-/// Lazily initialized single-thread runtime with a platform I/O reactor.
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+thread_local! {
+    /// Lazily initialized single-thread runtime with a platform I/O reactor.
+    ///
+    /// The bridge is thread-local because `Runtime::block_on` polls its future
+    /// on the calling thread. Sharing one current-thread runtime across
+    /// concurrent blocking adapters can couple an adapter to a reactor being
+    /// driven by another thread and starve sibling tasks on that runtime.
+    static RUNTIME: OnceCell<Runtime> = const { OnceCell::new() };
+}
 
 /// Blocks the current thread on the provided future.
 ///
-/// Uses a lazily initialized, single-thread asupersync runtime that has a
-/// platform I/O reactor enabled. The runtime's own `block_on` installs an
-/// ambient `Cx` carrying the runtime drivers (I/O, timer, blocking pool,
-/// entropy, observability) for the duration of the poll, so asupersync
-/// networking primitives that look up the driver via `Cx::current()` work
-/// correctly. Because we attach the reactor via [`RuntimeBuilder::with_reactor`],
-/// that ambient `Cx`'s I/O driver is backed by this reactor.
+/// Uses a lazily initialized, per-thread asupersync runtime that has a platform
+/// I/O reactor enabled. The runtime's own `block_on` installs an ambient `Cx`
+/// carrying the runtime drivers (I/O, timer, blocking pool, entropy,
+/// observability) for the duration of the poll, so asupersync networking
+/// primitives that look up the driver via `Cx::current()` work correctly.
+/// Because we attach the reactor via [`RuntimeBuilder::with_reactor`], that
+/// ambient `Cx`'s I/O driver is backed by the calling thread's reactor.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let runtime = RUNTIME.get_or_init(|| {
-        // Create the platform reactor (epoll/kqueue/IOCP). The runtime
-        // derives its I/O driver from this reactor, and `Runtime::block_on`
-        // installs an ambient `Cx` carrying that driver for each poll.
-        let reactor = create_reactor().expect("failed to create platform I/O reactor");
+    RUNTIME.with(|runtime| {
+        let runtime = runtime.get_or_init(|| {
+            // Create the platform reactor (epoll/kqueue/IOCP). The runtime
+            // derives its I/O driver from this reactor, and `Runtime::block_on`
+            // installs an ambient `Cx` carrying that driver for each poll.
+            let reactor = create_reactor().expect("failed to create platform I/O reactor");
 
-        RuntimeBuilder::current_thread()
-            .with_reactor(reactor)
-            .build()
-            .expect("failed to build asupersync runtime")
-    });
+            RuntimeBuilder::current_thread()
+                .with_reactor(reactor)
+                .build()
+                .expect("failed to build asupersync runtime")
+        });
 
-    runtime.block_on(future)
+        runtime.block_on(future)
+    })
 }
 
 #[cfg(test)]

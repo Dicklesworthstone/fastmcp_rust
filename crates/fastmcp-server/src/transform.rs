@@ -337,6 +337,10 @@ impl ToolHandler for TransformedTool {
         self.parent.timeout()
     }
 
+    fn execution_mode(&self) -> crate::ToolExecutionMode {
+        self.parent.execution_mode()
+    }
+
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let transformed_args = self.transform_arguments(arguments)?;
         self.parent.call(ctx, transformed_args)

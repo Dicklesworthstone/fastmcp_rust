@@ -896,11 +896,18 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
 
 /// One immutable catalog snapshot committed together with its dispatch target.
 /// No list or validation path re-invokes the handler's definition hooks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyToolDispatch {
+    Blocking,
+    CallerOwnedAsync,
+}
+
 struct AdmittedToolRegistration {
     handler: BoxedToolHandler,
     definition: Tool,
     final_registration: Option<AdmittedFinalToolRegistration>,
     legacy_enabled: bool,
+    legacy_dispatch: LegacyToolDispatch,
 }
 
 struct AdmittedFinalToolRegistration {
@@ -930,6 +937,7 @@ impl AdmittedToolRegistration {
         handler: H,
         definition: Tool,
         legacy_enabled: bool,
+        legacy_dispatch: LegacyToolDispatch,
     ) -> McpResult<Self> {
         let (exact_final_definition, declares_final_tasks, upstream_schema_registered) =
             crate::catch_extension_unwind(|| {
@@ -990,15 +998,21 @@ impl AdmittedToolRegistration {
                 declares_final_tasks,
             }),
             legacy_enabled,
+            legacy_dispatch,
         })
     }
 
-    fn legacy_only<H: ToolHandler + 'static>(handler: H, definition: Tool) -> Self {
+    fn legacy_only<H: ToolHandler + 'static>(
+        handler: H,
+        definition: Tool,
+        legacy_dispatch: LegacyToolDispatch,
+    ) -> Self {
         Self {
             handler: Box::new(handler),
             definition,
             final_registration: None,
             legacy_enabled: true,
+            legacy_dispatch,
         }
     }
 
@@ -1010,6 +1024,7 @@ impl AdmittedToolRegistration {
             mut definition,
             mut final_registration,
             legacy_enabled,
+            legacy_dispatch,
         } = self;
         definition.name.clone_from(&mounted_name);
         if let Some(final_registration) = final_registration.as_mut() {
@@ -1023,6 +1038,7 @@ impl AdmittedToolRegistration {
             definition,
             final_registration,
             legacy_enabled,
+            legacy_dispatch,
         }
     }
 }
@@ -2359,11 +2375,19 @@ impl Router {
         // Admission must finish before any map or ordering mutation. In
         // particular, a rejected replacement must retain the prior handler
         // and its admitted schemas for both protocol eras.
+        let execution_mode =
+            crate::catch_extension_unwind(|| handler.execution_mode()).map_err(|_payload| {
+                McpError::internal_error("tool execution-mode hook panicked during admission")
+            })?;
+        let legacy_dispatch = match execution_mode {
+            crate::ToolExecutionMode::Blocking => LegacyToolDispatch::Blocking,
+            crate::ToolExecutionMode::Async => LegacyToolDispatch::CallerOwnedAsync,
+        };
         let name = def.name.clone();
         let admitted = if admit_final {
-            AdmittedToolRegistration::admit(handler, def, legacy_enabled)?
+            AdmittedToolRegistration::admit(handler, def, legacy_enabled, legacy_dispatch)?
         } else {
-            AdmittedToolRegistration::legacy_only(handler, def)
+            AdmittedToolRegistration::legacy_only(handler, def, legacy_dispatch)
         };
         if let Some(final_registration) = admitted.final_registration.as_ref() {
             self.validate_mcp_apps_tool_admission(
@@ -3438,6 +3462,27 @@ impl Router {
     #[must_use]
     pub fn get_tool(&self, name: &str) -> Option<&BoxedToolHandler> {
         self.tools.get(name).map(|entry| &entry.handler)
+    }
+
+    /// Returns whether an admitted exact-2024 request selects a handler frozen
+    /// as async at registration and therefore stays on the caller's runtime.
+    pub(crate) fn legacy_request_uses_transport_owned_async_dispatch(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> bool {
+        if request.method != "tools/call" {
+            return false;
+        }
+        let Some(params) = request.params.clone() else {
+            return false;
+        };
+        let Ok(params) = serde_json::from_value::<CallToolParams>(params) else {
+            return false;
+        };
+        self.tools.get(&params.name).is_some_and(|registration| {
+            registration.legacy_enabled
+                && registration.legacy_dispatch == LegacyToolDispatch::CallerOwnedAsync
+        })
     }
 
     /// Gets a resource handler by URI.
@@ -12466,6 +12511,51 @@ mod router_tests {
         assert_eq!(r.tools_count(), 1);
         assert!(r.get_tool("my_tool").is_some());
         assert!(r.get_tool("other").is_none());
+    }
+
+    #[test]
+    fn caller_owned_legacy_dispatch_is_frozen_at_registration() {
+        struct AsyncNamedTool;
+
+        impl ToolHandler for AsyncNamedTool {
+            fn definition(&self) -> Tool {
+                NamedTool::new("async_tool").definition()
+            }
+
+            fn execution_mode(&self) -> crate::ToolExecutionMode {
+                crate::ToolExecutionMode::Async
+            }
+
+            fn call(
+                &self,
+                _context: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut router = Router::new();
+        router
+            .add_legacy_tool(AsyncNamedTool)
+            .expect("async legacy registration succeeds");
+        router
+            .add_legacy_tool(NamedTool::new("ordinary_tool"))
+            .expect("ordinary legacy registration succeeds");
+
+        let proxy_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name": "async_tool", "arguments": {}})),
+            1_i64,
+        );
+        assert!(router.legacy_request_uses_transport_owned_async_dispatch(&proxy_request));
+
+        let ordinary_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"name": "ordinary_tool", "arguments": {}})),
+            2_i64,
+        );
+        assert!(!router.legacy_request_uses_transport_owned_async_dispatch(&ordinary_request));
     }
 
     #[test]

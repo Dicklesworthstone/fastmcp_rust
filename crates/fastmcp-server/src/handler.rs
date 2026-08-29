@@ -1478,6 +1478,16 @@ impl UpstreamFinalToolSchemaRegistration {
     }
 }
 
+/// Immutable execution disposition for one admitted tool handler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    /// The handler enters its synchronous hook and may block the calling thread.
+    #[default]
+    Blocking,
+    /// The handler is a cooperative future that must be polled by the caller's runtime.
+    Async,
+}
+
 /// Handler for a tool.
 ///
 /// This trait is typically implemented via the `#[tool]` macro.
@@ -1485,8 +1495,9 @@ impl UpstreamFinalToolSchemaRegistration {
 /// # Sync vs Async
 ///
 /// By default, implement `call()` for synchronous execution. For async tools,
-/// override `call_async()` instead. The router always calls `call_async()`,
-/// which defaults to running `call()` in an async block.
+/// override `call_async()` and [`Self::execution_mode`]. The `#[tool]` macro
+/// emits both hooks together. The router always calls `call_async()`, which
+/// defaults to running `call()` in an async block.
 ///
 /// # Return Type
 ///
@@ -1626,6 +1637,17 @@ pub trait ToolHandler: Send + Sync {
     /// drain; handlers must still cooperate with [`McpContext::checkpoint`].
     fn timeout(&self) -> Option<Duration> {
         None
+    }
+
+    /// Declares how this handler must be driven by live transports.
+    ///
+    /// The router freezes this value at registration. The default protects
+    /// synchronous implementations by moving their request dispatch to a
+    /// bounded blocking lane. Hand-written handlers that override an async
+    /// call hook must return [`ToolExecutionMode::Async`]; `#[tool]` emits the
+    /// declaration automatically for `async fn` tools.
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Blocking
     }
 
     /// Calls the tool synchronously with the given arguments.
@@ -2977,6 +2999,10 @@ impl ToolHandler for MountedToolHandler {
 
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
+    }
+
+    fn execution_mode(&self) -> ToolExecutionMode {
+        self.inner.execution_mode()
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {

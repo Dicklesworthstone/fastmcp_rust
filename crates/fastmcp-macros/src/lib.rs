@@ -4914,6 +4914,15 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Check if function is async
     let is_async = input_fn.sig.asyncness.is_some();
+    let execution_mode = if is_async {
+        quote! {
+            fn execution_mode(&self) -> fastmcp_server::ToolExecutionMode {
+                fastmcp_server::ToolExecutionMode::Async
+            }
+        }
+    } else {
+        TokenStream2::new()
+    };
 
     // Analyze return type to determine conversion strategy
     let return_type = &input_fn.sig.output;
@@ -5013,6 +5022,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #tasks_declaration
 
                 #mrtr_declaration
+
+                #execution_mode
 
                 #execution_methods
 

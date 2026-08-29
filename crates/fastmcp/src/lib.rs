@@ -135,7 +135,7 @@ pub mod __private {
         pub use fastmcp_server::bidirectional;
         pub use fastmcp_server::{
             BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-            PromptHandler, ResourceHandler, ToolHandler,
+            PromptHandler, ResourceHandler, ToolExecutionMode, ToolHandler,
         };
     }
 
@@ -303,9 +303,9 @@ pub mod server {
         ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
         ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
         ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
-        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
-        TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, caching, create_context_with_progress,
+        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
+        ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+        TransportRootsProvider, TransportSamplingSender, caching, create_context_with_progress,
         create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
@@ -684,9 +684,9 @@ pub use fastmcp_server::{
     ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
     StaticTokenVerifier, StatsSnapshot, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
-    TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    TokenVerifier, ToolErrorKind, ToolExecutionMode, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_server::{
@@ -2197,8 +2197,8 @@ pub mod modern {
         LoggingConfig, Middleware, MiddlewareDecision, MountResult, PendingRequests,
         ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
         ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, create_context_with_progress,
+        ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+        TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -6476,8 +6476,8 @@ pub mod legacy_2024 {
     pub use fastmcp_server::{
         AuthProvider, BannerStyle, CompletionHandler, ConsoleConfig, DuplicateBehavior,
         HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, Middleware,
-        PromptHandler, ResourceHandler, ServerLaunchPolicyError, ToolErrorKind, ToolHandler,
-        TrafficVerbosity,
+        PromptHandler, ResourceHandler, ServerLaunchPolicyError, ToolErrorKind, ToolExecutionMode,
+        ToolHandler, TrafficVerbosity,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
