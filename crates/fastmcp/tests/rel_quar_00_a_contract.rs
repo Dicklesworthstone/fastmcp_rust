@@ -65,6 +65,29 @@ fn rel_quar_00_a_positive() {
         workflow_text.contains("contents: read"),
         "quarantine declares read-only permissions"
     );
+    for action in inventory.quarantine.actions {
+        let exact_use = format!("{}@{}", action.name, action.commit_sha);
+        assert!(
+            workflow_text.contains(&exact_use),
+            "checked-in workflow must use frozen action identity {exact_use}"
+        );
+    }
+    assert_eq!(
+        workflow_text
+            .matches("toolchain: nightly-2026-08-25")
+            .count(),
+        2,
+        "both quarantine jobs use the frozen dated toolchain"
+    );
+    for cache_key in [
+        "key: release-preflight-${{ runner.os }}-nightly-2026-08-25",
+        "key: release-${{ matrix.target }}-nightly-2026-08-25",
+    ] {
+        assert!(
+            workflow_text.contains(cache_key),
+            "checked-in workflow must use frozen cache key {cache_key}"
+        );
+    }
     for forbidden in [
         "\n  push:",
         "tags:",
@@ -76,6 +99,7 @@ fn rel_quar_00_a_positive() {
         "id-token: write",
         "action-gh-release",
         "environment:",
+        "nightly-2026-07-11",
     ] {
         assert!(
             !workflow_text.contains(forbidden),
@@ -126,12 +150,12 @@ fn rel_quar_00_a_planted_negative() {
          identity[quarantine-verification].revision"
     );
 
-    // Plant 2: exactly one pinned action commit identity changes to another
-    // valid lowercase-hex SHA (borrowed from a different real action), the
-    // precise bypass shape-only validation would admit.
+    // Plant 2: exactly one pinned action commit identity changes back to the
+    // prior valid lowercase-hex installer SHA, the precise stale mirror that
+    // shape-only validation would admit.
     let mut planted_action = pristine.clone();
     let mut actions: Vec<ActionIdentity> = pristine.quarantine.actions.to_vec();
-    actions[0].commit_sha = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+    actions[3].commit_sha = "6c6fd71fe4fb72c3697d269963d0e15df8adedad";
     planted_action.quarantine.actions = Box::leak(actions.into_boxed_slice());
     let diagnostic = rel_quar_00_a_ambient_authority_inventory(&planted_action)
         .expect_err("a substituted well-formed action pin is refused");

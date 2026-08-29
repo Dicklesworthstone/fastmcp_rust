@@ -450,7 +450,7 @@ fn quarantine_identity() -> WorkflowIdentity {
         },
         ActionIdentity {
             name: "taiki-e/install-action",
-            commit_sha: "6c6fd71fe4fb72c3697d269963d0e15df8adedad",
+            commit_sha: "ba47c86ac325773530516bb756137ac718732518",
         },
         ActionIdentity {
             name: "actions/upload-artifact",
@@ -462,8 +462,8 @@ fn quarantine_identity() -> WorkflowIdentity {
         role: WorkflowRole::QuarantineVerification,
         workflow_name: "Release Quarantine Verification",
         path: WORKFLOW_PATH,
-        revision: "1c607aa4b25bc6ef0e3a5462f5faaf4d04f38f4a",
-        definition_sha256_hex: "bebd9d3f9437883cadcc845f0cbb40b0639ff4d11ce7ccb1d823aa25466fea8b",
+        revision: "3332da3e036fb4c0a778aaec24cb17720b37c08c",
+        definition_sha256_hex: "23ea1534d4ee97a60506d2efc48c27e67dc4acbcd98c1818fb46f23e744b5684",
         events: &["workflow_dispatch"],
         jobs: &["preflight", "build"],
         declared_permissions: &[
@@ -490,7 +490,7 @@ fn quarantine_identity() -> WorkflowIdentity {
 /// Freezes exactly two workflow identities — the immutable historical
 /// `release.yml` publisher (revision `7c02d8e0`, the last pre-quarantine
 /// bytes) and the checked-in quarantine verification definition (revision
-/// `1c607aa4`, re-frozen over dependabot action-pin bumps) — plus the ordered
+/// `3332da3e`, re-frozen over action-pin and dated-toolchain updates) — plus the ordered
 /// twelve-context/six-sink closed sets, the seventy-two reachability cells,
 /// and the standing unresolved provider-side observations.
 #[must_use]
