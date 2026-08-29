@@ -8048,6 +8048,10 @@ impl ServerHttpSession {
         )
     }
 
+    #[cfg_attr(
+        not(any(feature = "legacy-2024-11-05", test)),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn handle_with_modern_request_cancellation_and_transport_authorization_async(
         &mut self,
         cx: &Cx,
@@ -8056,6 +8060,8 @@ impl ServerHttpSession {
         modern_request_cancellation: Option<McpRequestCancellation>,
         legacy_response_preclassified_unmatched: bool,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+        let _ = legacy_response_preclassified_unmatched;
         self.reap_modern_dispatches();
         let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
