@@ -33,6 +33,9 @@ qualification of every in-tree profile.
 
 ### Fixed
 
+- Exact-2024 HTTP proxy connection, initialization, catalog discovery, and
+  reverse-callback reception now stay on the caller-owned runtime, preventing
+  legacy SSE callback deadlocks caused by crossing reactor ownership.
 - Non-rich console rendering now preserves `Renderable` content instead of
   replacing it with a `[Complex Output]` placeholder.
 - Unified all-feature builds use the explicit Auto server facade in the CLI

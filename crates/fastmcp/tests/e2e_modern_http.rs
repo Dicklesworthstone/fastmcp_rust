@@ -32888,11 +32888,8 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                 1,
             )
             .map_err(|error| format!("legacy as_proxy HTTP plan failed: {error}"))?;
-            let mut registry = ProxyClient::upstream_binding_registry();
-            let proxy = registry
-                .connect_http_with_protocol_plan(
-                    "e2e-legacy-live-upstream",
-                    "native-h1:e2e-legacy-live-upstream",
+            let (proxy, catalog) =
+                ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
                     1,
                     plan,
                     ClientInfo {
@@ -32908,10 +32905,8 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                     },
                     cx.clone(),
                 )
+                .await
                 .map_err(|error| format!("live exact-2024 HTTP proxy upstream connect failed: {error}"))?;
-            let catalog = proxy
-                .catalog_typed()
-                .map_err(|error| format!("live exact-2024 HTTP proxy catalog failed: {error}"))?;
             let ProxyToolCatalog::Legacy(tools) = &catalog.tools else {
                 return Err(
                     "exact-2024 HTTP as_proxy catalog must stay on the 2024 tool model".to_owned(),

@@ -4694,6 +4694,64 @@ impl ProxyHttpClient {
             })?,
             request_id.clone(),
         )?;
+        self.admit_legacy_initialize_response(response)?;
+
+        block_on(self.connection.notify(
+            &self.cx,
+            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+            None,
+        ))
+        .map_err(proxy_http_connection_error)?;
+        self.legacy_initialized = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn ensure_legacy_initialized_async(&mut self) -> McpResult<()> {
+        if self.legacy_initialized {
+            return Ok(());
+        }
+        self.configure_legacy_reverse_request_handlers()?;
+        let request_id = self.next_request_id()?;
+        let parameters = InitializeParams {
+            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
+            capabilities: self.client_capabilities.clone(),
+            client_info: self.client_info.clone(),
+        };
+        let response = self
+            .connection
+            .request(
+                &self.cx,
+                fastmcp_protocol::methods::INITIALIZE,
+                serde_json::to_value(parameters).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP legacy initialize parameters could not be encoded: {error}"
+                    ))
+                })?,
+                request_id,
+            )
+            .await
+            .map_err(proxy_http_connection_error)?;
+        let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
+            return Err(McpError::invalid_request(
+                "Proxy HTTP legacy initialize did not return a JSON-RPC response",
+            ));
+        };
+        self.admit_legacy_initialize_response(response)?;
+        self.connection
+            .notify(
+                &self.cx,
+                fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
+                None,
+            )
+            .await
+            .map_err(proxy_http_connection_error)?;
+        self.legacy_initialized = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn admit_legacy_initialize_response(&mut self, response: JsonRpcResponse) -> McpResult<()> {
         if let Some(error) = response.error.as_ref() {
             return Err(McpError::internal_error(format!(
                 "Proxy HTTP legacy initialize was rejected: {} ({})",
@@ -4715,15 +4773,131 @@ impl ProxyHttpClient {
         }
         self.instructions = initialized.instructions.filter(|value| !value.is_empty());
         self.legacy_completion_supported = initialized.capabilities.completions.is_some();
-
-        block_on(self.connection.notify(
-            &self.cx,
-            fastmcp_protocol::methods::NOTIFICATIONS_INITIALIZED,
-            None,
-        ))
-        .map_err(proxy_http_connection_error)?;
-        self.legacy_initialized = true;
         Ok(())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn request_legacy_result_async(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.ensure_legacy_initialized_async().await?;
+        let parameters = self.request_parameters(parameters, None, None, None)?;
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Proxy HTTP request is invalid for the selected upstream era: {error}"
+                ))
+            })?;
+        let request_id = self.next_request_id()?;
+        let response = self
+            .connection
+            .request(&self.cx, method, parameters, request_id)
+            .await
+            .map_err(proxy_http_connection_error)?;
+        let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
+            return Err(McpError::invalid_request(format!(
+                "Proxy HTTP legacy {method} did not return a JSON-RPC response"
+            )));
+        };
+        if let Some(error) = response.error.as_ref() {
+            return Err(proxy_http_upstream_rpc_error(method, error));
+        }
+        request.decode_response(&response).map_err(|error| {
+            McpError::invalid_request(format!(
+                "Proxy HTTP upstream response is invalid for the selected era: {error}"
+            ))
+        })
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn collect_legacy_catalog_pages<T>(
+        &mut self,
+        method: &str,
+        mut decode: impl FnMut(CoreResult) -> McpResult<(Vec<T>, Option<String>)>,
+    ) -> McpResult<Vec<T>> {
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        let mut observed_cursors = HashSet::new();
+
+        for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
+            let result = self
+                .request_legacy_result_async(
+                    method,
+                    Self::modern_catalog_parameters(cursor.as_deref()),
+                )
+                .await?;
+            let (page, next_cursor) = decode(result)?;
+            entries.extend(page);
+            let Some(next_cursor) = next_cursor else {
+                return Ok(entries);
+            };
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(McpError::invalid_request(format!(
+                    "Proxy legacy {method} catalog returned a non-advancing cursor"
+                )));
+            }
+            if !observed_cursors.insert(next_cursor.clone()) {
+                return Err(McpError::invalid_request(format!(
+                    "Proxy legacy {method} catalog returned a repeated cursor"
+                )));
+            }
+            cursor = Some(next_cursor);
+        }
+
+        Err(McpError::invalid_request(format!(
+            "Proxy legacy {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+        )))
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn legacy_typed_catalog_async(&mut self) -> McpResult<ProxyTypedCatalog> {
+        let tools = self
+            .collect_legacy_catalog_pages(fastmcp_protocol::methods::TOOLS_LIST, |result| {
+                let CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) = result else {
+                    return Err(unexpected_proxy_result("tools/list"));
+                };
+                Ok((result.tools, result.next_cursor))
+            })
+            .await?;
+        let resources = self
+            .collect_legacy_catalog_pages(fastmcp_protocol::methods::RESOURCES_LIST, |result| {
+                let CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) = result else {
+                    return Err(unexpected_proxy_result("resources/list"));
+                };
+                Ok((result.resources, result.next_cursor))
+            })
+            .await?;
+        let resource_templates = self
+            .collect_legacy_catalog_pages(
+                fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                |result| {
+                    let CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) =
+                        result
+                    else {
+                        return Err(unexpected_proxy_result("resources/templates/list"));
+                    };
+                    Ok((result.resource_templates, result.next_cursor))
+                },
+            )
+            .await?;
+        let prompts = self
+            .collect_legacy_catalog_pages(fastmcp_protocol::methods::PROMPTS_LIST, |result| {
+                let CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) = result else {
+                    return Err(unexpected_proxy_result("prompts/list"));
+                };
+                Ok((result.prompts, result.next_cursor))
+            })
+            .await?;
+        let catalog = ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Legacy(tools),
+            resources: ProxyResourceCatalog::Legacy(resources),
+            resource_templates: ProxyResourceTemplateCatalog::Legacy(resource_templates),
+            prompts: ProxyPromptCatalog::Legacy(prompts),
+        };
+        catalog.era()?;
+        Ok(catalog)
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -7394,6 +7568,60 @@ fn binding_from_live_http_connection(
 }
 
 impl ProxyClient {
+    /// Opens an exact-2024 HTTP proxy and fetches its complete catalog on the
+    /// caller-owned runtime.
+    ///
+    /// A legacy SSE socket is reactor-bound for its full lifetime. Connection,
+    /// initialization, catalog discovery, request POSTs, and the persistent
+    /// receive pump therefore all retain the supplied `Cx`. This direct
+    /// constructor deliberately does not enter the runtime-agnostic live
+    /// binding cache.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub async fn connect_legacy_http_with_protocol_plan_and_catalog(
+        configuration_generation: u64,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        cx: Cx,
+    ) -> McpResult<(Self, ProxyTypedCatalog)> {
+        if protocol_plan.http_endpoints().is_none() {
+            return Err(McpError::invalid_params(
+                "An HTTP proxy upstream requires an HTTP client protocol plan",
+            ));
+        }
+        let connection = ClientHttpConnection::connect(
+            &cx,
+            protocol_plan.clone(),
+            client_info.clone(),
+            client_capabilities.clone(),
+        )
+        .await
+        .map_err(|error| {
+            McpError::internal_error(format!("HTTP proxy upstream connect failed: {error}"))
+        })?;
+        let binding = binding_from_live_http_connection(
+            &connection,
+            protocol_plan.policy(),
+            configuration_generation,
+        )?;
+        if binding.era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::invalid_request(
+                "Caller-owned legacy HTTP proxy establishment selected the final protocol era",
+            ));
+        }
+        let mut backend =
+            ProxyHttpClient::new(binding, connection, cx, client_info, client_capabilities);
+        backend.ensure_legacy_initialized_async().await?;
+        let catalog = backend.legacy_typed_catalog_async().await?;
+        backend.start_legacy_receive_pump()?;
+        let proxy = Self::from_backend_with_upstream_binding(
+            backend,
+            binding,
+            binding.era().version().as_str(),
+        )?;
+        Ok((proxy, catalog))
+    }
+
     /// Creates an independent cache for immutable upstream era selections.
     #[must_use]
     pub fn upstream_binding_registry() -> ProxyUpstreamBindingRegistry {

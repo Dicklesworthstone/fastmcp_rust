@@ -9694,8 +9694,7 @@ async fn send_legacy_sse_stream(
     response: DualEraHttpLegacySseResponse,
 ) -> Result<(), ()> {
     let (mut peer_reader, mut stream) = stream.into_split();
-    let peer_closed = Arc::new(AtomicBool::new(false));
-    let peer_closed_for_watch = Arc::clone(&peer_closed);
+    let (peer_closed_sender, mut peer_closed_receiver) = oneshot::channel();
     let mut peer_watch = cx
         .spawn(move |_peer_cx| async move {
             let mut byte = [0_u8; 1];
@@ -9704,7 +9703,7 @@ async fn send_legacy_sse_stream(
             // this one-way body without waiting for an application event to
             // cause a write-side error.
             let _ = peer_reader.read(&mut byte).await;
-            peer_closed_for_watch.store(true, Ordering::Release);
+            let _ = peer_closed_sender.send_blocking(());
         })
         .map_err(|_| ())?;
     let result = async {
@@ -9713,21 +9712,30 @@ async fn send_legacy_sse_stream(
             .await
             .map_err(|_| ())?;
         stream.flush().await.map_err(|_| ())?;
-        // Poll non-blockingly with an async yield between attempts, mirroring
-        // the modern SSE pump: a blocking receive on the executor starves the
-        // accept loop, and parking one blocking-pool thread per live stream
-        // exhausts the pool under concurrent sessions.
+        // Park on the channel's registered receive waker so publication wakes
+        // this writer directly. Race peer closure through its own wake-driven
+        // signal so an idle stream still tears down promptly.
         let mut response = response;
         loop {
-            if peer_closed.load(Ordering::Acquire) {
+            let next = {
+                let mut next_event = Box::pin(response.recv_event_async(cx));
+                let mut peer_closed = Box::pin(peer_closed_receiver.recv(cx));
+                std::future::poll_fn(|task_cx| {
+                    if peer_closed.as_mut().poll(task_cx).is_ready() {
+                        return std::task::Poll::Ready(None);
+                    }
+                    match next_event.as_mut().poll(task_cx) {
+                        std::task::Poll::Ready(event) => std::task::Poll::Ready(Some(event)),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+            };
+            let Some(event) = next else {
                 break;
-            }
-            let event = match response.try_recv_event(cx) {
-                Ok(Some(event)) => event,
-                Ok(None) => {
-                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
-                    continue;
-                }
+            };
+            let event = match event {
+                Ok(event) => event,
                 Err(_) => break,
             };
             let bytes = event.to_bytes().map_err(|_| ())?;
@@ -10672,7 +10680,7 @@ async fn dispatch_http_request_async(
                 return HttpResponse::new(HttpStatus::ACCEPTED);
             }
         }
-        // The connection creates this authority before queueing the blocking
+        // The connection creates this authority before entering async
         // dispatch. Direct embedding callers create it here instead. In both
         // cases it remains live through the serialized adapter/session mutex,
         // active guard, and response finalization.
@@ -10999,35 +11007,20 @@ async fn serve_http_connection(
         if request.method == HttpMethod::Post
             && request.path == endpoint.server.http_config.legacy_message_path
         {
-            let dispatch_endpoint = Arc::clone(&endpoint);
-            let dispatch_legacy_sessions = Arc::clone(&legacy_sessions);
-            let dispatch_modern_sessions = Arc::clone(&modern_sessions);
-            let mut dispatch = match cx.spawn_blocking(move |dispatch_cx| {
-                dispatch_http_request(
-                    &dispatch_cx,
-                    &dispatch_endpoint,
-                    &dispatch_legacy_sessions,
-                    &dispatch_modern_sessions,
-                    request,
-                    legacy_admission,
-                )
-            }) {
-                Ok(dispatch) => dispatch,
-                Err(_) => {
-                    let _ = send_h1_response(
-                        cx,
-                        &listener_shutdown,
-                        &mut framed,
-                        HttpResponse::internal_error(),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let response = match dispatch.join(cx).await {
-                Ok(response) => response,
-                Err(_) => HttpResponse::internal_error(),
-            };
+            // Keep request dispatch on the listener's structured runtime.
+            // Moving it into a nested blocking executor can starve a
+            // current-thread runtime's sibling SSE writer while the handler
+            // awaits a reverse sampling or roots response published through
+            // that writer.
+            let response = dispatch_http_request_async(
+                cx,
+                &endpoint,
+                &legacy_sessions,
+                &modern_sessions,
+                request,
+                legacy_admission,
+            )
+            .await;
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
         }

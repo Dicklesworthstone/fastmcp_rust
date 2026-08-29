@@ -5605,6 +5605,43 @@ impl DualEraHttpLegacySseResponse {
         }
     }
 
+    /// Asynchronously receives the next endpoint or live legacy SSE event.
+    ///
+    /// Unlike [`Self::try_recv_event`], this registers the current task's
+    /// waker with the live-message channel. A server-side publisher therefore
+    /// wakes a parked SSE writer immediately instead of relying on timer
+    /// polling to make progress.
+    pub async fn recv_event_async(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<SseEvent, DualEraHttpEndpointError> {
+        if let Err(error) = http_checkpoint(cx) {
+            self.deactivate();
+            return Err(DualEraHttpEndpointError::Transport(error));
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
+        }
+        if let Some(event) = self.initial_events.pop_front() {
+            return Ok(event);
+        }
+
+        match self.receiver.recv(cx).await {
+            Ok(message) => {
+                let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous > 0, "legacy SSE live-event count underflow");
+                Ok(SseEvent::message(message.data))
+            }
+            Err(mpsc::RecvError::Disconnected) => {
+                Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
+            }
+            Err(mpsc::RecvError::Cancelled) => Err(DualEraHttpEndpointError::Transport(
+                TransportError::Cancelled,
+            )),
+            Err(mpsc::RecvError::Empty) => unreachable!("a waiting receive cannot return Empty"),
+        }
+    }
+
     pub fn recv_event(&mut self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
         if let Err(error) = http_checkpoint(cx) {
             self.deactivate();
