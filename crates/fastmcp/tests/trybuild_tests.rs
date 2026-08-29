@@ -3,10 +3,12 @@
 //! These tests verify both facade consumers that must compile and macros that
 //! produce clear compile errors for invalid usage patterns.
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -36,6 +38,7 @@ const BOUNDED_EXIT_DESCENDANT_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_EXIT_DESCEND
 // them share one fingerprinted Cargo cache. The rest of the suite stays
 // parallel.
 static COMPILE_PROBE_LOCK: Mutex<()> = Mutex::new(());
+static LOCKED_DEPENDENCY_FETCH: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn compile_probe_guard() -> MutexGuard<'static, ()> {
     COMPILE_PROBE_LOCK
@@ -728,9 +731,11 @@ pub fn probe() {
 fn facade_feature_profile_compile_probes() {
     let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root(manifest_dir);
     let manifest = manifest_dir.join("Cargo.toml");
     let target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    ensure_workspace_lock_dependencies(&cargo, workspace_root);
 
     for (profile, arguments) in FACADE_FEATURE_COMPILE_PROBES {
         let mut command = Command::new(&cargo);
@@ -761,9 +766,11 @@ fn facade_feature_profile_compile_probes() {
 fn downstream_feature_symbol_probes() {
     let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root(manifest_dir);
     let facade_path = toml_path(manifest_dir);
     let target_dir = cargo_target_dir(manifest_dir).join("downstream-feature-symbol-probes");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    ensure_workspace_lock_dependencies(&cargo, workspace_root);
 
     for probe in DOWNSTREAM_FEATURE_SYMBOL_PROBES {
         let fixture_root = target_dir.join(probe.name);
@@ -798,31 +805,13 @@ asupersync = {{ version = "=0.4.9", default-features = false }}
         .unwrap_or_else(|error| panic!("write {} fixture manifest: {error}", probe.name));
         fs::write(fixture_src.join("lib.rs"), probe.source)
             .unwrap_or_else(|error| panic!("write {} fixture source: {error}", probe.name));
-
         let fixture_manifest = fixture_root.join("Cargo.toml");
-        // Each fixture keeps its own manifest and lockfile, while Cargo's
-        // fingerprints isolate dependency feature selections inside one
-        // shared artifact cache. Separate target directories would rebuild
-        // the full dependency graph for every positive/negative probe.
         let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
-        let mut lock_command = Command::new(&cargo);
-        lock_command
-            .arg("generate-lockfile")
-            .arg("--offline")
-            .arg("--manifest-path")
-            .arg(&fixture_manifest)
-            .env("CARGO_TARGET_DIR", &fixture_target_dir)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let lock_status = run_bounded(
-            lock_command,
-            &format!("{} downstream feature lock generation", probe.name),
-            COMPILE_DEADLINE,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            lock_status.success(),
-            "{} downstream feature lock generation failed with {lock_status}",
+        prepare_fixture_lock(
+            &cargo,
+            workspace_root,
+            &fixture_manifest,
+            &fixture_target_dir,
             probe.name,
         );
 
@@ -928,6 +917,7 @@ fn compile_fail_tests() {
 fn renamed_facade_only_consumer_compiles_every_macro_family() {
     let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root(manifest_dir);
     let target_dir = cargo_target_dir(manifest_dir);
     let fixture_root = target_dir.join("facade-only-renamed-consumer");
     let fixture_src = fixture_root.join("src");
@@ -957,24 +947,13 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}" }}
     let fixture_manifest = fixture_root.join("Cargo.toml");
     let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut lock_command = Command::new(&cargo);
-    lock_command
-        .arg("generate-lockfile")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&fixture_manifest)
-        .env("CARGO_TARGET_DIR", &fixture_target_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let lock_status = run_bounded(
-        lock_command,
-        "facade-only consumer offline lock generation",
-        COMPILE_DEADLINE,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    assert!(
-        lock_status.success(),
-        "facade-only consumer lock generation failed with {lock_status}"
+    ensure_workspace_lock_dependencies(&cargo, workspace_root);
+    prepare_fixture_lock(
+        &cargo,
+        workspace_root,
+        &fixture_manifest,
+        &fixture_target_dir,
+        "facade-only renamed consumer",
     );
 
     let mut check_command = Command::new(cargo);
@@ -1009,10 +988,7 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}" }}
 fn direct_derive_tasks_consumer_compiles() {
     let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("facade crate must be nested beneath the workspace");
+    let workspace_root = workspace_root(manifest_dir);
     let target_dir = cargo_target_dir(manifest_dir);
     let fixture_root = target_dir.join("direct-derive-tasks-consumer");
     let fixture_src = fixture_root.join("src");
@@ -1045,28 +1021,16 @@ serde_json = "=1.0.151"
     .expect("write direct-derive consumer manifest");
     fs::write(fixture_src.join("lib.rs"), DIRECT_DERIVE_TASKS_CONSUMER)
         .expect("write direct-derive consumer source");
-
     let fixture_manifest = fixture_root.join("Cargo.toml");
     let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut lock_command = Command::new(&cargo);
-    lock_command
-        .arg("generate-lockfile")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&fixture_manifest)
-        .env("CARGO_TARGET_DIR", &fixture_target_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let lock_status = run_bounded(
-        lock_command,
-        "direct-derive Tasks consumer offline lock generation",
-        COMPILE_DEADLINE,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    assert!(
-        lock_status.success(),
-        "direct-derive Tasks consumer lock generation failed with {lock_status}"
+    ensure_workspace_lock_dependencies(&cargo, workspace_root);
+    prepare_fixture_lock(
+        &cargo,
+        workspace_root,
+        &fixture_manifest,
+        &fixture_target_dir,
+        "direct-derive Tasks consumer",
     );
 
     let mut check_command = Command::new(cargo);
@@ -1090,6 +1054,187 @@ serde_json = "=1.0.151"
         status.success(),
         "direct-derive Tasks consumer failed to compile with status {status}",
     );
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LockedSourcePackage {
+    name: String,
+    version: String,
+    source: String,
+    checksum: Option<String>,
+}
+
+fn ensure_workspace_lock_dependencies(cargo: &OsStr, workspace_root: &Path) {
+    let result = LOCKED_DEPENDENCY_FETCH.get_or_init(|| {
+        let mut command = Command::new(cargo);
+        command
+            .arg("fetch")
+            .arg("--locked")
+            .arg("--manifest-path")
+            .arg(workspace_root.join("Cargo.toml"))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let status = run_bounded(
+            command,
+            "workspace locked dependency fetch",
+            COMPILE_DEADLINE,
+        )?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "workspace locked dependency fetch failed with {status}"
+            ))
+        }
+    });
+    if let Err(error) = result {
+        panic!("{error}");
+    }
+}
+
+fn prepare_fixture_lock(
+    cargo: &OsStr,
+    workspace_root: &Path,
+    fixture_manifest: &Path,
+    fixture_target_dir: &Path,
+    label: &str,
+) {
+    let workspace_lock = workspace_root.join("Cargo.lock");
+    let fixture_lock = fixture_manifest
+        .parent()
+        .expect("fixture manifest must have a parent directory")
+        .join("Cargo.lock");
+    let workspace_lock_bytes = fs::read(&workspace_lock)
+        .unwrap_or_else(|error| panic!("read {}: {error}", workspace_lock.display()));
+    let copied_bytes = fs::copy(&workspace_lock, &fixture_lock).unwrap_or_else(|error| {
+        panic!(
+            "seed {label} lock from {} to {}: {error}",
+            workspace_lock.display(),
+            fixture_lock.display(),
+        )
+    });
+    assert_eq!(
+        copied_bytes,
+        workspace_lock_bytes.len() as u64,
+        "{label} lock seed byte count differs from the workspace lock",
+    );
+    let seeded_lock_bytes = fs::read(&fixture_lock)
+        .unwrap_or_else(|error| panic!("read seeded {}: {error}", fixture_lock.display()));
+    assert_eq!(
+        seeded_lock_bytes, workspace_lock_bytes,
+        "{label} lock seed must exactly equal the workspace lock",
+    );
+
+    // The fixture is a standalone workspace with a synthetic root package.
+    // Allow Cargo to replace only that path-root entry while offline, then
+    // prove that it introduced no source-bearing package outside the release
+    // workspace's frozen dependency graph.
+    let mut materialize_command = Command::new(cargo);
+    materialize_command
+        .arg("metadata")
+        .arg("--offline")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(fixture_manifest)
+        .env_remove("CARGO_LOCKED")
+        .env("CARGO_TARGET_DIR", fixture_target_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let materialize_status = run_bounded(
+        materialize_command,
+        &format!("{label} offline lock materialization"),
+        COMPILE_DEADLINE,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        materialize_status.success(),
+        "{label} offline lock materialization failed with {materialize_status}",
+    );
+
+    let workspace_packages = locked_source_packages(&workspace_lock, "workspace");
+    let fixture_packages = locked_source_packages(&fixture_lock, label);
+    let unexpected_packages = fixture_packages
+        .difference(&workspace_packages)
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected_packages.is_empty(),
+        "{label} lock introduced source-bearing packages outside the workspace lock: {unexpected_packages:#?}",
+    );
+    let workspace_chacha = workspace_packages
+        .iter()
+        .find(|package| package.name == "chacha20" && package.version == "0.10.1")
+        .expect("workspace lock must freeze chacha20 0.10.1 for asupersync 0.4.9");
+    assert!(
+        fixture_packages.contains(workspace_chacha),
+        "{label} lock must retain the exact workspace chacha20 0.10.1 tuple",
+    );
+}
+
+fn locked_source_packages(lock_path: &Path, label: &str) -> BTreeSet<LockedSourcePackage> {
+    let lock_text = fs::read_to_string(lock_path)
+        .unwrap_or_else(|error| panic!("read {label} lock {}: {error}", lock_path.display()));
+    let lock: toml::Value = toml::from_str(&lock_text)
+        .unwrap_or_else(|error| panic!("parse {label} lock {}: {error}", lock_path.display()));
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .unwrap_or_else(|| panic!("{label} lock {} has no package array", lock_path.display()));
+
+    packages
+        .iter()
+        .filter_map(|package| {
+            let table = package.as_table().unwrap_or_else(|| {
+                panic!("{label} lock {} has a non-table package", lock_path.display())
+            });
+            let source = table.get("source")?.as_str().unwrap_or_else(|| {
+                panic!(
+                    "{label} lock {} has a non-string package source",
+                    lock_path.display()
+                )
+            });
+            let name = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} lock {} has a sourced package without a name",
+                        lock_path.display()
+                    )
+                });
+            let version = table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} lock {} has a sourced package without a version",
+                        lock_path.display()
+                    )
+                });
+            let checksum = table
+                .get("checksum")
+                .map(|value| {
+                    value.as_str().unwrap_or_else(|| {
+                        panic!(
+                            "{label} lock {} has a non-string package checksum",
+                            lock_path.display()
+                        )
+                    })
+                })
+                .map(str::to_owned);
+            assert!(
+                !source.starts_with("registry+") || checksum.is_some(),
+                "{label} lock {} has a registry package without a checksum",
+                lock_path.display(),
+            );
+            Some(LockedSourcePackage {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                source: source.to_owned(),
+                checksum,
+            })
+        })
+        .collect()
 }
 
 #[test]
@@ -1564,15 +1709,16 @@ fn process_is_zombie(pid: u32) -> Result<bool, String> {
 
 fn cargo_target_dir(manifest_dir: &Path) -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || {
-            manifest_dir
-                .parent()
-                .and_then(Path::parent)
-                .expect("facade crate must be nested beneath the workspace")
-                .join("target")
-        },
+        || workspace_root(manifest_dir).join("target"),
         PathBuf::from,
     )
+}
+
+fn workspace_root(manifest_dir: &Path) -> &Path {
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("facade crate must be nested beneath the workspace")
 }
 
 fn shared_compile_probe_target_dir(manifest_dir: &Path) -> PathBuf {
