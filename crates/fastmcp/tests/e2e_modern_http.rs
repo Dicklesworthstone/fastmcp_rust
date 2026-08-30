@@ -20,6 +20,7 @@
     clippy::unnested_or_patterns
 )]
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -44,8 +45,7 @@ use fastmcp_rust::{
     ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolExecutionMode, ToolHandler, auto,
-    caching, core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool,
-    transform,
+    caching, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
@@ -1722,13 +1722,29 @@ impl CompletionHandler for CountingPublicHttpCompletion {
     }
 }
 
-fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
-    core::block_on(future)
+thread_local! {
+    static PUBLIC_HTTP_RUNTIME: OnceCell<asupersync::runtime::Runtime> = const { OnceCell::new() };
 }
 
-/// Runs one public HTTP operation on the facade-owned runtime. The operation
-/// itself is bounded against the supplied caller-owned context clock, so a
-/// stalled peer cannot hold this test thread indefinitely.
+fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+    PUBLIC_HTTP_RUNTIME.with(|runtime| {
+        runtime
+            .get_or_init(|| {
+                asupersync::runtime::RuntimeBuilder::current_thread()
+                    .with_reactor(
+                        asupersync::runtime::reactor::create_reactor()
+                            .expect("public HTTP application reactor initializes"),
+                    )
+                    .build()
+                    .expect("public HTTP application owns its runtime")
+            })
+            .block_on(future)
+    })
+}
+
+/// Runs one public HTTP operation on the test application's owned runtime. The
+/// operation itself is bounded against the supplied caller-owned context clock,
+/// so a stalled peer cannot hold this test thread indefinitely.
 fn runtime_block_on_bounded<F: std::future::Future>(cx: &Cx, future: F) -> F::Output {
     runtime_block_on_bounded_named(cx, "public HTTP operation", future)
 }
@@ -5453,7 +5469,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
 #[test]
 fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
     let cx = Cx::for_request();
-    let mut client = core::block_on(
+    let mut client = runtime_block_on(
         modern::ClientBuilder::new()
             .client_info("e2e-stdio-hide-catalog", "1.0.0")
             .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
@@ -36730,7 +36746,7 @@ mod live_websocket_bind {
     fn connect_warmed_stdio_as_proxy_upstream(cx: &Cx, client_name: &str) -> modern::Client {
         let mut last_error = None;
         for attempt in 1_u32..=4 {
-            match core::block_on(
+            match runtime_block_on(
                 modern::ClientBuilder::new()
                     .client_info(client_name, "1.0.0")
                     .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
