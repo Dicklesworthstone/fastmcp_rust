@@ -89411,12 +89411,14 @@ original = "value"
                 "crypto",
                 "draw_security_identifier",
             ) != 1
+            // The exact route-set check above proves one root route and one
+            // curated `core` route; the recursive count also rejects a third.
             || state_partition_rng_use_member_count(
                 &facade_lib.tokens,
                 true,
                 "fastmcp_core",
                 "draw_security_identifier",
-            ) != 1
+            ) != 2
             || state_partition_rng_use_member_count(
                 &oauth.tokens,
                 false,
