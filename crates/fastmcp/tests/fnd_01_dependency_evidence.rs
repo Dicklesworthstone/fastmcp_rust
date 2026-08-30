@@ -51441,7 +51441,6 @@ activate = 1\n";
                     .count()
             }
             TokenTree::Group(_)
-            | TokenTree::Ident(_)
             | TokenTree::Punct(_)
             | TokenTree::Literal(_) => 0,
         }
