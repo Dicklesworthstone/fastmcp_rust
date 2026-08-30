@@ -51145,7 +51145,8 @@ activate = 1\n";
                 )?
             } else {
                 let binding_key = (base_scope.clone(), head.clone());
-                let resolving_current_grouped_self = leaf.grouped_self
+                let resolving_current_self_binding = (leaf.grouped_self
+                    || (!leaf.absolute && leaf.path.len() == 1 && leaf.alias.is_none()))
                     && traversal
                         .visiting_bindings
                         .last()
@@ -51153,7 +51154,7 @@ activate = 1\n";
                 let competing_use_candidates = bindings
                     .get(&binding_key)
                     .map_or(0, Vec::len)
-                    .saturating_sub(usize::from(resolving_current_grouped_self));
+                    .saturating_sub(usize::from(resolving_current_self_binding));
                 let has_local_candidate = competing_use_candidates != 0
                     || !public_core_child_modules(inventory, &base_scope, head).is_empty()
                     || inventory
@@ -51193,7 +51194,7 @@ activate = 1\n";
                         return Err(());
                     }
                     inherited
-                } else if resolving_current_grouped_self {
+                } else if resolving_current_self_binding {
                     if has_local_candidate {
                         return Err(());
                     }
@@ -89355,56 +89356,65 @@ original = "value"
             Sha256::digest(baseline_facade.text.as_bytes()).into();
         let non_facade_digest =
             state_partition_rng_input_digest_excluding(&inventory, facade_path);
-        let harmless_grouped_self_route =
-            "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n";
-        let mut harmless_grouped_self = inventory.clone();
-        let harmless_facade = harmless_grouped_self
-            .rust_sources
-            .get_mut(facade_path)
-            .expect("facade source is present for harmless grouped-self planting");
-        harmless_facade.text.push_str(harmless_grouped_self_route);
-        harmless_facade.tokens = TokenStream::from_str(&harmless_facade.text)
-            .expect("the harmless grouped-self route remains tokenizable");
-        let mut expected_harmless_facade_text = baseline_facade.text.clone();
-        expected_harmless_facade_text.push_str(harmless_grouped_self_route);
-        assert_eq!(harmless_facade.text, expected_harmless_facade_text);
-        let harmless_facade_digest_before: [u8; 32] =
-            Sha256::digest(harmless_facade.text.as_bytes()).into();
-        assert_eq!(
-            state_partition_rng_input_digest_excluding(&harmless_grouped_self, facade_path),
-            non_facade_digest,
-            "the harmless grouped-self route must not alter a non-facade input"
-        );
-        validate_state_partition_rng_seam(&harmless_grouped_self)
-            .expect("an unrelated unqualified grouped-self route must remain accepted");
-        let accepted_harmless_facade =
-            state_partition_rng_source(&harmless_grouped_self, facade_path)
-                .expect("accepted harmless grouped-self facade remains present");
-        assert_eq!(
-            accepted_harmless_facade.text, expected_harmless_facade_text,
-            "validation must preserve the exact accepted grouped-self plant"
-        );
-        let harmless_facade_digest_after: [u8; 32] =
-            Sha256::digest(accepted_harmless_facade.text.as_bytes()).into();
-        assert_eq!(
-            harmless_facade_digest_after, harmless_facade_digest_before,
-            "validation must not mutate the accepted grouped-self plant"
-        );
-        assert_ne!(
-            harmless_facade_digest_after, baseline_facade_digest,
-            "the planted facade digest must differ from the pristine baseline"
-        );
+        for (label, harmless_route) in [
+            (
+                "grouped-self",
+                "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n",
+            ),
+            (
+                "plain-self-binding",
+                "\npub mod fnd01_plain_self_binding_route { pub use serde_json; }\n",
+            ),
+        ] {
+            let mut harmless_planted = inventory.clone();
+            let harmless_facade = harmless_planted
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for harmless route planting");
+            harmless_facade.text.push_str(harmless_route);
+            harmless_facade.tokens = TokenStream::from_str(&harmless_facade.text)
+                .expect("the harmless route remains tokenizable");
+            let mut expected_harmless_facade_text = baseline_facade.text.clone();
+            expected_harmless_facade_text.push_str(harmless_route);
+            assert_eq!(harmless_facade.text, expected_harmless_facade_text, "{label}");
+            let harmless_facade_digest_before: [u8; 32] =
+                Sha256::digest(harmless_facade.text.as_bytes()).into();
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&harmless_planted, facade_path),
+                non_facade_digest,
+                "{label} route must not alter a non-facade input"
+            );
+            validate_state_partition_rng_seam(&harmless_planted)
+                .unwrap_or_else(|diagnostic| panic!("{label}: {}", diagnostic.stable()));
+            let accepted_harmless_facade =
+                state_partition_rng_source(&harmless_planted, facade_path)
+                    .expect("accepted harmless facade remains present");
+            assert_eq!(
+                accepted_harmless_facade.text, expected_harmless_facade_text,
+                "validation must preserve the exact accepted {label} plant"
+            );
+            let harmless_facade_digest_after: [u8; 32] =
+                Sha256::digest(accepted_harmless_facade.text.as_bytes()).into();
+            assert_eq!(
+                harmless_facade_digest_after, harmless_facade_digest_before,
+                "validation must not mutate the accepted {label} plant"
+            );
+            assert_ne!(
+                harmless_facade_digest_after, baseline_facade_digest,
+                "the {label} facade digest must differ from the pristine baseline"
+            );
 
-        let fresh = state_partition_rng_inventory()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        validate_state_partition_rng_seam(&fresh)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let fresh_facade = state_partition_rng_source(&fresh, facade_path)
-            .expect("fresh pristine facade remains present after grouped-self validation");
-        assert_eq!(fresh_facade.text, baseline_facade.text);
-        let fresh_facade_digest: [u8; 32] =
-            Sha256::digest(fresh_facade.text.as_bytes()).into();
-        assert_eq!(fresh_facade_digest, baseline_facade_digest);
+            let fresh = state_partition_rng_inventory()
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            validate_state_partition_rng_seam(&fresh)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            let fresh_facade = state_partition_rng_source(&fresh, facade_path)
+                .expect("fresh pristine facade remains present after harmless validation");
+            assert_eq!(fresh_facade.text, baseline_facade.text, "{label}");
+            let fresh_facade_digest: [u8; 32] =
+                Sha256::digest(fresh_facade.text.as_bytes()).into();
+            assert_eq!(fresh_facade_digest, baseline_facade_digest, "{label}");
+        }
         assert_state_partition_rng_public_behavior();
     }
 
@@ -89448,41 +89458,50 @@ original = "value"
             );
         };
 
-        let harmless_grouped_self_route =
-            "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n";
-        let sealed_grouped_self_route =
-            harmless_grouped_self_route.replacen("serde_json", "fastmcp_core", 1);
-        assert_eq!(
-            sealed_grouped_self_route.replacen("fastmcp_core", "serde_json", 1),
-            harmless_grouped_self_route,
-            "the grouped-self negative must differ only in the forbidden crate route"
-        );
-        let mut grouped_self_planted = baseline.clone();
-        let grouped_self_facade = grouped_self_planted
-            .rust_sources
-            .get_mut("crates/fastmcp/src/lib.rs")
-            .expect("facade source is present for sealed grouped-self planting");
-        grouped_self_facade.text.push_str(&sealed_grouped_self_route);
-        grouped_self_facade.tokens = TokenStream::from_str(&grouped_self_facade.text)
-            .expect("the sealed grouped-self route remains tokenizable");
-        assert_eq!(
-            state_partition_rng_input_digest_excluding(
-                &grouped_self_planted,
-                "crates/fastmcp/src/lib.rs",
+        for (label, harmless_route) in [
+            (
+                "grouped-self",
+                "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n",
             ),
-            state_partition_rng_input_digest_excluding(
-                &baseline,
-                "crates/fastmcp/src/lib.rs",
+            (
+                "plain-self-binding",
+                "\npub mod fnd01_plain_self_binding_route { pub use serde_json; }\n",
             ),
-            "the sealed grouped-self plant must not alter a non-facade input"
-        );
-        let grouped_self_error = validate_state_partition_rng_seam(&grouped_self_planted)
-            .expect_err("one sealed unqualified grouped-self route must fail closed");
-        assert_eq!(
-            grouped_self_error.stable(),
-            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
-        );
-        assert_fresh_baseline();
+        ] {
+            let sealed_route = harmless_route.replacen("serde_json", "fastmcp_core", 1);
+            assert_eq!(
+                sealed_route.replacen("fastmcp_core", "serde_json", 1),
+                harmless_route,
+                "the {label} negative must differ only in the forbidden crate route"
+            );
+            let mut sealed_planted = baseline.clone();
+            let sealed_facade = sealed_planted
+                .rust_sources
+                .get_mut("crates/fastmcp/src/lib.rs")
+                .expect("facade source is present for sealed route planting");
+            sealed_facade.text.push_str(&sealed_route);
+            sealed_facade.tokens = TokenStream::from_str(&sealed_facade.text)
+                .expect("the sealed route remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(
+                    &sealed_planted,
+                    "crates/fastmcp/src/lib.rs",
+                ),
+                state_partition_rng_input_digest_excluding(
+                    &baseline,
+                    "crates/fastmcp/src/lib.rs",
+                ),
+                "the sealed {label} plant must not alter a non-facade input"
+            );
+            let sealed_error = validate_state_partition_rng_seam(&sealed_planted)
+                .expect_err("one sealed unqualified route must fail closed");
+            assert_eq!(
+                sealed_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{label}"
+            );
+            assert_fresh_baseline();
+        }
 
         let from_map = state_partition_rng_method_body(baseline_state, "from_map")
             .expect("baseline state source has exactly one from_map method");
