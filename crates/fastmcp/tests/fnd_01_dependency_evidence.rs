@@ -88229,94 +88229,304 @@ original = "value"
             && state_partition_rng_path_empty_call_count(&body.stream(), namespace, api) == 1
     }
 
-    fn state_partition_rng_attribute_is_exact_cfg_test(tree: &TokenTree) -> bool {
-        let TokenTree::Group(attribute) = tree else {
-            return false;
-        };
-        if attribute.delimiter() != Delimiter::Bracket {
-            return false;
-        }
-        let tokens = attribute.stream().into_iter().collect::<Vec<_>>();
-        let [cfg, TokenTree::Group(arguments)] = tokens.as_slice() else {
-            return false;
-        };
-        if arguments.delimiter() != Delimiter::Parenthesis {
-            return false;
-        }
-        let arguments = arguments.stream().into_iter().collect::<Vec<_>>();
-        state_partition_rng_token_identifier_is(cfg, "cfg")
-            && arguments.len() == 1
-            && arguments
-                .first()
-                .is_some_and(|tree| state_partition_rng_token_identifier_is(tree, "test"))
+    #[derive(Debug, Clone)]
+    struct StatePartitionRngScopedBody {
+        body: Group,
+        conditions: Vec<String>,
     }
 
-    fn state_partition_rng_cfg_test_use_member_count(
-        stream: &TokenStream,
-        crate_name: &str,
-        member: &str,
+    fn state_partition_rng_function_attribute_anchor(
+        trees: &[TokenTree],
+        function_index: usize,
     ) -> usize {
-        let trees = stream.clone().into_iter().collect::<Vec<_>>();
-        let mut count = 0usize;
-        for index in 2..trees.len() {
-            if !state_partition_rng_token_identifier_is(&trees[index], "use")
-                || !source_token_is_punct(&trees[index - 2], '#')
-                || !state_partition_rng_attribute_is_exact_cfg_test(&trees[index - 1])
+        let mut anchor = function_index;
+        loop {
+            if anchor >= 2
+                && matches!(&trees[anchor - 1], TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis)
+                && state_partition_rng_token_identifier_is(&trees[anchor - 2], "pub")
             {
-                continue;
-            }
-            let Some(end) = trees
-                .iter()
-                .enumerate()
-                .skip(index)
-                .find_map(|(candidate, tree)| {
-                    source_token_is_punct(tree, ';').then_some(candidate)
+                anchor -= 2;
+            } else if anchor != 0
+                && trees.get(anchor - 1).is_some_and(|tree| {
+                    ["async", "const", "extern", "pub", "safe", "unsafe"]
+                        .iter()
+                        .any(|modifier| state_partition_rng_token_identifier_is(tree, modifier))
                 })
-            else {
-                continue;
-            };
-            let item = trees[index..=end]
-                .iter()
-                .cloned()
-                .collect::<TokenStream>();
-            count = count.saturating_add(state_partition_rng_use_member_count(
-                &item,
-                false,
-                crate_name,
-                member,
-            ));
+            {
+                anchor -= 1;
+            } else if anchor >= 2
+                && matches!(&trees[anchor - 1], TokenTree::Literal(_))
+                && state_partition_rng_token_identifier_is(&trees[anchor - 2], "extern")
+            {
+                anchor -= 2;
+            } else {
+                return anchor;
+            }
         }
-        count
     }
 
-    fn state_partition_rng_cfg_test_impl_method_bodies(
+    fn state_partition_rng_top_level_function_bodies(
         stream: &TokenStream,
-        method: &str,
-    ) -> Vec<Group> {
+        name: &str,
+    ) -> Vec<StatePartitionRngScopedBody> {
         let trees = stream.clone().into_iter().collect::<Vec<_>>();
         let mut bodies = Vec::new();
-        for index in 2..trees.len() {
-            if !state_partition_rng_token_identifier_is(&trees[index], "impl")
-                || !source_token_is_punct(&trees[index - 2], '#')
-                || !state_partition_rng_attribute_is_exact_cfg_test(&trees[index - 1])
+        for index in 0..trees.len().saturating_sub(1) {
+            if !state_partition_rng_token_identifier_is(&trees[index], "fn")
+                || !state_partition_rng_token_identifier_is(&trees[index + 1], name)
             {
                 continue;
             }
-            let Some(TokenTree::Group(implementation)) = trees
+            let Some(TokenTree::Group(body)) = trees
                 .iter()
-                .skip(index.saturating_add(1))
+                .skip(index.saturating_add(2))
                 .find(|tree| {
                     matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)
                 })
             else {
                 continue;
             };
-            bodies.extend(state_partition_rng_named_function_bodies(
-                &implementation.stream(),
-                method,
-            ));
+            let attribute_anchor =
+                state_partition_rng_function_attribute_anchor(&trees, index);
+            bodies.push(StatePartitionRngScopedBody {
+                body: body.clone(),
+                conditions: source_item_attributes(&trees, attribute_anchor).conditions,
+            });
         }
         bodies
+    }
+
+    fn state_partition_rng_inherent_method_bodies(
+        stream: &TokenStream,
+        owner: &str,
+        method: &str,
+    ) -> Vec<StatePartitionRngScopedBody> {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        let mut bodies = Vec::new();
+        for index in 0..trees.len().saturating_sub(2) {
+            if !state_partition_rng_token_identifier_is(&trees[index], "impl")
+                || !state_partition_rng_token_identifier_is(&trees[index + 1], owner)
+            {
+                continue;
+            }
+            let Some(TokenTree::Group(implementation)) = trees.get(index + 2)
+            else {
+                continue;
+            };
+            if implementation.delimiter() != Delimiter::Brace {
+                continue;
+            }
+            let implementation_conditions = source_item_attributes(&trees, index).conditions;
+            for mut scoped in state_partition_rng_top_level_function_bodies(
+                &implementation.stream(),
+                method,
+            ) {
+                let mut conditions = implementation_conditions.clone();
+                conditions.append(&mut scoped.conditions);
+                scoped.conditions = conditions;
+                bodies.push(scoped);
+            }
+        }
+        bodies
+    }
+
+    fn state_partition_rng_exact_inherent_method_bodies(
+        stream: &TokenStream,
+        expected_header: &str,
+        method: &str,
+    ) -> Vec<StatePartitionRngScopedBody> {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        let expected_header = TokenStream::from_str(expected_header)
+            .expect("fixed shipped-consumer impl header tokenizes")
+            .into_iter()
+            .collect::<Vec<_>>();
+        let expected_header_fingerprint = token_trees_fingerprint(&expected_header);
+        let mut bodies = Vec::new();
+        for index in 0..trees.len() {
+            if !state_partition_rng_token_identifier_is(&trees[index], "impl") {
+                continue;
+            }
+            let Some((body_index, TokenTree::Group(implementation))) = trees
+                .iter()
+                .enumerate()
+                .skip(index.saturating_add(1))
+                .find(|(_, tree)| {
+                    matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)
+                })
+            else {
+                continue;
+            };
+            let header = trees[index.saturating_add(1)..body_index]
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if token_trees_fingerprint(&header) != expected_header_fingerprint {
+                continue;
+            }
+            let implementation_conditions = source_item_attributes(&trees, index).conditions;
+            for mut scoped in state_partition_rng_top_level_function_bodies(
+                &implementation.stream(),
+                method,
+            ) {
+                let mut conditions = implementation_conditions.clone();
+                conditions.append(&mut scoped.conditions);
+                scoped.conditions = conditions;
+                bodies.push(scoped);
+            }
+        }
+        bodies
+    }
+
+    fn state_partition_rng_gating_attribute_fingerprints(
+        stream: &TokenStream,
+    ) -> Vec<String> {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        let mut fingerprints = Vec::new();
+        let mut index = 0usize;
+        while index < trees.len() {
+            if source_token_is_punct(&trees[index], '#')
+                && trees
+                    .get(index + 1)
+                    .is_some_and(source_attribute_gates_item)
+            {
+                fingerprints.push(token_trees_fingerprint(std::slice::from_ref(
+                    &trees[index + 1],
+                )));
+                index = index.saturating_add(2);
+                continue;
+            }
+            if let TokenTree::Group(group) = &trees[index] {
+                fingerprints.extend(state_partition_rng_gating_attribute_fingerprints(
+                    &group.stream(),
+                ));
+            }
+            index = index.saturating_add(1);
+        }
+        fingerprints
+    }
+
+    fn state_partition_rng_fixed_attribute_fingerprint(source: &str) -> String {
+        let trees = TokenStream::from_str(source)
+            .expect("fixed shipped-consumer cfg attribute tokenizes")
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(trees.len() == 2 && source_token_is_punct(&trees[0], '#'));
+        token_trees_fingerprint(&trees[1..])
+    }
+
+    fn state_partition_rng_gated_block_bodies(
+        stream: &TokenStream,
+        condition: &str,
+    ) -> Vec<Group> {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        trees
+            .windows(3)
+            .filter_map(|window| {
+                let TokenTree::Group(body) = &window[2] else {
+                    return None;
+                };
+                (source_token_is_punct(&window[0], '#')
+                    && token_trees_fingerprint(std::slice::from_ref(&window[1])) == condition
+                    && body.delimiter() == Delimiter::Brace)
+                    .then(|| body.clone())
+            })
+            .collect()
+    }
+
+    fn state_partition_rng_production_import_is_exact(
+        stream: &TokenStream,
+        member: &str,
+        expected_conditions: &[String],
+    ) -> bool {
+        let inventory = public_core_route_inventory(stream);
+        let Some(bindings) = public_core_route_graph_bindings(&inventory) else {
+            return false;
+        };
+        let mut protected_count = 0usize;
+        let mut alias_count = 0usize;
+        let mut exact_binding = false;
+        for route in &inventory.routes {
+            let Some(leaves) = core_use_route_leaves(route) else {
+                return false;
+            };
+            for leaf in leaves {
+                if leaf.path.iter().map(String::as_str).eq(["fastmcp_core", member]) {
+                    protected_count = protected_count.saturating_add(1);
+                    alias_count = alias_count.saturating_add(usize::from(leaf.alias.is_some()));
+                    exact_binding = route.scope.is_empty()
+                        && !route.public
+                        && route.conditions.as_slice() == expected_conditions
+                        && !leaf.absolute
+                        && !leaf.glob
+                        && !leaf.grouped_self
+                        && leaf.alias.is_none();
+                }
+            }
+        }
+        let binding_key = (Vec::new(), member.to_owned());
+        protected_count == 1
+            && alias_count == 0
+            && exact_binding
+            && state_partition_rng_core_namespace_is_unshadowed(stream)
+            && bindings.get(&binding_key).is_some_and(|candidates| candidates.len() == 1)
+            && public_core_child_modules(&inventory, &[], member).is_empty()
+            && !inventory
+                .native_items
+                .iter()
+                .any(|item| item.scope.is_empty() && item.name == member)
+            && !inventory
+                .extern_crate_routes
+                .iter()
+                .any(|route| route.scope.is_empty() && route.alias == member)
+    }
+
+    fn state_partition_rng_core_namespace_is_unshadowed(stream: &TokenStream) -> bool {
+        let inventory = public_core_route_inventory(stream);
+        let Some(bindings) = public_core_route_graph_bindings(&inventory) else {
+            return false;
+        };
+        let binding_key = (Vec::new(), "fastmcp_core".to_owned());
+        !bindings.contains_key(&binding_key)
+            && public_core_child_modules(&inventory, &[], "fastmcp_core").is_empty()
+            && !inventory
+                .native_items
+                .iter()
+                .any(|item| item.scope.is_empty() && item.name == "fastmcp_core")
+            && !inventory
+                .extern_crate_routes
+                .iter()
+                .any(|route| route.scope.is_empty() && route.alias == "fastmcp_core")
+    }
+
+    fn state_partition_rng_unqualified_draw_is_unshadowed(
+        stream: &TokenStream,
+        api: &str,
+    ) -> bool {
+        let inventory = public_core_route_inventory(stream);
+        let Some(bindings) = public_core_route_graph_bindings(&inventory) else {
+            return false;
+        };
+        let binding_key = (Vec::new(), api.to_owned());
+        if bindings.contains_key(&binding_key)
+            || !public_core_child_modules(&inventory, &[], api).is_empty()
+            || inventory
+                .native_items
+                .iter()
+                .any(|item| item.scope.is_empty() && item.name == api)
+            || inventory
+                .extern_crate_routes
+                .iter()
+                .any(|route| route.scope.is_empty() && route.alias == api)
+        {
+            return false;
+        }
+        stream.clone().into_iter().all(|tree| {
+            let TokenTree::Group(group) = tree else {
+                return true;
+            };
+            state_partition_rng_sealed_api_reference_count(&group.stream(), api) == 0
+                || state_partition_rng_unqualified_draw_is_unshadowed(&group.stream(), api)
+        })
     }
 
     fn state_partition_rng_input_digest_excluding_paths(
@@ -89510,22 +89720,47 @@ original = "value"
         }
 
         let oauth_generate_token =
-            state_partition_rng_named_function_bodies(&oauth.tokens, "generate_token");
+            state_partition_rng_top_level_function_bodies(&oauth.tokens, "generate_token");
         let http_generate_session_id =
-            state_partition_rng_named_function_bodies(&http.tokens, "generate_session_id");
-        let cli_create_retained_temp = state_partition_rng_named_function_bodies(
+            state_partition_rng_top_level_function_bodies(&http.tokens, "generate_session_id");
+        let cli_create_retained_temp = state_partition_rng_top_level_function_bodies(
             &cli.tokens,
             "create_retained_same_directory_temp",
         );
-        let bidirectional_allocate_request_state = impl_method_suffixes(
+        let bidirectional_allocate_request_state = state_partition_rng_inherent_method_bodies(
             &bidirectional.tokens,
             "MrtrExchangeRegistry",
             "allocate_request_state",
         );
-        let tasks_generate_final_task_id =
-            state_partition_rng_named_function_bodies(&tasks.tokens, "generate_final_task_id");
-        let websocket_test_generate_mask =
-            state_partition_rng_cfg_test_impl_method_bodies(&websocket.tokens, "generate_mask");
+        let tasks_generate_final_task_id = state_partition_rng_top_level_function_bodies(
+            &tasks.tokens,
+            "generate_final_task_id",
+        );
+        let websocket_test_generate_mask = state_partition_rng_exact_inherent_method_bodies(
+            &websocket.tokens,
+            "<W: Write> WsClientWriter<W>",
+            "generate_mask",
+        );
+        let cfg_test = state_partition_rng_fixed_attribute_fingerprint("#[cfg(test)]");
+        let cfg_target_linux =
+            state_partition_rng_fixed_attribute_fingerprint("#[cfg(target_os = \"linux\")]");
+        let cfg_not_target_linux = state_partition_rng_fixed_attribute_fingerprint(
+            "#[cfg(not(target_os = \"linux\"))]",
+        );
+        let expected_cli_body_conditions =
+            [cfg_target_linux.clone(), cfg_not_target_linux.clone()];
+        let cli_linux_bodies = cli_create_retained_temp.first().map_or_else(Vec::new, |scoped| {
+            state_partition_rng_gated_block_bodies(&scoped.body.stream(), &cfg_target_linux)
+        });
+        let cli_non_linux_bodies =
+            cli_create_retained_temp
+                .first()
+                .map_or_else(Vec::new, |scoped| {
+                    state_partition_rng_gated_block_bodies(
+                        &scoped.body.stream(),
+                        &cfg_not_target_linux,
+                    )
+                });
         if count_sibling_token_sequence(
             &core_lib.tokens,
             &[
@@ -89549,59 +89784,114 @@ original = "value"
                 "fastmcp_core",
                 "draw_security_identifier",
             ) != 2
-            || state_partition_rng_use_member_count(
+            || !state_partition_rng_production_import_is_exact(
                 &oauth.tokens,
-                false,
-                "fastmcp_core",
                 "draw_security_identifier",
-            ) != 1
+                &[],
+            )
             || oauth_generate_token.len() != 1
+            || !oauth_generate_token[0].conditions.is_empty()
+            || !state_partition_rng_gating_attribute_fingerprints(
+                &oauth_generate_token[0].body.stream(),
+            )
+            .is_empty()
             || state_partition_rng_sealed_api_reference_count(
-                &oauth_generate_token[0].stream(),
+                &oauth_generate_token[0].body.stream(),
                 "draw_security_identifier",
             ) != 1
             || state_partition_rng_call_with_ident_count(
-                &oauth_generate_token[0].stream(),
+                &oauth_generate_token[0].body.stream(),
                 "generate_token_with_draw",
                 "draw_security_identifier",
             ) != 1
-            || state_partition_rng_use_member_count(
-                &http.tokens,
-                false,
-                "fastmcp_core",
+            || !state_partition_rng_unqualified_draw_is_unshadowed(
+                &oauth_generate_token[0].body.stream(),
                 "draw_security_identifier",
-            ) != 1
+            )
+            || !state_partition_rng_production_import_is_exact(
+                &http.tokens,
+                "draw_security_identifier",
+                &[],
+            )
             || http_generate_session_id.len() != 1
+            || !http_generate_session_id[0].conditions.is_empty()
+            || !state_partition_rng_gating_attribute_fingerprints(
+                &http_generate_session_id[0].body.stream(),
+            )
+            .is_empty()
             || !state_partition_rng_body_has_exact_unqualified_draw(
-                &http_generate_session_id[0],
+                &http_generate_session_id[0].body,
+                "draw_security_identifier",
+            )
+            || !state_partition_rng_unqualified_draw_is_unshadowed(
+                &http_generate_session_id[0].body.stream(),
                 "draw_security_identifier",
             )
             || cli_create_retained_temp.len() != 1
+            || !cli_create_retained_temp[0].conditions.is_empty()
+            || state_partition_rng_gating_attribute_fingerprints(
+                &cli_create_retained_temp[0].body.stream(),
+            )
+                .as_slice()
+                != expected_cli_body_conditions.as_slice()
+            || cli_linux_bodies.len() != 1
             || !state_partition_rng_body_has_exact_qualified_draw(
-                &cli_create_retained_temp[0],
+                &cli_linux_bodies[0],
                 "fastmcp_core",
                 "draw_security_identifier",
             )
-            || state_partition_rng_use_member_count(
+            || cli_non_linux_bodies.len() != 1
+            || state_partition_rng_sealed_api_reference_count(
+                &cli_non_linux_bodies[0].stream(),
+                "draw_security_identifier",
+            ) != 0
+            || !state_partition_rng_body_has_exact_qualified_draw(
+                &cli_create_retained_temp[0].body,
+                "fastmcp_core",
+                "draw_security_identifier",
+            )
+            || !state_partition_rng_core_namespace_is_unshadowed(&cli.tokens)
+            || !state_partition_rng_core_namespace_is_unshadowed(
+                &cli_create_retained_temp[0].body.stream(),
+            )
+            || !state_partition_rng_production_import_is_exact(
                 &bidirectional.tokens,
-                false,
-                "fastmcp_core",
                 "draw_security_identifier",
-            ) != 1
+                &[],
+            )
             || bidirectional_allocate_request_state.len() != 1
+            || !bidirectional_allocate_request_state[0]
+                .conditions
+                .is_empty()
+            || !state_partition_rng_gating_attribute_fingerprints(
+                &bidirectional_allocate_request_state[0].body.stream(),
+            )
+            .is_empty()
             || !state_partition_rng_body_has_exact_unqualified_draw(
-                &bidirectional_allocate_request_state[0].1,
+                &bidirectional_allocate_request_state[0].body,
                 "draw_security_identifier",
             )
-            || state_partition_rng_use_member_count(
-                &tasks.tokens,
-                false,
-                "fastmcp_core",
+            || !state_partition_rng_unqualified_draw_is_unshadowed(
+                &bidirectional_allocate_request_state[0].body.stream(),
                 "draw_security_identifier",
-            ) != 1
+            )
+            || !state_partition_rng_production_import_is_exact(
+                &tasks.tokens,
+                "draw_security_identifier",
+                &[],
+            )
             || tasks_generate_final_task_id.len() != 1
+            || !tasks_generate_final_task_id[0].conditions.is_empty()
+            || !state_partition_rng_gating_attribute_fingerprints(
+                &tasks_generate_final_task_id[0].body.stream(),
+            )
+            .is_empty()
             || !state_partition_rng_body_has_exact_unqualified_draw(
-                &tasks_generate_final_task_id[0],
+                &tasks_generate_final_task_id[0].body,
+                "draw_security_identifier",
+            )
+            || !state_partition_rng_unqualified_draw_is_unshadowed(
+                &tasks_generate_final_task_id[0].body.stream(),
                 "draw_security_identifier",
             )
             // The legacy WebSocket writer and its sealed draw are test-only;
@@ -89610,14 +89900,24 @@ original = "value"
                 &websocket.tokens,
                 "draw_websocket_mask",
             ) != 2
-            || state_partition_rng_cfg_test_use_member_count(
+            || !state_partition_rng_production_import_is_exact(
                 &websocket.tokens,
-                "fastmcp_core",
                 "draw_websocket_mask",
-            ) != 1
+                std::slice::from_ref(&cfg_test),
+            )
             || websocket_test_generate_mask.len() != 1
+            || websocket_test_generate_mask[0].conditions.as_slice()
+                != std::slice::from_ref(&cfg_test)
+            || !state_partition_rng_gating_attribute_fingerprints(
+                &websocket_test_generate_mask[0].body.stream(),
+            )
+            .is_empty()
             || !state_partition_rng_body_has_exact_unqualified_draw(
-                &websocket_test_generate_mask[0],
+                &websocket_test_generate_mask[0].body,
+                "draw_websocket_mask",
+            )
+            || !state_partition_rng_unqualified_draw_is_unshadowed(
+                &websocket_test_generate_mask[0].body.stream(),
                 "draw_websocket_mask",
             )
         {
@@ -90034,6 +90334,18 @@ original = "value"
             "{ let fnd01_draw = draw_security_identifier; generate_token_with_draw(fnd01_draw) }",
         );
         assert_consumer_topology_rejected(
+            "oauth-production-draw-test-only",
+            "crates/fastmcp-server/src/oauth.rs",
+            "generate_token_with_draw(draw_security_identifier)",
+            "#[cfg(test)]\n    {\n        generate_token_with_draw(draw_security_identifier)\n    }\n    #[cfg(not(test))]\n    {\n        Err(OAuthError::ServerError(\n            \"fnd01 non-RNG fallback\".to_owned(),\n        ))\n    }",
+        );
+        assert_consumer_topology_rejected(
+            "oauth-additive-aliased-import",
+            "crates/fastmcp-server/src/oauth.rs",
+            "/// Draws token material through the core security-identifier API.",
+            "use fastmcp_core::draw_security_identifier as fnd01_draw_alias;\n\n/// Draws token material through the core security-identifier API.",
+        );
+        assert_consumer_topology_rejected(
             "http-production-draw-alias",
             "crates/fastmcp-transport/src/http.rs",
             "draw_security_identifier().map_err(|_| HttpSessionError::RandomnessUnavailable)?",
@@ -90044,6 +90356,12 @@ original = "value"
             "crates/fastmcp-cli/src/main.rs",
             "fastmcp_core::draw_security_identifier().map_err(|_| {",
             "{ let fnd01_draw = fastmcp_core::draw_security_identifier; fnd01_draw() }.map_err(|_| {",
+        );
+        assert_consumer_topology_rejected(
+            "cli-local-core-shadow",
+            "crates/fastmcp-cli/src/main.rs",
+            "fn create_retained_same_directory_temp(\n    parent: &SecuredParentDirectory,\n    final_snapshot: Option<&ExistingFileSnapshot>,\n    destination: &Path,\n    context: &str,\n    purpose: &str,\n) -> McpResult<RetainedStage> {\n    #[cfg(target_os = \"linux\")]",
+            "fn create_retained_same_directory_temp(\n    parent: &SecuredParentDirectory,\n    final_snapshot: Option<&ExistingFileSnapshot>,\n    destination: &Path,\n    context: &str,\n    purpose: &str,\n) -> McpResult<RetainedStage> {\n    use crate as fastmcp_core;\n\n    #[cfg(target_os = \"linux\")]",
         );
         assert_consumer_topology_rejected(
             "bidirectional-production-draw-alias",
@@ -90062,6 +90380,12 @@ original = "value"
             "crates/fastmcp-transport/src/websocket.rs",
             "#[cfg(test)]\nimpl<W: Write> WsClientWriter<W> {",
             "impl<W: Write> WsClientWriter<W> {",
+        );
+        assert_consumer_topology_rejected(
+            "websocket-fixture-owner-movement",
+            "crates/fastmcp-transport/src/websocket.rs",
+            "#[cfg(test)]\nimpl<W: Write> WsClientWriter<W> {",
+            "#[cfg(test)]\nimpl<W: Write> Fnd01WsClientWriter<W> {",
         );
 
         let from_map = state_partition_rng_method_body(baseline_state, "from_map")
