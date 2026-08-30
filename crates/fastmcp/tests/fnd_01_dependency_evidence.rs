@@ -50417,7 +50417,7 @@ activate = 1\n";
                 source_ident_semantic_name(actual) == expected
             }
             (TokenTree::Ident(actual), SourceTokenAtom::Keyword(expected)) => {
-                actual.to_string() == expected
+                actual == expected
             }
             (TokenTree::Punct(actual), SourceTokenAtom::Punct(expected)) => {
                 actual.as_char() == expected
@@ -51570,17 +51570,15 @@ activate = 1\n";
                     return false;
                 }
                 private_alias_routes = private_alias_routes.saturating_add(1);
-            } else {
-                if suffix.len() < 3
-                    || !source_token_is_punct(&suffix[0], ':')
-                    || !source_token_is_punct(&suffix[1], ':')
-                    || suffix[2..].iter().any(|tree| {
-                        token_tree_ident_count(tree, "self") != 0
-                            || source_token_tree_contains_punct(tree, '*')
-                    })
-                {
-                    return false;
-                }
+            } else if suffix.len() < 3
+                || !source_token_is_punct(&suffix[0], ':')
+                || !source_token_is_punct(&suffix[1], ':')
+                || suffix[2..].iter().any(|tree| {
+                    token_tree_ident_count(tree, "self") != 0
+                        || source_token_tree_contains_punct(tree, '*')
+                })
+            {
+                return false;
             }
             if exact_members != 0 {
                 if route.conditional {
