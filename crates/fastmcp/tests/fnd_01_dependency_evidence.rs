@@ -88579,6 +88579,9 @@ original = "value"
                 .native_items
                 .iter()
                 .any(|item| item.scope.is_empty() && item.name == member)
+            && !inventory.extern_crate_routes.iter().any(|route| {
+                route.scope.is_empty() && route.crate_name == "fastmcp_core"
+            })
             && !inventory
                 .extern_crate_routes
                 .iter()
@@ -90509,7 +90512,7 @@ original = "value"
             "oauth-two-hop-core-member-alias",
             "crates/fastmcp-server/src/oauth.rs",
             "/// Draws token material through the core security-identifier API.",
-            "#[allow(unused_imports)]\nuse fastmcp_core as fnd01_core;\n#[allow(unused_imports)]\nuse fnd01_core::draw_security_identifier as fnd01_extra;\n\n/// Draws token material through the core security-identifier API.",
+            "#[allow(unused_extern_crates)]\nextern crate fastmcp_core as fnd01_core;\n#[allow(unused_imports)]\nuse fnd01_core::draw_security_identifier as fnd01_extra;\n\n/// Draws token material through the core security-identifier API.",
         );
         assert_consumer_topology_rejected(
             "oauth-inline-module-core-glob",
