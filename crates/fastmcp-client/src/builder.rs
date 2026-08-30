@@ -1723,8 +1723,7 @@ mod tests {
     #[cfg(unix)]
     impl StdioRetryAttemptLog {
         fn new(label: &str) -> Self {
-            static NEXT_LOG_ID: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static NEXT_LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
             let log_id = NEXT_LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
@@ -1808,7 +1807,7 @@ mod tests {
         let result = block_on(
             ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
-                .auto_initialize(true)
+                .auto_initialize(false)
                 .connection_retry_policy(2, RETRY_DELAY, Duration::from_secs(5))
                 .expect("two-attempt public retry policy must be valid")
                 .connect_stdio_with_cx(
