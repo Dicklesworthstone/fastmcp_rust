@@ -78693,8 +78693,8 @@ activate = 1\n";
     }
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_041, "4d6c6c07984fc12aa662cdba99428ec9013ac72e4ba962bf912c5ef84decea97"),
-        ("Cargo.lock", 97_891, "de75ff76455a777e5bfa0e79e5d847766737f9769b392ed0ceb84aa1013e4a2a"),
+        ("Cargo.toml", 7_041, "e44968200598eda386dc9f6be0dfd7fdba5db144076864addaacb6b7345c116a"),
+        ("Cargo.lock", 97_891, "7794b447e6d1e6f17da06c2e95777778c5720629dcfebaa021bd10b921e5a5e9"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
@@ -86846,6 +86846,75 @@ original = "value"
         state_partition_rng_input_digest_excluding(inventory, "crates/fastmcp-core/src/state.rs")
     }
 
+    fn state_partition_rng_direct_public_use_member_count(
+        stream: &TokenStream,
+        crate_name: &str,
+        member: &str,
+    ) -> usize {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        let grouped = trees
+            .windows(6)
+            .filter_map(|window| {
+                let TokenTree::Group(group) = &window[5] else {
+                    return None;
+                };
+                (state_partition_rng_token_identifier_is(&window[0], "pub")
+                    && state_partition_rng_token_identifier_is(&window[1], "use")
+                    && state_partition_rng_token_identifier_is(&window[2], crate_name)
+                    && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && group.delimiter() == Delimiter::Brace)
+                    .then_some(group)
+            })
+            .map(|group| {
+                let members = group.stream().into_iter().collect::<Vec<_>>();
+                members
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, tree)| {
+                        state_partition_rng_token_identifier_is(tree, member)
+                            && !members.get(index + 1).is_some_and(|tree| {
+                                state_partition_rng_token_identifier_is(tree, "as")
+                            })
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        let direct = trees
+            .windows(7)
+            .filter(|window| {
+                state_partition_rng_token_identifier_is(&window[0], "pub")
+                    && state_partition_rng_token_identifier_is(&window[1], "use")
+                    && state_partition_rng_token_identifier_is(&window[2], crate_name)
+                    && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':')
+                    && state_partition_rng_token_identifier_is(&window[5], member)
+                    && matches!(&window[6], TokenTree::Punct(punct) if punct.as_char() == ';')
+            })
+            .count();
+        grouped + direct
+    }
+
+    fn state_partition_rng_direct_public_module_bodies(
+        stream: &TokenStream,
+        module: &str,
+    ) -> Vec<Group> {
+        let trees = stream.clone().into_iter().collect::<Vec<_>>();
+        trees
+            .windows(4)
+            .filter_map(|window| {
+                let TokenTree::Group(body) = &window[3] else {
+                    return None;
+                };
+                (state_partition_rng_token_identifier_is(&window[0], "pub")
+                    && state_partition_rng_token_identifier_is(&window[1], "mod")
+                    && state_partition_rng_token_identifier_is(&window[2], module)
+                    && body.delimiter() == Delimiter::Brace)
+                    .then(|| body.clone())
+            })
+            .collect()
+    }
+
     fn state_partition_rng_use_member_count(
         stream: &TokenStream,
         public: bool,
@@ -87845,13 +87914,41 @@ original = "value"
                 )
                 .at("crates/fastmcp-core/src/lib.rs"));
             }
-            if state_partition_rng_sealed_api_reference_count(&facade_lib.tokens, api) != 1
-                || state_partition_rng_use_member_count(
-                    &facade_lib.tokens,
-                    true,
-                    "fastmcp_core",
-                    api,
-                ) != 1
+        }
+        let facade_core_modules =
+            state_partition_rng_direct_public_module_bodies(&facade_lib.tokens, "core");
+        if facade_core_modules.len() != 1 {
+            return Err(Diagnostic::error(
+                "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
+                "state-partition-rng",
+            )
+            .at("crates/fastmcp/src/lib.rs"));
+        }
+        let facade_core = &facade_core_modules[0];
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            let root_routes = state_partition_rng_direct_public_use_member_count(
+                &facade_lib.tokens,
+                "fastmcp_core",
+                api,
+            );
+            let curated_core_routes = state_partition_rng_direct_public_use_member_count(
+                &facade_core.stream(),
+                "fastmcp_core",
+                api,
+            );
+            let accounted_references = root_routes
+                .checked_add(curated_core_routes)
+                .ok_or_else(|| {
+                    Diagnostic::error(
+                        "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
+                        "state-partition-rng",
+                    )
+                    .at("crates/fastmcp/src/lib.rs")
+                })?;
+            if root_routes != 1
+                || curated_core_routes != 1
+                || state_partition_rng_sealed_api_reference_count(&facade_lib.tokens, api)
+                    != accounted_references
                 || state_partition_rng_public_reexport_alias_count(
                     &facade_lib.tokens,
                     "fastmcp_core",
@@ -88112,6 +88209,10 @@ original = "value"
             state_partition_rng_source(&baseline, "crates/fastmcp-core/src/state.rs")
                 .expect("baseline state source is present");
         let baseline_state_digest: [u8; 32] = Sha256::digest(baseline_state.text.as_bytes()).into();
+        let baseline_facade = state_partition_rng_source(&baseline, "crates/fastmcp/src/lib.rs")
+            .expect("baseline facade source is present");
+        let baseline_facade_digest: [u8; 32] =
+            Sha256::digest(baseline_facade.text.as_bytes()).into();
         let baseline_other_input_digest = state_partition_rng_other_input_digest(&baseline);
         let assert_fresh_baseline = || {
             let fresh = state_partition_rng_inventory()
@@ -88124,6 +88225,12 @@ original = "value"
             assert_eq!(fresh_state.text, baseline_state.text);
             let fresh_state_digest: [u8; 32] = Sha256::digest(fresh_state.text.as_bytes()).into();
             assert_eq!(fresh_state_digest, baseline_state_digest);
+            let fresh_facade = state_partition_rng_source(&fresh, "crates/fastmcp/src/lib.rs")
+                .expect("fresh facade source is present");
+            assert_eq!(fresh_facade.text, baseline_facade.text);
+            let fresh_facade_digest: [u8; 32] =
+                Sha256::digest(fresh_facade.text.as_bytes()).into();
+            assert_eq!(fresh_facade_digest, baseline_facade_digest);
             assert_eq!(
                 state_partition_rng_other_input_digest(&fresh),
                 baseline_other_input_digest,
@@ -88404,6 +88511,93 @@ original = "value"
 
         let crypto_path = "crates/fastmcp-core/src/crypto.rs";
         let facade_path = "crates/fastmcp/src/lib.rs";
+        let facade_route_non_target_digest =
+            state_partition_rng_input_digest_excluding(&baseline, facade_path);
+        let facade_core_modules =
+            state_partition_rng_direct_public_module_bodies(&baseline_facade.tokens, "core");
+        assert_eq!(
+            facade_core_modules.len(),
+            1,
+            "baseline facade has exactly one curated public core module"
+        );
+        let facade_core = &facade_core_modules[0];
+        let facade_core_start = state_partition_rng_byte_offset(
+            &baseline_facade.text,
+            facade_core.span_open().start().line,
+            facade_core.span_open().start().column,
+        )
+        .expect("curated core opening brace has a byte position")
+            + 1;
+        let facade_core_end = state_partition_rng_byte_offset(
+            &baseline_facade.text,
+            facade_core.span_close().start().line,
+            facade_core.span_close().start().column,
+        )
+        .expect("curated core closing brace has a byte position");
+        let facade_core_text = &baseline_facade.text[facade_core_start..facade_core_end];
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            let route = format!("{api},");
+            let route_offsets = facade_core_text
+                .match_indices(&route)
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                route_offsets.len(),
+                1,
+                "{api} has exactly one curated core route to remove"
+            );
+
+            let mut missing_core_route = baseline.clone();
+            let missing_core_route_facade = missing_core_route
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for curated core route removal");
+            let route_start = facade_core_start + route_offsets[0];
+            missing_core_route_facade
+                .text
+                .replace_range(route_start..route_start + route.len(), "");
+            missing_core_route_facade.tokens =
+                TokenStream::from_str(&missing_core_route_facade.text)
+                    .expect("the missing curated core route plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&missing_core_route, facade_path),
+                facade_route_non_target_digest,
+                "{api} missing-route plant must not alter any non-facade input"
+            );
+            let missing_route_error = validate_state_partition_rng_seam(&missing_core_route)
+                .expect_err("removing only the curated core route must fail closed");
+            assert_eq!(
+                missing_route_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{api} missing curated core route"
+            );
+            assert_fresh_baseline();
+
+            let mut extra_core_route = baseline.clone();
+            let extra_core_route_facade = extra_core_route
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for extra curated core route planting");
+            extra_core_route_facade.text.insert_str(
+                facade_core_start,
+                &format!(" pub use fastmcp_core::{api} as fnd01_extra_core_route;"),
+            );
+            extra_core_route_facade.tokens = TokenStream::from_str(&extra_core_route_facade.text)
+                .expect("the extra aliased curated core route plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&extra_core_route, facade_path),
+                facade_route_non_target_digest,
+                "{api} extra-route plant must not alter any non-facade input"
+            );
+            let extra_route_error = validate_state_partition_rng_seam(&extra_core_route)
+                .expect_err("adding only an aliased curated core route must fail closed");
+            assert_eq!(
+                extra_route_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{api} extra aliased curated core route"
+            );
+            assert_fresh_baseline();
+        }
         let core_wrapper_non_target_digest =
             state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, state_path]);
         let facade_wrapper_non_target_digest = state_partition_rng_input_digest_excluding_paths(
