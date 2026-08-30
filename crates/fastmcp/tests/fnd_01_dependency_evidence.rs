@@ -50493,6 +50493,7 @@ activate = 1\n";
         path: Vec<String>,
         alias: Option<String>,
         glob: bool,
+        grouped_self: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50784,7 +50785,8 @@ activate = 1\n";
         glob: bool,
         leaves: &mut Vec<CoreUseLeaf>,
     ) -> bool {
-        if path.last().is_some_and(|segment| segment == "self") {
+        let grouped_self = path.last().is_some_and(|segment| segment == "self");
+        if grouped_self {
             path.pop();
         }
         if path.is_empty() || (glob && alias.is_some()) {
@@ -50795,6 +50797,7 @@ activate = 1\n";
             path,
             alias,
             glob,
+            grouped_self,
         });
         true
     }
@@ -51142,7 +51145,16 @@ activate = 1\n";
                 )?
             } else {
                 let binding_key = (base_scope.clone(), head.clone());
-                let has_local_candidate = bindings.contains_key(&binding_key)
+                let resolving_current_grouped_self = leaf.grouped_self
+                    && traversal
+                        .visiting_bindings
+                        .last()
+                        .is_some_and(|key| key == &binding_key);
+                let competing_use_candidates = bindings
+                    .get(&binding_key)
+                    .map_or(0, Vec::len)
+                    .saturating_sub(usize::from(resolving_current_grouped_self));
+                let has_local_candidate = competing_use_candidates != 0
                     || !public_core_child_modules(inventory, &base_scope, head).is_empty()
                     || inventory
                         .extern_crate_routes
@@ -51181,6 +51193,11 @@ activate = 1\n";
                         return Err(());
                     }
                     inherited
+                } else if resolving_current_grouped_self {
+                    if has_local_candidate {
+                        return Err(());
+                    }
+                    CoreRouteResolution::Other
                 } else {
                     public_core_graph_resolve_binding(
                         inventory,
@@ -89330,6 +89347,37 @@ original = "value"
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         validate_state_partition_rng_seam(&inventory)
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+
+        let facade_path = "crates/fastmcp/src/lib.rs";
+        let baseline_facade = state_partition_rng_source(&inventory, facade_path)
+            .expect("baseline facade source is present for grouped-self control");
+        let baseline_facade_digest: [u8; 32] =
+            Sha256::digest(baseline_facade.text.as_bytes()).into();
+        let non_facade_digest =
+            state_partition_rng_input_digest_excluding(&inventory, facade_path);
+        let harmless_grouped_self_route =
+            "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n";
+        let mut harmless_grouped_self = inventory.clone();
+        let harmless_facade = harmless_grouped_self
+            .rust_sources
+            .get_mut(facade_path)
+            .expect("facade source is present for harmless grouped-self planting");
+        harmless_facade.text.push_str(harmless_grouped_self_route);
+        harmless_facade.tokens = TokenStream::from_str(&harmless_facade.text)
+            .expect("the harmless grouped-self route remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding(&harmless_grouped_self, facade_path),
+            non_facade_digest,
+            "the harmless grouped-self route must not alter a non-facade input"
+        );
+        validate_state_partition_rng_seam(&harmless_grouped_self)
+            .expect("an unrelated unqualified grouped-self route must remain accepted");
+        let accepted_facade_digest: [u8; 32] =
+            Sha256::digest(baseline_facade.text.as_bytes()).into();
+        assert_eq!(
+            accepted_facade_digest, baseline_facade_digest,
+            "the harmless grouped-self plant must not mutate the accepted facade"
+        );
         assert_state_partition_rng_public_behavior();
     }
 
@@ -89372,6 +89420,43 @@ original = "value"
                 "fresh inventory must retain the baseline non-state domain"
             );
         };
+
+        let harmless_grouped_self_route =
+            "\npub mod fnd01_grouped_self_route { pub use serde_json::{self}; }\n";
+        let sealed_grouped_self_route =
+            harmless_grouped_self_route.replacen("serde_json", "fastmcp_core", 1);
+        assert_eq!(
+            sealed_grouped_self_route.replacen("fastmcp_core", "serde_json", 1),
+            harmless_grouped_self_route,
+            "the grouped-self negative must differ only in the forbidden crate route"
+        );
+        let mut grouped_self_planted = baseline.clone();
+        let grouped_self_facade = grouped_self_planted
+            .rust_sources
+            .get_mut("crates/fastmcp/src/lib.rs")
+            .expect("facade source is present for sealed grouped-self planting");
+        grouped_self_facade.text.push_str(&sealed_grouped_self_route);
+        grouped_self_facade.tokens = TokenStream::from_str(&grouped_self_facade.text)
+            .expect("the sealed grouped-self route remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding(
+                &grouped_self_planted,
+                "crates/fastmcp/src/lib.rs",
+            ),
+            state_partition_rng_input_digest_excluding(
+                &baseline,
+                "crates/fastmcp/src/lib.rs",
+            ),
+            "the sealed grouped-self plant must not alter a non-facade input"
+        );
+        let grouped_self_error = validate_state_partition_rng_seam(&grouped_self_planted)
+            .expect_err("one sealed unqualified grouped-self route must fail closed");
+        assert_eq!(
+            grouped_self_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
+        );
+        assert_fresh_baseline();
+
         let from_map = state_partition_rng_method_body(baseline_state, "from_map")
             .expect("baseline state source has exactly one from_map method");
         let insertion = state_partition_rng_byte_offset(
