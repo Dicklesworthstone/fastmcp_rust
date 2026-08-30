@@ -50470,6 +50470,7 @@ activate = 1\n";
         public: bool,
         inline: bool,
         conditional: bool,
+        conditions: Vec<String>,
         doc_hidden_count: usize,
     }
 
@@ -50523,6 +50524,7 @@ activate = 1\n";
     }
 
     const PUBLIC_CORE_ROUTE_GRAPH_MAX_DEPTH: usize = 64;
+    const PUBLIC_CORE_PROVABLY_FALSE_CFG_ANY_FINGERPRINT: &str = "[I3:cfg(I3:any())]";
 
     #[derive(Debug, Default)]
     struct SourceItemAttributes {
@@ -50757,6 +50759,7 @@ activate = 1\n";
                         public,
                         inline: true,
                         conditional,
+                        conditions: conditions.clone(),
                         doc_hidden_count: attributes.doc_hidden_count,
                     });
                     collect_public_core_routes_in_scope(
@@ -50776,6 +50779,7 @@ activate = 1\n";
                         public,
                         inline: false,
                         conditional,
+                        conditions,
                         doc_hidden_count: attributes.doc_hidden_count,
                     });
                     index = item_index.saturating_add(3);
@@ -51044,6 +51048,23 @@ activate = 1\n";
             .collect()
     }
 
+    fn public_core_conditions_are_provably_false(conditions: &[String]) -> bool {
+        conditions
+            .iter()
+            .any(|condition| condition == PUBLIC_CORE_PROVABLY_FALSE_CFG_ANY_FINGERPRINT)
+    }
+
+    fn public_core_module_candidates<'a>(
+        inventory: &'a PublicCoreRouteInventory,
+        scope: &[String],
+        name: &str,
+    ) -> Vec<&'a PublicCoreModule> {
+        public_core_child_modules(inventory, scope, name)
+            .into_iter()
+            .filter(|module| !public_core_conditions_are_provably_false(&module.conditions))
+            .collect()
+    }
+
     fn public_core_native_item_candidates<'a>(
         inventory: &'a PublicCoreRouteInventory,
         scope: &[String],
@@ -51086,7 +51107,7 @@ activate = 1\n";
             return Err(());
         }
         let use_candidates = bindings.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-        let module_candidates = public_core_child_modules(inventory, scope, name);
+        let module_candidates = public_core_module_candidates(inventory, scope, name);
         let extern_candidates = inventory
             .extern_crate_routes
             .iter()
@@ -51316,7 +51337,12 @@ activate = 1\n";
                     .map_or(0, Vec::len)
                     .saturating_sub(usize::from(resolving_current_self_binding));
                 let has_local_candidate = competing_use_candidates != 0
-                    || !public_core_child_modules(inventory, &base_scope, head).is_empty()
+                    || !public_core_module_candidates(
+                        inventory,
+                        &base_scope,
+                        head,
+                    )
+                    .is_empty()
                     || !public_core_native_item_candidates(
                         inventory,
                         &base_scope,
@@ -91372,6 +91398,41 @@ original = "value"
                     &exposed,
                     &rule,
                     &format!("{member}/{label}/public-reexport"),
+                    "E_INTEGRATION_SOURCE_SEMANTICS",
+                );
+            }
+
+            for (label, active_shadow) in [
+                (
+                    "private-absolute-alias-reachability/active-shadow",
+                    format!(
+                        "\nmod fastmcp_core {{}}\nmod fnd01_{member}_absolute_transit {{ pub use ::fastmcp_core as payload; }}\n"
+                    ),
+                ),
+                (
+                    "private-raw-absolute-alias-reachability/active-shadow",
+                    format!(
+                        "\nmod r#fastmcp_core {{}}\nmod fnd01_{member}_raw_absolute_transit {{ pub use ::r#fastmcp_core as payload; }}\n"
+                    ),
+                ),
+                (
+                    "private-absolute-alias-reachability/linux-shadow",
+                    format!(
+                        "\n#[cfg(target_os = \"linux\")]\nmod fastmcp_core {{}}\nmod fnd01_{member}_linux_absolute_transit {{ pub use ::fastmcp_core as payload; }}\n"
+                    ),
+                ),
+            ] {
+                let mut active = baseline.clone();
+                active
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for active local-shadow planting")
+                    .text
+                    .push_str(&active_shadow);
+                assert_integration_route_rejected(
+                    &active,
+                    &rule,
+                    &format!("{member}/{label}"),
                     "E_INTEGRATION_SOURCE_SEMANTICS",
                 );
             }
