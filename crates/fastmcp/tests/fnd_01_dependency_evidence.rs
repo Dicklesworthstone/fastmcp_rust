@@ -88444,6 +88444,7 @@ original = "value"
         bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
         scope: &[String],
         leaf: &CoreUseLeaf,
+        protected_member: &str,
     ) -> bool {
         if leaf.absolute {
             let Some(head) = leaf.path.first() else {
@@ -88474,12 +88475,24 @@ original = "value"
             Some(_) => {}
             None => return true,
         }
+        if leaf.glob && leaf.path.first().is_some_and(|root| root == "crate") {
+            return true;
+        }
         let Some(head) = leaf.path.get(index) else {
             return false;
         };
         let binding_key = (base_scope.clone(), head.clone());
+        let use_candidates = bindings.get(&binding_key).map(Vec::as_slice).unwrap_or(&[]);
+        let resolving_current_crate_binding = leaf.path.first().is_some_and(|root| root == "crate")
+            && scope == base_scope
+            && core_use_leaf_binding_name(leaf).as_deref() == Some(head.as_str())
+            && use_candidates.iter().any(|candidate| candidate == leaf);
+        let competing_use_candidates = use_candidates
+            .len()
+            .saturating_sub(usize::from(resolving_current_crate_binding));
         head == "fastmcp_core"
-            || bindings.contains_key(&binding_key)
+            || head == protected_member
+            || competing_use_candidates != 0
             || !public_core_child_modules(inventory, &base_scope, head).is_empty()
             || !public_core_native_item_candidates(
                 inventory,
@@ -88525,6 +88538,7 @@ original = "value"
                             &bindings,
                             &route.scope,
                             &leaf,
+                            member,
                         ) =>
                     {
                         return false;
@@ -90531,6 +90545,12 @@ original = "value"
             "crates/fastmcp-transport/src/http.rs",
             "draw_security_identifier().map_err(|_| HttpSessionError::RandomnessUnavailable)?",
             "{ let fnd01_draw = draw_security_identifier; fnd01_draw() }.map_err(|_| HttpSessionError::RandomnessUnavailable)?",
+        );
+        assert_consumer_topology_rejected(
+            "http-duplicate-crate-root-binding",
+            "crates/fastmcp-transport/src/http.rs",
+            "/// Generates a fresh 256-bit session ID from the process-wide OS randomness",
+            "#[allow(unused_imports)]\nuse crate::Codec;\n\n/// Generates a fresh 256-bit session ID from the process-wide OS randomness",
         );
         assert_consumer_topology_rejected(
             "cli-production-draw-alias",
