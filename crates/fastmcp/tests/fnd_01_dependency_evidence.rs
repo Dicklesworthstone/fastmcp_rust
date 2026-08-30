@@ -89365,6 +89365,11 @@ original = "value"
         harmless_facade.text.push_str(harmless_grouped_self_route);
         harmless_facade.tokens = TokenStream::from_str(&harmless_facade.text)
             .expect("the harmless grouped-self route remains tokenizable");
+        let mut expected_harmless_facade_text = baseline_facade.text.clone();
+        expected_harmless_facade_text.push_str(harmless_grouped_self_route);
+        assert_eq!(harmless_facade.text, expected_harmless_facade_text);
+        let harmless_facade_digest_before: [u8; 32] =
+            Sha256::digest(harmless_facade.text.as_bytes()).into();
         assert_eq!(
             state_partition_rng_input_digest_excluding(&harmless_grouped_self, facade_path),
             non_facade_digest,
@@ -89372,12 +89377,34 @@ original = "value"
         );
         validate_state_partition_rng_seam(&harmless_grouped_self)
             .expect("an unrelated unqualified grouped-self route must remain accepted");
-        let accepted_facade_digest: [u8; 32] =
-            Sha256::digest(baseline_facade.text.as_bytes()).into();
+        let accepted_harmless_facade =
+            state_partition_rng_source(&harmless_grouped_self, facade_path)
+                .expect("accepted harmless grouped-self facade remains present");
         assert_eq!(
-            accepted_facade_digest, baseline_facade_digest,
-            "the harmless grouped-self plant must not mutate the accepted facade"
+            accepted_harmless_facade.text, expected_harmless_facade_text,
+            "validation must preserve the exact accepted grouped-self plant"
         );
+        let harmless_facade_digest_after: [u8; 32] =
+            Sha256::digest(accepted_harmless_facade.text.as_bytes()).into();
+        assert_eq!(
+            harmless_facade_digest_after, harmless_facade_digest_before,
+            "validation must not mutate the accepted grouped-self plant"
+        );
+        assert_ne!(
+            harmless_facade_digest_after, baseline_facade_digest,
+            "the planted facade digest must differ from the pristine baseline"
+        );
+
+        let fresh = state_partition_rng_inventory()
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        validate_state_partition_rng_seam(&fresh)
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let fresh_facade = state_partition_rng_source(&fresh, facade_path)
+            .expect("fresh pristine facade remains present after grouped-self validation");
+        assert_eq!(fresh_facade.text, baseline_facade.text);
+        let fresh_facade_digest: [u8; 32] =
+            Sha256::digest(fresh_facade.text.as_bytes()).into();
+        assert_eq!(fresh_facade_digest, baseline_facade_digest);
         assert_state_partition_rng_public_behavior();
     }
 
