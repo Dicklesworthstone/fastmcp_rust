@@ -50460,6 +50460,7 @@ activate = 1\n";
         scope: Vec<String>,
         public: bool,
         conditional: bool,
+        conditions: Vec<String>,
         tail: Vec<TokenTree>,
     }
 
@@ -50480,11 +50481,19 @@ activate = 1\n";
         alias: String,
     }
 
+    #[derive(Debug, Clone)]
+    struct PublicCoreNativeItem {
+        scope: Vec<String>,
+        name: String,
+        conditions: Vec<String>,
+    }
+
     #[derive(Debug, Default)]
     struct PublicCoreRouteInventory {
         public_modules: Vec<PublicCoreModule>,
         routes: Vec<PublicCoreUseRoute>,
         extern_crate_routes: Vec<CoreExternCrateRoute>,
+        native_items: Vec<PublicCoreNativeItem>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50494,6 +50503,7 @@ activate = 1\n";
         alias: Option<String>,
         glob: bool,
         grouped_self: bool,
+        conditions: Vec<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50508,7 +50518,7 @@ activate = 1\n";
     #[derive(Debug, Default)]
     struct CoreRouteGraphTraversal {
         visiting_bindings: Vec<(Vec<String>, String)>,
-        resolved_bindings: BTreeMap<(Vec<String>, String), CoreRouteResolution>,
+        resolved_bindings: BTreeMap<(Vec<String>, String, Vec<String>), CoreRouteResolution>,
         visiting_modules: Vec<Vec<String>>,
     }
 
@@ -50516,7 +50526,7 @@ activate = 1\n";
 
     #[derive(Debug, Default)]
     struct SourceItemAttributes {
-        conditional: bool,
+        conditions: Vec<String>,
         doc_hidden_count: usize,
     }
 
@@ -50611,7 +50621,12 @@ activate = 1\n";
             && source_token_is_punct(&trees[cursor - 2], '#')
             && matches!(&trees[cursor - 1], TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket)
         {
-            attributes.conditional |= source_attribute_gates_item(&trees[cursor - 1]);
+            let gates_item = source_attribute_gates_item(&trees[cursor - 1]);
+            if gates_item {
+                attributes.conditions.push(token_trees_fingerprint(
+                    std::slice::from_ref(&trees[cursor - 1]),
+                ));
+            }
             attributes.doc_hidden_count = attributes
                 .doc_hidden_count
                 .saturating_add(usize::from(source_attribute_is_exact_doc_hidden(
@@ -50619,6 +50634,7 @@ activate = 1\n";
                 )));
             cursor -= 2;
         }
+        attributes.conditions.reverse();
         attributes
     }
 
@@ -50637,10 +50653,80 @@ activate = 1\n";
         }
     }
 
+    fn source_native_item_binding(
+        trees: &[TokenTree],
+        item_index: usize,
+    ) -> Option<(String, usize)> {
+        let mut cursor = item_index;
+        let (name, terminates_with_body) = loop {
+            let kind = trees.get(cursor).and_then(source_semantic_ident)?;
+            match kind.as_str() {
+                "async" | "default" | "safe" | "unsafe" => {
+                    cursor = cursor.saturating_add(1);
+                }
+                "extern" => {
+                    cursor = cursor.saturating_add(1);
+                    if matches!(trees.get(cursor), Some(TokenTree::Literal(_))) {
+                        cursor = cursor.saturating_add(1);
+                    }
+                }
+                "const"
+                    if trees
+                        .get(cursor + 1)
+                        .is_some_and(|tree| {
+                            token_tree_matches_atom(tree, SourceTokenAtom::Keyword("fn"))
+                        }) =>
+                {
+                    cursor = cursor.saturating_add(1);
+                }
+                "static" => {
+                    cursor = cursor.saturating_add(1);
+                    if trees.get(cursor).is_some_and(|tree| {
+                        token_tree_matches_atom(tree, SourceTokenAtom::Keyword("mut"))
+                    }) {
+                        cursor = cursor.saturating_add(1);
+                    }
+                    let name = trees.get(cursor).and_then(source_semantic_ident)?;
+                    break (name, false);
+                }
+                "const" | "type" => {
+                    let name_index = cursor.saturating_add(1);
+                    let name = trees.get(name_index).and_then(source_semantic_ident)?;
+                    cursor = name_index;
+                    break (name, false);
+                }
+                "enum" | "fn" | "struct" | "trait" | "union" => {
+                    let name_index = cursor.saturating_add(1);
+                    let name = trees.get(name_index).and_then(source_semantic_ident)?;
+                    cursor = name_index;
+                    break (name, true);
+                }
+                _ => return None,
+            }
+        };
+        let mut angle_depth = 0usize;
+        let mut next_index = cursor.saturating_add(1);
+        for (index, tree) in trees.iter().enumerate().skip(next_index) {
+            if source_token_is_punct(tree, '<') {
+                angle_depth = angle_depth.saturating_add(1);
+            } else if source_token_is_punct(tree, '>') {
+                angle_depth = angle_depth.saturating_sub(1);
+            } else if angle_depth == 0
+                && (source_token_is_punct(tree, ';')
+                    || (terminates_with_body
+                        && matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)))
+            {
+                next_index = index.saturating_add(1);
+                break;
+            }
+        }
+        Some((name, next_index))
+    }
+
     fn collect_public_core_routes_in_scope(
         stream: &TokenStream,
         scope: &[String],
-        enclosing_conditional: bool,
+        enclosing_conditions: &[String],
         inventory: &mut PublicCoreRouteInventory,
     ) {
         let trees = stream.clone().into_iter().collect::<Vec<_>>();
@@ -50648,7 +50734,9 @@ activate = 1\n";
         while index < trees.len() {
             let (public, item_index) = source_item_visibility(&trees, index);
             let attributes = source_item_attributes(&trees, index);
-            let conditional = enclosing_conditional || attributes.conditional;
+            let mut conditions = enclosing_conditions.to_vec();
+            conditions.extend(attributes.conditions.iter().cloned());
+            let conditional = !conditions.is_empty();
             if trees
                 .get(item_index)
                 .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Keyword("mod")))
@@ -50674,7 +50762,7 @@ activate = 1\n";
                     collect_public_core_routes_in_scope(
                         &body.stream(),
                         &child_scope,
-                        conditional,
+                        &conditions,
                         inventory,
                     );
                     index = item_index.saturating_add(3);
@@ -50748,9 +50836,34 @@ activate = 1\n";
                         scope: scope.to_vec(),
                         public,
                         conditional,
+                        conditions: conditions.clone(),
                         tail,
                     });
                     index = end + 1;
+                    continue;
+                }
+            }
+            if let Some((name, next_index)) = source_native_item_binding(&trees, item_index) {
+                inventory.native_items.push(PublicCoreNativeItem {
+                    scope: scope.to_vec(),
+                    name,
+                    conditions,
+                });
+                index = next_index;
+                continue;
+            }
+            if trees.get(item_index).and_then(source_semantic_ident).is_some() {
+                if let Some(end) = trees
+                    .iter()
+                    .enumerate()
+                    .skip(item_index)
+                    .find_map(|(candidate, tree)| {
+                        (source_token_is_punct(tree, ';')
+                            || matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
+                        .then_some(candidate)
+                    })
+                {
+                    index = end.saturating_add(1);
                     continue;
                 }
             }
@@ -50760,7 +50873,7 @@ activate = 1\n";
 
     fn public_core_route_inventory(stream: &TokenStream) -> PublicCoreRouteInventory {
         let mut inventory = PublicCoreRouteInventory::default();
-        collect_public_core_routes_in_scope(stream, &[], false, &mut inventory);
+        collect_public_core_routes_in_scope(stream, &[], &[], &mut inventory);
         inventory
     }
 
@@ -50798,6 +50911,7 @@ activate = 1\n";
             alias,
             glob,
             grouped_self,
+            conditions: Vec::new(),
         });
         true
     }
@@ -50881,7 +50995,12 @@ activate = 1\n";
 
     fn core_use_route_leaves(route: &PublicCoreUseRoute) -> Option<Vec<CoreUseLeaf>> {
         let mut leaves = Vec::new();
-        parse_core_use_tree(&route.tail, &[], false, &mut leaves).then_some(leaves)
+        parse_core_use_tree(&route.tail, &[], false, &mut leaves).then(|| {
+            for leaf in &mut leaves {
+                leaf.conditions.clone_from(&route.conditions);
+            }
+            leaves
+        })
     }
 
     fn core_use_leaf_binding_name(leaf: &CoreUseLeaf) -> Option<String> {
@@ -50925,11 +51044,29 @@ activate = 1\n";
             .collect()
     }
 
+    fn public_core_native_item_candidates<'a>(
+        inventory: &'a PublicCoreRouteInventory,
+        scope: &[String],
+        name: &str,
+        reference_conditions: &[String],
+    ) -> Vec<&'a PublicCoreNativeItem> {
+        inventory
+            .native_items
+            .iter()
+            .filter(|item| {
+                item.scope == scope
+                    && item.name == name
+                    && (item.conditions.is_empty() || item.conditions == reference_conditions)
+            })
+            .collect()
+    }
+
     fn public_core_graph_resolve_binding(
         inventory: &PublicCoreRouteInventory,
         bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
         scope: &[String],
         name: &str,
+        reference_conditions: &[String],
         traversal: &mut CoreRouteGraphTraversal,
         depth: usize,
     ) -> Result<CoreRouteResolution, ()> {
@@ -50937,7 +51074,12 @@ activate = 1\n";
             return Err(());
         }
         let key = (scope.to_vec(), name.to_owned());
-        if let Some(resolution) = traversal.resolved_bindings.get(&key) {
+        let resolution_key = (
+            scope.to_vec(),
+            name.to_owned(),
+            reference_conditions.to_vec(),
+        );
+        if let Some(resolution) = traversal.resolved_bindings.get(&resolution_key) {
             return Ok(resolution.clone());
         }
         if traversal.visiting_bindings.contains(&key) {
@@ -50950,10 +51092,17 @@ activate = 1\n";
             .iter()
             .filter(|route| route.scope == scope && route.alias == name)
             .collect::<Vec<_>>();
+        let native_candidates = public_core_native_item_candidates(
+            inventory,
+            scope,
+            name,
+            reference_conditions,
+        );
         let explicit_candidates = use_candidates
             .len()
             .saturating_add(module_candidates.len())
-            .saturating_add(extern_candidates.len());
+            .saturating_add(extern_candidates.len())
+            .saturating_add(native_candidates.len());
         if explicit_candidates > 1 {
             return Err(());
         }
@@ -50971,7 +51120,7 @@ activate = 1\n";
             if let Ok(resolution) = &result {
                 traversal
                     .resolved_bindings
-                    .insert(key, resolution.clone());
+                    .insert(resolution_key, resolution.clone());
             }
             return result;
         }
@@ -50982,7 +51131,7 @@ activate = 1\n";
                 .ok_or(())?;
             traversal
                 .resolved_bindings
-                .insert(key, resolution.clone());
+                .insert(resolution_key, resolution.clone());
             return Ok(resolution);
         }
         if let Some(route) = extern_candidates.first() {
@@ -50993,8 +51142,14 @@ activate = 1\n";
             };
             traversal
                 .resolved_bindings
-                .insert(key, resolution.clone());
+                .insert(resolution_key, resolution.clone());
             return Ok(resolution);
+        }
+        if native_candidates.len() == 1 {
+            traversal
+                .resolved_bindings
+                .insert(resolution_key, CoreRouteResolution::Other);
+            return Ok(CoreRouteResolution::Other);
         }
         let resolution = if name == "fastmcp_core" {
             CoreRouteResolution::CoreCrate
@@ -51003,7 +51158,7 @@ activate = 1\n";
         };
         traversal
             .resolved_bindings
-            .insert(key, resolution.clone());
+            .insert(resolution_key, resolution.clone());
         Ok(resolution)
     }
 
@@ -51012,6 +51167,7 @@ activate = 1\n";
         bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
         module_scope: &[String],
         member: &str,
+        reference_conditions: &[String],
         traversal: &mut CoreRouteGraphTraversal,
         depth: usize,
     ) -> Result<CoreRouteResolution, ()> {
@@ -51020,6 +51176,7 @@ activate = 1\n";
             bindings,
             module_scope,
             member,
+            reference_conditions,
             traversal,
             depth,
         )?;
@@ -51054,6 +51211,7 @@ activate = 1\n";
                             bindings,
                             &source_scope,
                             member,
+                            &leaf.conditions,
                             traversal,
                             depth.saturating_add(1),
                         )?
@@ -51140,6 +51298,7 @@ activate = 1\n";
                     bindings,
                     &base_scope,
                     head,
+                    &leaf.conditions,
                     traversal,
                     depth.saturating_add(1),
                 )?
@@ -51158,6 +51317,13 @@ activate = 1\n";
                     .saturating_sub(usize::from(resolving_current_self_binding));
                 let has_local_candidate = competing_use_candidates != 0
                     || !public_core_child_modules(inventory, &base_scope, head).is_empty()
+                    || !public_core_native_item_candidates(
+                        inventory,
+                        &base_scope,
+                        head,
+                        &leaf.conditions,
+                    )
+                    .is_empty()
                     || inventory
                         .extern_crate_routes
                         .iter()
@@ -51206,6 +51372,7 @@ activate = 1\n";
                         bindings,
                         &base_scope,
                         head,
+                        &leaf.conditions,
                         traversal,
                         depth.saturating_add(1),
                     )?
@@ -51233,6 +51400,7 @@ activate = 1\n";
                         bindings,
                         &module_scope,
                         segment,
+                        &leaf.conditions,
                         traversal,
                         depth.saturating_add(index),
                     )?
@@ -89357,6 +89525,45 @@ original = "value"
             Sha256::digest(baseline_facade.text.as_bytes()).into();
         let non_facade_digest =
             state_partition_rng_input_digest_excluding(&inventory, facade_path);
+        let baseline_route_inventory = public_core_route_inventory(&baseline_facade.tokens);
+        let proxy_native_items = baseline_route_inventory
+            .native_items
+            .iter()
+            .filter(|item| item.scope.is_empty() && item.name == "ProxyProgressCallback")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proxy_native_items.len(),
+            1,
+            "the real conditional proxy callback alias must be inventoried exactly once"
+        );
+        assert_eq!(
+            proxy_native_items[0].conditions.len(),
+            1,
+            "the real proxy callback alias must retain its cfg fingerprint"
+        );
+        let proxy_prelude_leaves = baseline_route_inventory
+            .routes
+            .iter()
+            .filter(|route| route.public && public_core_scope_is(&route.scope, "prelude"))
+            .flat_map(|route| core_use_route_leaves(route).unwrap_or_default())
+            .filter(|leaf| {
+                leaf.path
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["crate", "ProxyProgressCallback"])
+                    && leaf.alias.is_none()
+                    && !leaf.glob
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proxy_prelude_leaves.len(),
+            1,
+            "the real crate::ProxyProgressCallback prelude route must be unique"
+        );
+        assert_eq!(
+            proxy_prelude_leaves[0].conditions, proxy_native_items[0].conditions,
+            "the real conditional native declaration and route must share an exact cfg fingerprint"
+        );
         for (label, harmless_route) in [
             (
                 "grouped-self",
@@ -89365,6 +89572,10 @@ original = "value"
             (
                 "plain-self-binding",
                 "\npub mod fnd01_plain_self_binding_route { pub use serde_json; }\n",
+            ),
+            (
+                "conditional-native-item",
+                "\n#[cfg(feature = \"fnd01-native-route\")]\npub type Fnd01HarmlessNative = ();\n#[cfg(feature = \"fnd01-native-route\")]\npub use crate::Fnd01HarmlessNative as Fnd01HarmlessNativeExposed;\n",
             ),
         ] {
             let mut harmless_planted = inventory.clone();
@@ -89535,6 +89746,74 @@ original = "value"
             "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
         );
         assert_fresh_baseline();
+
+        let assert_native_route_rejected = |label: &str, planted_route: &str| {
+            let mut route_planted = baseline.clone();
+            let route_facade = route_planted
+                .rust_sources
+                .get_mut("crates/fastmcp/src/lib.rs")
+                .expect("facade source is present for native-route planting");
+            route_facade.text.push_str(planted_route);
+            route_facade.tokens = TokenStream::from_str(&route_facade.text)
+                .expect("the native-route control remains tokenizable");
+            let mut expected_facade_text = baseline_facade.text.clone();
+            expected_facade_text.push_str(planted_route);
+            assert_eq!(route_facade.text, expected_facade_text, "{label}");
+            let planted_facade_digest_before: [u8; 32] =
+                Sha256::digest(route_facade.text.as_bytes()).into();
+            assert_ne!(
+                planted_facade_digest_before, baseline_facade_digest,
+                "the {label} facade plant must differ from baseline"
+            );
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(
+                    &route_planted,
+                    "crates/fastmcp/src/lib.rs",
+                ),
+                state_partition_rng_input_digest_excluding(
+                    &baseline,
+                    "crates/fastmcp/src/lib.rs",
+                ),
+                "the {label} plant must not alter a non-facade input"
+            );
+            let route_error = validate_state_partition_rng_seam(&route_planted)
+                .expect_err("an invalid native route must fail closed");
+            assert_eq!(
+                route_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{label}"
+            );
+            let rejected_facade =
+                state_partition_rng_source(&route_planted, "crates/fastmcp/src/lib.rs")
+                    .expect("rejected native-route facade remains present");
+            assert_eq!(
+                rejected_facade.text, expected_facade_text,
+                "validation must preserve the exact rejected {label} plant"
+            );
+            let planted_facade_digest_after: [u8; 32] =
+                Sha256::digest(rejected_facade.text.as_bytes()).into();
+            assert_eq!(
+                planted_facade_digest_after, planted_facade_digest_before,
+                "validation must not mutate the rejected {label} plant"
+            );
+            assert_fresh_baseline();
+        };
+        assert_native_route_rejected(
+            "missing-native-item",
+            "\n#[cfg(feature = \"fnd01-native-route\")]\npub use crate::Fnd01HarmlessNative as Fnd01HarmlessNativeExposed;\n",
+        );
+        assert_native_route_rejected(
+            "mismatched-native-condition",
+            "\n#[cfg(any())]\npub type Fnd01HarmlessNative = ();\n#[cfg(feature = \"fnd01-native-route\")]\npub use crate::Fnd01HarmlessNative as Fnd01HarmlessNativeExposed;\n",
+        );
+        assert_native_route_rejected(
+            "native-use-ambiguity",
+            "\n#[cfg(feature = \"fnd01-native-route\")]\npub type Fnd01HarmlessNative = ();\n#[cfg(feature = \"fnd01-native-route\")]\nuse serde_json as Fnd01HarmlessNative;\n#[cfg(feature = \"fnd01-native-route\")]\npub use crate::Fnd01HarmlessNative as Fnd01HarmlessNativeExposed;\n",
+        );
+        assert_native_route_rejected(
+            "native-fastmcp-core-shadow",
+            "\npub type fastmcp_core = ();\n",
+        );
 
         let from_map = state_partition_rng_method_body(baseline_state, "from_map")
             .expect("baseline state source has exactly one from_map method");
