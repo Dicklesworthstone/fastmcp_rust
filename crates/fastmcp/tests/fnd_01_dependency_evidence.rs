@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 906521;
+const FROZEN_POLICY_BYTES: usize = 909064;
 const FROZEN_POLICY_SHA256: &str =
-    "559f27f5a78681fb6229dcb7447f5586fecfb878aa50367b0719b51d235e2c03";
+    "adfb57b5e9991e962274a760846458f4e48c7aa57a3ebb594fa6cb919c3df260";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -50379,9 +50379,17 @@ activate = 1\n";
         Ok(selected.into_values().collect())
     }
 
+    fn source_ident_semantic_name(identifier: &proc_macro2::Ident) -> String {
+        let spelling = identifier.to_string();
+        spelling
+            .strip_prefix("r#")
+            .unwrap_or(spelling.as_str())
+            .to_owned()
+    }
+
     fn token_tree_ident_count(tree: &TokenTree, identifier: &str) -> usize {
         match tree {
-            TokenTree::Ident(ident) => usize::from(ident == identifier),
+            TokenTree::Ident(ident) => usize::from(source_ident_semantic_name(ident) == identifier),
             TokenTree::Group(group) => token_stream_ident_count(&group.stream(), identifier),
             TokenTree::Punct(_) | TokenTree::Literal(_) => 0,
         }
@@ -50398,13 +50406,19 @@ activate = 1\n";
     #[derive(Debug, Clone, Copy)]
     enum SourceTokenAtom<'a> {
         Ident(&'a str),
+        Keyword(&'a str),
         Punct(char),
         EmptyGroup(Delimiter),
     }
 
     fn token_tree_matches_atom(tree: &TokenTree, atom: SourceTokenAtom<'_>) -> bool {
         match (tree, atom) {
-            (TokenTree::Ident(actual), SourceTokenAtom::Ident(expected)) => actual == expected,
+            (TokenTree::Ident(actual), SourceTokenAtom::Ident(expected)) => {
+                source_ident_semantic_name(actual) == expected
+            }
+            (TokenTree::Ident(actual), SourceTokenAtom::Keyword(expected)) => {
+                actual.to_string() == expected
+            }
             (TokenTree::Punct(actual), SourceTokenAtom::Punct(expected)) => {
                 actual.as_char() == expected
             }
@@ -50444,6 +50458,7 @@ activate = 1\n";
     #[derive(Debug, Clone)]
     struct PublicCoreUseRoute {
         scope: Vec<String>,
+        public: bool,
         conditional: bool,
         tail: Vec<TokenTree>,
     }
@@ -50451,16 +50466,52 @@ activate = 1\n";
     #[derive(Debug, Clone)]
     struct PublicCoreModule {
         scope: Vec<String>,
+        public: bool,
+        inline: bool,
         conditional: bool,
         doc_hidden_count: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CoreExternCrateRoute {
+        scope: Vec<String>,
+        public: bool,
+        crate_name: String,
+        alias: String,
     }
 
     #[derive(Debug, Default)]
     struct PublicCoreRouteInventory {
         public_modules: Vec<PublicCoreModule>,
         routes: Vec<PublicCoreUseRoute>,
-        public_extern_crate_routes: usize,
+        extern_crate_routes: Vec<CoreExternCrateRoute>,
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CoreUseLeaf {
+        absolute: bool,
+        path: Vec<String>,
+        alias: Option<String>,
+        glob: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CoreRouteResolution {
+        CoreCrate,
+        CoreMember(String),
+        InlineModule(Vec<String>),
+        Other,
+        Unresolved,
+    }
+
+    #[derive(Debug, Default)]
+    struct CoreRouteGraphTraversal {
+        visiting_bindings: Vec<(Vec<String>, String)>,
+        resolved_bindings: BTreeMap<(Vec<String>, String), CoreRouteResolution>,
+        visiting_modules: Vec<Vec<String>>,
+    }
+
+    const PUBLIC_CORE_ROUTE_GRAPH_MAX_DEPTH: usize = 64;
 
     #[derive(Debug, Default)]
     struct SourceItemAttributes {
@@ -50570,6 +50621,21 @@ activate = 1\n";
         attributes
     }
 
+    fn source_item_visibility(trees: &[TokenTree], index: usize) -> (bool, usize) {
+        if !trees
+            .get(index)
+            .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Keyword("pub")))
+        {
+            return (false, index);
+        }
+        if matches!(trees.get(index + 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis)
+        {
+            (false, index.saturating_add(2))
+        } else {
+            (true, index.saturating_add(1))
+        }
+    }
+
     fn collect_public_core_routes_in_scope(
         stream: &TokenStream,
         scope: &[String],
@@ -50579,23 +50645,28 @@ activate = 1\n";
         let trees = stream.clone().into_iter().collect::<Vec<_>>();
         let mut index = 0usize;
         while index < trees.len() {
-            if index + 3 < trees.len()
-                && token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
-                && token_tree_matches_atom(&trees[index + 1], SourceTokenAtom::Ident("mod"))
+            let (public, item_index) = source_item_visibility(&trees, index);
+            let attributes = source_item_attributes(&trees, index);
+            let conditional = enclosing_conditional || attributes.conditional;
+            if trees
+                .get(item_index)
+                .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Keyword("mod")))
             {
-                let (TokenTree::Ident(module), TokenTree::Group(body)) =
-                    (&trees[index + 2], &trees[index + 3])
-                else {
-                    index += 1;
+                let Some(TokenTree::Ident(module)) = trees.get(item_index + 1) else {
+                    index = index.saturating_add(1);
                     continue;
                 };
-                if body.delimiter() == Delimiter::Brace {
-                    let attributes = source_item_attributes(&trees, index);
-                    let conditional = enclosing_conditional || attributes.conditional;
-                    let mut child_scope = scope.to_vec();
-                    child_scope.push(module.to_string());
+                let mut child_scope = scope.to_vec();
+                child_scope.push(source_ident_semantic_name(module));
+                if let Some(TokenTree::Group(body)) = trees.get(item_index + 2) {
+                    if body.delimiter() != Delimiter::Brace {
+                        index = index.saturating_add(1);
+                        continue;
+                    }
                     inventory.public_modules.push(PublicCoreModule {
                         scope: child_scope.clone(),
+                        public,
+                        inline: true,
                         conditional,
                         doc_hidden_count: attributes.doc_hidden_count,
                     });
@@ -50605,40 +50676,77 @@ activate = 1\n";
                         conditional,
                         inventory,
                     );
-                    index += 4;
+                    index = item_index.saturating_add(3);
+                    continue;
+                }
+                if trees.get(item_index + 2).is_some_and(|tree| {
+                    token_tree_matches_atom(tree, SourceTokenAtom::Punct(';'))
+                }) {
+                    inventory.public_modules.push(PublicCoreModule {
+                        scope: child_scope,
+                        public,
+                        inline: false,
+                        conditional,
+                        doc_hidden_count: attributes.doc_hidden_count,
+                    });
+                    index = item_index.saturating_add(3);
                     continue;
                 }
             }
-            if index + 3 < trees.len()
-                && token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
-                && token_tree_matches_atom(&trees[index + 1], SourceTokenAtom::Ident("extern"))
-                && token_tree_matches_atom(&trees[index + 2], SourceTokenAtom::Ident("crate"))
-                && token_tree_matches_atom(
-                    &trees[index + 3],
-                    SourceTokenAtom::Ident("fastmcp_core"),
-                )
-            {
-                inventory.public_extern_crate_routes = inventory
-                    .public_extern_crate_routes
-                    .saturating_add(1);
+            if trees.get(item_index).is_some_and(|tree| {
+                token_tree_matches_atom(tree, SourceTokenAtom::Keyword("extern"))
+            }) && trees.get(item_index + 1).is_some_and(|tree| {
+                token_tree_matches_atom(tree, SourceTokenAtom::Keyword("crate"))
+            }) {
+                let Some(TokenTree::Ident(crate_identifier)) = trees.get(item_index + 2) else {
+                    index = index.saturating_add(1);
+                    continue;
+                };
+                let crate_name = source_ident_semantic_name(crate_identifier);
+                let alias = if trees.get(item_index + 3).is_some_and(|tree| {
+                    token_tree_matches_atom(tree, SourceTokenAtom::Keyword("as"))
+                }) {
+                    let Some(TokenTree::Ident(alias)) = trees.get(item_index + 4) else {
+                        index = index.saturating_add(1);
+                        continue;
+                    };
+                    source_ident_semantic_name(alias)
+                } else {
+                    crate_name.clone()
+                };
+                inventory.extern_crate_routes.push(CoreExternCrateRoute {
+                    scope: scope.to_vec(),
+                    public,
+                    crate_name,
+                    alias,
+                });
+                let mut end = item_index.saturating_add(3);
+                while end < trees.len()
+                    && !token_tree_matches_atom(&trees[end], SourceTokenAtom::Punct(';'))
+                {
+                    end = end.saturating_add(1);
+                }
+                if end < trees.len() {
+                    index = end.saturating_add(1);
+                    continue;
+                }
             }
-            if token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
-                && trees.get(index + 1).is_some_and(|tree| {
-                    token_tree_matches_atom(tree, SourceTokenAtom::Ident("use"))
-                })
+            if trees
+                .get(item_index)
+                .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Keyword("use")))
             {
-                let mut end = index + 2;
+                let mut end = item_index + 1;
                 while end < trees.len()
                     && !token_tree_matches_atom(&trees[end], SourceTokenAtom::Punct(';'))
                 {
                     end += 1;
                 }
                 if end < trees.len() {
-                    let tail = trees[index + 2..end].to_vec();
+                    let tail = trees[item_index + 1..end].to_vec();
                     inventory.routes.push(PublicCoreUseRoute {
                         scope: scope.to_vec(),
-                        conditional: enclosing_conditional
-                            || source_item_attributes(&trees, index).conditional,
+                        public,
+                        conditional,
                         tail,
                     });
                     index = end + 1;
@@ -50653,6 +50761,646 @@ activate = 1\n";
         let mut inventory = PublicCoreRouteInventory::default();
         collect_public_core_routes_in_scope(stream, &[], false, &mut inventory);
         inventory
+    }
+
+    fn source_semantic_ident(tree: &TokenTree) -> Option<String> {
+        let TokenTree::Ident(identifier) = tree else {
+            return None;
+        };
+        Some(source_ident_semantic_name(identifier))
+    }
+
+    fn source_has_path_separator(trees: &[TokenTree], index: usize) -> bool {
+        trees.get(index).is_some_and(|tree| source_token_is_punct(tree, ':'))
+            && trees
+                .get(index.saturating_add(1))
+                .is_some_and(|tree| source_token_is_punct(tree, ':'))
+    }
+
+    fn push_core_use_leaf(
+        mut path: Vec<String>,
+        absolute: bool,
+        alias: Option<String>,
+        glob: bool,
+        leaves: &mut Vec<CoreUseLeaf>,
+    ) -> bool {
+        if path.last().is_some_and(|segment| segment == "self") {
+            path.pop();
+        }
+        if path.is_empty() || (glob && alias.is_some()) {
+            return false;
+        }
+        leaves.push(CoreUseLeaf {
+            absolute,
+            path,
+            alias,
+            glob,
+        });
+        true
+    }
+
+    fn parse_core_use_tree(
+        trees: &[TokenTree],
+        prefix: &[String],
+        inherited_absolute: bool,
+        leaves: &mut Vec<CoreUseLeaf>,
+    ) -> bool {
+        let mut index = 0usize;
+        let mut absolute = inherited_absolute;
+        if source_has_path_separator(trees, index) {
+            absolute = true;
+            index = index.saturating_add(2);
+        }
+        if index >= trees.len() {
+            return false;
+        }
+        if index + 1 == trees.len() {
+            if let TokenTree::Group(group) = &trees[index] {
+                if group.delimiter() != Delimiter::Brace {
+                    return false;
+                }
+                let members = group.stream().into_iter().collect::<Vec<_>>();
+                return members
+                    .split(|tree| source_token_is_punct(tree, ','))
+                    .filter(|member| !member.is_empty())
+                    .all(|member| {
+                        parse_core_use_tree(member, prefix, absolute, leaves)
+                    });
+            }
+        }
+
+        let mut path = prefix.to_vec();
+        loop {
+            if index >= trees.len() {
+                return false;
+            }
+            if source_token_is_punct(&trees[index], '*') {
+                return index + 1 == trees.len()
+                    && push_core_use_leaf(path, absolute, None, true, leaves);
+            }
+            if let TokenTree::Group(group) = &trees[index] {
+                if group.delimiter() != Delimiter::Brace || index + 1 != trees.len() {
+                    return false;
+                }
+                let members = group.stream().into_iter().collect::<Vec<_>>();
+                return members
+                    .split(|tree| source_token_is_punct(tree, ','))
+                    .filter(|member| !member.is_empty())
+                    .all(|member| parse_core_use_tree(member, &path, absolute, leaves));
+            }
+            if token_tree_matches_atom(&trees[index], SourceTokenAtom::Keyword("as")) {
+                return false;
+            }
+            let Some(segment) = source_semantic_ident(&trees[index]) else {
+                return false;
+            };
+            path.push(segment);
+            index = index.saturating_add(1);
+            if index == trees.len() {
+                return push_core_use_leaf(path, absolute, None, false, leaves);
+            }
+            if trees
+                .get(index)
+                .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Keyword("as")))
+            {
+                let Some(alias) = trees.get(index + 1).and_then(source_semantic_ident) else {
+                    return false;
+                };
+                return index + 2 == trees.len()
+                    && push_core_use_leaf(path, absolute, Some(alias), false, leaves);
+            }
+            if !source_has_path_separator(trees, index) {
+                return false;
+            }
+            index = index.saturating_add(2);
+        }
+    }
+
+    fn core_use_route_leaves(route: &PublicCoreUseRoute) -> Option<Vec<CoreUseLeaf>> {
+        let mut leaves = Vec::new();
+        parse_core_use_tree(&route.tail, &[], false, &mut leaves).then_some(leaves)
+    }
+
+    fn core_use_leaf_binding_name(leaf: &CoreUseLeaf) -> Option<String> {
+        if leaf.glob {
+            None
+        } else {
+            leaf.alias.clone().or_else(|| leaf.path.last().cloned())
+        }
+    }
+
+    fn public_core_route_graph_bindings(
+        inventory: &PublicCoreRouteInventory,
+    ) -> Option<BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>> {
+        let mut bindings = BTreeMap::<(Vec<String>, String), Vec<CoreUseLeaf>>::new();
+        for route in &inventory.routes {
+            for leaf in core_use_route_leaves(route)? {
+                if let Some(binding) = core_use_leaf_binding_name(&leaf) {
+                    bindings
+                        .entry((route.scope.clone(), binding))
+                        .or_default()
+                        .push(leaf);
+                }
+            }
+        }
+        Some(bindings)
+    }
+
+    fn public_core_child_modules<'a>(
+        inventory: &'a PublicCoreRouteInventory,
+        scope: &[String],
+        name: &str,
+    ) -> Vec<&'a PublicCoreModule> {
+        inventory
+            .public_modules
+            .iter()
+            .filter(|module| {
+                module.scope.len() == scope.len().saturating_add(1)
+                    && module.scope.starts_with(scope)
+                    && module.scope.last().is_some_and(|segment| segment == name)
+            })
+            .collect()
+    }
+
+    fn public_core_graph_resolve_binding(
+        inventory: &PublicCoreRouteInventory,
+        bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
+        scope: &[String],
+        name: &str,
+        traversal: &mut CoreRouteGraphTraversal,
+        depth: usize,
+    ) -> Result<CoreRouteResolution, ()> {
+        if depth >= PUBLIC_CORE_ROUTE_GRAPH_MAX_DEPTH {
+            return Err(());
+        }
+        let key = (scope.to_vec(), name.to_owned());
+        if let Some(resolution) = traversal.resolved_bindings.get(&key) {
+            return Ok(resolution.clone());
+        }
+        if traversal.visiting_bindings.contains(&key) {
+            return Err(());
+        }
+        let use_candidates = bindings.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let module_candidates = public_core_child_modules(inventory, scope, name);
+        let extern_candidates = inventory
+            .extern_crate_routes
+            .iter()
+            .filter(|route| route.scope == scope && route.alias == name)
+            .collect::<Vec<_>>();
+        let explicit_candidates = use_candidates
+            .len()
+            .saturating_add(module_candidates.len())
+            .saturating_add(extern_candidates.len());
+        if explicit_candidates > 1 {
+            return Err(());
+        }
+        if let Some(candidate) = use_candidates.first() {
+            traversal.visiting_bindings.push(key.clone());
+            let result = public_core_graph_resolve_path(
+                inventory,
+                bindings,
+                scope,
+                candidate,
+                traversal,
+                depth.saturating_add(1),
+            );
+            traversal.visiting_bindings.pop();
+            if let Ok(resolution) = &result {
+                traversal
+                    .resolved_bindings
+                    .insert(key, resolution.clone());
+            }
+            return result;
+        }
+        if let Some(module) = module_candidates.first() {
+            let resolution = module
+                .inline
+                .then(|| CoreRouteResolution::InlineModule(module.scope.clone()))
+                .ok_or(())?;
+            traversal
+                .resolved_bindings
+                .insert(key, resolution.clone());
+            return Ok(resolution);
+        }
+        if let Some(route) = extern_candidates.first() {
+            let resolution = match route.crate_name.as_str() {
+                "fastmcp_core" => CoreRouteResolution::CoreCrate,
+                "self" => CoreRouteResolution::InlineModule(Vec::new()),
+                _ => CoreRouteResolution::Other,
+            };
+            traversal
+                .resolved_bindings
+                .insert(key, resolution.clone());
+            return Ok(resolution);
+        }
+        let resolution = if name == "fastmcp_core" {
+            CoreRouteResolution::CoreCrate
+        } else {
+            CoreRouteResolution::Unresolved
+        };
+        traversal
+            .resolved_bindings
+            .insert(key, resolution.clone());
+        Ok(resolution)
+    }
+
+    fn public_core_graph_resolve_module_member(
+        inventory: &PublicCoreRouteInventory,
+        bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
+        module_scope: &[String],
+        member: &str,
+        traversal: &mut CoreRouteGraphTraversal,
+        depth: usize,
+    ) -> Result<CoreRouteResolution, ()> {
+        let explicit = public_core_graph_resolve_binding(
+            inventory,
+            bindings,
+            module_scope,
+            member,
+            traversal,
+            depth,
+        )?;
+        if explicit != CoreRouteResolution::Unresolved {
+            return Ok(explicit);
+        }
+        let mut glob_resolutions = Vec::new();
+        for route in inventory
+            .routes
+            .iter()
+            .filter(|route| route.scope == module_scope)
+        {
+            for leaf in core_use_route_leaves(route).ok_or(())? {
+                if !leaf.glob {
+                    continue;
+                }
+                let resolution = public_core_graph_resolve_path(
+                    inventory,
+                    bindings,
+                    module_scope,
+                    &leaf,
+                    traversal,
+                    depth.saturating_add(1),
+                )?;
+                let resolution = match resolution {
+                    CoreRouteResolution::CoreCrate => {
+                        CoreRouteResolution::CoreMember(member.to_owned())
+                    }
+                    CoreRouteResolution::InlineModule(source_scope) => {
+                        public_core_graph_resolve_module_member(
+                            inventory,
+                            bindings,
+                            &source_scope,
+                            member,
+                            traversal,
+                            depth.saturating_add(1),
+                        )?
+                    }
+                    CoreRouteResolution::CoreMember(_)
+                    | CoreRouteResolution::Other
+                    | CoreRouteResolution::Unresolved => continue,
+                };
+                if resolution != CoreRouteResolution::Unresolved {
+                    glob_resolutions.push(resolution);
+                }
+            }
+        }
+        match glob_resolutions.as_slice() {
+            [] => Ok(CoreRouteResolution::Unresolved),
+            [resolution] => Ok(resolution.clone()),
+            _ => Err(()),
+        }
+    }
+
+    fn public_core_graph_resolve_path(
+        inventory: &PublicCoreRouteInventory,
+        bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
+        scope: &[String],
+        leaf: &CoreUseLeaf,
+        traversal: &mut CoreRouteGraphTraversal,
+        depth: usize,
+    ) -> Result<CoreRouteResolution, ()> {
+        if depth >= PUBLIC_CORE_ROUTE_GRAPH_MAX_DEPTH || leaf.path.is_empty() {
+            return Err(());
+        }
+        let (mut resolution, mut index) = if leaf.absolute {
+            let head = &leaf.path[0];
+            let resolution = if head == "fastmcp_core" {
+                CoreRouteResolution::CoreCrate
+            } else {
+                let extern_candidates = inventory
+                    .extern_crate_routes
+                    .iter()
+                    .filter(|route| route.scope.is_empty() && route.alias == head.as_str())
+                    .collect::<Vec<_>>();
+                match extern_candidates.as_slice() {
+                    [] => CoreRouteResolution::Other,
+                    [route] if route.crate_name == "fastmcp_core" => {
+                        CoreRouteResolution::CoreCrate
+                    }
+                    [route] if route.crate_name == "self" => {
+                        CoreRouteResolution::InlineModule(Vec::new())
+                    }
+                    [_] => CoreRouteResolution::Other,
+                    [_, ..] => return Err(()),
+                }
+            };
+            (resolution, 1)
+        } else {
+            let mut base_scope = scope.to_vec();
+            let mut index = 0usize;
+            let mut explicitly_local = false;
+            match leaf.path[0].as_str() {
+                "crate" => {
+                    base_scope.clear();
+                    index = 1;
+                    explicitly_local = true;
+                }
+                "self" => {
+                    index = 1;
+                    explicitly_local = true;
+                }
+                "super" => {
+                    explicitly_local = true;
+                    while leaf.path.get(index).is_some_and(|segment| segment == "super") {
+                        base_scope.pop().ok_or(())?;
+                        index = index.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+            let Some(head) = leaf.path.get(index) else {
+                return Err(());
+            };
+            let mut resolution = if explicitly_local {
+                public_core_graph_resolve_binding(
+                    inventory,
+                    bindings,
+                    &base_scope,
+                    head,
+                    traversal,
+                    depth.saturating_add(1),
+                )?
+            } else {
+                let binding_key = (base_scope.clone(), head.clone());
+                let has_local_candidate = bindings.contains_key(&binding_key)
+                    || !public_core_child_modules(inventory, &base_scope, head).is_empty()
+                    || inventory
+                        .extern_crate_routes
+                        .iter()
+                        .any(|route| {
+                            route.scope.as_slice() == base_scope.as_slice()
+                                && route.alias == head.as_str()
+                        });
+                let inherited_extern_candidates = inventory
+                    .extern_crate_routes
+                    .iter()
+                    .filter(|route| {
+                        !base_scope.is_empty()
+                            && route.scope.is_empty()
+                            && route.alias == head.as_str()
+                            && matches!(route.crate_name.as_str(), "fastmcp_core" | "self")
+                    })
+                    .collect::<Vec<_>>();
+                if inherited_extern_candidates.len() > 1 {
+                    return Err(());
+                }
+                let inherited_extern_resolution = inherited_extern_candidates.first().map(
+                    |route| match route.crate_name.as_str() {
+                        "fastmcp_core" => CoreRouteResolution::CoreCrate,
+                        "self" => CoreRouteResolution::InlineModule(Vec::new()),
+                        _ => CoreRouteResolution::Other,
+                    },
+                );
+                if head == "fastmcp_core" {
+                    if has_local_candidate {
+                        return Err(());
+                    }
+                    CoreRouteResolution::CoreCrate
+                } else if let Some(inherited) = inherited_extern_resolution {
+                    if has_local_candidate {
+                        return Err(());
+                    }
+                    inherited
+                } else {
+                    public_core_graph_resolve_binding(
+                        inventory,
+                        bindings,
+                        &base_scope,
+                        head,
+                        traversal,
+                        depth.saturating_add(1),
+                    )?
+                }
+            };
+            if resolution == CoreRouteResolution::Unresolved {
+                if explicitly_local {
+                    return Err(());
+                }
+                resolution = CoreRouteResolution::Other;
+            }
+            (resolution, index.saturating_add(1))
+        };
+        while let Some(segment) = leaf.path.get(index) {
+            let traversed_inline_module =
+                matches!(&resolution, CoreRouteResolution::InlineModule(_));
+            resolution = match resolution {
+                CoreRouteResolution::CoreCrate => {
+                    CoreRouteResolution::CoreMember(segment.clone())
+                }
+                CoreRouteResolution::CoreMember(member) => CoreRouteResolution::CoreMember(member),
+                CoreRouteResolution::InlineModule(module_scope) => {
+                    public_core_graph_resolve_module_member(
+                        inventory,
+                        bindings,
+                        &module_scope,
+                        segment,
+                        traversal,
+                        depth.saturating_add(index),
+                    )?
+                }
+                CoreRouteResolution::Other => CoreRouteResolution::Other,
+                CoreRouteResolution::Unresolved => return Err(()),
+            };
+            if traversed_inline_module && resolution == CoreRouteResolution::Unresolved {
+                return Err(());
+            }
+            index = index.saturating_add(1);
+        }
+        Ok(resolution)
+    }
+
+    fn public_core_graph_module_exposes_member(
+        inventory: &PublicCoreRouteInventory,
+        bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
+        module_scope: &[String],
+        member: &str,
+        traversal: &mut CoreRouteGraphTraversal,
+        depth: usize,
+    ) -> Result<bool, ()> {
+        if depth >= PUBLIC_CORE_ROUTE_GRAPH_MAX_DEPTH
+            || traversal
+                .visiting_modules
+                .iter()
+                .any(|scope| scope == module_scope)
+        {
+            return Err(());
+        }
+        traversal.visiting_modules.push(module_scope.to_vec());
+        if inventory.extern_crate_routes.iter().any(|route| {
+            route.public
+                && route.scope == module_scope
+                && matches!(route.crate_name.as_str(), "fastmcp_core" | "self")
+        }) {
+            traversal.visiting_modules.pop();
+            return Ok(true);
+        }
+        for route in inventory
+            .routes
+            .iter()
+            .filter(|route| route.public && route.scope == module_scope)
+        {
+            for leaf in core_use_route_leaves(route).ok_or(())? {
+                match public_core_graph_resolve_path(
+                    inventory,
+                    bindings,
+                    module_scope,
+                    &leaf,
+                    traversal,
+                    depth.saturating_add(1),
+                )? {
+                    CoreRouteResolution::CoreCrate => {
+                        traversal.visiting_modules.pop();
+                        return Ok(true);
+                    }
+                    CoreRouteResolution::CoreMember(resolved) if resolved == member => {
+                        traversal.visiting_modules.pop();
+                        return Ok(true);
+                    }
+                    CoreRouteResolution::InlineModule(child)
+                        if public_core_graph_module_exposes_member(
+                            inventory,
+                            bindings,
+                            &child,
+                            member,
+                            traversal,
+                            depth.saturating_add(1),
+                        )? =>
+                    {
+                        traversal.visiting_modules.pop();
+                        return Ok(true);
+                    }
+                    CoreRouteResolution::CoreMember(_)
+                    | CoreRouteResolution::InlineModule(_)
+                    | CoreRouteResolution::Other => {}
+                    CoreRouteResolution::Unresolved => {
+                        traversal.visiting_modules.pop();
+                        return Err(());
+                    }
+                }
+            }
+        }
+        for child in inventory.public_modules.iter().filter(|module| {
+            module.public
+                && module.scope.len() == module_scope.len().saturating_add(1)
+                && module.scope.starts_with(module_scope)
+        }) {
+            if !child.inline {
+                traversal.visiting_modules.pop();
+                return Err(());
+            }
+            if public_core_graph_module_exposes_member(
+                inventory,
+                bindings,
+                &child.scope,
+                member,
+                traversal,
+                depth.saturating_add(1),
+            )? {
+                traversal.visiting_modules.pop();
+                return Ok(true);
+            }
+        }
+        traversal.visiting_modules.pop();
+        Ok(false)
+    }
+
+    fn public_core_graph_has_only_allowed_exposures(
+        inventory: &PublicCoreRouteInventory,
+        member: &str,
+    ) -> bool {
+        let Some(bindings) = public_core_route_graph_bindings(inventory) else {
+            return false;
+        };
+        for route in inventory.routes.iter().filter(|route| route.public) {
+            match public_core_scope_is_publicly_reachable(inventory, &route.scope) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(()) => return false,
+            }
+            let Some(leaves) = core_use_route_leaves(route) else {
+                return false;
+            };
+            for leaf in leaves {
+                if leaf.glob {
+                    return false;
+                }
+                let direct_core_path = !leaf.absolute
+                    && leaf.path.first().is_some_and(|segment| segment == "fastmcp_core");
+                let mut traversal = CoreRouteGraphTraversal::default();
+                let resolution = match public_core_graph_resolve_path(
+                    inventory,
+                    &bindings,
+                    &route.scope,
+                    &leaf,
+                    &mut traversal,
+                    0,
+                ) {
+                    Ok(resolution) => resolution,
+                    Err(()) => return false,
+                };
+                match resolution {
+                    CoreRouteResolution::CoreCrate => {
+                        let allowed_private_alias = direct_core_path
+                            && !leaf.glob
+                            && leaf.alias.as_deref() == Some("core")
+                            && !route.conditional
+                            && public_core_scope_is(&route.scope, "__private");
+                        if !allowed_private_alias {
+                            return false;
+                        }
+                    }
+                    CoreRouteResolution::CoreMember(resolved) if resolved == member => {
+                        let allowed_member_route = direct_core_path
+                            && !leaf.glob
+                            && leaf.alias.is_none()
+                            && !route.conditional
+                            && (route.scope.is_empty()
+                                || public_core_scope_is(&route.scope, "core"));
+                        if !allowed_member_route {
+                            return false;
+                        }
+                    }
+                    CoreRouteResolution::InlineModule(module_scope) => {
+                        if match public_core_graph_module_exposes_member(
+                            inventory,
+                            &bindings,
+                            &module_scope,
+                            member,
+                            &mut traversal,
+                            0,
+                        ) {
+                            Ok(exposes) => exposes,
+                            Err(()) => return false,
+                        } {
+                            return false;
+                        }
+                    }
+                    CoreRouteResolution::CoreMember(_) | CoreRouteResolution::Other => {}
+                    CoreRouteResolution::Unresolved => return false,
+                }
+            }
+        }
+        true
     }
 
     fn public_core_route_suffix(route: &PublicCoreUseRoute) -> Option<&[TokenTree]> {
@@ -50676,7 +51424,9 @@ activate = 1\n";
             return 0;
         }
         match &suffix[2] {
-            TokenTree::Ident(identifier) => usize::from(identifier == member),
+            TokenTree::Ident(identifier) => {
+                usize::from(source_ident_semantic_name(identifier) == member)
+            }
             TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
                 let members = group.stream().into_iter().collect::<Vec<_>>();
                 members
@@ -50699,7 +51449,7 @@ activate = 1\n";
 
     fn public_core_route_pattern(member: &str) -> String {
         format!(
-            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr"
+            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr;resolver=semantic-ident|all-inline-modules|bounded-64|cycle-ambiguity-unresolved-external-fail-closed"
         )
     }
 
@@ -50707,16 +51457,54 @@ activate = 1\n";
         scope.len() == 1 && scope[0].as_str() == expected
     }
 
+    fn public_core_scope_is_publicly_reachable(
+        inventory: &PublicCoreRouteInventory,
+        scope: &[String],
+    ) -> Result<bool, ()> {
+        let mut parent = Vec::new();
+        for segment in scope {
+            let modules = public_core_child_modules(inventory, &parent, segment);
+            if modules.is_empty() {
+                return Err(());
+            }
+            if modules.iter().all(|module| !module.public) {
+                return Ok(false);
+            }
+            if modules.len() != 1 || !modules[0].inline {
+                return Err(());
+            }
+            parent.push(segment.clone());
+        }
+        Ok(true)
+    }
+
     fn public_core_export_route_set_is_exact(stream: &TokenStream, member: &str) -> bool {
         let inventory = public_core_route_inventory(stream);
-        if inventory.public_extern_crate_routes != 0 {
+        for route in inventory
+            .extern_crate_routes
+            .iter()
+            .filter(|route| {
+                route.public
+                    && matches!(route.crate_name.as_str(), "fastmcp_core" | "self")
+            })
+        {
+            match public_core_scope_is_publicly_reachable(&inventory, &route.scope) {
+                Ok(true) | Err(()) => return false,
+                Ok(false) => {}
+            }
+        }
+        if !public_core_graph_has_only_allowed_exposures(&inventory, member) {
             return false;
         }
         for expected_scope in ["core", "__private"] {
             let matching_modules = inventory
                 .public_modules
                 .iter()
-                .filter(|module| public_core_scope_is(&module.scope, expected_scope))
+                .filter(|module| {
+                    module.public
+                        && module.inline
+                        && public_core_scope_is(&module.scope, expected_scope)
+                })
                 .collect::<Vec<_>>();
             if matching_modules.len() != 1 || matching_modules[0].conditional {
                 return false;
@@ -50732,7 +51520,12 @@ activate = 1\n";
         let mut exact_member_routes = 0usize;
         let mut member_references = 0usize;
         let mut private_alias_routes = 0usize;
-        for route in &inventory.routes {
+        for route in inventory.routes.iter().filter(|route| route.public) {
+            match public_core_scope_is_publicly_reachable(&inventory, &route.scope) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(()) => return false,
+            }
             let route_member_references = route
                 .tail
                 .iter()
@@ -50768,7 +51561,7 @@ activate = 1\n";
                 return false;
             }
             if suffix.len() == 2
-                && token_tree_matches_atom(&suffix[0], SourceTokenAtom::Ident("as"))
+                && token_tree_matches_atom(&suffix[0], SourceTokenAtom::Keyword("as"))
                 && matches!(&suffix[1], TokenTree::Ident(_))
             {
                 let exact_private_alias = !route.conditional
@@ -50870,7 +51663,7 @@ activate = 1\n";
         let mut methods = Vec::new();
         let mut index = 0usize;
         while index + 2 < trees.len() {
-            let is_impl = token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("impl"))
+            let is_impl = token_tree_matches_atom(&trees[index], SourceTokenAtom::Keyword("impl"))
                 && token_tree_matches_atom(
                     &trees[index + 1],
                     SourceTokenAtom::Ident(implementation),
@@ -50886,7 +51679,7 @@ activate = 1\n";
                     while member_index + 1 < members.len() {
                         if token_tree_matches_atom(
                             &members[member_index],
-                            SourceTokenAtom::Ident("fn"),
+                            SourceTokenAtom::Keyword("fn"),
                         ) && token_tree_matches_atom(
                             &members[member_index + 1],
                             SourceTokenAtom::Ident(method),
@@ -51123,8 +51916,8 @@ activate = 1\n";
                             count_sibling_token_sequence(
                                 &source.tokens,
                                 &[
-                                    SourceTokenAtom::Ident("pub"),
-                                    SourceTokenAtom::Ident("mod"),
+                                    SourceTokenAtom::Keyword("pub"),
+                                    SourceTokenAtom::Keyword("mod"),
                                     SourceTokenAtom::Ident("crypto"),
                                     SourceTokenAtom::Punct(';'),
                                 ],
@@ -51137,8 +51930,8 @@ activate = 1\n";
                             count_sibling_token_sequence(
                                 &source.tokens,
                                 &[
-                                    SourceTokenAtom::Ident("pub"),
-                                    SourceTokenAtom::Ident("mod"),
+                                    SourceTokenAtom::Keyword("pub"),
+                                    SourceTokenAtom::Keyword("mod"),
                                     SourceTokenAtom::Ident("uri"),
                                     SourceTokenAtom::Punct(';'),
                                 ],
@@ -88420,8 +89213,8 @@ original = "value"
         if count_sibling_token_sequence(
             &core_lib.tokens,
             &[
-                SourceTokenAtom::Ident("pub"),
-                SourceTokenAtom::Ident("mod"),
+                SourceTokenAtom::Keyword("pub"),
+                SourceTokenAtom::Keyword("mod"),
                 SourceTokenAtom::Ident("crypto"),
                 SourceTokenAtom::Punct(';'),
             ],
@@ -89096,9 +89889,34 @@ original = "value"
                 );
                 let facade = state_partition_rng_source(planted, facade_path)
                     .expect("planted facade source is present for integration dispatch");
+                let rejected_digest_before: [u8; 32] =
+                    Sha256::digest(facade.text.as_bytes()).into();
                 let error = validate_facade_integration_source_text(&facade.text, rule, label)
                     .expect_err("the integration receipt route mutation must fail closed");
                 assert_eq!(error.code, expected_code, "{label}");
+                let rejected_digest_after: [u8; 32] =
+                    Sha256::digest(facade.text.as_bytes()).into();
+                assert_eq!(rejected_digest_after, rejected_digest_before, "{label}");
+                assert_fresh_baseline();
+            };
+        let assert_integration_route_accepted =
+            |planted: &StatePartitionRngInventory,
+             rule: &ParsedIntegrationSourceRule,
+             label: &str| {
+                assert_eq!(
+                    state_partition_rng_input_digest_excluding(planted, facade_path),
+                    facade_route_non_target_digest,
+                    "{label} must not alter any non-facade input"
+                );
+                let facade = state_partition_rng_source(planted, facade_path)
+                    .expect("planted facade source is present for integration dispatch");
+                let accepted_digest_before: [u8; 32] =
+                    Sha256::digest(facade.text.as_bytes()).into();
+                validate_facade_integration_source_text(&facade.text, rule, label)
+                    .expect("the semantic raw-identifier twin must retain the exact route");
+                let accepted_digest_after: [u8; 32] =
+                    Sha256::digest(facade.text.as_bytes()).into();
+                assert_eq!(accepted_digest_after, accepted_digest_before, "{label}");
                 assert_fresh_baseline();
             };
         let root_module_route = "pub use fastmcp_core::{crypto, uri};";
@@ -89110,6 +89928,237 @@ original = "value"
                 &format!("{member}/positive"),
             )
             .expect("the exact facade integration receipt route must pass");
+
+            for (label, anchor, replacement) in [
+                (
+                    "raw-crate-positive",
+                    root_module_route,
+                    "pub use r#fastmcp_core::{crypto, uri};",
+                ),
+                (
+                    "raw-module-positive",
+                    "pub mod core {",
+                    "pub mod r#core {",
+                ),
+                (
+                    "raw-private-alias-positive",
+                    "pub use fastmcp_core as core;",
+                    "pub use fastmcp_core as r#core;",
+                ),
+            ] {
+                let mut planted = baseline.clone();
+                let facade = planted
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for semantic raw-identifier planting");
+                assert_eq!(
+                    facade.text.matches(anchor).count(),
+                    1,
+                    "{member}/{label} baseline anchor is unique"
+                );
+                facade.text = facade.text.replacen(anchor, replacement, 1);
+                assert_integration_route_accepted(
+                    &planted,
+                    &rule,
+                    &format!("{member}/{label}"),
+                );
+            }
+
+            let raw_member_route = if member == "crypto" {
+                "pub use fastmcp_core::{r#crypto, uri};"
+            } else {
+                "pub use fastmcp_core::{crypto, r#uri};"
+            };
+            let mut raw_member = baseline.clone();
+            let raw_member_facade = raw_member
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for raw member planting");
+            assert_eq!(
+                raw_member_facade.text.matches(root_module_route).count(),
+                1,
+                "the baseline root crypto/URI route is unique"
+            );
+            raw_member_facade.text = raw_member_facade
+                .text
+                .replacen(root_module_route, raw_member_route, 1);
+            assert_integration_route_accepted(
+                &raw_member,
+                &rule,
+                &format!("{member}/raw-member-positive"),
+            );
+
+            for (label, harmless_route) in [
+                (
+                    "raw-keyword-path-control",
+                    format!(
+                        "\npub mod r#as {{}}\npub use crate::r#as as fnd01_{member}_harmless_raw_keyword;\n"
+                    ),
+                ),
+                (
+                    "grouped-crate-self-control",
+                    format!(
+                        "\npub mod fnd01_{member}_grouped_self {{}}\npub use crate::fnd01_{member}_grouped_self::{{self as fnd01_{member}_grouped_self_alias}};\n"
+                    ),
+                ),
+                (
+                    "absolute-grouped-self-control",
+                    format!(
+                        "\npub use ::serde_json::{{self as fnd01_{member}_absolute_self_alias}};\n"
+                    ),
+                ),
+            ] {
+                let mut harmless = baseline.clone();
+                harmless
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for harmless route control")
+                    .text
+                    .push_str(&harmless_route);
+                assert_integration_route_accepted(
+                    &harmless,
+                    &rule,
+                    &format!("{member}/{label}"),
+                );
+            }
+
+            for (label, dormant_item, public_reexport) in [
+                (
+                    "private-inline-alias-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_transit {{ pub use fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_transit::payload as fnd01_{member}_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-absolute-alias-reachability",
+                    format!(
+                        "\n#[cfg(any())]\nmod fastmcp_core {{}}\nmod fnd01_{member}_absolute_transit {{ pub use ::fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_absolute_transit::payload as fnd01_{member}_absolute_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-raw-absolute-alias-reachability",
+                    format!(
+                        "\n#[cfg(any())]\nmod r#fastmcp_core {{}}\nmod fnd01_{member}_raw_absolute_transit {{ pub use ::r#fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_raw_absolute_transit::payload as fnd01_{member}_raw_absolute_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-self-glob-module-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_self_holder {{ pub mod transit {{ pub use ::fastmcp_rust::*; }} }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_self_holder::transit as fnd01_{member}_self_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-raw-self-glob-module-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_raw_self_holder {{ pub mod transit {{ pub use ::r#fastmcp_rust::*; }} }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_raw_self_holder::transit as fnd01_{member}_raw_self_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-unqualified-self-glob-module-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_unqualified_self_holder {{ pub mod transit {{ pub use fastmcp_rust::*; }} }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_unqualified_self_holder::transit as fnd01_{member}_unqualified_self_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-raw-unqualified-self-glob-module-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_raw_unqualified_self_holder {{ pub mod transit {{ pub use r#fastmcp_rust::*; }} }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_raw_unqualified_self_holder::transit as fnd01_{member}_raw_unqualified_self_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-unqualified-shadow-alias-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_unqualified_shadow_transit {{ #[cfg(any())] use serde_json as fastmcp_core; pub use fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_unqualified_shadow_transit::payload as fnd01_{member}_unqualified_shadow_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-raw-unqualified-shadow-alias-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_raw_unqualified_shadow_transit {{ #[cfg(any())] use serde_json as r#fastmcp_core; pub use r#fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_raw_unqualified_shadow_transit::payload as fnd01_{member}_raw_unqualified_shadow_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-extern-alias-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_extern_transit {{ pub extern crate fastmcp_core as payload; }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_extern_transit::payload as fnd01_{member}_extern_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-root-extern-alias-reachability",
+                    format!(
+                        "\nextern crate fastmcp_core as fnd01_{member}_root_extern_payload;\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_root_extern_payload::{member} as fnd01_{member}_root_extern_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-nested-public-extern-module-reachability",
+                    format!(
+                        "\nmod fnd01_{member}_nested_extern_transit {{ pub mod inner {{ pub extern crate fastmcp_core as payload; }} }}\n"
+                    ),
+                    format!(
+                        "pub use fnd01_{member}_nested_extern_transit::inner as fnd01_{member}_nested_extern_exposed;\n"
+                    ),
+                ),
+            ] {
+                let mut dormant = baseline.clone();
+                dormant
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for dormant private-alias planting")
+                    .text
+                    .push_str(&dormant_item);
+                assert_integration_route_accepted(
+                    &dormant,
+                    &rule,
+                    &format!("{member}/{label}/dormant"),
+                );
+
+                let mut exposed = dormant.clone();
+                exposed
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for public private-alias re-export")
+                    .text
+                    .push_str(&public_reexport);
+                assert_integration_route_rejected(
+                    &exposed,
+                    &rule,
+                    &format!("{member}/{label}/public-reexport"),
+                    "E_INTEGRATION_SOURCE_SEMANTICS",
+                );
+            }
 
             let (missing_root_route, misbound_root_route) = if member == "crypto" {
                 (
@@ -89185,6 +90234,43 @@ original = "value"
                 (
                     "extern-crate",
                     "\npub extern crate fastmcp_core as fnd01_alternate_core;\n".to_owned(),
+                ),
+                (
+                    "raw-extern-crate",
+                    "\npub extern crate r#fastmcp_core as fnd01_raw_alternate_core;\n"
+                        .to_owned(),
+                ),
+                (
+                    "private-inline-alias-multi-hop",
+                    format!(
+                        "\nmod fnd01_{member}_hop_one {{ pub use fastmcp_core as payload; }}\nmod fnd01_{member}_hop_two {{ pub use crate::fnd01_{member}_hop_one::payload; }}\npub use fnd01_{member}_hop_two::payload as fnd01_{member}_multi_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-inline-alias-cycle",
+                    format!(
+                        "\n#[cfg(any())]\nmod fnd01_{member}_cycle_one {{ pub use crate::fnd01_{member}_cycle_two::payload; }}\n#[cfg(any())]\nmod fnd01_{member}_cycle_two {{ pub use crate::fnd01_{member}_cycle_one::payload; }}\n#[cfg(any())]\npub use fnd01_{member}_cycle_one::payload as fnd01_{member}_cycle_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-inline-alias-ambiguity",
+                    format!(
+                        "\n#[cfg(any())]\nmod fnd01_{member}_ambiguous {{ #[cfg(any())] pub use crate::modern as payload; #[cfg(not(any()))] pub use crate::server as payload; }}\n#[cfg(any())]\npub use fnd01_{member}_ambiguous::payload as fnd01_{member}_ambiguous_exposed;\n"
+                    ),
+                ),
+                (
+                    "private-external-module-indirection",
+                    format!(
+                        "\n#[cfg(any())]\nmod fnd01_{member}_external;\n#[cfg(any())]\npub use fnd01_{member}_external::payload as fnd01_{member}_external_exposed;\n"
+                    ),
+                ),
+                (
+                    "unqualified-local-wrapper-shadow",
+                    "\nmod fastmcp_core { pub use ::fastmcp_core::*; }\n".to_owned(),
+                ),
+                (
+                    "raw-unqualified-local-wrapper-shadow",
+                    "\nmod r#fastmcp_core { pub use ::r#fastmcp_core::*; }\n".to_owned(),
                 ),
                 (
                     "cfg",
