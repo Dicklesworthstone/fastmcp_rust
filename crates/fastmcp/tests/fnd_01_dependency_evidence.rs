@@ -51145,8 +51145,9 @@ activate = 1\n";
                 )?
             } else {
                 let binding_key = (base_scope.clone(), head.clone());
-                let resolving_current_self_binding = (leaf.grouped_self
-                    || (!leaf.absolute && leaf.path.len() == 1 && leaf.alias.is_none()))
+                let resolving_current_self_binding = !leaf.glob
+                    && (leaf.grouped_self
+                        || (!leaf.absolute && leaf.path.len() == 1 && leaf.alias.is_none()))
                     && traversal
                         .visiting_bindings
                         .last()
@@ -89502,6 +89503,38 @@ original = "value"
             );
             assert_fresh_baseline();
         }
+
+        let active_private_glob_cycle = "\n#[cfg(any())]\nmod fnd01_active_self_glob_source { pub use serde_json as missing; }\n#[cfg(any())]\nuse { fnd01_active_self_glob_source::*, fastmcp_rust::missing as fnd01_active_self_glob_cycle, fnd01_active_self_glob_cycle::* };\n#[cfg(any())]\npub use fnd01_active_self_glob_cycle::safe as fnd01_active_self_glob_exposed;\n";
+        let mut active_private_glob_planted = baseline.clone();
+        let active_private_glob_facade = active_private_glob_planted
+            .rust_sources
+            .get_mut("crates/fastmcp/src/lib.rs")
+            .expect("facade source is present for active private-glob cycle planting");
+        active_private_glob_facade
+            .text
+            .push_str(active_private_glob_cycle);
+        active_private_glob_facade.tokens =
+            TokenStream::from_str(&active_private_glob_facade.text)
+                .expect("the active private-glob cycle remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding(
+                &active_private_glob_planted,
+                "crates/fastmcp/src/lib.rs",
+            ),
+            state_partition_rng_input_digest_excluding(
+                &baseline,
+                "crates/fastmcp/src/lib.rs",
+            ),
+            "the active private-glob cycle must not alter a non-facade input"
+        );
+        let active_private_glob_error =
+            validate_state_partition_rng_seam(&active_private_glob_planted)
+                .expect_err("an active private-glob cycle must fail closed");
+        assert_eq!(
+            active_private_glob_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
+        );
+        assert_fresh_baseline();
 
         let from_map = state_partition_rng_method_body(baseline_state, "from_map")
             .expect("baseline state source has exactly one from_map method");
