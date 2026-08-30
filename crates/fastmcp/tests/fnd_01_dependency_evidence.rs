@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 905967;
+const FROZEN_POLICY_BYTES: usize = 906521;
 const FROZEN_POLICY_SHA256: &str =
-    "f084ddcd0a8e7139ecc8d30fee0f6c1d82f15b7eefdbd2dbd3f611580a0da1ac";
+    "559f27f5a78681fb6229dcb7447f5586fecfb878aa50367b0719b51d235e2c03";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -50448,10 +50448,24 @@ activate = 1\n";
         tail: Vec<TokenTree>,
     }
 
+    #[derive(Debug, Clone)]
+    struct PublicCoreModule {
+        scope: Vec<String>,
+        conditional: bool,
+        doc_hidden_count: usize,
+    }
+
     #[derive(Debug, Default)]
     struct PublicCoreRouteInventory {
-        public_modules: Vec<(Vec<String>, bool)>,
+        public_modules: Vec<PublicCoreModule>,
         routes: Vec<PublicCoreUseRoute>,
+        public_extern_crate_routes: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct SourceItemAttributes {
+        conditional: bool,
+        doc_hidden_count: usize,
     }
 
     fn source_token_is_punct(tree: &TokenTree, expected: char) -> bool {
@@ -50469,30 +50483,91 @@ activate = 1\n";
         }
     }
 
-    fn source_attribute_is_conditional(tree: &TokenTree) -> bool {
+    fn source_cfg_attr_arguments_gate_item(group: &Group) -> bool {
+        if group.delimiter() != Delimiter::Parenthesis {
+            return false;
+        }
+        let arguments = group.stream().into_iter().collect::<Vec<_>>();
+        arguments
+            .split(|tree| source_token_is_punct(tree, ','))
+            .skip(1)
+            .any(|attribute| {
+                attribute
+                    .first()
+                    .is_some_and(|tree| {
+                        token_tree_matches_atom(tree, SourceTokenAtom::Ident("cfg"))
+                    })
+                    || (attribute.len() == 2
+                        && attribute.first().is_some_and(|tree| {
+                            token_tree_matches_atom(tree, SourceTokenAtom::Ident("cfg_attr"))
+                        })
+                        && matches!(
+                            &attribute[1],
+                            TokenTree::Group(nested)
+                                if source_cfg_attr_arguments_gate_item(nested)
+                        ))
+            })
+    }
+
+    fn source_attribute_gates_item(tree: &TokenTree) -> bool {
         let TokenTree::Group(group) = tree else {
             return false;
         };
         if group.delimiter() != Delimiter::Bracket {
             return false;
         }
-        group.stream().into_iter().next().is_some_and(|tree| {
-            token_tree_matches_atom(&tree, SourceTokenAtom::Ident("cfg"))
-                || token_tree_matches_atom(&tree, SourceTokenAtom::Ident("cfg_attr"))
-        })
+        let tokens = group.stream().into_iter().collect::<Vec<_>>();
+        tokens
+            .first()
+            .is_some_and(|tree| token_tree_matches_atom(tree, SourceTokenAtom::Ident("cfg")))
+            || (tokens.len() == 2
+                && tokens.first().is_some_and(|tree| {
+                    token_tree_matches_atom(tree, SourceTokenAtom::Ident("cfg_attr"))
+                })
+                && matches!(
+                    &tokens[1],
+                    TokenTree::Group(arguments)
+                        if source_cfg_attr_arguments_gate_item(arguments)
+                ))
     }
 
-    fn source_item_has_conditional_attribute(trees: &[TokenTree], item_index: usize) -> bool {
+    fn source_attribute_is_exact_doc_hidden(tree: &TokenTree) -> bool {
+        let TokenTree::Group(group) = tree else {
+            return false;
+        };
+        if group.delimiter() != Delimiter::Bracket {
+            return false;
+        }
+        let tokens = group.stream().into_iter().collect::<Vec<_>>();
+        if tokens.len() != 2
+            || !token_tree_matches_atom(&tokens[0], SourceTokenAtom::Ident("doc"))
+        {
+            return false;
+        }
+        let TokenTree::Group(arguments) = &tokens[1] else {
+            return false;
+        };
+        let arguments = arguments.stream().into_iter().collect::<Vec<_>>();
+        arguments.len() == 1
+            && token_tree_matches_atom(&arguments[0], SourceTokenAtom::Ident("hidden"))
+    }
+
+    fn source_item_attributes(trees: &[TokenTree], item_index: usize) -> SourceItemAttributes {
         let mut cursor = item_index;
-        let mut conditional = false;
+        let mut attributes = SourceItemAttributes::default();
         while cursor >= 2
             && source_token_is_punct(&trees[cursor - 2], '#')
             && matches!(&trees[cursor - 1], TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket)
         {
-            conditional |= source_attribute_is_conditional(&trees[cursor - 1]);
+            attributes.conditional |= source_attribute_gates_item(&trees[cursor - 1]);
+            attributes.doc_hidden_count = attributes
+                .doc_hidden_count
+                .saturating_add(usize::from(source_attribute_is_exact_doc_hidden(
+                    &trees[cursor - 1],
+                )));
             cursor -= 2;
         }
-        conditional
+        attributes
     }
 
     fn collect_public_core_routes_in_scope(
@@ -50515,13 +50590,15 @@ activate = 1\n";
                     continue;
                 };
                 if body.delimiter() == Delimiter::Brace {
-                    let conditional = enclosing_conditional
-                        || source_item_has_conditional_attribute(&trees, index);
+                    let attributes = source_item_attributes(&trees, index);
+                    let conditional = enclosing_conditional || attributes.conditional;
                     let mut child_scope = scope.to_vec();
                     child_scope.push(module.to_string());
-                    inventory
-                        .public_modules
-                        .push((child_scope.clone(), conditional));
+                    inventory.public_modules.push(PublicCoreModule {
+                        scope: child_scope.clone(),
+                        conditional,
+                        doc_hidden_count: attributes.doc_hidden_count,
+                    });
                     collect_public_core_routes_in_scope(
                         &body.stream(),
                         &child_scope,
@@ -50531,6 +50608,19 @@ activate = 1\n";
                     index += 4;
                     continue;
                 }
+            }
+            if index + 3 < trees.len()
+                && token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
+                && token_tree_matches_atom(&trees[index + 1], SourceTokenAtom::Ident("extern"))
+                && token_tree_matches_atom(&trees[index + 2], SourceTokenAtom::Ident("crate"))
+                && token_tree_matches_atom(
+                    &trees[index + 3],
+                    SourceTokenAtom::Ident("fastmcp_core"),
+                )
+            {
+                inventory.public_extern_crate_routes = inventory
+                    .public_extern_crate_routes
+                    .saturating_add(1);
             }
             if token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
                 && trees.get(index + 1).is_some_and(|tree| {
@@ -50548,7 +50638,7 @@ activate = 1\n";
                     inventory.routes.push(PublicCoreUseRoute {
                         scope: scope.to_vec(),
                         conditional: enclosing_conditional
-                            || source_item_has_conditional_attribute(&trees, index),
+                            || source_item_attributes(&trees, index).conditional,
                         tail,
                     });
                     index = end + 1;
@@ -50609,7 +50699,7 @@ activate = 1\n";
 
     fn public_core_route_pattern(member: &str) -> String {
         format!(
-            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*__private::fastmcp_core as core;forbid=alias-target|member-alias|glob|whole-crate|cfg-disabled"
+            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr"
         )
     }
 
@@ -50619,15 +50709,20 @@ activate = 1\n";
 
     fn public_core_export_route_set_is_exact(stream: &TokenStream, member: &str) -> bool {
         let inventory = public_core_route_inventory(stream);
+        if inventory.public_extern_crate_routes != 0 {
+            return false;
+        }
         for expected_scope in ["core", "__private"] {
             let matching_modules = inventory
                 .public_modules
                 .iter()
-                .filter(|entry| {
-                    !entry.1 && public_core_scope_is(&entry.0, expected_scope)
-                })
-                .count();
-            if matching_modules != 1 {
+                .filter(|module| public_core_scope_is(&module.scope, expected_scope))
+                .collect::<Vec<_>>();
+            if matching_modules.len() != 1 || matching_modules[0].conditional {
+                return false;
+            }
+            let expected_doc_hidden_count = usize::from(expected_scope == "__private");
+            if matching_modules[0].doc_hidden_count != expected_doc_hidden_count {
                 return false;
             }
         }
@@ -50644,6 +50739,11 @@ activate = 1\n";
                 .map(|tree| token_tree_ident_count(tree, member))
                 .sum::<usize>();
             let Some(suffix) = public_core_route_suffix(route) else {
+                let fastmcp_core_references = route
+                    .tail
+                    .iter()
+                    .map(|tree| token_tree_ident_count(tree, "fastmcp_core"))
+                    .sum::<usize>();
                 let alternate_core_references = route
                     .tail
                     .iter()
@@ -50652,7 +50752,10 @@ activate = 1\n";
                             .saturating_add(token_tree_ident_count(tree, "__private"))
                     })
                     .sum::<usize>();
-                if route_member_references != 0 || alternate_core_references != 0 {
+                if route_member_references != 0
+                    || fastmcp_core_references != 0
+                    || alternate_core_references != 0
+                {
                     return false;
                 }
                 continue;
@@ -50903,6 +51006,101 @@ activate = 1\n";
         count
     }
 
+    fn facade_integration_source_rule_observed(
+        selected: &[&ParsedRustSource],
+        rule: &ParsedIntegrationSourceRule,
+        logical: &str,
+    ) -> VResult<Option<usize>> {
+        let member = match rule.id.as_str() {
+            "FACADE-EXPORT-CRYPTO" => "crypto",
+            "FACADE-EXPORT-URI" => "uri",
+            _ => return Ok(None),
+        };
+        if rule.path_scope != "crates/fastmcp/src/lib.rs"
+            || rule.match_kind != "scoped-use-route-set"
+            || rule.pattern != public_core_route_pattern(member)
+            || rule.expected_count != 1
+        {
+            return Err(Diagnostic::error(
+                "E_INTEGRATION_SOURCE_PATTERN",
+                logical,
+            ));
+        }
+        Ok(Some(usize::from(
+            selected.len() == 1
+                && public_core_export_route_set_is_exact(&selected[0].tokens, member),
+        )))
+    }
+
+    fn validate_integration_source_rule_observation(
+        rule: &ParsedIntegrationSourceRule,
+        observed: usize,
+        logical: &str,
+    ) -> VResult<()> {
+        if observed != rule.expected_count || observed != rule.observed_count {
+            return Err(
+                Diagnostic::error("E_INTEGRATION_SOURCE_SEMANTICS", logical).at(format!(
+                    "observed={observed};expected={}",
+                    rule.expected_count
+                )),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_facade_integration_source_rule_dispatch(
+        selected: &[&ParsedRustSource],
+        rule: &ParsedIntegrationSourceRule,
+        logical: &str,
+    ) -> VResult<()> {
+        let observed = facade_integration_source_rule_observed(selected, rule, logical)?
+            .ok_or_else(|| {
+                Diagnostic::error("E_INTEGRATION_SOURCE_DISPATCH", logical).at(&rule.id)
+            })?;
+        validate_integration_source_rule_observation(rule, observed, logical)
+    }
+
+    fn expected_facade_integration_source_rule(member: &str) -> ParsedIntegrationSourceRule {
+        assert!(
+            matches!(member, "crypto" | "uri"),
+            "the facade integration route contract has only crypto and uri"
+        );
+        let (id, reason) = match member {
+            "crypto" => (
+                "FACADE-EXPORT-CRYPTO",
+                "facade exposes shared crypto through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias",
+            ),
+            "uri" => (
+                "FACADE-EXPORT-URI",
+                "facade exposes shared URI through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias",
+            ),
+            _ => ("FACADE-EXPORT-INVALID", "invalid facade integration route"),
+        };
+        ParsedIntegrationSourceRule {
+            id: id.to_owned(),
+            path_scope: "crates/fastmcp/src/lib.rs".to_owned(),
+            match_kind: "scoped-use-route-set".to_owned(),
+            pattern: public_core_route_pattern(member),
+            expected_count: 1,
+            reason: reason.to_owned(),
+            observed_count: 1,
+        }
+    }
+
+    fn validate_facade_integration_source_text(
+        text: &str,
+        rule: &ParsedIntegrationSourceRule,
+        logical: &str,
+    ) -> VResult<()> {
+        let source = ParsedRustSource {
+            bytes: text.as_bytes().to_vec(),
+            tokens: TokenStream::from_str(text).map_err(|error| {
+                Diagnostic::error("E_INTEGRATION_SOURCE_PARSE", logical).at(error.to_string())
+            })?,
+        };
+        validate_facade_integration_source_rule_dispatch(&[&source], rule, logical)
+    }
+
     fn validate_integration_source_rule_semantics(
         root: &Path,
         receipt: &ParsedWorkspaceReceiptSummary,
@@ -50913,127 +51111,107 @@ activate = 1\n";
         for rule in &receipt.integration_source_rules {
             let logical = format!("workspace-receipt/{}", rule.id);
             let selected = rust_source_scope(&sources, &rule.path_scope, &logical)?;
-            let observed = match rule.id.as_str() {
-                "CORE-EXPORT-CRYPTO" => selected
-                    .iter()
-                    .map(|source| {
-                        count_sibling_token_sequence(
-                            &source.tokens,
-                            &[
-                                SourceTokenAtom::Ident("pub"),
-                                SourceTokenAtom::Ident("mod"),
-                                SourceTokenAtom::Ident("crypto"),
-                                SourceTokenAtom::Punct(';'),
-                            ],
-                        )
-                    })
-                    .sum(),
-                "CORE-EXPORT-URI" => selected
-                    .iter()
-                    .map(|source| {
-                        count_sibling_token_sequence(
-                            &source.tokens,
-                            &[
-                                SourceTokenAtom::Ident("pub"),
-                                SourceTokenAtom::Ident("mod"),
-                                SourceTokenAtom::Ident("uri"),
-                                SourceTokenAtom::Punct(';'),
-                            ],
-                        )
-                    })
-                    .sum(),
-                "FACADE-EXPORT-CRYPTO" => {
-                    if rule.match_kind != "scoped-use-route-set"
-                        || rule.pattern != public_core_route_pattern("crypto")
-                    {
-                        return Err(Diagnostic::error(
-                            "E_INTEGRATION_SOURCE_PATTERN",
-                            &logical,
-                        ));
-                    }
-                    usize::from(
-                        selected.len() == 1
-                            && public_core_export_route_set_is_exact(
-                                &selected[0].tokens,
-                                "crypto",
-                            ),
-                    )
-                }
-                "FACADE-EXPORT-URI" => {
-                    if rule.match_kind != "scoped-use-route-set"
-                        || rule.pattern != public_core_route_pattern("uri")
-                    {
-                        return Err(Diagnostic::error(
-                            "E_INTEGRATION_SOURCE_PATTERN",
-                            &logical,
-                        ));
-                    }
-                    usize::from(
-                        selected.len() == 1
-                            && public_core_export_route_set_is_exact(&selected[0].tokens, "uri"),
-                    )
-                }
-                "OIDC-ISSUANCE-FAIL-CLOSED" => selected
-                    .iter()
-                    .map(|source| {
-                        exact_function_token_body_count(&source.tokens, &rule.pattern, &logical)
-                    })
-                    .collect::<VResult<Vec<_>>>()?
-                    .into_iter()
-                    .sum(),
-                "OIDC-DISCOVERY-NO-SIGNER" => selected
-                    .iter()
-                    .map(|source| oidc_discovery_statement_count(&source.tokens, &logical))
-                    .collect::<VResult<Vec<_>>>()?
-                    .into_iter()
-                    .sum(),
-                _ if rule.match_kind == "required-ident-set" => {
-                    let identifiers = rule.pattern.split(',').collect::<Vec<_>>();
-                    if identifiers.iter().any(|identifier| identifier.is_empty()) {
-                        return Err(Diagnostic::error("E_INTEGRATION_SOURCE_PATTERN", &logical));
-                    }
-                    identifiers
+            let observed = if let Some(observed) =
+                facade_integration_source_rule_observed(&selected, rule, &logical)?
+            {
+                observed
+            } else {
+                match rule.id.as_str() {
+                    "CORE-EXPORT-CRYPTO" => selected
                         .iter()
-                        .filter(|identifier| {
-                            selected.iter().any(|source| {
-                                token_stream_ident_count(&source.tokens, identifier) != 0
-                            })
+                        .map(|source| {
+                            count_sibling_token_sequence(
+                                &source.tokens,
+                                &[
+                                    SourceTokenAtom::Ident("pub"),
+                                    SourceTokenAtom::Ident("mod"),
+                                    SourceTokenAtom::Ident("crypto"),
+                                    SourceTokenAtom::Punct(';'),
+                                ],
+                            )
                         })
-                        .count()
-                }
-                _ if rule.match_kind == "forbidden-ident-set" => rule
-                    .pattern
-                    .split(',')
-                    .map(|identifier| {
+                        .sum(),
+                    "CORE-EXPORT-URI" => selected
+                        .iter()
+                        .map(|source| {
+                            count_sibling_token_sequence(
+                                &source.tokens,
+                                &[
+                                    SourceTokenAtom::Ident("pub"),
+                                    SourceTokenAtom::Ident("mod"),
+                                    SourceTokenAtom::Ident("uri"),
+                                    SourceTokenAtom::Punct(';'),
+                                ],
+                            )
+                        })
+                        .sum(),
+                    "OIDC-ISSUANCE-FAIL-CLOSED" => selected
+                        .iter()
+                        .map(|source| {
+                            exact_function_token_body_count(&source.tokens, &rule.pattern, &logical)
+                        })
+                        .collect::<VResult<Vec<_>>>()?
+                        .into_iter()
+                        .sum(),
+                    "OIDC-DISCOVERY-NO-SIGNER" => selected
+                        .iter()
+                        .map(|source| oidc_discovery_statement_count(&source.tokens, &logical))
+                        .collect::<VResult<Vec<_>>>()?
+                        .into_iter()
+                        .sum(),
+                    _ if rule.match_kind == "required-ident-set" => {
+                        let identifiers = rule.pattern.split(',').collect::<Vec<_>>();
+                        if identifiers.iter().any(|identifier| identifier.is_empty()) {
+                            return Err(Diagnostic::error(
+                                "E_INTEGRATION_SOURCE_PATTERN",
+                                &logical,
+                            ));
+                        }
+                        identifiers
+                            .iter()
+                            .filter(|identifier| {
+                                selected.iter().any(|source| {
+                                    token_stream_ident_count(&source.tokens, identifier) != 0
+                                })
+                            })
+                            .count()
+                    }
+                    _ if rule.match_kind == "forbidden-ident-set" => rule
+                        .pattern
+                        .split(',')
+                        .map(|identifier| {
+                            selected
+                                .iter()
+                                .map(|source| {
+                                    token_stream_ident_count(&source.tokens, identifier)
+                                })
+                                .sum::<usize>()
+                        })
+                        .sum(),
+                    _ if rule.match_kind == "ident" => selected
+                        .iter()
+                        .map(|source| token_stream_ident_count(&source.tokens, &rule.pattern))
+                        .sum(),
+                    "NO-CLI-CRATES-IO-LITERAL" if rule.match_kind == "exact-byte-substring" => {
                         selected
                             .iter()
-                            .map(|source| token_stream_ident_count(&source.tokens, identifier))
-                            .sum::<usize>()
-                    })
-                    .sum(),
-                _ if rule.match_kind == "ident" => selected
-                    .iter()
-                    .map(|source| token_stream_ident_count(&source.tokens, &rule.pattern))
-                    .sum(),
-                "NO-CLI-CRATES-IO-LITERAL" if rule.match_kind == "exact-byte-substring" => selected
-                    .iter()
-                    .map(|source| {
-                        nonoverlapping_byte_occurrences(&source.bytes, rule.pattern.as_bytes())
-                    })
-                    .sum(),
-                _ => {
-                    return Err(Diagnostic::error("E_INTEGRATION_SOURCE_DISPATCH", &logical)
-                        .at(&rule.match_kind));
+                            .map(|source| {
+                                nonoverlapping_byte_occurrences(
+                                    &source.bytes,
+                                    rule.pattern.as_bytes(),
+                                )
+                            })
+                            .sum()
+                    }
+                    _ => {
+                        return Err(
+                            Diagnostic::error("E_INTEGRATION_SOURCE_DISPATCH", &logical)
+                                .at(&rule.match_kind),
+                        );
+                    }
                 }
             };
-            if observed != rule.expected_count || observed != rule.observed_count {
-                return Err(
-                    Diagnostic::error("E_INTEGRATION_SOURCE_SEMANTICS", &logical).at(format!(
-                        "observed={observed};expected={}",
-                        rule.expected_count
-                    )),
-                );
-            }
+            validate_integration_source_rule_observation(rule, observed, &logical)?;
         }
         Ok(())
     }
@@ -88905,6 +89083,236 @@ original = "value"
             "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
         );
         assert_fresh_baseline();
+
+        let assert_integration_route_rejected =
+            |planted: &StatePartitionRngInventory,
+             rule: &ParsedIntegrationSourceRule,
+             label: &str,
+             expected_code: &str| {
+                assert_eq!(
+                    state_partition_rng_input_digest_excluding(planted, facade_path),
+                    facade_route_non_target_digest,
+                    "{label} must not alter any non-facade input"
+                );
+                let facade = state_partition_rng_source(planted, facade_path)
+                    .expect("planted facade source is present for integration dispatch");
+                let error = validate_facade_integration_source_text(&facade.text, rule, label)
+                    .expect_err("the integration receipt route mutation must fail closed");
+                assert_eq!(error.code, expected_code, "{label}");
+                assert_fresh_baseline();
+            };
+        let root_module_route = "pub use fastmcp_core::{crypto, uri};";
+        for member in ["crypto", "uri"] {
+            let rule = expected_facade_integration_source_rule(member);
+            validate_facade_integration_source_text(
+                &baseline_facade.text,
+                &rule,
+                &format!("{member}/positive"),
+            )
+            .expect("the exact facade integration receipt route must pass");
+
+            let (missing_root_route, misbound_root_route) = if member == "crypto" {
+                (
+                    "pub use fastmcp_core::{uri};",
+                    "pub use fastmcp_core::{logging as crypto, uri};",
+                )
+            } else {
+                (
+                    "pub use fastmcp_core::{crypto};",
+                    "pub use fastmcp_core::{crypto, logging as uri};",
+                )
+            };
+            for (label, replacement) in [
+                ("missing-root", missing_root_route),
+                ("reverse-alias-target", misbound_root_route),
+            ] {
+                let mut planted = baseline.clone();
+                let facade = planted
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for integration root-route planting");
+                assert_eq!(
+                    facade.text.matches(root_module_route).count(),
+                    1,
+                    "the baseline root crypto/URI route is unique"
+                );
+                facade.text = facade.text.replacen(root_module_route, replacement, 1);
+                assert_integration_route_rejected(
+                    &planted,
+                    &rule,
+                    &format!("{member}/{label}"),
+                    "E_INTEGRATION_SOURCE_SEMANTICS",
+                );
+            }
+
+            for (label, route_plant) in [
+                (
+                    "absolute-glob",
+                    format!(
+                        "\npub mod fnd01_{member}_absolute_glob {{ pub use ::fastmcp_core::*; }}\n"
+                    ),
+                ),
+                (
+                    "absolute-whole-crate",
+                    format!(
+                        "\npub mod fnd01_{member}_absolute_whole {{ pub use ::fastmcp_core as alternate_core; }}\n"
+                    ),
+                ),
+                (
+                    "grouped-glob",
+                    format!(
+                        "\npub mod fnd01_{member}_grouped_glob {{ pub use {{fastmcp_core::*}}; }}\n"
+                    ),
+                ),
+                (
+                    "grouped-whole-crate",
+                    format!(
+                        "\npub mod fnd01_{member}_grouped_whole {{ pub use {{fastmcp_core as alternate_core}}; }}\n"
+                    ),
+                ),
+                (
+                    "unrooted-glob",
+                    format!(
+                        "\npub mod fnd01_{member}_unrooted_glob {{ pub use fastmcp_core::*; }}\n"
+                    ),
+                ),
+                (
+                    "unrooted-whole-crate",
+                    format!(
+                        "\npub mod fnd01_{member}_unrooted_whole {{ pub use fastmcp_core as alternate_core; }}\n"
+                    ),
+                ),
+                (
+                    "extern-crate",
+                    "\npub extern crate fastmcp_core as fnd01_alternate_core;\n".to_owned(),
+                ),
+                (
+                    "cfg",
+                    format!("\n#[cfg(any())]\npub use fastmcp_core::{member};\n"),
+                ),
+                (
+                    "gating-cfg-attr",
+                    format!(
+                        "\n#[cfg_attr(all(), cfg(any()))]\npub use fastmcp_core::{member};\n"
+                    ),
+                ),
+            ] {
+                let mut planted = baseline.clone();
+                planted
+                    .rust_sources
+                    .get_mut(facade_path)
+                    .expect("facade source is present for integration exposure planting")
+                    .text
+                    .push_str(&route_plant);
+                assert_integration_route_rejected(
+                    &planted,
+                    &rule,
+                    &format!("{member}/{label}"),
+                    "E_INTEGRATION_SOURCE_SEMANTICS",
+                );
+            }
+
+            let mut missing_doc_hidden = baseline.clone();
+            let missing_doc_hidden_facade = missing_doc_hidden
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for doc-hidden removal");
+            assert_eq!(
+                missing_doc_hidden_facade.text.matches("#[doc(hidden)]\n").count(),
+                1,
+                "the baseline has one exact doc-hidden private module attribute"
+            );
+            missing_doc_hidden_facade.text = missing_doc_hidden_facade
+                .text
+                .replacen("#[doc(hidden)]\n", "", 1);
+            missing_doc_hidden_facade.tokens =
+                TokenStream::from_str(&missing_doc_hidden_facade.text)
+                    .expect("the missing doc-hidden attribute plant remains tokenizable");
+            assert_integration_route_rejected(
+                &missing_doc_hidden,
+                &rule,
+                &format!("{member}/missing-doc-hidden"),
+                "E_INTEGRATION_SOURCE_SEMANTICS",
+            );
+            let missing_doc_hidden_error = validate_state_partition_rng_seam(&missing_doc_hidden)
+                .expect_err("removing only doc(hidden) from __private must fail closed");
+            assert_eq!(
+                missing_doc_hidden_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
+            );
+            assert_fresh_baseline();
+
+            let mut harmless_doc_cfg_attr = baseline.clone();
+            let harmless_doc_cfg_attr_facade = harmless_doc_cfg_attr
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for harmless cfg_attr planting");
+            harmless_doc_cfg_attr_facade.text = harmless_doc_cfg_attr_facade.text.replacen(
+                root_module_route,
+                &format!(
+                    "#[cfg_attr(docsrs, doc(cfg(feature = \"fnd01-{member}-route-proof\")))]\n{root_module_route}"
+                ),
+                1,
+            );
+            harmless_doc_cfg_attr_facade.tokens =
+                TokenStream::from_str(&harmless_doc_cfg_attr_facade.text)
+                    .expect("the harmless doc cfg_attr plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&harmless_doc_cfg_attr, facade_path),
+                facade_route_non_target_digest,
+                "{member} harmless doc cfg_attr must not alter a non-facade input"
+            );
+            let harmless_facade = state_partition_rng_source(&harmless_doc_cfg_attr, facade_path)
+                .expect("harmless cfg_attr facade source is present");
+            validate_facade_integration_source_text(
+                &harmless_facade.text,
+                &rule,
+                &format!("{member}/harmless-doc-cfg-attr"),
+            )
+            .expect("cfg_attr that can only emit doc(cfg) must not gate the route");
+            validate_state_partition_rng_seam(&harmless_doc_cfg_attr)
+                .expect("harmless doc cfg_attr must preserve the sealed facade routes");
+            assert_fresh_baseline();
+
+            let mut wrong_id = rule.clone();
+            wrong_id.id.push_str("-MUTATED");
+            let wrong_id_error = validate_facade_integration_source_text(
+                &baseline_facade.text,
+                &wrong_id,
+                &format!("{member}/receipt-id"),
+            )
+            .expect_err("a one-field receipt rule identity mutation must fail");
+            assert_eq!(wrong_id_error.code, "E_INTEGRATION_SOURCE_DISPATCH");
+
+            let mut wrong_pattern = rule.clone();
+            wrong_pattern.pattern.push_str(";mutated=1");
+            let wrong_pattern_error = validate_facade_integration_source_text(
+                &baseline_facade.text,
+                &wrong_pattern,
+                &format!("{member}/receipt-pattern"),
+            )
+            .expect_err("a one-field receipt route pattern mutation must fail");
+            assert_eq!(wrong_pattern_error.code, "E_INTEGRATION_SOURCE_PATTERN");
+
+            let mut wrong_observed_count = rule.clone();
+            wrong_observed_count.observed_count = 0;
+            let wrong_observed_error = validate_facade_integration_source_text(
+                &baseline_facade.text,
+                &wrong_observed_count,
+                &format!("{member}/receipt-observed-count"),
+            )
+            .expect_err("a one-field receipt observed-count mutation must fail");
+            assert_eq!(wrong_observed_error.code, "E_INTEGRATION_SOURCE_SEMANTICS");
+            let accepted_facade_digest: [u8; 32] =
+                Sha256::digest(baseline_facade.text.as_bytes()).into();
+            assert_eq!(accepted_facade_digest, baseline_facade_digest);
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&baseline, facade_path),
+                facade_route_non_target_digest,
+                "receipt identity plants must not mutate any accepted input"
+            );
+            assert_fresh_baseline();
+        }
         let core_wrapper_non_target_digest =
             state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, state_path]);
         let facade_wrapper_non_target_digest = state_partition_rng_input_digest_excluding_paths(
