@@ -32922,7 +32922,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
             )
             .map_err(|error| format!("legacy as_proxy HTTP plan failed: {error}"))?;
             let (proxy, catalog) =
-                ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
+                Box::pin(ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
                     1,
                     plan,
                     ClientInfo {
@@ -32937,7 +32937,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                         }),
                     },
                     cx.clone(),
-                )
+                ))
                 .await
                 .map_err(|error| format!("live exact-2024 HTTP proxy upstream connect failed: {error}"))?;
             let ProxyToolCatalog::Legacy(tools) = &catalog.tools else {
