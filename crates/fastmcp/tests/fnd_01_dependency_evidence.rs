@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 904756;
+const FROZEN_POLICY_BYTES: usize = 905967;
 const FROZEN_POLICY_SHA256: &str =
-    "7b6d7b7713d5301acafb3dc78351209b966322cf6bfd4b3dd78ee5d2f7fac0da";
+    "f084ddcd0a8e7139ecc8d30fee0f6c1d82f15b7eefdbd2dbd3f611580a0da1ac";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -50441,42 +50441,270 @@ activate = 1\n";
                 .sum::<usize>()
     }
 
-    fn count_ident_in_tree(tree: &TokenTree, identifier: &str) -> usize {
-        token_tree_ident_count(tree, identifier)
+    #[derive(Debug, Clone)]
+    struct PublicCoreUseRoute {
+        scope: Vec<String>,
+        conditional: bool,
+        tail: Vec<TokenTree>,
     }
 
-    fn count_public_core_use_member(stream: &TokenStream, member: &str) -> usize {
+    #[derive(Debug, Default)]
+    struct PublicCoreRouteInventory {
+        public_modules: Vec<(Vec<String>, bool)>,
+        routes: Vec<PublicCoreUseRoute>,
+    }
+
+    fn source_token_is_punct(tree: &TokenTree, expected: char) -> bool {
+        matches!(tree, TokenTree::Punct(punct) if punct.as_char() == expected)
+    }
+
+    fn source_token_tree_contains_punct(tree: &TokenTree, expected: char) -> bool {
+        match tree {
+            TokenTree::Punct(punct) => punct.as_char() == expected,
+            TokenTree::Group(group) => group
+                .stream()
+                .into_iter()
+                .any(|child| source_token_tree_contains_punct(&child, expected)),
+            TokenTree::Ident(_) | TokenTree::Literal(_) => false,
+        }
+    }
+
+    fn source_attribute_is_conditional(tree: &TokenTree) -> bool {
+        let TokenTree::Group(group) = tree else {
+            return false;
+        };
+        if group.delimiter() != Delimiter::Bracket {
+            return false;
+        }
+        group.stream().into_iter().next().is_some_and(|tree| {
+            token_tree_matches_atom(&tree, SourceTokenAtom::Ident("cfg"))
+                || token_tree_matches_atom(&tree, SourceTokenAtom::Ident("cfg_attr"))
+        })
+    }
+
+    fn source_item_has_conditional_attribute(trees: &[TokenTree], item_index: usize) -> bool {
+        let mut cursor = item_index;
+        let mut conditional = false;
+        while cursor >= 2
+            && source_token_is_punct(&trees[cursor - 2], '#')
+            && matches!(&trees[cursor - 1], TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket)
+        {
+            conditional |= source_attribute_is_conditional(&trees[cursor - 1]);
+            cursor -= 2;
+        }
+        conditional
+    }
+
+    fn collect_public_core_routes_in_scope(
+        stream: &TokenStream,
+        scope: &[String],
+        enclosing_conditional: bool,
+        inventory: &mut PublicCoreRouteInventory,
+    ) {
         let trees = stream.clone().into_iter().collect::<Vec<_>>();
-        let mut count = 0usize;
         let mut index = 0usize;
-        while index + 2 < trees.len() {
-            if token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
-                && token_tree_matches_atom(&trees[index + 1], SourceTokenAtom::Ident("use"))
-                && token_tree_matches_atom(
-                    &trees[index + 2],
-                    SourceTokenAtom::Ident("fastmcp_core"),
-                )
+        while index < trees.len() {
+            if index + 3 < trees.len()
+                && token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
+                && token_tree_matches_atom(&trees[index + 1], SourceTokenAtom::Ident("mod"))
             {
-                let mut end = index + 3;
+                let (TokenTree::Ident(module), TokenTree::Group(body)) =
+                    (&trees[index + 2], &trees[index + 3])
+                else {
+                    index += 1;
+                    continue;
+                };
+                if body.delimiter() == Delimiter::Brace {
+                    let conditional = enclosing_conditional
+                        || source_item_has_conditional_attribute(&trees, index);
+                    let mut child_scope = scope.to_vec();
+                    child_scope.push(module.to_string());
+                    inventory
+                        .public_modules
+                        .push((child_scope.clone(), conditional));
+                    collect_public_core_routes_in_scope(
+                        &body.stream(),
+                        &child_scope,
+                        conditional,
+                        inventory,
+                    );
+                    index += 4;
+                    continue;
+                }
+            }
+            if token_tree_matches_atom(&trees[index], SourceTokenAtom::Ident("pub"))
+                && trees.get(index + 1).is_some_and(|tree| {
+                    token_tree_matches_atom(tree, SourceTokenAtom::Ident("use"))
+                })
+            {
+                let mut end = index + 2;
                 while end < trees.len()
                     && !token_tree_matches_atom(&trees[end], SourceTokenAtom::Punct(';'))
                 {
-                    count = count.saturating_add(count_ident_in_tree(&trees[end], member));
                     end += 1;
+                }
+                if end < trees.len() {
+                    let tail = trees[index + 2..end].to_vec();
+                    inventory.routes.push(PublicCoreUseRoute {
+                        scope: scope.to_vec(),
+                        conditional: enclosing_conditional
+                            || source_item_has_conditional_attribute(&trees, index),
+                        tail,
+                    });
+                    index = end + 1;
+                    continue;
                 }
             }
             index += 1;
         }
-        count
-            + trees
+    }
+
+    fn public_core_route_inventory(stream: &TokenStream) -> PublicCoreRouteInventory {
+        let mut inventory = PublicCoreRouteInventory::default();
+        collect_public_core_routes_in_scope(stream, &[], false, &mut inventory);
+        inventory
+    }
+
+    fn public_core_route_suffix(route: &PublicCoreUseRoute) -> Option<&[TokenTree]> {
+        route
+            .tail
+            .first()
+            .is_some_and(|tree| {
+                token_tree_matches_atom(tree, SourceTokenAtom::Ident("fastmcp_core"))
+            })
+            .then_some(&route.tail[1..])
+    }
+
+    fn public_core_route_exact_member_count(route: &PublicCoreUseRoute, member: &str) -> usize {
+        let Some(suffix) = public_core_route_suffix(route) else {
+            return 0;
+        };
+        if suffix.len() != 3
+            || !source_token_is_punct(&suffix[0], ':')
+            || !source_token_is_punct(&suffix[1], ':')
+        {
+            return 0;
+        }
+        match &suffix[2] {
+            TokenTree::Ident(identifier) => usize::from(identifier == member),
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                let members = group.stream().into_iter().collect::<Vec<_>>();
+                members
+                    .split(|tree| source_token_is_punct(tree, ','))
+                    .filter(|item| {
+                        item.len() == 1
+                            && token_tree_matches_atom(
+                                &item[0],
+                                SourceTokenAtom::Ident(member),
+                            )
+                    })
+                    .count()
+            }
+            TokenTree::Group(_)
+            | TokenTree::Ident(_)
+            | TokenTree::Punct(_)
+            | TokenTree::Literal(_) => 0,
+        }
+    }
+
+    fn public_core_route_pattern(member: &str) -> String {
+        format!(
+            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*__private::fastmcp_core as core;forbid=alias-target|member-alias|glob|whole-crate|cfg-disabled"
+        )
+    }
+
+    fn public_core_scope_is(scope: &[String], expected: &str) -> bool {
+        scope.len() == 1 && scope[0].as_str() == expected
+    }
+
+    fn public_core_export_route_set_is_exact(stream: &TokenStream, member: &str) -> bool {
+        let inventory = public_core_route_inventory(stream);
+        for expected_scope in ["core", "__private"] {
+            let matching_modules = inventory
+                .public_modules
                 .iter()
-                .filter_map(|tree| match tree {
-                    TokenTree::Group(group) => {
-                        Some(count_public_core_use_member(&group.stream(), member))
-                    }
-                    _ => None,
+                .filter(|entry| {
+                    !entry.1 && public_core_scope_is(&entry.0, expected_scope)
                 })
-                .sum::<usize>()
+                .count();
+            if matching_modules != 1 {
+                return false;
+            }
+        }
+
+        let mut root_routes = 0usize;
+        let mut curated_routes = 0usize;
+        let mut exact_member_routes = 0usize;
+        let mut member_references = 0usize;
+        let mut private_alias_routes = 0usize;
+        for route in &inventory.routes {
+            let route_member_references = route
+                .tail
+                .iter()
+                .map(|tree| token_tree_ident_count(tree, member))
+                .sum::<usize>();
+            let Some(suffix) = public_core_route_suffix(route) else {
+                let alternate_core_references = route
+                    .tail
+                    .iter()
+                    .map(|tree| {
+                        token_tree_ident_count(tree, "core")
+                            .saturating_add(token_tree_ident_count(tree, "__private"))
+                    })
+                    .sum::<usize>();
+                if route_member_references != 0 || alternate_core_references != 0 {
+                    return false;
+                }
+                continue;
+            };
+            let exact_members = public_core_route_exact_member_count(route, member);
+            if route.conditional && route_member_references != 0 {
+                return false;
+            }
+            if suffix.is_empty() {
+                return false;
+            }
+            if suffix.len() == 2
+                && token_tree_matches_atom(&suffix[0], SourceTokenAtom::Ident("as"))
+                && matches!(&suffix[1], TokenTree::Ident(_))
+            {
+                let exact_private_alias = !route.conditional
+                    && public_core_scope_is(&route.scope, "__private")
+                    && token_tree_matches_atom(&suffix[1], SourceTokenAtom::Ident("core"));
+                if !exact_private_alias {
+                    return false;
+                }
+                private_alias_routes = private_alias_routes.saturating_add(1);
+            } else {
+                if suffix.len() < 3
+                    || !source_token_is_punct(&suffix[0], ':')
+                    || !source_token_is_punct(&suffix[1], ':')
+                    || suffix[2..].iter().any(|tree| {
+                        token_tree_ident_count(tree, "self") != 0
+                            || source_token_tree_contains_punct(tree, '*')
+                    })
+                {
+                    return false;
+                }
+            }
+            if exact_members != 0 {
+                if route.conditional {
+                    return false;
+                }
+                exact_member_routes = exact_member_routes.saturating_add(exact_members);
+                if route.scope.is_empty() {
+                    root_routes = root_routes.saturating_add(exact_members);
+                } else if public_core_scope_is(&route.scope, "core") {
+                    curated_routes = curated_routes.saturating_add(exact_members);
+                }
+            }
+            member_references = member_references.saturating_add(route_member_references);
+        }
+        root_routes == 1
+            && curated_routes == 1
+            && exact_member_routes == 2
+            && member_references == 2
+            && private_alias_routes == 1
     }
 
     fn token_tree_fingerprint(tree: &TokenTree, output: &mut String) {
@@ -50714,14 +50942,37 @@ activate = 1\n";
                         )
                     })
                     .sum(),
-                "FACADE-EXPORT-CRYPTO" => selected
-                    .iter()
-                    .map(|source| count_public_core_use_member(&source.tokens, "crypto"))
-                    .sum(),
-                "FACADE-EXPORT-URI" => selected
-                    .iter()
-                    .map(|source| count_public_core_use_member(&source.tokens, "uri"))
-                    .sum(),
+                "FACADE-EXPORT-CRYPTO" => {
+                    if rule.match_kind != "scoped-use-route-set"
+                        || rule.pattern != public_core_route_pattern("crypto")
+                    {
+                        return Err(Diagnostic::error(
+                            "E_INTEGRATION_SOURCE_PATTERN",
+                            &logical,
+                        ));
+                    }
+                    usize::from(
+                        selected.len() == 1
+                            && public_core_export_route_set_is_exact(
+                                &selected[0].tokens,
+                                "crypto",
+                            ),
+                    )
+                }
+                "FACADE-EXPORT-URI" => {
+                    if rule.match_kind != "scoped-use-route-set"
+                        || rule.pattern != public_core_route_pattern("uri")
+                    {
+                        return Err(Diagnostic::error(
+                            "E_INTEGRATION_SOURCE_PATTERN",
+                            &logical,
+                        ));
+                    }
+                    usize::from(
+                        selected.len() == 1
+                            && public_core_export_route_set_is_exact(&selected[0].tokens, "uri"),
+                    )
+                }
                 "OIDC-ISSUANCE-FAIL-CLOSED" => selected
                     .iter()
                     .map(|source| {
@@ -86846,55 +87097,6 @@ original = "value"
         state_partition_rng_input_digest_excluding(inventory, "crates/fastmcp-core/src/state.rs")
     }
 
-    fn state_partition_rng_direct_public_use_member_count(
-        stream: &TokenStream,
-        crate_name: &str,
-        member: &str,
-    ) -> usize {
-        let trees = stream.clone().into_iter().collect::<Vec<_>>();
-        let grouped = trees
-            .windows(6)
-            .filter_map(|window| {
-                let TokenTree::Group(group) = &window[5] else {
-                    return None;
-                };
-                (state_partition_rng_token_identifier_is(&window[0], "pub")
-                    && state_partition_rng_token_identifier_is(&window[1], "use")
-                    && state_partition_rng_token_identifier_is(&window[2], crate_name)
-                    && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
-                    && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':')
-                    && group.delimiter() == Delimiter::Brace)
-                    .then_some(group)
-            })
-            .map(|group| {
-                let members = group.stream().into_iter().collect::<Vec<_>>();
-                members
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, tree)| {
-                        state_partition_rng_token_identifier_is(tree, member)
-                            && !members.get(index + 1).is_some_and(|tree| {
-                                state_partition_rng_token_identifier_is(tree, "as")
-                            })
-                    })
-                    .count()
-            })
-            .sum::<usize>();
-        let direct = trees
-            .windows(7)
-            .filter(|window| {
-                state_partition_rng_token_identifier_is(&window[0], "pub")
-                    && state_partition_rng_token_identifier_is(&window[1], "use")
-                    && state_partition_rng_token_identifier_is(&window[2], crate_name)
-                    && matches!(&window[3], TokenTree::Punct(punct) if punct.as_char() == ':')
-                    && matches!(&window[4], TokenTree::Punct(punct) if punct.as_char() == ':')
-                    && state_partition_rng_token_identifier_is(&window[5], member)
-                    && matches!(&window[6], TokenTree::Punct(punct) if punct.as_char() == ';')
-            })
-            .count();
-        grouped + direct
-    }
-
     fn state_partition_rng_direct_public_module_bodies(
         stream: &TokenStream,
         module: &str,
@@ -87915,45 +88117,8 @@ original = "value"
                 .at("crates/fastmcp-core/src/lib.rs"));
             }
         }
-        let facade_core_modules =
-            state_partition_rng_direct_public_module_bodies(&facade_lib.tokens, "core");
-        if facade_core_modules.len() != 1 {
-            return Err(Diagnostic::error(
-                "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
-                "state-partition-rng",
-            )
-            .at("crates/fastmcp/src/lib.rs"));
-        }
-        let facade_core = &facade_core_modules[0];
         for api in STATE_PARTITION_RNG_SEALED_APIS {
-            let root_routes = state_partition_rng_direct_public_use_member_count(
-                &facade_lib.tokens,
-                "fastmcp_core",
-                api,
-            );
-            let curated_core_routes = state_partition_rng_direct_public_use_member_count(
-                &facade_core.stream(),
-                "fastmcp_core",
-                api,
-            );
-            let accounted_references = root_routes
-                .checked_add(curated_core_routes)
-                .ok_or_else(|| {
-                    Diagnostic::error(
-                        "E_STATE_PARTITION_RNG_SEALED_REEXPORT",
-                        "state-partition-rng",
-                    )
-                    .at("crates/fastmcp/src/lib.rs")
-                })?;
-            if root_routes != 1
-                || curated_core_routes != 1
-                || state_partition_rng_sealed_api_reference_count(&facade_lib.tokens, api)
-                    != accounted_references
-                || state_partition_rng_public_reexport_alias_count(
-                    &facade_lib.tokens,
-                    "fastmcp_core",
-                    api,
-                ) != 0
+            if !public_core_export_route_set_is_exact(&facade_lib.tokens, api)
                 || state_partition_rng_function_item_count(&facade_lib.tokens, api) != 0
             {
                 return Err(Diagnostic::error(
@@ -88537,6 +88702,16 @@ original = "value"
         let facade_core_text = &baseline_facade.text[facade_core_start..facade_core_end];
         for api in STATE_PARTITION_RNG_SEALED_APIS {
             let route = format!("{api},");
+            let all_route_offsets = baseline_facade
+                .text
+                .match_indices(&route)
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                all_route_offsets.len(),
+                2,
+                "{api} has exactly one root and one curated core route"
+            );
             let route_offsets = facade_core_text
                 .match_indices(&route)
                 .map(|(offset, _)| offset)
@@ -88546,6 +88721,68 @@ original = "value"
                 1,
                 "{api} has exactly one curated core route to remove"
             );
+            let root_route_offsets = all_route_offsets
+                .iter()
+                .copied()
+                .filter(|offset| *offset < facade_core_start || *offset >= facade_core_end)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                root_route_offsets.len(),
+                1,
+                "{api} has exactly one root route to remove or misbind"
+            );
+
+            let mut missing_root_route = baseline.clone();
+            let missing_root_route_facade = missing_root_route
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for root route removal");
+            let root_route_start = root_route_offsets[0];
+            missing_root_route_facade
+                .text
+                .replace_range(root_route_start..root_route_start + route.len(), "");
+            missing_root_route_facade.tokens =
+                TokenStream::from_str(&missing_root_route_facade.text)
+                    .expect("the missing root route plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&missing_root_route, facade_path),
+                facade_route_non_target_digest,
+                "{api} missing-root plant must not alter any non-facade input"
+            );
+            let missing_root_error = validate_state_partition_rng_seam(&missing_root_route)
+                .expect_err("removing only the root route must fail closed");
+            assert_eq!(
+                missing_root_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{api} missing root route"
+            );
+            assert_fresh_baseline();
+
+            let mut alias_target_root_route = baseline.clone();
+            let alias_target_root_facade = alias_target_root_route
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for alias-target root planting");
+            alias_target_root_facade.text.replace_range(
+                root_route_start..root_route_start + route.len(),
+                &format!("HmacSha256Key as {api},"),
+            );
+            alias_target_root_facade.tokens =
+                TokenStream::from_str(&alias_target_root_facade.text)
+                    .expect("the reverse-alias root route plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&alias_target_root_route, facade_path),
+                facade_route_non_target_digest,
+                "{api} alias-target plant must not alter any non-facade input"
+            );
+            let alias_target_error = validate_state_partition_rng_seam(&alias_target_root_route)
+                .expect_err("substituting another item as the root API must fail closed");
+            assert_eq!(
+                alias_target_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{api} reverse alias target"
+            );
+            assert_fresh_baseline();
 
             let mut missing_core_route = baseline.clone();
             let missing_core_route_facade = missing_core_route
@@ -88580,7 +88817,7 @@ original = "value"
                 .expect("facade source is present for extra curated core route planting");
             extra_core_route_facade.text.insert_str(
                 facade_core_start,
-                &format!(" pub use fastmcp_core::{api} as fnd01_extra_core_route;"),
+                &format!(" pub use fastmcp_core::{{{api} as fnd01_extra_core_route}};"),
             );
             extra_core_route_facade.tokens = TokenStream::from_str(&extra_core_route_facade.text)
                 .expect("the extra aliased curated core route plant remains tokenizable");
@@ -88597,7 +88834,77 @@ original = "value"
                 "{api} extra aliased curated core route"
             );
             assert_fresh_baseline();
+
+            let mut cfg_disabled_route = baseline.clone();
+            let cfg_disabled_route_facade = cfg_disabled_route
+                .rust_sources
+                .get_mut(facade_path)
+                .expect("facade source is present for cfg-disabled route planting");
+            cfg_disabled_route_facade.text.push_str(&format!(
+                "\n#[cfg(any())]\npub use fastmcp_core::{api};\n"
+            ));
+            cfg_disabled_route_facade.tokens = TokenStream::from_str(&cfg_disabled_route_facade.text)
+                .expect("the cfg-disabled direct route plant remains tokenizable");
+            assert_eq!(
+                state_partition_rng_input_digest_excluding(&cfg_disabled_route, facade_path),
+                facade_route_non_target_digest,
+                "{api} cfg-disabled route plant must not alter any non-facade input"
+            );
+            let cfg_disabled_error = validate_state_partition_rng_seam(&cfg_disabled_route)
+                .expect_err("adding only one cfg-disabled route must fail closed");
+            assert_eq!(
+                cfg_disabled_error.stable(),
+                "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs",
+                "{api} cfg-disabled route"
+            );
+            assert_fresh_baseline();
         }
+
+        let mut glob_route = baseline.clone();
+        let glob_route_facade = glob_route
+            .rust_sources
+            .get_mut(facade_path)
+            .expect("facade source is present for glob route planting");
+        glob_route_facade.text.push_str(
+            "\npub mod fnd01_extra_core_glob { pub use fastmcp_core::*; }\n",
+        );
+        glob_route_facade.tokens = TokenStream::from_str(&glob_route_facade.text)
+            .expect("the nested public glob route plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding(&glob_route, facade_path),
+            facade_route_non_target_digest,
+            "glob route plant must not alter any non-facade input"
+        );
+        let glob_route_error = validate_state_partition_rng_seam(&glob_route)
+            .expect_err("adding only one nested public glob route must fail closed");
+        assert_eq!(
+            glob_route_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
+        );
+        assert_fresh_baseline();
+
+        let mut whole_crate_route = baseline.clone();
+        let whole_crate_route_facade = whole_crate_route
+            .rust_sources
+            .get_mut(facade_path)
+            .expect("facade source is present for whole-crate route planting");
+        whole_crate_route_facade.text.push_str(
+            "\npub mod fnd01_extra_core_alias { pub use fastmcp_core as alternate_core; }\n",
+        );
+        whole_crate_route_facade.tokens = TokenStream::from_str(&whole_crate_route_facade.text)
+            .expect("the nested public whole-crate alias plant remains tokenizable");
+        assert_eq!(
+            state_partition_rng_input_digest_excluding(&whole_crate_route, facade_path),
+            facade_route_non_target_digest,
+            "whole-crate route plant must not alter any non-facade input"
+        );
+        let whole_crate_route_error = validate_state_partition_rng_seam(&whole_crate_route)
+            .expect_err("adding only one nested whole-crate alias must fail closed");
+        assert_eq!(
+            whole_crate_route_error.stable(),
+            "FND01|Error|E_STATE_PARTITION_RNG_SEALED_REEXPORT|state-partition-rng|crates/fastmcp/src/lib.rs"
+        );
+        assert_fresh_baseline();
         let core_wrapper_non_target_digest =
             state_partition_rng_input_digest_excluding_paths(&baseline, &[crypto_path, state_path]);
         let facade_wrapper_non_target_digest = state_partition_rng_input_digest_excluding_paths(
