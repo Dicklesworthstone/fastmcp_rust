@@ -24,7 +24,7 @@
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
 > historical parity rows are not conformance or release evidence. Versions
-> through 0.8.0 have been published, but publication and source edits alone do
+> through 0.8.1 have been published, but publication and source edits alone do
 > not prove historical workflow identities, queued runs, or credentials inert;
 > provider-side release-safety evidence is still required.
 
@@ -90,7 +90,7 @@
 
 ```bash
 # Current published package; publication is not aggregate conformance evidence
-cargo add fastmcp-rust@0.8.0
+cargo add fastmcp-rust@0.8.1
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -325,15 +325,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (current 0.8.0 package)
+### From crates.io (current 0.8.1 package)
 
-The `0.8.0` package was published on 2026-08-29. Publication does
+The `0.8.1` package was published on 2026-08-30. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.8.0"
+fastmcp-rust = "0.8.1"
 ```
 
 ### As a Git Dependency
@@ -369,7 +369,7 @@ tar -xJf fastmcp-darwin-arm64.tar.xz
 ### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli --version 0.8.0
+cargo install fastmcp-cli --version 0.8.1
 ```
 
 ### Client request deadlines (current source tree)
@@ -416,7 +416,7 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
 event stream and POST message endpoints are already known.
 
-The published 0.8.0 CLI includes these flags. From a current source checkout,
+The published 0.8.1 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash

@@ -200,6 +200,20 @@ fn raw_help_with_toggled_help_option_period(bytes: &[u8]) -> Vec<u8> {
     normalized.replacen(expected, toggled, 1).into_bytes()
 }
 
+fn raw_help_with_windows_executable_suffix(bytes: &[u8]) -> Vec<u8> {
+    let normalized = String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected = "Usage: fastmcp <COMMAND>";
+    let toggled = "Usage: fastmcp.exe <COMMAND>";
+    assert!(
+        normalized.contains(expected),
+        "approved root-help frame must contain the platform-neutral binary name"
+    );
+    normalized.replacen(expected, toggled, 1).into_bytes()
+}
+
 fn admit_public_root_help(
     state: &mut AcceptedPublicHelp,
     candidate: PublicHelpCandidate,
@@ -304,6 +318,20 @@ fn doc_01_b_public_binary_planted_negative() {
     assert_eq!(
         state, accepted_before,
         "a rejected punctuation mutation must not alter accepted evaluator/output state"
+    );
+
+    let windows_suffix_mutation = PublicHelpCandidate {
+        oracle: baseline.oracle,
+        stdout: raw_help_with_windows_executable_suffix(&baseline.stdout),
+    };
+    assert_eq!(
+        admit_public_root_help(&mut state, windows_suffix_mutation),
+        Err(PublicHelpRefusal::RootHelpFrameMismatch),
+        "the one-field executable-suffix mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected executable-suffix mutation must not alter accepted evaluator/output state"
     );
     let long_help_after_rejection = fastmcp_output("--help");
     assert_eq!(

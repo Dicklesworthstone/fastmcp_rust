@@ -34887,7 +34887,7 @@ mod ordinary {
         (ACTION_GITHUB_RELEASE, 0, 0),
     ];
     const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 36;
-    const PACKAGE_VERSION: &str = "0.8.0";
+    const PACKAGE_VERSION: &str = "0.8.1";
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!(
         "cargo-1.99.0-nightly-",

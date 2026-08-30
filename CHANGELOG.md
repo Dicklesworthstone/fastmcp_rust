@@ -6,9 +6,25 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.8.0)
+## [Unreleased] (after v0.8.1)
 
-## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-29 (GitHub Release)
+## [v0.8.1](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.1) -- 2026-08-30 (GitHub Release)
+
+The first published 0.8 release. It contains the full v0.8.0 candidate change
+set described below and supersedes that quarantined tag; no v0.8.0 GitHub
+Release, binary assets, or crates.io packages were published.
+
+### Fixed
+
+- Root `fastmcp --help` now freezes Clap's public binary name as `fastmcp` on
+  every platform. Windows previously rendered `Usage: fastmcp.exe <COMMAND>`,
+  which the exact DOC-01 help contract correctly rejected before release.
+  Windows-like argv and one-field executable-suffix mutation tests now cover
+  both admission and unchanged-state refusal behavior.
+
+**Exact changes:** [v0.7.1...v0.8.1](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.7.1...v0.8.1)
+
+## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-29 (quarantined release candidate; not published)
 
 Pre-1.0 minor release making caller-owned asupersync contexts explicit across
 library connection and server-runner boundaries. This release does **not**

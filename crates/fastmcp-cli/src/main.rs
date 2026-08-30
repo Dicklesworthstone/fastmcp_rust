@@ -218,6 +218,7 @@ struct ConsumerVisibleCliHelp {
 /// CLI tooling for FastMCP - run, inspect, and install MCP servers.
 #[derive(Parser)]
 #[command(name = "fastmcp")]
+#[command(bin_name = "fastmcp")]
 #[command(version, about, long_about = None)]
 #[command(after_help = CLI_PROTOCOL_STATUS_HELP)]
 #[command(propagate_version = true)]
@@ -398,6 +399,18 @@ fn raw_help_with_toggled_help_option_period(bytes: &[u8]) -> Vec<u8> {
     normalized.replacen(expected, toggled, 1).into_bytes()
 }
 
+#[cfg(test)]
+fn raw_help_with_windows_executable_suffix(bytes: &[u8]) -> Vec<u8> {
+    let normalized = normalize_cli_help_whitespace(bytes);
+    let expected = "Usage: fastmcp <COMMAND>";
+    let toggled = "Usage: fastmcp.exe <COMMAND>";
+    assert!(
+        normalized.contains(expected),
+        "approved root-help frame must contain the platform-neutral binary name"
+    );
+    normalized.replacen(expected, toggled, 1).into_bytes()
+}
+
 #[test]
 fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
@@ -438,6 +451,25 @@ fn doc_01_b_positive() {
         Ok(())
     );
     assert_eq!(state.accepted, Some(public_help));
+
+    let windows_argv_help = match Cli::try_parse_from(["fastmcp.exe", "--help"]) {
+        Err(error) => CliHelpCandidate {
+            contract: CLI_DOCUMENTATION_CONTRACT,
+            bytes: display_help_bytes(error)
+                .expect("Windows-like root --help must reach Clap DisplayHelp"),
+        },
+        Ok(_) => panic!("Windows-like root --help must not parse a command"),
+    };
+    assert_eq!(
+        normalize_cli_help_whitespace(&windows_argv_help.bytes),
+        format!("{EXPECTED_CLI_ROOT_HELP_PREFIX}{EXPECTED_CLI_PROTOCOL_STATUS_STANZA}"),
+        "the public root frame must use the platform-neutral fastmcp binary name"
+    );
+    let mut windows_argv_state = ConsumerVisibleCliHelp::default();
+    assert_eq!(
+        admit_public_cli_help(&mut windows_argv_state, windows_argv_help),
+        Ok(())
+    );
 
     let mut emitted = Vec::new();
     assert_eq!(emit_admitted_cli_help_to(&state, &mut emitted), Ok(()));
@@ -513,6 +545,20 @@ fn doc_01_b_planted_negative() {
     assert_eq!(
         state, accepted_before,
         "a rejected punctuation mutation must leave evaluator and consumer-visible state unchanged"
+    );
+
+    let windows_suffix_mutation = CliHelpCandidate {
+        contract: baseline.contract,
+        bytes: raw_help_with_windows_executable_suffix(&baseline.bytes),
+    };
+    assert_eq!(
+        admit_public_cli_help(&mut state, windows_suffix_mutation),
+        Err(CliDocumentationRefusal::RootHelpFrameMismatch),
+        "a one-field executable-suffix mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected executable-suffix mutation must leave evaluator and consumer-visible state unchanged"
     );
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(
