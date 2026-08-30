@@ -88439,6 +88439,62 @@ original = "value"
             .collect()
     }
 
+    fn state_partition_rng_leaf_has_local_head_candidate(
+        inventory: &PublicCoreRouteInventory,
+        bindings: &BTreeMap<(Vec<String>, String), Vec<CoreUseLeaf>>,
+        scope: &[String],
+        leaf: &CoreUseLeaf,
+    ) -> bool {
+        if leaf.absolute {
+            let Some(head) = leaf.path.first() else {
+                return true;
+            };
+            return head == "fastmcp_core"
+                || inventory
+                    .extern_crate_routes
+                    .iter()
+                    .any(|route| route.scope.is_empty() && route.alias == head.as_str());
+        }
+        let mut base_scope = scope.to_vec();
+        let mut index = 0usize;
+        match leaf.path.first().map(String::as_str) {
+            Some("crate") => {
+                base_scope.clear();
+                index = 1;
+            }
+            Some("self") => index = 1,
+            Some("super") => {
+                while leaf.path.get(index).is_some_and(|segment| segment == "super") {
+                    if base_scope.pop().is_none() {
+                        return true;
+                    }
+                    index = index.saturating_add(1);
+                }
+            }
+            Some(_) => {}
+            None => return true,
+        }
+        let Some(head) = leaf.path.get(index) else {
+            return false;
+        };
+        let binding_key = (base_scope.clone(), head.clone());
+        head == "fastmcp_core"
+            || bindings.contains_key(&binding_key)
+            || !public_core_child_modules(inventory, &base_scope, head).is_empty()
+            || !public_core_native_item_candidates(
+                inventory,
+                &base_scope,
+                head,
+                &leaf.conditions,
+            )
+            .is_empty()
+            || inventory.extern_crate_routes.iter().any(|route| {
+                (route.scope == base_scope
+                    || (!base_scope.is_empty() && route.scope.is_empty()))
+                    && route.alias == head.as_str()
+            })
+    }
+
     fn state_partition_rng_production_import_is_exact(
         stream: &TokenStream,
         member: &str,
@@ -88449,34 +88505,73 @@ original = "value"
             return false;
         };
         let mut protected_count = 0usize;
-        let mut alias_count = 0usize;
-        let mut exact_binding = false;
-        let mut has_core_root_glob = false;
         for route in &inventory.routes {
             let Some(leaves) = core_use_route_leaves(route) else {
                 return false;
             };
             for leaf in leaves {
-                has_core_root_glob |= leaf.glob
-                    && leaf.path.iter().map(String::as_str).eq(["fastmcp_core"]);
-                if leaf.path.iter().map(String::as_str).eq(["fastmcp_core", member]) {
-                    protected_count = protected_count.saturating_add(1);
-                    alias_count = alias_count.saturating_add(usize::from(leaf.alias.is_some()));
-                    exact_binding = route.scope.is_empty()
-                        && !route.public
-                        && route.conditions.as_slice() == expected_conditions
-                        && !leaf.absolute
-                        && !leaf.glob
-                        && !leaf.grouped_self
-                        && leaf.alias.is_none();
+                let mut traversal = CoreRouteGraphTraversal::default();
+                let resolution = match public_core_graph_resolve_path(
+                    &inventory,
+                    &bindings,
+                    &route.scope,
+                    &leaf,
+                    &mut traversal,
+                    0,
+                ) {
+                    Ok(CoreRouteResolution::Unresolved) | Err(())
+                        if state_partition_rng_leaf_has_local_head_candidate(
+                            &inventory,
+                            &bindings,
+                            &route.scope,
+                            &leaf,
+                        ) =>
+                    {
+                        return false;
+                    }
+                    Ok(CoreRouteResolution::Unresolved) | Err(()) => continue,
+                    Ok(resolution) => resolution,
+                };
+                match resolution {
+                    CoreRouteResolution::CoreCrate => return false,
+                    CoreRouteResolution::CoreMember(resolved) if resolved == member => {
+                        let exact_direct_route = route.scope.is_empty()
+                            && !route.public
+                            && route.conditions.as_slice() == expected_conditions
+                            && !leaf.absolute
+                            && !leaf.glob
+                            && !leaf.grouped_self
+                            && leaf.alias.is_none()
+                            && leaf
+                                .path
+                                .iter()
+                                .map(String::as_str)
+                                .eq(["fastmcp_core", member]);
+                        if !exact_direct_route {
+                            return false;
+                        }
+                        protected_count = protected_count.saturating_add(1);
+                    }
+                    CoreRouteResolution::InlineModule(module_scope) => {
+                        match public_core_graph_module_exposes_member(
+                            &inventory,
+                            &bindings,
+                            &module_scope,
+                            member,
+                            &mut traversal,
+                            0,
+                        ) {
+                            Ok(true) | Err(()) => return false,
+                            Ok(false) => {}
+                        }
+                    }
+                    CoreRouteResolution::CoreMember(_) | CoreRouteResolution::Other => {}
+                    CoreRouteResolution::Unresolved => return false,
                 }
             }
         }
         let binding_key = (Vec::new(), member.to_owned());
         protected_count == 1
-            && alias_count == 0
-            && exact_binding
-            && !has_core_root_glob
             && state_partition_rng_core_namespace_is_unshadowed(stream)
             && bindings.get(&binding_key).is_some_and(|candidates| candidates.len() == 1)
             && public_core_child_modules(&inventory, &[], member).is_empty()
@@ -90409,6 +90504,18 @@ original = "value"
             "crates/fastmcp-server/src/oauth.rs",
             "/// Draws token material through the core security-identifier API.",
             "#[allow(unused_imports)]\nuse fastmcp_core::*;\n\n/// Draws token material through the core security-identifier API.",
+        );
+        assert_consumer_topology_rejected(
+            "oauth-two-hop-core-member-alias",
+            "crates/fastmcp-server/src/oauth.rs",
+            "/// Draws token material through the core security-identifier API.",
+            "#[allow(unused_imports)]\nuse fastmcp_core as fnd01_core;\n#[allow(unused_imports)]\nuse fnd01_core::draw_security_identifier as fnd01_extra;\n\n/// Draws token material through the core security-identifier API.",
+        );
+        assert_consumer_topology_rejected(
+            "oauth-inline-module-core-glob",
+            "crates/fastmcp-server/src/oauth.rs",
+            "/// Draws token material through the core security-identifier API.",
+            "mod fnd01_core_shim {\n    pub extern crate fastmcp_core;\n}\n#[allow(unused_imports)]\nuse fnd01_core_shim::*;\n\n/// Draws token material through the core security-identifier API.",
         );
         assert_consumer_topology_rejected(
             "oauth-signature-draw-shadow",
