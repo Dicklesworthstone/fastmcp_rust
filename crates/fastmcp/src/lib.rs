@@ -262,12 +262,11 @@ pub mod client {
 /// construction remains an application responsibility; procedural macros use
 /// the separate doc-hidden [`__private::core`] expansion path.
 pub mod core {
-    pub use fastmcp_core::{combinator, crypto, limits, logging, uri};
     pub use fastmcp_core::{
-        ABSOLUTE_URI_HARD_MAX_BYTES, AccessToken, AbsoluteUri, AbsoluteUriComponent,
-        AbsoluteUriError, AbsoluteUriScheme, AuthContext, AuthorityErrorKind, Budget,
-        CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES, CancelledError,
-        CanonicalHttpUrl, CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
+        ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
+        AbsoluteUriScheme, AccessToken, AuthContext, AuthorityErrorKind, Budget,
+        CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES, CancelledError, CanonicalHttpUrl,
+        CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
         CanonicalResourceIdPolicy, CanonicalUrlPolicy, CatalogChangePublisher,
         ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, CryptoInputTooLongError, Cx,
         DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES,
@@ -282,24 +281,25 @@ pub mod core {
         HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
         HmacVerificationError, IdnaPolicy, IntoOutcome, LogicalExchangeBudget,
         LogicalExchangeBudgetError, LogicalExchangeBudgetResource, MAX_ACCESS_SCHEME_BYTES,
-        MAX_ACCESS_TOKEN_BYTES, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError,
-        McpErrorCode, McpLogLevel, McpOutcome, McpRequestCancellation, McpResult,
-        NONCE_DOMAIN_MATERIAL_BYTES, NoOpElicitationSender, NoOpNotificationSender,
-        NoOpSamplingSender, NonceDomainMaterial, NotificationSender, Outcome, OutcomeExt,
-        ParseDurationError, PercentEncodingPolicy, ProgressReporter, PromptCaller,
-        PromptGetResult, PromptMessageItem, PromptMessageRole, ProtocolLimit, ProtocolLimits,
-        ProtocolLimitsBuilder, ProtocolLimitsError, QueryPolicy, RandomDrawError, RegionId,
-        ResourceContentItem, ResourceEndpointPathPolicy, ResourceReadResult, ResourceReader,
-        ResultExt, RootsProvider, SamplingRequest, SamplingRequestMessage, SamplingResponse,
-        SamplingRole, SamplingSender, SamplingStopReason, SECURITY_IDENTIFIER_BYTES,
-        SHA256_DIGEST_BYTES, SchemeHostCasePolicy, Scope, SecurityIdentifier, ServerCapabilityInfo,
-        SessionState, Sha256Digest, SyntaxViolationPolicy, TaskId, ToolCallResult, ToolCaller,
-        ToolContentItem, TrailingSlashPolicy, UriComponentState, UserinfoPolicy,
-        WEBSOCKET_MASK_BYTES, WebSocketMask, cancelled, draw_ephemeral_key_material,
-        draw_hmac_sha256_key, draw_nonce_domain_material, draw_security_identifier,
-        draw_websocket_mask, err, ok, parse_duration, sha256_bounded,
+        MAX_ACCESS_TOKEN_BYTES, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
+        McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpLogLevel,
+        McpOutcome, McpRequestCancellation, McpResult, NONCE_DOMAIN_MATERIAL_BYTES,
+        NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NonceDomainMaterial,
+        NotificationSender, Outcome, OutcomeExt, ParseDurationError, PercentEncodingPolicy,
+        ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole,
+        ProtocolLimit, ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QueryPolicy,
+        RandomDrawError, RegionId, ResourceContentItem, ResourceEndpointPathPolicy,
+        ResourceReadResult, ResourceReader, ResultExt, RootsProvider, SECURITY_IDENTIFIER_BYTES,
+        SHA256_DIGEST_BYTES, SamplingRequest, SamplingRequestMessage, SamplingResponse,
+        SamplingRole, SamplingSender, SamplingStopReason, SchemeHostCasePolicy, Scope,
+        SecurityIdentifier, ServerCapabilityInfo, SessionState, Sha256Digest,
+        SyntaxViolationPolicy, TaskId, ToolCallResult, ToolCaller, ToolContentItem,
+        TrailingSlashPolicy, UriComponentState, UserinfoPolicy, WEBSOCKET_MASK_BYTES,
+        WebSocketMask, cancelled, draw_ephemeral_key_material, draw_hmac_sha256_key,
+        draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, err, ok,
+        parse_duration, sha256_bounded,
     };
+    pub use fastmcp_core::{combinator, crypto, limits, logging, uri};
 }
 pub use fastmcp_derive as derive;
 /// Curated core protocol namespaces for advanced consumers.
