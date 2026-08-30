@@ -88231,6 +88231,7 @@ original = "value"
 
     #[derive(Debug, Clone)]
     struct StatePartitionRngScopedBody {
+        signature: TokenStream,
         body: Group,
         conditions: Vec<String>,
     }
@@ -88277,10 +88278,11 @@ original = "value"
             {
                 continue;
             }
-            let Some(TokenTree::Group(body)) = trees
+            let Some((body_index, TokenTree::Group(body))) = trees
                 .iter()
+                .enumerate()
                 .skip(index.saturating_add(2))
-                .find(|tree| {
+                .find(|(_, tree)| {
                     matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace)
                 })
             else {
@@ -88289,6 +88291,10 @@ original = "value"
             let attribute_anchor =
                 state_partition_rng_function_attribute_anchor(&trees, index);
             bodies.push(StatePartitionRngScopedBody {
+                signature: trees[index..body_index]
+                    .iter()
+                    .cloned()
+                    .collect::<TokenStream>(),
                 body: body.clone(),
                 conditions: source_item_attributes(&trees, attribute_anchor).conditions,
             });
@@ -88445,11 +88451,14 @@ original = "value"
         let mut protected_count = 0usize;
         let mut alias_count = 0usize;
         let mut exact_binding = false;
+        let mut has_core_root_glob = false;
         for route in &inventory.routes {
             let Some(leaves) = core_use_route_leaves(route) else {
                 return false;
             };
             for leaf in leaves {
+                has_core_root_glob |= leaf.glob
+                    && leaf.path.iter().map(String::as_str).eq(["fastmcp_core"]);
                 if leaf.path.iter().map(String::as_str).eq(["fastmcp_core", member]) {
                     protected_count = protected_count.saturating_add(1);
                     alias_count = alias_count.saturating_add(usize::from(leaf.alias.is_some()));
@@ -88467,6 +88476,7 @@ original = "value"
         protected_count == 1
             && alias_count == 0
             && exact_binding
+            && !has_core_root_glob
             && state_partition_rng_core_namespace_is_unshadowed(stream)
             && bindings.get(&binding_key).is_some_and(|candidates| candidates.len() == 1)
             && public_core_child_modules(&inventory, &[], member).is_empty()
@@ -88496,6 +88506,23 @@ original = "value"
                 .extern_crate_routes
                 .iter()
                 .any(|route| route.scope.is_empty() && route.alias == "fastmcp_core")
+    }
+
+    fn state_partition_rng_qualified_core_path_is_unshadowed(
+        stream: &TokenStream,
+        member: &str,
+    ) -> bool {
+        state_partition_rng_core_namespace_is_unshadowed(stream)
+            && stream.clone().into_iter().all(|tree| {
+                let TokenTree::Group(group) = tree else {
+                    return true;
+                };
+                state_partition_rng_path_count(&group.stream(), "fastmcp_core", member) == 0
+                    || state_partition_rng_qualified_core_path_is_unshadowed(
+                        &group.stream(),
+                        member,
+                    )
+            })
     }
 
     fn state_partition_rng_unqualified_draw_is_unshadowed(
@@ -89791,6 +89818,10 @@ original = "value"
             )
             || oauth_generate_token.len() != 1
             || !oauth_generate_token[0].conditions.is_empty()
+            || state_partition_rng_identifier_count(
+                &oauth_generate_token[0].signature,
+                "draw_security_identifier",
+            ) != 0
             || !state_partition_rng_gating_attribute_fingerprints(
                 &oauth_generate_token[0].body.stream(),
             )
@@ -89815,6 +89846,10 @@ original = "value"
             )
             || http_generate_session_id.len() != 1
             || !http_generate_session_id[0].conditions.is_empty()
+            || state_partition_rng_identifier_count(
+                &http_generate_session_id[0].signature,
+                "draw_security_identifier",
+            ) != 0
             || !state_partition_rng_gating_attribute_fingerprints(
                 &http_generate_session_id[0].body.stream(),
             )
@@ -89829,6 +89864,14 @@ original = "value"
             )
             || cli_create_retained_temp.len() != 1
             || !cli_create_retained_temp[0].conditions.is_empty()
+            || state_partition_rng_identifier_count(
+                &cli_create_retained_temp[0].signature,
+                "draw_security_identifier",
+            ) != 0
+            || state_partition_rng_identifier_count(
+                &cli_create_retained_temp[0].signature,
+                "fastmcp_core",
+            ) != 0
             || state_partition_rng_gating_attribute_fingerprints(
                 &cli_create_retained_temp[0].body.stream(),
             )
@@ -89854,6 +89897,10 @@ original = "value"
             || !state_partition_rng_core_namespace_is_unshadowed(
                 &cli_create_retained_temp[0].body.stream(),
             )
+            || !state_partition_rng_qualified_core_path_is_unshadowed(
+                &cli_linux_bodies[0].stream(),
+                "draw_security_identifier",
+            )
             || !state_partition_rng_production_import_is_exact(
                 &bidirectional.tokens,
                 "draw_security_identifier",
@@ -89863,6 +89910,10 @@ original = "value"
             || !bidirectional_allocate_request_state[0]
                 .conditions
                 .is_empty()
+            || state_partition_rng_identifier_count(
+                &bidirectional_allocate_request_state[0].signature,
+                "draw_security_identifier",
+            ) != 0
             || !state_partition_rng_gating_attribute_fingerprints(
                 &bidirectional_allocate_request_state[0].body.stream(),
             )
@@ -89882,6 +89933,10 @@ original = "value"
             )
             || tasks_generate_final_task_id.len() != 1
             || !tasks_generate_final_task_id[0].conditions.is_empty()
+            || state_partition_rng_identifier_count(
+                &tasks_generate_final_task_id[0].signature,
+                "draw_security_identifier",
+            ) != 0
             || !state_partition_rng_gating_attribute_fingerprints(
                 &tasks_generate_final_task_id[0].body.stream(),
             )
@@ -89908,6 +89963,10 @@ original = "value"
             || websocket_test_generate_mask.len() != 1
             || websocket_test_generate_mask[0].conditions.as_slice()
                 != std::slice::from_ref(&cfg_test)
+            || state_partition_rng_identifier_count(
+                &websocket_test_generate_mask[0].signature,
+                "draw_websocket_mask",
+            ) != 0
             || !state_partition_rng_gating_attribute_fingerprints(
                 &websocket_test_generate_mask[0].body.stream(),
             )
@@ -90346,6 +90405,18 @@ original = "value"
             "use fastmcp_core::draw_security_identifier as fnd01_draw_alias;\n\n/// Draws token material through the core security-identifier API.",
         );
         assert_consumer_topology_rejected(
+            "oauth-additive-core-glob",
+            "crates/fastmcp-server/src/oauth.rs",
+            "/// Draws token material through the core security-identifier API.",
+            "#[allow(unused_imports)]\nuse fastmcp_core::*;\n\n/// Draws token material through the core security-identifier API.",
+        );
+        assert_consumer_topology_rejected(
+            "oauth-signature-draw-shadow",
+            "crates/fastmcp-server/src/oauth.rs",
+            "fn generate_token() -> Result<String, OAuthError> {",
+            "fn generate_token(\n    draw_security_identifier: fn() -> Result<SecurityIdentifier, OAuthError>,\n) -> Result<String, OAuthError> {",
+        );
+        assert_consumer_topology_rejected(
             "http-production-draw-alias",
             "crates/fastmcp-transport/src/http.rs",
             "draw_security_identifier().map_err(|_| HttpSessionError::RandomnessUnavailable)?",
@@ -90360,8 +90431,8 @@ original = "value"
         assert_consumer_topology_rejected(
             "cli-local-core-shadow",
             "crates/fastmcp-cli/src/main.rs",
-            "fn create_retained_same_directory_temp(\n    parent: &SecuredParentDirectory,\n    final_snapshot: Option<&ExistingFileSnapshot>,\n    destination: &Path,\n    context: &str,\n    purpose: &str,\n) -> McpResult<RetainedStage> {\n    #[cfg(target_os = \"linux\")]",
-            "fn create_retained_same_directory_temp(\n    parent: &SecuredParentDirectory,\n    final_snapshot: Option<&ExistingFileSnapshot>,\n    destination: &Path,\n    context: &str,\n    purpose: &str,\n) -> McpResult<RetainedStage> {\n    use crate as fastmcp_core;\n\n    #[cfg(target_os = \"linux\")]",
+            "#[cfg(target_os = \"linux\")]\n    {\n        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};",
+            "#[cfg(target_os = \"linux\")]\n    {\n        use crate as fastmcp_core;\n        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};",
         );
         assert_consumer_topology_rejected(
             "bidirectional-production-draw-alias",
