@@ -2171,6 +2171,7 @@ fn legacy_adapter_response<H: Legacy2024Handler>(
     block_on(legacy_adapter_response_async(adapter, binding, request))
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 async fn legacy_adapter_response_async<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,
