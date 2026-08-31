@@ -51058,10 +51058,14 @@ activate = 1\n";
         inventory: &'a PublicCoreRouteInventory,
         scope: &[String],
         name: &str,
+        reference_conditions: &[String],
     ) -> Vec<&'a PublicCoreModule> {
         public_core_child_modules(inventory, scope, name)
             .into_iter()
-            .filter(|module| !public_core_conditions_are_provably_false(&module.conditions))
+            .filter(|module| {
+                !public_core_conditions_are_provably_false(&module.conditions)
+                    || public_core_conditions_are_provably_false(reference_conditions)
+            })
             .collect()
     }
 
@@ -51107,7 +51111,8 @@ activate = 1\n";
             return Err(());
         }
         let use_candidates = bindings.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-        let module_candidates = public_core_module_candidates(inventory, scope, name);
+        let module_candidates =
+            public_core_module_candidates(inventory, scope, name, reference_conditions);
         let extern_candidates = inventory
             .extern_crate_routes
             .iter()
@@ -51341,6 +51346,7 @@ activate = 1\n";
                         inventory,
                         &base_scope,
                         head,
+                        &leaf.conditions,
                     )
                     .is_empty()
                     || !public_core_native_item_candidates(
@@ -51692,7 +51698,7 @@ activate = 1\n";
 
     fn public_core_export_route_set_is_exact(stream: &TokenStream, member: &str) -> bool {
         let inventory = public_core_route_inventory(stream);
-        if !public_core_module_candidates(&inventory, &[], "fastmcp_core").is_empty() {
+        if !public_core_module_candidates(&inventory, &[], "fastmcp_core", &[]).is_empty() {
             return false;
         }
         for route in inventory
@@ -91410,8 +91416,13 @@ original = "value"
                         "{member}/{label}: the dormant local module must remain inventoried"
                     );
                     assert!(
-                        public_core_module_candidates(&dormant_inventory, &[], "fastmcp_core")
-                            .is_empty(),
+                        public_core_module_candidates(
+                            &dormant_inventory,
+                            &[],
+                            "fastmcp_core",
+                            &[],
+                        )
+                        .is_empty(),
                         "{member}/{label}: exact cfg(any()) must be the sole suppressed module candidate"
                     );
                 }
@@ -91476,7 +91487,13 @@ original = "value"
                     "{member}/{label}: the active local module must remain inventoried"
                 );
                 assert_eq!(
-                    public_core_module_candidates(&active_inventory, &[], "fastmcp_core").len(),
+                    public_core_module_candidates(
+                        &active_inventory,
+                        &[],
+                        "fastmcp_core",
+                        &[],
+                    )
+                    .len(),
                     1,
                     "{member}/{label}: the active local module must compete with the extern-prelude route"
                 );
@@ -91577,7 +91594,7 @@ original = "value"
                 (
                     "private-inline-alias-cycle",
                     format!(
-                        "\n#[cfg(any())]\nmod fnd01_{member}_cycle_one {{ pub use crate::fnd01_{member}_cycle_two::payload; }}\n#[cfg(any())]\nmod fnd01_{member}_cycle_two {{ pub use crate::fnd01_{member}_cycle_one::payload; }}\n#[cfg(any())]\npub use fnd01_{member}_cycle_one::payload as fnd01_{member}_cycle_exposed;\n"
+                        "\n#[cfg(any())]\nmod fnd01_{member}_cycle_one {{ pub use crate::fnd01_{member}_cycle_two::payload; }}\n#[cfg(any())]\nmod fnd01_{member}_cycle_two {{ pub use crate::fnd01_{member}_cycle_one::payload; }}\n#[cfg(any())]\n#[cfg(all())]\npub use fnd01_{member}_cycle_one::payload as fnd01_{member}_cycle_exposed;\n"
                     ),
                 ),
                 (
