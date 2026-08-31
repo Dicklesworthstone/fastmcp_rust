@@ -87748,6 +87748,10 @@ original = "value"
         Diagnostic::error("E_STATE_PARTITION_RNG_INVENTORY", "state-partition-rng").at(path)
     }
 
+    fn state_partition_rng_is_rust_source_name(name: &str) -> bool {
+        name.strip_suffix(".rs").is_some()
+    }
+
     fn load_state_partition_rng_rust_source(
         inventory: &mut StatePartitionRngInventory,
         logical_path: String,
@@ -87809,7 +87813,7 @@ original = "value"
             }
             if metadata.is_dir() {
                 collect_state_partition_rng_workspace_inventory(inventory, root, &logical_path)?;
-            } else if metadata.is_file() && name.strip_suffix(".rs").is_some() {
+            } else if metadata.is_file() && state_partition_rng_is_rust_source_name(&name) {
                 load_state_partition_rng_rust_source(inventory, logical_path, &absolute_path)?;
             } else if metadata.is_file() && name == "Cargo.toml" {
                 let manifest = fs::read_to_string(&absolute_path)
@@ -88208,7 +88212,7 @@ original = "value"
                     rust_sources,
                     manifests,
                 )?;
-            } else if metadata.is_file() && name.ends_with(".rs") {
+            } else if metadata.is_file() && state_partition_rng_is_rust_source_name(&name) {
                 if !rust_sources.insert(logical_path.clone()) {
                     return Err(state_partition_rng_inventory_error(format!(
                         "duplicate:{logical_path}"
@@ -88618,10 +88622,7 @@ original = "value"
             else {
                 continue;
             };
-            let header = trees[index.saturating_add(1)..body_index]
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            let header = trees[index.saturating_add(1)..body_index].to_vec();
             if token_trees_fingerprint(&header) != expected_header_fingerprint {
                 continue;
             }
@@ -90531,6 +90532,14 @@ original = "value"
     #[test]
     fn fnd_01_state_partition_rng_rejects_direct_getrandom_planted_negative() {
         eprintln!("FND01|Progress|state-partition-rng|negative|start");
+        assert!(
+            state_partition_rng_is_rust_source_name(".rs"),
+            "the exact Rust-source predicate must retain the admitted dotfile boundary"
+        );
+        assert!(
+            !state_partition_rng_is_rust_source_name(".RS"),
+            "the exact Rust-source predicate must remain case-sensitive"
+        );
         let baseline = state_partition_rng_inventory()
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         validate_state_partition_rng_seam(&baseline)
