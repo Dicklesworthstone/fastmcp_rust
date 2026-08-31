@@ -52099,20 +52099,6 @@ activate = 1\n";
         }
     }
 
-    fn validate_facade_integration_source_text(
-        text: &str,
-        rule: &ParsedIntegrationSourceRule,
-        logical: &str,
-    ) -> VResult<()> {
-        let source = ParsedRustSource {
-            bytes: text.as_bytes().to_vec(),
-            tokens: TokenStream::from_str(text).map_err(|error| {
-                Diagnostic::error("E_INTEGRATION_SOURCE_PARSE", logical).at(error.to_string())
-            })?,
-        };
-        validate_facade_integration_source_rule_dispatch(&[&source], rule, logical)
-    }
-
     fn validate_integration_source_rule_semantics(
         root: &Path,
         receipt: &ParsedWorkspaceReceiptSummary,
@@ -87747,6 +87733,7 @@ original = "value"
     struct StatePartitionRngRustSource {
         text: String,
         tokens: TokenStream,
+        parsed_text_sha256: [u8; 32],
     }
 
     #[derive(Clone)]
@@ -87771,11 +87758,16 @@ original = "value"
         let tokens = TokenStream::from_str(&text).map_err(|error| {
             state_partition_rng_inventory_error(format!("{logical_path}:{error}"))
         })?;
+        let parsed_text_sha256 = Sha256::digest(text.as_bytes()).into();
         if inventory
             .rust_sources
             .insert(
                 logical_path.clone(),
-                StatePartitionRngRustSource { text, tokens },
+                StatePartitionRngRustSource {
+                    text,
+                    tokens,
+                    parsed_text_sha256,
+                },
             )
             .is_some()
         {
@@ -87851,39 +87843,12 @@ original = "value"
             fs::read_to_string(root_manifest)
                 .map_err(|_| state_partition_rng_inventory_error("Cargo.toml"))?,
         );
-        let root_value = toml::from_str::<toml::Value>(
+        inventory.member_roots = state_partition_rng_manifest_member_roots(
             inventory
                 .manifests
                 .get("Cargo.toml")
                 .expect("root manifest was just inserted"),
-        )
-        .map_err(|_| state_partition_rng_inventory_error("Cargo.toml"))?;
-        let members = root_value
-            .get("workspace")
-            .and_then(toml::Value::as_table)
-            .and_then(|workspace| workspace.get("members"))
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| state_partition_rng_inventory_error("Cargo.toml:workspace.members"))?;
-        for member in members {
-            let member = member
-                .as_str()
-                .filter(|member| {
-                    member.starts_with("crates/")
-                        && !member.contains('*')
-                        && !Path::new(member).is_absolute()
-                        && Path::new(member)
-                            .components()
-                            .all(|component| matches!(component, std::path::Component::Normal(_)))
-                })
-                .ok_or_else(|| {
-                    state_partition_rng_inventory_error("Cargo.toml:workspace.members")
-                })?;
-            if !inventory.member_roots.insert(member.to_owned()) {
-                return Err(state_partition_rng_inventory_error(format!(
-                    "duplicate:{member}"
-                )));
-            }
-        }
+        )?;
         for member in inventory.member_roots.clone() {
             collect_state_partition_rng_workspace_inventory(&mut inventory, &root, &member)?;
         }
@@ -88112,6 +88077,262 @@ original = "value"
         inventory.rust_sources.get(path).ok_or_else(|| {
             Diagnostic::error("E_STATE_PARTITION_RNG_INVENTORY", "state-partition-rng").at(path)
         })
+    }
+
+    fn state_partition_rng_append_rust_source_fragment(
+        source: &mut StatePartitionRngRustSource,
+        fragment: &str,
+        logical: &str,
+    ) -> VResult<()> {
+        if !state_partition_rng_rust_source_tokens_are_current(source) {
+            return Err(state_partition_rng_inventory_error(format!(
+                "{logical}:text-token-sync"
+            )));
+        }
+        if !source.text.ends_with('\n') || !fragment.starts_with('\n') {
+            return Err(state_partition_rng_inventory_error(format!(
+                "{logical}:fragment-separator"
+            )));
+        }
+        let fragment_tokens = TokenStream::from_str(fragment).map_err(|error| {
+            state_partition_rng_inventory_error(format!("{logical}:fragment:{error}"))
+        })?;
+        let mut appended_text = source.text.clone();
+        let original_text_len = appended_text.len();
+        let original_root_token_count = source.tokens.clone().into_iter().count();
+        let fragment_root_token_count = fragment_tokens.clone().into_iter().count();
+        let expected_root_token_count = original_root_token_count
+            .checked_add(fragment_root_token_count)
+            .ok_or_else(|| state_partition_rng_inventory_error(format!("{logical}:tokens")))?;
+        let mut appended_tokens = source.tokens.clone();
+        appended_text.push_str(fragment);
+        appended_tokens.extend(fragment_tokens);
+        if appended_text.get(original_text_len..) != Some(fragment)
+            || appended_tokens.clone().into_iter().count() != expected_root_token_count
+        {
+            return Err(state_partition_rng_inventory_error(format!(
+                "{logical}:text-token-sync"
+            )));
+        }
+        let parsed_text_sha256 = Sha256::digest(appended_text.as_bytes()).into();
+        source.text = appended_text;
+        source.tokens = appended_tokens;
+        source.parsed_text_sha256 = parsed_text_sha256;
+        Ok(())
+    }
+
+    fn state_partition_rng_replace_rust_source_text(
+        source: &mut StatePartitionRngRustSource,
+        replacement_text: String,
+        logical: &str,
+    ) -> VResult<()> {
+        if !state_partition_rng_rust_source_tokens_are_current(source) {
+            return Err(state_partition_rng_inventory_error(format!(
+                "{logical}:text-token-sync"
+            )));
+        }
+        let tokens = TokenStream::from_str(&replacement_text).map_err(|error| {
+            state_partition_rng_inventory_error(format!("{logical}:source:{error}"))
+        })?;
+        let parsed_text_sha256 = Sha256::digest(replacement_text.as_bytes()).into();
+        source.text = replacement_text;
+        source.tokens = tokens;
+        source.parsed_text_sha256 = parsed_text_sha256;
+        Ok(())
+    }
+
+    fn state_partition_rng_rust_source_tokens_are_current(
+        source: &StatePartitionRngRustSource,
+    ) -> bool {
+        let current_text_sha256: [u8; 32] = Sha256::digest(source.text.as_bytes()).into();
+        source.parsed_text_sha256 == current_text_sha256
+    }
+
+    fn validate_state_partition_rng_facade_integration_source(
+        source: &StatePartitionRngRustSource,
+        rule: &ParsedIntegrationSourceRule,
+        logical: &str,
+    ) -> VResult<()> {
+        if !state_partition_rng_rust_source_tokens_are_current(source) {
+            return Err(state_partition_rng_inventory_error(format!(
+                "{logical}:text-token-sync"
+            )));
+        }
+        let parsed = ParsedRustSource {
+            bytes: source.text.as_bytes().to_vec(),
+            tokens: source.tokens.clone(),
+        };
+        validate_facade_integration_source_rule_dispatch(&[&parsed], rule, logical)
+    }
+
+    fn collect_state_partition_rng_disk_paths(
+        root: &Path,
+        logical_directory: &str,
+        rust_sources: &mut BTreeSet<String>,
+        manifests: &mut BTreeSet<String>,
+    ) -> VResult<()> {
+        let directory = root.join(logical_directory);
+        let directory_metadata = fs::symlink_metadata(&directory)
+            .map_err(|_| state_partition_rng_inventory_error(logical_directory))?;
+        if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+            return Err(state_partition_rng_inventory_error(format!(
+                "fresh:{logical_directory}"
+            )));
+        }
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|_| state_partition_rng_inventory_error(logical_directory))?
+            .map(|entry| {
+                let entry =
+                    entry.map_err(|_| state_partition_rng_inventory_error(logical_directory))?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| state_partition_rng_inventory_error(logical_directory))?;
+                Ok((name, entry.path()))
+            })
+            .collect::<VResult<Vec<_>>>()?;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, absolute_path) in entries {
+            let logical_path = format!("{logical_directory}/{name}");
+            let metadata = fs::symlink_metadata(&absolute_path)
+                .map_err(|_| state_partition_rng_inventory_error(&logical_path))?;
+            if metadata.file_type().is_symlink() {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "symlink:{logical_path}"
+                )));
+            }
+            if metadata.is_dir() {
+                collect_state_partition_rng_disk_paths(
+                    root,
+                    &logical_path,
+                    rust_sources,
+                    manifests,
+                )?;
+            } else if metadata.is_file() && name.ends_with(".rs") {
+                if !rust_sources.insert(logical_path.clone()) {
+                    return Err(state_partition_rng_inventory_error(format!(
+                        "duplicate:{logical_path}"
+                    )));
+                }
+            } else if metadata.is_file() && name == "Cargo.toml" {
+                if !manifests.insert(logical_path.clone()) {
+                    return Err(state_partition_rng_inventory_error(format!(
+                        "duplicate:{logical_path}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn state_partition_rng_manifest_member_roots(
+        root_manifest: &str,
+    ) -> VResult<BTreeSet<String>> {
+        let root_value = toml::from_str::<toml::Value>(root_manifest)
+            .map_err(|_| state_partition_rng_inventory_error("Cargo.toml"))?;
+        let members = root_value
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("members"))
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| state_partition_rng_inventory_error("Cargo.toml:workspace.members"))?;
+        let mut member_roots = BTreeSet::new();
+        for member in members {
+            let member = member
+                .as_str()
+                .filter(|member| {
+                    member.starts_with("crates/")
+                        && !member.contains('*')
+                        && !Path::new(member).is_absolute()
+                        && Path::new(member)
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_)))
+                })
+                .ok_or_else(|| {
+                    state_partition_rng_inventory_error("Cargo.toml:workspace.members")
+                })?;
+            if !member_roots.insert(member.to_owned()) {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "duplicate:{member}"
+                )));
+            }
+        }
+        Ok(member_roots)
+    }
+
+    fn validate_state_partition_rng_inventory_matches_disk(
+        inventory: &StatePartitionRngInventory,
+    ) -> VResult<()> {
+        let root = repository_root();
+        let validate_file = |logical_path: &str, expected: &str| -> VResult<()> {
+            let absolute_path = root.join(logical_path);
+            let metadata = fs::symlink_metadata(&absolute_path)
+                .map_err(|_| state_partition_rng_inventory_error(logical_path))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "fresh:{logical_path}"
+                )));
+            }
+            let observed = fs::read_to_string(&absolute_path)
+                .map_err(|_| state_partition_rng_inventory_error(logical_path))?;
+            if observed != expected {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "changed:{logical_path}"
+                )));
+            }
+            Ok(())
+        };
+        validate_file("Cargo.lock", &inventory.cargo_lock)?;
+        let root_manifest = inventory
+            .manifests
+            .get("Cargo.toml")
+            .ok_or_else(|| state_partition_rng_inventory_error("Cargo.toml"))?;
+        validate_file("Cargo.toml", root_manifest)?;
+        if state_partition_rng_manifest_member_roots(root_manifest)? != inventory.member_roots {
+            return Err(state_partition_rng_inventory_error(
+                "fresh:workspace-member-roots",
+            ));
+        }
+        let mut observed_rust_sources = BTreeSet::new();
+        let mut observed_manifests = BTreeSet::from(["Cargo.toml".to_owned()]);
+        for member in &inventory.member_roots {
+            collect_state_partition_rng_disk_paths(
+                &root,
+                member,
+                &mut observed_rust_sources,
+                &mut observed_manifests,
+            )?;
+        }
+        let expected_rust_sources = inventory
+            .rust_sources
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_manifests = inventory
+            .manifests
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if observed_rust_sources != expected_rust_sources {
+            return Err(state_partition_rng_inventory_error(
+                "fresh:workspace-rust-source-paths",
+            ));
+        }
+        if observed_manifests != expected_manifests {
+            return Err(state_partition_rng_inventory_error(
+                "fresh:workspace-manifest-paths",
+            ));
+        }
+        for (logical_path, expected) in &inventory.manifests {
+            if logical_path == "Cargo.toml" {
+                continue;
+            }
+            validate_file(logical_path, expected)?;
+        }
+        for (logical_path, expected) in &inventory.rust_sources {
+            validate_file(logical_path, &expected.text)?;
+        }
+        Ok(())
     }
 
     fn state_partition_rng_method_body(
@@ -89645,6 +89866,13 @@ original = "value"
     }
 
     fn validate_state_partition_rng_seam(inventory: &StatePartitionRngInventory) -> VResult<()> {
+        for (path, source) in &inventory.rust_sources {
+            if !state_partition_rng_rust_source_tokens_are_current(source) {
+                return Err(state_partition_rng_inventory_error(format!(
+                    "{path}:text-token-sync"
+                )));
+            }
+        }
         validate_state_partition_rng_manifest_ownership(inventory)?;
         let state = state_partition_rng_source(inventory, "crates/fastmcp-core/src/state.rs")?;
         let crypto = state_partition_rng_source(inventory, "crates/fastmcp-core/src/crypto.rs")?;
@@ -90250,9 +90478,12 @@ original = "value"
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for harmless route planting");
-            harmless_facade.text.push_str(harmless_route);
-            harmless_facade.tokens = TokenStream::from_str(&harmless_facade.text)
-                .expect("the harmless route remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                harmless_facade,
+                harmless_route,
+                &format!("positive/{label}"),
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             let mut expected_harmless_facade_text = baseline_facade.text.clone();
             expected_harmless_facade_text.push_str(harmless_route);
             assert_eq!(harmless_facade.text, expected_harmless_facade_text, "{label}");
@@ -90283,11 +90514,11 @@ original = "value"
                 "the {label} facade digest must differ from the pristine baseline"
             );
 
-            let fresh = state_partition_rng_inventory()
+            validate_state_partition_rng_inventory_matches_disk(&inventory)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-            validate_state_partition_rng_seam(&fresh)
+            validate_state_partition_rng_seam(&inventory)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-            let fresh_facade = state_partition_rng_source(&fresh, facade_path)
+            let fresh_facade = state_partition_rng_source(&inventory, facade_path)
                 .expect("fresh pristine facade remains present after harmless validation");
             assert_eq!(fresh_facade.text, baseline_facade.text, "{label}");
             let fresh_facade_digest: [u8; 32] =
@@ -90314,28 +90545,175 @@ original = "value"
             Sha256::digest(baseline_facade.text.as_bytes()).into();
         let baseline_other_input_digest = state_partition_rng_other_input_digest(&baseline);
         let assert_fresh_baseline = || {
-            let fresh = state_partition_rng_inventory()
+            validate_state_partition_rng_inventory_matches_disk(&baseline)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-            validate_state_partition_rng_seam(&fresh)
+            validate_state_partition_rng_seam(&baseline)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             let fresh_state =
-                state_partition_rng_source(&fresh, "crates/fastmcp-core/src/state.rs")
+                state_partition_rng_source(&baseline, "crates/fastmcp-core/src/state.rs")
                     .expect("fresh state source is present");
             assert_eq!(fresh_state.text, baseline_state.text);
             let fresh_state_digest: [u8; 32] = Sha256::digest(fresh_state.text.as_bytes()).into();
             assert_eq!(fresh_state_digest, baseline_state_digest);
-            let fresh_facade = state_partition_rng_source(&fresh, "crates/fastmcp/src/lib.rs")
+            let fresh_facade = state_partition_rng_source(&baseline, "crates/fastmcp/src/lib.rs")
                 .expect("fresh facade source is present");
             assert_eq!(fresh_facade.text, baseline_facade.text);
             let fresh_facade_digest: [u8; 32] =
                 Sha256::digest(fresh_facade.text.as_bytes()).into();
             assert_eq!(fresh_facade_digest, baseline_facade_digest);
             assert_eq!(
-                state_partition_rng_other_input_digest(&fresh),
+                state_partition_rng_other_input_digest(&baseline),
                 baseline_other_input_digest,
                 "fresh inventory must retain the baseline non-state domain"
             );
         };
+
+        let mut deleted_source_path_planted = baseline.clone();
+        deleted_source_path_planted
+            .rust_sources
+            .remove("crates/fastmcp-server/src/oauth.rs")
+            .expect("the topology deletion plant removes one baseline Rust source path");
+        let deleted_source_path_digest = state_partition_rng_input_digest_excluding_paths(
+            &deleted_source_path_planted,
+            &[],
+        );
+        let deleted_source_path_error =
+            validate_state_partition_rng_inventory_matches_disk(&deleted_source_path_planted)
+                .expect_err("a deleted Rust source inventory path must fail closed");
+        assert_eq!(
+            deleted_source_path_error.code,
+            "E_STATE_PARTITION_RNG_INVENTORY"
+        );
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(&deleted_source_path_planted, &[]),
+            deleted_source_path_digest,
+            "path-set validation must not mutate the rejected deletion plant"
+        );
+        assert_fresh_baseline();
+
+        let mut added_source_path_planted = baseline.clone();
+        let added_source = baseline_state.clone();
+        assert!(
+            added_source_path_planted
+                .rust_sources
+                .insert(
+                    "crates/fastmcp-core/src/fnd01_unexpected_source.rs".to_owned(),
+                    added_source,
+                )
+                .is_none(),
+            "the topology addition plant introduces one new Rust source path"
+        );
+        let added_source_path_digest =
+            state_partition_rng_input_digest_excluding_paths(&added_source_path_planted, &[]);
+        let added_source_path_error =
+            validate_state_partition_rng_inventory_matches_disk(&added_source_path_planted)
+                .expect_err("an added Rust source inventory path must fail closed");
+        assert_eq!(
+            added_source_path_error.code,
+            "E_STATE_PARTITION_RNG_INVENTORY"
+        );
+        assert_eq!(
+            state_partition_rng_input_digest_excluding_paths(&added_source_path_planted, &[]),
+            added_source_path_digest,
+            "path-set validation must not mutate the rejected addition plant"
+        );
+        assert_fresh_baseline();
+
+        let mut stale_tokens_planted = baseline.clone();
+        let stale_state = stale_tokens_planted
+            .rust_sources
+            .get_mut("crates/fastmcp-core/src/state.rs")
+            .expect("state source is present for stale-token planting");
+        let stale_parsed_digest = stale_state.parsed_text_sha256;
+        let stale_token_fingerprint =
+            token_trees_fingerprint(&stale_state.tokens.clone().into_iter().collect::<Vec<_>>());
+        stale_state
+            .text
+            .push_str("\nconst FND01_STALE_TOKEN_BYPASS: () = ();\n");
+        let stale_text_before_validation = stale_state.text.clone();
+        let stale_text_digest: [u8; 32] =
+            Sha256::digest(stale_text_before_validation.as_bytes()).into();
+        assert_ne!(stale_text_digest, stale_parsed_digest);
+        let stale_error = validate_state_partition_rng_seam(&stale_tokens_planted)
+            .expect_err("text changed without matching cached tokens must fail closed");
+        assert_eq!(stale_error.code, "E_STATE_PARTITION_RNG_INVENTORY");
+        let rejected_stale_state = state_partition_rng_source(
+            &stale_tokens_planted,
+            "crates/fastmcp-core/src/state.rs",
+        )
+        .expect("rejected stale-token source remains present");
+        assert_eq!(rejected_stale_state.text, stale_text_before_validation);
+        assert_eq!(rejected_stale_state.parsed_text_sha256, stale_parsed_digest);
+        assert_eq!(
+            token_trees_fingerprint(
+                &rejected_stale_state
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ),
+            stale_token_fingerprint,
+            "rejected stale-token validation must not mutate cached tokens"
+        );
+        assert_eq!(
+            state_partition_rng_other_input_digest(&stale_tokens_planted),
+            baseline_other_input_digest,
+            "stale-token plant must not alter another inventory input"
+        );
+        assert_fresh_baseline();
+
+        let mut parse_failure_planted = baseline.clone();
+        let parse_failure_state = parse_failure_planted
+            .rust_sources
+            .get_mut("crates/fastmcp-core/src/state.rs")
+            .expect("state source is present for parse-failure planting");
+        let parse_failure_text = parse_failure_state.text.clone();
+        let parse_failure_digest = parse_failure_state.parsed_text_sha256;
+        let parse_failure_token_fingerprint = token_trees_fingerprint(
+            &parse_failure_state
+                .tokens
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        let parse_failure_error = state_partition_rng_append_rust_source_fragment(
+            parse_failure_state,
+            "\npub mod fnd01_parse_failure {\n",
+            "parse-failure-atomicity",
+        )
+        .expect_err("an unclosed appended Rust fragment must reject before mutation");
+        assert_eq!(parse_failure_error.code, "E_STATE_PARTITION_RNG_INVENTORY");
+        let mut invalid_replacement_text = parse_failure_text.clone();
+        invalid_replacement_text.push_str("\npub mod fnd01_replacement_parse_failure {\n");
+        let replacement_parse_failure_error = state_partition_rng_replace_rust_source_text(
+            parse_failure_state,
+            invalid_replacement_text,
+            "replacement-parse-failure-atomicity",
+        )
+        .expect_err("an unclosed replacement Rust source must reject before mutation");
+        assert_eq!(
+            replacement_parse_failure_error.code,
+            "E_STATE_PARTITION_RNG_INVENTORY"
+        );
+        assert_eq!(parse_failure_state.text, parse_failure_text);
+        assert_eq!(parse_failure_state.parsed_text_sha256, parse_failure_digest);
+        assert_eq!(
+            token_trees_fingerprint(
+                &parse_failure_state
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ),
+            parse_failure_token_fingerprint,
+            "failed fragment parsing must leave cached tokens unchanged"
+        );
+        assert_eq!(
+            state_partition_rng_other_input_digest(&parse_failure_planted),
+            baseline_other_input_digest,
+            "parse-failure plant must not alter another inventory input"
+        );
+        assert_fresh_baseline();
 
         for (label, harmless_route) in [
             (
@@ -90358,9 +90736,12 @@ original = "value"
                 .rust_sources
                 .get_mut("crates/fastmcp/src/lib.rs")
                 .expect("facade source is present for sealed route planting");
-            sealed_facade.text.push_str(&sealed_route);
-            sealed_facade.tokens = TokenStream::from_str(&sealed_facade.text)
-                .expect("the sealed route remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                sealed_facade,
+                &sealed_route,
+                &format!("sealed/{label}"),
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             assert_eq!(
                 state_partition_rng_input_digest_excluding(
                     &sealed_planted,
@@ -90388,12 +90769,12 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp/src/lib.rs")
             .expect("facade source is present for active private-glob cycle planting");
-        active_private_glob_facade
-            .text
-            .push_str(active_private_glob_cycle);
-        active_private_glob_facade.tokens =
-            TokenStream::from_str(&active_private_glob_facade.text)
-                .expect("the active private-glob cycle remains tokenizable");
+        state_partition_rng_append_rust_source_fragment(
+            active_private_glob_facade,
+            active_private_glob_cycle,
+            "active-private-glob-cycle",
+        )
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_input_digest_excluding(
                 &active_private_glob_planted,
@@ -90420,9 +90801,12 @@ original = "value"
                 .rust_sources
                 .get_mut("crates/fastmcp/src/lib.rs")
                 .expect("facade source is present for native-route planting");
-            route_facade.text.push_str(planted_route);
-            route_facade.tokens = TokenStream::from_str(&route_facade.text)
-                .expect("the native-route control remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                route_facade,
+                planted_route,
+                label,
+            )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             let mut expected_facade_text = baseline_facade.text.clone();
             expected_facade_text.push_str(planted_route);
             assert_eq!(route_facade.text, expected_facade_text, "{label}");
@@ -90502,9 +90886,12 @@ original = "value"
                     .rust_sources
                     .get_mut(path)
                     .expect("sealed consumer source is present for topology planting");
-                planted_consumer.text.clone_from(&expected_consumer_text);
-                planted_consumer.tokens = TokenStream::from_str(&planted_consumer.text)
-                    .expect("the sealed-consumer topology mutation remains tokenizable");
+                state_partition_rng_replace_rust_source_text(
+                    planted_consumer,
+                    expected_consumer_text.clone(),
+                    label,
+                )
+                    .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
                 let planted_digest_before: [u8; 32] =
                     Sha256::digest(planted_consumer.text.as_bytes()).into();
                 assert_eq!(
@@ -90638,12 +91025,17 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present in the workspace inventory");
-        state.text.insert_str(
-        insertion + 1,
-        " let mut fnd01_planted_bytes = [0_u8; 1]; let _ = getrandom::fill(&mut fnd01_planted_bytes);",
-    );
-        state.tokens = TokenStream::from_str(&state.text)
-            .expect("the one-change planted state source remains tokenizable");
+        let mut planted_state_text = state.text.clone();
+        planted_state_text.insert_str(
+            insertion + 1,
+            " let mut fnd01_planted_bytes = [0_u8; 1]; let _ = getrandom::fill(&mut fnd01_planted_bytes);",
+        );
+        state_partition_rng_replace_rust_source_text(
+            state,
+            planted_state_text,
+            "direct-getrandom",
+        )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_other_input_digest(&planted),
             baseline_other_input_digest,
@@ -90656,20 +91048,7 @@ original = "value"
         "FND01|Error|E_STATE_PARTITION_DIRECT_GETRANDOM|state-partition-rng|crates/fastmcp-core/src/state.rs"
     );
 
-        let fresh = state_partition_rng_inventory()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        validate_state_partition_rng_seam(&fresh)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let fresh_state = state_partition_rng_source(&fresh, "crates/fastmcp-core/src/state.rs")
-            .expect("fresh state source is present");
-        assert_eq!(fresh_state.text, baseline_state.text);
-        let fresh_state_digest: [u8; 32] = Sha256::digest(fresh_state.text.as_bytes()).into();
-        assert_eq!(fresh_state_digest, baseline_state_digest);
-        assert_eq!(
-            state_partition_rng_other_input_digest(&fresh),
-            baseline_other_input_digest,
-            "fresh inventory must retain the baseline non-state domain"
-        );
+        assert_fresh_baseline();
 
         let signature_marker = "Result<[u8; CACHE_PARTITION_BYTES], E>";
         let signature_offset = baseline_state
@@ -90681,12 +91060,17 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present in the workspace inventory");
-        signature_state.text.replace_range(
+        let mut signature_state_text = signature_state.text.clone();
+        signature_state_text.replace_range(
             signature_offset..signature_offset + signature_marker.len(),
             "std::result::Result<[u8; CACHE_PARTITION_BYTES], E>",
         );
-        signature_state.tokens = TokenStream::from_str(&signature_state.text)
-            .expect("the one-change planted signature remains tokenizable");
+        state_partition_rng_replace_rust_source_text(
+            signature_state,
+            signature_state_text,
+            "signature",
+        )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_other_input_digest(&signature_planted),
             baseline_other_input_digest,
@@ -90699,34 +91083,24 @@ original = "value"
         "FND01|Error|E_STATE_PARTITION_RNG_SEAM_SIGNATURE|state-partition-rng|crates/fastmcp-core/src/state.rs"
     );
 
-        let signature_fresh = state_partition_rng_inventory()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        validate_state_partition_rng_seam(&signature_fresh)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let signature_fresh_state =
-            state_partition_rng_source(&signature_fresh, "crates/fastmcp-core/src/state.rs")
-                .expect("fresh state source is present after signature plant");
-        assert_eq!(signature_fresh_state.text, baseline_state.text);
-        let signature_fresh_digest: [u8; 32] =
-            Sha256::digest(signature_fresh_state.text.as_bytes()).into();
-        assert_eq!(signature_fresh_digest, baseline_state_digest);
-        assert_eq!(
-            state_partition_rng_other_input_digest(&signature_fresh),
-            baseline_other_input_digest,
-            "fresh inventory must retain the baseline non-state domain after signature plant"
-        );
+        assert_fresh_baseline();
 
         let mut raw_identifier_planted = baseline.clone();
         let raw_identifier_state = raw_identifier_planted
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present for raw-identifier planting");
-        raw_identifier_state.text.insert_str(
-        insertion + 1,
-        " let mut fnd01_raw_identifier_bytes = [0_u8; 1]; let _ = r#getrandom::fill(&mut fnd01_raw_identifier_bytes);",
-    );
-        raw_identifier_state.tokens = TokenStream::from_str(&raw_identifier_state.text)
-            .expect("the raw-identifier planted state source remains tokenizable");
+        let mut raw_identifier_state_text = raw_identifier_state.text.clone();
+        raw_identifier_state_text.insert_str(
+            insertion + 1,
+            " let mut fnd01_raw_identifier_bytes = [0_u8; 1]; let _ = r#getrandom::fill(&mut fnd01_raw_identifier_bytes);",
+        );
+        state_partition_rng_replace_rust_source_text(
+            raw_identifier_state,
+            raw_identifier_state_text,
+            "raw-getrandom",
+        )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_other_input_digest(&raw_identifier_planted),
             baseline_other_input_digest,
@@ -90739,22 +91113,7 @@ original = "value"
         "FND01|Error|E_STATE_PARTITION_DIRECT_GETRANDOM|state-partition-rng|crates/fastmcp-core/src/state.rs"
     );
 
-        let raw_identifier_fresh = state_partition_rng_inventory()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        validate_state_partition_rng_seam(&raw_identifier_fresh)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let raw_identifier_fresh_state =
-            state_partition_rng_source(&raw_identifier_fresh, "crates/fastmcp-core/src/state.rs")
-                .expect("fresh state source is present after raw-identifier plant");
-        assert_eq!(raw_identifier_fresh_state.text, baseline_state.text);
-        let raw_identifier_fresh_digest: [u8; 32] =
-            Sha256::digest(raw_identifier_fresh_state.text.as_bytes()).into();
-        assert_eq!(raw_identifier_fresh_digest, baseline_state_digest);
-        assert_eq!(
-            state_partition_rng_other_input_digest(&raw_identifier_fresh),
-            baseline_other_input_digest,
-            "fresh inventory must retain the baseline non-state domain after raw-identifier plant"
-        );
+        assert_fresh_baseline();
 
         let unlisted_method_offset = baseline_state
             .text
@@ -90765,12 +91124,17 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present for sealed-draw planting");
-        sealed_draw_state.text.insert_str(
-        unlisted_method_offset,
-        "\n    fn fnd01_unlisted_private_draw() { let _ = crate::crypto::draw_security_identifier(); }\n",
-    );
-        sealed_draw_state.tokens = TokenStream::from_str(&sealed_draw_state.text)
-            .expect("the unlisted private sealed-draw plant remains tokenizable");
+        let mut sealed_draw_state_text = sealed_draw_state.text.clone();
+        sealed_draw_state_text.insert_str(
+            unlisted_method_offset,
+            "\n    fn fnd01_unlisted_private_draw() { let _ = crate::crypto::draw_security_identifier(); }\n",
+        );
+        state_partition_rng_replace_rust_source_text(
+            sealed_draw_state,
+            sealed_draw_state_text,
+            "sealed-draw",
+        )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_other_input_digest(&sealed_draw_planted),
             baseline_other_input_digest,
@@ -90819,11 +91183,14 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present for sealed API planting");
-        sealed_api_state
-            .text
-            .insert_str(record_mutation_insertion + 1, planted_reference);
-        sealed_api_state.tokens = TokenStream::from_str(&sealed_api_state.text)
-            .expect("the aliased sealed API plant remains tokenizable");
+        let mut sealed_api_state_text = sealed_api_state.text.clone();
+        sealed_api_state_text.insert_str(record_mutation_insertion + 1, planted_reference);
+        state_partition_rng_replace_rust_source_text(
+            sealed_api_state,
+            sealed_api_state_text,
+            api,
+        )
+            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(
             state_partition_rng_other_input_digest(&sealed_api_planted),
             baseline_other_input_digest,
@@ -90862,22 +91229,30 @@ original = "value"
                 reexport_replacement, reexport_core_lib.text,
                 "{api} grouped public reexport plant changes the core export"
             );
-            reexport_core_lib.text = reexport_replacement;
-            reexport_core_lib.tokens = TokenStream::from_str(&reexport_core_lib.text)
-                .expect("the grouped public alias export remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                reexport_core_lib,
+                reexport_replacement,
+                api,
+            )
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
 
             let reexport_state = reexport_planted
                 .rust_sources
                 .get_mut(state_path)
                 .expect("state source is present for public alias indirection planting");
-            reexport_state.text.insert_str(
-            unlisted_method_offset,
-            &format!(
-                "\n    fn fnd01_public_alias_indirection() {{ trait Fnd01PublicAlias {{ fn call(); }} struct Fnd01PublicAliasOwner; impl Fnd01PublicAlias for Fnd01PublicAliasOwner {{ fn call() {{ let _ = crate::{alias}(); }} }} <Fnd01PublicAliasOwner as Fnd01PublicAlias>::call(); }}\n"
-            ),
-        );
-            reexport_state.tokens = TokenStream::from_str(&reexport_state.text)
-                .expect("the trait and function-item alias indirection remains tokenizable");
+            let mut reexport_state_text = reexport_state.text.clone();
+            reexport_state_text.insert_str(
+                unlisted_method_offset,
+                &format!(
+                    "\n    fn fnd01_public_alias_indirection() {{ trait Fnd01PublicAlias {{ fn call(); }} struct Fnd01PublicAliasOwner; impl Fnd01PublicAlias for Fnd01PublicAliasOwner {{ fn call() {{ let _ = crate::{alias}(); }} }} <Fnd01PublicAliasOwner as Fnd01PublicAlias>::call(); }}\n"
+                ),
+            );
+            state_partition_rng_replace_rust_source_text(
+                reexport_state,
+                reexport_state_text,
+                api,
+            )
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             assert_eq!(
                 state_partition_rng_input_digest_excluding_paths(
                     &reexport_planted,
@@ -90960,12 +91335,15 @@ original = "value"
                 .get_mut(facade_path)
                 .expect("facade source is present for root route removal");
             let root_route_start = root_route_offsets[0];
-            missing_root_route_facade
-                .text
+            let mut missing_root_route_text = missing_root_route_facade.text.clone();
+            missing_root_route_text
                 .replace_range(root_route_start..root_route_start + route.len(), "");
-            missing_root_route_facade.tokens =
-                TokenStream::from_str(&missing_root_route_facade.text)
-                    .expect("the missing root route plant remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                missing_root_route_facade,
+                missing_root_route_text,
+                &format!("{api}/missing-root-route"),
+            )
+            .expect("the missing root route plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&missing_root_route, facade_path),
                 facade_route_non_target_digest,
@@ -90985,13 +91363,17 @@ original = "value"
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for alias-target root planting");
-            alias_target_root_facade.text.replace_range(
+            let mut alias_target_root_text = alias_target_root_facade.text.clone();
+            alias_target_root_text.replace_range(
                 root_route_start..root_route_start + route.len(),
                 &format!("HmacSha256Key as {api},"),
             );
-            alias_target_root_facade.tokens =
-                TokenStream::from_str(&alias_target_root_facade.text)
-                    .expect("the reverse-alias root route plant remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                alias_target_root_facade,
+                alias_target_root_text,
+                &format!("{api}/reverse-alias-root-route"),
+            )
+            .expect("the reverse-alias root route plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&alias_target_root_route, facade_path),
                 facade_route_non_target_digest,
@@ -91012,12 +91394,14 @@ original = "value"
                 .get_mut(facade_path)
                 .expect("facade source is present for curated core route removal");
             let route_start = facade_core_start + route_offsets[0];
-            missing_core_route_facade
-                .text
-                .replace_range(route_start..route_start + route.len(), "");
-            missing_core_route_facade.tokens =
-                TokenStream::from_str(&missing_core_route_facade.text)
-                    .expect("the missing curated core route plant remains tokenizable");
+            let mut missing_core_route_text = missing_core_route_facade.text.clone();
+            missing_core_route_text.replace_range(route_start..route_start + route.len(), "");
+            state_partition_rng_replace_rust_source_text(
+                missing_core_route_facade,
+                missing_core_route_text,
+                &format!("{api}/missing-curated-core-route"),
+            )
+            .expect("the missing curated core route plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&missing_core_route, facade_path),
                 facade_route_non_target_digest,
@@ -91037,12 +91421,17 @@ original = "value"
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for extra curated core route planting");
-            extra_core_route_facade.text.insert_str(
+            let mut extra_core_route_text = extra_core_route_facade.text.clone();
+            extra_core_route_text.insert_str(
                 facade_core_start,
                 &format!(" pub use fastmcp_core::{{{api} as fnd01_extra_core_route}};"),
             );
-            extra_core_route_facade.tokens = TokenStream::from_str(&extra_core_route_facade.text)
-                .expect("the extra aliased curated core route plant remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                extra_core_route_facade,
+                extra_core_route_text,
+                &format!("{api}/extra-curated-core-route"),
+            )
+            .expect("the extra aliased curated core route plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&extra_core_route, facade_path),
                 facade_route_non_target_digest,
@@ -91062,11 +91451,12 @@ original = "value"
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for cfg-disabled route planting");
-            cfg_disabled_route_facade.text.push_str(&format!(
-                "\n#[cfg(any())]\npub use fastmcp_core::{api};\n"
-            ));
-            cfg_disabled_route_facade.tokens = TokenStream::from_str(&cfg_disabled_route_facade.text)
-                .expect("the cfg-disabled direct route plant remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                cfg_disabled_route_facade,
+                &format!("\n#[cfg(any())]\npub use fastmcp_core::{api};\n"),
+                &format!("{api}/cfg-disabled-route"),
+            )
+            .expect("the cfg-disabled direct route plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&cfg_disabled_route, facade_path),
                 facade_route_non_target_digest,
@@ -91087,11 +91477,12 @@ original = "value"
             .rust_sources
             .get_mut(facade_path)
             .expect("facade source is present for glob route planting");
-        glob_route_facade.text.push_str(
+        state_partition_rng_append_rust_source_fragment(
+            glob_route_facade,
             "\npub mod fnd01_extra_core_glob { pub use fastmcp_core::*; }\n",
-        );
-        glob_route_facade.tokens = TokenStream::from_str(&glob_route_facade.text)
-            .expect("the nested public glob route plant remains tokenizable");
+            "glob-route",
+        )
+        .expect("the nested public glob route plant remains tokenizable");
         assert_eq!(
             state_partition_rng_input_digest_excluding(&glob_route, facade_path),
             facade_route_non_target_digest,
@@ -91110,11 +91501,12 @@ original = "value"
             .rust_sources
             .get_mut(facade_path)
             .expect("facade source is present for whole-crate route planting");
-        whole_crate_route_facade.text.push_str(
+        state_partition_rng_append_rust_source_fragment(
+            whole_crate_route_facade,
             "\npub mod fnd01_extra_core_alias { pub use fastmcp_core as alternate_core; }\n",
-        );
-        whole_crate_route_facade.tokens = TokenStream::from_str(&whole_crate_route_facade.text)
-            .expect("the nested public whole-crate alias plant remains tokenizable");
+            "whole-crate-route",
+        )
+        .expect("the nested public whole-crate alias plant remains tokenizable");
         assert_eq!(
             state_partition_rng_input_digest_excluding(&whole_crate_route, facade_path),
             facade_route_non_target_digest,
@@ -91142,10 +91534,8 @@ original = "value"
                     .expect("planted facade source is present for integration dispatch");
                 let rejected_digest_before: [u8; 32] =
                     Sha256::digest(facade.text.as_bytes()).into();
-                let error = match validate_facade_integration_source_text(
-                    &facade.text,
-                    rule,
-                    label,
+                let error = match validate_state_partition_rng_facade_integration_source(
+                    facade, rule, label,
                 ) {
                     Err(error) => error,
                     Ok(()) => panic!(
@@ -91171,7 +91561,7 @@ original = "value"
                     .expect("planted facade source is present for integration dispatch");
                 let accepted_digest_before: [u8; 32] =
                     Sha256::digest(facade.text.as_bytes()).into();
-                validate_facade_integration_source_text(&facade.text, rule, label)
+                validate_state_partition_rng_facade_integration_source(facade, rule, label)
                     .expect("the semantic raw-identifier twin must retain the exact route");
                 let accepted_digest_after: [u8; 32] =
                     Sha256::digest(facade.text.as_bytes()).into();
@@ -91181,8 +91571,8 @@ original = "value"
         let root_module_route = "pub use fastmcp_core::{crypto, uri};";
         for member in ["crypto", "uri"] {
             let rule = expected_facade_integration_source_rule(member);
-            validate_facade_integration_source_text(
-                &baseline_facade.text,
+            validate_state_partition_rng_facade_integration_source(
+                baseline_facade,
                 &rule,
                 &format!("{member}/positive"),
             )
@@ -91215,7 +91605,13 @@ original = "value"
                     1,
                     "{member}/{label} baseline anchor is unique"
                 );
-                facade.text = facade.text.replacen(anchor, replacement, 1);
+                let replacement_text = facade.text.replacen(anchor, replacement, 1);
+                state_partition_rng_replace_rust_source_text(
+                    facade,
+                    replacement_text,
+                    &format!("{member}/{label}"),
+                )
+                .expect("the semantic raw-identifier plant remains tokenizable");
                 assert_integration_route_accepted(
                     &planted,
                     &rule,
@@ -91238,9 +91634,15 @@ original = "value"
                 1,
                 "the baseline root crypto/URI route is unique"
             );
-            raw_member_facade.text = raw_member_facade
+            let raw_member_text = raw_member_facade
                 .text
                 .replacen(root_module_route, raw_member_route, 1);
+            state_partition_rng_replace_rust_source_text(
+                raw_member_facade,
+                raw_member_text,
+                &format!("{member}/raw-member-positive"),
+            )
+            .expect("the raw member plant remains tokenizable");
             assert_integration_route_accepted(
                 &raw_member,
                 &rule,
@@ -91268,12 +91670,16 @@ original = "value"
                 ),
             ] {
                 let mut harmless = baseline.clone();
-                harmless
+                let harmless_facade = harmless
                     .rust_sources
                     .get_mut(facade_path)
-                    .expect("facade source is present for harmless route control")
-                    .text
-                    .push_str(&harmless_route);
+                    .expect("facade source is present for harmless route control");
+                state_partition_rng_append_rust_source_fragment(
+                    harmless_facade,
+                    &harmless_route,
+                    &format!("{member}/{label}"),
+                )
+                .expect("the harmless route control remains tokenizable");
                 assert_integration_route_accepted(
                     &harmless,
                     &rule,
@@ -91392,12 +91798,16 @@ original = "value"
                 ),
             ] {
                 let mut dormant = baseline.clone();
-                dormant
+                let dormant_facade = dormant
                     .rust_sources
                     .get_mut(facade_path)
-                    .expect("facade source is present for dormant private-alias planting")
-                    .text
-                    .push_str(&dormant_item);
+                    .expect("facade source is present for dormant private-alias planting");
+                state_partition_rng_append_rust_source_fragment(
+                    dormant_facade,
+                    &dormant_item,
+                    &format!("{member}/{label}/dormant"),
+                )
+                .expect("the dormant private-alias plant remains tokenizable");
                 if matches!(
                     label,
                     "private-absolute-alias-reachability"
@@ -91407,9 +91817,7 @@ original = "value"
                         .rust_sources
                         .get(facade_path)
                         .expect("facade source is present for dormant module inventory");
-                    let dormant_tokens = TokenStream::from_str(&dormant_facade.text)
-                        .expect("the dormant local-shadow route remains tokenizable");
-                    let dormant_inventory = public_core_route_inventory(&dormant_tokens);
+                    let dormant_inventory = public_core_route_inventory(&dormant_facade.tokens);
                     assert_eq!(
                         public_core_child_modules(&dormant_inventory, &[], "fastmcp_core").len(),
                         1,
@@ -91433,12 +91841,16 @@ original = "value"
                 );
 
                 let mut exposed = dormant.clone();
-                exposed
+                let exposed_facade = exposed
                     .rust_sources
                     .get_mut(facade_path)
-                    .expect("facade source is present for public private-alias re-export")
-                    .text
-                    .push_str(&public_reexport);
+                    .expect("facade source is present for public private-alias re-export");
+                state_partition_rng_append_rust_source_fragment(
+                    exposed_facade,
+                    &format!("\n{public_reexport}"),
+                    &format!("{member}/{label}/public-reexport"),
+                )
+                .expect("the public private-alias re-export remains tokenizable");
                 assert_integration_route_rejected(
                     &exposed,
                     &rule,
@@ -91468,19 +91880,21 @@ original = "value"
                 ),
             ] {
                 let mut active = baseline.clone();
-                active
+                let active_facade = active
                     .rust_sources
                     .get_mut(facade_path)
-                    .expect("facade source is present for active local-shadow planting")
-                    .text
-                    .push_str(&active_shadow);
+                    .expect("facade source is present for active local-shadow planting");
+                state_partition_rng_append_rust_source_fragment(
+                    active_facade,
+                    &active_shadow,
+                    &format!("{member}/{label}"),
+                )
+                .expect("the active local-shadow route remains tokenizable");
                 let active_facade = active
                     .rust_sources
                     .get(facade_path)
                     .expect("facade source is present for active module inventory");
-                let active_tokens = TokenStream::from_str(&active_facade.text)
-                    .expect("the active local-shadow route remains tokenizable");
-                let active_inventory = public_core_route_inventory(&active_tokens);
+                let active_inventory = public_core_route_inventory(&active_facade.tokens);
                 assert_eq!(
                     public_core_child_modules(&active_inventory, &[], "fastmcp_core").len(),
                     1,
@@ -91530,7 +91944,13 @@ original = "value"
                     1,
                     "the baseline root crypto/URI route is unique"
                 );
-                facade.text = facade.text.replacen(root_module_route, replacement, 1);
+                let planted_facade_text = facade.text.replacen(root_module_route, replacement, 1);
+                state_partition_rng_replace_rust_source_text(
+                    facade,
+                    planted_facade_text,
+                    &format!("{member}/{label}"),
+                )
+                .expect("the integration root-route plant remains tokenizable");
                 assert_integration_route_rejected(
                     &planted,
                     &rule,
@@ -91629,12 +92049,16 @@ original = "value"
                 ),
             ] {
                 let mut planted = baseline.clone();
-                planted
+                let planted_facade = planted
                     .rust_sources
                     .get_mut(facade_path)
-                    .expect("facade source is present for integration exposure planting")
-                    .text
-                    .push_str(&route_plant);
+                    .expect("facade source is present for integration exposure planting");
+                state_partition_rng_append_rust_source_fragment(
+                    planted_facade,
+                    &route_plant,
+                    &format!("{member}/{label}"),
+                )
+                .expect("the integration exposure plant remains tokenizable");
                 assert_integration_route_rejected(
                     &planted,
                     &rule,
@@ -91653,12 +92077,15 @@ original = "value"
                 1,
                 "the baseline has one exact doc-hidden private module attribute"
             );
-            missing_doc_hidden_facade.text = missing_doc_hidden_facade
+            let missing_doc_hidden_text = missing_doc_hidden_facade
                 .text
                 .replacen("#[doc(hidden)]\n", "", 1);
-            missing_doc_hidden_facade.tokens =
-                TokenStream::from_str(&missing_doc_hidden_facade.text)
-                    .expect("the missing doc-hidden attribute plant remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                missing_doc_hidden_facade,
+                missing_doc_hidden_text,
+                &format!("{member}/missing-doc-hidden"),
+            )
+            .expect("the missing doc-hidden attribute plant remains tokenizable");
             assert_integration_route_rejected(
                 &missing_doc_hidden,
                 &rule,
@@ -91678,16 +92105,19 @@ original = "value"
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for harmless cfg_attr planting");
-            harmless_doc_cfg_attr_facade.text = harmless_doc_cfg_attr_facade.text.replacen(
+            let harmless_doc_cfg_attr_text = harmless_doc_cfg_attr_facade.text.replacen(
                 root_module_route,
                 &format!(
                     "#[cfg_attr(docsrs, doc(cfg(feature = \"fnd01-{member}-route-proof\")))]\n{root_module_route}"
                 ),
                 1,
             );
-            harmless_doc_cfg_attr_facade.tokens =
-                TokenStream::from_str(&harmless_doc_cfg_attr_facade.text)
-                    .expect("the harmless doc cfg_attr plant remains tokenizable");
+            state_partition_rng_replace_rust_source_text(
+                harmless_doc_cfg_attr_facade,
+                harmless_doc_cfg_attr_text,
+                &format!("{member}/harmless-doc-cfg-attr"),
+            )
+            .expect("the harmless doc cfg_attr plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding(&harmless_doc_cfg_attr, facade_path),
                 facade_route_non_target_digest,
@@ -91695,8 +92125,8 @@ original = "value"
             );
             let harmless_facade = state_partition_rng_source(&harmless_doc_cfg_attr, facade_path)
                 .expect("harmless cfg_attr facade source is present");
-            validate_facade_integration_source_text(
-                &harmless_facade.text,
+            validate_state_partition_rng_facade_integration_source(
+                harmless_facade,
                 &rule,
                 &format!("{member}/harmless-doc-cfg-attr"),
             )
@@ -91707,8 +92137,8 @@ original = "value"
 
             let mut wrong_id = rule.clone();
             wrong_id.id.push_str("-MUTATED");
-            let wrong_id_error = validate_facade_integration_source_text(
-                &baseline_facade.text,
+            let wrong_id_error = validate_state_partition_rng_facade_integration_source(
+                baseline_facade,
                 &wrong_id,
                 &format!("{member}/receipt-id"),
             )
@@ -91717,8 +92147,8 @@ original = "value"
 
             let mut wrong_pattern = rule.clone();
             wrong_pattern.pattern.push_str(";mutated=1");
-            let wrong_pattern_error = validate_facade_integration_source_text(
-                &baseline_facade.text,
+            let wrong_pattern_error = validate_state_partition_rng_facade_integration_source(
+                baseline_facade,
                 &wrong_pattern,
                 &format!("{member}/receipt-pattern"),
             )
@@ -91727,8 +92157,8 @@ original = "value"
 
             let mut wrong_observed_count = rule.clone();
             wrong_observed_count.observed_count = 0;
-            let wrong_observed_error = validate_facade_integration_source_text(
-                &baseline_facade.text,
+            let wrong_observed_error = validate_state_partition_rng_facade_integration_source(
+                baseline_facade,
                 &wrong_observed_count,
                 &format!("{member}/receipt-observed-count"),
             )
@@ -91757,23 +92187,29 @@ original = "value"
                 .rust_sources
                 .get_mut(crypto_path)
                 .expect("crypto source is present for core wrapper planting");
-            core_wrapper_crypto.text.push_str(&format!(
-                "\npub fn {core_wrapper}() {{ let _ = {api}(); }}\n"
-            ));
-            core_wrapper_crypto.tokens = TokenStream::from_str(&core_wrapper_crypto.text)
-                .expect("the core owner wrapper plant remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                core_wrapper_crypto,
+                &format!("\npub fn {core_wrapper}() {{ let _ = {api}(); }}\n"),
+                &format!("{api}/core-owner-wrapper"),
+            )
+            .expect("the core owner wrapper plant remains tokenizable");
             let core_wrapper_state = core_wrapper_planted
                 .rust_sources
                 .get_mut(state_path)
                 .expect("state source is present for core wrapper proxy planting");
-            core_wrapper_state.text.insert_str(
-            unlisted_method_offset,
-            &format!(
-                "\n    fn fnd01_core_wrapper_proxy_{api}() {{ let _ = crate::crypto::{core_wrapper}(); }}\n"
-            ),
-        );
-            core_wrapper_state.tokens = TokenStream::from_str(&core_wrapper_state.text)
-                .expect("the core wrapper proxy plant remains tokenizable");
+            let mut core_wrapper_state_text = core_wrapper_state.text.clone();
+            core_wrapper_state_text.insert_str(
+                unlisted_method_offset,
+                &format!(
+                    "\n    fn fnd01_core_wrapper_proxy_{api}() {{ let _ = crate::crypto::{core_wrapper}(); }}\n"
+                ),
+            );
+            state_partition_rng_replace_rust_source_text(
+                core_wrapper_state,
+                core_wrapper_state_text,
+                &format!("{api}/core-wrapper-proxy"),
+            )
+            .expect("the core wrapper proxy plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding_paths(
                     &core_wrapper_planted,
@@ -91799,20 +92235,24 @@ original = "value"
                 .rust_sources
                 .get_mut(crypto_path)
                 .expect("crypto source is present for facade wrapper planting");
-            facade_wrapper_crypto.text.push_str(&format!(
-                "\npub fn {facade_wrapper}() {{ let _ = {api}(); }}\n"
-            ));
-            facade_wrapper_crypto.tokens = TokenStream::from_str(&facade_wrapper_crypto.text)
-                .expect("the facade owner wrapper plant remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                facade_wrapper_crypto,
+                &format!("\npub fn {facade_wrapper}() {{ let _ = {api}(); }}\n"),
+                &format!("{api}/facade-owner-wrapper"),
+            )
+            .expect("the facade owner wrapper plant remains tokenizable");
             let facade_wrapper_source = facade_wrapper_planted
                 .rust_sources
                 .get_mut(facade_path)
                 .expect("facade source is present for facade wrapper proxy planting");
-            facade_wrapper_source.text.push_str(&format!(
-            "\npub fn fnd01_facade_wrapper_proxy_{api}() {{ let _ = fastmcp_core::crypto::{facade_wrapper}(); }}\n"
-        ));
-            facade_wrapper_source.tokens = TokenStream::from_str(&facade_wrapper_source.text)
-                .expect("the facade-visible wrapper proxy plant remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                facade_wrapper_source,
+                &format!(
+                    "\npub fn fnd01_facade_wrapper_proxy_{api}() {{ let _ = fastmcp_core::crypto::{facade_wrapper}(); }}\n"
+                ),
+                &format!("{api}/facade-wrapper-proxy"),
+            )
+            .expect("the facade-visible wrapper proxy plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding_paths(
                     &facade_wrapper_planted,
@@ -91842,23 +92282,31 @@ original = "value"
                 .rust_sources
                 .get_mut(crypto_path)
                 .expect("crypto source is present for helper-wrapper planting");
-            helper_wrapper_crypto.text.push_str(&format!(
-                "\npub fn {helper_wrapper}() {{ let _ = {api}_with(&OsRandomSource); }}\n"
-            ));
-            helper_wrapper_crypto.tokens = TokenStream::from_str(&helper_wrapper_crypto.text)
-                .expect("the private-helper wrapper plant remains tokenizable");
+            state_partition_rng_append_rust_source_fragment(
+                helper_wrapper_crypto,
+                &format!(
+                    "\npub fn {helper_wrapper}() {{ let _ = {api}_with(&OsRandomSource); }}\n"
+                ),
+                &format!("{api}/private-helper-wrapper"),
+            )
+            .expect("the private-helper wrapper plant remains tokenizable");
             let helper_wrapper_state = helper_wrapper_planted
                 .rust_sources
                 .get_mut(state_path)
                 .expect("state source is present for helper-wrapper proxy planting");
-            helper_wrapper_state.text.insert_str(
-            unlisted_method_offset,
-            &format!(
-                "\n    fn fnd01_private_helper_proxy_{api}() {{ let _ = crate::crypto::{helper_wrapper}(); }}\n"
-            ),
-        );
-            helper_wrapper_state.tokens = TokenStream::from_str(&helper_wrapper_state.text)
-                .expect("the helper-wrapper proxy plant remains tokenizable");
+            let mut helper_wrapper_state_text = helper_wrapper_state.text.clone();
+            helper_wrapper_state_text.insert_str(
+                unlisted_method_offset,
+                &format!(
+                    "\n    fn fnd01_private_helper_proxy_{api}() {{ let _ = crate::crypto::{helper_wrapper}(); }}\n"
+                ),
+            );
+            state_partition_rng_replace_rust_source_text(
+                helper_wrapper_state,
+                helper_wrapper_state_text,
+                &format!("{api}/private-helper-wrapper-proxy"),
+            )
+            .expect("the helper-wrapper proxy plant remains tokenizable");
             assert_eq!(
                 state_partition_rng_input_digest_excluding_paths(
                     &helper_wrapper_planted,
@@ -91929,18 +92377,24 @@ original = "value"
             .rust_sources
             .get_mut(crypto_path)
             .expect("crypto source is present for public-surface variant planting");
-        variant_crypto.text.push_str(crypto_append);
-        variant_crypto.tokens = TokenStream::from_str(&variant_crypto.text)
-            .expect("the public-surface variant remains tokenizable");
+        state_partition_rng_append_rust_source_fragment(
+            variant_crypto,
+            crypto_append,
+            &format!("{variant}/public-surface"),
+        )
+        .expect("the public-surface variant remains tokenizable");
         let variant_state = variant_planted
             .rust_sources
             .get_mut(state_path)
             .expect("state source is present for public-surface variant proxy planting");
-        variant_state
-            .text
-            .insert_str(unlisted_method_offset, state_proxy);
-        variant_state.tokens = TokenStream::from_str(&variant_state.text)
-            .expect("the public-surface variant proxy remains tokenizable");
+        let mut variant_state_text = variant_state.text.clone();
+        variant_state_text.insert_str(unlisted_method_offset, state_proxy);
+        state_partition_rng_replace_rust_source_text(
+            variant_state,
+            variant_state_text,
+            &format!("{variant}/public-surface-proxy"),
+        )
+        .expect("the public-surface variant proxy remains tokenizable");
         assert_eq!(
             state_partition_rng_input_digest_excluding_paths(
                 &variant_planted,
@@ -91979,12 +92433,17 @@ original = "value"
             .rust_sources
             .get_mut("crates/fastmcp-core/src/state.rs")
             .expect("state source is present for callsite planting");
-        callsite_state.text.insert_str(
-        failure_test + 1,
-        " let _fnd01_extra_partition = SessionState::from_map_with_partition_draw(HashMap::new(), || Ok::<[u8; CACHE_PARTITION_BYTES], &'static str>([0_u8; CACHE_PARTITION_BYTES]));",
-    );
-        callsite_state.tokens = TokenStream::from_str(&callsite_state.text)
-            .expect("the callsite-planted state source remains tokenizable");
+        let mut callsite_state_text = callsite_state.text.clone();
+        callsite_state_text.insert_str(
+            failure_test + 1,
+            " let _fnd01_extra_partition = SessionState::from_map_with_partition_draw(HashMap::new(), || Ok::<[u8; CACHE_PARTITION_BYTES], &'static str>([0_u8; CACHE_PARTITION_BYTES]));",
+        );
+        state_partition_rng_replace_rust_source_text(
+            callsite_state,
+            callsite_state_text,
+            "callsite-plant",
+        )
+        .expect("the callsite-planted state source remains tokenizable");
         assert_eq!(
             state_partition_rng_other_input_digest(&callsite_planted),
             baseline_other_input_digest,
@@ -91997,22 +92456,7 @@ original = "value"
         "FND01|Error|E_STATE_PARTITION_RNG_CALLSITE|state-partition-rng|crates/fastmcp-core/src/state.rs"
     );
 
-        let callsite_fresh = state_partition_rng_inventory()
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        validate_state_partition_rng_seam(&callsite_fresh)
-            .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
-        let callsite_fresh_state =
-            state_partition_rng_source(&callsite_fresh, "crates/fastmcp-core/src/state.rs")
-                .expect("fresh state source is present after callsite plant");
-        assert_eq!(callsite_fresh_state.text, baseline_state.text);
-        let callsite_fresh_digest: [u8; 32] =
-            Sha256::digest(callsite_fresh_state.text.as_bytes()).into();
-        assert_eq!(callsite_fresh_digest, baseline_state_digest);
-        assert_eq!(
-            state_partition_rng_other_input_digest(&callsite_fresh),
-            baseline_other_input_digest,
-            "fresh inventory must retain the baseline non-state domain after callsite plant"
-        );
+        assert_fresh_baseline();
 
         let root_non_target_digest =
             state_partition_rng_input_digest_excluding(&baseline, "Cargo.toml");
