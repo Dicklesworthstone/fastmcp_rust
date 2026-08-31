@@ -90530,6 +90530,7 @@ original = "value"
 
     #[test]
     fn fnd_01_state_partition_rng_rejects_direct_getrandom_planted_negative() {
+        eprintln!("FND01|Progress|state-partition-rng|negative|start");
         let baseline = state_partition_rng_inventory()
             .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         validate_state_partition_rng_seam(&baseline)
@@ -90544,7 +90545,11 @@ original = "value"
         let baseline_facade_digest: [u8; 32] =
             Sha256::digest(baseline_facade.text.as_bytes()).into();
         let baseline_other_input_digest = state_partition_rng_other_input_digest(&baseline);
+        let fresh_baseline_cycle = Cell::new(0_u64);
         let assert_fresh_baseline = || {
+            let cycle = fresh_baseline_cycle.get() + 1;
+            fresh_baseline_cycle.set(cycle);
+            eprintln!("FND01|Progress|state-partition-rng|negative|fresh-baseline={cycle}");
             validate_state_partition_rng_inventory_matches_disk(&baseline)
                 .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             validate_state_partition_rng_seam(&baseline)
