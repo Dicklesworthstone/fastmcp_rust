@@ -655,8 +655,8 @@ enum Commands {
         /// Server command or path.
         server: String,
 
-        /// Arguments to pass to the server.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Arguments to pass to the server (after --).
+        #[arg(last = true)]
         args: Vec<String>,
 
         /// Working directory to store in the generated server configuration.

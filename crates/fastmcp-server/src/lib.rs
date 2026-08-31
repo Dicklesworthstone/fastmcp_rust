@@ -39885,9 +39885,13 @@ mod lib_unit_tests {
                     // planted negative interfere with the settlement path it
                     // is meant to verify.
                     asupersync::time::sleep(client_cx.now(), Duration::from_millis(100)).await;
-                    if !matches!(reverse_post.try_join(), Ok(None)) {
+                    if !matches!(tool_call.try_join(), Ok(None)) {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("wrong-ID reverse response probe failed"),
+                        );
                         return Err(
-                            "wrong-ID reverse response escaped the originating legacy session mutex"
+                            "wrong-ID reverse response settled the pending handler"
                                 .to_string(),
                         );
                     }
@@ -39900,6 +39904,10 @@ mod lib_unit_tests {
                         })),
                     );
                     let cancellation_body = serde_json::to_vec(&cancellation).map_err(|error| {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("cancellation serialization failed"),
+                        );
                         format!("legacy sampling cancellation did not serialize: {error}")
                     })?;
                     let cancellation_response = live_http_exchange(
@@ -39910,16 +39918,38 @@ mod lib_unit_tests {
                             &opener_headers,
                         ),
                     )
-                    .await?;
+                    .await;
+                    let cancellation_response = match cancellation_response {
+                        Ok(response) => response,
+                        Err(error) => {
+                            caller_cx.cancel_with(
+                                CancelKind::User,
+                                Some("cancellation exchange failed"),
+                            );
+                            return Err(error);
+                        }
+                    };
                     if !cancellation_response.starts_with(b"HTTP/1.1 202") {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("cancellation not accepted"),
+                        );
                         return Err(format!(
                             "legacy sampling cancellation was not accepted: {cancellation_response:?}"
                         ));
                     }
                     let _ = tool_call.join(&client_cx).await.map_err(|error| {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("tool-call join failed"),
+                        );
                         format!("legacy sampling cancelled tool-call POST failed: {error:?}")
                     })??;
                     let _ = reverse_post.join(&client_cx).await.map_err(|error| {
+                        caller_cx.cancel_with(
+                            CancelKind::User,
+                            Some("reverse-post join failed"),
+                        );
                         format!("wrong-ID reverse-response POST failed after settlement: {error:?}")
                     })??;
                 } else {

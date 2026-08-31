@@ -798,7 +798,12 @@ pub use fastmcp_server::bidirectional::{
 };
 
 // Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+pub use fastmcp_server::caching::ResponseCachingMiddleware;
 pub use fastmcp_server::providers;
+pub use fastmcp_server::rate_limiting::{
+    RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware,
+};
+pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
@@ -9776,6 +9781,7 @@ pub mod prelude {
         // Context and errors
         AccessToken,
         AdmittedSchema,
+        ArgTransform,
         AuthContext,
         BoundHttpServer,
         // Client
@@ -9920,12 +9926,14 @@ pub mod prelude {
         ProtocolEra,
         ProtocolPolicy,
         ProtocolVersion,
+        RateLimitingMiddleware,
         RequestAdmissionError,
         RequestId,
         RequestTimeoutPolicy,
         RequestTimeoutSource,
         Resource,
         ResourceContent,
+        ResponseCachingMiddleware,
         ResultExt,
         ReversibleResourceTemplate,
         Role,
@@ -9943,6 +9951,7 @@ pub mod prelude {
         ServerHttpSession,
         ServerHttpSseResponse,
         ServerNotification,
+        SlidingWindowRateLimitingMiddleware,
         SseEndOfStream,
         SseEvent,
         SseLimits,
@@ -9960,6 +9969,8 @@ pub mod prelude {
         TokenAuthProvider,
         TokenVerifier,
         Tool,
+        TransformedTool,
+        TransformedToolBuilder,
         TransportRecvHalf,
         TransportSendHalf,
         TwoPhaseTransport,

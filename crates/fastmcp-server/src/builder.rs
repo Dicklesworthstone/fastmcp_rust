@@ -807,6 +807,27 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers response caching middleware.
+    #[must_use]
+    pub fn response_caching(self, caching: crate::caching::ResponseCachingMiddleware) -> Self {
+        self.middleware(caching)
+    }
+
+    /// Registers rate limiting middleware.
+    #[must_use]
+    pub fn rate_limiting(
+        self,
+        rate_limiting: crate::rate_limiting::RateLimitingMiddleware,
+    ) -> Self {
+        self.middleware(rate_limiting)
+    }
+
+    /// Registers a transformed tool handler.
+    #[must_use]
+    pub fn transformed_tool(self, tool: crate::transform::TransformedTool) -> Self {
+        self.tool(tool)
+    }
+
     /// Registers a tool handler.
     ///
     /// Duplicate handling is controlled by [`on_duplicate`](Self::on_duplicate).
