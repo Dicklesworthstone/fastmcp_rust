@@ -80121,7 +80121,7 @@ activate = 1\n";
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
         ("Cargo.toml", 7_041, "e44968200598eda386dc9f6be0dfd7fdba5db144076864addaacb6b7345c116a"),
-        ("Cargo.lock", 97_891, "7794b447e6d1e6f17da06c2e95777778c5720629dcfebaa021bd10b921e5a5e9"),
+        ("Cargo.lock", 97_891, "7ec9da6ae2797b1ea453aa97f8ca7c33046d8ce6fa4ffe355bae8d8aea3d0a44"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
@@ -80142,8 +80142,16 @@ activate = 1\n";
         root: &Path,
         policy: &Policy,
     ) -> VResult<Vec<Vec<u8>>> {
-        let mut inputs = Vec::with_capacity(TOOLCHAIN_WORKSPACE_INPUTS.len());
-        for (path, byte_length, expected_sha256) in TOOLCHAIN_WORKSPACE_INPUTS {
+        toolchain_workspace_inputs_with_bindings(root, policy, &TOOLCHAIN_WORKSPACE_INPUTS)
+    }
+
+    fn toolchain_workspace_inputs_with_bindings(
+        root: &Path,
+        policy: &Policy,
+        bindings: &[(&str, u64, &str)],
+    ) -> VResult<Vec<Vec<u8>>> {
+        let mut inputs = Vec::with_capacity(bindings.len());
+        for &(path, byte_length, expected_sha256) in bindings {
             let sha256: [u8; 32] = decode_lower_hex(expected_sha256, path)?
                 .try_into()
                 .map_err(|_| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", path).at("sha256"))?;
@@ -87134,6 +87142,59 @@ original = "value"
             )
             .verified(),
             accepted,
+        );
+
+        let mut planted_workspace_bindings = TOOLCHAIN_WORKSPACE_INPUTS;
+        let pristine_lock_binding = planted_workspace_bindings[1];
+        planted_workspace_bindings[1].2 =
+            "6ec9da6ae2797b1ea453aa97f8ca7c33046d8ce6fa4ffe355bae8d8aea3d0a44";
+        assert_eq!(
+            (
+                planted_workspace_bindings[1].0,
+                planted_workspace_bindings[1].1,
+            ),
+            (pristine_lock_binding.0, pristine_lock_binding.1),
+            "lock-digest plant preserves the exact path and byte length",
+        );
+        assert_ne!(
+            planted_workspace_bindings[1].2, pristine_lock_binding.2,
+            "lock-digest plant changes the forbidden digest dimension",
+        );
+        assert_eq!(
+            planted_workspace_bindings[0], TOOLCHAIN_WORKSPACE_INPUTS[0],
+            "lock-digest plant preserves the manifest binding",
+        );
+        assert_eq!(
+            planted_workspace_bindings[2], TOOLCHAIN_WORKSPACE_INPUTS[2],
+            "lock-digest plant preserves the toolchain binding",
+        );
+        let lock_error = toolchain_workspace_inputs_with_bindings(
+            &root,
+            &policy,
+            &planted_workspace_bindings,
+        )
+        .expect_err("one wrong Cargo.lock digest must fail at the production checked-read seam");
+        assert_eq!(
+            lock_error.stable(),
+            "FND01|Error|E_TOOLCHAIN_ASUPERSYNC|Cargo.lock|E_FILE_DIGEST|Cargo.lock: marker digest mismatch",
+        );
+        assert_sdk_loaded_file_vectors_equal(&loaded_before, &files, "lock-digest retained inputs")
+            .verified();
+        assert_eq!(
+            toolchain_workspace_inputs(&root, &policy).verified(),
+            workspace_before,
+            "rejected lock-digest plant leaves all live workspace inputs unchanged",
+        );
+        assert_eq!(
+            validate_toolchain_asupersync_contract(
+                &root,
+                &files,
+                &policy,
+                &accepted_document,
+            )
+            .verified(),
+            accepted,
+            "pristine toolchain contract reaccepts after the lock-digest plant",
         );
 
         let (fresh_policy, _) = read_policy(&root).verified();
