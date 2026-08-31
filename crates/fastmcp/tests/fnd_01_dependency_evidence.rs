@@ -51692,6 +51692,9 @@ activate = 1\n";
 
     fn public_core_export_route_set_is_exact(stream: &TokenStream, member: &str) -> bool {
         let inventory = public_core_route_inventory(stream);
+        if !public_core_module_candidates(&inventory, &[], "fastmcp_core").is_empty() {
+            return false;
+        }
         for route in inventory
             .extern_crate_routes
             .iter()
@@ -91133,8 +91136,16 @@ original = "value"
                     .expect("planted facade source is present for integration dispatch");
                 let rejected_digest_before: [u8; 32] =
                     Sha256::digest(facade.text.as_bytes()).into();
-                let error = validate_facade_integration_source_text(&facade.text, rule, label)
-                    .expect_err("the integration receipt route mutation must fail closed");
+                let error = match validate_facade_integration_source_text(
+                    &facade.text,
+                    rule,
+                    label,
+                ) {
+                    Err(error) => error,
+                    Ok(()) => panic!(
+                        "{label}: the integration receipt route mutation must fail closed"
+                    ),
+                };
                 assert_eq!(error.code, expected_code, "{label}");
                 let rejected_digest_after: [u8; 32] =
                     Sha256::digest(facade.text.as_bytes()).into();
@@ -91381,6 +91392,29 @@ original = "value"
                     .expect("facade source is present for dormant private-alias planting")
                     .text
                     .push_str(&dormant_item);
+                if matches!(
+                    label,
+                    "private-absolute-alias-reachability"
+                        | "private-raw-absolute-alias-reachability"
+                ) {
+                    let dormant_facade = dormant
+                        .rust_sources
+                        .get(facade_path)
+                        .expect("facade source is present for dormant module inventory");
+                    let dormant_tokens = TokenStream::from_str(&dormant_facade.text)
+                        .expect("the dormant local-shadow route remains tokenizable");
+                    let dormant_inventory = public_core_route_inventory(&dormant_tokens);
+                    assert_eq!(
+                        public_core_child_modules(&dormant_inventory, &[], "fastmcp_core").len(),
+                        1,
+                        "{member}/{label}: the dormant local module must remain inventoried"
+                    );
+                    assert!(
+                        public_core_module_candidates(&dormant_inventory, &[], "fastmcp_core")
+                            .is_empty(),
+                        "{member}/{label}: exact cfg(any()) must be the sole suppressed module candidate"
+                    );
+                }
                 assert_integration_route_accepted(
                     &dormant,
                     &rule,
@@ -91404,15 +91438,15 @@ original = "value"
 
             for (label, active_shadow) in [
                 (
-                    "private-absolute-alias-reachability/active-shadow",
+                    "private-absolute-alias-reachability/always-active-shadow",
                     format!(
-                        "\nmod fastmcp_core {{}}\nmod fnd01_{member}_absolute_transit {{ pub use ::fastmcp_core as payload; }}\n"
+                        "\n#[cfg(all())]\nmod fastmcp_core {{}}\nmod fnd01_{member}_absolute_transit {{ pub use ::fastmcp_core as payload; }}\n"
                     ),
                 ),
                 (
-                    "private-raw-absolute-alias-reachability/active-shadow",
+                    "private-raw-absolute-alias-reachability/always-active-shadow",
                     format!(
-                        "\nmod r#fastmcp_core {{}}\nmod fnd01_{member}_raw_absolute_transit {{ pub use ::r#fastmcp_core as payload; }}\n"
+                        "\n#[cfg(all())]\nmod r#fastmcp_core {{}}\nmod fnd01_{member}_raw_absolute_transit {{ pub use ::r#fastmcp_core as payload; }}\n"
                     ),
                 ),
                 (
@@ -91429,6 +91463,23 @@ original = "value"
                     .expect("facade source is present for active local-shadow planting")
                     .text
                     .push_str(&active_shadow);
+                let active_facade = active
+                    .rust_sources
+                    .get(facade_path)
+                    .expect("facade source is present for active module inventory");
+                let active_tokens = TokenStream::from_str(&active_facade.text)
+                    .expect("the active local-shadow route remains tokenizable");
+                let active_inventory = public_core_route_inventory(&active_tokens);
+                assert_eq!(
+                    public_core_child_modules(&active_inventory, &[], "fastmcp_core").len(),
+                    1,
+                    "{member}/{label}: the active local module must remain inventoried"
+                );
+                assert_eq!(
+                    public_core_module_candidates(&active_inventory, &[], "fastmcp_core").len(),
+                    1,
+                    "{member}/{label}: the active local module must compete with the extern-prelude route"
+                );
                 assert_integration_route_rejected(
                     &active,
                     &rule,
