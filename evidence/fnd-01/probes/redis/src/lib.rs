@@ -1703,6 +1703,9 @@ mod tests {
     fn validate_crate_records(evidence: &str) -> Result<(), StructuredEvidenceError> {
         let mut names = Vec::new();
         for record in evidence.split("[[crate]]").skip(1) {
+            let record = record
+                .find("\n[")
+                .map_or(record, |next_header| &record[..next_header]);
             names.push(quoted_field("crate record", record, "name")?);
         }
         names.sort();
