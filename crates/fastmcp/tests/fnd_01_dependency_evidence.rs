@@ -34884,9 +34884,9 @@ mod ordinary {
     const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
     const HARD_MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_CAMPAIGN_ISSUES_JSONL_BYTES: usize = 32 * 1024 * 1024;
-    const CAMPAIGN_PROOF_FIELD_COUNT: usize = 524;
+    const CAMPAIGN_PROOF_FIELD_COUNT: usize = 580;
     const CAMPAIGN_PROOF_FIELD_SHA256: &str =
-        "5611cb1c304cd609900713a21451fa7c890771b58366c0d9a530081dfb98467f";
+        "6940feeb5211f2aa35c64178b6cb376cb3d26b8ad4d5043bbefb10d16ca8c3d8";
     const CAMPAIGN_PROOF_CONTROL_BEAD: &str = "bd-rebase-proof-toolchain-vjd8z";
     const CAMPAIGN_PROOF_NEGATIVE_MARKER: &str = "REALITY-PROOF-NEGATIVE:";
     const CAMPAIGN_PROOF_CHECKLIST_PREFIXES: [&str; 3] = ["- [ ] ", "- [x] ", "- [X] "];
