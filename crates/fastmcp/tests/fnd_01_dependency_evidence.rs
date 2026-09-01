@@ -34888,8 +34888,8 @@ mod ordinary {
     const CAMPAIGN_PROOF_FIELD_SHA256: &str =
         "5611cb1c304cd609900713a21451fa7c890771b58366c0d9a530081dfb98467f";
     const CAMPAIGN_PROOF_CONTROL_BEAD: &str = "bd-rebase-proof-toolchain-vjd8z";
-    const CAMPAIGN_PROOF_NEGATIVE_PREFIX: &str =
-        "- [ ] REALITY-PROOF-NEGATIVE:";
+    const CAMPAIGN_PROOF_NEGATIVE_MARKER: &str = "REALITY-PROOF-NEGATIVE:";
+    const CAMPAIGN_PROOF_CHECKLIST_PREFIXES: [&str; 3] = ["- [ ] ", "- [x] ", "- [X] "];
     const SUPERSEDED_CAMPAIGN_TOOLCHAINS: [&str; 2] =
         ["nightly-2026-07-11", "nightly-2026-08-20"];
     const EXACT_RUST_TOOLCHAIN_TOML: &str = concat!(
@@ -53467,6 +53467,22 @@ activate = 1\n";
         lower_hex(&sha256(&bytes))
     }
 
+    fn campaign_proof_checklist_body<'a>(
+        line: &'a str,
+        subject: &str,
+    ) -> VResult<Option<&'a str>> {
+        for prefix in CAMPAIGN_PROOF_CHECKLIST_PREFIXES {
+            if let Some(body) = line.strip_prefix(prefix) {
+                return Ok(Some(body));
+            }
+        }
+        if line.starts_with("- [") {
+            return Err(Diagnostic::error("E_CAMPAIGN_PROOF_TOOLCHAIN", subject)
+                .at("malformed checklist prefix"));
+        }
+        Ok(None)
+    }
+
     fn validate_campaign_executable_toolchain_contracts(
         issues_jsonl: &[u8],
         identity: &CampaignProofIdentity,
@@ -53497,7 +53513,7 @@ activate = 1\n";
                     .at("duplicate issue id"));
             }
             let status = strict_json_string(object, "status", &line_subject)?;
-            if matches!(status, "closed" | "tombstone") {
+            if matches!(status, "closed" | "tombstone") && id != CAMPAIGN_PROOF_CONTROL_BEAD {
                 continue;
             }
             let Some(StrictJson::String(acceptance)) = object.get("acceptance_criteria") else {
@@ -53506,8 +53522,12 @@ activate = 1\n";
             let field_subject = format!("{id}/acceptance_criteria");
             let mut field_predicates = 0usize;
             for acceptance_line in acceptance.lines() {
+                let checklist_body =
+                    campaign_proof_checklist_body(acceptance_line, &field_subject)?;
                 let tokens = dated_nightly_tokens(acceptance_line, &field_subject)?;
-                if acceptance_line.starts_with(CAMPAIGN_PROOF_NEGATIVE_PREFIX) {
+                if checklist_body
+                    .is_some_and(|body| body.starts_with(CAMPAIGN_PROOF_NEGATIVE_MARKER))
+                {
                     if id != CAMPAIGN_PROOF_CONTROL_BEAD
                         || tokens
                             != [
@@ -82040,12 +82060,49 @@ activate = 1\n";
             .join(".beads/issues.jsonl")
     }
 
+    fn campaign_proof_issue_fixture(id: &str, status: &str, acceptance: &str) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "id": id,
+            "status": status,
+            "acceptance_criteria": acceptance,
+        }))
+        .expect("serialize campaign proof fixture");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn campaign_proof_control_fixture(
+        identity: &CampaignProofIdentity,
+        status: &str,
+        checklist_prefix: &str,
+        marker: &str,
+        negative_toolchains: [&str; 3],
+        negative_copies: usize,
+    ) -> Vec<u8> {
+        assert!(negative_copies > 0);
+        let positive = format!(
+            "{checklist_prefix}REALITY-PROOF-POSITIVE: toolchain {}; rust-version == {}",
+            identity.toolchain, identity.rust_version,
+        );
+        let negative = format!(
+            "{checklist_prefix}{marker} near-identical isolated fixtures use {}, {}, and {}",
+            negative_toolchains[0], negative_toolchains[1], negative_toolchains[2],
+        );
+        let mut acceptance = positive;
+        for _ in 0..negative_copies {
+            acceptance.push('\n');
+            acceptance.push_str(&negative);
+        }
+        campaign_proof_issue_fixture(CAMPAIGN_PROOF_CONTROL_BEAD, status, &acceptance)
+    }
+
     #[test]
     fn reality_proof_positive_executable_toolchain_contracts_match_checked_in_pin() {
         let identity = canonical_campaign_proof_identity().verified();
         assert_eq!(identity.toolchain, "nightly-2026-08-25");
         assert_eq!(identity.rust_version, "1.100");
-        let issues = fs::read(campaign_issues_jsonl_path())
+        let live_path = campaign_issues_jsonl_path();
+        let issues = fs::read(&live_path)
             .expect("read live campaign issues JSONL");
         let inventory = validate_campaign_executable_toolchain_contracts(
             &issues,
@@ -82062,6 +82119,59 @@ activate = 1\n";
         assert_eq!(inventory.current_predicates, CAMPAIGN_PROOF_FIELD_COUNT);
         assert_eq!(inventory.planted_negative_fields, 1);
         assert_eq!(inventory.field_sha256, CAMPAIGN_PROOF_FIELD_SHA256);
+
+        let mut control_fields = BTreeSet::new();
+        assert!(control_fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
+        let control_sha256 = campaign_proof_field_sha256(&control_fields);
+        let expected_control = ExpectedCampaignProofInventory {
+            field_count: 1,
+            current_predicates: 1,
+            planted_negative_fields: 1,
+            field_sha256: &control_sha256,
+        };
+        let negative_toolchains = [
+            identity.toolchain.as_str(),
+            SUPERSEDED_CAMPAIGN_TOOLCHAINS[0],
+            SUPERSEDED_CAMPAIGN_TOOLCHAINS[1],
+        ];
+        let mut lifecycle_inventory = None;
+        for (status, checklist_prefix) in [
+            ("open", "- [ ] "),
+            ("review", "- [x] "),
+            ("closed", "- [X] "),
+        ] {
+            let mut fixture = campaign_proof_control_fixture(
+                &identity,
+                status,
+                checklist_prefix,
+                CAMPAIGN_PROOF_NEGATIVE_MARKER,
+                negative_toolchains,
+                1,
+            );
+            if status == "closed" {
+                fixture.extend_from_slice(&campaign_proof_issue_fixture(
+                    "closed-non-control",
+                    "closed",
+                    "- [x] Proof configuration used nightly-2026-07-11 historically",
+                ));
+            }
+            let observed = validate_campaign_executable_toolchain_contracts(
+                &fixture,
+                &identity,
+                expected_control,
+            )
+            .verified();
+            if let Some(expected) = &lifecycle_inventory {
+                assert_eq!(&observed, expected);
+            } else {
+                lifecycle_inventory = Some(observed);
+            }
+        }
+        assert_eq!(
+            fs::read(live_path).expect("read live campaign state after lifecycle positives"),
+            issues,
+            "positive lifecycle evaluation must not mutate live state",
+        );
     }
 
     #[test]
@@ -82107,6 +82217,152 @@ activate = 1\n";
             assert_eq!(error.subject, "fixture-proof/acceptance_criteria");
             assert_eq!(error.logical_path, stale);
         }
+
+        let negative_toolchains = [
+            identity.toolchain.as_str(),
+            SUPERSEDED_CAMPAIGN_TOOLCHAINS[0],
+            SUPERSEDED_CAMPAIGN_TOOLCHAINS[1],
+        ];
+        let control_fixture = campaign_proof_control_fixture(
+            &identity,
+            "open",
+            "- [ ] ",
+            CAMPAIGN_PROOF_NEGATIVE_MARKER,
+            negative_toolchains,
+            1,
+        );
+        let mut control_fields = BTreeSet::new();
+        assert!(control_fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
+        let control_sha256 = campaign_proof_field_sha256(&control_fields);
+        let expected_control = ExpectedCampaignProofInventory {
+            field_count: 1,
+            current_predicates: 1,
+            planted_negative_fields: 1,
+            field_sha256: &control_sha256,
+        };
+        validate_campaign_executable_toolchain_contracts(
+            &control_fixture,
+            &identity,
+            expected_control,
+        )
+        .verified();
+
+        let control_text =
+            String::from_utf8(control_fixture.clone()).expect("control fixture is UTF-8");
+        let marker_corruption = control_text.replacen(
+            CAMPAIGN_PROOF_NEGATIVE_MARKER,
+            "REALITY-PROOF-NEGATIVF:",
+            1,
+        );
+        assert_eq!(
+            marker_corruption.replacen(
+                "REALITY-PROOF-NEGATIVF:",
+                CAMPAIGN_PROOF_NEGATIVE_MARKER,
+                1,
+            ),
+            control_text,
+        );
+        let marker_error = validate_campaign_executable_toolchain_contracts(
+            marker_corruption.as_bytes(),
+            &identity,
+            expected_control,
+        )
+        .expect_err("a one-byte semantic marker corruption must fail closed");
+        assert_eq!(marker_error.code, "E_CAMPAIGN_PROOF_TOOLCHAIN");
+        assert_eq!(
+            marker_error.subject,
+            format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"),
+        );
+
+        let drifted_token = control_text.replacen(
+            SUPERSEDED_CAMPAIGN_TOOLCHAINS[1],
+            "nightly-2026-08-21",
+            1,
+        );
+        assert_eq!(
+            drifted_token.replacen(
+                "nightly-2026-08-21",
+                SUPERSEDED_CAMPAIGN_TOOLCHAINS[1],
+                1,
+            ),
+            control_text,
+        );
+        let token_error = validate_campaign_executable_toolchain_contracts(
+            drifted_token.as_bytes(),
+            &identity,
+            expected_control,
+        )
+        .expect_err("a one-token planted-negative drift must fail closed");
+        assert_eq!(token_error.code, "E_CAMPAIGN_PROOF_NEGATIVE_CONTRACT");
+        assert_eq!(
+            token_error.subject,
+            format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"),
+        );
+
+        let wrong_control_id = control_text.replacen(
+            CAMPAIGN_PROOF_CONTROL_BEAD,
+            "bd-rebase-proof-toolchain-vjd8y",
+            1,
+        );
+        assert_eq!(
+            wrong_control_id.replacen(
+                "bd-rebase-proof-toolchain-vjd8y",
+                CAMPAIGN_PROOF_CONTROL_BEAD,
+                1,
+            ),
+            control_text,
+        );
+        let id_error = validate_campaign_executable_toolchain_contracts(
+            wrong_control_id.as_bytes(),
+            &identity,
+            expected_control,
+        )
+        .expect_err("a one-byte control Bead identity drift must fail closed");
+        assert_eq!(id_error.code, "E_CAMPAIGN_PROOF_NEGATIVE_CONTRACT");
+        assert_eq!(
+            id_error.subject,
+            "bd-rebase-proof-toolchain-vjd8y/acceptance_criteria",
+        );
+
+        let malformed_checklist = control_text.replacen(
+            "- [ ] REALITY-PROOF-NEGATIVE:",
+            "- [x ] REALITY-PROOF-NEGATIVE:",
+            1,
+        );
+        assert_eq!(
+            malformed_checklist.replacen(
+                "- [x ] REALITY-PROOF-NEGATIVE:",
+                "- [ ] REALITY-PROOF-NEGATIVE:",
+                1,
+            ),
+            control_text,
+        );
+        let checklist_error = validate_campaign_executable_toolchain_contracts(
+            malformed_checklist.as_bytes(),
+            &identity,
+            expected_control,
+        )
+        .expect_err("a malformed checklist prefix must fail closed");
+        assert_eq!(checklist_error.code, "E_CAMPAIGN_PROOF_TOOLCHAIN");
+        assert_eq!(checklist_error.logical_path, "malformed checklist prefix");
+
+        let duplicate_negative = campaign_proof_control_fixture(
+            &identity,
+            "open",
+            "- [ ] ",
+            CAMPAIGN_PROOF_NEGATIVE_MARKER,
+            negative_toolchains,
+            2,
+        );
+        let duplicate_error = validate_campaign_executable_toolchain_contracts(
+            &duplicate_negative,
+            &identity,
+            expected_control,
+        )
+        .expect_err("a duplicate planted negative must fail exact inventory equality");
+        assert_eq!(duplicate_error.code, "E_CAMPAIGN_PROOF_INVENTORY");
+        assert_eq!(duplicate_error.subject, ".beads/issues.jsonl");
+
         let live_after = fs::read(live_path).expect("read live campaign state after negatives");
         assert_eq!(live_after, live_before, "negative evaluation must not mutate live state");
     }
