@@ -1725,67 +1725,67 @@ mod tests {
         inputs: &Inputs,
     ) -> Result<AcceptedContractState, StructuredEvidenceError> {
         #[allow(non_snake_case)]
-        let STATE = inputs.state.as_str();
+        let state = inputs.state.as_str();
         #[allow(non_snake_case)]
-        let ENVELOPE_MANIFEST = inputs.envelope_manifest.as_str();
+        let envelope_manifest = inputs.envelope_manifest.as_str();
         #[allow(non_snake_case)]
-        let ENVELOPE_LOCK = inputs.envelope_lock.as_str();
+        let envelope_lock = inputs.envelope_lock.as_str();
         #[allow(non_snake_case)]
-        let CAPABILITY_FS_MANIFEST = inputs.capability_fs_manifest.as_str();
+        let capability_fs_manifest = inputs.capability_fs_manifest.as_str();
         #[allow(non_snake_case)]
-        let CAPABILITY_FS_LOCK = inputs.capability_fs_lock.as_str();
+        let capability_fs_lock = inputs.capability_fs_lock.as_str();
         #[allow(non_snake_case)]
-        let REDIS_MANIFEST = inputs.redis_manifest.as_str();
+        let redis_manifest = inputs.redis_manifest.as_str();
         #[allow(non_snake_case)]
-        let REDIS_LOCK = inputs.redis_lock.as_str();
-        bounded("envelope lock", ENVELOPE_LOCK, MAX_LOCK_BYTES)?;
-        bounded("capability-fs lock", CAPABILITY_FS_LOCK, MAX_LOCK_BYTES)?;
-        bounded("redis lock", REDIS_LOCK, MAX_LOCK_BYTES)?;
-        validate_state_table_inventory(STATE)?;
-        validate_crate_records(STATE)?;
-        validate_recorded_bytes(STATE, "[probe.envelope]", "manifest", ENVELOPE_MANIFEST)?;
-        validate_recorded_bytes(STATE, "[probe.envelope]", "lock", ENVELOPE_LOCK)?;
+        let redis_lock = inputs.redis_lock.as_str();
+        bounded("envelope lock", envelope_lock, MAX_LOCK_BYTES)?;
+        bounded("capability-fs lock", capability_fs_lock, MAX_LOCK_BYTES)?;
+        bounded("redis lock", redis_lock, MAX_LOCK_BYTES)?;
+        validate_state_table_inventory(state)?;
+        validate_crate_records(state)?;
+        validate_recorded_bytes(state, "[probe.envelope]", "manifest", envelope_manifest)?;
+        validate_recorded_bytes(state, "[probe.envelope]", "lock", envelope_lock)?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.envelope]",
             "source",
             inputs.envelope_source.as_str(),
         )?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
         )?;
-        validate_recorded_bytes(STATE, "[probe.capability_fs]", "lock", CAPABILITY_FS_LOCK)?;
+        validate_recorded_bytes(state, "[probe.capability_fs]", "lock", capability_fs_lock)?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "source",
             inputs.capability_fs_source.as_str(),
         )?;
-        validate_recorded_bytes(STATE, "[probe.redis]", "manifest", REDIS_MANIFEST)?;
-        validate_recorded_bytes(STATE, "[probe.redis]", "lock", REDIS_LOCK)?;
+        validate_recorded_bytes(state, "[probe.redis]", "manifest", redis_manifest)?;
+        validate_recorded_bytes(state, "[probe.redis]", "lock", redis_lock)?;
         validate_manifest_contract(
             "envelope manifest",
-            ENVELOPE_MANIFEST,
+            envelope_manifest,
             "fastmcp-fnd01-envelope-probe",
             &["chacha20poly1305"],
         )?;
         validate_manifest_contract(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "fastmcp-fnd01-capability-fs-probe",
             &["cap-fs-ext", "cap-std"],
         )?;
         validate_manifest_contract(
             "redis manifest",
-            REDIS_MANIFEST,
+            redis_manifest,
             "fastmcp-fnd01-redis-probe",
             &["redis"],
         )?;
 
-        let hard_gate = section(STATE, "[rematerialized_hard_gate]")?;
+        let hard_gate = section(state, "[rematerialized_hard_gate]")?;
         expect_string(
             "rematerialized hard gate",
             hard_gate,
@@ -1823,18 +1823,18 @@ mod tests {
         )?;
 
         let envelope =
-            parse_dependency_selection("envelope manifest", ENVELOPE_MANIFEST, "chacha20poly1305")?;
+            parse_dependency_selection("envelope manifest", envelope_manifest, "chacha20poly1305")?;
         let capability_fs_extension = parse_dependency_selection(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "cap-fs-ext",
         )?;
         let capability_fs_root = parse_dependency_selection(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "cap-std",
         )?;
-        let redis = validate_redis_selection(REDIS_MANIFEST)?;
+        let redis = validate_redis_selection(redis_manifest)?;
         validate_selection(
             "envelope manifest",
             &envelope,
@@ -1850,7 +1850,7 @@ mod tests {
         validate_selection("capability-fs manifest", &capability_fs_root, "=4.0.2", &[])?;
 
         validate_candidate_evidence(
-            STATE,
+            state,
             "envelope evidence",
             "chacha20poly1305",
             "0.11.0",
@@ -1869,7 +1869,7 @@ mod tests {
             "1.85",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "capability-fs root evidence",
             "cap-std",
             "4.0.2",
@@ -1881,7 +1881,7 @@ mod tests {
             "",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "capability-fs extension evidence",
             "cap-fs-ext",
             "4.0.2",
@@ -1893,7 +1893,7 @@ mod tests {
             "",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "redis evidence",
             "redis",
             "1.4.1",
@@ -1940,7 +1940,7 @@ mod tests {
         )?;
 
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.envelope]",
             18,
             "chacha20poly1305 0.11.0 9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb",
@@ -1955,7 +1955,7 @@ mod tests {
             &["getrandom", "rand", "rand_core"],
         )?;
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.capability_fs]",
             41,
             "cap-fs-ext 4.0.2 d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b",
@@ -1967,7 +1967,7 @@ mod tests {
             &["arf-strings", "camino", "tokio", "async-std", "smol"],
         )?;
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.redis]",
             46,
             "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
@@ -2007,7 +2007,7 @@ mod tests {
 
         validate_lock(
             "envelope lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             4046,
             "f60c46fe85004ade47468d2b93441ab87551cd6a1cc6a9481eb75b199614c1e5",
             18,
@@ -2017,7 +2017,7 @@ mod tests {
         )?;
         validate_lock(
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             9614,
             "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c",
             41,
@@ -2027,7 +2027,7 @@ mod tests {
         )?;
         validate_lock(
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             9614,
             "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c",
             41,
@@ -2037,7 +2037,7 @@ mod tests {
         )?;
         validate_lock(
             "redis lock",
-            REDIS_LOCK,
+            redis_lock,
             10699,
             "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45",
             46,
@@ -2046,27 +2046,27 @@ mod tests {
             "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.envelope]",
             "envelope lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             "fdc2097796d6f17f16c077b7b0c306bd8ca0c2b8d0449ec98fa936684788ae1f",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             "b6c9207a08283979144bcaf2f170b58daca1b31bbff355419a2d5186abfcd9f6",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.redis]",
             "redis lock",
-            REDIS_LOCK,
+            redis_lock,
             "f764af3aefb41dbf7cc7388f2e182ba9bb01bd5d545c7bea6a7dde6984dcf8df",
         )?;
-        let redis_packages = parse_lock("redis lock", REDIS_LOCK)?;
+        let redis_packages = parse_lock("redis lock", redis_lock)?;
         if !redis_packages.iter().any(|package| {
             package.name == "sha1_smol"
                 && package.version == "1.0.1"
@@ -2080,17 +2080,17 @@ mod tests {
 
         validate_packages_absent(
             "envelope prohibited_packages_absent_from_lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             &["getrandom", "rand", "rand_core"],
         )?;
         validate_packages_absent(
             "capability-fs prohibited_packages_absent_from_lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             &["arf-strings", "camino", "tokio", "smol", "async-std"],
         )?;
         validate_packages_absent(
             "redis prohibited_packages_absent_from_lock",
-            REDIS_LOCK,
+            redis_lock,
             &[
                 "tokio",
                 "smol",
@@ -2105,7 +2105,7 @@ mod tests {
             ],
         )?;
 
-        let advisory = section(STATE, "[advisory_snapshot]")?;
+        let advisory = section(state, "[advisory_snapshot]")?;
         validate_exact_table_keys(
             "advisory snapshot",
             advisory,
@@ -2214,7 +2214,7 @@ mod tests {
         )?;
         expect_array(
             "policy",
-            section(STATE, "[policy]")?,
+            section(state, "[policy]")?,
             "prohibited_active_packages",
             &[
                 "tokio",
@@ -2229,7 +2229,7 @@ mod tests {
                 "reqwest",
             ],
         )?;
-        let policy = section(STATE, "[policy]")?;
+        let policy = section(state, "[policy]")?;
         let global_prohibitions = string_array("policy", policy, "prohibited_active_packages")?;
         let global_prohibitions = global_prohibitions
             .iter()
@@ -2237,17 +2237,17 @@ mod tests {
             .collect::<Vec<_>>();
         validate_packages_absent(
             "policy prohibited_active_packages envelope",
-            ENVELOPE_LOCK,
+            envelope_lock,
             &global_prohibitions,
         )?;
         validate_packages_absent(
             "policy prohibited_active_packages capability-fs",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             &global_prohibitions,
         )?;
         validate_packages_absent(
             "policy prohibited_active_packages redis",
-            REDIS_LOCK,
+            redis_lock,
             &global_prohibitions,
         )?;
         for (candidate, targets) in [
@@ -2282,12 +2282,12 @@ mod tests {
                 ],
             ),
         ] {
-            expect_targets(STATE, candidate, &targets)?;
+            expect_targets(state, candidate, &targets)?;
         }
-        validate_target_rows(STATE)?;
+        validate_target_rows(state)?;
         expect_array(
             "policy",
-            section(STATE, "[policy]")?,
+            section(state, "[policy]")?,
             "supported_targets",
             &[
                 "x86_64-unknown-linux-gnu",
@@ -2298,7 +2298,7 @@ mod tests {
             ],
         )?;
 
-        let gate = section(STATE, "[gate]")?;
+        let gate = section(state, "[gate]")?;
         validate_exact_table_keys(
             "gate",
             gate,
@@ -2379,13 +2379,13 @@ mod tests {
             "claim",
             "Direct immutable provenance and offline isolated lock/archive projections are frozen. All execution, target, semantic-support, bounded-Redis, and workspace integration gates remain fail-closed.",
         )?;
-        let revalidation = section(STATE, "[current_revalidation]")?;
+        let revalidation = section(state, "[current_revalidation]")?;
         expect_false(
             "current revalidation",
             revalidation,
             "archive_cache_paths_available_now",
         )?;
-        let redis_bounds = section(STATE, "[bounds.redis]")?;
+        let redis_bounds = section(state, "[bounds.redis]")?;
         validate_exact_table_keys(
             "redis bounds",
             redis_bounds,
@@ -2427,7 +2427,7 @@ mod tests {
             "blocking_boundary",
             "synchronous crate; unmodified connector/parser cannot cross the TASKR-01 support gate",
         )?;
-        let envelope_bounds = section(STATE, "[bounds.envelope]")?;
+        let envelope_bounds = section(state, "[bounds.envelope]")?;
         validate_exact_table_keys(
             "envelope bounds",
             envelope_bounds,
@@ -2479,7 +2479,7 @@ mod tests {
             envelope_bounds,
             "constant_time_targets_verified",
         )?;
-        let capability_bounds = section(STATE, "[bounds.capability_fs]")?;
+        let capability_bounds = section(state, "[bounds.capability_fs]")?;
         validate_exact_table_keys(
             "capability-fs bounds",
             capability_bounds,
