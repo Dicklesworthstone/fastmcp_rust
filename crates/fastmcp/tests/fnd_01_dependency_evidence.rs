@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 909064;
 const FROZEN_POLICY_SHA256: &str =
-    "669fb4f7c9ce301ba2f67a8c84d1d4f4ae840bf4c7c84b935497e5cf0346be65";
+    "4343cb27191db8de7bbd3c8dcaeb96eb0cca50e6ef76413059e8d978ad102ff1";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34938,7 +34938,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
     const SOURCE_TREE_SHA256: &str =
-        "10cafa60d8c12320720a0f4561ff64cce16a81f182fa0a28f409ce302e6c9e41";
+        "dde288ffdb01d672db786a3de9339d31fdcb6d0256c80685ec01c0284bde7832";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -35904,8 +35904,8 @@ activate = 1\n";
             "state",
             "bd-mcp-2026-07-28-support-ahet.1.13",
             10,
-            224_455,
-            "96e3e0568fbbc50be4207af73bdf8a2b4e7e4b895f4e2e454f2f0d6fb6734bc3",
+            229_905,
+            "26f3e9c195cadfcce3dafba73f86e88e011d27a9dd8072312472a00ae72b9b9b",
         ),
     ];
 
@@ -41447,7 +41447,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3019295
+            || policy.source_input_total_bytes != 3024745
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
