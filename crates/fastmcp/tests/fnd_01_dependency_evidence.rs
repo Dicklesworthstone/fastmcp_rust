@@ -32572,89 +32572,77 @@ _ => unreachable!("closed family matrix"),
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         #[test]
         fn phase_b_produce_acquisition_authority_matrix() {
-            if std::env::var_os("FASTMCP_FND01_RUN_ID").is_some() {
-                let run_id = std::env::var("FASTMCP_FND01_RUN_ID")
-                    .expect("run ID");
-                let error = super::super::bootstrap::run_role(vec![
-                    OsString::from(format!("target/debug/fnd-01/{run_id}/bootstrap")),
-                    OsString::from("produce"), OsString::from("."), OsString::from(run_id),
-                ]).expect_err("tool admission");
-                assert_eq!(error.code(), "E_PHASE_B_TOOL_SET");
-                return;
-            }
             let SyntheticPhaseBInputs {
+                policy,
+                manifest,
                 authoring_bytes,
+                marker,
                 mut arguments,
-                mut environment,
-                ..
+                environment,
             } = synthetic_phase_b_inputs(BootstrapMode::Produce, 0x15);
             let repository_root =
-                super::super::fresh_test_root("phase-b-role");
-            write_authoring(&repository_root, &authoring_bytes);
+                super::super::fresh_test_root("phase-b-produce-permit");
             arguments.run_root = repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id
             ));
             arguments.repository_root = repository_root.clone();
-            let tool_bin=repository_root.join("phase-b-tools/bin");
-            fs::create_dir_all(&tool_bin).expect("bin");
-            environment.closed_path=format!("{}:/usr/bin:/bin",tool_bin.display());
-            let child = std::process::Command::new(
-                std::env::current_exe().expect("exe"),
-            )
-            .args(["--exact", "phase_b_std::typed_result_tests::phase_b_produce_acquisition_authority_matrix", "--nocapture"])
-            .env_clear()
-            .env("FASTMCP_FND01_AUTHORING_CLOSURE", &environment.authoring_marker)
-            .env("FASTMCP_FND01_RUN_ID", &arguments.run_id)
-            .env("LANG", "C").env("LC_ALL", "C")
-            .env("PATH", &environment.closed_path).env("TZ", "UTC")
-            .current_dir(&repository_root).output().expect("child");
-            let child_stdout = String::from_utf8(child.stdout)
-                .expect("Phase-B Produce authority child stdout UTF-8");
-            let child_stderr = String::from_utf8(child.stderr)
-                .expect("Phase-B Produce authority child stderr UTF-8");
-            assert!(
-                child.status.success(),
-                "Phase-B Produce authority child failed: status={}; stdout={child_stdout:?}; stderr={child_stderr:?}",
-                child.status,
-            );
-            let (_, rows) = snapshot_tree_rows_with_profile(
+            let before_tree = snapshot_tree(
                 &repository_root,
-                "Produce effects",
-                TreeReadProfile::Generic,
+                "bounded Produce permit unchanged tree",
             )
-            .expect("rows");
-            let observed=rows
-                .iter()
-                .map(|row| row.path.clone())
-                .filter(|path| path == ".fnd01-run" || path.starts_with(".fnd01-run/"))
-                .collect::<BTreeSet<_>>();
+            .expect("bounded Produce permit pre-snapshot");
+            let before_authoring = authoring_bytes.clone();
+            let authority = validate_phase_b_authority(&policy)
+                .expect("independently validated whole-policy authority");
+            let expected_authority = compiled_produce_acquisition_authority();
+            assert_eq!(authority.produce_acquisition, expected_authority);
+            assert_eq!(authority.manifest.as_slice(), manifest.as_slice());
+            assert_eq!(
+                produce_acquisition_permit::require_complete_produce_acquisition_policy_join(
+                    &authority.produce_acquisition,
+                )
+                .expect("complete Produce policy join"),
+                PRODUCE_POLICY_JOIN_SHA256,
+            );
+            let acquisition = produce_acquisition_permit::issue(
+                authority,
+                &arguments,
+                &environment,
+                &marker,
+                [0; 32],
+                &authoring_bytes,
+            )
+            .expect("complete trusted inputs issue one bounded Produce permit")
+            .consume()
+            .expect("the issued permit is consumed exactly once");
             let run_root = format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id
             );
             let package_root = format!("{run_root}/bootstrap-control-package");
-            let expected = [
-                ".fnd01-run".to_owned(),
-                ".fnd01-run/integration-producer".to_owned(), run_root.clone(), package_root.clone(),
-                format!("{package_root}/Cargo.toml"), format!("{package_root}/src"),
-                format!("{package_root}/src/main.rs"), format!("{package_root}/tests"),
-                format!("{package_root}/tests/fnd_01_dependency_evidence.rs"),
-                format!("{run_root}/cargo-home"), format!("{run_root}/cargo-home/acquisition"),
-                format!("{run_root}/targets"), format!("{run_root}/targets/acquisition"),
-            ].into_iter().collect::<BTreeSet<_>>();
-            assert_eq!(observed, expected);
-            for relative in [
-                "execution-bin",
-                "supply-bundle.bin",
-                "acquisition-spool.bin",
-                "local-registry",
-                "bootstrap-control-target",
-                "control-ledger.bin",
-            ] {
-                assert!(
-                    !arguments.run_root.join(relative).exists(),
-                    "tool admission precedes {relative}",
-                );
-            }
+            let acquisition_home = format!("{run_root}/cargo-home/acquisition");
+            let acquisition_target = format!("{run_root}/targets/acquisition");
+            let execution_bin = format!("{run_root}/execution-bin");
+            assert_eq!(acquisition.authority(), &expected_authority);
+            assert_eq!(acquisition.manifest(), manifest.as_slice());
+            assert_eq!(acquisition.role_root(), run_root.as_str());
+            assert_eq!(acquisition.package_root(), package_root.as_str());
+            assert_eq!(acquisition.acquisition_home(), acquisition_home.as_str());
+            assert_eq!(
+                acquisition.acquisition_target(),
+                acquisition_target.as_str(),
+            );
+            assert_eq!(acquisition.execution_bin(), execution_bin.as_str());
+            assert_eq!(arguments.run_root, repository_root.join(&run_root));
+            assert_eq!(authoring_bytes, before_authoring);
+            assert_eq!(
+                snapshot_tree(
+                    &repository_root,
+                    "bounded Produce permit unchanged tree",
+                )
+                .expect("bounded Produce permit post-snapshot"),
+                before_tree,
+            );
+            assert!(!arguments.run_root.exists());
         }
 
         #[test]
@@ -32698,6 +32686,11 @@ _ => unreachable!("closed family matrix"),
             let package_root = arguments.run_root.join("bootstrap-control-package");
             let before = fs_identity(&fs::metadata(&package_root).expect("pkg"));
             assert_no_later_effects(&arguments);
+            let before_second_claim = snapshot_tree(
+                &arguments.repository_root,
+                "single-use Produce permit second claim",
+            )
+            .expect("single-use pre-snapshot");
             assert_eq!(
                 produce_acquisition_permit::run(
                     synthetic_phase_b_authority(&policy, &manifest), &arguments,
@@ -32706,6 +32699,14 @@ _ => unreachable!("closed family matrix"),
                 "E_PHASE_B_FRESHNESS",
             );
             assert_eq!(fs_identity(&fs::metadata(&package_root).expect("rejected")), before);
+            assert_eq!(
+                snapshot_tree(
+                    &arguments.repository_root,
+                    "single-use Produce permit second claim",
+                )
+                .expect("single-use post-snapshot"),
+                before_second_claim,
+            );
             let archive = [
                 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0,
                 0, 0, 0, 0, 0,
@@ -32717,10 +32718,24 @@ _ => unreachable!("closed family matrix"),
             wrong_manifest[0] ^= 1;
             let before_authoring = authoring_bytes.clone();
             let before_supply = supply.clone();
-            let wrong_root = super::super::fresh_test_root("phase-b-wrong-authority");
-            arguments.repository_root = wrong_root;
+            assert_eq!(
+                manifest
+                    .iter()
+                    .zip(&wrong_manifest)
+                    .filter(|(left, right)| left != right)
+                    .count(),
+                1,
+            );
+            let authority_root =
+                super::super::fresh_test_root("phase-b-wrong-authority");
+            arguments.repository_root = authority_root;
             arguments.run_root = arguments.repository_root.join(format!(
                 ".fnd01-run/integration-producer/{}", arguments.run_id));
+            let before_wrong_manifest = snapshot_tree(
+                &arguments.repository_root,
+                "wrong-manifest Produce authority",
+            )
+            .expect("wrong-manifest pre-snapshot");
             let acquisition=produce_acquisition_permit::issue(
                 synthetic_phase_b_authority(&policy,&manifest),&arguments,&environment,
                 &marker,[0;32],&authoring_bytes).expect("issue").consume().expect("consume");
@@ -32730,11 +32745,15 @@ _ => unreachable!("closed family matrix"),
             assert_eq!(authoring_bytes, before_authoring);
             assert_eq!(supply, before_supply);
             assert_no_later_effects(&arguments);
+            assert_eq!(
+                snapshot_tree(
+                    &arguments.repository_root,
+                    "wrong-manifest Produce authority",
+                )
+                .expect("wrong-manifest post-snapshot"),
+                before_wrong_manifest,
+            );
 
-            let later_root = super::super::fresh_test_root("phase-b-later-authority");
-            arguments.repository_root = later_root;
-            arguments.run_root = arguments.repository_root.join(format!(
-                ".fnd01-run/integration-producer/{}", arguments.run_id));
             let acquisition=produce_acquisition_permit::issue(
                 synthetic_phase_b_authority(&policy,&manifest),&arguments,&environment,
                 &marker,[0;32],&authoring_bytes).expect("issue").consume().expect("consume");
@@ -32744,6 +32763,14 @@ _ => unreachable!("closed family matrix"),
             assert_eq!(authoring_bytes, before_authoring);
             assert_eq!(supply, before_supply);
             assert_no_later_effects(&arguments);
+            assert_eq!(
+                snapshot_tree(
+                    &arguments.repository_root,
+                    "wrong-manifest Produce authority",
+                )
+                .expect("pristine same-root post-snapshot"),
+                before_wrong_manifest,
+            );
         }
 
         #[test]
