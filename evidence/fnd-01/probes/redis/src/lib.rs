@@ -711,12 +711,19 @@ mod tests {
         }
     }
 
+    fn array_table_record<'a>(record: &'a str) -> &'a str {
+        record
+            .find("\n[")
+            .map_or(record, |next_header| &record[..next_header])
+    }
+
     fn crate_section<'a>(
         evidence: &'a str,
         candidate: &'static str,
     ) -> Result<&'a str, StructuredEvidenceError> {
         bounded("evidence", evidence, MAX_EVIDENCE_BYTES)?;
         for item in evidence.split("[[crate]]").skip(1).take(8) {
+            let item = array_table_record(item);
             if quoted_field("crate", item, "name").ok().as_deref() == Some(candidate) {
                 return Ok(item);
             }
@@ -903,6 +910,7 @@ mod tests {
         bounded(subject, lock, MAX_LOCK_BYTES)?;
         let mut packages = Vec::new();
         for item in lock.split("[[package]]").skip(1) {
+            let item = array_table_record(item);
             let name = quoted_field(subject, item, "name")?;
             let version = quoted_field(subject, item, "version")?;
             let source = optional_field_value(subject, item, "source")?
@@ -1506,6 +1514,7 @@ mod tests {
         let mut targets = Vec::new();
         let mut matched = 0;
         for projection in evidence.split("[[target_projection]]").skip(1).take(16) {
+            let projection = array_table_record(projection);
             if quoted_field("target projection", projection, "candidate")
                 .ok()
                 .as_deref()
@@ -1552,6 +1561,7 @@ mod tests {
             .split("[[target_projection]]")
             .skip(1)
             .take(9)
+            .map(array_table_record)
             .collect::<Vec<_>>();
         let expected: [(&str, &[&str], &str); 8] = [
             (
@@ -1710,9 +1720,7 @@ mod tests {
     fn validate_crate_records(evidence: &str) -> Result<(), StructuredEvidenceError> {
         let mut names = Vec::new();
         for record in evidence.split("[[crate]]").skip(1) {
-            let record = record
-                .find("\n[")
-                .map_or(record, |next_header| &record[..next_header]);
+            let record = array_table_record(record);
             names.push(quoted_field("crate record", record, "name")?);
         }
         names.sort();
