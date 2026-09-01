@@ -302,24 +302,48 @@ mod tests {
             "manifest_sha256 = \"{}\"",
             sha256_hex(redis_manifest.as_bytes())
         );
-        let rebound_probe = probe.replacen(&old_bytes, &new_bytes, 1);
-        if rebound_probe == probe || rebound_probe.matches(&old_bytes).count() != 0 {
-            return Err(StructuredEvidenceError::UnexpectedValue {
-                subject: "[probe.redis]",
-                field: "manifest_bytes mirror",
-                expected: "one exact field replacement".to_owned(),
-                actual: old_bytes,
-            });
-        }
-        let rebound_probe = rebound_probe.replacen(&old_hash, &new_hash, 1);
-        if rebound_probe.matches(&old_hash).count() != 0 {
-            return Err(StructuredEvidenceError::UnexpectedValue {
-                subject: "[probe.redis]",
-                field: "manifest_sha256 mirror",
-                expected: "one exact field replacement".to_owned(),
-                actual: old_hash,
-            });
-        }
+        let rebind_field = |input: &str,
+                            current: &str,
+                            derived: &str,
+                            field: &'static str|
+         -> Result<String, StructuredEvidenceError> {
+            if input.lines().filter(|line| *line == current).count() != 1 {
+                return Err(StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field,
+                    expected: "one exact field replacement".to_owned(),
+                    actual: current.to_owned(),
+                });
+            }
+            let rebound = if current == derived {
+                input.to_owned()
+            } else {
+                input.replacen(current, derived, 1)
+            };
+            if rebound.lines().filter(|line| *line == derived).count() != 1
+                || (current != derived && rebound.lines().any(|line| line == current))
+            {
+                return Err(StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field,
+                    expected: "one exact field replacement".to_owned(),
+                    actual: current.to_owned(),
+                });
+            }
+            Ok(rebound)
+        };
+        let rebound_probe = rebind_field(
+            probe,
+            &old_bytes,
+            &new_bytes,
+            "manifest_bytes mirror",
+        )?;
+        let rebound_probe = rebind_field(
+            &rebound_probe,
+            &old_hash,
+            &new_hash,
+            "manifest_sha256 mirror",
+        )?;
         Ok(format!(
             "{}{}{}",
             &state[..after_header],
@@ -2607,6 +2631,7 @@ mod tests {
             REDIS_FEATURE_LINE,
             "redis={version=\"=1.4.1\",default-features=false,features=[\"acl\",\"script\",\"tokio-comp\"]}",
         );
+        assert_eq!(baseline.redis_manifest.len(), planted.redis_manifest.len());
         planted.state = rebind_redis_manifest_mirror(&planted.state, &planted.redis_manifest)
             .expect("the virtual mirror must be derived from the planted manifest");
         planted
