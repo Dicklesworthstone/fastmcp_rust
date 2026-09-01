@@ -32607,8 +32607,16 @@ _ => unreachable!("closed family matrix"),
             .env("FASTMCP_FND01_RUN_ID", &arguments.run_id)
             .env("LANG", "C").env("LC_ALL", "C")
             .env("PATH", &environment.closed_path).env("TZ", "UTC")
-            .current_dir(&repository_root).status().expect("child");
-            assert!(child.success());
+            .current_dir(&repository_root).output().expect("child");
+            let child_stdout = String::from_utf8(child.stdout)
+                .expect("Phase-B Produce authority child stdout UTF-8");
+            let child_stderr = String::from_utf8(child.stderr)
+                .expect("Phase-B Produce authority child stderr UTF-8");
+            assert!(
+                child.status.success(),
+                "Phase-B Produce authority child failed: status={}; stdout={child_stdout:?}; stderr={child_stderr:?}",
+                child.status,
+            );
             let (_, rows) = snapshot_tree_rows_with_profile(
                 &repository_root,
                 "Produce effects",
