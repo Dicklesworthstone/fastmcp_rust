@@ -47,7 +47,7 @@ mod tests {
     const CAPABILITY_FS_SOURCE: &str = include_str!("../../capability-fs/src/lib.rs");
     const REDIS_FEATURE_LINE: &str = "redis = { version = \"=1.4.1\", default-features = false, features = [\"acl\", \"script\"] }";
     const FROZEN_INPUTS_DIGEST: &str =
-        "923516149086b604095c323b1f6b7d3f0c9da5d17fc784339db0c3a4efe10a45";
+        "166511cfae5c5dd9073c6123c98fd83b8cadf2481c400b5150709129844866d1";
     fn validate_packages_absent(
         subject: &'static str,
         lock: &str,
@@ -1969,7 +1969,7 @@ mod tests {
         validate_probe_evidence(
             state,
             "[probe.redis]",
-            46,
+            50,
             "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
             &[
                 "redis/acl",
@@ -2038,9 +2038,9 @@ mod tests {
         validate_lock(
             "redis lock",
             redis_lock,
-            10699,
-            "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45",
-            46,
+            11713,
+            "d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029",
+            50,
             "redis",
             "1.4.1",
             "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
@@ -2064,7 +2064,7 @@ mod tests {
             "[probe.redis]",
             "redis lock",
             redis_lock,
-            "f764af3aefb41dbf7cc7388f2e182ba9bb01bd5d545c7bea6a7dde6984dcf8df",
+            "20b4e7f176301d12cd682638bd9b1b3f10d4d89dc2ca1546acfb82cafdca5946",
         )?;
         let redis_packages = parse_lock("redis lock", redis_lock)?;
         if !redis_packages.iter().any(|package| {
