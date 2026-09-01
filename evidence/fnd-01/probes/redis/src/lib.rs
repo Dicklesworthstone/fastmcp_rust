@@ -2924,7 +2924,7 @@ mod tests {
             assert_fresh_baseline(&accepted_before);
         }
 
-        for (label, lock) in [
+        for (label, lock, expected_actual) in [
             (
                 "alternate registry source",
                 baseline.redis_lock.replacen(
@@ -2932,6 +2932,7 @@ mod tests {
                     "registry+https://example.invalid/index",
                     1,
                 ),
+                "lock_bytes=11698;lock_sha256=d3ea89518d958ec1c96f24051a89aeec5226f6f2bd6a536d0db718a78785e865",
             ),
             (
                 "alternate registry checksum",
@@ -2940,6 +2941,7 @@ mod tests {
                     "checksum = \"0000000000000000000000000000000000000000000000000000000000000000\"",
                     1,
                 ),
+                "lock_bytes=11713;lock_sha256=02e4ec378a3deb718fc40a8a137187d9b8cbde5c3f0bb5a54f69f6bedc98d4ef",
             ),
         ] {
             let mut alternate_lock = Inputs::baseline();
@@ -2947,14 +2949,33 @@ mod tests {
             alternate_lock
                 .rebind_expected_domain_digest()
                 .expect("lock plant expected digest must be derived");
-            assert!(matches!(
-                validate_full(&alternate_lock),
-                Err(StructuredEvidenceError::UnexpectedValue {
-                    subject: "redis lock",
-                    field: "lock byte/hash binding",
-                    ..
-                })
-            ), "{label}");
+            assert_eq!(changed_input_count(&baseline, &alternate_lock), 1, "{label}");
+            assert_eq!(
+                semantic_input_change_count(&baseline, &alternate_lock),
+                1,
+                "{label}"
+            );
+            assert_eq!(alternate_lock.state, baseline.state, "{label}");
+            let error = validate_full(&alternate_lock)
+                .expect_err("one-field Redis lock plant must fail closed");
+            let expected_binding = "lock_bytes=11713;lock_sha256=d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029";
+            assert_eq!(
+                error,
+                StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field: "recorded byte/hash binding",
+                    expected: expected_binding.to_owned(),
+                    actual: expected_actual.to_owned(),
+                },
+                "{label}"
+            );
+            assert_eq!(
+                error.stable_diagnostic(),
+                format!(
+                    "E_UNEXPECTED_VALUE:[probe.redis]:recorded byte/hash binding:{expected_binding}:{expected_actual}"
+                ),
+                "{label}"
+            );
             assert_fresh_baseline(&accepted_before);
         }
     }
