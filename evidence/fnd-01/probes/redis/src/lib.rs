@@ -583,7 +583,14 @@ mod tests {
         field: &'static str,
     ) -> Result<Vec<String>, StructuredEvidenceError> {
         let encoded = field_value(subject, text, field)?;
-        parse_string_array_value(subject, field, encoded)
+        let normalized = encoded
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .map(str::trim_end)
+            .and_then(|content| content.strip_suffix(','))
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| format!("[{content}]"));
+        parse_string_array_value(subject, field, normalized.as_deref().unwrap_or(encoded))
     }
 
     fn parse_string_array_value(
@@ -2626,6 +2633,34 @@ mod tests {
         assert_eq!(
             error.stable_diagnostic(),
             "E_FORBIDDEN_FEATURE:redis requested_features:tokio-comp"
+        );
+        assert_fresh_baseline(&accepted_before);
+
+        let mut double_terminal_comma = Inputs::baseline();
+        let test_ids_tail = concat!(
+            "  \"tests::fnd_01_state_capability_dependencies_planted_negative\",\n",
+            "]",
+        );
+        let double_comma_tail = concat!(
+            "  \"tests::fnd_01_state_capability_dependencies_planted_negative\",,\n",
+            "]",
+        );
+        double_terminal_comma.state = double_terminal_comma.state.replacen(
+            test_ids_tail,
+            double_comma_tail,
+            1,
+        );
+        double_terminal_comma
+            .rebind_expected_domain_digest()
+            .expect("double-comma expected digest must be derived");
+        assert_eq!(changed_input_count(&baseline, &double_terminal_comma), 1);
+        assert_eq!(semantic_input_change_count(&baseline, &double_terminal_comma), 0);
+        assert_eq!(
+            validate_full(&double_terminal_comma),
+            Err(StructuredEvidenceError::MalformedField {
+                subject: "rematerialized hard gate",
+                field: "test_ids",
+            })
         );
         assert_fresh_baseline(&accepted_before);
 
