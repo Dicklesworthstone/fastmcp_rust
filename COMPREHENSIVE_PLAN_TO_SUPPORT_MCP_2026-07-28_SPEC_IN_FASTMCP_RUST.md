@@ -30632,7 +30632,7 @@ Implementation:
   and OIDC Enterprise `-01`
   `13832c150ecb7b8d31d08240214388cbfc4982142ecf4808c443014c573c868b`.
   Do not import the client-credentials MDX/scenario into this stable
-  gate; GATE-EXPERIMENTAL-AUTH-BUILD owns those artifacts.
+  gate; GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY owns those artifacts.
 - Aggregate the positive OIDC and AUTHX-04 SAML branches independently;
   neither branch can mask the other. Retain the provider-proof and defensive
   ID-token checks, and prove pre-dispatch rejection of refresh-token subject exchange,
@@ -32436,7 +32436,7 @@ aggregate or final-release claim.
 
 Implementation:
 
-- Run GATE-EXPERIMENTAL-AUTH-BUILD, exact
+- Run GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY, exact
   `auth/client-credentials-jwt` as the pinned multi-cause raw negative,
   a separately hashed one-variable ES256 negative, an independent
   nonempty RS256 real-peer positive matrix, and exact
@@ -32531,7 +32531,7 @@ Tests:
 Dependencies:
 
 - CI-BASE-01.
-- GATE-EXPERIMENTAL-AUTH-BUILD.
+- GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY.
 - CI-FINAL-CORE-01.
 - DOC-02.
 
@@ -34368,7 +34368,7 @@ Dependencies:
 - GATE-PROXY-READY.
 - GATE-PROXY-DUAL-READY.
 - GATE-PROXY-TASKS-READY.
-- GATE-EXPERIMENTAL-AUTH-BUILD.
+- GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY.
 - EXT-SRC-01.
 - EXT-DEV-01.
 - DX-TEST-01.
@@ -34417,7 +34417,7 @@ Dependencies:
 - CI-EMA-01.
 - CI-BUILTIN-AUTH-01.
 - CI-EMA-BUILTIN-01.
-- CI-EXPERIMENTAL-AUTH-01.
+- CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01.
 - CI-PROXY-01.
 - CI-PROXY-DUAL-01.
 - CI-PROXY-TASKS-01.
@@ -35498,16 +35498,15 @@ multiple closures. The checker derives membership from package edges and
 rejects an omitted/extra label or a delta-only projection.
 
 The formal corpus has exactly 145 work packages and 782 prerequisite bullets
-in this plan revision. Three separately owned authorization-profile bullets
-still use retired package IDs and therefore keep the canonical graph
-fail-closed: two `GATE-EXPERIMENTAL-AUTH-BUILD` references and one
-`CI-EXPERIMENTAL-AUTH-01` reference. After their security owner performs the
-name-only replacements with `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY` and
-`CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01`, the graph has two intentional seeds
+in this plan revision. On 2026-09-01 the designated security structure owner
+applied the three frozen name-only authorization-profile corrections: the two
+retired gate references now name
+`GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY`, and the retired CI reference now
+names `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01`. The graph therefore has two intentional seeds
 (`FND-01` and `REL-QUAR-00`), no unresolved package ID, no cycle, two sinks
 (`REL-02` and the separately optional `CI-REDIS-TASKS-01`), and a longest
-formal path of 33 packages. Until that independent correction lands, none of
-those resolved-graph facts is claim evidence.
+formal path of 33 packages. Those resolved-graph facts are structural
+predicates only and are not aggregate support or release evidence.
 Changing any package or dependency regenerates this table, the release
 inventories, the canonical graph artifact, and the Beads projection in
 one reviewed transaction.
@@ -38504,26 +38503,22 @@ Beads issue to be synchronized.
 
 ### 36.1 Materialization result
 
-The Beads materialization/projection is intentionally marked non-current.
-The last complete tracker materialization occurred on 2026-07-29 against an older 122-package,
-606-edge plan. Subsequent implementation activity, formal package edits,
-new packages, missing provenance edges, and an unhealthy lock/base anchor
-mean it cannot authorize a claim, close, schedule, or release decision.
+A complete structural tracker materialization was performed by the designated
+authorization/security structure owner on 2026-09-01. It completed the frozen
+145-parent/595-executable-child topology and the 580 canonical A/B/I/V role
+identities, repaired the two observed incomplete A/B-to-I chains, and matched
+every frozen formal profile-closure count below. This is topology only: it
+cannot authorize a capability claim, close, maturity promotion, or release
+decision until the independent batch verifier binds it to the exact revision
+and executable evidence.
 
 Current formal-plan truth, independently extracted from the package-local
 `Dependencies:` blocks, is:
 
 - 145 unique packages and 782 prerequisite bullets;
-- no duplicate ID/edge or self-edge. The raw canonical text still has
-  three externally owned authorization-profile name defects: two
-  references to `GATE-EXPERIMENTAL-AUTH-BUILD` must become
-  `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY`, and one reference to
-  `CI-EXPERIMENTAL-AUTH-01` must become
-  `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01`. Until that separate owner
-  synchronizes those package bodies, raw graph resolution is not clean
-  and no aggregate claim may consume an alias silently;
-- applying only those exact intended renames in a read-only diagnostic
-  projection yields no unresolved ID, duplicate edge, self-edge, or cycle;
+- no unresolved package ID, duplicate edge, self-edge, or cycle after the
+  designated security structure owner applied the three frozen name-only
+  authorization-profile corrections on 2026-09-01;
 - two intentional seeds: implementation-evidence seed `FND-01` and
   emergency release-safety seed `REL-QUAR-00`;
 - two terminal sinks in that intended projection: `REL-02` and
@@ -38738,7 +38733,7 @@ IDs or infer readiness from this table.
 | `CI-DUAL-01` | `bd-mcp-2026-07-28-support-ahet.101` |
 | `CI-EMA-01` | `bd-mcp-2026-07-28-support-ahet.104` |
 | `CI-EMA-BUILTIN-01` | `bd-mcp-2026-07-28-support-ahet.121` |
-| `CI-EXPERIMENTAL-AUTH-01` | `bd-mcp-2026-07-28-support-ahet.106` |
+| `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01` | `bd-mcp-2026-07-28-support-ahet.106` |
 | `CI-FINAL-CORE-01` | `bd-mcp-2026-07-28-support-ahet.119` |
 | `CI-PROXY-01` | `bd-mcp-2026-07-28-support-ahet.107` |
 | `CI-PROXY-DUAL-01` | `bd-mcp-2026-07-28-support-ahet.109` |
@@ -38770,7 +38765,7 @@ IDs or infer readiness from this table.
 | `GATE-DUAL-READY` | `bd-mcp-2026-07-28-support-ahet.90` |
 | `GATE-EMA-BUILTIN-READY` | `bd-mcp-2026-07-28-support-ahet.118` |
 | `GATE-EMA-READY` | `bd-mcp-2026-07-28-support-ahet.93` |
-| `GATE-EXPERIMENTAL-AUTH-BUILD` | `bd-mcp-2026-07-28-support-ahet.96` |
+| `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY` | `bd-mcp-2026-07-28-support-ahet.96` |
 | `GATE-PROXY-DUAL-READY` | `bd-mcp-2026-07-28-support-ahet.97` |
 | `GATE-PROXY-READY` | `bd-mcp-2026-07-28-support-ahet.95` |
 | `GATE-PROXY-TASKS-READY` | `bd-mcp-2026-07-28-support-ahet.98` |
@@ -39082,10 +39077,10 @@ shape. The exact addition is `17 * 4 + 2 * 3 + 2 * 4 + 2 = 84` children plus
 the two core parent records, producing the
 mandatory intermediate checkpoint of 988 physical records, 965 non-tombstone
 records, 540 associated children, 539 executable `work-package-child` records,
-and 524 canonical A/B/I/V roles. The separately owned 14-package
-authorization/security cohort adds the remaining 56 children. Its owner must
-also update, not duplicate, the two existing parents whose external references
-still use the superseded experimental-auth names. Only the combined
+and 524 canonical A/B/I/V roles. On 2026-09-01 the separately owned 14-package
+authorization/security cohort added the remaining 56 children and updated,
+rather than duplicated, the two existing parents whose external references
+used the superseded experimental-auth names. Only the combined
 1044/1021/596/595/580 physical/non-tombstone/associated/executable/
 canonical-role result is the complete topology; neither cohort alone
 establishes aggregate support or readiness.

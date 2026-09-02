@@ -1715,6 +1715,134 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    struct StdioRetryAttemptLog {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl StdioRetryAttemptLog {
+        fn new(label: &str) -> Self {
+            static NEXT_LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+            let log_id = NEXT_LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "fastmcp-client-stdio-retry-{label}-{}-{log_id}.log",
+                std::process::id()
+            ));
+            std::fs::write(&path, []).expect("retry attempt log must be created empty");
+            Self { path }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.path)
+                .expect("retry attempt log must remain readable")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StdioRetryAttemptLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    struct PublicStdioRetryProbe {
+        error: McpError,
+        attempt_events: Vec<String>,
+        elapsed: Duration,
+    }
+
+    #[cfg(unix)]
+    fn run_public_stdio_retry_probe(cancel_during_delay: bool) -> PublicStdioRetryProbe {
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        const FIRST_RESPONSE: [&str; 2] = ["spawn", "response"];
+
+        let attempt_log = StdioRetryAttemptLog::new(if cancel_during_delay {
+            "cancelled"
+        } else {
+            "active"
+        });
+        let attempt_log_arg = attempt_log
+            .path
+            .to_str()
+            .expect("temporary retry attempt path must be valid UTF-8");
+        let script = r#"printf '%s\n' spawn >> "$1";
+            IFS= read -r request || exit 91;
+            case "$request" in *server/discover*) ;; *) exit 92 ;; esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"planned retry probe failure"}}';
+            printf '%s\n' response >> "$1";
+            exit 73"#;
+        let cx = Cx::for_request();
+        let canceller = cancel_during_delay.then(|| {
+            let cancellation_cx = cx.clone();
+            let cancellation_log = attempt_log.path.clone();
+            std::thread::spawn(move || {
+                let observation_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let events = std::fs::read_to_string(&cancellation_log).unwrap_or_default();
+                    if events.lines().eq(FIRST_RESPONSE) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < observation_deadline,
+                        "the first real child must emit its correlated failure before cancellation"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+
+                // The child has emitted its terminal response. Give the public
+                // connection path time to enter its much longer retry delay,
+                // then cancel that caller-owned wait.
+                std::thread::sleep(Duration::from_millis(50));
+                cancellation_cx.set_cancel_requested(true);
+            })
+        });
+
+        let started = Instant::now();
+        let result = block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .auto_initialize(false)
+                .connection_retry_policy(2, RETRY_DELAY, Duration::from_secs(5))
+                .expect("two-attempt public retry policy must be valid")
+                .connect_stdio_with_cx(
+                    "sh",
+                    &["-c", script, "fastmcp-stdio-retry-probe", attempt_log_arg],
+                    &cx,
+                ),
+        );
+        let elapsed = started.elapsed();
+        if let Some(canceller) = canceller {
+            canceller
+                .join()
+                .expect("retry-delay cancellation helper must complete");
+        }
+        let error = match result {
+            Ok(mut client) => {
+                client
+                    .close()
+                    .expect("unexpected retry probe client must still be cleaned up");
+                panic!("both retry probe children return a correlated protocol failure")
+            }
+            Err(error) => error,
+        };
+
+        // A wrongly admitted second child may append shortly after the public
+        // future resolves. Wait one cancellation slice before freezing the
+        // observable so the negative assertion detects that race as well.
+        std::thread::sleep(CONNECTION_RETRY_CANCEL_SLICE);
+        PublicStdioRetryProbe {
+            error,
+            attempt_events: attempt_log.lines(),
+            elapsed,
+        }
+    }
+
     #[test]
     fn test_builder_defaults() {
         let builder = ClientBuilder::new();
@@ -2522,6 +2650,44 @@ mod tests {
         );
         let err = result.err().expect("error result");
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_connect_stdio_with_cx_retries_after_failed_first_child() {
+        let probe = run_public_stdio_retry_probe(false);
+
+        assert_ne!(
+            probe.error.code,
+            McpErrorCode::RequestCancelled,
+            "an active caller context must not turn a failed retry sequence into cancellation"
+        );
+        assert_eq!(
+            probe.attempt_events,
+            ["spawn", "response", "spawn", "response"],
+            "the public connection path must create and observe the second real child"
+        );
+        assert!(
+            probe.elapsed >= Duration::from_secs(2),
+            "the second child must remain gated by the configured caller-context retry delay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_connect_stdio_with_cx_cancellation_during_retry_delay_creates_no_second_child() {
+        let probe = run_public_stdio_retry_probe(true);
+
+        assert_eq!(probe.error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            probe.attempt_events,
+            ["spawn", "response"],
+            "cancellation after the failed first child must leave the attempt log unchanged"
+        );
+        assert!(
+            probe.elapsed < Duration::from_secs(2),
+            "caller cancellation must settle before the retry delay could admit attempt two"
+        );
     }
 
     #[test]

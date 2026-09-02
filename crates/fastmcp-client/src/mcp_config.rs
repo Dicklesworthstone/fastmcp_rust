@@ -63,9 +63,9 @@ use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
-    ChildGuard, Client, ClientProtocolPlan, ClientSession, RequestTimeoutPolicy,
-    combine_cleanup_results, combine_operation_with_cleanup, resolve_stdio_command,
-    transport_error_to_mcp,
+    ChildGuard, Client, ClientBuilder, ClientProtocolPlan, ClientSession, HttpClient,
+    HttpClientError, RequestTimeoutPolicy, combine_cleanup_results, combine_operation_with_cleanup,
+    resolve_stdio_command, transport_error_to_mcp,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
@@ -426,6 +426,28 @@ impl HttpEndpointConfig {
     pub const fn endpoint_bundle(&self) -> &HttpEndpointBundle {
         &self.bundle
     }
+
+    /// Constructs the immutable client protocol plan for this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the retained canonical routes no longer
+    /// satisfy their explicit protocol policy.
+    pub fn protocol_plan(&self) -> Result<ClientProtocolPlan, HttpEndpointConfigError> {
+        ClientProtocolPlan::http(
+            self.policy,
+            self.modern_post.clone(),
+            self.legacy_sse.clone(),
+            self.legacy_message_post.clone(),
+            self.credential_partition.clone(),
+            self.security_partition.clone(),
+            self.transport_profile.clone(),
+            self.policy_generation,
+            self.configuration_generation,
+            self.legacy_receipt_generation,
+        )
+        .map_err(HttpEndpointConfigError::from)
+    }
 }
 
 fn parse_configured_target(
@@ -530,6 +552,12 @@ pub enum ConfigError {
     ServerNotFound(String),
     /// Server is disabled.
     ServerDisabled(String),
+    /// Server has no configured HTTP endpoint.
+    HttpNotConfigured(String),
+    /// Configured HTTP routes could not form a client protocol plan.
+    HttpPlanError(HttpEndpointConfigError),
+    /// Configured HTTP client connection or initialization failed.
+    HttpClientError(HttpClientError),
     /// Failed to spawn server process.
     SpawnError(String),
     /// Server process started, but the MCP client lifecycle failed.
@@ -544,6 +572,11 @@ impl std::fmt::Display for ConfigError {
             ConfigError::ParseError(e) => write!(f, "Failed to parse configuration: {e}"),
             ConfigError::ServerNotFound(name) => write!(f, "Server not found: {name}"),
             ConfigError::ServerDisabled(name) => write!(f, "Server is disabled: {name}"),
+            ConfigError::HttpNotConfigured(name) => {
+                write!(f, "Server has no configured HTTP endpoint: {name}")
+            }
+            ConfigError::HttpPlanError(e) => write!(f, "Invalid configured HTTP plan: {e}"),
+            ConfigError::HttpClientError(e) => write!(f, "HTTP MCP client lifecycle failed: {e}"),
             ConfigError::SpawnError(e) => write!(f, "Failed to spawn server: {e}"),
             ConfigError::ClientError(e) => write!(f, "MCP client lifecycle failed: {e}"),
         }
@@ -554,6 +587,8 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::ReadError(e) => Some(e),
+            ConfigError::HttpPlanError(e) => Some(e),
+            ConfigError::HttpClientError(e) => Some(e),
             ConfigError::ClientError(e) => Some(e),
             _ => None,
         }
@@ -709,16 +744,45 @@ impl McpConfig {
         timeout_policy
             .validate()
             .map_err(ConfigError::ClientError)?;
+        let config = self.enabled_server(name)?;
+
+        spawn_client_from_config(name, config, cx, timeout_policy)
+    }
+
+    /// Connects a ready HTTP client from one server's explicit endpoint
+    /// configuration under the caller's capability context.
+    ///
+    /// This entrypoint never inspects or spawns the configured stdio command.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the server is missing, disabled, lacks HTTP
+    /// endpoint configuration, has an invalid retained protocol plan, or the
+    /// HTTP connection lifecycle fails.
+    pub async fn http_client(&self, cx: &Cx, name: &str) -> Result<HttpClient, ConfigError> {
+        let config = self.enabled_server(name)?;
+        let http = config
+            .http_endpoint_config()
+            .ok_or_else(|| ConfigError::HttpNotConfigured(name.to_owned()))?;
+        let protocol_plan = http.protocol_plan().map_err(ConfigError::HttpPlanError)?;
+
+        ClientBuilder::new()
+            .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
+            .protocol_plan(protocol_plan)
+            .connect_http_client_with_cx(cx)
+            .await
+            .map_err(ConfigError::HttpClientError)
+    }
+
+    fn enabled_server(&self, name: &str) -> Result<&ServerConfig, ConfigError> {
         let config = self
             .mcp_servers
             .get(name)
-            .ok_or_else(|| ConfigError::ServerNotFound(name.to_string()))?;
-
+            .ok_or_else(|| ConfigError::ServerNotFound(name.to_owned()))?;
         if config.disabled {
-            return Err(ConfigError::ServerDisabled(name.to_string()));
+            return Err(ConfigError::ServerDisabled(name.to_owned()));
         }
-
-        spawn_client_from_config(name, config, cx, timeout_policy)
+        Ok(config)
     }
 
     /// Merges another configuration into this one.
@@ -1576,6 +1640,20 @@ mod tests {
                 "server not found",
             ),
             (ConfigError::ServerDisabled("name".into()), "disabled"),
+            (
+                ConfigError::HttpNotConfigured("name".into()),
+                "http endpoint",
+            ),
+            (
+                ConfigError::HttpPlanError(HttpEndpointConfigError::MissingModernPostTarget {
+                    policy: ProtocolPolicy::ModernOnly,
+                }),
+                "http plan",
+            ),
+            (
+                ConfigError::HttpClientError(HttpClientError::ModernDiscoveryMissingServerInfo),
+                "http mcp client lifecycle",
+            ),
             (ConfigError::ParseError("msg".into()), "parse"),
             (
                 ConfigError::ClientError(McpError::request_cancelled()),
@@ -1607,6 +1685,16 @@ mod tests {
 
         let client_err = ConfigError::ClientError(McpError::request_cancelled());
         assert!(std::error::Error::source(&client_err).is_some());
+
+        let http_plan_err =
+            ConfigError::HttpPlanError(HttpEndpointConfigError::MissingModernPostTarget {
+                policy: ProtocolPolicy::ModernOnly,
+            });
+        assert!(std::error::Error::source(&http_plan_err).is_some());
+
+        let http_client_err =
+            ConfigError::HttpClientError(HttpClientError::ModernDiscoveryMissingServerInfo);
+        assert!(std::error::Error::source(&http_client_err).is_some());
     }
 
     #[test]

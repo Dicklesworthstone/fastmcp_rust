@@ -106,6 +106,19 @@
 //! use fastmcp_rust::prelude::block_on;
 //! # let _ = block_on(async {});
 //! ```
+//!
+//! The curated `core` namespace likewise omits both the helper and its
+//! implementation module:
+//!
+//! ```compile_fail
+//! use fastmcp_rust::core::block_on;
+//! # let _ = block_on(async {});
+//! ```
+//!
+//! ```compile_fail
+//! use fastmcp_rust::core::runtime::block_on;
+//! # let _ = block_on(async {});
+//! ```
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -242,11 +255,52 @@ pub mod client {
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
 }
 
-/// Complete component namespaces for advanced consumers.
+/// Curated core namespace for advanced consumers.
 ///
-/// The remaining component namespaces retain their implemented public items
-/// without requiring an application to name a FastMCP component crate directly.
-pub use fastmcp_core as core;
+/// This retains the core context, error, limit, crypto, URI, and combinator
+/// vocabulary without exposing the workspace-private runtime adapter. Runtime
+/// construction remains an application responsibility; procedural macros use
+/// the separate doc-hidden [`__private::core`] expansion path.
+pub mod core {
+    pub use fastmcp_core::{
+        ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,
+        AbsoluteUriScheme, AccessToken, AuthContext, AuthorityErrorKind, Budget,
+        CANONICAL_HTTP_URL_POLICY, CANONICAL_URL_HARD_MAX_BYTES, CancelledError, CanonicalHttpUrl,
+        CanonicalHttpUrlError, CanonicalResourceId, CanonicalResourceIdError,
+        CanonicalResourceIdPolicy, CanonicalUrlPolicy, CatalogChangePublisher,
+        ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, CryptoInputTooLongError, Cx,
+        DEFAULT_ABSOLUTE_URI_MAX_BYTES, DEFAULT_CANONICAL_URL_MAX_BYTES,
+        DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
+        DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS, DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
+        DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK, DISABLED_PROMPTS_KEY, DISABLED_RESOURCES_KEY,
+        DISABLED_TOOLS_KEY, DefaultPortPolicy, DotSegmentPolicy, EPHEMERAL_KEY_MATERIAL_BYTES,
+        ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
+        ElicitationSender, EphemeralKeyMaterial, FragmentPolicy, HARD_LOGICAL_EXCHANGE_MAX_INPUTS,
+        HARD_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND, HARD_LOGICAL_EXCHANGE_MAX_ROUNDS,
+        HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES, HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
+        HMAC_SHA256_KEY_BYTES, HMAC_SHA256_TAG_BYTES, HmacSha256Key, HmacSha256Tag,
+        HmacVerificationError, IdnaPolicy, IntoOutcome, LogicalExchangeBudget,
+        LogicalExchangeBudgetError, LogicalExchangeBudgetResource, MAX_ACCESS_SCHEME_BYTES,
+        MAX_ACCESS_TOKEN_BYTES, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
+        McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpLogLevel,
+        McpOutcome, McpRequestCancellation, McpResult, NONCE_DOMAIN_MATERIAL_BYTES,
+        NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NonceDomainMaterial,
+        NotificationSender, Outcome, OutcomeExt, ParseDurationError, PercentEncodingPolicy,
+        ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole,
+        ProtocolLimit, ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QueryPolicy,
+        RandomDrawError, RegionId, ResourceContentItem, ResourceEndpointPathPolicy,
+        ResourceReadResult, ResourceReader, ResultExt, RootsProvider, SECURITY_IDENTIFIER_BYTES,
+        SHA256_DIGEST_BYTES, SamplingRequest, SamplingRequestMessage, SamplingResponse,
+        SamplingRole, SamplingSender, SamplingStopReason, SchemeHostCasePolicy, Scope,
+        SecurityIdentifier, ServerCapabilityInfo, SessionState, Sha256Digest,
+        SyntaxViolationPolicy, TaskId, ToolCallResult, ToolCaller, ToolContentItem,
+        TrailingSlashPolicy, UriComponentState, UserinfoPolicy, WEBSOCKET_MASK_BYTES,
+        WebSocketMask, cancelled, draw_ephemeral_key_material, draw_hmac_sha256_key,
+        draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, err, ok,
+        parse_duration, sha256_bounded,
+    };
+    pub use fastmcp_core::{combinator, crypto, limits, logging, uri};
+}
 pub use fastmcp_derive as derive;
 /// Curated core protocol namespaces for advanced consumers.
 ///
@@ -744,7 +798,12 @@ pub use fastmcp_server::bidirectional::{
 };
 
 // Re-export server middleware modules (no Docket/Redis in FND-01 surface).
+pub use fastmcp_server::caching::ResponseCachingMiddleware;
 pub use fastmcp_server::providers;
+pub use fastmcp_server::rate_limiting::{
+    RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware,
+};
+pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
@@ -9722,6 +9781,7 @@ pub mod prelude {
         // Context and errors
         AccessToken,
         AdmittedSchema,
+        ArgTransform,
         AuthContext,
         BoundHttpServer,
         // Client
@@ -9866,12 +9926,14 @@ pub mod prelude {
         ProtocolEra,
         ProtocolPolicy,
         ProtocolVersion,
+        RateLimitingMiddleware,
         RequestAdmissionError,
         RequestId,
         RequestTimeoutPolicy,
         RequestTimeoutSource,
         Resource,
         ResourceContent,
+        ResponseCachingMiddleware,
         ResultExt,
         ReversibleResourceTemplate,
         Role,
@@ -9889,6 +9951,7 @@ pub mod prelude {
         ServerHttpSession,
         ServerHttpSseResponse,
         ServerNotification,
+        SlidingWindowRateLimitingMiddleware,
         SseEndOfStream,
         SseEvent,
         SseLimits,
@@ -9906,6 +9969,8 @@ pub mod prelude {
         TokenAuthProvider,
         TokenVerifier,
         Tool,
+        TransformedTool,
+        TransformedToolBuilder,
         TransportRecvHalf,
         TransportSendHalf,
         TwoPhaseTransport,
