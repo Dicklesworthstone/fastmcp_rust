@@ -1666,8 +1666,11 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
 
 #[cfg(target_os = "linux")]
 fn process_is_zombie(pid: u32) -> Result<bool, String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(format!("failed to read process {pid} state: {error}")),
+    };
     let (state, _) = linux_process_state_and_group(&stat)
         .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
     Ok(matches!(state, 'Z' | 'X'))

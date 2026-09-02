@@ -20,6 +20,7 @@
     clippy::unnested_or_patterns
 )]
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -32,20 +33,20 @@ use fastmcp_rust::server::{BoxFuture, FinalMethodOutcome};
 use fastmcp_rust::{
     AccessToken, AuthContext, AuthRequest, CacheScope, CacheTtl, CanonicalHttpUrl,
     ClientCapabilities, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan,
-    CompleteResult, CompletionHandler, Content, ContentBlock, CoreResult, Cx, DuplicateBehavior,
-    EmbeddedResourceContents, FinalCallToolResult, FinalCoreResult, FinalElicitationContextExt,
-    FinalEmbeddedRootsListParams, FinalGetPromptResult, FinalPromptMessage,
-    FinalReadResourceResult, FinalResourceTemplate, FinalRootsContextExt, FinalSamplingContextExt,
-    FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
-    JsonRpcMessage, JsonRpcRequest, ListPromptsParams, ListResourceTemplatesParams,
-    ListResourcesParams, ListToolsParams, McpContext, McpError, McpErrorCode, McpOutcome,
-    McpRequestCancellation, McpResult, Middleware, ModernHttpResponseKind,
-    ModernHttpResponseStream, Outcome, Prompt, PromptArgument, PromptHandler, PromptMessage,
-    ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
-    ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider,
-    TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolExecutionMode, ToolHandler, auto,
-    caching, core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool,
-    transform,
+    CompleteResult, CompletionHandler, ConfigError, Content, ContentBlock, CoreResult, Cx,
+    DuplicateBehavior, EmbeddedResourceContents, FinalCallToolResult, FinalCoreResult,
+    FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalGetPromptResult,
+    FinalPromptMessage, FinalReadResourceResult, FinalResourceTemplate, FinalRootsContextExt,
+    FinalSamplingContextExt, FinalToolOutcome, HttpEndpointConfig, HttpNonquiescentShutdown,
+    HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, ListPromptsParams,
+    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, McpConfig, McpContext,
+    McpError, McpErrorCode, McpOutcome, McpRequestCancellation, McpResult, Middleware,
+    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Outcome, Prompt,
+    PromptArgument, PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, RawIcon, Resource,
+    ResourceContent, ResourceHandler, ResourceTemplate, ResultMeta, Role, ServerConfig, SseLimits,
+    StaticTokenVerifier, TokenAuthProvider, TokenVerifier, Tool, ToolAnnotations, ToolErrorKind,
+    ToolExecutionMode, ToolHandler, auto, caching, legacy_2024, modern, prompt, providers,
+    rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
@@ -114,6 +115,48 @@ const PUBLIC_HTTP_IMAGE_DATA: &str = "e2eimage";
 const PUBLIC_HTTP_AUDIO_DATA: &str = "e2eaudio";
 const PUBLIC_HTTP_CUSTOM_AUTH_SUBJECT: &str = "e2e-custom-verifier-principal";
 const PUBLIC_HTTP_CUSTOM_AUTH_TOKEN: &str = "gamma";
+const MCP_CONFIG_HTTP_SERVER_NAME: &str = "configured-modern-http";
+const MCP_CONFIG_NONEXISTENT_COMMAND: &str =
+    "fastmcp-http-config-command-must-not-exist-bd-mcp-http-03-integration-vx7y-1";
+
+struct McpConfigHttpRequestCounter {
+    requests: Arc<AtomicUsize>,
+}
+
+impl Middleware for McpConfigHttpRequestCounter {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        _request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(MiddlewareDecision::Continue)
+    }
+}
+
+// RH-5: the frozen positive and zero-contact negative call this same constructor,
+// changing only `disabled`.
+fn mcp_config_for_live_modern_endpoint(address: SocketAddr, disabled: bool) -> McpConfig {
+    let endpoint = HttpEndpointConfig::new(
+        ProtocolPolicy::ModernOnly,
+        Some(format!("http://{address}/mcp")),
+        None,
+        None,
+        "configured-http-credential-v1".to_owned(),
+        "configured-http-security-v1".to_owned(),
+        "configured-http-sse-v2".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("the live fixture address forms a valid ModernOnly endpoint plan");
+    let server =
+        ServerConfig::new(MCP_CONFIG_NONEXISTENT_COMMAND).with_http_endpoint_config(endpoint);
+    let server = if disabled { server.disabled() } else { server };
+    let mut config = McpConfig::new();
+    config.add_server(MCP_CONFIG_HTTP_SERVER_NAME, server);
+    config
+}
 
 /// The deterministic user handler exercised through both public HTTP facades.
 #[tool(name = "public-http-e2e-tool", tags = ["cursor"])]
@@ -1722,13 +1765,29 @@ impl CompletionHandler for CountingPublicHttpCompletion {
     }
 }
 
-fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
-    core::block_on(future)
+thread_local! {
+    static PUBLIC_HTTP_RUNTIME: OnceCell<asupersync::runtime::Runtime> = const { OnceCell::new() };
 }
 
-/// Runs one public HTTP operation on the facade-owned runtime. The operation
-/// itself is bounded against the supplied caller-owned context clock, so a
-/// stalled peer cannot hold this test thread indefinitely.
+fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+    PUBLIC_HTTP_RUNTIME.with(|runtime| {
+        runtime
+            .get_or_init(|| {
+                asupersync::runtime::RuntimeBuilder::current_thread()
+                    .with_reactor(
+                        asupersync::runtime::reactor::create_reactor()
+                            .expect("public HTTP application reactor initializes"),
+                    )
+                    .build()
+                    .expect("public HTTP application owns its runtime")
+            })
+            .block_on(future)
+    })
+}
+
+/// Runs one public HTTP operation on the test application's owned runtime. The
+/// operation itself is bounded against the supplied caller-owned context clock,
+/// so a stalled peer cannot hold this test thread indefinitely.
 fn runtime_block_on_bounded<F: std::future::Future>(cx: &Cx, future: F) -> F::Output {
     runtime_block_on_bounded_named(cx, "public HTTP operation", future)
 }
@@ -2467,6 +2526,90 @@ fn join_finished_thread(
         }
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn mcp_config_http_client_connects_live_modern_endpoint() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_with_policy_and_middleware(
+        ProtocolPolicy::ModernOnly,
+        Some(Arc::new(McpConfigHttpRequestCounter {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let config = mcp_config_for_live_modern_endpoint(server.address(), false);
+    assert_eq!(
+        config
+            .get_server(MCP_CONFIG_HTTP_SERVER_NAME)
+            .expect("the test config retains its named server")
+            .command,
+        MCP_CONFIG_NONEXISTENT_COMMAND,
+        "a successful HTTP connection proves the configured stdio command was never spawned"
+    );
+    let cx = Cx::for_request();
+
+    let mut client =
+        runtime_block_on_bounded(&cx, config.http_client(&cx, MCP_CONFIG_HTTP_SERVER_NAME))
+            .expect("stored HTTP configuration must connect through the shipped client lifecycle");
+    assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+    assert_eq!(
+        client.client_info().name,
+        format!("fastmcp-client:{MCP_CONFIG_HTTP_SERVER_NAME}")
+    );
+
+    let tools = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the configured client must make a public tools/list request");
+    let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = tools else {
+        panic!("configured modern HTTP tools/list must retain the final result vocabulary");
+    };
+    assert!(
+        result
+            .payload
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "the configured client must observe the live server's public tool"
+    );
+    assert!(
+        requests.load(Ordering::SeqCst) >= 2,
+        "server/discover and tools/list must both contact the real HTTP server"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn mcp_config_http_client_disabled_is_zero_contact() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_with_policy_and_middleware(
+        ProtocolPolicy::ModernOnly,
+        Some(Arc::new(McpConfigHttpRequestCounter {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let config = mcp_config_for_live_modern_endpoint(server.address(), true);
+    let serialized_before = config.to_json();
+    let cx = Cx::for_request();
+
+    let error =
+        match runtime_block_on_bounded(&cx, config.http_client(&cx, MCP_CONFIG_HTTP_SERVER_NAME)) {
+            Ok(_) => panic!("a disabled configured HTTP server must fail before connection"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        error,
+        ConfigError::ServerDisabled(name) if name == MCP_CONFIG_HTTP_SERVER_NAME
+    ));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "changing only disabled to true must prevent every HTTP request"
+    );
+    assert_eq!(
+        config.to_json(),
+        serialized_before,
+        "zero-contact rejection must leave serialized configuration unchanged"
+    );
+    server.shutdown();
 }
 
 #[test]
@@ -5453,7 +5596,7 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
 #[test]
 fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
     let cx = Cx::for_request();
-    let mut client = core::block_on(
+    let mut client = runtime_block_on(
         modern::ClientBuilder::new()
             .client_info("e2e-stdio-hide-catalog", "1.0.0")
             .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
@@ -32906,7 +33049,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
             )
             .map_err(|error| format!("legacy as_proxy HTTP plan failed: {error}"))?;
             let (proxy, catalog) =
-                ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
+                Box::pin(ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
                     1,
                     plan,
                     ClientInfo {
@@ -32921,7 +33064,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                         }),
                     },
                     cx.clone(),
-                )
+                ))
                 .await
                 .map_err(|error| format!("live exact-2024 HTTP proxy upstream connect failed: {error}"))?;
             let ProxyToolCatalog::Legacy(tools) = &catalog.tools else {
@@ -36730,7 +36873,7 @@ mod live_websocket_bind {
     fn connect_warmed_stdio_as_proxy_upstream(cx: &Cx, client_name: &str) -> modern::Client {
         let mut last_error = None;
         for attempt in 1_u32..=4 {
-            match core::block_on(
+            match runtime_block_on(
                 modern::ClientBuilder::new()
                     .client_info(client_name, "1.0.0")
                     .env("FASTMCP_PROTOCOL_POLICY", "modern-only")

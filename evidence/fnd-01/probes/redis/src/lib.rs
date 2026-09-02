@@ -47,7 +47,7 @@ mod tests {
     const CAPABILITY_FS_SOURCE: &str = include_str!("../../capability-fs/src/lib.rs");
     const REDIS_FEATURE_LINE: &str = "redis = { version = \"=1.4.1\", default-features = false, features = [\"acl\", \"script\"] }";
     const FROZEN_INPUTS_DIGEST: &str =
-        "923516149086b604095c323b1f6b7d3f0c9da5d17fc784339db0c3a4efe10a45";
+        "166511cfae5c5dd9073c6123c98fd83b8cadf2481c400b5150709129844866d1";
     fn validate_packages_absent(
         subject: &'static str,
         lock: &str,
@@ -302,24 +302,48 @@ mod tests {
             "manifest_sha256 = \"{}\"",
             sha256_hex(redis_manifest.as_bytes())
         );
-        let rebound_probe = probe.replacen(&old_bytes, &new_bytes, 1);
-        if rebound_probe == probe || rebound_probe.matches(&old_bytes).count() != 0 {
-            return Err(StructuredEvidenceError::UnexpectedValue {
-                subject: "[probe.redis]",
-                field: "manifest_bytes mirror",
-                expected: "one exact field replacement".to_owned(),
-                actual: old_bytes,
-            });
-        }
-        let rebound_probe = rebound_probe.replacen(&old_hash, &new_hash, 1);
-        if rebound_probe.matches(&old_hash).count() != 0 {
-            return Err(StructuredEvidenceError::UnexpectedValue {
-                subject: "[probe.redis]",
-                field: "manifest_sha256 mirror",
-                expected: "one exact field replacement".to_owned(),
-                actual: old_hash,
-            });
-        }
+        let rebind_field = |input: &str,
+                            current: &str,
+                            derived: &str,
+                            field: &'static str|
+         -> Result<String, StructuredEvidenceError> {
+            if input.lines().filter(|line| *line == current).count() != 1 {
+                return Err(StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field,
+                    expected: "one exact field replacement".to_owned(),
+                    actual: current.to_owned(),
+                });
+            }
+            let rebound = if current == derived {
+                input.to_owned()
+            } else {
+                input.replacen(current, derived, 1)
+            };
+            if rebound.lines().filter(|line| *line == derived).count() != 1
+                || (current != derived && rebound.lines().any(|line| line == current))
+            {
+                return Err(StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field,
+                    expected: "one exact field replacement".to_owned(),
+                    actual: current.to_owned(),
+                });
+            }
+            Ok(rebound)
+        };
+        let rebound_probe = rebind_field(
+            probe,
+            &old_bytes,
+            &new_bytes,
+            "manifest_bytes mirror",
+        )?;
+        let rebound_probe = rebind_field(
+            &rebound_probe,
+            &old_hash,
+            &new_hash,
+            "manifest_sha256 mirror",
+        )?;
         Ok(format!(
             "{}{}{}",
             &state[..after_header],
@@ -583,7 +607,14 @@ mod tests {
         field: &'static str,
     ) -> Result<Vec<String>, StructuredEvidenceError> {
         let encoded = field_value(subject, text, field)?;
-        parse_string_array_value(subject, field, encoded)
+        let normalized = encoded
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .map(str::trim_end)
+            .and_then(|content| content.strip_suffix(','))
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| format!("[{content}]"));
+        parse_string_array_value(subject, field, normalized.as_deref().unwrap_or(encoded))
     }
 
     fn parse_string_array_value(
@@ -704,12 +735,19 @@ mod tests {
         }
     }
 
+    fn array_table_record<'a>(record: &'a str) -> &'a str {
+        record
+            .find("\n[")
+            .map_or(record, |next_header| &record[..next_header])
+    }
+
     fn crate_section<'a>(
         evidence: &'a str,
         candidate: &'static str,
     ) -> Result<&'a str, StructuredEvidenceError> {
         bounded("evidence", evidence, MAX_EVIDENCE_BYTES)?;
         for item in evidence.split("[[crate]]").skip(1).take(8) {
+            let item = array_table_record(item);
             if quoted_field("crate", item, "name").ok().as_deref() == Some(candidate) {
                 return Ok(item);
             }
@@ -896,6 +934,7 @@ mod tests {
         bounded(subject, lock, MAX_LOCK_BYTES)?;
         let mut packages = Vec::new();
         for item in lock.split("[[package]]").skip(1) {
+            let item = array_table_record(item);
             let name = quoted_field(subject, item, "name")?;
             let version = quoted_field(subject, item, "version")?;
             let source = optional_field_value(subject, item, "source")?
@@ -1499,6 +1538,7 @@ mod tests {
         let mut targets = Vec::new();
         let mut matched = 0;
         for projection in evidence.split("[[target_projection]]").skip(1).take(16) {
+            let projection = array_table_record(projection);
             if quoted_field("target projection", projection, "candidate")
                 .ok()
                 .as_deref()
@@ -1545,6 +1585,7 @@ mod tests {
             .split("[[target_projection]]")
             .skip(1)
             .take(9)
+            .map(array_table_record)
             .collect::<Vec<_>>();
         let expected: [(&str, &[&str], &str); 8] = [
             (
@@ -1703,6 +1744,7 @@ mod tests {
     fn validate_crate_records(evidence: &str) -> Result<(), StructuredEvidenceError> {
         let mut names = Vec::new();
         for record in evidence.split("[[crate]]").skip(1) {
+            let record = array_table_record(record);
             names.push(quoted_field("crate record", record, "name")?);
         }
         names.sort();
@@ -1725,67 +1767,67 @@ mod tests {
         inputs: &Inputs,
     ) -> Result<AcceptedContractState, StructuredEvidenceError> {
         #[allow(non_snake_case)]
-        let STATE = inputs.state.as_str();
+        let state = inputs.state.as_str();
         #[allow(non_snake_case)]
-        let ENVELOPE_MANIFEST = inputs.envelope_manifest.as_str();
+        let envelope_manifest = inputs.envelope_manifest.as_str();
         #[allow(non_snake_case)]
-        let ENVELOPE_LOCK = inputs.envelope_lock.as_str();
+        let envelope_lock = inputs.envelope_lock.as_str();
         #[allow(non_snake_case)]
-        let CAPABILITY_FS_MANIFEST = inputs.capability_fs_manifest.as_str();
+        let capability_fs_manifest = inputs.capability_fs_manifest.as_str();
         #[allow(non_snake_case)]
-        let CAPABILITY_FS_LOCK = inputs.capability_fs_lock.as_str();
+        let capability_fs_lock = inputs.capability_fs_lock.as_str();
         #[allow(non_snake_case)]
-        let REDIS_MANIFEST = inputs.redis_manifest.as_str();
+        let redis_manifest = inputs.redis_manifest.as_str();
         #[allow(non_snake_case)]
-        let REDIS_LOCK = inputs.redis_lock.as_str();
-        bounded("envelope lock", ENVELOPE_LOCK, MAX_LOCK_BYTES)?;
-        bounded("capability-fs lock", CAPABILITY_FS_LOCK, MAX_LOCK_BYTES)?;
-        bounded("redis lock", REDIS_LOCK, MAX_LOCK_BYTES)?;
-        validate_state_table_inventory(STATE)?;
-        validate_crate_records(STATE)?;
-        validate_recorded_bytes(STATE, "[probe.envelope]", "manifest", ENVELOPE_MANIFEST)?;
-        validate_recorded_bytes(STATE, "[probe.envelope]", "lock", ENVELOPE_LOCK)?;
+        let redis_lock = inputs.redis_lock.as_str();
+        bounded("envelope lock", envelope_lock, MAX_LOCK_BYTES)?;
+        bounded("capability-fs lock", capability_fs_lock, MAX_LOCK_BYTES)?;
+        bounded("redis lock", redis_lock, MAX_LOCK_BYTES)?;
+        validate_state_table_inventory(state)?;
+        validate_crate_records(state)?;
+        validate_recorded_bytes(state, "[probe.envelope]", "manifest", envelope_manifest)?;
+        validate_recorded_bytes(state, "[probe.envelope]", "lock", envelope_lock)?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.envelope]",
             "source",
             inputs.envelope_source.as_str(),
         )?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
         )?;
-        validate_recorded_bytes(STATE, "[probe.capability_fs]", "lock", CAPABILITY_FS_LOCK)?;
+        validate_recorded_bytes(state, "[probe.capability_fs]", "lock", capability_fs_lock)?;
         validate_recorded_bytes(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "source",
             inputs.capability_fs_source.as_str(),
         )?;
-        validate_recorded_bytes(STATE, "[probe.redis]", "manifest", REDIS_MANIFEST)?;
-        validate_recorded_bytes(STATE, "[probe.redis]", "lock", REDIS_LOCK)?;
+        validate_recorded_bytes(state, "[probe.redis]", "manifest", redis_manifest)?;
+        validate_recorded_bytes(state, "[probe.redis]", "lock", redis_lock)?;
         validate_manifest_contract(
             "envelope manifest",
-            ENVELOPE_MANIFEST,
+            envelope_manifest,
             "fastmcp-fnd01-envelope-probe",
             &["chacha20poly1305"],
         )?;
         validate_manifest_contract(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "fastmcp-fnd01-capability-fs-probe",
             &["cap-fs-ext", "cap-std"],
         )?;
         validate_manifest_contract(
             "redis manifest",
-            REDIS_MANIFEST,
+            redis_manifest,
             "fastmcp-fnd01-redis-probe",
             &["redis"],
         )?;
 
-        let hard_gate = section(STATE, "[rematerialized_hard_gate]")?;
+        let hard_gate = section(state, "[rematerialized_hard_gate]")?;
         expect_string(
             "rematerialized hard gate",
             hard_gate,
@@ -1823,18 +1865,18 @@ mod tests {
         )?;
 
         let envelope =
-            parse_dependency_selection("envelope manifest", ENVELOPE_MANIFEST, "chacha20poly1305")?;
+            parse_dependency_selection("envelope manifest", envelope_manifest, "chacha20poly1305")?;
         let capability_fs_extension = parse_dependency_selection(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "cap-fs-ext",
         )?;
         let capability_fs_root = parse_dependency_selection(
             "capability-fs manifest",
-            CAPABILITY_FS_MANIFEST,
+            capability_fs_manifest,
             "cap-std",
         )?;
-        let redis = validate_redis_selection(REDIS_MANIFEST)?;
+        let redis = validate_redis_selection(redis_manifest)?;
         validate_selection(
             "envelope manifest",
             &envelope,
@@ -1850,7 +1892,7 @@ mod tests {
         validate_selection("capability-fs manifest", &capability_fs_root, "=4.0.2", &[])?;
 
         validate_candidate_evidence(
-            STATE,
+            state,
             "envelope evidence",
             "chacha20poly1305",
             "0.11.0",
@@ -1869,7 +1911,7 @@ mod tests {
             "1.85",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "capability-fs root evidence",
             "cap-std",
             "4.0.2",
@@ -1881,7 +1923,7 @@ mod tests {
             "",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "capability-fs extension evidence",
             "cap-fs-ext",
             "4.0.2",
@@ -1893,7 +1935,7 @@ mod tests {
             "",
         )?;
         validate_candidate_evidence(
-            STATE,
+            state,
             "redis evidence",
             "redis",
             "1.4.1",
@@ -1940,7 +1982,7 @@ mod tests {
         )?;
 
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.envelope]",
             18,
             "chacha20poly1305 0.11.0 9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb",
@@ -1955,7 +1997,7 @@ mod tests {
             &["getrandom", "rand", "rand_core"],
         )?;
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.capability_fs]",
             41,
             "cap-fs-ext 4.0.2 d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b",
@@ -1967,9 +2009,9 @@ mod tests {
             &["arf-strings", "camino", "tokio", "async-std", "smol"],
         )?;
         validate_probe_evidence(
-            STATE,
+            state,
             "[probe.redis]",
-            46,
+            50,
             "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
             &[
                 "redis/acl",
@@ -2007,7 +2049,7 @@ mod tests {
 
         validate_lock(
             "envelope lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             4046,
             "f60c46fe85004ade47468d2b93441ab87551cd6a1cc6a9481eb75b199614c1e5",
             18,
@@ -2017,7 +2059,7 @@ mod tests {
         )?;
         validate_lock(
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             9614,
             "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c",
             41,
@@ -2027,7 +2069,7 @@ mod tests {
         )?;
         validate_lock(
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             9614,
             "a1962ecdf71a74787a4481cac2a8788581bb9dcb7fd2e459f81e5c3aabcbfe4c",
             41,
@@ -2037,36 +2079,36 @@ mod tests {
         )?;
         validate_lock(
             "redis lock",
-            REDIS_LOCK,
-            10699,
-            "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45",
-            46,
+            redis_lock,
+            11713,
+            "d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029",
+            50,
             "redis",
             "1.4.1",
             "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.envelope]",
             "envelope lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             "fdc2097796d6f17f16c077b7b0c306bd8ca0c2b8d0449ec98fa936684788ae1f",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.capability_fs]",
             "capability-fs lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             "b6c9207a08283979144bcaf2f170b58daca1b31bbff355419a2d5186abfcd9f6",
         )?;
         validate_projection_bindings(
-            STATE,
+            state,
             "[probe.redis]",
             "redis lock",
-            REDIS_LOCK,
-            "f764af3aefb41dbf7cc7388f2e182ba9bb01bd5d545c7bea6a7dde6984dcf8df",
+            redis_lock,
+            "20b4e7f176301d12cd682638bd9b1b3f10d4d89dc2ca1546acfb82cafdca5946",
         )?;
-        let redis_packages = parse_lock("redis lock", REDIS_LOCK)?;
+        let redis_packages = parse_lock("redis lock", redis_lock)?;
         if !redis_packages.iter().any(|package| {
             package.name == "sha1_smol"
                 && package.version == "1.0.1"
@@ -2080,17 +2122,17 @@ mod tests {
 
         validate_packages_absent(
             "envelope prohibited_packages_absent_from_lock",
-            ENVELOPE_LOCK,
+            envelope_lock,
             &["getrandom", "rand", "rand_core"],
         )?;
         validate_packages_absent(
             "capability-fs prohibited_packages_absent_from_lock",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             &["arf-strings", "camino", "tokio", "smol", "async-std"],
         )?;
         validate_packages_absent(
             "redis prohibited_packages_absent_from_lock",
-            REDIS_LOCK,
+            redis_lock,
             &[
                 "tokio",
                 "smol",
@@ -2105,7 +2147,7 @@ mod tests {
             ],
         )?;
 
-        let advisory = section(STATE, "[advisory_snapshot]")?;
+        let advisory = section(state, "[advisory_snapshot]")?;
         validate_exact_table_keys(
             "advisory snapshot",
             advisory,
@@ -2214,7 +2256,7 @@ mod tests {
         )?;
         expect_array(
             "policy",
-            section(STATE, "[policy]")?,
+            section(state, "[policy]")?,
             "prohibited_active_packages",
             &[
                 "tokio",
@@ -2229,7 +2271,7 @@ mod tests {
                 "reqwest",
             ],
         )?;
-        let policy = section(STATE, "[policy]")?;
+        let policy = section(state, "[policy]")?;
         let global_prohibitions = string_array("policy", policy, "prohibited_active_packages")?;
         let global_prohibitions = global_prohibitions
             .iter()
@@ -2237,17 +2279,17 @@ mod tests {
             .collect::<Vec<_>>();
         validate_packages_absent(
             "policy prohibited_active_packages envelope",
-            ENVELOPE_LOCK,
+            envelope_lock,
             &global_prohibitions,
         )?;
         validate_packages_absent(
             "policy prohibited_active_packages capability-fs",
-            CAPABILITY_FS_LOCK,
+            capability_fs_lock,
             &global_prohibitions,
         )?;
         validate_packages_absent(
             "policy prohibited_active_packages redis",
-            REDIS_LOCK,
+            redis_lock,
             &global_prohibitions,
         )?;
         for (candidate, targets) in [
@@ -2282,12 +2324,12 @@ mod tests {
                 ],
             ),
         ] {
-            expect_targets(STATE, candidate, &targets)?;
+            expect_targets(state, candidate, &targets)?;
         }
-        validate_target_rows(STATE)?;
+        validate_target_rows(state)?;
         expect_array(
             "policy",
-            section(STATE, "[policy]")?,
+            section(state, "[policy]")?,
             "supported_targets",
             &[
                 "x86_64-unknown-linux-gnu",
@@ -2298,7 +2340,7 @@ mod tests {
             ],
         )?;
 
-        let gate = section(STATE, "[gate]")?;
+        let gate = section(state, "[gate]")?;
         validate_exact_table_keys(
             "gate",
             gate,
@@ -2379,13 +2421,13 @@ mod tests {
             "claim",
             "Direct immutable provenance and offline isolated lock/archive projections are frozen. All execution, target, semantic-support, bounded-Redis, and workspace integration gates remain fail-closed.",
         )?;
-        let revalidation = section(STATE, "[current_revalidation]")?;
+        let revalidation = section(state, "[current_revalidation]")?;
         expect_false(
             "current revalidation",
             revalidation,
             "archive_cache_paths_available_now",
         )?;
-        let redis_bounds = section(STATE, "[bounds.redis]")?;
+        let redis_bounds = section(state, "[bounds.redis]")?;
         validate_exact_table_keys(
             "redis bounds",
             redis_bounds,
@@ -2427,7 +2469,7 @@ mod tests {
             "blocking_boundary",
             "synchronous crate; unmodified connector/parser cannot cross the TASKR-01 support gate",
         )?;
-        let envelope_bounds = section(STATE, "[bounds.envelope]")?;
+        let envelope_bounds = section(state, "[bounds.envelope]")?;
         validate_exact_table_keys(
             "envelope bounds",
             envelope_bounds,
@@ -2479,7 +2521,7 @@ mod tests {
             envelope_bounds,
             "constant_time_targets_verified",
         )?;
-        let capability_bounds = section(STATE, "[bounds.capability_fs]")?;
+        let capability_bounds = section(state, "[bounds.capability_fs]")?;
         validate_exact_table_keys(
             "capability-fs bounds",
             capability_bounds,
@@ -2589,6 +2631,7 @@ mod tests {
             REDIS_FEATURE_LINE,
             "redis={version=\"=1.4.1\",default-features=false,features=[\"acl\",\"script\",\"tokio-comp\"]}",
         );
+        assert_eq!(baseline.redis_manifest.len(), planted.redis_manifest.len());
         planted.state = rebind_redis_manifest_mirror(&planted.state, &planted.redis_manifest)
             .expect("the virtual mirror must be derived from the planted manifest");
         planted
@@ -2623,6 +2666,34 @@ mod tests {
         assert_eq!(
             error.stable_diagnostic(),
             "E_FORBIDDEN_FEATURE:redis requested_features:tokio-comp"
+        );
+        assert_fresh_baseline(&accepted_before);
+
+        let mut double_terminal_comma = Inputs::baseline();
+        let test_ids_tail = concat!(
+            "  \"tests::fnd_01_state_capability_dependencies_planted_negative\",\n",
+            "]",
+        );
+        let double_comma_tail = concat!(
+            "  \"tests::fnd_01_state_capability_dependencies_planted_negative\",,\n",
+            "]",
+        );
+        double_terminal_comma.state = double_terminal_comma.state.replacen(
+            test_ids_tail,
+            double_comma_tail,
+            1,
+        );
+        double_terminal_comma
+            .rebind_expected_domain_digest()
+            .expect("double-comma expected digest must be derived");
+        assert_eq!(changed_input_count(&baseline, &double_terminal_comma), 1);
+        assert_eq!(semantic_input_change_count(&baseline, &double_terminal_comma), 0);
+        assert_eq!(
+            validate_full(&double_terminal_comma),
+            Err(StructuredEvidenceError::MalformedField {
+                subject: "rematerialized hard gate",
+                field: "test_ids",
+            })
         );
         assert_fresh_baseline(&accepted_before);
 
@@ -2853,7 +2924,7 @@ mod tests {
             assert_fresh_baseline(&accepted_before);
         }
 
-        for (label, lock) in [
+        for (label, lock, expected_actual) in [
             (
                 "alternate registry source",
                 baseline.redis_lock.replacen(
@@ -2861,6 +2932,7 @@ mod tests {
                     "registry+https://example.invalid/index",
                     1,
                 ),
+                "lock_bytes=11698;lock_sha256=d3ea89518d958ec1c96f24051a89aeec5226f6f2bd6a536d0db718a78785e865",
             ),
             (
                 "alternate registry checksum",
@@ -2869,6 +2941,7 @@ mod tests {
                     "checksum = \"0000000000000000000000000000000000000000000000000000000000000000\"",
                     1,
                 ),
+                "lock_bytes=11713;lock_sha256=02e4ec378a3deb718fc40a8a137187d9b8cbde5c3f0bb5a54f69f6bedc98d4ef",
             ),
         ] {
             let mut alternate_lock = Inputs::baseline();
@@ -2876,14 +2949,33 @@ mod tests {
             alternate_lock
                 .rebind_expected_domain_digest()
                 .expect("lock plant expected digest must be derived");
-            assert!(matches!(
-                validate_full(&alternate_lock),
-                Err(StructuredEvidenceError::UnexpectedValue {
-                    subject: "redis lock",
-                    field: "lock byte/hash binding",
-                    ..
-                })
-            ), "{label}");
+            assert_eq!(changed_input_count(&baseline, &alternate_lock), 1, "{label}");
+            assert_eq!(
+                semantic_input_change_count(&baseline, &alternate_lock),
+                1,
+                "{label}"
+            );
+            assert_eq!(alternate_lock.state, baseline.state, "{label}");
+            let error = validate_full(&alternate_lock)
+                .expect_err("one-field Redis lock plant must fail closed");
+            let expected_binding = "lock_bytes=11713;lock_sha256=d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029";
+            assert_eq!(
+                error,
+                StructuredEvidenceError::UnexpectedValue {
+                    subject: "[probe.redis]",
+                    field: "recorded byte/hash binding",
+                    expected: expected_binding.to_owned(),
+                    actual: expected_actual.to_owned(),
+                },
+                "{label}"
+            );
+            assert_eq!(
+                error.stable_diagnostic(),
+                format!(
+                    "E_UNEXPECTED_VALUE:[probe.redis]:recorded byte/hash binding:{expected_binding}:{expected_actual}"
+                ),
+                "{label}"
+            );
             assert_fresh_baseline(&accepted_before);
         }
     }

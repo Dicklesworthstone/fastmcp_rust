@@ -554,14 +554,14 @@ manifest_path = "evidence/fnd-01/probes/redis/Cargo.toml"
 manifest_bytes = 254
 manifest_sha256 = "62ed2704f3c878d08dba3e48c42df07bdea9325ce3e570a975795bc47fbe880b"
 source_path = "evidence/fnd-01/probes/redis/src/lib.rs"
-source_bytes = 110480
-source_sha256 = "b37b792d04e3b6dc31d4464b34d9d3a89b84acf15f06d2bb7d4e02dca62a642b"
+source_bytes = 116120
+source_sha256 = "c014f2a8a2c4e51ba7f37c8b79badb9d3e755ec19ef5cf424590c0f85c72060b"
 lock_path = "evidence/fnd-01/probes/redis/Cargo.lock"
-lock_bytes = 10699
-lock_sha256 = "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45"
+lock_bytes = 11713
+lock_sha256 = "d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029"
 lock_version = 4
-package_count = 46
-registry_package_count = 45
+package_count = 50
+registry_package_count = 49
 all_archives_present = true
 all_archive_checksums_match = true
 lock_origin = "manual normal/build projection from cached redis 1.4.1/current compatible registry records; default num-bigint and publisher dev graph removed"
@@ -625,11 +625,15 @@ package_projection = [
   "quote 1.0.47 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
   "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
   "ryu 1.0.23 9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f",
+  "serde 1.0.229 4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+  "serde_core 1.0.229 67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+  "serde_derive 1.0.229 e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
   "sha1_smol 1.0.1 bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d",
   "smallvec 1.15.2 8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90",
   "socket2 0.6.5 c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
   "stable_deref_trait 1.2.1 6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596",
   "syn 2.0.119 872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297",
+  "syn 3.0.4 e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f",
   "synstructure 0.13.2 728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2",
   "tinystr 0.8.3 c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d",
   "unicode-ident 1.0.24 e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75",
@@ -672,11 +676,15 @@ license_msrv_projection = [
   "quote 1.0.47 | MIT OR Apache-2.0 | 1.71",
   "redis 1.4.1 | BSD-3-Clause | 1.88",
   "ryu 1.0.23 | Apache-2.0 OR BSL-1.0 | 1.71",
+  "serde 1.0.229 | MIT OR Apache-2.0 | 1.56",
+  "serde_core 1.0.229 | MIT OR Apache-2.0 | 1.56",
+  "serde_derive 1.0.229 | MIT OR Apache-2.0 | 1.71",
   "sha1_smol 1.0.1 | BSD-3-Clause | UNDECLARED",
   "smallvec 1.15.2 | MIT OR Apache-2.0 | UNDECLARED",
   "socket2 0.6.5 | MIT OR Apache-2.0 | 1.70",
   "stable_deref_trait 1.2.1 | MIT OR Apache-2.0 | UNDECLARED",
   "syn 2.0.119 | MIT OR Apache-2.0 | 1.71",
+  "syn 3.0.4 | MIT OR Apache-2.0 | 1.71",
   "synstructure 0.13.2 | MIT | UNDECLARED",
   "tinystr 0.8.3 | Unicode-3.0 | 1.82",
   "unicode-ident 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | 1.71",

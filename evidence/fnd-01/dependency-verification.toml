@@ -15,7 +15,7 @@ authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
 source_input_count = 71
-source_input_total_bytes = 3019295
+source_input_total_bytes = 3024745
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -152,8 +152,8 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 71
-total_bytes = 3019295
-sha256 = "10cafa60d8c12320720a0f4561ff64cce16a81f182fa0a28f409ce302e6c9e41"
+total_bytes = 3024745
+sha256 = "dde288ffdb01d672db786a3de9339d31fdcb6d0256c80685ec01c0284bde7832"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -774,8 +774,8 @@ manifest_rule = "parse every named workspace_snapshot manifest as strict duplica
 source_rule_count = 19
 source_rule_exact_fields = ["id", "path_scope", "match_kind", "pattern", "expected_count", "reason"]
 source_rule_order = ["CORE-EXPORT-CRYPTO", "CORE-EXPORT-URI", "CORE-CRYPTO-SURFACE", "CORE-URI-SURFACE", "FACADE-EXPORT-CRYPTO", "FACADE-EXPORT-URI", "OAUTH-USES-CORE-CRYPTO", "OAUTH-NO-DIRECT-CRYPTO", "OIDC-ISSUANCE-FAIL-CLOSED", "OIDC-DISCOVERY-NO-SIGNER", "OIDC-NO-LOCAL-SIGNER", "WEBSOCKET-USES-CORE-MASK", "WEBSOCKET-NO-DIRECT-RNG", "NO-JSONWEBTOKEN-TOKENS", "NO-JWT-ENCODING-KEY", "NO-JWT-VERIFIER-SURFACE", "NO-DOCKET-PUBLIC-SURFACE", "NO-CLI-UPDATE-SYMBOLS", "NO-CLI-CRATES-IO-LITERAL"]
-source_rule_match_kinds = ["token-sequence", "use-tree-member", "required-ident-set", "forbidden-ident-set", "ident", "exact-byte-substring", "exact-function-token-body"]
-source_rule = "for an exact path or no-follow closed Rust path_scope, use static_source_classifier_contract's proc_macro2 parse; token-sequence and use-tree-member count exact structural matches, required-ident-set requires each comma-separated exact identifier at least once and sets expected_count to the number of distinct required identifiers, forbidden-ident-set requires every named identifier absent and has expected_count zero, ident counts exact identifier tokens, exact-byte-substring counts exact raw nonoverlapping byte occurrences, and exact-function-token-body resolves exactly one non-test free/impl function by name/signature and compares its recursively delimited TokenTree body to the pattern grammar with literal contents included; identifier rules never inspect comments or literal contents unless exact-function-token-body explicitly names a literal, no rule expands macros, expected_count is over the complete selected workspace_snapshot scope, and a parse failure, omitted/extra required match, excluded test/e2e file, or dynamically chosen scope fails"
+source_rule_match_kinds = ["token-sequence", "scoped-use-route-set", "required-ident-set", "forbidden-ident-set", "ident", "exact-byte-substring", "exact-function-token-body"]
+source_rule = "for an exact path or no-follow closed Rust path_scope, use static_source_classifier_contract's proc_macro2 parse; token-sequence counts exact structural matches; scoped-use-route-set returns one only when its pattern binds exactly one unconditional root fastmcp_core member route, exactly one unconditional member route inside the sole unconditional public core module, and exactly one unconditional fastmcp_core as core alias inside the sole public __private module carrying exactly one literal #[doc(hidden)] attribute. Every proc_macro2 user Ident is first normalized to its semantic Rust name, so r# spellings are identical to their ordinary crate, module, member, and alias spellings, while grammar keywords are matched by their exact non-raw spelling so r#as and other raw identifiers cannot become syntax. The classifier inventories every use, inline module regardless of visibility, external module declaration, and extern-crate item; flattens grouped use trees to explicit bindings; and resolves crate-public routes, including public re-export chains through private inline modules or private extern bindings, through a maximum-64-depth graph with visiting/cached cycle control. A leading :: bypasses every local use and module binding: semantic fastmcp_core resolves directly from the extern prelude, while another absolute head consults only a root extern-crate alias or remains unrelated. Every extern crate self alias resolves to the facade's root inline module rather than an unrelated crate, so a public or traversed self alias, including a private facade-root glob later re-exported through a module, is checked as facade exposure. An unqualified semantic fastmcp_core head resolves from the extern prelude only when its current scope has zero local use, module, or extern candidates; any candidate, including a cfg-disabled shadow or private whole-crate wrapper, fails closed instead of being silently overridden or allowed to downgrade the core route. It rejects leading-:: fastmcp_core routes, grouped-root fastmcp_core trees, reverse alias targets, member aliases, rooted or unrooted core/private aliases, glob routes, every other whole-crate route, every crate-public or publicly re-exported extern crate fastmcp_core spelling, every crate-public or publicly re-exported extern crate self facade alias, every public core exposure through private-module indirection, direct cfg gating, and cfg_attr only when an emitted attribute is cfg. Dormant private-module and private-extern bindings are inventory-only and admissible until a crate-public route traverses them; once traversed, a public fastmcp_core or self extern item is itself a whole-crate exposure even when reached through a nested public module. A cycle, duplicate or ambiguous binding or module, core-connected unresolved local head, glob indirection, traversed external module declaration, unsupported use grammar, or depth exhaustion fails closed; cfg_attr(docsrs, doc(cfg(...))) is explicitly nongating and remains admissible. Required-ident-set requires each comma-separated exact identifier at least once and sets expected_count to the number of distinct required identifiers, forbidden-ident-set requires every named identifier absent and has expected_count zero, ident counts semantic identifier tokens, exact-byte-substring counts exact raw nonoverlapping byte occurrences, and exact-function-token-body resolves exactly one non-test free/impl function by name/signature and compares its recursively delimited TokenTree body to the pattern grammar with literal contents included; identifier rules never inspect comments or literal contents unless exact-function-token-body explicitly names a literal, no rule expands macros, expected_count is over the complete selected workspace_snapshot scope, and a parse failure, omitted/extra required match, excluded test/e2e file, or dynamically chosen scope fails"
 manifest_feature_rule_count = 4
 manifest_feature_rule_order = ["SERVER-NO-JWT-FEATURE", "SERVER-NO-REDIS-FEATURE", "FACADE-NO-JWT-FEATURE", "FACADE-NO-REDIS-FEATURE"]
 manifest_feature_rule = "parse each exact manifest as strict duplicate-key-free TOML and require the named [features] key absent; the same spelling in any feature forwarding array, optional dependency feature, target feature table, or alias is also forbidden, while prose/comments are irrelevant; an empty feature, stub forwarding feature, renamed near-equivalent, or second table cannot preserve the removed public JWT surface"
@@ -1387,18 +1387,18 @@ reason = "core owns both byte-preserving absolute URI and policy-aware canonical
 [[integration_source_rule]]
 id = "FACADE-EXPORT-CRYPTO"
 path_scope = "crates/fastmcp/src/lib.rs"
-match_kind = "use-tree-member"
-pattern = "one public use tree rooted fastmcp_core contains exact member crypto"
+match_kind = "scoped-use-route-set"
+pattern = "root=1*fastmcp_core::{crypto};curated=1*core::fastmcp_core::{crypto};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr;resolver=semantic-ident|all-inline-modules|bounded-64|cycle-ambiguity-unresolved-external-fail-closed"
 expected_count = 1
-reason = "facade exposes shared crypto module"
+reason = "facade exposes shared crypto through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias"
 
 [[integration_source_rule]]
 id = "FACADE-EXPORT-URI"
 path_scope = "crates/fastmcp/src/lib.rs"
-match_kind = "use-tree-member"
-pattern = "one public use tree rooted fastmcp_core contains exact member uri"
+match_kind = "scoped-use-route-set"
+pattern = "root=1*fastmcp_core::{uri};curated=1*core::fastmcp_core::{uri};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr;resolver=semantic-ident|all-inline-modules|bounded-64|cycle-ambiguity-unresolved-external-fail-closed"
 expected_count = 1
-reason = "facade exposes shared URI module"
+reason = "facade exposes shared URI through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias"
 
 [[integration_source_rule]]
 id = "OAUTH-USES-CORE-CRYPTO"
@@ -4627,8 +4627,8 @@ record_schema_selector_grammar = "one exact slash-delimited root/type/field sele
 receipt_common_selector_rule = "receipt/common is a compiled schema namespace, never an input path or wildcard: for each of the exact ten receipt roots in recursive_root_selectors, only its top-level policy, verifier, and harness fields normalize respectively to receipt/common/policy, receipt/common/verifier, and receipt/common/harness, and only its top-level parent array normalizes to receipt/common/parent[]. The original concrete logical path is retained for diagnostics; no table-specific field, nested parent array, unknown receipt kind, or other path may normalize through common"
 record_schema_registry_encoding = "ASCII FND01RECSCHEMAv2 followed by NUL and u32be row count, then rows in id raw-byte order as u32be-length-prefixed id, u32be selector count and each selector string in declared order, u32be exact-field count and each field string in declared order, u32be child-field count and each `field=>schema-id` string in declared order, and one u32be-length-prefixed rule; all strings are strict UTF-8 and all counts/lengths are checked before allocation"
 record_schema_registry_count = 110
-record_schema_registry_bytes = 72295
-record_schema_registry_sha256 = "fec1a4c75227dd4b6c57289385033452c73b9970a2e17c451343a7dd7438e685"
+record_schema_registry_bytes = 72981
+record_schema_registry_sha256 = "9b031cf7acc890f70b50601bc030b389a9607064b71d34b494f18eef768eeb70"
 record_registry_bound_rule = "before allocating or decoding any row, enforce bounds.max_record_registry_bytes over the checked sum of the complete FND01RECSCHEMAv2 and FND01RECVARIANTv1 canonical byte strings, and independently require each byte string not to exceed that bound. The byte-length/SHA mirrors must equal the independently compiled authority; semantic row counts, selectors, child closure, and shape parity must already be exact, and no policy mirror, per-row limit, or trailing ignored byte substitutes for compiled authority"
 record_schema_verifier_authority_rule = "the verifier pins the literal schema ID/version plus both record and variant canonical headers, row schemas, counts, byte lengths, and SHA-256 values in compiled Rust; these policy-declared mirror values never authorize a changed registry. Validation of both pinned registries, selector/discriminator uniqueness, child-target closure, and recursive-root completeness precedes parsing any receipt, attestation, gate, ledger, or spool"
 record_field_type_authority_rule = "the compiled verifier owns one exhaustive exact type entry for every (root-or-schema-id, direct-field) pair, including unsigned versus signed integers, text versus raw bytes, homogeneous scalar/record arrays and their one element type, maps and their one value type, child schemas, count-field widths/relationships, and the two closed three-way tagged-union dispatch sites for supply entries and acquisition anchors. It explicitly types producer-outer and attester-outer as outer-lifecycle roots; portable Unix file/directory/socket identities; daemon pre/post records; strict status argv/environment/signed-exit/raw-stream/running/socket/required-unsigned-uptime fields; gate raw streams and signed rch_exit_code; and both sparse-cache selected version/ordinal/SHA array families. It never infers a type from the current TOML value, an empty array, a field name, serde coercion, policy prose, or a producer tag; a missing/duplicate type entry or encoded tag different from the compiled entry fails before semantic validation"
@@ -5286,7 +5286,7 @@ id = "integration-source-rule-result"
 selectors = ["receipt/workspace_receipt/workspace_receipt/integration_source_rule[]"]
 exact_fields = ["id", "path_scope", "match_kind", "pattern", "expected_count", "reason", "observed_count", "evidence_verdict"]
 child_fields = []
-rule = "the rule equals integration_source_rule, observed_count equals expected_count, and evidence is Pass"
+rule = "the rule equals integration_source_rule field-for-field, including exact ID, path, match kind, complete scoped-use-route-set pattern, expected count, and reason; observed_count equals expected_count. scoped-use-route-set observed_count one means the exact root plus curated plus literal-doc-hidden-private route set was structurally accepted after semantic raw-identifier normalization and the bounded all-inline-module use/re-export/extern graph, including extern-prelude-only absolute-head resolution, facade-root resolution for extern crate self aliases, and public core/self extern exposure in every traversed module, resolved without a core leak, cycle, ambiguity, unsupported path, or traversed external module, rather than aggregate member count one or two, and evidence is Pass"
 
 [[record_schema]]
 id = "integration-feature-rule-result"
@@ -5684,8 +5684,8 @@ tree_sha256 = "abed2b6ee906b8c6694bbea0034b88eda013d0cfbab1e2d365a84f17ea396de9"
 id = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 file_count = 10
-total_bytes = 224455
-tree_sha256 = "96e3e0568fbbc50be4207af73bdf8a2b4e7e4b895f4e2e454f2f0d6fb6734bc3"
+total_bytes = 229905
+tree_sha256 = "26f3e9c195cadfcce3dafba73f86e88e011d27a9dd8072312472a00ae72b9b9b"
 
 [[negative_family]]
 id = "sdk.catalog"
@@ -6524,8 +6524,8 @@ id = "s14"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/redis/Cargo.lock"
-byte_length = 10699
-sha256 = "342d429e99265f95c559b9c047fe903623fec1d91a5c230aae7a42a7eaa74b45"
+byte_length = 11713
+sha256 = "d2deaeced0e36efbd0232a3f4d1bf198de102a719d86d59eea7ed59b193ab029"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -6554,8 +6554,8 @@ id = "s16"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/redis/src/lib.rs"
-byte_length = 112220
-sha256 = "2e0ade735fdecc50238836d6dc38d3fc7f34a47caa390091ec15a61211c625f2"
+byte_length = 116120
+sha256 = "c014f2a8a2c4e51ba7f37c8b79badb9d3e755ec19ef5cf424590c0f85c72060b"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -6809,8 +6809,8 @@ id = "s33"
 family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/state-capability-dependencies.toml"
-byte_length = 81807
-sha256 = "b9f1f2d7fdbcb029ae6536c1537d86e26240af5bee268b3a32c55cfed74c0325"
+byte_length = 82343
+sha256 = "0d34dcd65994dfb70ba5967a1546833c745b716cec8d0aed3b623c222282372e"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
