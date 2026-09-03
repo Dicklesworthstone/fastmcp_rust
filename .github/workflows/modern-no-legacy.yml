@@ -1,0 +1,62 @@
+name: Modern-only production graph
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/fastmcp-server/**
+      - crates/fastmcp-core/**
+      - crates/fastmcp-protocol/**
+      - crates/fastmcp-transport/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/modern-no-legacy.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/fastmcp-server/**
+      - crates/fastmcp-core/**
+      - crates/fastmcp-protocol/**
+      - crates/fastmcp-transport/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/modern-no-legacy.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  production-graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-08-25
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: modern-no-legacy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test shipped no-legacy server graph
+        run: cargo test --locked -p fastmcp-server --no-default-features --test srv_02_b -- --nocapture
+
+      - name: Lint shipped no-legacy server graph
+        run: cargo clippy --locked -p fastmcp-server --no-default-features --test srv_02_b -- -D warnings
