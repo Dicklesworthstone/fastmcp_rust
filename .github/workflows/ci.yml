@@ -32,13 +32,13 @@ jobs:
         run: |
           set -euo pipefail
           git rev-parse HEAD > SOURCE_HEAD
-          tar --exclude=.git --exclude=source-snapshot.tar.gz -czf source-snapshot.tar.gz .
+          tar --exclude=.git -czf ../source-snapshot.tar.gz .
 
       - name: Upload exact checkout
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: fastmcp-source-${{ github.sha }}
-          path: source-snapshot.tar.gz
+          path: ../source-snapshot.tar.gz
           if-no-files-found: error
           retention-days: 1
 
