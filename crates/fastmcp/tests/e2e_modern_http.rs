@@ -6610,6 +6610,105 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
     server.shutdown();
 }
 
+fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
+    fn result_identity(result: &fastmcp_rust::FinalListToolsResult) -> serde_json::Value {
+        serde_json::to_value(result)
+            .expect("the typed modern tools page has a stable observable identity")
+    }
+
+    let cx = Cx::for_request();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_with_policy_and_middleware(
+        ProtocolPolicy::ModernOnly,
+        Some(Arc::new(McpConfigHttpRequestCounter {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-modern-facade-cache-controls", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public modern HTTP facade completes live discovery");
+
+    assert!(
+        client.final_result_cache_enabled(),
+        "the facade exposes the component cache's enabled-by-default state"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "connection performs exactly one live server/discover request"
+    );
+
+    let first = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the first public tools/list fills the final-result cache");
+    let first_identity = result_identity(&first);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(client.final_result_cache_stats().hits, 0);
+    assert_eq!(client.final_result_cache_stats().misses, 1);
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+
+    // RH-5: the positive and near-negative use the same live server, endpoint,
+    // params, and call sequence. Only this cache-enabled bit differs.
+    client.set_final_result_cache_enabled(cache_enabled);
+    assert_eq!(client.final_result_cache_enabled(), cache_enabled);
+    let second = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the second identical public tools/list observes the selected cache policy");
+    assert_eq!(result_identity(&second), first_identity);
+
+    let expected_hits = if cache_enabled { 1 } else { 0 };
+    let expected_misses = if cache_enabled { 1 } else { 2 };
+    let expected_requests = if cache_enabled { 2 } else { 3 };
+    let after_second = client.final_result_cache_stats();
+    assert_eq!(after_second.hits, expected_hits);
+    assert_eq!(after_second.misses, expected_misses);
+    assert_eq!(after_second.fills, 1);
+    assert_eq!(after_second.stale, 0);
+    assert_eq!(after_second.invalidations, 0);
+    assert_eq!(after_second.evictions, 0);
+    assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+
+    assert!(
+        client.take_final_cache_ttl_diagnostics().is_empty(),
+        "the valid five-minute peer TTL produces no compatibility diagnostic"
+    );
+    assert_eq!(
+        client.final_result_cache_stats(),
+        after_second,
+        "draining diagnostics does not mutate cache entries or counters"
+    );
+
+    // Clearing while disabled is significant: disabling deliberately retains
+    // entries. Re-enabling would hit the first entry unless this public clear
+    // actually reached the sealed component client.
+    client.clear_final_result_cache();
+    assert_eq!(client.final_result_cache_stats(), after_second);
+    client.set_final_result_cache_enabled(true);
+    let third = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("clearing forces the next identical request back onto the wire");
+    assert_eq!(result_identity(&third), first_identity);
+    assert_eq!(requests.load(Ordering::SeqCst), expected_requests + 1);
+    let after_clear = client.final_result_cache_stats();
+    assert_eq!(after_clear.hits, expected_hits);
+    assert_eq!(after_clear.misses, expected_misses + 1);
+    assert_eq!(after_clear.fills, 2);
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_modern_facade_final_cache_disabled_bypasses_live_http_positive() {
+    evaluate_modern_facade_final_cache_controls(false);
+}
+
+#[test]
+fn e2e_modern_facade_final_cache_enabled_hits_near_negative() {
+    evaluate_modern_facade_final_cache_controls(true);
+}
+
 #[test]
 fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_closed() {
     fn tools_page(result: CoreResult) -> fastmcp_rust::FinalListToolsResult {

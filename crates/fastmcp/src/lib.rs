@@ -4213,6 +4213,36 @@ pub mod modern {
             self.inner.set_log_level_typed(level)
         }
 
+        /// Returns whether typed final complete-result caching is enabled.
+        #[must_use]
+        pub const fn final_result_cache_enabled(&self) -> bool {
+            self.inner.final_result_cache_enabled()
+        }
+
+        /// Enables or disables typed final complete-result caching without
+        /// discarding retained entries.
+        pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+            self.inner.set_final_result_cache_enabled(enabled);
+        }
+
+        /// Returns aggregate counters for this client's bounded final cache.
+        #[must_use]
+        pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+            self.inner.final_result_cache_stats()
+        }
+
+        /// Removes all retained typed final complete results for this client.
+        pub fn clear_final_result_cache(&mut self) {
+            self.inner.clear_final_result_cache();
+        }
+
+        /// Drains compatibility diagnostics for final peer TTLs admitted with
+        /// zero freshness.
+        #[must_use]
+        pub fn take_final_cache_ttl_diagnostics(&mut self) -> Vec<FinalCacheTtlDiagnostic> {
+            self.inner.take_final_cache_ttl_diagnostics()
+        }
+
         pub fn list_tools(&mut self, cursor: Option<&str>) -> McpResult<FinalListToolsResult> {
             self.list_tools_with_params(crate::ListToolsParams {
                 cursor: cursor.map(ToOwned::to_owned),
@@ -5476,6 +5506,36 @@ pub mod modern {
         #[must_use]
         pub fn log_level(&self) -> Option<LoggingLevel> {
             self.inner.log_level()
+        }
+
+        /// Returns whether typed final complete-result caching is enabled.
+        #[must_use]
+        pub const fn final_result_cache_enabled(&self) -> bool {
+            self.inner.final_result_cache_enabled()
+        }
+
+        /// Enables or disables typed final complete-result caching without
+        /// discarding retained entries.
+        pub fn set_final_result_cache_enabled(&mut self, enabled: bool) {
+            self.inner.set_final_result_cache_enabled(enabled);
+        }
+
+        /// Returns aggregate counters for this HTTP client's bounded final cache.
+        #[must_use]
+        pub const fn final_result_cache_stats(&self) -> FinalCacheStats {
+            self.inner.final_result_cache_stats()
+        }
+
+        /// Removes all retained typed final complete results for this HTTP client.
+        pub fn clear_final_result_cache(&mut self) {
+            self.inner.clear_final_result_cache();
+        }
+
+        /// Drains compatibility diagnostics for final peer TTLs admitted with
+        /// zero freshness.
+        #[must_use]
+        pub fn take_final_cache_ttl_diagnostics(&mut self) -> Vec<FinalCacheTtlDiagnostic> {
+            self.inner.take_final_cache_ttl_diagnostics()
         }
 
         /// Drains exact final progress notifications received on request-owned
@@ -12155,6 +12215,21 @@ mod tests {
             &mut modern::Client,
             Option<&str>,
         ) -> modern::McpResult<modern::FinalListPromptsResult> = modern::Client::list_prompts;
+        let _: fn(&modern::Client) -> bool = modern::Client::final_result_cache_enabled;
+        let _: fn(&mut modern::Client, bool) = modern::Client::set_final_result_cache_enabled;
+        let _: fn(&modern::Client) -> modern::FinalCacheStats =
+            modern::Client::final_result_cache_stats;
+        let _: fn(&mut modern::Client) = modern::Client::clear_final_result_cache;
+        let _: fn(&mut modern::Client) -> Vec<modern::FinalCacheTtlDiagnostic> =
+            modern::Client::take_final_cache_ttl_diagnostics;
+        let _: fn(&modern::HttpClient) -> bool = modern::HttpClient::final_result_cache_enabled;
+        let _: fn(&mut modern::HttpClient, bool) =
+            modern::HttpClient::set_final_result_cache_enabled;
+        let _: fn(&modern::HttpClient) -> modern::FinalCacheStats =
+            modern::HttpClient::final_result_cache_stats;
+        let _: fn(&mut modern::HttpClient) = modern::HttpClient::clear_final_result_cache;
+        let _: fn(&mut modern::HttpClient) -> Vec<modern::FinalCacheTtlDiagnostic> =
+            modern::HttpClient::take_final_cache_ttl_diagnostics;
         let _: fn(
             &mut modern::Client,
             modern::CompletionParams,
