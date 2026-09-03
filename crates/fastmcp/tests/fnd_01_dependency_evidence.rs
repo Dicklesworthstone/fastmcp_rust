@@ -1446,7 +1446,7 @@ mod trust_std {
             if self.entry_count > cap.max_entry_count || self.regular_file_bytes > cap.max_regular_file_bytes {
                 return Err(TrustError::new(
                     "E_SPACE_BOUND",
-                    format!("{subject}: usage entries={} bytes={} exceeds entries={} bytes={}", self.entry_count, self.regular_file_bytes, cap.max_entry_count, cap.max_regular_file_bytes,),
+                    format!("{subject}: usage entries={} bytes={} exceeds entries={} bytes={}", self.entry_count, self.regular_file_bytes, cap.max_entry_count, cap.max_regular_file_bytes),
                 ));
             }
             Ok(())
@@ -1582,7 +1582,7 @@ mod trust_std {
                 *usage = usage.checked_projected(FilesystemUsage { entry_count: 0, regular_file_bytes: identity.byte_length }, cap, subject)?;
                 let after_metadata = fs::symlink_metadata(&path).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: {}: {error}", path.display())))?;
                 if linux_identity(&after_metadata, subject)? != identity {
-                    return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: regular-file identity drift at {}", path.display(),)));
+                    return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: regular-file identity drift at {}", path.display())));
                 }
             } else {
                 return Err(TrustError::new("E_SPACE_FILE_TYPE", format!("{subject}: special file forbidden at {}", path.display())));
@@ -1641,9 +1641,9 @@ mod trust_std {
                     } else {
                         return Err(TrustError::new("E_SPACE_FILE_TYPE", format!("{subject}: root is a special file")));
                     };
-                    let after_root = fs::symlink_metadata(&root).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: {}: {error}", root.display(),)))?;
+                    let after_root = fs::symlink_metadata(&root).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: {}: {error}", root.display())))?;
                     if linux_identity(&after_root, subject)? != root_identity {
-                        return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: root identity drift at {}", root.display(),)));
+                        return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: root identity drift at {}", root.display())));
                     }
                     snapshots.try_reserve(1).map_err(|_| TrustError::new("E_SPACE_ALLOCATION", format!("{subject}: root snapshot allocation")))?;
                     snapshots.push(FilesystemRootUsage { root, root_identity, usage });
@@ -1661,13 +1661,13 @@ mod trust_std {
         for (path, expected) in missing_parents {
             let metadata = fs::symlink_metadata(&path).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: {}: {error}", path.display())))?;
             if linux_identity(&metadata, subject)? != expected {
-                return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: missing-root ancestor drift at {}", path.display(),)));
+                return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: missing-root ancestor drift at {}", path.display())));
             }
         }
         for snapshot in &snapshots {
-            let metadata = fs::symlink_metadata(&snapshot.root).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: final root bookend {}: {error}", snapshot.root.display(),)))?;
+            let metadata = fs::symlink_metadata(&snapshot.root).map_err(|error| TrustError::new("E_SPACE_RACE", format!("{subject}: final root bookend {}: {error}", snapshot.root.display())))?;
             if linux_identity(&metadata, subject)? != snapshot.root_identity {
-                return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: final root identity drift at {}", snapshot.root.display(),)));
+                return Err(TrustError::new("E_SPACE_RACE", format!("{subject}: final root identity drift at {}", snapshot.root.display())));
             }
         }
         Ok(snapshots)
@@ -2049,7 +2049,7 @@ mod trust_std {
     fn require_cargo_config_absent(path: &Path, subject: &str) -> TrustResult<()> {
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Ok(metadata) => Err(TrustError::new("E_CARGO_CONFIG_DISCOVERY", format!("{subject}: discovered forbidden node {} with mode {:o}", path.display(), metadata.mode(),))),
+            Ok(metadata) => Err(TrustError::new("E_CARGO_CONFIG_DISCOVERY", format!("{subject}: discovered forbidden node {} with mode {:o}", path.display(), metadata.mode()))),
             Err(error) => Err(io_error("E_CARGO_CONFIG_DISCOVERY", subject, &error)),
         }
     }
@@ -2466,7 +2466,7 @@ mod trust_std {
                 }
                 let identity = linux_identity(&metadata, subject)?;
                 if identity.link_count != expected_link_count {
-                    return Err(TrustError::new("E_FILE_HARDLINK", format!("{subject}: nlink={} differs from exact admitted count {expected_link_count}", identity.link_count,)));
+                    return Err(TrustError::new("E_FILE_HARDLINK", format!("{subject}: nlink={} differs from exact admitted count {expected_link_count}", identity.link_count)));
                 }
                 return Ok((current, metadata, identity));
             }
@@ -4365,7 +4365,7 @@ mod trust_std {
 
     fn finalize_acquisition_command(structural: StructurallyValidatedAcquisitionCommand, independent: &TypedAcquisitionResult) -> TrustResult<ValidatedAcquisitionCommand> {
         if structural.claimed_typed_result_kind != independent.kind || structural.claimed_typed_result_sha256 != independent.sha256 {
-            return Err(TrustError::new("E_ACQUISITION_TYPED_RESULT", format!("ordinal {}: claimed typed result differs from independent recomputation", structural.ordinal,)));
+            return Err(TrustError::new("E_ACQUISITION_TYPED_RESULT", format!("ordinal {}: claimed typed result differs from independent recomputation", structural.ordinal)));
         }
         let independent_preimage = acquisition_command_preimage(&AcquisitionCommandPreimageInput {
             ordinal: structural.ordinal,
@@ -4381,7 +4381,7 @@ mod trust_std {
             evidence_verdict: &structural.evidence_verdict,
         })?;
         if independent_preimage != structural.claimed_preimage {
-            return Err(TrustError::new("E_ACQUISITION_COMMAND_PREIMAGE", format!("ordinal {}: claimed command preimage differs from independent recomputation", structural.ordinal,)));
+            return Err(TrustError::new("E_ACQUISITION_COMMAND_PREIMAGE", format!("ordinal {}: claimed command preimage differs from independent recomputation", structural.ordinal)));
         }
         Ok(ValidatedAcquisitionCommand {
             id: structural.id,
@@ -5209,22 +5209,22 @@ mod trust_std {
         if authoring_closure_sha256 != expected.authoring_closure_sha256 {
             return Err(TrustError::new(
                 "E_CONTROL_AUTHORITY",
-                format!("authoring_closure_sha256 expected={} observed={}", encode_lower_hex(&expected.authoring_closure_sha256), encode_lower_hex(&authoring_closure_sha256),),
+                format!("authoring_closure_sha256 expected={} observed={}", encode_lower_hex(&expected.authoring_closure_sha256), encode_lower_hex(&authoring_closure_sha256)),
             ));
         }
         if integration_seal_sha256 != expected.integration_seal_sha256 {
             return Err(TrustError::new(
                 "E_CONTROL_AUTHORITY",
-                format!("integration_seal_sha256 expected={} observed={}", encode_lower_hex(&expected.integration_seal_sha256), encode_lower_hex(&integration_seal_sha256),),
+                format!("integration_seal_sha256 expected={} observed={}", encode_lower_hex(&expected.integration_seal_sha256), encode_lower_hex(&integration_seal_sha256)),
             ));
         }
         if tool_set_sha256 != expected.tool_set_sha256 {
-            return Err(TrustError::new("E_CONTROL_AUTHORITY", format!("tool_set_sha256 expected={} observed={}", encode_lower_hex(&expected.tool_set_sha256), encode_lower_hex(&tool_set_sha256),)));
+            return Err(TrustError::new("E_CONTROL_AUTHORITY", format!("tool_set_sha256 expected={} observed={}", encode_lower_hex(&expected.tool_set_sha256), encode_lower_hex(&tool_set_sha256))));
         }
         if environment_set_sha256 != expected.environment_set_sha256 {
             return Err(TrustError::new(
                 "E_CONTROL_AUTHORITY",
-                format!("environment_set_sha256 expected={} observed={}", encode_lower_hex(&expected.environment_set_sha256), encode_lower_hex(&environment_set_sha256),),
+                format!("environment_set_sha256 expected={} observed={}", encode_lower_hex(&expected.environment_set_sha256), encode_lower_hex(&environment_set_sha256)),
             ));
         }
 
@@ -10932,8 +10932,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         fn bootstrap_usage(&self) -> TrustResult<FilesystemUsage> {
             let mut roots = Vec::new();
             for role in PHASE_B_ROLES {
-                roots.push(format!(".fnd01-run/{role}/{}/bootstrap-control-package", self.run_id,));
-                roots.push(format!(".fnd01-run/{role}/{}/{CONTROL_TARGET_SUFFIX}", self.run_id,));
+                roots.push(format!(".fnd01-run/{role}/{}/bootstrap-control-package", self.run_id));
+                roots.push(format!(".fnd01-run/{role}/{}/{CONTROL_TARGET_SUFFIX}", self.run_id));
             }
             self.usage(&roots, self.budget.max_bootstrap_scratch_total_bytes, "collective Phase-B bootstrap scratch")
         }
@@ -11588,7 +11588,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         let policy_join = encode_produce_acquisition_policy_join(&produce_acquisition)?;
         let policy_join_sha256 = sha256(&policy_join)?;
         if policy_join.len() != PRODUCE_POLICY_JOIN_BYTES || policy_join_sha256 != PRODUCE_POLICY_JOIN_SHA256 || produce_acquisition.full_policy_join_sha256 != policy_join_sha256 {
-            return Err(phase_b_error("E_PHASE_B_POLICY_AUTHORITY", format!("Produce policy join pin drift: bytes={} sha256={}", policy_join.len(), encode_lower_hex(&policy_join_sha256),)));
+            return Err(phase_b_error("E_PHASE_B_POLICY_AUTHORITY", format!("Produce policy join pin drift: bytes={} sha256={}", policy_join.len(), encode_lower_hex(&policy_join_sha256))));
         }
         Ok(PhaseBAuthority { policy_binding, manifest, manifest_binding, direct_registry_binding, union_registry_binding, native_tool_registry_binding, produce_acquisition })
     }
@@ -11866,7 +11866,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         for entry in entries {
             member_count = member_count.checked_add(1).ok_or_else(|| phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent member count overflow")))?;
             if member_count > maximum_parent_members {
-                return Err(phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent member count exceeds canonical cap {maximum_parent_members}",)));
+                return Err(phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent member count exceeds canonical cap {maximum_parent_members}")));
             }
             let entry = entry.map_err(|error| phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent member ({error})")))?;
             let metadata = fs::symlink_metadata(entry.path()).map_err(|error| phase_b_error("E_PHASE_B_FILE_RACE", format!("{subject}: parent member metadata ({error})")))?;
@@ -17063,7 +17063,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     continue;
                 }
                 if left.final_sha256 != right.final_sha256 || !allowed_pair(left.id, right.id) {
-                    return Err(phase_b_error("E_PHASE_B_TOOL_ALIAS", format!("{} and {} share an unapproved final executable identity", left.id, right.id,)));
+                    return Err(phase_b_error("E_PHASE_B_TOOL_ALIAS", format!("{} and {} share an unapproved final executable identity", left.id, right.id)));
                 }
             }
         }
@@ -17105,7 +17105,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             if current != *expected_candidate {
                 return Err(phase_b_error(
                     "E_PHASE_B_TOOL_REVALIDATION",
-                    format!("{}: candidate {} disposition, symlink chain, final identity, or bytes drifted", tool.id, expected_candidate.lexical_path,),
+                    format!("{}: candidate {} disposition, symlink chain, final identity, or bytes drifted", tool.id, expected_candidate.lexical_path),
                 ));
             }
         }
@@ -17139,7 +17139,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         for (ordinal, tool) in tools.iter().enumerate() {
             let expected_tool = descriptors.get(ordinal).ok_or_else(|| phase_b_error("E_PHASE_B_EXECUTION_BIN", "native-tool ordinal is missing"))?;
             if tool.id != expected_tool.id {
-                return Err(phase_b_error("E_PHASE_B_EXECUTION_BIN", format!("execution-bin ordinal {ordinal} maps to {} instead of {}", tool.id, expected_tool.id,)));
+                return Err(phase_b_error("E_PHASE_B_EXECUTION_BIN", format!("execution-bin ordinal {ordinal} maps to {} instead of {}", tool.id, expected_tool.id)));
             }
             let name = EXECUTION_BIN_NAMES[ordinal];
             let link_path = execution_bin.join(name);
@@ -25643,7 +25643,7 @@ activate = 1\n";
         )
     }
 
-    fn validate_frozen_policy_mirrors_with_pins(raw: &toml::Value, policy: &Policy, policy_bytes: &[u8], pins: FrozenPolicyMirrorPins) -> VResult<()> {
+    fn validate_frozen_policy_mirrors_with_pins(raw: &toml::Value, policy: &Policy, policy_bytes: &[u8], pins: &FrozenPolicyMirrorPins) -> VResult<()> {
         if policy_bytes.len() != pins.policy.byte_length || lower_hex(&sha256(policy_bytes)) != pins.policy.sha256 {
             return Err(Diagnostic::error("E_POLICY_FROZEN_BINDING", "dependency-verification policy mirror"));
         }
@@ -25829,7 +25829,7 @@ activate = 1\n";
         let raw: toml::Value = parse_toml_strict(&bytes, relative)?;
         validate_raw_policy_shape(&raw)?;
         let policy = raw.clone().try_into::<Policy>().map_err(|_| Diagnostic::error("E_TOML_SCHEMA", relative).at("V2 typed extraction after raw policy-shape validation"))?;
-        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &bytes, FROZEN_POLICY_MIRROR_PINS)?;
+        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &bytes, &FROZEN_POLICY_MIRROR_PINS)?;
         Ok((policy, bytes))
     }
 
@@ -33586,7 +33586,7 @@ activate = 1\n";
             .ok_or_else(|| Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml").at("workspace.package.rust-version"))?;
         let identity = CampaignProofIdentity { toolchain: toolchain.to_owned(), rust_version: rust_version.to_owned() };
         if identity.toolchain != super::trust_std::CURRENT_ORDINARY_TOOLCHAIN || identity.rust_version != super::trust_std::CURRENT_ORDINARY_RUST_VERSION {
-            return Err(Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "current campaign toolchain").at(format!("toolchain={};rust-version={}", identity.toolchain, identity.rust_version,)));
+            return Err(Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "current campaign toolchain").at(format!("toolchain={};rust-version={}", identity.toolchain, identity.rust_version)));
         }
         Ok(identity)
     }
@@ -33730,7 +33730,7 @@ activate = 1\n";
             || field_sha256 != expected.field_sha256
         {
             return Err(
-                Diagnostic::error("E_CAMPAIGN_PROOF_INVENTORY", SUBJECT).at(format!("fields={};current={current_predicates};negatives={planted_negative_fields};sha256={field_sha256}", fields.len(),))
+                Diagnostic::error("E_CAMPAIGN_PROOF_INVENTORY", SUBJECT).at(format!("fields={};current={current_predicates};negatives={planted_negative_fields};sha256={field_sha256}", fields.len()))
             );
         }
         Ok(CampaignProofInventory { fields, current_predicates, planted_negative_fields, field_sha256 })
@@ -34178,7 +34178,7 @@ activate = 1\n";
         let pattern = parse_optional_claim_pattern(policy)?;
         let agents = documents.get("AGENTS.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "AGENTS.md"))?;
         let agents_scope =
-            format!("{}\n{}", exact_markdown_h2_section(agents, "## Toolchain: Rust & Cargo", "AGENTS.md",)?, exact_markdown_h2_section(agents, "## FastMCP Rust — This Project", "AGENTS.md",)?,);
+            format!("{}\n{}", exact_markdown_h2_section(agents, "## Toolchain: Rust & Cargo", "AGENTS.md")?, exact_markdown_h2_section(agents, "## FastMCP Rust — This Project", "AGENTS.md")?);
         let readme = documents.get("README.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "README.md"))?;
         let feature_parity = documents.get("FEATURE_PARITY.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "FEATURE_PARITY.md"))?;
         let changelog = documents.get("CHANGELOG.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "CHANGELOG.md"))?;
@@ -34446,7 +34446,7 @@ activate = 1\n";
     fn documentation_current_scopes(documents: &BTreeMap<String, String>, policy: &Policy) -> VResult<BTreeMap<String, String>> {
         let agents = documents.get("AGENTS.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "AGENTS.md"))?;
         let agents_scope =
-            format!("{}\n{}", exact_markdown_h2_section(agents, "## Toolchain: Rust & Cargo", "AGENTS.md",)?, exact_markdown_h2_section(agents, "## FastMCP Rust — This Project", "AGENTS.md",)?,);
+            format!("{}\n{}", exact_markdown_h2_section(agents, "## Toolchain: Rust & Cargo", "AGENTS.md")?, exact_markdown_h2_section(agents, "## FastMCP Rust — This Project", "AGENTS.md")?);
         let facade = documents.get("crates/fastmcp/src/lib.rs").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "crates/fastmcp/src/lib.rs"))?;
         let changelog = documents.get("CHANGELOG.md").ok_or_else(|| Diagnostic::error("E_DOCUMENTATION_SCOPE", "CHANGELOG.md"))?;
         let mut scopes = BTreeMap::new();
@@ -45940,7 +45940,7 @@ activate = 1\n";
             return Err(Diagnostic::error("E_SDK_CATALOG", subject));
         }
         let source_page =
-            format!("https://github.com/modelcontextprotocol/modelcontextprotocol/blob/{}/{}", record_string(catalog, "revision", subject)?, record_string(catalog, "upstream_path", subject)?,);
+            format!("https://github.com/modelcontextprotocol/modelcontextprotocol/blob/{}/{}", record_string(catalog, "revision", subject)?, record_string(catalog, "upstream_path", subject)?);
         let retrieval = format!(
             "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/{}/{}",
             record_string(catalog, "revision", subject)?,
@@ -45993,11 +45993,11 @@ activate = 1\n";
             let row = lines.get(header + 2 + index).ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at("missing row"))?;
             let cells = sdk_catalog_cells(row, subject)?;
             let sdk_cell = match expected.documentation_url {
-                Some(url) => format!("<Icon icon=\"{}\" size={{24}} /> &nbsp; [{}]({url})", expected.icon, expected.display_name,),
-                None => format!("<Icon icon=\"{}\" size={{24}} /> &nbsp; {}", expected.icon, expected.display_name,),
+                Some(url) => format!("<Icon icon=\"{}\" size={{24}} /> &nbsp; [{}]({url})", expected.icon, expected.display_name),
+                None => format!("<Icon icon=\"{}\" size={{24}} /> &nbsp; {}", expected.icon, expected.display_name),
             };
-            let repository_cell = format!("[modelcontextprotocol/{}](https://github.com/modelcontextprotocol/{})", expected.repository_slug, expected.repository_slug,);
-            let tier_cell = format!("<Badge color=\"{}\" shape=\"pill\">Tier&nbsp;{}</Badge>", expected.badge_color, expected.tier,);
+            let repository_cell = format!("[modelcontextprotocol/{}](https://github.com/modelcontextprotocol/{})", expected.repository_slug, expected.repository_slug);
+            let tier_cell = format!("<Badge color=\"{}\" shape=\"pill\">Tier&nbsp;{}</Badge>", expected.badge_color, expected.tier);
             if cells != [sdk_cell.as_str(), repository_cell.as_str(), tier_cell.as_str()] {
                 return Err(Diagnostic::error("E_SDK_CATALOG", subject).at(format!("catalog row {}", expected.id)));
             }
@@ -46014,7 +46014,7 @@ activate = 1\n";
         let mut seen = BTreeSet::new();
         for (value, expected) in entries.iter().zip(&SDK_CATALOG_EXPECTATIONS) {
             let entry = value.as_table().ok_or_else(|| Diagnostic::error("E_SDK_CATALOG", subject).at(expected.id))?;
-            let repository = format!("https://github.com/modelcontextprotocol/{}", expected.repository_slug,);
+            let repository = format!("https://github.com/modelcontextprotocol/{}", expected.repository_slug);
             if record_string(entry, "id", subject)? != expected.id
                 || record_string(entry, "display_name", subject)? != expected.display_name
                 || record_u64(entry, "tier", subject)? != expected.tier
@@ -46092,7 +46092,7 @@ activate = 1\n";
 
     fn validate_sdk_peer_identity_and_eras(peer: &toml::map::Map<String, toml::Value>, expected: &SdkPeerExpectation) -> VResult<()> {
         let subject = format!("SDK peer {}", expected.id);
-        let repository = format!("https://github.com/modelcontextprotocol/{}", expected.repository_slug,);
+        let repository = format!("https://github.com/modelcontextprotocol/{}", expected.repository_slug);
         let source_commit_url = format!("{repository}/commit/{}", expected.source_commit);
         if record_string(peer, "id", &subject)? != expected.id
             || record_string(peer, "display_name", &subject)? != expected.display_name
@@ -46152,8 +46152,8 @@ activate = 1\n";
         }
         for (version, wire, evidence) in [("2024-11-05", expected.legacy_wire_era, expected.legacy_evidence), ("2026-07-28", expected.modern_wire_era, expected.modern_evidence)] {
             let era = by_version.get(version).ok_or_else(|| Diagnostic::error("fnd01.sdk_matrix.peer_era_capability_mismatch", &subject))?;
-            let source_page = format!("{repository}/blob/{}/{}", expected.source_commit, expected.capability_path,);
-            let retrieval = format!("https://raw.githubusercontent.com/modelcontextprotocol/{}/{}/{}", expected.repository_slug, expected.source_commit, expected.capability_path,);
+            let source_page = format!("{repository}/blob/{}/{}", expected.source_commit, expected.capability_path);
+            let retrieval = format!("https://raw.githubusercontent.com/modelcontextprotocol/{}/{}/{}", expected.repository_slug, expected.source_commit, expected.capability_path);
             if record_string(era, "support_state", &subject)? != "supported"
                 || record_string(era, "wire_era", &subject)? != wire
                 || record_string(era, "source_page_url", &subject)? != source_page
@@ -49141,7 +49141,7 @@ activate = 1\n";
             let subject = format!("license_provenance.{id}");
             let record = pointer_get(document, &format!("/license_provenance/{id}"), &subject)?.as_table().ok_or_else(|| Diagnostic::error("E_CORE_CONFORMANCE_LICENSE", &subject))?;
             let source_page_url = format!("{repository}/blob/{revision}/LICENSE");
-            let retrieval_url = format!("https://raw.githubusercontent.com/{}/{revision}/LICENSE", repository.trim_start_matches("https://github.com/"),);
+            let retrieval_url = format!("https://raw.githubusercontent.com/{}/{revision}/LICENSE", repository.trim_start_matches("https://github.com/"));
             if record_string(record, "repository", &subject)? != repository
                 || record_string(record, "repository_revision", &subject)? != revision
                 || record_string(record, "upstream_path", &subject)? != "LICENSE"
@@ -50577,9 +50577,9 @@ activate = 1\n";
             .collect::<Vec<_>>();
         root_dependencies.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         root_dependencies.dedup();
-        assert_eq!(root_dependencies.len(), packages.len(), "synthetic root dependency identities must be unique",);
+        assert_eq!(root_dependencies.len(), packages.len(), "synthetic root dependency identities must be unique");
         const ROOT_PACKAGE: &str = "fastmcp-fnd01-bootstrap-control";
-        let mut root_block = format!("[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n",);
+        let mut root_block = format!("[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n");
         for dependency in root_dependencies {
             root_block.push_str(&format!(" \"{dependency}\",\n"));
         }
@@ -50590,7 +50590,7 @@ activate = 1\n";
                 package.name.clone(),
                 SemverVersion::parse(&package.version).expect("synthetic registry version"),
                 Some(CRATES_IO_SOURCE.to_owned()),
-                format!("[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO_SOURCE}\"\nchecksum = \"{}\"\n", package.name, package.version, package.checksum,),
+                format!("[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO_SOURCE}\"\nchecksum = \"{}\"\n", package.name, package.version, package.checksum),
             ));
         }
         lock_blocks.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()).then_with(|| left.1.cmp(&right.1)).then_with(|| left.2.cmp(&right.2)));
@@ -51004,8 +51004,8 @@ activate = 1\n";
 
     fn campaign_proof_control_fixture(identity: &CampaignProofIdentity, status: &str, checklist_prefix: &str, marker: &str, negative_toolchains: [&str; 3], negative_copies: usize) -> Vec<u8> {
         assert!(negative_copies > 0);
-        let positive = format!("{checklist_prefix}REALITY-PROOF-POSITIVE: toolchain {}; rust-version == {}", identity.toolchain, identity.rust_version,);
-        let negative = format!("{checklist_prefix}{marker} near-identical isolated fixtures use {}, {}, and {}", negative_toolchains[0], negative_toolchains[1], negative_toolchains[2],);
+        let positive = format!("{checklist_prefix}REALITY-PROOF-POSITIVE: toolchain {}; rust-version == {}", identity.toolchain, identity.rust_version);
+        let negative = format!("{checklist_prefix}{marker} near-identical isolated fixtures use {}, {}, and {}", negative_toolchains[0], negative_toolchains[1], negative_toolchains[2]);
         let mut acceptance = positive;
         for _ in 0..negative_copies {
             acceptance.push('\n');
@@ -57898,7 +57898,7 @@ fn fallible(value: Option<u8>) {
         let shape = root_table.get("policy_shape_contract").expect("policy shape contract").clone().try_into::<PolicyShapeBootstrap>().expect("typed policy shape contract");
         let shape_rules = parse_policy_shape_rules_unpinned(&shape).expect("unpinned policy shape rules");
         let policy = raw.clone().try_into::<Policy>().expect("typed policy");
-        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, FROZEN_POLICY_MIRROR_PINS).expect("all D-M1 through D-M8 mirrors match the live policy");
+        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, &FROZEN_POLICY_MIRROR_PINS).expect("all D-M1 through D-M8 mirrors match the live policy");
 
         let shape_row_count = shape.shape_rows_a.len().checked_add(shape.shape_rows_b.len()).and_then(|count| count.checked_add(shape.shape_rows_c.len())).expect("policy shape row count");
         let record_selector_count = policy.record_schema.iter().try_fold(0usize, |count, row| count.checked_add(row.selectors.len())).expect("record selector count");
@@ -58056,7 +58056,7 @@ fn fallible(value: Option<u8>) {
         let policy = raw.clone().try_into::<Policy>().expect("typed mirror negative policy");
         let pristine_raw = raw.clone();
         let pristine_bytes = policy_bytes.clone();
-        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, FROZEN_POLICY_MIRROR_PINS).expect("pristine D-M1 through D-M8 mirrors");
+        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, &FROZEN_POLICY_MIRROR_PINS).expect("pristine D-M1 through D-M8 mirrors");
 
         let cases: [(&str, MirrorMutation); 29] = [
             ("E_POLICY_FROZEN_BINDING", |pins| pins.policy.byte_length += 1),
@@ -58093,11 +58093,11 @@ fn fallible(value: Option<u8>) {
         for (expected_code, mutate) in cases {
             let mut pins = FROZEN_POLICY_MIRROR_PINS;
             mutate(&mut pins);
-            let error = validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, pins).expect_err("one compiled mirror pin drift must fail closed");
+            let error = validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, &pins).expect_err("one compiled mirror pin drift must fail closed");
             assert_eq!(error.code, expected_code, "{}", error.stable());
             assert_eq!(raw, pristine_raw, "mirror-pin rejection must not mutate parsed policy state");
             assert_eq!(policy_bytes, pristine_bytes, "mirror-pin rejection must not mutate live policy bytes");
-            validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, FROZEN_POLICY_MIRROR_PINS).expect("pristine mirrors must reaccept after each planted pin drift");
+            validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, &FROZEN_POLICY_MIRROR_PINS).expect("pristine mirrors must reaccept after each planted pin drift");
         }
 
         let mut oversized = raw.clone();
@@ -58108,11 +58108,11 @@ fn fallible(value: Option<u8>) {
             .and_then(|table| table.get_mut("digest_rule"))
             .expect("mutable digest_rule") = toml::Value::String("x".repeat(MAX_POLICY_SHAPE_REGISTRY_BYTES));
         let oversized_policy = oversized.clone().try_into::<Policy>().expect("typed oversized receipt-contract policy");
-        let error = validate_frozen_policy_mirrors_with_pins(&oversized, &oversized_policy, &policy_bytes, FROZEN_POLICY_MIRROR_PINS)
+        let error = validate_frozen_policy_mirrors_with_pins(&oversized, &oversized_policy, &policy_bytes, &FROZEN_POLICY_MIRROR_PINS)
             .expect_err("canonical receipt-contract output above the compiled bound must fail closed");
         assert_eq!(error.code, "E_RECEIPT_CONTRACT_REGISTRY");
         assert!(error.stable().contains("E_OBSERVATION_BOUND"), "oversized canonical output did not fail at the pre-hash bound: {}", error.stable());
-        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, FROZEN_POLICY_MIRROR_PINS).expect("pristine mirrors reaccept after oversized planted negative");
+        validate_frozen_policy_mirrors_with_pins(&raw, &policy, &policy_bytes, &FROZEN_POLICY_MIRROR_PINS).expect("pristine mirrors reaccept after oversized planted negative");
     }
 
     #[test]
@@ -59261,7 +59261,7 @@ fn fallible(value: Option<u8>) {
         if count != expected_count || byte_length != expected_byte_length || sha256 != expected_sha256 {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                format!("pure twenty-tool descriptor registry drift: actual count {count}, bytes {byte_length}, sha256 {}", lower_hex(&sha256),),
+                format!("pure twenty-tool descriptor registry drift: actual count {count}, bytes {byte_length}, sha256 {}", lower_hex(&sha256)),
             ));
         }
         Ok(())
@@ -59284,7 +59284,7 @@ fn fallible(value: Option<u8>) {
         if descriptors.len() != ORDINARY_NATIVE_TOOL_COUNT {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                format!("pure table cardinality {} != ORDINARY_NATIVE_TOOL_COUNT {ORDINARY_NATIVE_TOOL_COUNT}", descriptors.len(),),
+                format!("pure table cardinality {} != ORDINARY_NATIVE_TOOL_COUNT {ORDINARY_NATIVE_TOOL_COUNT}", descriptors.len()),
             ));
         }
         let mut seen_ids = std::collections::BTreeSet::new();
@@ -59302,7 +59302,7 @@ fn fallible(value: Option<u8>) {
         if seen_ids.len() != ORDINARY_NATIVE_TOOL_COUNT {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                format!("pure table unique-id cardinality {} != {ORDINARY_NATIVE_TOOL_COUNT}", seen_ids.len(),),
+                format!("pure table unique-id cardinality {} != {ORDINARY_NATIVE_TOOL_COUNT}", seen_ids.len()),
             ));
         }
         let (count, byte_length, sha256) =
@@ -59310,7 +59310,7 @@ fn fallible(value: Option<u8>) {
         if count != ORDINARY_NATIVE_TOOL_COUNT || byte_length != ORDINARY_NATIVE_TOOL_REGISTRY_BYTES || lower_hex(&sha256) != ORDINARY_NATIVE_TOOL_REGISTRY_SHA256 {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                format!("pure dual-path registry identity drift: actual count {count}, bytes {byte_length}, sha256 {}", lower_hex(&sha256),),
+                format!("pure dual-path registry identity drift: actual count {count}, bytes {byte_length}, sha256 {}", lower_hex(&sha256)),
             ));
         }
         Ok(OrdinaryDualPathPureAuthority { native_tool_count: count, registry_byte_length: byte_length, registry_sha256: sha256 })
@@ -64105,7 +64105,7 @@ fn fallible(value: Option<u8>) {
             if inventory.native_tool_count() != pure.native_tool_count || inventory.native_tool_count() != ORDINARY_NATIVE_TOOL_COUNT {
                 return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                     OrdinaryFailureSite::ProbeToolSet,
-                    format!("live inventory cardinality {} != pure dual-path count {}", inventory.native_tool_count(), pure.native_tool_count,),
+                    format!("live inventory cardinality {} != pure dual-path count {}", inventory.native_tool_count(), pure.native_tool_count),
                 ));
             }
             let reprobe = OrdinaryToolReprobe {
