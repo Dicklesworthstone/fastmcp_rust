@@ -24,6 +24,7 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
     CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
@@ -621,14 +622,15 @@ where
 /// Emits `notifications/message` from handler `ctx.info()` and friends.
 pub(crate) struct LogNotificationSender<F> {
     send_fn: F,
+    era: ProtocolEra,
 }
 
 impl<F> LogNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
-    pub(crate) fn new(send_fn: F) -> Self {
-        Self { send_fn }
+    pub(crate) fn new(send_fn: F, era: ProtocolEra) -> Self {
+        Self { send_fn, era }
     }
 }
 
@@ -657,6 +659,9 @@ where
     }
 
     fn send_catalog_changed(&self, kind: McpCatalogKind) {
+        if self.era == ProtocolEra::Modern2026 {
+            return;
+        }
         let method = match kind {
             McpCatalogKind::Tools => "notifications/tools/list_changed",
             McpCatalogKind::Resources => "notifications/resources/list_changed",
@@ -672,6 +677,9 @@ where
     }
 
     fn send_resource_updated(&self, uri: &str) {
+        if self.era == ProtocolEra::Modern2026 {
+            return;
+        }
         let params = fastmcp_protocol::ResourceUpdatedNotificationParams {
             uri: uri.to_owned(),
         };

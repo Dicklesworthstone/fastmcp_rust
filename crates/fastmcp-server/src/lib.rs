@@ -4588,14 +4588,18 @@ enum FinalSubscriptionPhase {
 
 struct FinalSubscriptionElection {
     phase: Mutex<FinalSubscriptionPhase>,
+    phase_changed: Condvar,
     graceful_completion: AtomicBool,
+    opener_thread: std::thread::ThreadId,
 }
 
 impl FinalSubscriptionElection {
     fn opening() -> Self {
         Self {
             phase: Mutex::new(FinalSubscriptionPhase::Opening),
+            phase_changed: Condvar::new(),
             graceful_completion: AtomicBool::new(false),
+            opener_thread: std::thread::current().id(),
         }
     }
 }
@@ -4657,6 +4661,8 @@ impl Drop for FinalSubscriptionLease {
             ) {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
             }
+            drop(phase);
+            entry.election.phase_changed.notify_all();
         }
     }
 }
@@ -4845,6 +4851,7 @@ impl FinalSubscriptionRegistry {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
             }
             drop(phase);
+            election.phase_changed.notify_all();
             if let Some(delivery) = &terminal_delivery {
                 delivery.mark_failed();
             }
@@ -4866,6 +4873,7 @@ impl FinalSubscriptionRegistry {
             {
                 *phase = FinalSubscriptionPhase::ServerTerminated;
                 drop(phase);
+                election.phase_changed.notify_all();
                 if !complete_final_subscription_server_termination(
                     &election,
                     &subscription_id,
@@ -4879,6 +4887,7 @@ impl FinalSubscriptionRegistry {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         FinalSubscriptionPhase::PeerTerminated;
+                    election.phase_changed.notify_all();
                     return Err(McpError::request_cancelled());
                 }
                 return Ok(FinalSubscriptionLease {
@@ -4892,6 +4901,7 @@ impl FinalSubscriptionRegistry {
             | FinalSubscriptionPhase::EventDelivery(_) => {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
                 drop(phase);
+                election.phase_changed.notify_all();
                 let mut state = self
                     .inner
                     .lock()
@@ -4908,6 +4918,7 @@ impl FinalSubscriptionRegistry {
             FinalSubscriptionPhase::ServerTerminationPending(_) => {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
                 drop(phase);
+                election.phase_changed.notify_all();
                 if let Some(delivery) = &terminal_delivery {
                     delivery.mark_failed();
                 }
@@ -4916,11 +4927,13 @@ impl FinalSubscriptionRegistry {
             }
             FinalSubscriptionPhase::PeerTerminated | FinalSubscriptionPhase::ServerTerminated => {
                 drop(phase);
+                election.phase_changed.notify_all();
                 request_cancellation.cancel();
                 return Err(McpError::request_cancelled());
             }
         }
         drop(phase);
+        election.phase_changed.notify_all();
 
         Ok(FinalSubscriptionLease {
             registry: Arc::clone(self),
@@ -4968,6 +4981,27 @@ impl FinalSubscriptionRegistry {
                 .phase
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*phase, FinalSubscriptionPhase::Opening)
+                && std::thread::current().id() != entry.election.opener_thread
+            {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while matches!(*phase, FinalSubscriptionPhase::Opening) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let timeout = deadline - now;
+                    let (new_phase, timeout_result) = entry
+                        .election
+                        .phase_changed
+                        .wait_timeout(phase, timeout)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    phase = new_phase;
+                    if timeout_result.timed_out() {
+                        break;
+                    }
+                }
+            }
             match *phase {
                 FinalSubscriptionPhase::Active => {
                     if entry.request_cancellation.is_cancel_requested() {
@@ -5227,6 +5261,8 @@ impl FinalSubscriptionRegistry {
             FinalSubscriptionPhase::Opening => {
                 if entry.request_cancellation.is_cancel_requested() {
                     *phase = FinalSubscriptionPhase::PeerTerminated;
+                    drop(phase);
+                    entry.election.phase_changed.notify_all();
                     if let Some(delivery) = &entry.terminal_delivery {
                         delivery.mark_failed();
                     }
@@ -5238,6 +5274,8 @@ impl FinalSubscriptionRegistry {
                 // callback returns, without waiting under a callback-spanning
                 // lock.
                 *phase = FinalSubscriptionPhase::ServerTerminationPending(0);
+                drop(phase);
+                entry.election.phase_changed.notify_all();
                 (true, entry.terminal_delivery)
             }
             FinalSubscriptionPhase::Active => {
@@ -12884,9 +12922,12 @@ impl Server {
         {
             let sender = notification_sender.clone();
             request_ctx = request_ctx.with_log_sender(Arc::new(
-                crate::handler::LogNotificationSender::new(move |notification| {
-                    sender(notification);
-                }),
+                crate::handler::LogNotificationSender::new(
+                    move |notification| {
+                        sender(notification);
+                    },
+                    ProtocolEra::Modern2026,
+                ),
             ));
         }
         // The outer request owner retains the sole final-progress runtime.
@@ -13734,9 +13775,12 @@ impl Server {
             if let Some(runtime) = runtime {
                 let sender = Arc::clone(&runtime.notification_sender);
                 request_ctx = request_ctx.with_log_sender(Arc::new(
-                    crate::handler::LogNotificationSender::new(move |notification| {
-                        sender(notification);
-                    }),
+                    crate::handler::LogNotificationSender::new(
+                        move |notification| {
+                            sender(notification);
+                        },
+                        ProtocolEra::Legacy2024,
+                    ),
                 ));
             }
             if let (Some(marker), Some(runtime)) = (Self::request_progress_marker(request), runtime)
@@ -32814,7 +32858,7 @@ mod lib_unit_tests {
             SUBSCRIPTIONS_LISTEN,
             Some(serde_json::json!({
                 "notifications": {
-                    "tools/list_changed": true,
+                    "toolsListChanged": true,
                 },
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
