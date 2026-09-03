@@ -5919,6 +5919,14 @@ impl AuthorizedTaskServiceRunner {
                 return Ok(());
             }
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
+            // The supervisor is promised one poll boundary in which to observe
+            // and honour a cancellation winner. Electing the winner on the
+            // same turn the request first becomes visible makes that window
+            // unsatisfiable, so the first observation arms this flag, wakes
+            // this future, and yields; the next turn elects the winner if the
+            // supervisor still has not finished. Exactly one extra boundary is
+            // granted, so the runner remains the authority.
+            let mut cancellation_boundary_granted = false;
             let completed = std::future::poll_fn(|task_context| {
                 if let Err(error) = cx.checkpoint() {
                     return std::task::Poll::Ready(Some(Err(McpError::internal_error(
@@ -5926,11 +5934,14 @@ impl AuthorizedTaskServiceRunner {
                     ))));
                 }
                 cancellation_wake.register_waker(task_context.waker());
-                match guard.is_cancellation_requested() {
-                    Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
-                    Ok(false) => {}
-                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
-                }
+                // Poll the supervisor before electing the cancellation winner.
+                // The documented contract gives a supervisor exactly one poll
+                // boundary to observe and honour `tasks/cancel`; checking the
+                // winner first consumed that boundary and dropped the
+                // supervisor future unpolled, so the promised window could
+                // never be satisfied. The runner remains the authority:
+                // `retire_if_cancellation_requested` below still records
+                // terminal cancellation when the supervisor declines.
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
                     // A completed application result is authoritative. The
                     // sanctioned wind-down idiom cancels the service region
@@ -5938,6 +5949,25 @@ impl AuthorizedTaskServiceRunner {
                     // here would overwrite the success and restore a durable
                     // handoff the application already consumed.
                     return std::task::Poll::Ready(Some(result));
+                }
+                // The supervisor declined this boundary, so the runner elects
+                // the cancellation winner and records terminal cancellation --
+                // but only after granting the one promised boundary above.
+                match guard.is_cancellation_requested() {
+                    Ok(true) => {
+                        if cancellation_boundary_granted {
+                            return std::task::Poll::Ready(Some(Ok(())));
+                        }
+                        // Yield without self-waking: the supervisor's own
+                        // wake (its retry timer) drives the next poll, so it
+                        // gets a real window rather than a zero-length one.
+                        // The heartbeat below remains the backstop if the
+                        // supervisor never wakes again.
+                        cancellation_boundary_granted = true;
+                        return std::task::Poll::Pending;
+                    }
+                    Ok(false) => {}
+                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                 }
                 if heartbeat.as_mut().poll(task_context).is_ready() {
                     return std::task::Poll::Ready(None);

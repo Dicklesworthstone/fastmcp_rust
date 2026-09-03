@@ -15,7 +15,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::Poll;
 use std::thread::{self, JoinHandle};
@@ -99,7 +99,14 @@ impl fastmcp_rust::ProxyBackend for FacadeProxyBoundaryBackend {
 // ============================================================================
 
 /// Echoes back the input.
-#[tool(name = "echo", version = "1.0.0", annotations(read_only, idempotent))]
+#[tool(
+    name = "echo",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Echoes back the input",
+    version = "1.0.0",
+    annotations(read_only, idempotent)
+)]
 fn echo_tool(_ctx: &McpContext, message: String) -> String {
     message
 }
@@ -143,6 +150,9 @@ fn status(_ctx: &McpContext) -> String {
 #[resource(
     uri = "file:///README.md",
     name = "README",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Project README file",
     mime_type = "text/markdown",
     version = "1.0.0",
     tags = ["docs"]
@@ -334,7 +344,10 @@ fn setup_workflow_server() -> TestHarness {
         .resource(StatusResource)
         .resource(ReadmeResource)
         .resource_template(ResourceTemplate {
-            uri_template: "file:///{path}".to_string(),
+            // A modern exact resource may not be shadowed by a template, and
+            // this server registers the exact `file:///README.md`. Namespace
+            // the template so it admits without colliding.
+            uri_template: "file:///files/{path}".to_string(),
             name: "File Path".to_string(),
             description: Some("Access files by path".to_string()),
             mime_type: None,
@@ -1368,9 +1381,19 @@ impl LegacyContentExt for LegacyContent {
 // Final Tasks public-facade HTTP E2E tests
 // ============================================================================
 
+/// Per-operation and teardown budget. Every individual client request, the
+/// readiness handshake, and the settle path must complete within this, so it
+/// is the bound that actually asserts responsiveness.
 const FINAL_TASKS_E2E_BOUND: Duration = Duration::from_secs(2);
 const FINAL_TASKS_HTTP_RESPONSE_MAX_BYTES: usize = 1 << 20;
-const FINAL_TASKS_SERVER_BOUND: Duration = Duration::from_secs(4);
+/// Whole-lifetime cap on the fixture's server task. This is an anti-hang
+/// guard, not a latency assertion: it must exceed the total duration of the
+/// longest test that drives this fixture (a full Tasks create/poll/
+/// input-required/resume/cancel sequence over HTTP), or the server is killed
+/// mid-test and every in-flight request fails as cancelled. It was 4s, which
+/// the lifecycle test legitimately exceeds; the per-operation bound above is
+/// what keeps the test honest about responsiveness.
+const FINAL_TASKS_SERVER_BOUND: Duration = Duration::from_secs(120);
 
 fn final_tasks_runtime_block_on<F: Future>(future: F) -> F::Output {
     asupersync::runtime::RuntimeBuilder::current_thread()
@@ -1464,6 +1487,13 @@ impl FinalTasksHttpFixture {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        // Teardown deliberately cancels the server context, which makes the
+        // lifetime `timeout` below resolve as an error. Without this flag the
+        // fixture reported every intended shutdown as "exceeded its deadline",
+        // failing teardown on a perfectly healthy run. A real deadline breach
+        // (no shutdown requested) still reports the deadline error.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_observed = Arc::clone(&shutdown_requested);
         let join = Some(thread::spawn(move || {
             let (task_done_tx, task_done_rx) = mpsc::channel();
             let (server_cx_tx, server_cx_rx) = mpsc::sync_channel(1);
@@ -1549,7 +1579,14 @@ impl FinalTasksHttpFixture {
                             })
                             .await
                             .unwrap_or_else(|_| {
-                                Err("final Tasks E2E server exceeded its deadline".to_owned())
+                                if shutdown_observed.load(Ordering::SeqCst) {
+                                    // The fixture cancelled this context on
+                                    // purpose; that is a clean stop, not a
+                                    // deadline breach.
+                                    Ok(())
+                                } else {
+                                    Err("final Tasks E2E server exceeded its deadline".to_owned())
+                                }
                             });
                         let _ = finished_tx.send(outcome);
                         let _ = task_done_tx.send(());
@@ -1564,6 +1601,7 @@ impl FinalTasksHttpFixture {
                     match shutdown_rx.try_recv() {
                         Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
                             if let Some(cx) = server_cx.as_ref() {
+                                shutdown_requested.store(true, Ordering::SeqCst);
                                 cx.cancel_with(
                                     asupersync::CancelKind::User,
                                     Some("final Tasks E2E fixture shutdown"),
@@ -4416,7 +4454,9 @@ fn tool_call_multiple_argument_types() {
                 "string_val": "test",
                 "int_val": 100,
                 "bool_val": true,
-                "array_val": [1, 2, 3]
+                // This handler declares `array_val` as an array of strings,
+                // and input validation enforces that declared schema.
+                "array_val": ["one", "two", "three"]
             }),
         )
         .unwrap();
@@ -4719,7 +4759,14 @@ fn tool_call_alternating_success_failure() {
 // ============================================================================
 
 /// Resource that returns plain text content.
-#[resource(uri = "text://plain", name = "Plain Text", mime_type = "text/plain")]
+#[resource(
+    uri = "text://plain",
+    name = "Plain Text",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Returns plain text content",
+    mime_type = "text/plain"
+)]
 fn plain_text() -> String {
     "Hello, World!".to_string()
 }
