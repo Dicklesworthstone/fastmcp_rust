@@ -44,7 +44,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +69,63 @@ jobs:
 
       - name: Run all-feature tests
         run: cargo test --locked --workspace --all-targets --all-features --verbose
+
+      - name: Prove revived facade E2E binaries reached libtest completion
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          status=0
+          transcript="$(cargo test --locked -p fastmcp-rust \
+            --features testing-lab,legacy-2024-11-05,tasks,proxy \
+            --test e2e_protocol --test e2e_workflow 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+
+          result_for() {
+            local target="$1"
+            printf '%s\n' "$transcript" | awk -v target="$target" '
+              $0 ~ "Running .*" target { active = 1; next }
+              active && /^test result: / { print; exit }
+            '
+          }
+
+          protocol_result="$(result_for e2e_protocol)"
+          workflow_result="$(result_for e2e_workflow)"
+          case "$protocol_result" in
+            "test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'e2e_protocol did not complete its exact 163-test inventory: %s\n' "$protocol_result" >&2; exit 1 ;;
+          esac
+          case "$workflow_result" in
+            "test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'e2e_workflow did not complete its exact 79-test inventory: %s\n' "$workflow_result" >&2; exit 1 ;;
+          esac
+
+      - name: Prove the shipped CLI and echo server compose under every policy
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          cargo build --locked -p fastmcp-rust \
+            --features legacy-2024-11-05,tasks \
+            --bin echo_server
+          status=0
+          transcript="$(FASTMCP_ECHO_SERVER_BIN="$PWD/target/debug/echo_server" \
+            cargo test --locked -p fastmcp-cli \
+            --features tasks,e2e-fixture \
+            --test e2e_test \
+            -- --include-ignored 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+          result="$(printf '%s\n' "$transcript" | awk '/^test result: / { print; exit }')"
+          case "$result" in
+            "test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'CLI E2E proof did not complete its exact 41-test inventory: %s\n' "$result" >&2; exit 1 ;;
+          esac
 
       - name: Compile renamed facade-only macro consumer
         if: matrix.os == 'ubuntu-latest'
@@ -183,7 +240,13 @@ jobs:
           fallback: none
 
       - name: Run security audit
-        run: cargo audit --deny warnings
+        # These are unmaintained notices, not vulnerabilities: bincode and
+        # yaml-rust are owned by rich_rust -> syntect, while rustls-pemfile is
+        # owned by asupersync TLS. Remove each exception as soon as that owner
+        # moves off the package. Vulnerability advisories are never ignored.
+        # Yanked chacha20 0.10.1 remains non-fatal until FND-01's exact TCB
+        # source evidence is deliberately rebound; vulnerabilities still fail.
+        run: cargo audit --deny unmaintained --deny unsound --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2024-0320
 
   build:
     name: Build (${{ matrix.target }})

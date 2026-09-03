@@ -36688,6 +36688,7 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
 
+    #[cfg(unix)]
     #[test]
     #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn clt_01_i_planted_negative() {

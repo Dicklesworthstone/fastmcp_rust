@@ -202,7 +202,8 @@ fn main() {
 Run it:
 
 ```bash
-cargo run -p fastmcp-rust --example echo_server
+# echo_server is a shipped binary target of the facade crate, not an example
+cargo run -p fastmcp-rust --bin echo_server
 ```
 
 ---
@@ -353,16 +354,22 @@ cargo build --release
 
 ### CLI binaries (GitHub Releases)
 
-Prebuilt `fastmcp` binaries are published on GitHub Releases. The
-`fastmcp-cli` source package is also available from crates.io for Cargo-based
-installation. Release archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on
-Unix, `.zip` on Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64
-aliases; Windows ships amd64 MSVC.
+The latest published release, v0.8.1, provides prebuilt `fastmcp` binaries on
+GitHub Releases. The `fastmcp-cli` source package is also available from
+crates.io for Cargo-based installation. Its archives use
+`fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on Windows). Linux and
+macOS provide `x86_64` and `aarch64` archives (`fastmcp-linux-x86_64`,
+`fastmcp-linux-aarch64`, `fastmcp-darwin-x86_64`,
+`fastmcp-darwin-aarch64`); Windows provides `fastmcp-windows-x86_64` (MSVC).
+There are no `amd64`/`arm64` alias names. Every archive has a `.sha256`
+sibling and the release carries a `SHA256SUMS` file. The checked-in release
+workflow is currently a quarantined verification surface and does not publish
+new GitHub Releases.
 
 ```bash
 # Example: macOS Apple Silicon
-curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/latest/download/fastmcp-darwin-arm64.tar.xz
-tar -xJf fastmcp-darwin-arm64.tar.xz
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/latest/download/fastmcp-darwin-aarch64.tar.xz
+tar -xJf fastmcp-darwin-aarch64.tar.xz
 ./fastmcp --version
 ```
 

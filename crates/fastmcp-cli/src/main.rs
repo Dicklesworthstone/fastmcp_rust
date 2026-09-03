@@ -37,15 +37,13 @@ use asupersync::Cx;
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use clap::{Parser, Subcommand};
-use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
 #[cfg(target_os = "linux")]
 use fastmcp_client::linux_process_group_has_live_member;
 use fastmcp_client::{
-    CanonicalHttpUrl, Client, ClientBuilder, ClientProtocolPlan, ListPageLimits,
-    claude_desktop_config_path,
+    CanonicalHttpUrl, Client, ClientBuilder, ClientProtocolPlan, claude_desktop_config_path,
 };
 use fastmcp_console::console::{is_credential_key, redact_free_text_credentials_with};
 use fastmcp_core::McpResult;
@@ -1318,6 +1316,8 @@ fn cmd_run(
 struct ServerEntry {
     name: String,
     source: String,
+    transport: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     command: String,
     #[serde(serialize_with = "serialize_redacted_arguments")]
     args: Vec<String>,
@@ -1328,6 +1328,10 @@ struct ServerEntry {
     env: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credentials_configured: Option<bool>,
     enabled: bool,
 }
 
@@ -1335,6 +1339,7 @@ const REDACTED_ENV_VALUE: &str = "<redacted>";
 const REDACTED_ARGUMENT_VALUE: &str = "<redacted>";
 const REDACTED_LONG_OPTION: &str = "--<option>";
 const REDACTED_SHORT_OPTION: &str = "-<option>";
+const REDACTED_REMOTE_ROUTE: &str = "<redacted-route>";
 const TERMINAL_TEXT_LIMIT: usize = 4 * 1024;
 const TERMINAL_TRUNCATED: &str = "...[truncated]";
 const PEER_FIELD_LIMIT: usize = 512;
@@ -2725,12 +2730,18 @@ fn format_redacted_environment(environment: Option<&HashMap<String, String>>) ->
 struct BoundedServerEntry {
     name: String,
     source: String,
+    transport: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     command: String,
     args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     env: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials_configured: Option<bool>,
     enabled: bool,
 }
 
@@ -2791,6 +2802,9 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
         let (source, source_mutation) =
             sanitize_peer_text_with_metadata(&entry.source, PEER_FIELD_LIMIT);
         mutation.merge(source_mutation);
+        let (transport, transport_mutation) =
+            sanitize_peer_text_with_metadata(&entry.transport, PEER_FIELD_LIMIT);
+        mutation.merge(transport_mutation);
         let (command, command_mutation) =
             sanitize_peer_text_with_metadata(&entry.command, PEER_FIELD_LIMIT);
         mutation.merge(command_mutation);
@@ -2799,14 +2813,28 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
             mutation.merge(cwd_mutation);
             cwd
         });
+        let endpoint = entry.endpoint.as_deref().map(|endpoint| {
+            let (endpoint, endpoint_mutation) =
+                sanitize_peer_text_with_metadata(endpoint, PEER_FIELD_LIMIT);
+            mutation.merge(endpoint_mutation);
+            endpoint
+        });
+        mutation.redacted |= entry
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.ends_with(REDACTED_REMOTE_ROUTE));
+        mutation.redacted |= entry.credentials_configured == Some(true);
 
         bounded.push(BoundedServerEntry {
             name,
             source,
+            transport,
             command,
             args,
             env,
             cwd,
+            endpoint,
+            credentials_configured: entry.credentials_configured,
             enabled: entry.enabled,
         });
     }
@@ -2819,9 +2847,9 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
 fn format_list_table(servers: &[ServerEntry], verbose: bool) -> String {
     let mut output = String::new();
     let header = if verbose {
-        "Source | Server Name | Command | Working Directory | Status | Arguments | Environment"
+        "Source | Server Name | Transport | Target | Working Directory | Status | Arguments | Environment | Credentials"
     } else {
-        "Source | Server Name | Command | Status"
+        "Source | Server Name | Transport | Target | Status"
     };
     let _ = push_output_line(&mut output, "Configured MCP Servers");
     let _ = push_output_line(&mut output, header);
@@ -2832,7 +2860,9 @@ fn format_list_table(servers: &[ServerEntry], verbose: bool) -> String {
         let status = if entry.enabled { "enabled" } else { "disabled" };
         let source = sanitize_peer_text(&entry.source, PEER_FIELD_LIMIT);
         let name = sanitize_peer_text(&entry.name, PEER_FIELD_LIMIT);
-        let command = sanitize_peer_text(&entry.command, PEER_FIELD_LIMIT);
+        let transport = sanitize_peer_text(&entry.transport, PEER_FIELD_LIMIT);
+        let target = entry.endpoint.as_deref().unwrap_or(&entry.command);
+        let target = sanitize_peer_text(target, PEER_FIELD_LIMIT);
         let line = if verbose {
             let cwd = entry.cwd.as_deref().map_or_else(
                 || "-".to_owned(),
@@ -2840,9 +2870,14 @@ fn format_list_table(servers: &[ServerEntry], verbose: bool) -> String {
             );
             let args = format_redacted_arguments(&entry.args);
             let environment = format_redacted_environment(entry.env.as_ref());
-            format!("{source} | {name} | {command} | {cwd} | {status} | {args} | {environment}")
+            let credentials = entry.credentials_configured.map_or("-", |configured| {
+                if configured { "configured" } else { "none" }
+            });
+            format!(
+                "{source} | {name} | {transport} | {target} | {cwd} | {status} | {args} | {environment} | {credentials}"
+            )
         } else {
-            format!("{source} | {name} | {command} | {status}")
+            format!("{source} | {name} | {transport} | {target} | {status}")
         };
         if !push_output_line(&mut output, &line) {
             break;
@@ -2867,7 +2902,7 @@ fn cmd_list(
 
     // If custom config path is provided, use only that
     if let Some(config_path) = config {
-        load_servers_from_path(&config_path, "Custom", &mut servers)?;
+        load_servers_from_path(&config_path, "Custom", target, &mut servers)?;
     } else {
         // Load from standard targets
         let explicit_target = target.is_some();
@@ -3003,6 +3038,10 @@ fn is_bounded_client_json(value: &serde_json::Value) -> bool {
     visit(value, 0, &mut remaining)
 }
 
+fn is_bounded_optional_client_object(value: &serde_json::Value) -> bool {
+    value.is_null() || (value.is_object() && is_bounded_client_json(value))
+}
+
 fn is_valid_cline_timeout(value: &serde_json::Value) -> bool {
     value
         .as_f64()
@@ -3016,11 +3055,14 @@ enum ClientServerFieldClass {
     Unsupported,
 }
 
-fn is_remote_transport_name(value: &str) -> bool {
-    matches!(
-        value,
-        "http" | "streamable-http" | "streamableHttp" | "sse" | "ws"
-    )
+fn normalized_remote_transport(target: InstallTarget, value: &str) -> Option<&'static str> {
+    match (target, value) {
+        (InstallTarget::Claude, "http" | "streamable-http")
+        | (InstallTarget::Cursor, "http")
+        | (InstallTarget::Cline, "streamableHttp") => Some("streamable-http"),
+        (_, "sse") => Some("sse"),
+        _ => None,
+    }
 }
 
 fn classify_cline_transport(value: &serde_json::Value) -> ClientServerFieldClass {
@@ -3030,10 +3072,15 @@ fn classify_cline_transport(value: &serde_json::Value) -> ClientServerFieldClass
     let Some(transport_type) = transport.get("type").and_then(serde_json::Value::as_str) else {
         return ClientServerFieldClass::Unsupported;
     };
-    if is_remote_transport_name(transport_type) {
+    if normalized_remote_transport(InstallTarget::Cline, transport_type).is_some() {
         return if transport
             .keys()
             .all(|field| matches!(field.as_str(), "type" | "url" | "headers"))
+            && transport
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| !url.trim().is_empty())
+            && transport.get("headers").is_none_or(is_bounded_string_map)
         {
             ClientServerFieldClass::Remote
         } else {
@@ -3078,14 +3125,21 @@ fn classify_client_server_field(
     if field == "type" {
         return match value.as_str() {
             Some("stdio") => ClientServerFieldClass::Local,
-            Some(kind) if is_remote_transport_name(kind) => ClientServerFieldClass::Remote,
+            Some(kind) if normalized_remote_transport(target, kind).is_some() => {
+                ClientServerFieldClass::Remote
+            }
             _ => ClientServerFieldClass::Unsupported,
         };
     }
     if field == "transportType" {
         return match value.as_str() {
             Some("stdio") if target == InstallTarget::Cline => ClientServerFieldClass::Local,
-            Some(kind) if is_remote_transport_name(kind) => ClientServerFieldClass::Remote,
+            Some(kind)
+                if target == InstallTarget::Cline
+                    && normalized_remote_transport(target, kind).is_some() =>
+            {
+                ClientServerFieldClass::Remote
+            }
             _ => ClientServerFieldClass::Unsupported,
         };
     }
@@ -3114,9 +3168,140 @@ fn classify_client_server_field(
     }
 }
 
-fn normalize_cline_nested_stdio_entry(
+struct RemoteServerProjection {
+    transport: String,
+    endpoint: String,
+    credentials_configured: bool,
+    enabled: bool,
+}
+
+enum NormalizedClineServerEntry {
+    Stdio {
+        config: serde_json::Value,
+        credentials_configured: Option<bool>,
+    },
+    Remote(RemoteServerProjection),
+}
+
+fn remote_endpoint_identity(endpoint: &str) -> Result<(String, bool), &'static str> {
+    let canonical = CanonicalHttpUrl::parse(endpoint).map_err(|_| "schema validation failed")?;
+    let mut identity = format!("{}://{}", canonical.scheme(), canonical.host());
+    if let Some(port) = canonical.port() {
+        identity.push(':');
+        identity.push_str(&port.to_string());
+    }
+    identity.push('/');
+
+    let has_userinfo = canonical.has_userinfo();
+    let route_redacted = has_userinfo
+        || canonical.path() != "/"
+        || canonical.query().is_some()
+        || canonical.fragment().is_some();
+    if route_redacted {
+        identity.push_str(REDACTED_REMOTE_ROUTE);
+    }
+    Ok((identity, has_userinfo))
+}
+
+fn remote_credentials_configured(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, &'static str> {
+    if fields
+        .get("headers")
+        .is_some_and(|headers| !is_bounded_string_map(headers))
+        || fields
+            .get("auth")
+            .is_some_and(|auth| !is_bounded_optional_client_object(auth))
+        || fields
+            .get("oauth")
+            .is_some_and(|oauth| !is_bounded_optional_client_object(oauth))
+    {
+        return Err("schema validation failed");
+    }
+
+    Ok(fields
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|headers| !headers.is_empty())
+        || fields.get("auth").is_some_and(|auth| !auth.is_null())
+        || fields.get("oauth").is_some_and(|oauth| !oauth.is_null()))
+}
+
+fn normalize_flat_remote_entry(
     config: &serde_json::Value,
-) -> Result<serde_json::Value, &'static str> {
+    client_target: Option<InstallTarget>,
+) -> Result<Option<RemoteServerProjection>, &'static str> {
+    let Some(fields) = config.as_object() else {
+        return Ok(None);
+    };
+    let profile_target = client_target.unwrap_or(InstallTarget::Claude);
+    let mut has_remote_field = false;
+    for (field, value) in fields {
+        match classify_client_server_field(profile_target, field, value) {
+            ClientServerFieldClass::Remote => has_remote_field = true,
+            ClientServerFieldClass::Unsupported => return Err("schema validation failed"),
+            ClientServerFieldClass::Local => {}
+        }
+    }
+    if !has_remote_field {
+        return Ok(None);
+    }
+
+    let allowed = |field: &str| {
+        matches!(
+            field,
+            "type" | "transportType" | "url" | "headers" | "auth" | "oauth" | "disabled"
+        ) || (profile_target == InstallTarget::Cline
+            && matches!(
+                field,
+                "autoApprove" | "timeout" | "remoteConfigured" | "metadata"
+            ))
+    };
+    if fields.keys().any(|field| !allowed(field)) {
+        return Err("schema validation failed");
+    }
+
+    let declared_type = match (
+        fields.get("type").and_then(serde_json::Value::as_str),
+        fields
+            .get("transportType")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        (Some(_), Some(_)) => return Err("schema validation failed"),
+        (Some(kind), None) | (None, Some(kind)) => kind,
+        (None, None) if fields.contains_key("url") => match profile_target {
+            InstallTarget::Cursor => "http",
+            InstallTarget::Cline => "sse",
+            InstallTarget::Claude => return Err("schema validation failed"),
+        },
+        (None, None) => return Err("schema validation failed"),
+    };
+    let transport = normalized_remote_transport(profile_target, declared_type)
+        .ok_or("schema validation failed")?
+        .to_owned();
+    let endpoint = fields
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .ok_or("schema validation failed")?;
+    let (endpoint, userinfo_configured) = remote_endpoint_identity(endpoint)?;
+    let credentials_configured = userinfo_configured || remote_credentials_configured(fields)?;
+    let enabled = match fields.get("disabled") {
+        Some(value) => !value.as_bool().ok_or("schema validation failed")?,
+        None => true,
+    };
+
+    Ok(Some(RemoteServerProjection {
+        transport,
+        endpoint,
+        credentials_configured,
+        enabled,
+    }))
+}
+
+fn normalize_cline_nested_server_entry(
+    config: &serde_json::Value,
+) -> Result<NormalizedClineServerEntry, &'static str> {
     let outer = config.as_object().ok_or("schema validation failed")?;
     let allowed_outer = [
         "transport",
@@ -3146,8 +3331,28 @@ fn normalize_cline_nested_stdio_entry(
         .get("type")
         .and_then(serde_json::Value::as_str)
         .ok_or("schema validation failed")?;
-    if is_remote_transport_name(transport_type) {
-        return Err("remote MCP entries are not yet representable by fastmcp list");
+    if normalized_remote_transport(InstallTarget::Cline, transport_type).is_some() {
+        let endpoint = transport
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .ok_or("schema validation failed")?;
+        let (endpoint, userinfo_configured) = remote_endpoint_identity(endpoint)?;
+        let mut credentials_configured =
+            userinfo_configured || remote_credentials_configured(transport)?;
+        credentials_configured |= outer.get("oauth").is_some_and(|oauth| !oauth.is_null());
+        let enabled = match outer.get("disabled") {
+            Some(value) => !value.as_bool().ok_or("schema validation failed")?,
+            None => true,
+        };
+        return Ok(NormalizedClineServerEntry::Remote(RemoteServerProjection {
+            transport: normalized_remote_transport(InstallTarget::Cline, transport_type)
+                .ok_or("schema validation failed")?
+                .to_owned(),
+            endpoint,
+            credentials_configured,
+            enabled,
+        }));
     }
     if transport_type != "stdio" {
         return Err("schema validation failed");
@@ -3162,7 +3367,32 @@ fn normalize_cline_nested_stdio_entry(
     if let Some(disabled) = outer.get("disabled") {
         normalized.insert("disabled".to_owned(), disabled.clone());
     }
-    Ok(serde_json::Value::Object(normalized))
+    Ok(NormalizedClineServerEntry::Stdio {
+        config: serde_json::Value::Object(normalized),
+        credentials_configured: outer
+            .get("oauth")
+            .is_some_and(|oauth| !oauth.is_null())
+            .then_some(true),
+    })
+}
+
+fn server_entry_from_remote(
+    source_name: &str,
+    name: &str,
+    remote: RemoteServerProjection,
+) -> ServerEntry {
+    ServerEntry {
+        name: name.to_owned(),
+        source: source_name.to_owned(),
+        transport: remote.transport,
+        command: String::new(),
+        args: Vec::new(),
+        env: None,
+        cwd: None,
+        endpoint: Some(remote.endpoint),
+        credentials_configured: Some(remote.credentials_configured),
+        enabled: remote.enabled,
+    }
 }
 
 fn parse_json_server_entry(
@@ -3172,33 +3402,39 @@ fn parse_json_server_entry(
     config: &serde_json::Value,
     client_target: Option<InstallTarget>,
 ) -> McpResult<ServerEntry> {
-    let normalized = if client_target == Some(InstallTarget::Cline)
+    let (normalized, credentials_configured) = if client_target == Some(InstallTarget::Cline)
         && config
             .as_object()
             .is_some_and(|fields| fields.contains_key("transport"))
     {
-        Some(
-            normalize_cline_nested_stdio_entry(config)
-                .map_err(|detail| invalid_server_entry(path, source_name, name, detail))?,
-        )
+        match normalize_cline_nested_server_entry(config)
+            .map_err(|detail| invalid_server_entry(path, source_name, name, detail))?
+        {
+            NormalizedClineServerEntry::Stdio {
+                config,
+                credentials_configured,
+            } => (Some(config), credentials_configured),
+            NormalizedClineServerEntry::Remote(remote) => {
+                return Ok(server_entry_from_remote(source_name, name, remote));
+            }
+        }
     } else {
-        None
+        let credentials_configured = (client_target == Some(InstallTarget::Cline))
+            .then(|| {
+                config
+                    .as_object()
+                    .and_then(|fields| fields.get("oauth"))
+                    .is_some_and(|oauth| !oauth.is_null())
+            })
+            .filter(|configured| *configured);
+        (None, credentials_configured)
     };
     let config = normalized.as_ref().unwrap_or(config);
 
-    if client_target.is_some_and(|target| {
-        config.as_object().is_some_and(|fields| {
-            fields.iter().any(|(field, value)| {
-                classify_client_server_field(target, field, value) == ClientServerFieldClass::Remote
-            })
-        })
-    }) {
-        return Err(invalid_server_entry(
-            path,
-            source_name,
-            name,
-            "remote MCP entries are not yet representable by fastmcp list",
-        ));
+    if let Some(remote) = normalize_flat_remote_entry(config, client_target)
+        .map_err(|detail| invalid_server_entry(path, source_name, name, detail))?
+    {
+        return Ok(server_entry_from_remote(source_name, name, remote));
     }
     if config
         .as_object()
@@ -3226,10 +3462,13 @@ fn parse_json_server_entry(
     Ok(ServerEntry {
         name: name.to_owned(),
         source: source_name.to_owned(),
+        transport: "stdio".to_owned(),
         command: mcp_config.command,
         args: mcp_config.args,
         env: mcp_config.env,
         cwd: mcp_config.cwd,
+        endpoint: None,
+        credentials_configured,
         enabled: !mcp_config.disabled,
     })
 }
@@ -3284,10 +3523,13 @@ fn parse_toml_server_entry(
     Ok(ServerEntry {
         name: name.to_owned(),
         source: source_name.to_owned(),
+        transport: "stdio".to_owned(),
         command: mcp_config.command,
         args: mcp_config.args,
         env: mcp_config.env,
         cwd: mcp_config.cwd,
+        endpoint: None,
+        credentials_configured: None,
         enabled: !mcp_config.disabled,
     })
 }
@@ -3373,6 +3615,7 @@ fn load_servers_from_client_config(
 fn load_servers_from_path(
     path: &Path,
     source_name: &str,
+    client_target: Option<InstallTarget>,
     servers: &mut Vec<ServerEntry>,
 ) -> McpResult<()> {
     let content = read_bounded_config(path, source_name)?;
@@ -3452,7 +3695,7 @@ fn load_servers_from_path(
                     "MCP server registry must be a JSON object",
                 )
             })?;
-            let parsed = parse_json_server_entries(path, source_name, map, None)?;
+            let parsed = parse_json_server_entries(path, source_name, map, client_target)?;
             servers.extend(parsed);
         }
     }
@@ -3465,7 +3708,7 @@ fn load_project_local_servers(servers: &mut Vec<ServerEntry>) {
     // Check for ./mcp.json
     let mcp_json = PathBuf::from("./mcp.json");
     if mcp_json.exists() {
-        if let Err(e) = load_servers_from_path(&mcp_json, "Project (mcp.json)", servers) {
+        if let Err(e) = load_servers_from_path(&mcp_json, "Project (mcp.json)", None, servers) {
             write_cli_warning(&format!(
                 "failed to load project config at {}: {e}",
                 sanitize_config_path(&mcp_json)
@@ -3476,7 +3719,7 @@ fn load_project_local_servers(servers: &mut Vec<ServerEntry>) {
     // Check for ./mcp.toml
     let mcp_toml = PathBuf::from("./mcp.toml");
     if mcp_toml.exists() {
-        if let Err(e) = load_servers_from_path(&mcp_toml, "Project (mcp.toml)", servers) {
+        if let Err(e) = load_servers_from_path(&mcp_toml, "Project (mcp.toml)", None, servers) {
             write_cli_warning(&format!(
                 "failed to load project config at {}: {e}",
                 sanitize_config_path(&mcp_toml)
@@ -3861,7 +4104,11 @@ async fn cmd_test(
     }
     results.push(init_result);
 
-    let capabilities = client.server_capabilities().clone();
+    // Read capabilities from the era the negotiation actually selected: a
+    // modern session advertises them in its `server/discover` result, while
+    // the legacy `server_capabilities()` model stays empty there.
+    let capabilities = stdio_inspect_capabilities(&client)?;
+    let advertised = |member: &str| capabilities.advertises(member).then_some(());
 
     let ping_result = run_test("ping", || {
         client.ping()?;
@@ -3873,20 +4120,17 @@ async fn cmd_test(
     results.push(ping_result);
 
     // Only invoke capability-specific methods the server advertised.
-    let tools_result = capabilities.tools.as_ref().map_or_else(
+    let tools_result = advertised("tools").map_or_else(
         || skipped_test("list_tools", "server did not advertise tools"),
         |_| {
             run_test("list_tools", || {
-                let page = client.list_tools_page(
-                    None,
-                    ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES),
-                )?;
-                let qualifier = if page.local_truncated || page.peer_has_more {
+                let (items, truncated) = inspect_tools_result(client.list_tools_typed(None)?)?;
+                let qualifier = if truncated {
                     " in the bounded first page; more were omitted"
                 } else {
                     ""
                 };
-                Ok(format!("{} tools{qualifier}", page.items.len()))
+                Ok(format!("{} tools{qualifier}", items.len()))
             })
         },
     );
@@ -3895,20 +4139,18 @@ async fn cmd_test(
     }
     results.push(tools_result);
 
-    let resources_result = capabilities.resources.as_ref().map_or_else(
+    let resources_result = advertised("resources").map_or_else(
         || skipped_test("list_resources", "server did not advertise resources"),
         |_| {
             run_test("list_resources", || {
-                let page = client.list_resources_page(
-                    None,
-                    ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES),
-                )?;
-                let qualifier = if page.local_truncated || page.peer_has_more {
+                let (items, truncated) =
+                    inspect_resources_result(client.list_resources_typed(None)?)?;
+                let qualifier = if truncated {
                     " in the bounded first page; more were omitted"
                 } else {
                     ""
                 };
-                Ok(format!("{} resources{qualifier}", page.items.len()))
+                Ok(format!("{} resources{qualifier}", items.len()))
             })
         },
     );
@@ -3919,20 +4161,17 @@ async fn cmd_test(
     }
     results.push(resources_result);
 
-    let prompts_result = capabilities.prompts.as_ref().map_or_else(
+    let prompts_result = advertised("prompts").map_or_else(
         || skipped_test("list_prompts", "server did not advertise prompts"),
         |_| {
             run_test("list_prompts", || {
-                let page = client.list_prompts_page(
-                    None,
-                    ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES),
-                )?;
-                let qualifier = if page.local_truncated || page.peer_has_more {
+                let (items, truncated) = inspect_prompts_result(client.list_prompts_typed(None)?)?;
+                let qualifier = if truncated {
                     " in the bounded first page; more were omitted"
                 } else {
                     ""
                 };
-                Ok(format!("{} prompts{qualifier}", page.items.len()))
+                Ok(format!("{} prompts{qualifier}", items.len()))
             })
         },
     );
@@ -5472,40 +5711,40 @@ async fn cmd_inspect(
         let server_info = client.server_info().clone();
         let capabilities = stdio_inspect_capabilities(&client)?;
 
-        // Acquire one bounded page per category. MCP's list requests have no item
+        // Acquire one typed page per category. MCP's list requests have no item
         // limit, so the transport may still receive one bounded protocol message,
-        // but inspect never follows cursors into the client's much larger default
-        // auto-pagination budget.
-        let limits = ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES);
+        // but inspect projects and bounds that page locally and never follows a
+        // peer cursor into the client's larger auto-pagination budget.
         let mut acquisition_truncated = false;
         let tools = if capabilities.advertises("tools") {
-            let page = client.list_tools_page(None, limits)?;
-            acquisition_truncated |= page.local_truncated || page.peer_has_more;
-            page.items
+            let (items, truncated) = inspect_tools_result(client.list_tools_typed(None)?)?;
+            acquisition_truncated |= truncated;
+            items
         } else {
             Vec::new()
         };
 
         let resources = if capabilities.advertises("resources") {
-            let page = client.list_resources_page(None, limits)?;
-            acquisition_truncated |= page.local_truncated || page.peer_has_more;
-            page.items
+            let (items, truncated) = inspect_resources_result(client.list_resources_typed(None)?)?;
+            acquisition_truncated |= truncated;
+            items
         } else {
             Vec::new()
         };
 
         let resource_templates = if capabilities.advertises("resources") {
-            let page = client.list_resource_templates_page(None, limits)?;
-            acquisition_truncated |= page.local_truncated || page.peer_has_more;
-            page.items
+            let (items, truncated) =
+                inspect_resource_templates_result(client.list_resource_templates_typed(None)?)?;
+            acquisition_truncated |= truncated;
+            items
         } else {
             Vec::new()
         };
 
         let prompts = if capabilities.advertises("prompts") {
-            let page = client.list_prompts_page(None, limits)?;
-            acquisition_truncated |= page.local_truncated || page.peer_has_more;
-            page.items
+            let (items, truncated) = inspect_prompts_result(client.list_prompts_typed(None)?)?;
+            acquisition_truncated |= truncated;
+            items
         } else {
             Vec::new()
         };
@@ -5845,14 +6084,14 @@ async fn http_inspect_catalogs(
     let mut acquisition_truncated = false;
     let tools = if capabilities.advertises("tools") {
         let (items, truncated) =
-            http_inspect_tools_result(http_inspect_core_request(cx, client, "tools/list").await?)?;
+            inspect_tools_result(http_inspect_core_request(cx, client, "tools/list").await?)?;
         acquisition_truncated |= truncated;
         items
     } else {
         Vec::new()
     };
     let resources = if capabilities.advertises("resources") {
-        let (items, truncated) = http_inspect_resources_result(
+        let (items, truncated) = inspect_resources_result(
             http_inspect_core_request(cx, client, "resources/list").await?,
         )?;
         acquisition_truncated |= truncated;
@@ -5861,7 +6100,7 @@ async fn http_inspect_catalogs(
         Vec::new()
     };
     let resource_templates = if capabilities.advertises("resources") {
-        let (items, truncated) = http_inspect_resource_templates_result(
+        let (items, truncated) = inspect_resource_templates_result(
             http_inspect_core_request(cx, client, "resources/templates/list").await?,
         )?;
         acquisition_truncated |= truncated;
@@ -5870,9 +6109,8 @@ async fn http_inspect_catalogs(
         Vec::new()
     };
     let prompts = if capabilities.advertises("prompts") {
-        let (items, truncated) = http_inspect_prompts_result(
-            http_inspect_core_request(cx, client, "prompts/list").await?,
-        )?;
+        let (items, truncated) =
+            inspect_prompts_result(http_inspect_core_request(cx, client, "prompts/list").await?)?;
         acquisition_truncated |= truncated;
         items
     } else {
@@ -5902,108 +6140,248 @@ async fn http_inspect_core_request(
         })
 }
 
-fn http_inspect_tools_result(
+fn inspect_tools_result(
     result: fastmcp_client::CoreResult,
 ) -> McpResult<(Vec<fastmcp_protocol::Tool>, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ToolsList(result)) => {
-            Ok((result.tools, result.next_cursor.is_some()))
+            bound_inspect_items(result.tools, result.next_cursor.is_some(), "tools/list")
         }
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
             result,
             ..
-        }) => Ok((
-            project_final_for_inspect(result.payload.tools, "tools/list")?,
-            result.payload.next_cursor.is_some(),
-        )),
-        _ => Err(unexpected_http_inspect_result("tools/list")),
+        }) => {
+            let fastmcp_protocol::FinalListToolsResult {
+                tools, next_cursor, ..
+            } = result.payload;
+            bound_inspect_items(
+                tools.into_iter().map(inspect_tool_from_final).collect(),
+                next_cursor.is_some(),
+                "tools/list",
+            )
+        }
+        _ => Err(unexpected_inspect_result("tools/list")),
     }
 }
 
-fn http_inspect_resources_result(
+fn inspect_resources_result(
     result: fastmcp_client::CoreResult,
 ) -> McpResult<(Vec<fastmcp_protocol::Resource>, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ResourcesList(
             result,
-        )) => Ok((result.resources, result.next_cursor.is_some())),
+        )) => bound_inspect_items(
+            result.resources,
+            result.next_cursor.is_some(),
+            "resources/list",
+        ),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
             result,
             ..
-        }) => Ok((
-            project_final_for_inspect(result.payload.resources, "resources/list")?,
-            result.payload.next_cursor.is_some(),
-        )),
-        _ => Err(unexpected_http_inspect_result("resources/list")),
+        }) => {
+            let fastmcp_protocol::FinalListResourcesResult {
+                resources,
+                next_cursor,
+                ..
+            } = result.payload;
+            bound_inspect_items(
+                resources
+                    .into_iter()
+                    .map(inspect_resource_from_final)
+                    .collect(),
+                next_cursor.is_some(),
+                "resources/list",
+            )
+        }
+        _ => Err(unexpected_inspect_result("resources/list")),
     }
 }
 
-fn http_inspect_resource_templates_result(
+fn inspect_resource_templates_result(
     result: fastmcp_client::CoreResult,
 ) -> McpResult<(Vec<fastmcp_protocol::ResourceTemplate>, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(
             fastmcp_client::LegacyCoreResult::ResourceTemplatesList(result),
-        ) => Ok((result.resource_templates, result.next_cursor.is_some())),
+        ) => bound_inspect_items(
+            result.resource_templates,
+            result.next_cursor.is_some(),
+            "resources/templates/list",
+        ),
         fastmcp_client::CoreResult::Final(
             fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
-        ) => Ok((
-            project_final_for_inspect(
-                result.payload.resource_templates,
+        ) => {
+            let fastmcp_protocol::FinalListResourceTemplatesResult {
+                resource_templates,
+                next_cursor,
+                ..
+            } = result.payload;
+            bound_inspect_items(
+                resource_templates
+                    .into_iter()
+                    .map(inspect_resource_template_from_final)
+                    .collect(),
+                next_cursor.is_some(),
                 "resources/templates/list",
-            )?,
-            result.payload.next_cursor.is_some(),
-        )),
-        _ => Err(unexpected_http_inspect_result("resources/templates/list")),
+            )
+        }
+        _ => Err(unexpected_inspect_result("resources/templates/list")),
     }
 }
 
-fn http_inspect_prompts_result(
+fn inspect_prompts_result(
     result: fastmcp_client::CoreResult,
 ) -> McpResult<(Vec<fastmcp_protocol::Prompt>, bool)> {
     match result {
         #[cfg(feature = "legacy-2024-11-05")]
         fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::PromptsList(
             result,
-        )) => Ok((result.prompts, result.next_cursor.is_some())),
+        )) => bound_inspect_items(result.prompts, result.next_cursor.is_some(), "prompts/list"),
         fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
             result,
             ..
-        }) => Ok((
-            project_final_for_inspect(result.payload.prompts, "prompts/list")?,
-            result.payload.next_cursor.is_some(),
-        )),
-        _ => Err(unexpected_http_inspect_result("prompts/list")),
+        }) => {
+            let fastmcp_protocol::FinalListPromptsResult {
+                prompts,
+                next_cursor,
+                ..
+            } = result.payload;
+            bound_inspect_items(
+                prompts.into_iter().map(inspect_prompt_from_final).collect(),
+                next_cursor.is_some(),
+                "prompts/list",
+            )
+        }
+        _ => Err(unexpected_inspect_result("prompts/list")),
     }
 }
 
-fn unexpected_http_inspect_result(method: &str) -> fastmcp_core::McpError {
+fn unexpected_inspect_result(method: &str) -> fastmcp_core::McpError {
     fastmcp_core::McpError::internal_error(format!(
-        "HTTP inspect received an unexpected selected-era result for {method}",
+        "inspect received an unexpected selected-era result for {method}",
     ))
 }
 
-/// Projects typed final catalog items into the inspect catalog display model.
-/// Final discovery capabilities never pass through this helper: inspect retains
-/// and renders their complete final capability object separately.
-fn project_final_for_inspect<T, U>(value: T, source: &str) -> McpResult<U>
-where
-    T: Serialize,
-    U: DeserializeOwned,
-{
-    let value = serde_json::to_value(value).map_err(|error| {
-        fastmcp_core::McpError::internal_error(format!(
-            "inspect could not serialize typed final {source} data: {error}"
-        ))
-    })?;
-    serde_json::from_value(value).map_err(|error| {
-        fastmcp_core::McpError::internal_error(format!(
-            "inspect could not render typed final {source} data: {error}"
-        ))
+/// Bounds one already-decoded, single peer page before it reaches an inspect
+/// renderer. The byte count is the exact compact JSON array spelling,
+/// including brackets and commas, so final-era projection cannot bypass the
+/// same output budget applied to legacy pages.
+fn bound_inspect_items<T: Serialize>(
+    items: Vec<T>,
+    peer_has_more: bool,
+    source: &str,
+) -> McpResult<(Vec<T>, bool)> {
+    let total_items = items.len();
+    let mut rendered_bytes = 2usize;
+    let mut bounded = Vec::with_capacity(total_items.min(CLI_OUTPUT_MAX_ITEMS));
+
+    for item in items {
+        if bounded.len() == CLI_OUTPUT_MAX_ITEMS {
+            break;
+        }
+        let item_bytes = serde_json::to_vec(&item).map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "inspect could not size typed {source} data: {error}"
+            ))
+        })?;
+        let separator_bytes = usize::from(!bounded.is_empty());
+        let Some(next_bytes) = rendered_bytes
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(item_bytes.len()))
+        else {
+            break;
+        };
+        if next_bytes > INSPECT_CATEGORY_MAX_BYTES {
+            break;
+        }
+        rendered_bytes = next_bytes;
+        bounded.push(item);
+    }
+
+    let truncated = peer_has_more || bounded.len() < total_items;
+    Ok((bounded, truncated))
+}
+
+fn inspect_icon_from_final(
+    icons: Option<Vec<fastmcp_protocol::RawIcon>>,
+) -> Option<fastmcp_protocol::Icon> {
+    let icon = icons?.into_iter().next()?;
+    Some(fastmcp_protocol::Icon {
+        src: Some(icon.src.as_str().to_owned()),
+        mime_type: icon.mime_type,
+        sizes: icon.sizes.map(|sizes| sizes.join(" ")),
     })
+}
+
+fn inspect_tool_from_final(tool: fastmcp_protocol::FinalTool) -> fastmcp_protocol::Tool {
+    fastmcp_protocol::Tool {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        output_schema: tool.output_schema,
+        icon: inspect_icon_from_final(tool.icons),
+        version: None,
+        tags: Vec::new(),
+        annotations: tool
+            .annotations
+            .map(|annotations| fastmcp_protocol::ToolAnnotations {
+                destructive: annotations.destructive,
+                idempotent: annotations.idempotent,
+                read_only: annotations.read_only,
+                open_world_hint: annotations.open_world_hint,
+            }),
+    }
+}
+
+fn inspect_resource_from_final(
+    resource: fastmcp_protocol::FinalResource,
+) -> fastmcp_protocol::Resource {
+    fastmcp_protocol::Resource {
+        uri: resource.uri.as_str().to_owned(),
+        name: resource.name,
+        description: resource.description,
+        mime_type: resource.mime_type,
+        icon: inspect_icon_from_final(resource.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn inspect_resource_template_from_final(
+    template: fastmcp_protocol::FinalResourceTemplate,
+) -> fastmcp_protocol::ResourceTemplate {
+    fastmcp_protocol::ResourceTemplate {
+        uri_template: template.uri_template,
+        name: template.name,
+        description: template.description,
+        mime_type: template.mime_type,
+        icon: inspect_icon_from_final(template.icons),
+        version: None,
+        tags: Vec::new(),
+    }
+}
+
+fn inspect_prompt_from_final(prompt: fastmcp_protocol::FinalPrompt) -> fastmcp_protocol::Prompt {
+    fastmcp_protocol::Prompt {
+        name: prompt.name,
+        description: prompt.description,
+        arguments: prompt
+            .arguments
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| fastmcp_protocol::PromptArgument {
+                name: argument.name,
+                description: argument.description,
+                required: argument.required.unwrap_or(false),
+            })
+            .collect(),
+        icon: inspect_icon_from_final(prompt.icons),
+        version: None,
+        tags: Vec::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12122,11 +12500,281 @@ mod tests {
             ] {
                 let error = parse_json_server_entry(path, "client", "server", &value, Some(target))
                     .expect_err("unsupported or malformed target fields must be rejected");
-                assert!(
-                    error.message.contains("schema validation failed")
-                        || error.message.contains("not yet representable")
-                );
+                assert!(error.message.contains("schema validation failed"));
             }
+        }
+
+        #[test]
+        fn remote_list_entries_are_typed_bounded_and_credential_safe() {
+            const USERINFO_SECRET: &str = "userinfo-secret";
+            const PATH_SECRET: &str = "path-secret";
+            const QUERY_SECRET: &str = "query-secret";
+            const FRAGMENT_SECRET: &str = "fragment-secret";
+            const HEADER_SECRET: &str = "header-secret";
+            const OAUTH_SECRET: &str = "oauth-secret";
+            let path = Path::new("config.json");
+
+            let flat = serde_json::json!({
+                "type": "http",
+                "url": format!(
+                    "https://user:{USERINFO_SECRET}@api.example.test/{PATH_SECRET}?token={QUERY_SECRET}#{FRAGMENT_SECRET}"
+                ),
+                "headers": {"Authorization": format!("Bearer {HEADER_SECRET}")},
+                "auth": {"token": OAUTH_SECRET},
+                "disabled": true,
+            });
+            let parsed = parse_json_server_entry(
+                path,
+                "Claude",
+                "remote",
+                &flat,
+                Some(InstallTarget::Claude),
+            )
+            .expect("documented flat remote entry");
+            assert_eq!(parsed.transport, "streamable-http");
+            assert_eq!(
+                parsed.endpoint.as_deref(),
+                Some("https://api.example.test/<redacted-route>")
+            );
+            assert_eq!(parsed.credentials_configured, Some(true));
+            assert!(parsed.command.is_empty());
+            assert!(!parsed.enabled);
+
+            let bounded = bounded_server_entries(std::slice::from_ref(&parsed));
+            assert!(bounded.mutation.redacted);
+            let rendered = serde_json::to_string(&bounded).expect("serialize bounded remote list");
+            for secret in [
+                USERINFO_SECRET,
+                PATH_SECRET,
+                QUERY_SECRET,
+                FRAGMENT_SECRET,
+                HEADER_SECRET,
+                OAUTH_SECRET,
+                "Authorization",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+            assert!(rendered.contains("streamable-http"));
+            assert!(rendered.contains("https://api.example.test/<redacted-route>"));
+
+            let credentialed_root = serde_json::json!({
+                "type": "sse",
+                "url": "https://root.example.test/",
+                "headers": {"Authorization": format!("Bearer {HEADER_SECRET}")},
+            });
+            let credentialed_root = parse_json_server_entry(
+                path,
+                "Claude",
+                "credentialed-root",
+                &credentialed_root,
+                Some(InstallTarget::Claude),
+            )
+            .expect("credentialed root endpoint");
+            assert_eq!(
+                credentialed_root.endpoint.as_deref(),
+                Some("https://root.example.test/")
+            );
+            assert_eq!(credentialed_root.credentials_configured, Some(true));
+            assert!(
+                bounded_server_entries(&[credentialed_root])
+                    .mutation
+                    .redacted,
+                "omitting configured credentials is a reported redaction even when the endpoint route itself is unchanged"
+            );
+
+            let cursor_url_only = serde_json::json!({
+                "url": format!("https://user:{USERINFO_SECRET}@cursor.example.test/"),
+            });
+            let parsed = parse_json_server_entry(
+                path,
+                "Cursor",
+                "remote",
+                &cursor_url_only,
+                Some(InstallTarget::Cursor),
+            )
+            .expect("documented Cursor URL-only remote entry");
+            assert_eq!(parsed.transport, "streamable-http");
+            assert_eq!(
+                parsed.endpoint.as_deref(),
+                Some("https://cursor.example.test/<redacted-route>")
+            );
+            assert_eq!(
+                parsed.credentials_configured,
+                Some(true),
+                "URL userinfo alone is configured credential material"
+            );
+
+            let claude_alias = serde_json::json!({
+                "type": "streamable-http",
+                "url": "https://claude.example.test/mcp",
+            });
+            let parsed = parse_json_server_entry(
+                path,
+                "Claude",
+                "remote",
+                &claude_alias,
+                Some(InstallTarget::Claude),
+            )
+            .expect("documented Claude streamable-http alias");
+            assert_eq!(parsed.transport, "streamable-http");
+
+            let nested = serde_json::json!({
+                "transport": {
+                    "type": "streamableHttp",
+                    "url": "https://cline.example.test/mcp",
+                    "headers": {"X-Api-Key": HEADER_SECRET},
+                },
+                "oauth": {"accessToken": OAUTH_SECRET},
+                "metadata": {"owner": "test"},
+            });
+            let parsed = parse_json_server_entry(
+                path,
+                "Cline",
+                "remote",
+                &nested,
+                Some(InstallTarget::Cline),
+            )
+            .expect("current nested Cline remote entry");
+            assert_eq!(parsed.transport, "streamable-http");
+            assert_eq!(
+                parsed.endpoint.as_deref(),
+                Some("https://cline.example.test/<redacted-route>")
+            );
+            assert_eq!(parsed.credentials_configured, Some(true));
+
+            let mut nested_sse = nested;
+            nested_sse["transport"]["type"] = serde_json::json!("sse");
+            let parsed = parse_json_server_entry(
+                path,
+                "Cline",
+                "remote-sse",
+                &nested_sse,
+                Some(InstallTarget::Cline),
+            )
+            .expect("current nested Cline SSE entry");
+            assert_eq!(parsed.transport, "sse");
+        }
+
+        #[test]
+        fn remote_list_entry_negative_differs_only_in_forbidden_dimension() {
+            const SECRET: &str = "REMOTE_NEGATIVE_SECRET_MUST_NOT_LEAK";
+            let path = Path::new("config.json");
+            let accepted = serde_json::json!({
+                "type": "sse",
+                "url": "https://remote.example.test/sse",
+                "headers": {"X-Test": "safe"},
+            });
+            parse_json_server_entry(
+                path,
+                "Cursor",
+                "remote",
+                &accepted,
+                Some(InstallTarget::Cursor),
+            )
+            .expect("baseline remote entry");
+
+            let mut invalid_scheme = accepted.clone();
+            invalid_scheme["url"] = serde_json::json!("ftp://remote.example.test/sse");
+            let mut malformed_url = accepted.clone();
+            malformed_url["url"] = serde_json::json!("https://remote.example.test/%zz");
+            let mut non_string_header = accepted.clone();
+            non_string_header["headers"]["X-Test"] = serde_json::json!([SECRET]);
+            let mut conflicting_local_field = accepted.clone();
+            conflicting_local_field["command"] = serde_json::json!(SECRET);
+            let mut unsupported_transport = accepted.clone();
+            unsupported_transport["type"] = serde_json::json!("ws");
+            let mut target_foreign_transport_field = accepted.clone();
+            target_foreign_transport_field
+                .as_object_mut()
+                .expect("accepted fixture object")
+                .remove("type");
+            target_foreign_transport_field["transportType"] = serde_json::json!("sse");
+            let mut unknown_field = accepted.clone();
+            unknown_field["credentialTypo"] = serde_json::json!(SECRET);
+            let mut malformed_auth = accepted.clone();
+            malformed_auth["auth"] = serde_json::json!([SECRET]);
+            let mut malformed_oauth = accepted.clone();
+            malformed_oauth["oauth"] = serde_json::json!(SECRET);
+            let rejected = [
+                invalid_scheme,
+                malformed_url,
+                non_string_header,
+                conflicting_local_field,
+                unsupported_transport,
+                target_foreign_transport_field,
+                unknown_field,
+                malformed_auth,
+                malformed_oauth,
+            ];
+            for value in rejected {
+                let error = parse_json_server_entry(
+                    path,
+                    "Cursor",
+                    "remote",
+                    &value,
+                    Some(InstallTarget::Cursor),
+                )
+                .expect_err("forbidden remote dimension must fail closed");
+                assert!(error.message.contains("schema validation failed"));
+                assert!(!error.message.contains(SECRET));
+            }
+
+            let oversized_headers = (0..=CLI_OUTPUT_MAX_ITEMS)
+                .map(|index| (format!("X-{index}"), serde_json::json!("value")))
+                .collect::<serde_json::Map<_, _>>();
+            let oversized = serde_json::json!({
+                "type": "sse",
+                "url": "https://remote.example.test/sse",
+                "headers": oversized_headers,
+            });
+            parse_json_server_entry(
+                path,
+                "Cursor",
+                "remote",
+                &oversized,
+                Some(InstallTarget::Cursor),
+            )
+            .expect_err("oversized remote header map");
+
+            let mut oversized_url = accepted.clone();
+            oversized_url["url"] = serde_json::json!(format!(
+                "https://remote.example.test/{}",
+                "x".repeat(fastmcp_core::DEFAULT_CANONICAL_URL_MAX_BYTES)
+            ));
+            parse_json_server_entry(
+                path,
+                "Cursor",
+                "remote",
+                &oversized_url,
+                Some(InstallTarget::Cursor),
+            )
+            .expect_err("oversized remote URL");
+
+            let nested = serde_json::json!({
+                "transport": {
+                    "type": "streamableHttp",
+                    "url": "https://remote.example.test/mcp",
+                },
+            });
+            let mut foreign_nested_alias = nested;
+            foreign_nested_alias["transport"]["type"] = serde_json::json!("http");
+            parse_json_server_entry(
+                path,
+                "Cline",
+                "remote",
+                &foreign_nested_alias,
+                Some(InstallTarget::Cline),
+            )
+            .expect_err("Cline nested transport requires its documented discriminator");
+
+            parse_json_server_entry(
+                path,
+                "Cursor",
+                "remote",
+                &accepted,
+                Some(InstallTarget::Cursor),
+            )
+            .expect("rejection must not mutate pristine accepted input");
         }
 
         #[test]
@@ -12164,6 +12812,39 @@ mod tests {
                 Some(&"test".to_owned())
             );
             assert!(!parsed.enabled);
+            assert_eq!(parsed.credentials_configured, Some(true));
+
+            let mut null_oauth = entry.clone();
+            null_oauth["oauth"] = serde_json::Value::Null;
+            let parsed_without_oauth = parse_json_server_entry(
+                path,
+                "Cline",
+                "server",
+                &null_oauth,
+                Some(InstallTarget::Cline),
+            )
+            .expect("null Cline OAuth state is not configured credentials");
+            assert_eq!(parsed_without_oauth.credentials_configured, None);
+
+            let flat = serde_json::json!({
+                "command": "server",
+                "oauth": {"accessToken": SECRET},
+            });
+            let parsed_flat =
+                parse_json_server_entry(path, "Cline", "server", &flat, Some(InstallTarget::Cline))
+                    .expect("valid flat Cline stdio entry");
+            assert_eq!(parsed_flat.credentials_configured, Some(true));
+            let mut flat_null_oauth = flat;
+            flat_null_oauth["oauth"] = serde_json::Value::Null;
+            let parsed_flat_without_oauth = parse_json_server_entry(
+                path,
+                "Cline",
+                "server",
+                &flat_null_oauth,
+                Some(InstallTarget::Cline),
+            )
+            .expect("null flat Cline OAuth state is not configured credentials");
+            assert_eq!(parsed_flat_without_oauth.credentials_configured, None);
 
             for malformed in [
                 serde_json::json!({
@@ -12352,6 +13033,7 @@ mod tests {
             let entry = ServerEntry {
                 name: "test-server".to_string(),
                 source: "Claude".to_string(),
+                transport: "stdio".to_owned(),
                 command: "/path/to/server".to_string(),
                 args: vec!["--config".to_string(), "config.json".to_string()],
                 env: Some(HashMap::from([
@@ -12359,6 +13041,8 @@ mod tests {
                     ("A_KEY".to_string(), "another-secret".to_string()),
                 ])),
                 cwd: Some("/srv/test-server".to_owned()),
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             };
 
@@ -12501,10 +13185,13 @@ mod tests {
             let entry = ServerEntry {
                 name: "test".to_string(),
                 source: "Test".to_string(),
+                transport: "stdio".to_owned(),
                 command: "cmd".to_string(),
                 args: arguments,
                 env: None,
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             };
             let json = serde_json::to_value(&entry).unwrap();
@@ -12564,10 +13251,13 @@ mod tests {
             let entry = ServerEntry {
                 name: "test".to_owned(),
                 source: "Test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "cmd".to_owned(),
                 args: Vec::new(),
                 env: Some(environment),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             };
             let json = serde_json::to_string(&entry).unwrap();
@@ -12823,10 +13513,13 @@ mod tests {
             let entries = std::iter::repeat_with(|| ServerEntry {
                 name: "[server]\u{1b}[31m".to_owned(),
                 source: "source".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "token=LIST_BOUND_SECRET_CANARY".to_owned(),
                 args: vec![SECRET.repeat(4)],
                 env: Some(HashMap::from([("API_TOKEN".to_owned(), SECRET.repeat(4))])),
                 cwd: Some(format!("token={SECRET}\nworking")),
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             })
             .take(CLI_OUTPUT_MAX_ITEMS + 3)
@@ -12851,10 +13544,13 @@ mod tests {
             let output = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([("\n".to_owned(), "secret".to_owned())])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
             let json = serde_json::to_string(&output).unwrap();
@@ -12871,10 +13567,13 @@ mod tests {
             let output = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([(exact_key.clone(), "secret".to_owned())])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
 
@@ -12891,6 +13590,7 @@ mod tests {
             let output = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([(
@@ -12898,6 +13598,8 @@ mod tests {
                     "value-secret".to_owned(),
                 )])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
             let serialized = serde_json::to_string(&output).unwrap();
@@ -12920,10 +13622,13 @@ mod tests {
             let make_entry = |environment| ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(environment),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             };
 
@@ -12943,10 +13648,13 @@ mod tests {
             let oversized = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([(oversized_key, "secret".to_owned())])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
             let rendered_key = oversized.servers[0]
@@ -12963,6 +13671,7 @@ mod tests {
             let colliding = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
                 env: Some(HashMap::from([
@@ -12970,6 +13679,8 @@ mod tests {
                     ("token=SECOND_SECRET".to_owned(), "second".to_owned()),
                 ])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
             let environment = colliding.servers[0].env.as_ref().unwrap();
@@ -12987,6 +13698,7 @@ mod tests {
             let output = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
+                transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: vec!["argument".to_owned(); CLI_OUTPUT_MAX_ITEMS - 1],
                 env: Some(HashMap::from([
@@ -12994,6 +13706,8 @@ mod tests {
                     ("B".to_owned(), "second".to_owned()),
                 ])),
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: true,
             }]);
 
@@ -13122,10 +13836,13 @@ mod tests {
             let entry = ServerEntry {
                 name: "test".to_string(),
                 source: "Test".to_string(),
+                transport: "stdio".to_owned(),
                 command: "cmd".to_string(),
                 args: vec![],
                 env: None,
                 cwd: None,
+                endpoint: None,
+                credentials_configured: None,
                 enabled: false,
             };
 
@@ -13141,19 +13858,25 @@ mod tests {
                     BoundedServerEntry {
                         name: "server1".to_string(),
                         source: "Claude".to_string(),
+                        transport: "stdio".to_owned(),
                         command: "cmd1".to_string(),
                         args: vec![],
                         env: None,
                         cwd: Some("/srv/server1".to_owned()),
+                        endpoint: None,
+                        credentials_configured: None,
                         enabled: true,
                     },
                     BoundedServerEntry {
                         name: "server2".to_string(),
                         source: "Cursor".to_string(),
+                        transport: "stdio".to_owned(),
                         command: "cmd2".to_string(),
                         args: vec!["arg1".to_string()],
                         env: None,
                         cwd: None,
+                        endpoint: None,
+                        credentials_configured: None,
                         enabled: false,
                     },
                 ],
@@ -13458,6 +14181,65 @@ mod tests {
                 version: None,
                 tags: vec![],
             }
+        }
+
+        #[test]
+        fn final_tool_projection_is_cli_local_and_preserves_displayable_fields() {
+            let icon = fastmcp_protocol::RawIcon::try_with_details(
+                "https://example.test/tool.png",
+                Some("image/png".to_owned()),
+                Some(vec!["16x16".to_owned(), "32x32".to_owned()]),
+                Some(fastmcp_protocol::IconTheme::Dark),
+            )
+            .expect("valid final icon");
+            let projected = inspect_tool_from_final(fastmcp_protocol::FinalTool {
+                name: "echo".to_owned(),
+                title: Some("Echo".to_owned()),
+                description: Some("Echo input".to_owned()),
+                icons: Some(vec![icon]),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: Some(serde_json::json!({"type": "object"})),
+                annotations: Some(fastmcp_protocol::FinalToolAnnotations {
+                    title: Some("Display title".to_owned()),
+                    destructive: Some(false),
+                    idempotent: Some(true),
+                    read_only: Some(true),
+                    open_world_hint: Some(false),
+                }),
+                meta: None,
+            });
+
+            assert_eq!(projected.name, "echo");
+            assert_eq!(projected.description.as_deref(), Some("Echo input"));
+            assert!(projected.output_schema.is_some());
+            let icon = projected.icon.expect("first icon is displayable");
+            assert_eq!(icon.src.as_deref(), Some("https://example.test/tool.png"));
+            assert_eq!(icon.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(icon.sizes.as_deref(), Some("16x16 32x32"));
+            let annotations = projected.annotations.expect("behavioral hints survive");
+            assert_eq!(annotations.read_only, Some(true));
+            assert_eq!(annotations.idempotent, Some(true));
+        }
+
+        #[test]
+        fn absent_final_icon_cannot_invent_a_legacy_display_icon() {
+            assert!(inspect_icon_from_final(None).is_none());
+            assert!(inspect_icon_from_final(Some(Vec::new())).is_none());
+        }
+
+        #[test]
+        fn inspect_page_byte_boundary_accepts_exact_fit_and_rejects_one_extra_byte() {
+            let exact = "x".repeat(INSPECT_CATEGORY_MAX_BYTES - 4);
+            let (items, truncated) =
+                bound_inspect_items(vec![exact], false, "test/list").expect("exact fit");
+            assert_eq!(items.len(), 1);
+            assert!(!truncated);
+
+            let oversized = "x".repeat(INSPECT_CATEGORY_MAX_BYTES - 3);
+            let (items, truncated) = bound_inspect_items(vec![oversized], false, "test/list")
+                .expect("oversized item is omitted without losing the process");
+            assert!(items.is_empty());
+            assert!(truncated);
         }
 
         #[test]

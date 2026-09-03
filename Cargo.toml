@@ -23,6 +23,12 @@ repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
 homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
 readme = "README.md"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 # Runtime (our own). Library surfaces accept caller-owned contexts; process
 # owners install an ambient context only at their top-level runtime boundary.

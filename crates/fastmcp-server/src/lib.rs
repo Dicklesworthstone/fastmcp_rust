@@ -575,6 +575,13 @@ const MAX_DISPATCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exhausted";
 const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
 const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not enabled";
+/// Typed refusal for a modern (discovery-era) request on a `LegacyOnly`
+/// endpoint. Plan §1.7: a `LegacyOnly` endpoint exposes no modern method, so
+/// the JSON-RPC class is `-32601` (method not found), the same admitted
+/// legacy-refusal signal the Auto stdio client uses to fall back to the
+/// exact 2024-11-05 lifecycle. `-32600` stays reserved for a genuine
+/// mid-connection era mismatch on an already negotiated connection.
+const LEGACY_ONLY_MODERN_MESSAGE: &str = "Discovery-based MCP is not enabled";
 const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2299,6 +2306,116 @@ fn protocol_era_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     })
 }
 
+/// `-32601` refusal for a modern request that reaches a `LegacyOnly` policy.
+fn legacy_only_modern_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    request.id.clone().map(|id| {
+        JsonRpcResponse::error(
+            Some(id),
+            JsonRpcError {
+                code: (-32601).into(),
+                message: LEGACY_ONLY_MODERN_MESSAGE.to_owned(),
+                data: Some(serde_json::json!({ "supported": [LEGACY_PROTOCOL_VERSION] })),
+            },
+        )
+    })
+}
+
+/// Selects the refusal shape for a request that failed era admission:
+/// a modern request under `LegacyOnly` is a method-not-found style typed
+/// refusal, every other mismatch is the negotiated-era `-32600` refusal.
+fn era_admission_refusal(
+    policy: ProtocolPolicy,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    if matches!(policy, ProtocolPolicy::LegacyOnly) && modern_protocol_version(request).is_some() {
+        return legacy_only_modern_refusal(request);
+    }
+    protocol_era_refusal(request)
+}
+
+#[cfg(test)]
+mod era_admission_refusal_tests {
+    use super::*;
+
+    fn modern_discover() -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "server/discover",
+            Some(serde_json::json!({
+                "_meta": {
+                    fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                }
+            })),
+            7,
+        )
+    }
+
+    fn legacy_initialize() -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "1"},
+            })),
+            7,
+        )
+    }
+
+    fn refusal(policy: ProtocolPolicy, request: &JsonRpcRequest) -> JsonRpcError {
+        era_admission_refusal(policy, request)
+            .expect("an id-bearing request receives a refusal response")
+            .error
+            .expect("the refusal is a JSON-RPC error")
+    }
+
+    /// Positive: a modern probe against `LegacyOnly` is the typed `-32601`
+    /// signal the Auto stdio client admits as a legacy refusal.
+    #[test]
+    fn legacy_only_refuses_a_modern_probe_with_method_not_found() {
+        let error = refusal(ProtocolPolicy::LegacyOnly, &modern_discover());
+        assert_eq!(error.code, fastmcp_protocol::JsonInteger::from(-32601));
+        assert_eq!(error.message, LEGACY_ONLY_MODERN_MESSAGE);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({ "supported": [LEGACY_PROTOCOL_VERSION] }))
+        );
+    }
+
+    /// Planted negative (policy differs): the same probe on an Auto
+    /// connection that already failed era admission keeps the negotiated-era
+    /// `-32600` refusal.
+    #[test]
+    fn auto_keeps_the_negotiated_era_refusal_for_a_modern_probe() {
+        let error = refusal(ProtocolPolicy::Auto, &modern_discover());
+        assert_eq!(error.code, fastmcp_protocol::JsonInteger::from(-32600));
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "supported": [MODERN_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+            }))
+        );
+    }
+
+    /// Planted negative (request differs): a legacy-shaped request that
+    /// fails admission under `LegacyOnly` is not a modern method and keeps
+    /// the `-32600` refusal.
+    #[test]
+    fn legacy_only_keeps_the_negotiated_era_refusal_for_a_legacy_request() {
+        let error = refusal(ProtocolPolicy::LegacyOnly, &legacy_initialize());
+        assert_eq!(error.code, fastmcp_protocol::JsonInteger::from(-32600));
+        assert_ne!(error.message, LEGACY_ONLY_MODERN_MESSAGE);
+    }
+
+    /// A notification (no id) never receives a refusal response.
+    #[test]
+    fn notifications_receive_no_refusal_response() {
+        let mut request = modern_discover();
+        request.id = None;
+        assert!(era_admission_refusal(ProtocolPolicy::LegacyOnly, &request).is_none());
+    }
+}
+
 fn is_quarantined_task_rpc(method: &str) -> bool {
     // Legacy 2024-era names. Official MCP 2026-07-28 Tasks methods are
     // tasks/get, tasks/update, and tasks/cancel and are served when
@@ -2530,11 +2647,14 @@ impl DispatchQueueState {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.reserved.remove(&key);
+        let removed = inner.reserved.remove(&key);
         inner.peer_cancellation_protected.remove(&key);
         inner.admitted_cancellations.remove(&key);
         inner.dispatching.remove(&key);
         inner.cancelled.remove(&key);
+        if removed && inner.reserved.is_empty() {
+            self.drained.notify_all();
+        }
     }
 
     fn admitted_request_cancellation(&self, id: &RequestId) -> Option<McpRequestCancellation> {
@@ -2671,6 +2791,23 @@ impl DispatchQueueState {
             .wait_timeout_while(inner, timeout, |inner| inner.modern_in_flight != 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.modern_in_flight == 0
+    }
+
+    /// Waits for every admitted id-bearing request to finish its terminal
+    /// response attempt. This spans modern children and the exact-2024
+    /// adapter; `reserved` is retained from queue admission through the send
+    /// attempt, so an ingress EOF cannot strand a reply by stopping the shared
+    /// dispatch worker too early.
+    fn wait_for_correlated_response_drain(&self, timeout: Duration) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (inner, _) = self
+            .drained
+            .wait_timeout_while(inner, timeout, |inner| !inner.reserved.is_empty())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.reserved.is_empty()
     }
 
     fn wait_for_modern_drain_unbounded(&self) {
@@ -13907,7 +14044,7 @@ impl Server {
         if matches!(policy, ProtocolPolicy::LegacyOnly)
             && modern_protocol_version(request).is_some()
         {
-            return protocol_era_refusal(request);
+            return legacy_only_modern_refusal(request);
         }
         if matches!(policy, ProtocolPolicy::ModernOnly)
             && modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION)
@@ -15834,7 +15971,7 @@ impl Server {
             StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         let mut negotiated_era = None;
         let mut exit_code = 0;
-        let mut drain_modern_before_stop = false;
+        let mut drain_correlated_before_stop = false;
         'receive: loop {
             if worker_failed.load(Ordering::Acquire)
                 || connection_failure
@@ -15853,10 +15990,10 @@ impl Server {
                 Err(TransportError::Closed) => {
                     // A full-duplex peer may half-close ingress while the
                     // independently owned egress remains writable. Give
-                    // already-admitted modern children a bounded opportunity
-                    // to finish their response commit before shutdown
-                    // cancellation begins.
-                    drain_modern_before_stop = true;
+                    // every already-admitted id-bearing request a bounded
+                    // opportunity to finish its response commit before
+                    // shutdown cancellation begins, regardless of era.
+                    drain_correlated_before_stop = true;
                     break;
                 }
                 Err(TransportError::Cancelled) => break,
@@ -15924,7 +16061,9 @@ impl Server {
                         if let JsonRpcMessage::Request(request) = &message {
                             let _ = if request.validate().is_err() {
                                 send_invalid_request(&send, cx, request.id.clone())
-                            } else if let Some(response) = protocol_era_refusal(request) {
+                            } else if let Some(response) =
+                                era_admission_refusal(server.protocol_policy, request)
+                            {
                                 send.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)(
                                     cx,
@@ -16701,8 +16840,8 @@ impl Server {
         // Notification children have no response commit to protect, so they
         // are cancelled before the drain windows instead of being waited out.
         queue_state.cancel_uncorrelated_modern_children();
-        if drain_modern_before_stop
-            && !queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+        if drain_correlated_before_stop
+            && !queue_state.wait_for_correlated_response_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
         {
             exit_code = 1;
         }
@@ -18149,7 +18288,7 @@ impl Server {
         let ctx = McpContext::with_state(cx.clone(), request_id, state)
             .with_request_cancellation(request_cancellation)
             .with_budget_ceiling(budget);
-        self.attach_request_scoped_component_access(self.with_final_catalog_publisher(ctx))
+        self.attach_request_scoped_component_access(ctx)
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))
     }
@@ -28349,6 +28488,22 @@ mod lib_unit_tests {
         assert!(
             queue.admit(&request_id, true),
             "the id may be reused only after response completion releases it"
+        );
+    }
+
+    #[test]
+    fn correlated_response_drain_completes_only_after_the_reservation_is_discarded() {
+        let queue = DispatchQueueState::default();
+        let request_id = RequestId::String("pending-response".to_owned());
+        assert!(queue.admit(&request_id, true));
+        assert!(
+            !queue.wait_for_correlated_response_drain(Duration::ZERO),
+            "an admitted response reservation prevents an immediate drain"
+        );
+        queue.discard(&request_id);
+        assert!(
+            queue.wait_for_correlated_response_drain(Duration::ZERO),
+            "discarding the response reservation completes the drain"
         );
     }
 

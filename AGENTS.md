@@ -400,8 +400,7 @@ fastmcp_rust/
 │   ├── fastmcp-macros/               # Proc macros: #[tool], #[resource], #[prompt], JsonSchema
 │   ├── fastmcp-console/              # Rich console output (rich_rust integration)
 │   └── fastmcp-cli/                  # CLI binary: run, dev, install, inspect commands
-├── legacy_fastmcp/                    # Python reference (read-only)
-├── PLAN_TO_PORT_FASTMCP_TO_RUST.md   # Porting strategy
+├── PLAN_TO_PORT_FASTMCP_TO_RUST.md   # Porting strategy (the Python reference is not vendored in this repo)
 ├── EXISTING_FASTMCP_STRUCTURE.md     # THE SPEC DOC (consult this, not legacy)
 └── PROPOSED_RUST_ARCHITECTURE.md     # Rust design from references
 ```

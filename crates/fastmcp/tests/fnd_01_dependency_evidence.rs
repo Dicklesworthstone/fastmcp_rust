@@ -7,6 +7,11 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
+// This file is both an integration-test crate root and a shared module in the
+// two FND examples. The examples repeat this gate at their actual crate roots;
+// their module-level `unused_attributes` allowance covers this otherwise
+// inert copy of the crate-only attribute.
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 const FROZEN_POLICY_BYTES: usize = 909064;
 const FROZEN_POLICY_SHA256: &str =
@@ -24037,8 +24042,14 @@ activate = 1\n";
             return Err(Diagnostic::error("E_FILE_HARDLINK", subject).at(format!("link_count={}", metadata.nlink())));
         }
         #[cfg(windows)]
-        if metadata.number_of_links() != 1 {
-            return Err(Diagnostic::error("E_FILE_HARDLINK", subject).at(format!("link_count={}", metadata.number_of_links())));
+        match metadata.number_of_links() {
+            Some(1) => {}
+            Some(link_count) => {
+                return Err(Diagnostic::error("E_FILE_HARDLINK", subject).at(format!("link_count={link_count}")));
+            }
+            None => {
+                return Err(Diagnostic::error("E_FILE_HARDLINK", subject).at("link_count=unavailable"));
+            }
         }
         if metadata.len() > limit {
             return Err(Diagnostic::error("E_FILE_BOUND", subject).at(metadata.len().to_string()));
@@ -26580,8 +26591,14 @@ activate = 1\n";
                     return Err(Diagnostic::error("E_FILE_HARDLINK", &child).at(format!("link_count={}", metadata.nlink())));
                 }
                 #[cfg(windows)]
-                if metadata.number_of_links() != 1 {
-                    return Err(Diagnostic::error("E_FILE_HARDLINK", &child).at(format!("link_count={}", metadata.number_of_links())));
+                match metadata.number_of_links() {
+                    Some(1) => {}
+                    Some(link_count) => {
+                        return Err(Diagnostic::error("E_FILE_HARDLINK", &child).at(format!("link_count={link_count}")));
+                    }
+                    None => {
+                        return Err(Diagnostic::error("E_FILE_HARDLINK", &child).at("link_count=unavailable"));
+                    }
                 }
                 if !output.insert(child.clone()) {
                     return Err(Diagnostic::error("E_INVENTORY_DUPLICATE", &child));
@@ -49828,7 +49845,7 @@ activate = 1\n";
     }
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_041, "e44968200598eda386dc9f6be0dfd7fdba5db144076864addaacb6b7345c116a"),
+        ("Cargo.toml", 7_116, "def5fb70059ea7824aaea260ce59e50e2bfeb374d10aad1ee51293411be7bd45"),
         ("Cargo.lock", 97_891, "7ec9da6ae2797b1ea453aa97f8ca7c33046d8ce6fa4ffe355bae8d8aea3d0a44"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
@@ -54025,6 +54042,23 @@ original = "value"
         assert_sdk_loaded_file_vectors_equal(&loaded_before, &files, "toolchain retained inputs").verified();
         assert_eq!(toolchain_workspace_inputs(&root, &policy).verified(), workspace_before,);
         assert_eq!(validate_toolchain_asupersync_contract(&root, &files, &policy, &accepted_document,).verified(), accepted,);
+
+        let mut planted_manifest_bindings = TOOLCHAIN_WORKSPACE_INPUTS;
+        let pristine_manifest_binding = planted_manifest_bindings[0];
+        planted_manifest_bindings[0].2 = "cef5fb70059ea7824aaea260ce59e50e2bfeb374d10aad1ee51293411be7bd45";
+        assert_eq!(
+            (planted_manifest_bindings[0].0, planted_manifest_bindings[0].1,),
+            (pristine_manifest_binding.0, pristine_manifest_binding.1),
+            "manifest-digest plant preserves the exact path and byte length",
+        );
+        assert_ne!(planted_manifest_bindings[0].2, pristine_manifest_binding.2, "manifest-digest plant changes the forbidden digest dimension");
+        assert_eq!(planted_manifest_bindings[1], TOOLCHAIN_WORKSPACE_INPUTS[1], "manifest-digest plant preserves the lock binding");
+        assert_eq!(planted_manifest_bindings[2], TOOLCHAIN_WORKSPACE_INPUTS[2], "manifest-digest plant preserves the toolchain binding");
+        let manifest_error = toolchain_workspace_inputs_with_bindings(&root, &policy, &planted_manifest_bindings).expect_err("one wrong Cargo.toml digest must fail at the production checked-read seam");
+        assert_eq!(manifest_error.stable(), "FND01|Error|E_TOOLCHAIN_ASUPERSYNC|Cargo.toml|E_FILE_DIGEST|Cargo.toml: marker digest mismatch",);
+        assert_sdk_loaded_file_vectors_equal(&loaded_before, &files, "manifest-digest retained inputs").verified();
+        assert_eq!(toolchain_workspace_inputs(&root, &policy).verified(), workspace_before, "rejected manifest-digest plant leaves all live workspace inputs unchanged");
+        assert_eq!(validate_toolchain_asupersync_contract(&root, &files, &policy, &accepted_document).verified(), accepted, "pristine toolchain contract reaccepts after the manifest-digest plant");
 
         let mut planted_workspace_bindings = TOOLCHAIN_WORKSPACE_INPUTS;
         let pristine_lock_binding = planted_workspace_bindings[1];

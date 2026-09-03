@@ -54,6 +54,39 @@ done
 printf 'FASTMCP_E2E_EOF\n' >&2
 "#;
 
+const MODERN_NO_CATALOGS_TEST_FIXTURE: &str = r#"
+emit_wire() {
+    printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
+}
+
+request_id() {
+    id=${1##*\"id\":}
+    id=${id%\}}
+    case "$id" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$id"
+}
+
+state=discover
+while IFS= read -r request; do
+    emit_wire "$request"
+    id=$(request_id "$request") || exit 1
+    case "$state:$request" in
+        discover:*'"method":"server/discover"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"no-catalogs","version":"1"}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+            state=ping
+            ;;
+        ping:*'"method":"ping"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            state=done
+            ;;
+        *) exit 1 ;;
+    esac
+done
+[ "$state" = done ]
+"#;
+
 const LEGACY_FALLBACK_INSPECT_FIXTURE: &str = r#"
 emit_wire() {
     printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
@@ -1765,6 +1798,56 @@ fn e2e_test_json_report_against_static_protocol_fixture() {
     assert!(json.get("total_duration_ms").is_some());
 }
 
+#[test]
+fn modern_test_skips_an_unadvertised_tools_catalog_without_sending_tools_list() {
+    let output = run_cli(&[
+        "test",
+        "--json",
+        "--protocol-policy",
+        "modern-only",
+        "/bin/sh",
+        "--",
+        "-c",
+        MODERN_NO_CATALOGS_TEST_FIXTURE,
+    ]);
+
+    assert!(
+        output.status.success(),
+        "modern no-catalog test failed: stdout={} stderr={}",
+        stdout_str(&output),
+        stderr_str(&output)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("parse modern test report");
+    let tests = report["tests"].as_array().expect("test results array");
+    let list_tools = tests
+        .iter()
+        .find(|entry| entry["name"] == "list_tools")
+        .expect("test report includes list_tools");
+    assert_eq!(list_tools["success"], true);
+    assert_eq!(list_tools["skipped"], true);
+    assert_eq!(list_tools["details"], "server did not advertise tools");
+
+    let wire = observed_protocol_wire(&output);
+    assert_eq!(
+        wire.iter()
+            .filter(|request| request_method(request) == "server/discover")
+            .count(),
+        1
+    );
+    assert_eq!(
+        wire.iter()
+            .filter(|request| request_method(request) == "ping")
+            .count(),
+        1
+    );
+    assert!(
+        wire.iter()
+            .all(|request| request_method(request) != "tools/list"),
+        "a non-advertised catalog must not be contacted"
+    );
+}
+
 #[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
@@ -1978,7 +2061,7 @@ fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_st
         write_h1_json_response(
             &mut stream,
             deadline,
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"h1-tool","description":"modern H1 catalog","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"h1-tool","title":"Final H1 Tool","description":"modern H1 catalog","icons":[{"src":"https://example.test/h1-tool.png","mimeType":"image/png","sizes":["16x16"],"theme":"dark"}],"inputSchema":{"type":"object"},"_meta":{"com.example/inspect":{"retained":true}}}],"ttlMs":17,"cacheScope":"public"}}"#,
         );
     });
 
@@ -2005,6 +2088,12 @@ fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_st
     assert_eq!(rendered["protocol"]["version"], "2026-07-28");
     assert_eq!(rendered["protocol"]["era"], "modern-2026");
     assert_eq!(rendered["tools"][0]["name"], "h1-tool");
+    assert_eq!(
+        rendered["tools"][0]["icon"]["src"],
+        "https://example.test/h1-tool.png"
+    );
+    assert_eq!(rendered["tools"][0]["icon"]["mimeType"], "image/png");
+    assert_eq!(rendered["tools"][0]["icon"]["sizes"], "16x16");
 }
 
 #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -3229,4 +3318,379 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
         stderr.contains("Some tests failed"),
         "top-level failure diagnostic missing: {stderr}"
     );
+}
+
+/// Real shipped-pair coverage lives in this existing integration target so it
+/// remains inside the frozen workspace source inventory. Scripted fixtures did
+/// not expose the original defects: modern `inspect` could not read the real
+/// server, and modern `test` could pass while skipping every catalog request.
+///
+/// These cases prove CLI/server composition, not aggregate MCP conformance.
+mod shipped_pair {
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::{CLI_DEADLINE, fastmcp_bin, run_with_deadline};
+
+    const ECHO_SERVER_TOOLS: usize = 26;
+    const ECHO_SERVER_RESOURCES: usize = 10;
+    const ECHO_SERVER_RESOURCE_TEMPLATES: usize = 2;
+    const ECHO_SERVER_PROMPTS: usize = 6;
+
+    const ONE_SHOT_MODERN_DISCOVER: &str = r#"{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"half-close-probe","version":"1"},"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"id":1}"#;
+    const ONE_SHOT_LEGACY_INITIALIZE: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"half-close-probe","version":"1"},"protocolVersion":"2024-11-05"},"id":1}"#;
+    const ONE_SHOT_MODERN_TOOL_CALL: &str = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/protocolVersion":"2026-07-28"},"name":"echo","arguments":{"message":"modern-half-close"}},"id":2}"#;
+    const ONE_SHOT_LEGACY_INITIALIZED: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    const ONE_SHOT_LEGACY_TOOL_CALL: &str = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{"message":"legacy-half-close"}},"id":2}"#;
+
+    fn echo_server() -> PathBuf {
+        let server = std::env::var_os("FASTMCP_ECHO_SERVER_BIN")
+            .map(PathBuf::from)
+            .expect("FASTMCP_ECHO_SERVER_BIN must name a freshly built echo_server artifact");
+        assert!(
+            server.is_absolute(),
+            "FASTMCP_ECHO_SERVER_BIN must be absolute"
+        );
+        assert!(
+            server.is_file(),
+            "echo_server artifact missing at {}",
+            server.display()
+        );
+        server
+    }
+
+    struct CliRun {
+        status: i32,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn run_cli(args: &[&str]) -> CliRun {
+        let server = echo_server();
+        let mut command = Command::new(fastmcp_bin());
+        command
+            .args(args)
+            .arg(&server)
+            .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+            .env("NO_COLOR", "1");
+        let output = run_with_deadline(command, CLI_DEADLINE).unwrap_or_else(|expired| {
+            panic!(
+                "shipped-pair CLI deadline expired; cleanup error: {:?}; captured stdout={} bytes, stderr={} bytes",
+                expired.cleanup_error,
+                expired.stdout.len(),
+                expired.stderr.len()
+            )
+        });
+        CliRun {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8(output.stdout)
+                .expect("shipped-pair CLI stdout must be UTF-8"),
+            stderr: String::from_utf8(output.stderr)
+                .expect("shipped-pair CLI stderr must be UTF-8"),
+        }
+    }
+
+    fn catalog_count(stdout: &str, heading: &str) -> usize {
+        let prefix = format!("{heading} (");
+        stdout
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim_start().strip_prefix(&prefix)?;
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .unwrap_or_else(|| panic!("no `{heading} (N):` heading in inspect output:\n{stdout}"))
+    }
+
+    struct InspectCatalog {
+        tools: usize,
+        resources: usize,
+        resource_templates: usize,
+        prompts: usize,
+    }
+
+    fn inspect(policy: &str) -> (CliRun, InspectCatalog) {
+        let run = run_cli(&["inspect", "--protocol-policy", policy]);
+        assert_eq!(
+            run.status, 0,
+            "inspect --protocol-policy {policy} failed\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
+        );
+        let catalog = InspectCatalog {
+            tools: catalog_count(&run.stdout, "Tools"),
+            resources: catalog_count(&run.stdout, "Resources"),
+            resource_templates: catalog_count(&run.stdout, "Resource Templates"),
+            prompts: catalog_count(&run.stdout, "Prompts"),
+        };
+        (run, catalog)
+    }
+
+    fn test_report(policy: &str) -> serde_json::Value {
+        let run = run_cli(&["test", "--protocol-policy", policy, "--json"]);
+        assert_eq!(
+            run.status, 0,
+            "test --protocol-policy {policy} failed\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
+        );
+        let json_start = run
+            .stdout
+            .find('{')
+            .unwrap_or_else(|| panic!("no JSON report in test output:\n{}", run.stdout));
+        serde_json::from_str(&run.stdout[json_start..])
+            .unwrap_or_else(|error| panic!("invalid JSON test report ({error}):\n{}", run.stdout))
+    }
+
+    fn test_entry<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        report["tests"]
+            .as_array()
+            .and_then(|tests| tests.iter().find(|entry| entry["name"] == name))
+            .unwrap_or_else(|| panic!("missing `{name}` entry in test report: {report}"))
+    }
+
+    fn assert_catalog_tests_ran(report: &serde_json::Value) {
+        for name in ["list_tools", "list_resources", "list_prompts"] {
+            let entry = test_entry(report, name);
+            assert_ne!(entry["skipped"], true, "`{name}` must run: {entry}");
+            assert_eq!(entry["success"], true, "`{name}` must pass: {entry}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn cli_inspect_reads_the_shipped_server_catalog_under_every_policy() {
+        let (modern, modern_catalog) = inspect("modern-only");
+        let (legacy, legacy_catalog) = inspect("legacy-only");
+        let (auto, auto_catalog) = inspect("auto");
+
+        assert!(modern.stdout.contains("2026-07-28"));
+        assert!(!modern.stdout.contains("2024-11-05"));
+        assert!(legacy.stdout.contains("2024-11-05"));
+        assert!(!legacy.stdout.contains("2026-07-28"));
+        assert!(auto.stdout.contains("2026-07-28"));
+
+        for (policy, catalog) in [
+            ("modern-only", &modern_catalog),
+            ("legacy-only", &legacy_catalog),
+            ("auto", &auto_catalog),
+        ] {
+            assert_eq!(
+                catalog.tools, ECHO_SERVER_TOOLS,
+                "{policy} inspect must list every shipped tool"
+            );
+            assert_eq!(
+                catalog.resources, ECHO_SERVER_RESOURCES,
+                "{policy} inspect must list every shipped concrete resource"
+            );
+            assert_eq!(
+                catalog.resource_templates, ECHO_SERVER_RESOURCE_TEMPLATES,
+                "{policy} inspect must list every shipped resource template"
+            );
+            assert_eq!(
+                catalog.prompts, ECHO_SERVER_PROMPTS,
+                "{policy} inspect must list every shipped prompt"
+            );
+        }
+
+        assert_eq!(modern_catalog.tools, legacy_catalog.tools);
+        assert_eq!(modern_catalog.resources, legacy_catalog.resources);
+        assert_eq!(
+            modern_catalog.resource_templates,
+            legacy_catalog.resource_templates
+        );
+        assert_eq!(modern_catalog.prompts, legacy_catalog.prompts);
+        assert_eq!(auto_catalog.tools, modern_catalog.tools);
+        assert_eq!(auto_catalog.resources, modern_catalog.resources);
+        assert_eq!(
+            auto_catalog.resource_templates,
+            modern_catalog.resource_templates
+        );
+        assert_eq!(auto_catalog.prompts, modern_catalog.prompts);
+        assert!(modern.stdout.contains("- echo:"));
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn cli_test_exercises_the_shipped_server_catalog_on_a_modern_session() {
+        let report = test_report("modern-only");
+        assert_eq!(report["success"], true, "{report}");
+        let initialize = test_entry(&report, "initialize");
+        assert!(
+            initialize["details"]
+                .as_str()
+                .is_some_and(|details| details.contains("2026-07-28")),
+            "modern-only test must negotiate the modern era: {initialize}"
+        );
+        assert_catalog_tests_ran(&report);
+        let tools = test_entry(&report, "list_tools");
+        assert!(
+            tools["details"]
+                .as_str()
+                .is_some_and(|details| details.contains(&ECHO_SERVER_TOOLS.to_string())),
+            "list_tools must report the shipped tool count: {tools}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn cli_test_exercises_the_shipped_server_catalog_on_a_legacy_session() {
+        let report = test_report("legacy-only");
+        assert_eq!(report["success"], true, "{report}");
+        let initialize = test_entry(&report, "initialize");
+        assert!(
+            initialize["details"]
+                .as_str()
+                .is_some_and(|details| details.contains("2024-11-05")),
+            "legacy-only test must negotiate the legacy era: {initialize}"
+        );
+        assert_catalog_tests_ran(&report);
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn cli_test_auto_selects_modern_and_exercises_the_shipped_catalog() {
+        let report = test_report("auto");
+        assert_eq!(report["success"], true, "{report}");
+        let initialize = test_entry(&report, "initialize");
+        assert!(
+            initialize["details"]
+                .as_str()
+                .is_some_and(|details| details.contains("2026-07-28")),
+            "Auto must select modern against the shipped Auto server: {initialize}"
+        );
+        assert_catalog_tests_ran(&report);
+        let tools = test_entry(&report, "list_tools");
+        assert!(
+            tools["details"]
+                .as_str()
+                .is_some_and(|details| details.contains(&ECHO_SERVER_TOOLS.to_string())),
+            "Auto list_tools must report the shipped tool count: {tools}"
+        );
+    }
+
+    fn run_echo_one_shot(policy: &str, request: &str) -> CliRun {
+        let mut child = Command::new(echo_server())
+            .env("FASTMCP_PROTOCOL_POLICY", policy)
+            .env("FASTMCP_NO_BANNER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("shipped echo server starts");
+        let mut stdin = child.stdin.take().expect("echo server stdin is piped");
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .expect("request reaches the echo server");
+        drop(stdin);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("echo server status is observable") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("echo server did not settle after request ingress reached EOF");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("echo server stdout is piped")
+            .read_to_string(&mut stdout)
+            .expect("echo server stdout is UTF-8");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("echo server stderr is piped")
+            .read_to_string(&mut stderr)
+            .expect("echo server stderr is UTF-8");
+        CliRun {
+            status: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        }
+    }
+
+    fn response_with_id(stdout: &str, id: i64) -> serde_json::Value {
+        stdout
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("response line is JSON")
+            })
+            .find(|response| response["id"] == id)
+            .unwrap_or_else(|| panic!("missing response id {id} in:\n{stdout}"))
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn echo_server_commits_modern_and_legacy_responses_after_request_ingress_eof() {
+        let modern = run_echo_one_shot(
+            "modern-only",
+            &format!("{ONE_SHOT_MODERN_DISCOVER}\n{ONE_SHOT_MODERN_TOOL_CALL}"),
+        );
+        assert_eq!(
+            modern.status, 0,
+            "modern half-close failed\nstdout:\n{}\nstderr:\n{}",
+            modern.stdout, modern.stderr
+        );
+        let modern_response = response_with_id(&modern.stdout, 1);
+        assert_eq!(modern_response["result"]["resultType"], "complete");
+        assert_eq!(
+            modern_response["result"]["supportedVersions"][0],
+            "2026-07-28"
+        );
+        let modern_tool_response = response_with_id(&modern.stdout, 2);
+        assert!(
+            serde_json::to_string(&modern_tool_response)
+                .expect("modern tool response serializes")
+                .contains("modern-half-close")
+        );
+
+        let legacy = run_echo_one_shot(
+            "legacy-only",
+            &format!(
+                "{ONE_SHOT_LEGACY_INITIALIZE}\n{ONE_SHOT_LEGACY_INITIALIZED}\n{ONE_SHOT_LEGACY_TOOL_CALL}"
+            ),
+        );
+        assert_eq!(
+            legacy.status, 0,
+            "legacy half-close failed\nstdout:\n{}\nstderr:\n{}",
+            legacy.stdout, legacy.stderr
+        );
+        let legacy_response = response_with_id(&legacy.stdout, 1);
+        assert_eq!(legacy_response["result"]["protocolVersion"], "2024-11-05");
+        let legacy_tool_response = response_with_id(&legacy.stdout, 2);
+        assert!(
+            serde_json::to_string(&legacy_tool_response)
+                .expect("legacy tool response serializes")
+                .contains("legacy-half-close")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicit freshly built FASTMCP_ECHO_SERVER_BIN artifact"]
+    fn echo_server_mid_connection_protocol_mismatch_is_nonzero_without_a_panic() {
+        let mismatch = run_echo_one_shot(
+            "legacy-only",
+            &format!(
+                "{ONE_SHOT_LEGACY_INITIALIZE}\n{ONE_SHOT_LEGACY_INITIALIZED}\n{ONE_SHOT_MODERN_TOOL_CALL}"
+            ),
+        );
+        assert_ne!(mismatch.status, 0);
+        let response = response_with_id(&mismatch.stdout, 2);
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(
+            !mismatch.stderr.contains("panicked at"),
+            "a policy refusal must not become a Rust panic: {}",
+            mismatch.stderr
+        );
+    }
 }

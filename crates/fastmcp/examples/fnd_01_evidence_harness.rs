@@ -5,6 +5,7 @@
 //! for the integration producer.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 // The included module compiles under three cfg surfaces (bootstrap binary,
 // integration test, and this non-test binary). Off-Linux non-test builds bind
@@ -13,6 +14,7 @@
 // verifier source.
 #[allow(
     dead_code,
+    unused_attributes,
     unused_imports,
     unused_variables,
     unused_mut,

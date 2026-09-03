@@ -38,8 +38,6 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, PromptCaller, PromptGetResult,
     PromptMessageItem, PromptMessageRole, SessionState, block_on, sha256_bounded,
 };
-#[cfg(feature = "tasks")]
-use fastmcp_protocol::MissingRequiredClientCapabilityError;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
@@ -758,20 +756,7 @@ fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
         return Ok(());
     }
 
-    let mut extensions = serde_json::Map::new();
-    extensions.insert(
-        OFFICIAL_TASKS_EXTENSION_ID.to_owned(),
-        serde_json::json!({}),
-    );
-    let missing = MissingRequiredClientCapabilityError::new(serde_json::json!({
-        "extensions": serde_json::Value::Object(extensions)
-    }))
-    .map_err(|_| McpError::internal_error("failed to encode required Tasks capability"))?;
-    Err(McpError::with_data(
-        McpErrorCode::Custom(missing.jsonrpc_error_code()),
-        "Required client capability is missing",
-        missing.canonical_error_data(),
-    ))
+    Err(crate::missing_final_tasks_capability_error()?)
 }
 
 /// Admits the schemas a local tool declares for a final-dialect call.
@@ -1817,6 +1802,11 @@ const fn is_framework_terminal_tool_error(code: McpErrorCode) -> bool {
         code,
         McpErrorCode::InternalError | McpErrorCode::RequestCancelled
     )
+}
+
+fn is_framework_terminal_final_tool_error(error: &McpError) -> bool {
+    is_framework_terminal_tool_error(error.code)
+        || crate::is_canonical_missing_required_client_capability_error(error)
 }
 
 fn read_handler_timeout(
@@ -5206,7 +5196,7 @@ impl Router {
             }
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
-                if is_framework_terminal_tool_error(error.code) {
+                if is_framework_terminal_final_tool_error(&error) {
                     return Err(error);
                 }
                 let mut result =
@@ -8252,7 +8242,7 @@ impl RouterToolCaller {
             },
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(parent_ctx.cx(), "tool", error);
-                if is_framework_terminal_tool_error(error.code) {
+                if is_framework_terminal_final_tool_error(&error) {
                     return Err(error);
                 }
                 Ok(ToolCallResult::error(error.message))
@@ -11759,6 +11749,40 @@ mod router_tests {
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Err(McpError::new(self.code, "nested tool error"))
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    struct DetailedFinalErrorTool {
+        name: &'static str,
+        error: McpError,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl ToolHandler for DetailedFinalErrorTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Err(self.error.clone())
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            Err(self.error.clone())
         }
     }
 
@@ -19787,6 +19811,79 @@ mod router_tests {
             .expect_err("explicit-null final prompt arguments are rejected");
         assert_eq!(null_prompt_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn only_the_exact_missing_capability_error_is_terminal_for_final_tools() {
+        let canonical = require_final_tasks_capability(&OpenMetadata::default())
+            .expect_err("missing Tasks capability has a canonical refusal");
+        assert!(is_framework_terminal_final_tool_error(&canonical));
+
+        let mut altered_message = canonical.clone();
+        altered_message.message.push('.');
+        let mut altered_data = canonical.clone();
+        altered_data
+            .data
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("canonical refusal data is an object")
+            .insert("extra".to_owned(), serde_json::Value::Bool(true));
+        let mut non_object_required_capabilities = canonical.clone();
+        non_object_required_capabilities.data = Some(serde_json::json!({
+            "requiredCapabilities": [],
+        }));
+        assert!(!is_framework_terminal_final_tool_error(&altered_message));
+        assert!(!is_framework_terminal_final_tool_error(&altered_data));
+        assert!(!is_framework_terminal_final_tool_error(
+            &non_object_required_capabilities
+        ));
+
+        let mut router = Router::new();
+        for (name, error) in [
+            ("canonical-capability-error", canonical.clone()),
+            ("message-lookalike", altered_message),
+            ("data-lookalike", altered_data),
+            (
+                "non-object-required-capabilities",
+                non_object_required_capabilities,
+            ),
+        ] {
+            router
+                .add_tool(DetailedFinalErrorTool { name, error })
+                .expect("error tool registration succeeds");
+        }
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 159, Budget::INFINITE, &state);
+
+        let observed = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "canonical-capability-error",
+                    serde_json::json!({}),
+                    159_i64,
+                ),
+            )
+            .expect_err("the exact framework-owned refusal remains a JSON-RPC error");
+        assert_eq!(observed.code, canonical.code);
+        assert_eq!(observed.message, canonical.message);
+        assert_eq!(observed.data, canonical.data);
+
+        for (name, request_id) in [
+            ("message-lookalike", 160_i64),
+            ("data-lookalike", 161_i64),
+            ("non-object-required-capabilities", 162_i64),
+        ] {
+            let result = router
+                .dispatch_stateless(
+                    &request_ctx,
+                    &final_tools_call_request(name, serde_json::json!({}), request_id),
+                )
+                .expect("a handler-controlled lookalike remains a tool-level error result");
+            assert_eq!(result["isError"], true);
+        }
     }
 
     #[cfg(feature = "tasks")]

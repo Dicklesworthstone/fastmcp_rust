@@ -1,6 +1,7 @@
 //! Bounded RFC 6570 Level 4 URI-template parsing and expansion.
 //!
-//! A URI template is deliberately distinct from [`crate::AbsoluteUri`]: a
+//! A URI template is deliberately distinct from
+//! [`crate::common_types::AbsoluteUri`]: a
 //! template describes a set of references and must be expanded before it can
 //! be used where an ordinary URI is required. This module owns the
 //! syntax-preserving representation, forward expansion, and the separate

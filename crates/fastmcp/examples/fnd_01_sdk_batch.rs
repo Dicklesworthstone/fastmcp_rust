@@ -5,12 +5,14 @@
 //! admit the trusted production proof class.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 // Same rationale as fnd_01_evidence_harness: the included verifier compiles
 // under multiple cfg surfaces, and off-Linux non-test builds bind helpers it
 // does not consume, so binary-context lint classes are allowed at the wrapper.
 #[allow(
     dead_code,
+    unused_attributes,
     unused_imports,
     unused_variables,
     unused_mut,

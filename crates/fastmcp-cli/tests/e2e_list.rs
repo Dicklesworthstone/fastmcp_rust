@@ -746,6 +746,356 @@ fn e2e_list_custom_config_path_only_uses_that_file() {
 }
 
 #[test]
+fn e2e_list_remote_config_is_typed_and_never_renders_credentials() {
+    const USERINFO_SECRET: &str = "remote-userinfo-secret";
+    const PATH_SECRET: &str = "remote-path-secret";
+    const QUERY_SECRET: &str = "remote-query-secret";
+    const FRAGMENT_SECRET: &str = "remote-fragment-secret";
+    const HEADER_SECRET: &str = "remote-header-secret";
+    const AUTH_SECRET: &str = "remote-auth-secret";
+
+    let home = mktemp_dir("list-remote-home");
+    let proj = mktemp_dir("list-remote-proj");
+    let custom = proj.join("remote.json");
+    write_file(
+        &custom,
+        &format!(
+            r#"{{"mcpServers":{{"remote":{{"type":"http","url":"https://user:{USERINFO_SECRET}@api.example.test/{PATH_SECRET}?token={QUERY_SECRET}#{FRAGMENT_SECRET}","headers":{{"Authorization":"Bearer {HEADER_SECRET}"}},"auth":{{"token":"{AUTH_SECRET}"}}}},"public-root":{{"type":"sse","url":"https://events.example.test/"}}}}}}"#,
+        ),
+    );
+
+    for format in ["json", "yaml"] {
+        let output = run_cli(
+            &home,
+            &proj,
+            &[
+                "list",
+                "--config",
+                custom.to_str().unwrap(),
+                "--format",
+                format,
+            ],
+        );
+        assert!(output.status.success(), "remote {format} listing failed");
+        let rendered = stdout_str(&output);
+        for secret in [
+            USERINFO_SECRET,
+            PATH_SECRET,
+            QUERY_SECRET,
+            FRAGMENT_SECRET,
+            HEADER_SECRET,
+            AUTH_SECRET,
+            "Authorization",
+        ] {
+            assert!(!rendered.contains(secret));
+            assert!(!stderr_str(&output).contains(secret));
+        }
+        assert!(rendered.contains("streamable-http"));
+        assert!(rendered.contains("sse"));
+        assert!(rendered.contains("https://api.example.test/<redacted-route>"));
+        assert!(rendered.contains("https://events.example.test/"));
+    }
+
+    let json_output = run_cli(
+        &home,
+        &proj,
+        &[
+            "list",
+            "--config",
+            custom.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout_str(&json_output)).expect("parse remote list JSON");
+    let servers = json["servers"].as_array().expect("remote server array");
+    let remote = servers
+        .iter()
+        .find(|server| server["name"] == "remote")
+        .expect("remote entry");
+    assert_eq!(remote["transport"], "streamable-http");
+    assert_eq!(
+        remote["endpoint"],
+        "https://api.example.test/<redacted-route>"
+    );
+    assert_eq!(remote["credentials_configured"], true);
+    assert!(remote.get("command").is_none());
+    assert_eq!(json["redacted"], true);
+
+    let root = servers
+        .iter()
+        .find(|server| server["name"] == "public-root")
+        .expect("root endpoint entry");
+    assert_eq!(root["transport"], "sse");
+    assert_eq!(root["endpoint"], "https://events.example.test/");
+    assert_eq!(root["credentials_configured"], false);
+
+    let table_output = run_cli(
+        &home,
+        &proj,
+        &["list", "--config", custom.to_str().unwrap(), "--verbose"],
+    );
+    assert!(table_output.status.success());
+    let table = stdout_str(&table_output);
+    assert!(table.contains("Transport"));
+    assert!(table.contains("Target"));
+    assert!(table.contains("Credentials"));
+    assert!(table.contains("configured"));
+    for secret in [
+        USERINFO_SECRET,
+        PATH_SECRET,
+        QUERY_SECRET,
+        FRAGMENT_SECRET,
+        HEADER_SECRET,
+        AUTH_SECRET,
+        "Authorization",
+    ] {
+        assert!(!table.contains(secret));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_list_current_nested_cline_remote_config() {
+    const HEADER_SECRET: &str = "cline-header-secret";
+    const OAUTH_SECRET: &str = "cline-oauth-secret";
+    let home = mktemp_dir("list-cline-remote-home");
+    let proj = mktemp_dir("list-cline-remote-proj");
+    write_file(
+        &cline_cfg(&home),
+        &format!(
+            r#"{{"mcpServers":{{"cline-http":{{"transport":{{"type":"streamableHttp","url":"https://cline.example.test/mcp","headers":{{"X-Api-Key":"{HEADER_SECRET}"}}}},"oauth":{{"accessToken":"{OAUTH_SECRET}"}},"disabled":true}},"cline-sse":{{"transport":{{"type":"sse","url":"https://events.cline.example.test/"}}}}}}}}"#,
+        ),
+    );
+
+    for format in ["json", "yaml"] {
+        let output = run_cli(
+            &home,
+            &proj,
+            &["list", "--target", "cline", "--format", format],
+        );
+        assert!(output.status.success(), "nested Cline {format} listing");
+        let rendered = stdout_str(&output);
+        assert!(!rendered.contains(HEADER_SECRET));
+        assert!(!rendered.contains(OAUTH_SECRET));
+        assert!(!rendered.contains("X-Api-Key"));
+        assert!(rendered.contains("streamable-http"));
+        assert!(rendered.contains("sse"));
+        assert!(rendered.contains("https://cline.example.test/<redacted-route>"));
+        assert!(rendered.contains("https://events.cline.example.test/"));
+
+        if format == "json" {
+            let json: serde_json::Value =
+                serde_json::from_str(&rendered).expect("parse Cline list JSON");
+            let servers = json["servers"].as_array().expect("Cline server array");
+            let http = servers
+                .iter()
+                .find(|server| server["name"] == "cline-http")
+                .expect("nested Cline HTTP entry");
+            assert_eq!(http["transport"], "streamable-http");
+            assert_eq!(
+                http["endpoint"],
+                "https://cline.example.test/<redacted-route>"
+            );
+            assert_eq!(http["credentials_configured"], true);
+            assert_eq!(http["enabled"], false);
+
+            let sse = servers
+                .iter()
+                .find(|server| server["name"] == "cline-sse")
+                .expect("nested Cline SSE entry");
+            assert_eq!(sse["transport"], "sse");
+            assert_eq!(sse["endpoint"], "https://events.cline.example.test/");
+            assert_eq!(sse["credentials_configured"], false);
+        }
+    }
+
+    let table = run_cli(&home, &proj, &["list", "--target", "cline", "--verbose"]);
+    assert!(table.status.success(), "nested Cline table listing");
+    let rendered = stdout_str(&table);
+    assert!(rendered.contains("streamable-http"));
+    assert!(rendered.contains("sse"));
+    assert!(rendered.contains("https://cline.example.test/<redacted-route>"));
+    assert!(rendered.contains("https://events.cline.example.test/"));
+    assert!(!rendered.contains(HEADER_SECRET));
+    assert!(!rendered.contains(OAUTH_SECRET));
+    assert!(!rendered.contains("X-Api-Key"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_list_custom_config_honors_the_explicit_client_target() {
+    const SECRET: &str = "CUSTOM_TARGET_SECRET_MUST_NOT_LEAK";
+    let home = mktemp_dir("list-custom-target-home");
+    let proj = mktemp_dir("list-custom-target-proj");
+    let custom = proj.join("nested-cline.json");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "remote": {
+                "transport": {
+                    "type": "streamableHttp",
+                    "url": "https://custom.cline.example.test/",
+                    "headers": {"Authorization": format!("Bearer {SECRET}")},
+                }
+            }
+        }
+    });
+    write_file(&custom, &config.to_string());
+
+    let accepted = run_cli(
+        &home,
+        &proj,
+        &[
+            "list",
+            "--config",
+            custom.to_str().unwrap(),
+            "--target",
+            "cline",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        accepted.status.success(),
+        "the explicit Cline target must select the nested Cline schema"
+    );
+    let rendered = stdout_str(&accepted);
+    assert!(!rendered.contains(SECRET));
+    assert!(!stderr_str(&accepted).contains(SECRET));
+    let json: serde_json::Value =
+        serde_json::from_str(&rendered).expect("parse explicitly targeted custom config");
+    assert_eq!(json["servers"][0]["transport"], "streamable-http");
+    assert_eq!(
+        json["servers"][0]["endpoint"],
+        "https://custom.cline.example.test/"
+    );
+    assert_eq!(json["servers"][0]["credentials_configured"], true);
+    assert_eq!(json["redacted"], true);
+
+    let rejected = run_cli(
+        &home,
+        &proj,
+        &[
+            "list",
+            "--config",
+            custom.to_str().unwrap(),
+            "--target",
+            "cursor",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !rejected.status.success(),
+        "changing only the target must not admit Cline's nested schema as Cursor config"
+    );
+    assert!(
+        rejected.stdout.is_empty(),
+        "wrong-target custom parsing must fail atomically"
+    );
+    let diagnostic = stderr_str(&rejected);
+    assert!(diagnostic.contains("schema validation failed"));
+    assert!(!diagnostic.contains(SECRET));
+    assert!(diagnostic.len() < 16 * 1024);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_list_cursor_url_only_remote_marks_userinfo_credentials() {
+    const USERINFO_SECRET: &str = "cursor-userinfo-only-secret";
+    let home = mktemp_dir("list-cursor-remote-home");
+    let proj = mktemp_dir("list-cursor-remote-proj");
+    write_file(
+        &cursor_cfg(&home),
+        &format!(
+            r#"{{"mcpServers":{{"cursor-remote":{{"url":"https://user:{USERINFO_SECRET}@cursor.example.test/"}}}}}}"#,
+        ),
+    );
+
+    let output = run_cli(
+        &home,
+        &proj,
+        &["list", "--target", "cursor", "--format", "json"],
+    );
+    assert!(
+        output.status.success(),
+        "documented Cursor URL-only listing"
+    );
+    let rendered = stdout_str(&output);
+    assert!(!rendered.contains(USERINFO_SECRET));
+    let json: serde_json::Value = serde_json::from_str(&rendered).expect("parse Cursor list JSON");
+    assert_eq!(json["servers"][0]["transport"], "streamable-http");
+    assert_eq!(
+        json["servers"][0]["endpoint"],
+        "https://cursor.example.test/<redacted-route>"
+    );
+    assert_eq!(json["servers"][0]["credentials_configured"], true);
+    assert_eq!(json["redacted"], true);
+}
+
+#[test]
+fn e2e_list_remote_config_rejects_forbidden_dimension_atomically() {
+    const SECRET: &str = "REMOTE_E2E_NEGATIVE_SECRET_MUST_NOT_LEAK";
+    let home = mktemp_dir("list-remote-negative-home");
+    let proj = mktemp_dir("list-remote-negative-proj");
+    let custom = proj.join("remote-negative.json");
+    let accepted = serde_json::json!({
+        "mcpServers": {
+            "remote": {
+                "type": "sse",
+                "url": "https://example.test/sse",
+                "headers": {"X-Test": "safe"},
+            }
+        }
+    });
+    let mut invalid_scheme = accepted.clone();
+    invalid_scheme["mcpServers"]["remote"]["url"] = serde_json::json!("ftp://example.test/sse");
+    let mut malformed_url = accepted.clone();
+    malformed_url["mcpServers"]["remote"]["url"] = serde_json::json!("https://example.test/%zz");
+    let mut non_string_header = accepted.clone();
+    non_string_header["mcpServers"]["remote"]["headers"]["X-Test"] = serde_json::json!([SECRET]);
+    let mut conflicting_local_field = accepted.clone();
+    conflicting_local_field["mcpServers"]["remote"]["command"] = serde_json::json!(SECRET);
+    let mut unsupported_transport = accepted.clone();
+    unsupported_transport["mcpServers"]["remote"]["type"] = serde_json::json!("ws");
+    let mut unknown_field = accepted;
+    unknown_field["mcpServers"]["remote"]["credentialTypo"] = serde_json::json!(SECRET);
+    let cases = [
+        invalid_scheme.to_string(),
+        malformed_url.to_string(),
+        non_string_header.to_string(),
+        conflicting_local_field.to_string(),
+        unsupported_transport.to_string(),
+        unknown_field.to_string(),
+    ];
+
+    for content in cases {
+        write_file(&custom, &content);
+        let output = run_cli(
+            &home,
+            &proj,
+            &[
+                "list",
+                "--config",
+                custom.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "failed list output must be atomic"
+        );
+        let stderr = stderr_str(&output);
+        assert!(stderr.contains("schema validation failed"));
+        assert!(!stderr.contains(SECRET));
+        assert!(stderr.len() < 16 * 1024);
+    }
+}
+
+#[test]
 fn e2e_list_toml_preserves_cwd_in_structured_and_verbose_output() {
     let home = mktemp_dir("list-toml-cwd-home");
     let proj = mktemp_dir("list-toml-cwd-proj");
@@ -1143,6 +1493,50 @@ fn e2e_list_accepts_client_owned_cline_extension_fields() {
     assert_eq!(json["servers"][0]["env"]["MODE"], "<redacted>");
     assert_eq!(json["servers"][0]["cwd"], "/srv/server");
     assert_eq!(json["servers"][0]["enabled"], false);
+    assert!(json["servers"][0].get("credentials_configured").is_none());
+
+    write_file(
+        &config_path,
+        r#"{"mcpServers":{"extended":{"transport":{"type":"stdio","command":"echo"},"oauth":null}}}"#,
+    );
+    let null_oauth_output = run_cli(
+        &home,
+        &proj,
+        &["list", "--target", "cline", "--format", "json"],
+    );
+    assert!(null_oauth_output.status.success());
+    let null_oauth_json: serde_json::Value = serde_json::from_str(&stdout_str(&null_oauth_output))
+        .expect("parse null-OAuth Cline list JSON");
+    assert!(
+        null_oauth_json["servers"][0]
+            .get("credentials_configured")
+            .is_none()
+    );
+    assert_eq!(null_oauth_json["redacted"], false);
+
+    const OAUTH_SECRET: &str = "CLINE_STDIO_OAUTH_SECRET_MUST_NOT_LEAK";
+    write_file(
+        &config_path,
+        &format!(
+            r#"{{"mcpServers":{{"extended":{{"transport":{{"type":"stdio","command":"echo"}},"oauth":{{"accessToken":"{OAUTH_SECRET}"}}}}}}}}"#
+        ),
+    );
+    let credentialed_output = run_cli(
+        &home,
+        &proj,
+        &["list", "--target", "cline", "--format", "json"],
+    );
+    assert!(credentialed_output.status.success());
+    let credentialed_stdout = stdout_str(&credentialed_output);
+    assert!(!credentialed_stdout.contains(OAUTH_SECRET));
+    assert!(!stderr_str(&credentialed_output).contains(OAUTH_SECRET));
+    let credentialed_json: serde_json::Value =
+        serde_json::from_str(&credentialed_stdout).expect("parse credentialed Cline list JSON");
+    assert_eq!(
+        credentialed_json["servers"][0]["credentials_configured"],
+        true
+    );
+    assert_eq!(credentialed_json["redacted"], true);
 }
 
 #[test]

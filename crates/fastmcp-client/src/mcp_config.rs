@@ -55,22 +55,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use asupersync::Cx;
 use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult};
-use fastmcp_transport::StdioTransport;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
-    ChildGuard, Client, ClientBuilder, ClientProtocolPlan, ClientSession, HttpClient,
-    HttpClientError, RequestTimeoutPolicy, combine_cleanup_results, combine_operation_with_cleanup,
-    resolve_stdio_command, transport_error_to_mcp,
+    Client, ClientBuilder, ClientProtocolPlan, HttpClient, HttpClientError, RequestTimeoutPolicy,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
 };
-use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 
 // ============================================================================
 // Configuration Types
@@ -558,9 +553,7 @@ pub enum ConfigError {
     HttpPlanError(HttpEndpointConfigError),
     /// Configured HTTP client connection or initialization failed.
     HttpClientError(HttpClientError),
-    /// Failed to spawn server process.
-    SpawnError(String),
-    /// Server process started, but the MCP client lifecycle failed.
+    /// Configured subprocess creation or MCP client lifecycle failed.
     ClientError(McpError),
 }
 
@@ -577,7 +570,6 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::HttpPlanError(e) => write!(f, "Invalid configured HTTP plan: {e}"),
             ConfigError::HttpClientError(e) => write!(f, "HTTP MCP client lifecycle failed: {e}"),
-            ConfigError::SpawnError(e) => write!(f, "Failed to spawn server: {e}"),
             ConfigError::ClientError(e) => write!(f, "MCP client lifecycle failed: {e}"),
         }
     }
@@ -800,165 +792,17 @@ fn spawn_client_from_config(
     cx: &Cx,
     timeout_policy: RequestTimeoutPolicy,
 ) -> Result<Client, ConfigError> {
-    if cx.checkpoint().is_err() {
-        return Err(ConfigError::ClientError(McpError::request_cancelled()));
+    let mut builder = ClientBuilder::new()
+        .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
+        .request_timeout_policy(timeout_policy)
+        .envs(config.env.clone());
+    if let Some(cwd) = config.cwd.as_deref() {
+        builder = builder.working_dir(cwd);
     }
-
-    // Build the command
-    let executable = resolve_stdio_command(&config.command, config.cwd.as_deref().map(Path::new))
-        .map_err(ConfigError::ClientError)?;
-    let mut cmd = Command::new(executable);
-    cmd.args(&config.args);
-
-    // Set environment variables
-    for (key, value) in &config.env {
-        cmd.env(key, value);
-    }
-
-    // Set working directory if specified
-    if let Some(ref cwd) = config.cwd {
-        cmd.current_dir(cwd);
-    }
-
-    // Configure stdio
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
-    // Configuration expansion may consume the caller's cancellation budget.
-    // Re-admit the subprocess immediately before creation so an observed
-    // cancellation cannot still produce a child.
-    if cx.checkpoint().is_err() {
-        return Err(ConfigError::ClientError(McpError::request_cancelled()));
-    }
-    // Spawn the process
-    let child = cmd.spawn().map_err(|error| {
-        ConfigError::SpawnError(format!(
-            "Configured server process could not be started ({:?})",
-            error.kind()
-        ))
-    })?;
-    let mut child_guard = ChildGuard::new(child);
-
-    // Get stdin/stdout handles
-    let stdin = child_guard.child_mut().stdin.take().ok_or_else(|| {
-        ConfigError::SpawnError(format!("Failed to get stdin for server '{name}'"))
-    })?;
-    let stdout = child_guard.child_mut().stdout.take().ok_or_else(|| {
-        ConfigError::SpawnError(format!("Failed to get stdout for server '{name}'"))
-    })?;
-
-    // Create transport
-    let transport = StdioTransport::new(stdout, stdin);
-
-    // Create client info
-    let client_info = ClientInfo {
-        name: format!("fastmcp-client:{name}"),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
-    let client_capabilities = ClientCapabilities::default();
-
-    // Create client and initialize
-    create_and_initialize_client(
-        child_guard.disarm(),
-        transport,
-        cx,
-        client_info,
-        client_capabilities,
-        timeout_policy,
-    )
-    .map_err(ConfigError::ClientError)
-}
-
-/// Creates a client and performs initialization handshake.
-fn create_and_initialize_client(
-    child: Child,
-    mut transport: StdioTransport<ChildStdout, ChildStdin>,
-    cx: &Cx,
-    client_info: ClientInfo,
-    client_capabilities: ClientCapabilities,
-    timeout_policy: RequestTimeoutPolicy,
-) -> McpResult<Client> {
-    use fastmcp_transport::Transport;
-
-    let child_guard = ChildGuard::new(child);
-    let init_result = match crate::initialize_child_transport(
-        &mut transport,
-        cx,
-        &client_info,
-        &client_capabilities,
-        timeout_policy,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            return combine_operation_with_cleanup(Err(error), || {
-                combine_cleanup_results(
-                    transport.close().map_err(transport_error_to_mcp),
-                    child_guard.cleanup(),
-                )
-            });
-        }
-    };
-
-    // The child peer controls the selected version, so keep this boundary
-    // fallible even though the shared initialization validator already checks it.
-    let session = match ClientSession::try_new(
-        client_info,
-        client_capabilities,
-        init_result.server_info,
-        init_result.capabilities,
-        init_result.protocol_version,
-    ) {
-        Ok(session) => match session
-            .with_legacy_instructions(init_result.instructions)
-            .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
-        {
-            Ok(session) => session,
-            Err(_) => {
-                return combine_operation_with_cleanup(
-                    Err(McpError::internal_error(
-                        "Configured legacy initialization selected an incompatible protocol era",
-                    )),
-                    || {
-                        combine_cleanup_results(
-                            transport.close().map_err(transport_error_to_mcp),
-                            child_guard.cleanup(),
-                        )
-                    },
-                );
-            }
-        },
-        Err(_) => {
-            return combine_operation_with_cleanup(
-                Err(McpError::internal_error(
-                    "Server selected an unsupported MCP protocol version",
-                )),
-                || {
-                    combine_cleanup_results(
-                        transport.close().map_err(transport_error_to_mcp),
-                        child_guard.cleanup(),
-                    )
-                },
-            );
-        }
-    };
-
-    if cx.checkpoint().is_err() {
-        return combine_operation_with_cleanup(Err(McpError::request_cancelled()), || {
-            combine_cleanup_results(
-                transport.close().map_err(transport_error_to_mcp),
-                child_guard.cleanup(),
-            )
-        });
-    }
-
-    // Return client
-    Ok(Client::from_parts(
-        child_guard.disarm(),
-        transport,
-        cx.clone(),
-        session,
-        timeout_policy,
-    ))
+    let arguments = config.args.iter().map(String::as_str).collect::<Vec<_>>();
+    builder
+        .connect_stdio_once_with_cx(&config.command, &arguments, cx)
+        .map_err(ConfigError::ClientError)
 }
 
 // ============================================================================
@@ -1707,7 +1551,7 @@ mod tests {
             Ok(_) => panic!("an unresolved command must not create a client"),
             Err(error) => error,
         };
-        assert!(matches!(active_error, ConfigError::SpawnError(_)));
+        assert!(matches!(active_error, ConfigError::ClientError(_)));
         assert!(!matches!(
             active_error,
             ConfigError::ClientError(McpError {
@@ -1807,38 +1651,29 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
-    fn config_legacy_initialization_returns_a_legacy_only_session_plan() {
-        let initialize_response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "serverInfo": {"name": "configured-legacy", "version": "1.0.0"}
-            }
-        });
-        let response_line = serde_json::to_string(&initialize_response)
-            .expect("serialize exact legacy initialization response");
-        assert!(
-            !response_line.contains('\''),
-            "the shell fixture requires a single-quote-free JSON line"
-        );
-        let script = format!(
-            "IFS= read -r _; printf '%s\\n' '{response_line}'; IFS= read -r _; exec sleep 2"
-        );
+    fn config_client_auto_reopens_a_fresh_child_for_exact_legacy_fallback() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}';
+                    exec sleep 2 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"configured-legacy","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
         let mut config = McpConfig::new();
-        config.add_server(
-            "legacy",
-            ServerConfig::new("sh").with_args(["-c", script.as_str()]),
-        );
+        config.add_server("legacy", ServerConfig::new("sh").with_args(["-c", script]));
 
         let mut client = config
             .client(&Cx::for_request(), "legacy")
-            .expect("configured stdio client completes exact legacy initialization");
+            .expect("the correlated refusal authorizes one fresh legacy child");
 
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
         assert_eq!(
             client.selected_protocol_era(),
             Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
@@ -1848,42 +1683,90 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn config_legacy_initialization_rejects_only_a_modern_peer_version() {
-        let initialize_response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "protocolVersion": "2026-07-28",
-                "capabilities": {},
-                "serverInfo": {"name": "configured-legacy", "version": "1.0.0"}
-            }
-        });
-        let response_line = serde_json::to_string(&initialize_response)
-            .expect("serialize wrong-era initialization response");
-        assert!(
-            !response_line.contains('\''),
-            "the shell fixture requires a single-quote-free JSON line"
-        );
-        let script = format!("IFS= read -r _; printf '%s\\n' '{response_line}'; exec sleep 2");
+    fn config_client_uses_modern_first_builder_with_identity_cwd_and_environment() {
+        let cwd = std::env::current_dir().expect("current directory is available");
+        let cwd = cwd
+            .to_str()
+            .expect("test workspace path is valid UTF-8")
+            .to_owned();
+        let script = r#"test "$PWD" = "$FASTMCP_CONFIG_EXPECTED_CWD" || exit 91;
+            test "$FASTMCP_CONFIG_CANARY" = "config-modern-env" || exit 92;
+            IFS= read -r discover || exit 93;
+            case "$discover" in *server/discover*) ;; *) exit 94 ;; esac;
+            case "$discover" in *fastmcp-client:modern*) ;; *) exit 95 ;; esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"configured-modern","version":"1.0.0"}}}}';
+            exec sleep 2"#;
         let mut config = McpConfig::new();
         config.add_server(
-            "legacy",
-            ServerConfig::new("sh").with_args(["-c", script.as_str()]),
+            "modern",
+            ServerConfig::new("sh")
+                .with_args(["-c", script])
+                .with_cwd(cwd.as_str())
+                .with_env("FASTMCP_CONFIG_EXPECTED_CWD", cwd.as_str())
+                .with_env("FASTMCP_CONFIG_CANARY", "config-modern-env"),
         );
+        let timeout_policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(4),
+        )
+        .expect("configured modern timeout policy is valid");
 
-        let error = match config.client(&Cx::for_request(), "legacy") {
-            Err(error) => error,
-            Ok(_) => {
-                panic!("changing only the peer era must reject configured legacy initialization")
-            }
-        };
+        let mut client = config
+            .client_with_timeout_policy(&Cx::for_request(), "modern", timeout_policy)
+            .expect("configured stdio client completes modern discovery");
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        assert_eq!(client.protocol_version(), "2026-07-28");
+        assert_eq!(client.request_timeout_policy(), timeout_policy);
+        client.close().expect("configured modern client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn config_client_wrong_id_discovery_never_authorizes_legacy_fallback() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found"}}';
+                    exec sleep 2 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"forbidden-legacy","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let mut config = McpConfig::new();
+        config.add_server(
+            "wrong-id",
+            ServerConfig::new("sh").with_args(["-c", script]),
+        );
+        let config_before = config.to_json();
+        let timeout_policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("bounded wrong-ID policy is valid");
+
+        let error =
+            match config.client_with_timeout_policy(&Cx::for_request(), "wrong-id", timeout_policy)
+            {
+                Err(error) => error,
+                Ok(mut client) => {
+                    let _ = client.close();
+                    panic!("a wrong-ID discovery refusal must not open a legacy child")
+                }
+            };
 
         assert!(matches!(error, ConfigError::ClientError(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("Server selected an unsupported MCP protocol version")
-        );
+        assert_eq!(config.to_json(), config_before);
     }
 
     #[test]
@@ -2043,14 +1926,6 @@ mod tests {
         assert_eq!(config.env.get("A"), Some(&"1".to_string()));
         assert_eq!(config.env.get("B"), Some(&"2".to_string()));
         assert_eq!(config.env.get("C"), Some(&"3".to_string()));
-    }
-
-    #[test]
-    fn test_config_spawn_error_display() {
-        let err = ConfigError::SpawnError("process died".into());
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("spawn"));
-        assert!(msg.contains("process died"));
     }
 
     #[test]

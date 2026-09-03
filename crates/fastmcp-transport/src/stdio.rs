@@ -864,10 +864,16 @@ pub struct StdioRecvHalf<R> {
 }
 
 impl<R> StdioRecvHalf<R> {
-    /// Returns whether either split half has entered a terminal state.
+    /// Returns whether ingress has closed or either split half has entered a
+    /// shared terminal state.
+    ///
+    /// A clean reader EOF closes only this receive half. The independently
+    /// owned send half remains open so a request admitted before EOF can still
+    /// commit its response. Explicit close and non-EOF terminal failures are
+    /// shared with the send half.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
+        self.transport.closed || self.terminal.load(Ordering::Acquire)
     }
 }
 
@@ -890,10 +896,14 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
         }
 
         let result = self.transport.recv(cx);
-        if self.transport.is_closed() {
+        let sibling_closed = self.terminal.load(Ordering::Acquire);
+        let receiver_closed = self.transport.is_closed();
+        let clean_eof =
+            receiver_closed && !sibling_closed && matches!(&result, Err(TransportError::Closed));
+        if receiver_closed && !clean_eof {
             self.terminal.store(true, Ordering::Release);
         }
-        if self.is_closed() && result.is_ok() {
+        if result.is_ok() && (receiver_closed || self.terminal.load(Ordering::Acquire)) {
             return Err(TransportError::Closed);
         }
         result
@@ -951,10 +961,14 @@ impl<R: Read + AsFd> StdioRecvHalf<R> {
             .map(|(message, _completed_at)| message);
         let sibling_closed = self.terminal.load(Ordering::Acquire);
         let receiver_closed = self.transport.is_closed();
-        if receiver_closed {
+        let clean_eof =
+            receiver_closed && !sibling_closed && matches!(&result, Err(TransportError::Closed));
+        if receiver_closed && !clean_eof {
             self.terminal.store(true, Ordering::Release);
         }
-        if sibling_closed || (receiver_closed && result.is_ok()) {
+        if sibling_closed
+            || result.is_ok() && (receiver_closed || self.terminal.load(Ordering::Acquire))
+        {
             return Err(TransportError::Closed);
         }
         result
@@ -976,7 +990,11 @@ impl<W: Write> StdioSendHalf<W> {
         self.terminal.store(true, Ordering::Release);
     }
 
-    /// Returns whether either split half has entered a terminal state.
+    /// Returns whether egress has closed or either split half has entered a
+    /// shared terminal state.
+    ///
+    /// A clean EOF observed only by the receive half is not a shared terminal
+    /// state and therefore does not close this sender.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed || self.terminal.load(Ordering::Acquire)
@@ -2545,6 +2563,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stdio_split_pollable_clean_eof_preserves_response_egress() {
+        let (mut peer, reader) = UnixStream::pair().expect("create split peer");
+        peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n")
+            .expect("write split ingress");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("half-close split ingress");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let transport = StdioTransport::new(reader, SharedWriter(Arc::clone(&output)));
+        let (mut recv_half, mut send_half) = transport.into_split();
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            recv_half.recv_until_or_closed(&cx, None),
+            Ok(JsonRpcMessage::Request(_))
+        ));
+        assert!(matches!(
+            recv_half.recv_until_or_closed(&cx, None),
+            Err(TransportError::Closed)
+        ));
+        assert!(recv_half.is_closed(), "clean EOF closes pollable ingress");
+        assert!(
+            !send_half.is_closed(),
+            "pollable clean EOF must not invalidate response egress"
+        );
+        send_half
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::json!({"tools": []}),
+                )),
+            )
+            .expect("an admitted pollable request can respond after clean EOF");
+
+        let bytes = output.lock().expect("shared split output lock").clone();
+        let mut output_reader = StdioTransport::new(Cursor::new(bytes), Vec::new());
+        let JsonRpcMessage::Response(response) = output_reader
+            .recv(&Cx::for_testing())
+            .expect("pollable clean-EOF response")
+        else {
+            panic!("expected pollable clean-EOF response");
+        };
+        assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stdio_split_pollable_receive_wakes_on_send_close() {
         let (_peer, reader) = UnixStream::pair().expect("create split peer");
         let (entered_poll_tx, entered_poll_rx) = mpsc::channel();
@@ -2640,6 +2705,81 @@ mod tests {
                 )),
             )
             .expect("a preserved complete frame must leave both halves usable");
+    }
+
+    #[test]
+    fn stdio_split_clean_eof_half_closes_ingress_but_preserves_egress() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n";
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+
+        {
+            let transport = StdioTransport::new(Cursor::new(input.to_vec()), &mut output);
+            let (mut recv_half, mut send_half) = transport.into_split();
+
+            assert!(matches!(
+                recv_half.recv(&cx),
+                Ok(JsonRpcMessage::Request(_))
+            ));
+            assert!(matches!(recv_half.recv(&cx), Err(TransportError::Closed)));
+            assert!(recv_half.is_closed(), "clean EOF closes ingress");
+            assert!(
+                !send_half.is_closed(),
+                "clean EOF must not invalidate independent response egress"
+            );
+            send_half
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"tools": []}),
+                    )),
+                )
+                .expect("a response admitted before clean EOF must still commit");
+        }
+
+        let mut output_reader = StdioTransport::new(Cursor::new(output), Vec::new());
+        assert!(matches!(
+            output_reader.recv(&Cx::for_testing()),
+            Ok(JsonRpcMessage::Response(_))
+        ));
+    }
+
+    #[test]
+    fn stdio_split_explicit_receive_close_remains_shared_terminal() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}\n";
+        let mut output = Vec::new();
+        let cx = Cx::for_testing();
+
+        {
+            let transport = StdioTransport::new(Cursor::new(input.to_vec()), &mut output);
+            let (mut recv_half, mut send_half) = transport.into_split();
+
+            assert!(matches!(
+                recv_half.recv(&cx),
+                Ok(JsonRpcMessage::Request(_))
+            ));
+            recv_half
+                .close()
+                .expect("explicit receive-half close succeeds");
+            assert!(recv_half.is_closed());
+            assert!(
+                send_half.is_closed(),
+                "explicit close remains shared terminal"
+            );
+            assert!(matches!(
+                send_half.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        fastmcp_protocol::RequestId::Number(1),
+                        serde_json::json!({"tools": []}),
+                    )),
+                ),
+                Err(TransportError::Closed)
+            ));
+        }
+
+        assert!(output.is_empty(), "shared terminal close must not write");
     }
 
     #[test]

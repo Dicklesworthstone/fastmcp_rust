@@ -156,8 +156,8 @@ required-features = ["testing-lab", "tasks", "legacy-2024-11-05"]
 [[bin]]
 name = "echo_server"
 path = "examples/echo_server.rs"
-# The integration target launches this shipped executable through Cargo's
-# deterministic CARGO_BIN_EXE_echo_server environment binding.
+# The CLI integration target launches an explicit freshly built instance of
+# this shipped executable rather than a scripted fixture.
 required-features = ["legacy-2024-11-05", "tasks"]
 
 [[example]]

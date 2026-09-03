@@ -232,7 +232,9 @@ fn setup_test_server_and_client() -> TestHarness {
     // Run server in background thread
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -255,7 +257,9 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -332,7 +336,9 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     let mut trace = TestTrace::new("e2e-auth-static-token");
 
     // Unauthorized tools/list.
-    let params = json!({ "cursor": null });
+    // Exact 2024-11-05 admission types `cursor?: string`; an explicit null is
+    // refused before authentication, so an unauthenticated probe omits it.
+    let params = json!({});
     let corr = trace.log_request("tools/list", Some(&params));
     let err = client.send_request_json("tools/list", params).unwrap_err();
     trace.log_response(
@@ -343,7 +349,7 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     assert_eq!(err.code, McpErrorCode::ResourceForbidden);
 
     // Invalid token should be rejected.
-    let params = json!({ "cursor": null, "auth": "Bearer bad-token" });
+    let params = json!({ "auth": "Bearer bad-token" });
     let corr = trace.log_request("tools/list", Some(&params));
     let err = client.send_request_json("tools/list", params).unwrap_err();
     trace.log_response(
@@ -354,7 +360,7 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
     assert_eq!(err.code, McpErrorCode::ResourceForbidden);
 
     // Authorized tools/list.
-    let params = json!({ "cursor": null, "auth": "Bearer good-token" });
+    let params = json!({ "auth": "Bearer good-token" });
     let corr = trace.log_request("tools/list", Some(&params));
     let value = client.send_request_json("tools/list", params).unwrap();
     trace.log_response(&corr, Some(&value), None::<&serde_json::Value>);
@@ -554,8 +560,19 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     );
 
     // Revoke access token: request should now be forbidden.
-    oauth.revoke(&access, "test-client", None).unwrap();
-    let params = json!({ "cursor": null, "auth": format!("Bearer {access}") });
+    // RFC 7009: a confidential client must authenticate to revoke its token.
+    // Near-identical negative: the same call without the secret is refused.
+    assert!(
+        matches!(
+            oauth.revoke(&access, "test-client", None),
+            Err(fastmcp_rust::oauth::OAuthError::InvalidClient { .. })
+        ),
+        "revocation without the confidential client's secret must be refused"
+    );
+    oauth
+        .revoke(&access, "test-client", Some(CLIENT_SECRET))
+        .unwrap();
+    let params = json!({ "auth": format!("Bearer {access}") });
     let corr = trace.log_request("tools/list(revoked)", Some(&params));
     let err = mcp_client
         .send_request_json("tools/list", params)
@@ -1119,7 +1136,9 @@ fn e2e_server_with_tools_only() {
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1145,7 +1164,9 @@ fn e2e_server_with_resources_only() {
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1169,7 +1190,9 @@ fn e2e_server_with_prompts_only() {
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1193,7 +1216,9 @@ fn e2e_empty_server() {
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1218,7 +1243,9 @@ fn e2e_custom_client_info() {
 
     let handle = spawn_thread(move || {
         let cx = Cx::for_testing();
-        server.run_transport_with_cx(&cx, server_transport);
+        server
+            .run_transport_returning_with_cx(&cx, server_transport)
+            .expect("server transport loop settles cleanly");
     });
 
     let client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");
@@ -2537,6 +2564,13 @@ fn e2e_public_stdio_tools_list_changed_is_retained_on_incremental_listen() {
             )
         ),
         "live stdio must retain notifications/tools/list_changed on the incremental listener: {changed:?}"
+    );
+    assert!(
+        client
+            .try_next_subscription_event(&cx, &cancellation)
+            .expect("the live subscription remains valid after the catalog change")
+            .is_none(),
+        "one catalog mutation must emit exactly one modern subscription notification"
     );
     client
         .close()
@@ -4032,11 +4066,11 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
     let legacy_resource = client
         .read_resource("info://mrtr-resource")
         .expect_err("exact-2024 cannot activate the final MRTR resource handler");
+    // The router redacts every handler-returned internal error toward the
+    // peer (router `sanitize_handler_error`); the exact macro hint stays in
+    // the server incident log, never on the wire.
     assert_eq!(legacy_resource.code, McpErrorCode::InternalError);
-    assert_eq!(
-        legacy_resource.message,
-        "final #[resource] handlers must be invoked through ResourceHandler::read_final"
-    );
+    assert_eq!(legacy_resource.message, "Internal server error");
     let legacy_prompt = client
         .get_prompt(
             "mrtr_prompt",
@@ -4044,10 +4078,7 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
         )
         .expect_err("exact-2024 cannot activate the final MRTR prompt handler");
     assert_eq!(legacy_prompt.code, McpErrorCode::InternalError);
-    assert_eq!(
-        legacy_prompt.message,
-        "final #[prompt] handlers must be invoked through PromptHandler::get_final"
-    );
+    assert_eq!(legacy_prompt.message, "Internal server error");
     client.close().expect("legacy-only stdio client cleanup");
 }
 
@@ -4559,12 +4590,16 @@ fn e2e_public_stdio_legacy_notification_tools_list_changed_is_retained() {
     let notifications = client
         .take_server_notifications()
         .expect("exact-2024 stdio notifications must decode");
-    assert!(
-        notifications.iter().any(|notification| matches!(
-            notification,
-            legacy_2024::ServerNotification::ToolsListChanged
-        )),
-        "live exact-2024 stdio must retain notifications/tools/list_changed: {notifications:?}"
+    assert_eq!(
+        notifications
+            .iter()
+            .filter(|notification| matches!(
+                notification,
+                legacy_2024::ServerNotification::ToolsListChanged
+            ))
+            .count(),
+        1,
+        "one catalog mutation must emit exactly one exact-2024 tools/list_changed notification: {notifications:?}"
     );
 
     client

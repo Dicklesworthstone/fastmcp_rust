@@ -4,18 +4,19 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run -p fastmcp-rust --example echo_server
+//! cargo run -p fastmcp-rust --bin echo_server
 //! ```
 //!
 //! Test with MCP Inspector:
 //! ```bash
-//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --example echo_server
+//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --bin echo_server
 //! ```
 
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -1240,7 +1241,7 @@ async fn run_stdio(server: fastmcp_server::Server, cx: &Cx) -> McpResult<()> {
 // Main
 // ============================================================================
 
-fn main() {
+fn main() -> ExitCode {
     let task_runtime = FinalTaskRuntime::in_memory_with_capacity(
         1,
         FinalTaskRuntimeConfig::new(60_000, Some(1_000))
@@ -1443,18 +1444,22 @@ fn main() {
         .blocking_threads(4, 64)
         .build()
         .expect("the example caller runtime initializes");
-    application_runtime
-        .block_on(async move {
-            let cx = Cx::current().expect("the example caller runtime installs its Cx");
-            match protocol_policy {
-                // The component builder read FASTMCP_PROTOCOL_POLICY before
-                // registration. Exact 2024 gets no Task service and its
-                // dispatch remains blind to the modern Tasks extension.
-                ProtocolPolicy::LegacyOnly => run_stdio(server, &cx).await,
-                ProtocolPolicy::Auto | ProtocolPolicy::ModernOnly => {
-                    run_tasks_stdio(server, task_runtime, task_runner, &cx).await
-                }
+    match application_runtime.block_on(async move {
+        let cx = Cx::current().expect("the example caller runtime installs its Cx");
+        match protocol_policy {
+            // The component builder read FASTMCP_PROTOCOL_POLICY before
+            // registration. Exact 2024 gets no Task service and its
+            // dispatch remains blind to the modern Tasks extension.
+            ProtocolPolicy::LegacyOnly => run_stdio(server, &cx).await,
+            ProtocolPolicy::Auto | ProtocolPolicy::ModernOnly => {
+                run_tasks_stdio(server, task_runtime, task_runner, &cx).await
             }
-        })
-        .expect("the caller-owned stdio server and Task service settle cleanly");
+        }
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_error) => {
+            eprintln!("echo server terminated with an error");
+            ExitCode::FAILURE
+        }
+    }
 }

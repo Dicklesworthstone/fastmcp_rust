@@ -3341,11 +3341,16 @@ impl McpContext {
     }
 
     fn emit_catalog_changed(&self, kind: McpCatalogKind) {
-        if let Some(sender) = self.log_sender.as_ref() {
-            sender.send_catalog_changed(kind);
-        }
+        // A modern session delivers catalog changes only through its
+        // `subscriptions/listen` publisher, tagged per subscription. The
+        // untagged broadcast is the exact-2024 shape; emitting both on one
+        // session double-delivers the same change to a modern peer.
         if let Some(publisher) = self.catalog_publisher.as_ref() {
             let _ = publisher.publish_catalog_changed(kind);
+            return;
+        }
+        if let Some(sender) = self.log_sender.as_ref() {
+            sender.send_catalog_changed(kind);
         }
     }
 
@@ -4974,6 +4979,66 @@ mod tests {
         assert!(ctx.disable_tool("admin"));
         assert!(ctx.disable_tool("admin"));
         assert_eq!(*captured.lock().expect("lock"), vec![McpCatalogKind::Tools]);
+    }
+
+    /// A modern session installs both a session notification sender and a
+    /// `subscriptions/listen` catalog publisher. One catalog mutation must
+    /// reach the peer exactly once, through the publisher; the untagged
+    /// session broadcast is the exact-2024 shape and stays reserved for
+    /// sessions without a publisher.
+    #[test]
+    fn catalog_publisher_supersedes_the_session_broadcast() {
+        struct CaptureSender(Arc<Mutex<Vec<McpCatalogKind>>>);
+        impl NotificationSender for CaptureSender {
+            fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+            fn send_resource_updated(&self, _uri: &str) {}
+            fn send_catalog_changed(&self, kind: McpCatalogKind) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(kind);
+            }
+        }
+        struct CapturePublisher(Arc<Mutex<Vec<McpCatalogKind>>>);
+        impl CatalogChangePublisher for CapturePublisher {
+            fn publish_catalog_changed(&self, kind: McpCatalogKind) -> bool {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(kind);
+                true
+            }
+            fn publish_resource_updated(&self, _uri: &str) -> bool {
+                false
+            }
+        }
+
+        // Positive: publisher installed, the broadcast sender stays silent.
+        let broadcast = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
+            .with_log_sender(Arc::new(CaptureSender(Arc::clone(&broadcast))))
+            .with_catalog_publisher(Arc::new(CapturePublisher(Arc::clone(&published))));
+        assert!(ctx.disable_prompt("greeting"));
+        assert_eq!(
+            *published.lock().expect("lock"),
+            vec![McpCatalogKind::Prompts]
+        );
+        assert!(
+            broadcast.lock().expect("lock").is_empty(),
+            "a session with a catalog publisher must not also broadcast the change"
+        );
+
+        // Near-identical negative: the same mutation without a publisher
+        // still reaches the exact-2024 session broadcast.
+        let broadcast = Arc::new(Mutex::new(Vec::new()));
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
+            .with_log_sender(Arc::new(CaptureSender(Arc::clone(&broadcast))));
+        assert!(ctx.disable_prompt("greeting"));
+        assert_eq!(
+            *broadcast.lock().expect("lock"),
+            vec![McpCatalogKind::Prompts]
+        );
     }
 
     #[test]
