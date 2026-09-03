@@ -4122,7 +4122,7 @@ async fn cmd_test(
     // Only invoke capability-specific methods the server advertised.
     let tools_result = advertised("tools").map_or_else(
         || skipped_test("list_tools", "server did not advertise tools"),
-        |_| {
+        |()| {
             run_test("list_tools", || {
                 let (items, truncated) = inspect_tools_result(client.list_tools_typed(None)?)?;
                 let qualifier = if truncated {
@@ -4141,7 +4141,7 @@ async fn cmd_test(
 
     let resources_result = advertised("resources").map_or_else(
         || skipped_test("list_resources", "server did not advertise resources"),
-        |_| {
+        |()| {
             run_test("list_resources", || {
                 let (items, truncated) =
                     inspect_resources_result(client.list_resources_typed(None)?)?;
@@ -4163,7 +4163,7 @@ async fn cmd_test(
 
     let prompts_result = advertised("prompts").map_or_else(
         || skipped_test("list_prompts", "server did not advertise prompts"),
-        |_| {
+        |()| {
             run_test("list_prompts", || {
                 let (items, truncated) = inspect_prompts_result(client.list_prompts_typed(None)?)?;
                 let qualifier = if truncated {
