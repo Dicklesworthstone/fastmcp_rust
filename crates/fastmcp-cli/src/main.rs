@@ -6306,7 +6306,7 @@ fn bound_inspect_items<T: Serialize>(
 }
 
 fn inspect_icon_from_final(
-    icons: Option<Vec<fastmcp_protocol::RawIcon>>,
+    icons: Option<Vec<fastmcp_protocol::common_types::RawIcon>>,
 ) -> Option<fastmcp_protocol::Icon> {
     let icon = icons?.into_iter().next()?;
     Some(fastmcp_protocol::Icon {
@@ -14185,11 +14185,11 @@ mod tests {
 
         #[test]
         fn final_tool_projection_is_cli_local_and_preserves_displayable_fields() {
-            let icon = fastmcp_protocol::RawIcon::try_with_details(
+            let icon = fastmcp_protocol::common_types::RawIcon::try_with_details(
                 "https://example.test/tool.png",
                 Some("image/png".to_owned()),
                 Some(vec!["16x16".to_owned(), "32x32".to_owned()]),
-                Some(fastmcp_protocol::IconTheme::Dark),
+                Some(fastmcp_protocol::common_types::IconTheme::Dark),
             )
             .expect("valid final icon");
             let projected = inspect_tool_from_final(fastmcp_protocol::FinalTool {

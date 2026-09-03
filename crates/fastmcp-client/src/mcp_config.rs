@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use asupersync::Cx;
-use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult};
+use fastmcp_core::{CanonicalHttpUrl, McpError};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
