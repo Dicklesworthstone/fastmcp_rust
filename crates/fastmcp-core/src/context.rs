@@ -3341,16 +3341,15 @@ impl McpContext {
     }
 
     fn emit_catalog_changed(&self, kind: McpCatalogKind) {
-        // A modern session delivers catalog changes only through its
-        // `subscriptions/listen` publisher, tagged per subscription. The
-        // untagged broadcast is the exact-2024 shape; emitting both on one
-        // session double-delivers the same change to a modern peer.
-        if let Some(publisher) = self.catalog_publisher.as_ref() {
-            let _ = publisher.publish_catalog_changed(kind);
-            return;
-        }
+        // Both sinks are notified: a session may install a notification
+        // sender, a `subscriptions/listen` catalog publisher, or both, and
+        // each owns its own delivery decision. Suppressing either one here
+        // silently drops catalog changes for the sessions that rely on it.
         if let Some(sender) = self.log_sender.as_ref() {
             sender.send_catalog_changed(kind);
+        }
+        if let Some(publisher) = self.catalog_publisher.as_ref() {
+            let _ = publisher.publish_catalog_changed(kind);
         }
     }
 
@@ -4981,13 +4980,12 @@ mod tests {
         assert_eq!(*captured.lock().expect("lock"), vec![McpCatalogKind::Tools]);
     }
 
-    /// A modern session installs both a session notification sender and a
-    /// `subscriptions/listen` catalog publisher. One catalog mutation must
-    /// reach the peer exactly once, through the publisher; the untagged
-    /// session broadcast is the exact-2024 shape and stays reserved for
-    /// sessions without a publisher.
+    /// A session may install a notification sender, a subscriptions/listen
+    /// catalog publisher, or both. Every installed sink must observe each
+    /// catalog mutation exactly once; suppressing either one silently drops
+    /// catalog changes for the sessions that depend on it.
     #[test]
-    fn catalog_publisher_supersedes_the_session_broadcast() {
+    fn catalog_mutations_reach_every_installed_sink() {
         struct CaptureSender(Arc<Mutex<Vec<McpCatalogKind>>>);
         impl NotificationSender for CaptureSender {
             fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
@@ -5013,7 +5011,7 @@ mod tests {
             }
         }
 
-        // Positive: publisher installed, the broadcast sender stays silent.
+        // Both installed: each sink observes the mutation exactly once.
         let broadcast = Arc::new(Mutex::new(Vec::new()));
         let published = Arc::new(Mutex::new(Vec::new()));
         let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
@@ -5024,13 +5022,13 @@ mod tests {
             *published.lock().expect("lock"),
             vec![McpCatalogKind::Prompts]
         );
-        assert!(
-            broadcast.lock().expect("lock").is_empty(),
-            "a session with a catalog publisher must not also broadcast the change"
+        assert_eq!(
+            *broadcast.lock().expect("lock"),
+            vec![McpCatalogKind::Prompts]
         );
 
-        // Near-identical negative: the same mutation without a publisher
-        // still reaches the exact-2024 session broadcast.
+        // Near-identical negative: with only the sender installed the same
+        // mutation still reaches it exactly once.
         let broadcast = Arc::new(Mutex::new(Vec::new()));
         let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
             .with_log_sender(Arc::new(CaptureSender(Arc::clone(&broadcast))));
