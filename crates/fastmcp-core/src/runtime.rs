@@ -18,6 +18,14 @@ use asupersync::runtime::Runtime;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 
+/// Upper bound on on-demand blocking threads for the shared bridge runtime.
+///
+/// The bridge hosts a transport receive pump and any handler the embedder puts
+/// on `Cx::spawn_blocking`; it is not a general-purpose worker pool, so the
+/// ceiling stays small, host-independent and deterministic. Threads are created
+/// only when blocking work is admitted and retire when idle.
+const MAX_BLOCKING_THREADS: usize = 16;
+
 thread_local! {
     /// Lazily initialized single-thread runtime with a platform I/O reactor.
     ///
@@ -47,6 +55,20 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
             RuntimeBuilder::current_thread()
                 .with_reactor(reactor)
+                // A blocking pool is REQUIRED, not an optimization.
+                // `Cx::spawn_blocking` falls back to running its closure INLINE
+                // when the ambient runtime has none, and the default pool
+                // configuration is `max_threads = 0` — no pool at all. A server
+                // that puts its receive pump on `Cx::spawn_blocking` (the stdio
+                // transport does) would then run that pump on the single worker
+                // thread, so the worker can never poll the request-owned child
+                // the router spawns for an ordinary request: the first request
+                // that admits a child never completes and the process stops
+                // answering (GitHub #65).
+                //
+                // `min_threads = 0` keeps the pool on-demand, so a process that
+                // never blocks still starts no extra thread.
+                .blocking_threads(0, MAX_BLOCKING_THREADS)
                 .build()
                 .expect("failed to build asupersync runtime")
         });

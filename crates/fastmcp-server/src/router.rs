@@ -4071,7 +4071,9 @@ impl Router {
         let spawn_request = request.clone();
         let spawn_raw_params = raw_params.clone();
         let spawn_continuation_cancellation = continuation_cancellation.clone();
+        eprintln!("DBG65B router pre-spawn");
         let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
+            eprintln!("DBG65B router child running");
             spawn_self
                 .dispatch_stateless_in_request(
                     &dispatch_ctx,
@@ -4089,6 +4091,7 @@ impl Router {
             // cancellation observations without child isolation. Every other
             // spawn failure (region closed, quota) stays a scheduling error.
             Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
+                eprintln!("DBG65B router inline fallback");
                 return self
                     .dispatch_stateless_in_request(
                         &request_ctx,
@@ -4106,6 +4109,7 @@ impl Router {
             }
         };
 
+        eprintln!("DBG65B router spawned, joining");
         match task.join(&join_cx).await {
             Ok(result) => result,
             Err(asupersync::runtime::JoinError::Panicked(_payload)) => {

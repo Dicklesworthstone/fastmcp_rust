@@ -58,5 +58,8 @@ jobs:
       - name: Test shipped no-legacy server graph
         run: cargo test --locked -p fastmcp-server --no-default-features --test srv_02_b -- --nocapture
 
+      - name: Test shipped no-legacy multi-request lifecycle (GH #65)
+        run: cargo test --locked -p fastmcp-server --no-default-features --test srv_65_modern_multi_request -- --nocapture
+
       - name: Lint shipped no-legacy server graph
-        run: cargo clippy --locked -p fastmcp-server --no-default-features --test srv_02_b -- -D warnings
+        run: cargo clippy --locked -p fastmcp-server --no-default-features --test srv_02_b --test srv_65_modern_multi_request -- -D warnings
