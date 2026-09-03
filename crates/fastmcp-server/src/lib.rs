@@ -18288,7 +18288,10 @@ impl Server {
         let ctx = McpContext::with_state(cx.clone(), request_id, state)
             .with_request_cancellation(request_cancellation)
             .with_budget_ceiling(budget);
-        self.attach_request_scoped_component_access(ctx)
+        // A handler that mutates the catalog on this path must still reach the
+        // `subscriptions/listen` publisher; dropping it here silently stopped
+        // every handler-driven `list_changed` from reaching modern listeners.
+        self.attach_request_scoped_component_access(self.with_final_catalog_publisher(ctx))
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))
     }
