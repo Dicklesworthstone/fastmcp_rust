@@ -1916,9 +1916,16 @@ impl ToolHandler for PublicStateOnlyMrtrTool {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         Box::pin(async move {
+            // Every modern final tool call reaches this hook: `None` marks the
+            // initial invocation and `Some` an admitted retry, so the initial
+            // leg must issue the continuation here rather than error. The
+            // non-resuming `call_final_outcome` above is unreachable on the
+            // modern path.
             let Some(resume_inputs) = resume_inputs else {
-                return Outcome::Err(McpError::internal_error(
-                    "state-only MRTR resume inputs were not supplied",
+                self.initial_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Outcome::Ok(FinalToolOutcome::InputRequired(
+                    state_only_mrtr_input_required(),
                 ));
             };
             if !resume_inputs.responses().is_empty() {
