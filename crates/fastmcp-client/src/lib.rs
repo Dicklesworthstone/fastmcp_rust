@@ -16332,7 +16332,14 @@ impl Client {
         let params_value = if declare_tasks {
             self.with_final_tasks_client_capability(params_value)?
         } else {
-            self.prepare_request_parameters(params_value)?
+            // An extension is negotiated per request and stays disabled unless
+            // this call opted in. The configured client extension settings
+            // would otherwise re-advertise Tasks here, letting a task-capable
+            // tool create a durable Task for a caller that cannot represent
+            // one. The cancellation-aware request path strips it the same way.
+            let mut params_value = self.prepare_request_parameters(params_value)?;
+            remove_tasks_client_extension(&mut params_value);
+            params_value
         };
         #[cfg(not(feature = "tasks"))]
         let params_value = {

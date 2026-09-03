@@ -591,7 +591,9 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             code: None,
             redirect_uri: None,
             client_id: "test-client".to_string(),
-            client_secret: None,
+            // RFC 6749 §6: a confidential client authenticates on the
+            // refresh_token grant exactly as it did on the code exchange.
+            client_secret: Some(CLIENT_SECRET.to_string()),
             code_verifier: None,
             refresh_token: Some(refresh),
             scopes: None,
@@ -1529,13 +1531,27 @@ fn e2e_public_stdio_auto_selects_modern_on_the_shipped_facade_server() {
         client.server_discovery().is_some(),
         "a modern selection retains its public discovery observable"
     );
-    let tools = client
-        .list_tools()
+    // A modern catalog carries the required `ttlMs`/`cacheScope` directives,
+    // which the flattened exact-2024 convenience shape cannot express. The
+    // typed verb is the supported modern path and preserves them.
+    let listed = client
+        .list_tools_typed(None)
         .expect("the selected modern stdio client accepts tools/list");
+    let fastmcp_rust::CoreResult::Final(modern::FinalCoreResult::ToolsList { result, .. }) = listed
+    else {
+        panic!("a modern selection returns the final tools/list result");
+    };
     assert!(
-        tools.iter().any(|tool| tool.name == "echo"),
+        result.payload.tools.iter().any(|tool| tool.name == "echo"),
         "the modern tools/list result must expose the shipped echo tool"
     );
+    // Planted negative pinning the projection contract: the exact-2024
+    // convenience verb refuses the same modern catalog rather than silently
+    // dropping its cache directives.
+    let refused = client
+        .list_tools()
+        .expect_err("the legacy convenience verb cannot represent modern cache fields");
+    assert_eq!(refused.code, McpErrorCode::InvalidRequest);
     client.close().expect("modern stdio client cleanup");
 }
 

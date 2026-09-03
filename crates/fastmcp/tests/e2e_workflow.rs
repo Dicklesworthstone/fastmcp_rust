@@ -1639,8 +1639,16 @@ impl Drop for FinalTasksHttpFixture {
         if let Err(error) =
             settle_final_tasks_http_server(&self.shutdown, &self.finished, &mut self.join)
         {
-            eprintln!("final Tasks HTTP server fixture drop failed: {error}");
-            std::process::abort();
+            // A fixture teardown failure must fail its own test, never abort
+            // the harness: `std::process::abort()` here destroyed the original
+            // panic message and every other test's result in the same binary.
+            assert!(
+                std::thread::panicking(),
+                "final Tasks HTTP server fixture drop failed: {error}"
+            );
+            eprintln!(
+                "final Tasks HTTP server fixture drop failed while already panicking: {error}"
+            );
         }
     }
 }
