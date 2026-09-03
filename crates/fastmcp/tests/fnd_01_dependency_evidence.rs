@@ -1753,7 +1753,7 @@ mod trust_std {
             // module; ordinary offline compilation only exercises the shared
             // relative-path grammar that the guard reuses before any FS walk.
             for relative in ["../escape", "target/../debug", "./target", "target//debug"] {
-                assert!(validate_relative_path(relative, "synthetic invalid root").is_err(), "non-normal root {relative:?} must fail before I/O",);
+                assert!(validate_relative_path(relative, "synthetic invalid root").is_err(), "non-normal root {relative:?} must fail before I/O");
             }
             assert!(
                 validate_relative_path(".fnd01-run/integration-producer/0123456789abcdef0123456789abcdef", "synthetic valid root",).is_ok(),
@@ -1814,7 +1814,7 @@ mod trust_std {
                 "E_SPACE_BOUND",
             );
 
-            let missing = PathBuf::from(format!("/proc/{}/fnd01-space-missing", std::process::id(),));
+            let missing = PathBuf::from(format!("/proc/{}/fnd01-space-missing", std::process::id()));
             assert!(
                 snapshot_usage_roots_nofollow(&[missing], FilesystemUsageCap { max_entry_count: 1, max_regular_file_bytes: 1 }, "missing no-follow root",)
                     .expect("a bookended missing root is zero usage")
@@ -9246,7 +9246,7 @@ mod trust_std {
                 "cfg(unix)\t",
                 "not-cfg(foo)",
             ] {
-                assert!(validate_sparse_target(invalid, "invalid target").is_err(), "{invalid}",);
+                assert!(validate_sparse_target(invalid, "invalid target").is_err(), "{invalid}");
             }
         }
     }
@@ -9307,7 +9307,7 @@ mod trust_std {
             for index in 0..produce.len() {
                 let mut changed = produce.clone();
                 changed[index].push('x');
-                assert!(validate_ordinary_handoff_argv(&changed, BootstrapMode::Produce, executable, run_id, &produce[4],).is_err(), "argv position {index} must be bound",);
+                assert!(validate_ordinary_handoff_argv(&changed, BootstrapMode::Produce, executable, run_id, &produce[4]).is_err(), "argv position {index} must be bound");
             }
             assert!(validate_ordinary_handoff_argv(&produce[..4], BootstrapMode::Produce, executable, run_id, &produce[4],).is_err());
             let mut longer = produce.clone();
@@ -9339,7 +9339,7 @@ mod trust_std {
                 "/repo//.fnd01-run/integration-producer/0123456789abcdef0123456789abcdef/supply-bundle.bin",
                 attest,
             ] {
-                assert!(validate_ordinary_supply_path(invalid, root, BootstrapMode::Produce, run_id,).is_err(), "{invalid} must not satisfy the producer path authority",);
+                assert!(validate_ordinary_supply_path(invalid, root, BootstrapMode::Produce, run_id).is_err(), "{invalid} must not satisfy the producer path authority");
             }
             assert!(validate_ordinary_supply_path(attest, root, BootstrapMode::Gate, run_id,).is_err());
         }
@@ -9686,7 +9686,7 @@ mod trust_std {
         fn assert_acquisition_command_preimage_binds_every_field(command: &ValidatedAcquisitionCommand) {
             let baseline = validated_acquisition_command_preimage(command).expect("baseline command preimage");
             assert_eq!(baseline, command.preimage);
-            assert_eq!(baseline, manual_acquisition_command_preimage(command), "the production encoder must match an independently assembled byte oracle",);
+            assert_eq!(baseline, manual_acquisition_command_preimage(command), "the production encoder must match an independently assembled byte oracle");
 
             let mut ordinal = command.clone();
             ordinal.ordinal = u64::from(command.ordinal == 0);
@@ -9699,7 +9699,7 @@ mod trust_std {
             for index in 0..command.argv.len() {
                 let mut argument = command.clone();
                 argument.argv[index].push('x');
-                assert_ne!(validated_acquisition_command_preimage(&argument).expect("mutated argv item preimage"), baseline, "argv item {index} was not bound",);
+                assert_ne!(validated_acquisition_command_preimage(&argument).expect("mutated argv item preimage"), baseline, "argv item {index} was not bound");
             }
             let mut reordered_argv = command.clone();
             reordered_argv.argv.swap(1, 2);
@@ -9711,11 +9711,11 @@ mod trust_std {
             for index in 0..command.environment.len() {
                 let mut key = command.clone();
                 key.environment[index].0.push_str("_ALT");
-                assert_ne!(validated_acquisition_command_preimage(&key).expect("mutated environment key preimage"), baseline, "environment key {index} was not bound",);
+                assert_ne!(validated_acquisition_command_preimage(&key).expect("mutated environment key preimage"), baseline, "environment key {index} was not bound");
 
                 let mut value = command.clone();
                 value.environment[index].1.push('x');
-                assert_ne!(validated_acquisition_command_preimage(&value).expect("mutated environment value preimage"), baseline, "environment value {index} was not bound",);
+                assert_ne!(validated_acquisition_command_preimage(&value).expect("mutated environment value preimage"), baseline, "environment value {index} was not bound");
             }
             let mut reordered_environment = command.clone();
             reordered_environment.environment.swap(0, 1);
@@ -9780,7 +9780,7 @@ mod trust_std {
                 "gate" => "g",
                 _ => panic!("fixture lifecycle phase"),
             };
-            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture(),);
+            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture());
             let invocation_argv = outer_argv.iter().map(|value| std::str::from_utf8(value).expect("outer fixture argv UTF-8")).collect::<Vec<_>>();
             let producer_outer_path = format!(".fnd01-run/controller/{run_id}/producer-outer.bin");
             let mut output = Vec::new();
@@ -9860,7 +9860,7 @@ mod trust_std {
                 "gate" => "g",
                 other => other, // already a phase-code in some call sites
             };
-            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture(),);
+            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture());
             let argv = [b"/controller/bin/rch".to_vec(), b"exec".to_vec(), b"--".to_vec(), b"sh".to_vec(), b"-c".to_vec(), shell.into_bytes()].to_vec();
             let lifecycle = outer_lifecycle_fixture(mode, run_id, phase, authoring_marker, integration_marker, &argv);
             OuterTransportRecord {
@@ -9936,8 +9936,8 @@ mod trust_std {
                 "gate" => "g",
                 _ => panic!("fixture daemon phase"),
             };
-            let run_directory = format!("{}/fnd01/{run_id}/ev/{phase}", controller_temp_root_fixture(),);
-            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture(),);
+            let run_directory = format!("{}/fnd01/{run_id}/ev/{phase}", controller_temp_root_fixture());
+            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture());
             let history_path = format!("{run_directory}/history.jsonl");
             let stdout_path = format!("{run_directory}/rchd.stdout");
             let stderr_path = format!("{run_directory}/rchd.stderr");
@@ -9986,8 +9986,8 @@ mod trust_std {
                 "gate" => "g",
                 _ => panic!("fixture daemon phase"),
             };
-            let run_directory = format!("{}/fnd01/{run_id}/ev/{phase}", controller_temp_root_fixture(),);
-            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture(),);
+            let run_directory = format!("{}/fnd01/{run_id}/ev/{phase}", controller_temp_root_fixture());
+            let socket_path = format!("{}/fnd01/{run_id}/s/{phase_code}/rch.sock", controller_temp_root_fixture());
             let history_path = format!("{run_directory}/history.jsonl");
             let stdout_path = format!("{run_directory}/rchd.stdout");
             let stderr_path = format!("{run_directory}/rchd.stderr");
@@ -10029,8 +10029,8 @@ mod trust_std {
         fn canonical_gate_input_fixture_with_mutation(controller_working_directory: &str, mutation: GateFixtureMutation) -> Vec<u8> {
             let run_id = "0123456789abcdef0123456789abcdef";
             let controller_path = "/controller/bin/rch";
-            let socket_path = format!("{}/fnd01/{run_id}/s/g/rch.sock", controller_temp_root_fixture(),);
-            let status_socket_path = if mutation == GateFixtureMutation::StatusSocketJoin { format!("{}/fnd01/{run_id}/s/x/rch.sock", controller_temp_root_fixture(),) } else { socket_path.clone() };
+            let socket_path = format!("{}/fnd01/{run_id}/s/g/rch.sock", controller_temp_root_fixture());
+            let status_socket_path = if mutation == GateFixtureMutation::StatusSocketJoin { format!("{}/fnd01/{run_id}/s/x/rch.sock", controller_temp_root_fixture()) } else { socket_path.clone() };
             let gate_argv = [
                 format!(".fnd01-run/controller/{run_id}/final-gate"),
                 "gate".to_owned(),
@@ -10231,7 +10231,7 @@ mod trust_std {
             validate_outer_role_record(&attester, BootstrapMode::Attest, run_id, authoring_marker, Some(integration_marker)).expect("attester socket assignment with optional worker");
 
             let mut wrong_phase = outer_role_fixture(BootstrapMode::Produce, run_id, "producer", "authoring-marker", None);
-            set_outer_socket_path(&mut wrong_phase, &format!("{}/fnd01/{run_id}/s/a/rch.sock", controller_temp_root_fixture(),));
+            set_outer_socket_path(&mut wrong_phase, &format!("{}/fnd01/{run_id}/s/a/rch.sock", controller_temp_root_fixture()));
             let error = validate_outer_role_record(&wrong_phase, BootstrapMode::Produce, run_id, authoring_marker, None).expect_err("cross-phase socket must fail");
             assert_eq!(error.code(), "E_OUTER_ASSIGNMENT");
 
@@ -12087,8 +12087,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| phase_b_error("E_PHASE_B_TEST_CLOCK", error.to_string()))?.as_nanos();
-        let run_id = format!("{:032x}", timestamp ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),);
-        let root = PathBuf::from("/tmp").join(format!("fastmcp-fnd01-parent-chain-{label}-{}-{timestamp}-{sequence}", std::process::id(),));
+        let run_id = format!("{:032x}", timestamp ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence));
+        let root = PathBuf::from("/tmp").join(format!("fastmcp-fnd01-parent-chain-{label}-{}-{timestamp}-{sequence}", std::process::id()));
         fs::create_dir(&root).map_err(|error| io_error("E_PHASE_B_TEST_CREATE", "parent-chain root", &error))?;
         Ok((root, run_id))
     }
@@ -12116,7 +12116,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     #[cfg(test)]
     pub(super) fn create_sealed_file_parent_chain_positive() -> TrustResult<FileBinding> {
         let (root, run_id) = fresh_parent_chain_contract_root("positive")?;
-        let parent_relative = format!(".fnd01-run/integration-producer/{run_id}/sealed-parent",);
+        let parent_relative = format!(".fnd01-run/integration-producer/{run_id}/sealed-parent");
         fs::create_dir_all(root.join(&parent_relative)).map_err(|error| io_error("E_PHASE_B_TEST_CREATE", "positive parent chain", &error))?;
         let guard = PhaseBSpaceGuard::new(&root, &run_id, parent_chain_contract_space_budget())?;
         let payload = b"intended sealed leaf\n";
@@ -19479,7 +19479,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             assert_eq!(corpus.invalid.len(), expected_cases.len());
             for ((case_id, json), (expected_id, expected_code)) in corpus.invalid.iter().zip(expected_cases) {
                 assert_eq!(*case_id, expected_id);
-                assert_eq!(sparse_index_identity(json.as_bytes(), Some("1.2.3"), "invalid index").expect_err("invalid registered index JSON must fail").code(), expected_code, "{case_id}: {json}",);
+                assert_eq!(sparse_index_identity(json.as_bytes(), Some("1.2.3"), "invalid index").expect_err("invalid registered index JSON must fail").code(), expected_code, "{case_id}: {json}");
             }
             assert_eq!(sparse_index_identity(corpus.duplicate_key.as_bytes(), Some("1.2.3"), "duplicate index key",).expect_err("duplicate object keys must fail").code(), "E_PHASE_B_JSON",);
             assert_eq!(sparse_index_identity(corpus.valid_v1.as_bytes(), Some("1.2.4"), "cache mismatch").expect_err("outer cache version must equal vers").code(), "E_PHASE_B_CARGO_INDEX_IDENTITY",);
@@ -19634,10 +19634,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 
         fn synthetic_supply_lock_for(package_name: &str, checksum: &str) -> Vec<u8> {
             const ROOT_PACKAGE: &str = "fastmcp-fnd01-bootstrap-control";
-            let root = format!("[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n \"{package_name}\",\n]\n",);
-            let registry = format!("[[package]]\nname = \"{package_name}\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n",);
+            let root = format!("[[package]]\nname = \"{ROOT_PACKAGE}\"\nversion = \"0.0.0\"\ndependencies = [\n \"{package_name}\",\n]\n");
+            let registry = format!("[[package]]\nname = \"{package_name}\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n");
             let (first, second) = if package_name.as_bytes() < ROOT_PACKAGE.as_bytes() { (&registry, &root) } else { (&root, &registry) };
-            format!("# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n{first}\n{second}",).into_bytes()
+            format!("# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n{first}\n{second}").into_bytes()
         }
 
         fn synthetic_supply_lock(checksum: &str) -> Vec<u8> {
@@ -50896,7 +50896,7 @@ activate = 1\n";
         );
         assert_eq!(parse_restricted_workflow_yaml("jobs: &shared\n", "anchor workflow",).expect_err("YAML anchors must fail").code, "E_WORKFLOW_YAML_SCALAR",);
         assert_eq!(parse_restricted_workflow_yaml("jobs: { build: {} }\n", "flow-map workflow",).expect_err("flow mappings must fail").code, "E_WORKFLOW_YAML_SCALAR",);
-        let quoted_duplicate = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_CHECKOUT}\n        \"uses\": {ACTION_CHECKOUT}\n",);
+        let quoted_duplicate = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_CHECKOUT}\n        \"uses\": {ACTION_CHECKOUT}\n");
         assert_eq!(
             parse_restricted_workflow_yaml(&quoted_duplicate, "quoted duplicate workflow").expect_err("quoted and unquoted equivalent YAML keys must collide").code,
             "E_WORKFLOW_YAML_DUPLICATE",
@@ -50904,7 +50904,7 @@ activate = 1\n";
         for (indicator, expected_code) in
             [(">", "E_WORKFLOW_YAML_MULTILINE"), (">-", "E_WORKFLOW_YAML_MULTILINE"), ("|+", "E_WORKFLOW_YAML_MULTILINE"), ("|-", "E_WORKFLOW_YAML_MULTILINE"), ("|2", "E_WORKFLOW_YAML_MULTILINE")]
         {
-            let workflow = format!("jobs:\n  build:\n    steps:\n      - run: {indicator}\n        echo ambiguous\n",);
+            let workflow = format!("jobs:\n  build:\n    steps:\n      - run: {indicator}\n        echo ambiguous\n");
             assert_eq!(parse_restricted_workflow_yaml(&workflow, "block indicator workflow").expect_err("only the exact literal block indicator is admitted").code, expected_code,);
         }
         for (workflow, expected_code) in [
@@ -50933,7 +50933,7 @@ activate = 1\n";
             assert_eq!(parse_restricted_workflow_yaml(workflow, "closed workflow").expect_err("unknown or incorrectly typed context fields must fail").code, expected_code,);
         }
 
-        let wrong_action_input = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_CHECKOUT}\n        with:\n          toolchain: nightly-2026-07-11\n",);
+        let wrong_action_input = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_CHECKOUT}\n        with:\n          toolchain: nightly-2026-07-11\n");
         assert_eq!(parse_restricted_workflow_yaml(&wrong_action_input, "action-specific input workflow",).expect_err("an input valid for another action must fail").code, "E_WORKFLOW_YAML_KEY",);
     }
 
@@ -50951,7 +50951,7 @@ activate = 1\n";
         assert_eq!(parse_restricted_workflow_yaml(&scalar_workflow, "large scalar workflow").expect_err("scalar bytes must be bounded").code, "E_WORKFLOW_YAML_LIMIT",);
 
         let oversized_collection = (0..=MAX_RESTRICTED_YAML_COLLECTION_ITEMS).map(|_| "main").collect::<Vec<_>>().join(", ");
-        let collection_workflow = format!("on:\n  push:\n    branches: [{oversized_collection}]\njobs:\n  build:\n    steps:\n      - run: echo ok\n",);
+        let collection_workflow = format!("on:\n  push:\n    branches: [{oversized_collection}]\njobs:\n  build:\n    steps:\n      - run: echo ok\n");
         assert_eq!(parse_restricted_workflow_yaml(&collection_workflow, "large collection workflow",).expect_err("collection cardinality must be bounded").code, "E_WORKFLOW_YAML_LIMIT",);
 
         let mut budget = RestrictedYamlBudget::default();
@@ -50973,14 +50973,14 @@ activate = 1\n";
     #[test]
     fn reality_proof_positive_workflow_toolchain_consumer_uses_checked_in_pin() {
         let identity = canonical_campaign_proof_identity().verified();
-        let fixture = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_RUST_TOOLCHAIN}\n        with:\n          toolchain: {}\n      - run: cargo check\n", identity.toolchain,);
+        let fixture = format!("jobs:\n  build:\n    steps:\n      - uses: {ACTION_RUST_TOOLCHAIN}\n        with:\n          toolchain: {}\n      - run: cargo check\n", identity.toolchain);
         let workflow = parse_restricted_workflow_yaml(&fixture, "toolchain consumer").verified();
         assert_eq!(validate_workflow_toolchain_closure(&workflow, "toolchain consumer").verified(), 1,);
 
         for (subject, workflow, expected_setups) in
             [(".github/workflows/ci.yml", include_str!("../../../.github/workflows/ci.yml"), 8), (".github/workflows/release.yml", include_str!("../../../.github/workflows/release.yml"), 2)]
         {
-            assert_eq!(workflow.matches(&format!("toolchain: {}", identity.toolchain)).count(), expected_setups, "{subject}",);
+            assert_eq!(workflow.matches(&format!("toolchain: {}", identity.toolchain)).count(), expected_setups, "{subject}");
             for stale in SUPERSEDED_CAMPAIGN_TOOLCHAINS {
                 assert!(!workflow.contains(stale), "{subject}: {stale}");
             }
@@ -51055,7 +51055,7 @@ activate = 1\n";
                 lifecycle_inventory = Some(observed);
             }
         }
-        assert_eq!(fs::read(live_path).expect("read live campaign state after lifecycle positives"), issues, "positive lifecycle evaluation must not mutate live state",);
+        assert_eq!(fs::read(live_path).expect("read live campaign state after lifecycle positives"), issues, "positive lifecycle evaluation must not mutate live state");
     }
 
     #[test]
@@ -51106,13 +51106,13 @@ activate = 1\n";
         let marker_error =
             validate_campaign_executable_toolchain_contracts(marker_corruption.as_bytes(), &identity, expected_control).expect_err("a one-byte semantic marker corruption must fail closed");
         assert_eq!(marker_error.code, "E_CAMPAIGN_PROOF_TOOLCHAIN");
-        assert_eq!(marker_error.subject, format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"),);
+        assert_eq!(marker_error.subject, format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"));
 
         let drifted_token = control_text.replacen(SUPERSEDED_CAMPAIGN_TOOLCHAINS[1], "nightly-2026-08-21", 1);
         assert_eq!(drifted_token.replacen("nightly-2026-08-21", SUPERSEDED_CAMPAIGN_TOOLCHAINS[1], 1,), control_text,);
         let token_error = validate_campaign_executable_toolchain_contracts(drifted_token.as_bytes(), &identity, expected_control).expect_err("a one-token planted-negative drift must fail closed");
         assert_eq!(token_error.code, "E_CAMPAIGN_PROOF_NEGATIVE_CONTRACT");
-        assert_eq!(token_error.subject, format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"),);
+        assert_eq!(token_error.subject, format!("{CAMPAIGN_PROOF_CONTROL_BEAD}/acceptance_criteria"));
 
         let wrong_control_id = control_text.replacen(CAMPAIGN_PROOF_CONTROL_BEAD, "bd-rebase-proof-toolchain-vjd8y", 1);
         assert_eq!(wrong_control_id.replacen("bd-rebase-proof-toolchain-vjd8y", CAMPAIGN_PROOF_CONTROL_BEAD, 1,), control_text,);
@@ -51152,7 +51152,7 @@ activate = 1\n";
             EXACT_RUST_TOOLCHAIN_TOML.replacen("\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"", "\"aarch64-unknown-linux-gnu\", \"aarch64-apple-darwin\"", 1),
         ];
         for mutation in toolchain_mutations {
-            assert!(!is_exact_rust_toolchain_document(mutation.as_bytes()), "mutated toolchain bytes must fail exact comparison",);
+            assert!(!is_exact_rust_toolchain_document(mutation.as_bytes()), "mutated toolchain bytes must fail exact comparison");
         }
 
         for (reference, _, _) in WORKFLOW_ACTION_IDENTITIES {
@@ -51311,7 +51311,7 @@ activate = 1\n";
         let lock_start = lock_length_offset + 8 + 32;
         let lock_text = std::str::from_utf8(&valid[lock_start..lock_start + lock_length]).expect("synthetic lock is UTF-8");
         let unreachable_lock = lock_text.replace(" \"beta\",\n", "");
-        assert_ne!(unreachable_lock, lock_text, "synthetic lock mutation must remove one controlled-root edge",);
+        assert_ne!(unreachable_lock, lock_text, "synthetic lock mutation must remove one controlled-root edge");
         let mut unreachable_and_corrupt_tail = test_replace_supply_bootstrap_lock(&valid, unreachable_lock.as_bytes());
         *unreachable_and_corrupt_tail.last_mut().expect("synthetic supply has a tail") ^= 1;
         assert_eq!(
@@ -51323,7 +51323,7 @@ activate = 1\n";
         let sample_v2 = test_gzip(&test_tar(&[("sample-2.0.0/src/lib.rs", b"sample-v2", 0)]));
         let multi_version = test_ordinary_supply_bundle(&[("sample-1.0.0.crate", &sample_v1), ("sample-2.0.0.crate", &sample_v2)]);
         let multi_version_framing = parse_ordinary_supply_framing(&multi_version, "multi-version ordinary supply").verified();
-        assert_eq!(multi_version_framing.entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(), [0x01, 0x01, 0x02, 0x03], "two versions of one package share one derived index and sparse cache",);
+        assert_eq!(multi_version_framing.entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(), [0x01, 0x01, 0x02, 0x03], "two versions of one package share one derived index and sparse cache");
         assert_eq!(multi_version_framing.closure_rows.iter().map(|row| row.selected_ordinal).collect::<Vec<_>>(), [0, 1],);
         assert_eq!(multi_version_framing.closure_rows[0].sparse_path, multi_version_framing.closure_rows[1].sparse_path,);
         assert_eq!(multi_version_framing.closure_rows[0].sparse_sha256, multi_version_framing.closure_rows[1].sparse_sha256,);
@@ -51381,7 +51381,7 @@ activate = 1\n";
         let config_digest = sha256(&rebound_config[offsets.config_payload..offsets.config_payload + offsets.config_length]);
         rebound_config[offsets.config_digest..offsets.config_digest + 32].copy_from_slice(&config_digest);
         parse_ordinary_supply_framing(&rebound_config, "rebound config digest").expect("a self-consistent v4 header remains parseable");
-        assert_ne!(sha256(&rebound_config), sha256(&valid), "a config rewrite changes the full supply binding",);
+        assert_ne!(sha256(&rebound_config), sha256(&valid), "a config rewrite changes the full supply binding");
 
         let truncated = &valid[..valid.len() - 1];
         assert!(parse_ordinary_supply_framing(truncated, "truncated supply-v4").is_err(),);
@@ -53240,7 +53240,7 @@ dependency_kinds = ["build", "normal"]
                     (SnapshotStage::PostReadPreFinalMetadata, Mutation::Relink) => "E_FILE_HARDLINK",
                     _ => "E_FILE_RACE",
                 };
-                assert_eq!(error.code(), expected_code, "unexpected error for stage={stage:?}, mutation={mutation:?}: {error}",);
+                assert_eq!(error.code(), expected_code, "unexpected error for stage={stage:?}, mutation={mutation:?}: {error}");
             }
         }
     }
@@ -54034,14 +54034,14 @@ original = "value"
             (pristine_lock_binding.0, pristine_lock_binding.1),
             "lock-digest plant preserves the exact path and byte length",
         );
-        assert_ne!(planted_workspace_bindings[1].2, pristine_lock_binding.2, "lock-digest plant changes the forbidden digest dimension",);
-        assert_eq!(planted_workspace_bindings[0], TOOLCHAIN_WORKSPACE_INPUTS[0], "lock-digest plant preserves the manifest binding",);
-        assert_eq!(planted_workspace_bindings[2], TOOLCHAIN_WORKSPACE_INPUTS[2], "lock-digest plant preserves the toolchain binding",);
+        assert_ne!(planted_workspace_bindings[1].2, pristine_lock_binding.2, "lock-digest plant changes the forbidden digest dimension");
+        assert_eq!(planted_workspace_bindings[0], TOOLCHAIN_WORKSPACE_INPUTS[0], "lock-digest plant preserves the manifest binding");
+        assert_eq!(planted_workspace_bindings[2], TOOLCHAIN_WORKSPACE_INPUTS[2], "lock-digest plant preserves the toolchain binding");
         let lock_error = toolchain_workspace_inputs_with_bindings(&root, &policy, &planted_workspace_bindings).expect_err("one wrong Cargo.lock digest must fail at the production checked-read seam");
         assert_eq!(lock_error.stable(), "FND01|Error|E_TOOLCHAIN_ASUPERSYNC|Cargo.lock|E_FILE_DIGEST|Cargo.lock: marker digest mismatch",);
         assert_sdk_loaded_file_vectors_equal(&loaded_before, &files, "lock-digest retained inputs").verified();
-        assert_eq!(toolchain_workspace_inputs(&root, &policy).verified(), workspace_before, "rejected lock-digest plant leaves all live workspace inputs unchanged",);
-        assert_eq!(validate_toolchain_asupersync_contract(&root, &files, &policy, &accepted_document,).verified(), accepted, "pristine toolchain contract reaccepts after the lock-digest plant",);
+        assert_eq!(toolchain_workspace_inputs(&root, &policy).verified(), workspace_before, "rejected lock-digest plant leaves all live workspace inputs unchanged");
+        assert_eq!(validate_toolchain_asupersync_contract(&root, &files, &policy, &accepted_document).verified(), accepted, "pristine toolchain contract reaccepts after the lock-digest plant");
 
         let (fresh_policy, _) = read_policy(&root).verified();
         validate_policy_shape(&fresh_policy).verified();
@@ -57614,7 +57614,7 @@ original = "value"
                 "{}: rebound preimage digest",
                 plant.id
             );
-            assert_ne!(candidate_preimage, baseline_preimage, "{}: candidate preimage differs from the pristine baseline", plant.id,);
+            assert_ne!(candidate_preimage, baseline_preimage, "{}: candidate preimage differs from the pristine baseline", plant.id);
             assert_ne!(
                 record_string(candidate_binding, "digest", "candidate binding").expect("candidate digest"),
                 baseline_preimage_sha256,
@@ -57631,7 +57631,7 @@ original = "value"
                 );
             }
             let error = fnd_01_sdk_matrix_validate(&candidate, &policy, ExternalSdkExecutionFacts::Absent).expect_err("candidate must reject");
-            assert_eq!(error.stable(), format!("FND01|Error|{}|SDK matrix revision-6 dimensions|", plant.diagnostic,), "{}: exact diagnostic excludes cotriggers", plant.id,);
+            assert_eq!(error.stable(), format!("FND01|Error|{}|SDK matrix revision-6 dimensions|", plant.diagnostic), "{}: exact diagnostic excludes cotriggers", plant.id);
             let baseline_reaccepted = fnd_01_sdk_matrix_validate(&files, &policy, ExternalSdkExecutionFacts::Absent).expect("baseline remains accepted");
             assert_eq!(baseline_reaccepted, accepted, "{}: baseline typed validation", plant.id);
             assert_sdk_loaded_file_vectors_equal(&raw_baseline, &files, "baseline after planted rejection").unwrap_or_else(|diagnostic| panic!("{}: {}", plant.id, diagnostic.stable()));
@@ -57680,13 +57680,13 @@ original = "value"
         let candidate_snapshot = candidate_process.clone();
         let mut restored_candidate = candidate_process.clone();
         restored_candidate.tool_identity_after_sha256 = pristine_process.tool_identity_after_sha256.clone();
-        assert_eq!(restored_candidate, pristine_process, "the temporal plant changes exactly the after digest",);
+        assert_eq!(restored_candidate, pristine_process, "the temporal plant changes exactly the after digest");
         let error = sdk_validate_tool_identity_binding(&candidate_process, "tool-identity after-only plant").expect_err("one changed after digest must reject");
         assert_eq!(error.code, "E_SDK_TOOL_IDENTITY");
         assert_eq!(error.stable(), "FND01|Error|E_SDK_TOOL_IDENTITY|tool-identity after-only plant|",);
-        assert_eq!(candidate_process, candidate_snapshot, "rejection leaves the planted candidate unchanged",);
+        assert_eq!(candidate_process, candidate_snapshot, "rejection leaves the planted candidate unchanged");
         assert_eq!(pristine_process, pristine_snapshot, "plant leaves pristine state unchanged");
-        assert_ne!(sdk_process_sha256(&candidate_process), sdk_process_sha256(&pristine_process), "the after digest is bound into the process receipt",);
+        assert_ne!(sdk_process_sha256(&candidate_process), sdk_process_sha256(&pristine_process), "the after digest is bound into the process receipt");
         sdk_validate_tool_identity_binding(&pristine_process, "tool-identity pristine").expect("tool-identity pristine reacceptance");
 
         let pristine_environment = [("PATH".to_owned(), "/sdk/npm:/sdk/node:/sdk/jq:/usr/bin:/bin".to_owned())];
@@ -60181,7 +60181,7 @@ fn fallible(value: Option<u8>) {
         for (ordinal, fixture) in fixtures.iter().enumerate() {
             let raw = ordinary_probe_decode_base64(fixture.raw_base64);
             let raw_sha256 = trust_sha256(&raw).expect("fixture raw capture SHA-256");
-            assert_eq!(encode_lower_hex(&raw_sha256), fixture.raw_sha256, "{} raw capture", fixture.tool_id,);
+            assert_eq!(encode_lower_hex(&raw_sha256), fixture.raw_sha256, "{} raw capture", fixture.tool_id);
             let final_path = format!("/fixture/finals/{}", fixture.tool_id);
             let identity = ToolIdentity {
                 device: 7,
@@ -60325,7 +60325,7 @@ fn fallible(value: Option<u8>) {
             ("llvm-current-version-family", "apple-ar") => (b"22.1.2", b"22.1.3", "llvm-current-version-family|apple-ar: exact-line[0]".to_owned()),
             ("openssl-current-version-a", "openssl") => (b"(Library: OpenSSL", b"(Librarz: OpenSSL", "openssl-current-version-a: OpenSSL identity/platform grammar".to_owned()),
             ("host-c-compiler-current-v", "host-cc") => (b"22.1.2", b"22.1.3", "host-c-compiler-current-v|host-cc: exact-line[0]".to_owned()),
-            ("archiver-current-version", "host-ar" | "host-ranlib") => (b"22.1.2", b"22.1.3", format!("archiver-current-version|{}: exact-line[0]", fixture.tool_id,)),
+            ("archiver-current-version", "host-ar" | "host-ranlib") => (b"22.1.2", b"22.1.3", format!("archiver-current-version|{}: exact-line[0]", fixture.tool_id)),
             ("aarch64-c-compiler-current-v", "aarch64-linux-cc") => (b"Target: aarch64-linux-gnu", b"Target: aarch64-linux-gnv", "aarch64-c-compiler-current-v: gcc target field".to_owned()),
             ("archiver-current-version", "aarch64-linux-ar") => (b"2.46", b"2.47", "archiver-current-version|aarch64-linux-ar: exact-line[0]".to_owned()),
             ("apple-clang-current-version", "apple-clang") => (b"Target: aarch64-apple-darwin", b"Target: aarch64-apple-darwio", "apple-clang-current-version|apple-clang: exact-line[1]".to_owned()),
@@ -60360,7 +60360,7 @@ fn fallible(value: Option<u8>) {
         let raw = ordinary_probe_decode_base64(raw_base64);
         validate_version_stream_for_role(tool_id, parser_id, selected_lexical, &raw).expect("supplementary parser-role positive");
         let changed = ordinary_probe_replace_once_same_length(&raw, needle, replacement);
-        assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "supplementary parser-role negative differs by one byte",);
+        assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "supplementary parser-role negative differs by one byte");
         let error = validate_version_stream_for_role(tool_id, parser_id, selected_lexical, &changed).expect_err("supplementary parser-role semantic drift must fail closed");
         assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
         assert_eq!(error.detail(), expected_diagnostic);
@@ -60388,7 +60388,7 @@ fn fallible(value: Option<u8>) {
             accepted += 1;
 
             let changed = ordinary_parser_semantic_negative(parser_id, &raw);
-            assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "{parser_id} semantic negative differs by one byte",);
+            assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "{parser_id} semantic negative differs by one byte");
             let direct_error = validate_version_stream_for_role(fixture.tool_id, fixture.parser_id, fixture.selected_lexical, &changed).expect_err("one-field parser semantic drift must fail closed");
             assert_eq!(direct_error.code(), "E_PHASE_B_TOOL_VERSION");
             assert_eq!(direct_error.detail(), expected_diagnostic);
@@ -60406,7 +60406,7 @@ fn fallible(value: Option<u8>) {
             assert_eq!(error.detail(), expected_diagnostic);
             assert_eq!(authorities, authority_baseline, "authority state unchanged");
             assert_eq!(pristine_inputs, input_baseline, "accepted input state unchanged");
-            assert_eq!(validate_tool_probe_batch(&authorities, &pristine_inputs).expect("pristine parser inventory reacceptance"), accepted_state, "complete accepted parser state unchanged",);
+            assert_eq!(validate_tool_probe_batch(&authorities, &pristine_inputs).expect("pristine parser inventory reacceptance"), accepted_state, "complete accepted parser state unchanged");
             if parser_id == "windows-clang-cl-version" {
                 assert_eq!(raw.len(), 125, "qualified clang-cl capture length");
                 assert!(changed.windows(4).any(|window| window == b"msvx"));
@@ -60419,7 +60419,7 @@ fn fallible(value: Option<u8>) {
         let current_rustc = b"rustc 1.100.0-nightly (e7769602a 2026-08-24)\nbinary: rustc\ncommit-hash: e7769602aca3770e8d8ea55716becb22e839a579\ncommit-date: 2026-08-24\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n";
         validate_version_stream_for_role("rustc", "rustc-vv-current-1.100", "/fixture/toolchains/nightly-2026-08-25/bin/rustc", current_rustc).expect("current Ordinary rustc parser positive");
         let changed_current_rustc = ordinary_probe_replace_once_same_length(current_rustc, b"e7769602aca3770e8d8ea55716becb22e839a579", b"e7769602aca3770e8d8ea55716becb22e839a578");
-        assert_eq!(current_rustc.iter().zip(&changed_current_rustc).filter(|(left, right)| left != right).count(), 1, "current Ordinary rustc negative differs by one commit byte",);
+        assert_eq!(current_rustc.iter().zip(&changed_current_rustc).filter(|(left, right)| left != right).count(), 1, "current Ordinary rustc negative differs by one commit byte");
         let current_error = validate_version_stream_for_role("rustc", "rustc-vv-current-1.100", "/fixture/toolchains/nightly-2026-08-25/bin/rustc", &changed_current_rustc)
             .expect_err("current Ordinary rustc commit drift must fail closed");
         assert_eq!(current_error.code(), "E_PHASE_B_TOOL_VERSION");
@@ -60442,7 +60442,7 @@ fn fallible(value: Option<u8>) {
         validate_version_stream_for_role("cargo", "cargo-vv-current-1.100", "/fixture/toolchains/nightly-2026-08-25/bin/cargo-rch-real", current_cargo)
             .expect("current Ordinary Cargo parser positive");
         let changed_current_cargo = ordinary_probe_replace_once_same_length(current_cargo, b"os: Ubuntu 26.4.0 (resolute) [unknown bitness]", b"os: Ubuntu 26.4.0 (resolute) [unknowo bitness]");
-        assert_eq!(current_cargo.iter().zip(&changed_current_cargo).filter(|(left, right)| left != right).count(), 1, "current Ordinary Cargo negative differs by one bitness byte",);
+        assert_eq!(current_cargo.iter().zip(&changed_current_cargo).filter(|(left, right)| left != right).count(), 1, "current Ordinary Cargo negative differs by one bitness byte");
         let changed_cargo_error = validate_version_stream_for_role("cargo", "cargo-vv-current-1.100", "/fixture/toolchains/nightly-2026-08-25/bin/cargo-rch-real", &changed_current_cargo)
             .expect_err("current Ordinary Cargo OS drift must fail closed");
         assert_eq!(changed_cargo_error.code(), "E_PHASE_B_TOOL_VERSION");
@@ -60462,14 +60462,14 @@ fn fallible(value: Option<u8>) {
             .expect("current Ordinary Cargo pristine reacceptance");
 
         let current_descriptors = super::trust_std::current_ordinary_native_tool_descriptors();
-        assert_eq!(super::trust_std::NATIVE_TOOL_DESCRIPTORS[1].candidates, &["{pinned-toolchain-bin}/cargo"], "historical Cargo evidence keeps the toolchain entry-point candidate",);
-        assert_eq!(current_descriptors[1].candidates, &["{pinned-toolchain-bin}/cargo-rch-real"], "current Ordinary evidence binds the independently admitted real Cargo binary",);
+        assert_eq!(super::trust_std::NATIVE_TOOL_DESCRIPTORS[1].candidates, &["{pinned-toolchain-bin}/cargo"], "historical Cargo evidence keeps the toolchain entry-point candidate");
+        assert_eq!(current_descriptors[1].candidates, &["{pinned-toolchain-bin}/cargo-rch-real"], "current Ordinary evidence binds the independently admitted real Cargo binary");
         let mut wrapped_cargo_descriptors = current_descriptors.clone();
         wrapped_cargo_descriptors[1].candidates = super::trust_std::NATIVE_TOOL_DESCRIPTORS[1].candidates;
         let wrapped_cargo_registry = super::trust_std::current_ordinary_native_tool_registry_identity_for(&wrapped_cargo_descriptors).expect("near-identical wrapped-Cargo registry identity");
         let current_descriptors_baseline = current_descriptors.clone();
         let current_registry_baseline = super::trust_std::current_ordinary_native_tool_registry_identity().expect("current Ordinary registry identity");
-        assert_ne!(wrapped_cargo_registry, current_registry_baseline, "changing only the current Cargo candidate back to the orchestration wrapper must invalidate the frozen registry",);
+        assert_ne!(wrapped_cargo_registry, current_registry_baseline, "changing only the current Cargo candidate back to the orchestration wrapper must invalidate the frozen registry");
         let historical_fixtures = ordinary_tool_probe_fixtures();
         let mut current_system_positives = 0usize;
         let mut current_system_negatives = 0usize;
@@ -60479,30 +60479,30 @@ fn fallible(value: Option<u8>) {
             let ordinal = offset + 8;
             let descriptor = current_descriptors[ordinal];
             assert_eq!(descriptor.id, fixture.tool_id, "current tool role {ordinal}");
-            assert_eq!(descriptor.parser, fixture.parser_id, "current parser role {ordinal}",);
-            assert_eq!(descriptor.candidates.first().copied(), Some(fixture.selected_lexical), "qualified current candidate role {ordinal}",);
-            assert_eq!(descriptor.version_argv, fixture.argv_tail, "current argv role {ordinal}",);
-            assert_eq!(descriptor.stream, fixture.selected_stream, "current stream role {ordinal}",);
+            assert_eq!(descriptor.parser, fixture.parser_id, "current parser role {ordinal}");
+            assert_eq!(descriptor.candidates.first().copied(), Some(fixture.selected_lexical), "qualified current candidate role {ordinal}");
+            assert_eq!(descriptor.version_argv, fixture.argv_tail, "current argv role {ordinal}");
+            assert_eq!(descriptor.stream, fixture.selected_stream, "current stream role {ordinal}");
 
             let raw = ordinary_probe_decode_base64(fixture.raw_base64);
-            assert_eq!(encode_lower_hex(&trust_sha256(&raw).expect("current system capture digest"),), fixture.raw_sha256, "current system capture role {ordinal}",);
+            assert_eq!(encode_lower_hex(&trust_sha256(&raw).expect("current system capture digest")), fixture.raw_sha256, "current system capture role {ordinal}");
             validate_version_stream_for_role(fixture.tool_id, fixture.parser_id, fixture.selected_lexical, &raw).expect("current system parser positive");
             current_system_positives += 1;
 
             let (changed, expected_diagnostic) = current_ordinary_system_parser_semantic_negative(fixture, &raw);
-            assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "current system role {ordinal} negative differs by one byte",);
+            assert_eq!(raw.iter().zip(&changed).filter(|(left, right)| left != right).count(), 1, "current system role {ordinal} negative differs by one byte");
             let error = validate_version_stream_for_role(fixture.tool_id, fixture.parser_id, fixture.selected_lexical, &changed).expect_err("current system semantic drift must fail closed");
             assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
             assert_eq!(error.detail(), expected_diagnostic);
-            assert_eq!(current_descriptors, current_descriptors_baseline, "parser rejection leaves the current descriptor authority unchanged",);
+            assert_eq!(current_descriptors, current_descriptors_baseline, "parser rejection leaves the current descriptor authority unchanged");
             validate_version_stream_for_role(fixture.tool_id, fixture.parser_id, fixture.selected_lexical, &raw).expect("current system pristine reacceptance");
             current_system_negatives += 1;
 
             let historical = historical_fixtures.iter().copied().find(|candidate| candidate.tool_id == fixture.tool_id).expect("historical role twin");
-            assert_ne!(historical.parser_id, fixture.parser_id, "every current role has an epoch-specific parser identity",);
+            assert_ne!(historical.parser_id, fixture.parser_id, "every current role has an epoch-specific parser identity");
             let historical_raw = ordinary_probe_decode_base64(historical.raw_base64);
             if historical_raw == raw {
-                assert!(matches!(fixture.tool_id, "aarch64-linux-cc" | "windows-lib"), "only captured byte-identical cross-epoch roles are admitted",);
+                assert!(matches!(fixture.tool_id, "aarch64-linux-cc" | "windows-lib"), "only captured byte-identical cross-epoch roles are admitted");
                 byte_identical_cross_epoch_roles += 1;
             } else {
                 validate_version_stream_for_role(fixture.tool_id, fixture.parser_id, fixture.selected_lexical, &historical_raw)
@@ -60554,7 +60554,7 @@ fn fallible(value: Option<u8>) {
         supplementary_role_grammars += 1;
         ordinary_assert_parser_role_variant("archiver-version", "host-ranlib", "/usr/bin/ranlib", ORDINARY_PROBE_GNU_RANLIB_B64, b"2.45", b"2.46", "archiver-version|host-ranlib: exact-line[0]");
         supplementary_role_grammars += 1;
-        assert_eq!(supplementary_role_grammars, 4, "exact supplementary role-grammar branch registry",);
+        assert_eq!(supplementary_role_grammars, 4, "exact supplementary role-grammar branch registry");
 
         let rustc = ordinary_tool_probe_fixture_for("rustc-vv-pinned-1.99", "rustc");
         let rustc_raw = ordinary_probe_decode_base64(rustc.raw_base64);
@@ -60564,7 +60564,7 @@ fn fallible(value: Option<u8>) {
         validate_version_stream_for_role(rustc.tool_id, rustc.parser_id, rustc.selected_lexical, &rustc_raw).expect("unknown-parser pristine twin reacceptance");
         assert_eq!(validate_tool_probe_batch(&authorities, &pristine_inputs).expect("unknown-parser complete-state reacceptance"), accepted_state,);
         assert_eq!(ledger_advances.get(), 0, "parser rejection advances no ledger state");
-        assert_eq!(evidence_advances.get(), 0, "parser rejection advances no evidence state",);
+        assert_eq!(evidence_advances.get(), 0, "parser rejection advances no evidence state");
     }
 
     #[test]
@@ -60620,14 +60620,14 @@ fn fallible(value: Option<u8>) {
                 assert_eq!(seam_error.detail(), format!("{parser_id}: {field}"));
                 assert_eq!(authorities, authority_baseline, "authority state unchanged");
                 assert_eq!(pristine_inputs, input_baseline, "accepted input state unchanged");
-                assert_eq!(validate_tool_probe_batch(&authorities, &pristine_inputs).expect("global-hygiene pristine reacceptance"), accepted_state, "complete accepted hygiene state unchanged",);
+                assert_eq!(validate_tool_probe_batch(&authorities, &pristine_inputs).expect("global-hygiene pristine reacceptance"), accepted_state, "complete accepted hygiene state unchanged");
                 negatives += 1;
             }
         }
         assert_eq!(positive_twins, 15, "exact hygiene positive-twin count");
         assert_eq!(negatives, 90, "six global negatives for every parser");
-        assert_eq!(ledger_advances.get(), 0, "global rejection advances no ledger state",);
-        assert_eq!(evidence_advances.get(), 0, "global rejection advances no evidence state",);
+        assert_eq!(ledger_advances.get(), 0, "global rejection advances no ledger state");
+        assert_eq!(evidence_advances.get(), 0, "global rejection advances no evidence state");
     }
 
     #[test]
@@ -60640,7 +60640,7 @@ fn fallible(value: Option<u8>) {
             assert_eq!(fixture.parser_id, *parser_id, "literal parser role {ordinal}");
         }
         let parser_multiplicities = ORDINARY_VERSION_PARSER_CASES.map(|(parser_id, _, _)| ORDINARY_TOOL_PROBE_ROLE_REGISTRY.iter().filter(|(_, observed)| *observed == parser_id).count());
-        assert_eq!(parser_multiplicities, [1, 1, 1, 2, 2, 1, 2, 1, 1, 3, 1, 1, 1, 1, 1], "exact 15-parser multiplicities over 20 roles",);
+        assert_eq!(parser_multiplicities, [1, 1, 1, 2, 2, 1, 2, 1, 1, 3, 1, 1, 1, 1, 1], "exact 15-parser multiplicities over 20 roles");
 
         let (authorities, inputs) = ordinary_tool_probe_fixture_batch();
         let authority_baseline = authorities.clone();
@@ -60698,7 +60698,7 @@ fn fallible(value: Option<u8>) {
                 assert_eq!(error.detail(), *expected_diagnostic);
                 assert_eq!(authorities, authority_baseline, "authority state unchanged");
                 assert_eq!(inputs, input_baseline, "accepted input state unchanged");
-                assert_eq!(validate_tool_probe_batch(&authorities, &inputs).expect("pristine full-batch reacceptance"), accepted, "accepted inventory state unchanged",);
+                assert_eq!(validate_tool_probe_batch(&authorities, &inputs).expect("pristine full-batch reacceptance"), accepted, "accepted inventory state unchanged");
                 rejected_batches += 1;
             }
         }
@@ -60716,7 +60716,7 @@ fn fallible(value: Option<u8>) {
         let openssl = 9usize;
         let changed_raw = ordinary_probe_replace_once_same_length(&changed_inputs[openssl].stdout, b"Tue Jun  2 17:21:36 2026 UTC", b"Tue Jun  2 17:21:37 2026 UTC");
         ordinary_tool_probe_replace_selected_raw(&mut changed_inputs[openssl], changed_raw);
-        assert_eq!(baseline_inputs[openssl].stdout.iter().zip(&changed_inputs[openssl].stdout).filter(|(left, right)| left != right).count(), 1, "one allowed same-length observational byte changes",);
+        assert_eq!(baseline_inputs[openssl].stdout.iter().zip(&changed_inputs[openssl].stdout).filter(|(left, right)| left != right).count(), 1, "one allowed same-length observational byte changes");
         let authority_baseline = authorities.clone();
         let changed_input_baseline = changed_inputs.clone();
         let ledger_advances = Cell::new(0usize);
@@ -60732,23 +60732,23 @@ fn fallible(value: Option<u8>) {
         assert_eq!(stale_digest_error.code(), "E_PHASE_B_TOOL_VERSION");
         assert_eq!(stale_digest_error.detail(), "context.raw_sha256: observed mismatch",);
         assert_eq!(authorities, authority_baseline, "authority state unchanged");
-        assert_eq!(changed_inputs, changed_input_baseline, "accepted changed-observation state unchanged",);
+        assert_eq!(changed_inputs, changed_input_baseline, "accepted changed-observation state unchanged");
         let changed = validate_tool_probe_batch(&authorities, &changed_inputs).expect("stale-digest rejection permits pristine changed-state reacceptance");
         assert_eq!(ledger_advances.get(), 0, "digest rejection advances no ledger state");
-        assert_eq!(evidence_advances.get(), 0, "digest rejection advances no evidence state",);
-        assert_eq!(baseline.observations.len() + changed.observations.len(), 40, "two inventories produce exactly 40 role admissions",);
-        assert_eq!(encode_lower_hex(&baseline.observations[openssl].raw_sha256), "7436f55ee9e0598fbe4c9671dff4209d3f1a6c7cd7b2ce5d88381671addfcc21", "frozen baseline OpenSSL raw digest",);
-        assert_eq!(encode_lower_hex(&changed.observations[openssl].raw_sha256), "f96c32d294d9f0a498d4342d73ba9c543b4f87ae7560d214689b05689c0f50b8", "frozen changed OpenSSL raw digest",);
+        assert_eq!(evidence_advances.get(), 0, "digest rejection advances no evidence state");
+        assert_eq!(baseline.observations.len() + changed.observations.len(), 40, "two inventories produce exactly 40 role admissions");
+        assert_eq!(encode_lower_hex(&baseline.observations[openssl].raw_sha256), "7436f55ee9e0598fbe4c9671dff4209d3f1a6c7cd7b2ce5d88381671addfcc21", "frozen baseline OpenSSL raw digest");
+        assert_eq!(encode_lower_hex(&changed.observations[openssl].raw_sha256), "f96c32d294d9f0a498d4342d73ba9c543b4f87ae7560d214689b05689c0f50b8", "frozen changed OpenSSL raw digest");
         for ordinal in 0..20 {
             if ordinal == openssl {
-                assert_ne!(baseline.observations[ordinal].raw_sha256, changed.observations[ordinal].raw_sha256, "allowed observational value rebinds its raw digest",);
+                assert_ne!(baseline.observations[ordinal].raw_sha256, changed.observations[ordinal].raw_sha256, "allowed observational value rebinds its raw digest");
             } else {
-                assert_eq!(baseline.observations[ordinal].raw_sha256, changed.observations[ordinal].raw_sha256, "unmodified role raw digest remains exact",);
+                assert_eq!(baseline.observations[ordinal].raw_sha256, changed.observations[ordinal].raw_sha256, "unmodified role raw digest remains exact");
             }
         }
         assert_ne!(baseline.tool_set_sha256, [0; 32]);
         assert_ne!(changed.tool_set_sha256, [0; 32]);
-        assert_ne!(baseline.tool_set_sha256, changed.tool_set_sha256, "complete tool-set digest rebinds the allowed raw observation",);
+        assert_ne!(baseline.tool_set_sha256, changed.tool_set_sha256, "complete tool-set digest rebinds the allowed raw observation");
     }
 
     const ORDINARY_B_R2_SEALED_PRODUCTION_E2E_TEST_ID: &str = "ordinary::ordinary_b_r2_sealed_production_e2e";
@@ -60795,7 +60795,7 @@ fn fallible(value: Option<u8>) {
     #[test]
     fn ordinary_b_required_test_id_manifest_is_exact_and_nonempty() {
         let unique = ORDINARY_B_REQUIRED_TEST_IDS.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(unique.len(), ORDINARY_B_REQUIRED_TEST_IDS.len(), "frozen B-R manifest must contain no duplicate test IDs",);
+        assert_eq!(unique.len(), ORDINARY_B_REQUIRED_TEST_IDS.len(), "frozen B-R manifest must contain no duplicate test IDs");
         assert_eq!(ORDINARY_B_REQUIRED_TEST_IDS.len(), 21, "complete B-R1..B-R5 manifest");
         assert_eq!(ORDINARY_B_PREDECESSOR_SUCCESSORS.len(), 6);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -60822,8 +60822,8 @@ fn fallible(value: Option<u8>) {
             };
             let selected = list(Some("ordinary::ordinary_b_"), false);
             assert_eq!(selected.len(), ORDINARY_B_REQUIRED_TEST_IDS.len());
-            assert_eq!(selected.iter().map(String::as_str).collect::<BTreeSet<_>>(), unique, "actual focused libtest discovery must equal the frozen manifest",);
-            assert!(list(Some("ordinary::ordinary_b_"), true).is_empty(), "focused discovery must contain no ignored test",);
+            assert_eq!(selected.iter().map(String::as_str).collect::<BTreeSet<_>>(), unique, "actual focused libtest discovery must equal the frozen manifest");
+            assert!(list(Some("ordinary::ordinary_b_"), true).is_empty(), "focused discovery must contain no ignored test");
             let unfiltered = list(None, false);
             for (predecessor, successor) in ORDINARY_B_PREDECESSOR_SUCCESSORS {
                 let count = |id: &str| unfiltered.iter().filter(|actual| actual.as_str() == id).count();
@@ -61120,7 +61120,7 @@ fn fallible(value: Option<u8>) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| pending!("fixture clock: {error}"))?.as_nanos();
         let mut fresh = None;
         for retry in 0..64u64 {
-            let run_id = format!("{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence + retry),);
+            let run_id = format!("{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence + retry));
             if run_id == "00000000000000000000000000000000" {
                 continue;
             }
@@ -61183,7 +61183,7 @@ fn fallible(value: Option<u8>) {
         ordinary_require_physical_directory_chain(&sysroot, "current rust sysroot")?;
         let toolchain_bin = sysroot.join("bin");
         ordinary_require_physical_directory_chain(&toolchain_bin, "current rust toolchain bin")?;
-        let closed_path = format!("{}:/usr/bin:/bin", toolchain_bin.to_str().ok_or_else(|| pending!("rust toolchain bin is not UTF-8"))?,);
+        let closed_path = format!("{}:/usr/bin:/bin", toolchain_bin.to_str().ok_or_else(|| pending!("rust toolchain bin is not UTF-8"))?);
 
         let archive = test_gzip(&test_tar(&[("attest-fixture-1.0.0/src/lib.rs", b"pub fn attest_fixture() {}\n", 0)]));
         let supply_bytes = test_ordinary_supply_bundle(&[("attest-fixture-1.0.0.crate", &archive)]);
@@ -61300,7 +61300,7 @@ fn fallible(value: Option<u8>) {
         };
         ordinary_fixture_write_new(
             &invocation.repository_root,
-            &format!(".fnd01-run/independent-attester/{}/self-reexec-child-ran", invocation.run_id,),
+            &format!(".fnd01-run/independent-attester/{}/self-reexec-child-ran", invocation.run_id),
             format!("child-ran={}\n", invocation.run_id).as_bytes(),
         )?;
         let environment = read_ordinary_handoff_environment(&invocation).map_err(|error| format!("E_HANDOFF_ENVIRONMENT: child environment: {error}"))?;
@@ -61353,7 +61353,7 @@ fn fallible(value: Option<u8>) {
             let state = ordinary_fixture_tree_state(&invocation.repository_root)?;
             let state_sha256 = trust_sha256(format!("{state:?}").as_bytes()).map_err(|error| format!("E_HANDOFF_LEDGER: baseline state digest: {error}"))?;
             let mut stdout = io::stdout().lock();
-            writeln!(stdout, "FND01NEGSTATEv1|{}|{}|{}", encode_lower_hex(&state_sha256), encode_lower_hex(&expected), encode_lower_hex(&observed),)
+            writeln!(stdout, "FND01NEGSTATEv1|{}|{}|{}", encode_lower_hex(&state_sha256), encode_lower_hex(&expected), encode_lower_hex(&observed))
                 .and_then(|()| stdout.flush())
                 .map_err(|error| format!("E_HANDOFF_LEDGER: baseline state output: {error}"))?;
         }
@@ -61395,7 +61395,7 @@ fn fallible(value: Option<u8>) {
             "Attest self-reexec exact child body did not run",
         );
         if plant == OrdinaryPlant::None {
-            assert_eq!(output.status.code(), Some(0), "public harness positive failed: stdout={stdout:?}; stderr={stderr:?}",);
+            assert_eq!(output.status.code(), Some(0), "public harness positive failed: stdout={stdout:?}; stderr={stderr:?}");
             assert!(stdout.is_empty() && stderr.is_empty());
         } else {
             let stderr = stderr.strip_suffix('\n').expect("public harness failure-frame terminal LF");
@@ -63208,32 +63208,32 @@ fn fallible(value: Option<u8>) {
     fn ordinary_b_r4_all_fail_closed_branches_emit_product_stage() {
         assert_eq!(OrdinaryFailureSite::ALL.len(), 42, "raw public site count");
         let public_sites = OrdinaryFailureSite::ALL.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(public_sites.len(), OrdinaryFailureSite::ALL.len(), "public site rows must be unique before map equality",);
-        assert_eq!(OrdinaryFailureSite::CATCH_ONLY.len(), 1, "raw catch-only site count",);
+        assert_eq!(public_sites.len(), OrdinaryFailureSite::ALL.len(), "public site rows must be unique before map equality");
+        assert_eq!(OrdinaryFailureSite::CATCH_ONLY.len(), 1, "raw catch-only site count");
         let catch_only_sites = OrdinaryFailureSite::CATCH_ONLY.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(catch_only_sites.len(), OrdinaryFailureSite::CATCH_ONLY.len(), "catch-only site rows must be unique before map equality",);
-        assert_eq!(ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(), 42, "raw public site-oracle row count",);
+        assert_eq!(catch_only_sites.len(), OrdinaryFailureSite::CATCH_ONLY.len(), "catch-only site rows must be unique before map equality");
+        assert_eq!(ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(), 42, "raw public site-oracle row count");
         let oracle_sites = ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.iter().map(|(site, _)| *site).collect::<BTreeSet<_>>();
-        assert_eq!(oracle_sites.len(), ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(), "site-oracle keys must be unique before map equality",);
+        assert_eq!(oracle_sites.len(), ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.len(), "site-oracle keys must be unique before map equality");
         let oracle_site_routes = ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.iter().map(|(_, route)| *route).collect::<BTreeSet<_>>();
-        assert_eq!(oracle_site_routes.len(), 41, "ExecutableAdmission is the sole two-site public route",);
-        assert_eq!(ORDINARY_FAILURE_ROUTE_ORACLE.len(), 42, "raw literal route-oracle row count",);
+        assert_eq!(oracle_site_routes.len(), 41, "ExecutableAdmission is the sole two-site public route");
+        assert_eq!(ORDINARY_FAILURE_ROUTE_ORACLE.len(), 42, "raw literal route-oracle row count");
         let oracle_routes = ORDINARY_FAILURE_ROUTE_ORACLE.iter().map(|row| row.0).collect::<BTreeSet<_>>();
         let oracle_route_ids = ORDINARY_FAILURE_ROUTE_ORACLE.iter().map(|row| row.1).collect::<BTreeSet<_>>();
-        assert_eq!(oracle_routes.len(), ORDINARY_FAILURE_ROUTE_ORACLE.len(), "literal route rows must have unique route keys",);
-        assert_eq!(oracle_route_ids.len(), ORDINARY_FAILURE_ROUTE_ORACLE.len(), "literal route rows must have unique IDs",);
-        assert_eq!(OrdinaryFailureRoute::SHIPPED.len(), 42, "raw shipped route count",);
+        assert_eq!(oracle_routes.len(), ORDINARY_FAILURE_ROUTE_ORACLE.len(), "literal route rows must have unique route keys");
+        assert_eq!(oracle_route_ids.len(), ORDINARY_FAILURE_ROUTE_ORACLE.len(), "literal route rows must have unique IDs");
+        assert_eq!(OrdinaryFailureRoute::SHIPPED.len(), 42, "raw shipped route count");
         let shipped_routes = OrdinaryFailureRoute::SHIPPED.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(shipped_routes.len(), OrdinaryFailureRoute::SHIPPED.len(), "shipped route rows must be unique before set equality",);
-        assert_eq!(OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(), 7, "raw legacy route count",);
+        assert_eq!(shipped_routes.len(), OrdinaryFailureRoute::SHIPPED.len(), "shipped route rows must be unique before set equality");
+        assert_eq!(OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(), 7, "raw legacy route count");
         let legacy_test_routes = OrdinaryFailureRoute::LEGACY_TEST_ONLY.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(legacy_test_routes.len(), OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(), "legacy route rows must be unique before set equality",);
+        assert_eq!(legacy_test_routes.len(), OrdinaryFailureRoute::LEGACY_TEST_ONLY.len(), "legacy route rows must be unique before set equality");
         assert_eq!(OrdinaryFailureRoute::ALL.len(), 49, "raw complete route count");
         let all_routes = OrdinaryFailureRoute::ALL.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(all_routes.len(), OrdinaryFailureRoute::ALL.len(), "complete route rows must be unique before partition equality",);
-        assert_eq!(OrdinaryFailureSite::LEGACY_TEST_ONLY, &[OrdinaryFailureSite::ProbeToolPlatform], "the dominated direct-helper platform site is the sole legacy site",);
+        assert_eq!(all_routes.len(), OrdinaryFailureRoute::ALL.len(), "complete route rows must be unique before partition equality");
+        assert_eq!(OrdinaryFailureSite::LEGACY_TEST_ONLY, &[OrdinaryFailureSite::ProbeToolPlatform], "the dominated direct-helper platform site is the sole legacy site");
         let legacy_test_sites = OrdinaryFailureSite::LEGACY_TEST_ONLY.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(legacy_test_sites.len(), OrdinaryFailureSite::LEGACY_TEST_ONLY.len(), "legacy site rows must be unique before partition equality",);
+        assert_eq!(legacy_test_sites.len(), OrdinaryFailureSite::LEGACY_TEST_ONLY.len(), "legacy site rows must be unique before partition equality");
 
         let public = OrdinaryFailureSite::ALL.iter().copied().map(|site| (site, site.route())).collect::<BTreeMap<_, _>>();
         let catch_only = OrdinaryFailureSite::CATCH_ONLY.iter().copied().map(|site| (site, site.route())).collect::<BTreeMap<_, _>>();
@@ -63243,28 +63243,28 @@ fn fallible(value: Option<u8>) {
         // reachability claim. Public runtime witnesses remain the argv, env,
         // filesystem, and race tests that select those paths without a test hook.
         assert_eq!(public, expected, "public site-to-route oracle must be exact");
-        assert_eq!(catch_only, BTreeMap::from([(OrdinaryFailureSite::HandoffPanic, OrdinaryFailureRoute::Panic)]), "only defensive panic emission is catch-only",);
-        assert!(public.keys().all(|site| !catch_only.contains_key(site)), "public and catch-only site sets must be disjoint",);
-        assert!(legacy_test_sites.iter().all(|site| !public_sites.contains(site) && !catch_only_sites.contains(site)), "legacy sites cannot receive public or catch-only credit",);
+        assert_eq!(catch_only, BTreeMap::from([(OrdinaryFailureSite::HandoffPanic, OrdinaryFailureRoute::Panic)]), "only defensive panic emission is catch-only");
+        assert!(public.keys().all(|site| !catch_only.contains_key(site)), "public and catch-only site sets must be disjoint");
+        assert!(legacy_test_sites.iter().all(|site| !public_sites.contains(site) && !catch_only_sites.contains(site)), "legacy sites cannot receive public or catch-only credit");
         assert!(
             ORDINARY_PUBLIC_FAILURE_SITE_ORACLE.iter().all(|(site, route)| { !legacy_test_sites.contains(site) && !legacy_test_routes.contains(route) }),
             "the public site oracle must exclude every legacy site and route",
         );
         let covered_routes = public.values().chain(catch_only.values()).copied().collect::<BTreeSet<_>>();
-        assert_eq!(oracle_routes, covered_routes, "literal route metadata covers every public and catch-only site route",);
-        assert_eq!(oracle_routes, shipped_routes, "literal 42-row metadata must equal the exact shipped-route inventory",);
-        assert_eq!(covered_routes, shipped_routes, "public site routes plus the catch-only route equal SHIPPED",);
-        assert!(shipped_routes.is_disjoint(&legacy_test_routes), "shipped and legacy routes must be disjoint",);
+        assert_eq!(oracle_routes, covered_routes, "literal route metadata covers every public and catch-only site route");
+        assert_eq!(oracle_routes, shipped_routes, "literal 42-row metadata must equal the exact shipped-route inventory");
+        assert_eq!(covered_routes, shipped_routes, "public site routes plus the catch-only route equal SHIPPED");
+        assert!(shipped_routes.is_disjoint(&legacy_test_routes), "shipped and legacy routes must be disjoint");
         let complete_partition = shipped_routes.union(&legacy_test_routes).copied().collect::<BTreeSet<_>>();
-        assert_eq!(complete_partition, all_routes, "shipped plus legacy routes must partition the complete registry",);
-        assert_eq!(OrdinaryFailureSite::ProbeToolPlatform.route(), OrdinaryFailureRoute::ToolPlatform, "the sole legacy site maps only to the legacy platform route",);
+        assert_eq!(complete_partition, all_routes, "shipped plus legacy routes must partition the complete registry");
+        assert_eq!(OrdinaryFailureSite::ProbeToolPlatform.route(), OrdinaryFailureRoute::ToolPlatform, "the sole legacy site maps only to the legacy platform route");
 
         let mut route_counts = BTreeMap::new();
         for route in public.values() {
             *route_counts.entry(*route).or_insert(0usize) += 1;
         }
         let duplicates = route_counts.into_iter().filter_map(|(route, count)| (count > 1).then_some((route, count))).collect::<Vec<_>>();
-        assert_eq!(duplicates, vec![(OrdinaryFailureRoute::ExecutableAdmission, 2)], "the one admitted many-site route must be the sole duplicate",);
+        assert_eq!(duplicates, vec![(OrdinaryFailureRoute::ExecutableAdmission, 2)], "the one admitted many-site route must be the sole duplicate");
     }
 
     #[test]
@@ -63452,15 +63452,15 @@ fn fallible(value: Option<u8>) {
             let receipt = super::phase_b_std::create_sealed_file_parent_chain_negatives().expect("physical parent/file substitutions produce a typed receipt");
             assert_eq!(receipt.direct_parent_code, "E_PHASE_B_FILE_RACE");
             assert_eq!(receipt.direct_parent_detail, "direct parent negative: parent member delta",);
-            assert!(receipt.direct_parent_binding_unchanged, "rejected same-inode member drift cannot advance the binding",);
+            assert!(receipt.direct_parent_binding_unchanged, "rejected same-inode member drift cannot advance the binding");
             assert_eq!(receipt.member_cap_code, "E_PHASE_B_FILE_RACE");
             assert_eq!(receipt.member_cap_detail, "member-cap negative: parent member count exceeds canonical cap 256",);
-            assert!(receipt.member_cap_binding_unchanged, "cap-plus-one parent members cannot advance the binding",);
+            assert!(receipt.member_cap_binding_unchanged, "cap-plus-one parent members cannot advance the binding");
             assert_eq!(receipt.substituted_parent_code, "E_PHASE_B_FILE_RACE");
-            assert!(receipt.substituted_parent_binding_unchanged, "rejected direct-parent substitution cannot advance the binding",);
+            assert!(receipt.substituted_parent_binding_unchanged, "rejected direct-parent substitution cannot advance the binding");
             assert_eq!(receipt.post_advance_code, "E_PHASE_B_FILE_RACE");
             assert_eq!(receipt.same_bytes_file_code, "E_PHASE_B_FILE_RACE");
-            assert_eq!(receipt.accepted_binding_count, 0, "no rejected physical substitution earns an accepted binding",);
+            assert_eq!(receipt.accepted_binding_count, 0, "no rejected physical substitution earns an accepted binding");
         }
         assert_ordinary_attest_self_reexec(ORDINARY_B_R2_SEALED_FIELD_DESYNC_TEST_ID, OrdinaryPlant::ToolSet);
     }
@@ -63550,7 +63550,7 @@ fn fallible(value: Option<u8>) {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("Cargo example fixture clock").as_nanos();
-        let root = Path::new("/tmp").join(format!("fastmcp-fnd01-cargo-example-{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),));
+        let root = Path::new("/tmp").join(format!("fastmcp-fnd01-cargo-example-{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence)));
         fs::create_dir(&root).expect("exclusive Cargo example fixture root");
         let stable_relative = "debug/examples/fnd_01_evidence_harness";
         ordinary_fixture_write_new(&root, stable_relative, ORDINARY_CARGO_EXAMPLE_FIXTURE_BYTES).expect("write Cargo example fixture");
@@ -63566,7 +63566,7 @@ fn fallible(value: Option<u8>) {
     fn ordinary_pinned_rustc_fixture(mode: u32) -> (PathBuf, PathBuf, PathBuf) {
         let root = super::fresh_test_root("ordinary-pinned-rustc");
         let rustup_home = root.join("rustup-home");
-        let rustc_relative = format!("rustup-home/toolchains/{}-x86_64-unknown-linux-gnu/bin/rustc", super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,);
+        let rustc_relative = format!("rustup-home/toolchains/{}-x86_64-unknown-linux-gnu/bin/rustc", super::trust_std::CURRENT_ORDINARY_TOOLCHAIN);
         ordinary_fixture_write_new(&root, &rustc_relative, b"#!/bin/sh\nexit 0\n").expect("write pinned rustc authority fixture");
         let rustc = root.join(rustc_relative);
         let mut permissions = fs::metadata(&rustc).expect("pinned rustc authority fixture metadata").permissions();
@@ -63629,7 +63629,7 @@ fn fallible(value: Option<u8>) {
         let (rustc_fixture, rustup_home, _rustc_path) = ordinary_pinned_rustc_fixture(0o755);
         let isolated_cargo_home = rustc_fixture.join("isolated-cargo-home");
         fs::create_dir(&isolated_cargo_home).expect("isolated Cargo cache fixture");
-        assert!(!isolated_cargo_home.join("bin/rustup").exists(), "a valid isolated Cargo cache need not contain a rustup launcher",);
+        assert!(!isolated_cargo_home.join("bin/rustup").exists(), "a valid isolated Cargo cache need not contain a rustup launcher");
         let rustup_home_text = ordinary_utf8_path(&rustup_home, "rustc fixture RUSTUP_HOME").expect("rustc fixture RUSTUP_HOME UTF-8");
         let pristine = ordinary_checked_rustc_authority(&rustup_home_text, super::trust_std::CURRENT_ORDINARY_TOOLCHAIN).expect("physical pinned rustc authority fixture");
         let rustup_home_alias = rustc_fixture.join("rustup-home-alias");
@@ -63637,8 +63637,8 @@ fn fallible(value: Option<u8>) {
         let before = ordinary_fixture_tree_state(&rustc_fixture).expect("symlinked RUSTUP_HOME fixture state");
         let alias_text = ordinary_utf8_path(&rustup_home_alias, "symlinked RUSTUP_HOME").expect("symlinked RUSTUP_HOME UTF-8");
         let error = ordinary_checked_rustc_authority(&alias_text, super::trust_std::CURRENT_ORDINARY_TOOLCHAIN).expect_err("symlinked RUSTUP_HOME must fail closed");
-        assert_eq!(error, format!("E_ORDINARY_HANDOFF_PENDING: current rust sysroot: {} is not a physical directory", rustup_home_alias.display(),),);
-        assert_eq!(ordinary_fixture_tree_state(&rustc_fixture).expect("symlinked RUSTUP_HOME fixture-state recheck"), before, "rejected symlinked RUSTUP_HOME leaves the complete fixture unchanged",);
+        assert_eq!(error, format!("E_ORDINARY_HANDOFF_PENDING: current rust sysroot: {} is not a physical directory", rustup_home_alias.display()));
+        assert_eq!(ordinary_fixture_tree_state(&rustc_fixture).expect("symlinked RUSTUP_HOME fixture-state recheck"), before, "rejected symlinked RUSTUP_HOME leaves the complete fixture unchanged");
         assert_eq!(ordinary_checked_rustc_authority(&rustup_home_text, super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,).expect("physical pinned rustc pristine reacceptance"), pristine,);
 
         let (hardlink_root, hardlink_rustup_home, hardlinked_rustc) = ordinary_pinned_rustc_fixture(0o755);
@@ -63682,14 +63682,14 @@ fn fallible(value: Option<u8>) {
         wrong_binding.sha256[31] ^= 1;
         let error = ordinary_checked_cargo_example_binding(&mismatched, wrong_binding).expect_err("one-byte Cargo receipt digest mismatch");
         assert_eq!(error, "E_ORDINARY_HANDOFF_PENDING: Cargo-built public harness: debug/examples/fnd_01_evidence_harness: marker digest mismatch",);
-        assert_eq!(ordinary_fixture_tree_state(&mismatched).expect("re-snapshot mismatched Cargo binding fixture"), before, "rejected Cargo receipt binding must remain byte-for-byte unchanged",);
+        assert_eq!(ordinary_fixture_tree_state(&mismatched).expect("re-snapshot mismatched Cargo binding fixture"), before, "rejected Cargo receipt binding must remain byte-for-byte unchanged");
 
         let overlinked = ordinary_cargo_example_hardlink_fixture("fnd_01_evidence_harness-fedcba9876543210");
         fs::hard_link(overlinked.join("debug/examples/fnd_01_evidence_harness"), overlinked.join("debug/examples/fnd_01_evidence_harness-extra")).expect("third Cargo example fixture hardlink");
         let before = ordinary_fixture_tree_state(&overlinked).expect("snapshot overlinked Cargo fixture");
         let error = ordinary_checked_cargo_example_binding(&overlinked, fixture_binding).expect_err("three-link Cargo artifact");
         assert_eq!(error, "E_ORDINARY_HANDOFF_PENDING: Cargo-built public harness link count 3 is not an admitted Cargo layout",);
-        assert_eq!(ordinary_fixture_tree_state(&overlinked).expect("re-snapshot overlinked Cargo fixture"), before, "rejected three-link Cargo layout must remain byte-for-byte unchanged",);
+        assert_eq!(ordinary_fixture_tree_state(&overlinked).expect("re-snapshot overlinked Cargo fixture"), before, "rejected three-link Cargo layout must remain byte-for-byte unchanged");
         qualified_linux_live_reprobe("B-R1");
     }
 
@@ -63720,7 +63720,7 @@ fn fallible(value: Option<u8>) {
             static NEXT_PLATFORM_SUBJECT: AtomicU64 = AtomicU64::new(1);
             let sequence = NEXT_PLATFORM_SUBJECT.fetch_add(1, Ordering::Relaxed);
             let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("platform A/B fixture clock").as_nanos();
-            let fresh_root = Path::new("/tmp").join(format!("fastmcp-fnd01-platform-ab-{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),));
+            let fresh_root = Path::new("/tmp").join(format!("fastmcp-fnd01-platform-ab-{:032x}", now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence)));
             fs::create_dir(&fresh_root).expect("exclusive fresh platform A/B root");
             let source_root = repository_root();
             for path in AUTHORING_PATHS {
@@ -63762,15 +63762,15 @@ fn fallible(value: Option<u8>) {
             assert_eq!(error.observed, "ordinary handoff requires Linux x86_64");
             assert_eq!(negative_effects.ledger_open_attempts, 0);
             assert_eq!(negative_effects.evidence_dispatch_attempts, 0);
-            assert_eq!(ordinary_fixture_tree_state(&fresh_root).expect("platform-refusal fresh-root state"), before, "the rejected one-variable platform dimension leaves the fresh root unchanged",);
+            assert_eq!(ordinary_fixture_tree_state(&fresh_root).expect("platform-refusal fresh-root state"), before, "the rejected one-variable platform dimension leaves the fresh root unchanged");
 
             let (positive, positive_effects) = evaluate(true);
             let advanced = positive.expect_err("the true twin advances to the intentionally absent first non-tool binding");
             assert_eq!(advanced.site, OrdinaryFailureSite::PreLedgerAuthority);
-            assert!(advanced.observed.starts_with("ordinary scratch binding 0:"), "the true twin must advance through platform and complete pre-ledger authority: {advanced}",);
+            assert!(advanced.observed.starts_with("ordinary scratch binding 0:"), "the true twin must advance through platform and complete pre-ledger authority: {advanced}");
             assert_eq!(positive_effects.ledger_open_attempts, 0);
             assert_eq!(positive_effects.evidence_dispatch_attempts, 0);
-            assert_eq!(ordinary_fixture_tree_state(&fresh_root).expect("platform-positive fresh-root state"), before, "the advancing true twin remains read-only before the first scratch binding",);
+            assert_eq!(ordinary_fixture_tree_state(&fresh_root).expect("platform-positive fresh-root state"), before, "the advancing true twin remains read-only before the first scratch binding");
         }
 
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -63842,7 +63842,7 @@ fn fallible(value: Option<u8>) {
             assert!(route_ids.insert(route.id()), "duplicate ordinary route id: {}", route.id());
             let frame = OrdinaryRouteFixture::new(*route, "fixture observed").frame("attest", "0123456789abcdef0123456789abcdef");
             assert_eq!(frame.stage, route.stage().as_str());
-            assert_eq!(frame.parts[2], format!("expected={}", route.expected()), "route {} must preserve its registry invariant", route.id(),);
+            assert_eq!(frame.parts[2], format!("expected={}", route.expected()), "route {} must preserve its registry invariant", route.id());
         }
         for stage in ["authority", "reprobe", "ledger", "archive", "bookend", "evidence"] {
             assert_ne!(stage, "ordinary");
@@ -63865,8 +63865,8 @@ fn fallible(value: Option<u8>) {
             assert!(selectors.insert(route.id()), "duplicate selector: {}", route.id());
             assert_eq!(route.id(), id, "literal route ID: {id}");
             assert_eq!(route.code(), code, "literal route code: {id}");
-            assert_eq!(route.stage().as_str(), stage, "literal route stage: {id}",);
-            assert_eq!(route.expected(), expected, "literal route expectation: {id}",);
+            assert_eq!(route.stage().as_str(), stage, "literal route stage: {id}");
+            assert_eq!(route.expected(), expected, "literal route expectation: {id}");
             let frame = OrdinaryRouteFixture::new(route, "route frame observation").frame("attest", run_id);
             assert_eq!(frame.stage, route.stage().as_str());
             assert_eq!(
@@ -63913,7 +63913,7 @@ fn fallible(value: Option<u8>) {
             Err("candidate site-to-route mismatch"),
             "only the typed site differs from the accepted spool candidate",
         );
-        assert_eq!(committed, before_negative, "the rejected one-field substitution leaves accepted frame and effect state unchanged",);
+        assert_eq!(committed, before_negative, "the rejected one-field substitution leaves accepted frame and effect state unchanged");
     }
 
     #[test]
@@ -63944,10 +63944,10 @@ fn fallible(value: Option<u8>) {
             Err("ordinary harness must bind the real handoff callback and emitter"),
             "one emitter binding replacement must reject the wrapper evaluator",
         );
-        assert!(handoff_core.contains("arguments.len()!=ORDINARY_HANDOFF_ARGV_ARITY"), "the typed core must reject malformed arity before callback dispatch",);
-        assert!(handoff_core.contains("OrdinaryFailureSite::EntryArity"), "malformed arity must select the EntryArity site",);
-        assert!(handoff_core.contains("OrdinaryFailureSite::HandoffPanic"), "panic path must select the HandoffPanic site",);
-        assert!(!body.contains("emit_entry_diagnostic(\"ordinary\","), "harness_main must not hard-code stage=ordinary for ordinary product failures",);
+        assert!(handoff_core.contains("arguments.len()!=ORDINARY_HANDOFF_ARGV_ARITY"), "the typed core must reject malformed arity before callback dispatch");
+        assert!(handoff_core.contains("OrdinaryFailureSite::EntryArity"), "malformed arity must select the EntryArity site");
+        assert!(handoff_core.contains("OrdinaryFailureSite::HandoffPanic"), "panic path must select the HandoffPanic site");
+        assert!(!body.contains("emit_entry_diagnostic(\"ordinary\","), "harness_main must not hard-code stage=ordinary for ordinary product failures");
 
         let state = std::rc::Rc::new(RefCell::new(MalformedHandoffState::default()));
         let callback_state = std::rc::Rc::clone(&state);
@@ -64027,7 +64027,7 @@ fn fallible(value: Option<u8>) {
             Err("catch-only site cannot receive public reachability credit"),
             "one forbidden public-credit field must reject",
         );
-        assert_eq!(catch_only, before_public_credit_request, "rejected public-credit request leaves catch classification commit/effect state unchanged",);
+        assert_eq!(catch_only, before_public_credit_request, "rejected public-credit request leaves catch classification commit/effect state unchanged");
     }
 
     #[test]
@@ -65600,7 +65600,7 @@ fn fallible(value: Option<u8>) {
                 TaOp::RemoveManifest => assert!(delta.before.is_some() && delta.after.is_none() && plan.replacement.is_none(), "exact removal payload"),
                 TaOp::AddManifest => assert!(delta.before.is_none() && delta.after.as_ref() == plan.replacement.as_ref(), "exact addition payload"),
                 TaOp::ReplaceManifest => {
-                    assert!(delta.before.is_some() && delta.before.as_ref() != delta.after.as_ref() && delta.after.as_ref() == plan.replacement.as_ref(), "exact replacement payload")
+                    assert!(delta.before.is_some() && delta.before.as_ref() != delta.after.as_ref() && delta.after.as_ref() == plan.replacement.as_ref(), "exact replacement payload");
                 }
                 _ => unreachable!("manifest operations selected above"),
             }
