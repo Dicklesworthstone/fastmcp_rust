@@ -29,7 +29,7 @@ classification = "fnd_01_evidence_child_only"
 aggregate_fnd_01_support = false
 apps_support = false
 safe_icon_rendering_support = false
-runtime_results = "shared verifier implemented; exact positive and planted-negative execution pending final source rebind and central RCH verification"
+runtime_results = "no runtime result is claimed; the shared dependency-evidence validator is implemented, while current central verification remains pending"
 owned_paths = [
   "evidence/fnd-01/media-dependencies.toml",
   "evidence/fnd-01/vectors/media/*",
@@ -38,7 +38,7 @@ shared_files_modified = true
 
 [phase_a_validation_contract]
 phase = "A"
-status = "shared production loader, validator, and both named tests implemented; final source rebind and central execution remain pending"
+status = "immutable historical Phase-A classification: the shared loader, validator, and both named tests were implemented; this field grants no current execution or final-rebind authority"
 positive_test_id = "ordinary::fnd_01_media_dependencies_positive"
 planted_negative_test_id = "ordinary::fnd_01_media_dependencies_planted_negative"
 test_id_count = 2
@@ -86,11 +86,11 @@ phase_b_precondition = "The shared verifier owner, bd-mcp-2026-07-28-support-ahe
 runtime_nonclaim = "This contract validates dependency evidence only. It cannot claim HTML decoding, image decoding, SVG rendering, Apps support, safe icon rendering, or any runtime capability."
 
 [toolchain]
-rust_version = "1.99"
-channel = "nightly-2026-07-11"
-rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
-cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
-resolver = "2"
+rust_version = "1.100"
+channel = "nightly-2026-08-20"
+rustc = "rustc 1.100.0-nightly (f7d782a3b 2026-08-19)"
+cargo = "cargo 1.100.0-nightly (514c56dd7 2026-08-19)"
+resolver = "3"
 supported_targets = [
   "aarch64-apple-darwin",
   "aarch64-unknown-linux-gnu",
@@ -99,8 +99,8 @@ supported_targets = [
   "x86_64-unknown-linux-gnu",
 ]
 target_authority = "evidence/fnd-01/toolchain-asupersync.toml"
-target_authority_byte_length = 39211
-target_authority_sha256 = "5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314"
+target_authority_byte_length = 20933
+target_authority_sha256 = "cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0"
 
 [source_policy]
 direct_root_archive_bytes_checked_in = false

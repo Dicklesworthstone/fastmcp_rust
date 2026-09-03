@@ -15,7 +15,7 @@ authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
 source_input_count = 71
-source_input_total_bytes = 3024745
+source_input_total_bytes = 3024805
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -152,8 +152,8 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 71
-total_bytes = 3024745
-sha256 = "dde288ffdb01d672db786a3de9339d31fdcb6d0256c80685ec01c0284bde7832"
+total_bytes = 3024805
+sha256 = "e9b5deb6d83e3a26b872a1c91074a1021337c3daa66e6beea06cff84bb9b98d0"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5677,8 +5677,8 @@ tree_sha256 = "6a5f5d57a771c6a49b418093f8161d0c5cee74cfe708293edc6bcae99d62b0a7"
 id = "media"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.12"
 file_count = 10
-total_bytes = 564485
-tree_sha256 = "abed2b6ee906b8c6694bbea0034b88eda013d0cfbab1e2d365a84f17ea396de9"
+total_bytes = 564545
+tree_sha256 = "65d85e80198986f5cd4b19ca8fbe2550c624fcc8a5404d64e67b52801c6c9ecd"
 
 [[source_family]]
 id = "state"
@@ -6374,8 +6374,8 @@ id = "s04"
 family = "media"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.12"
 path = "evidence/fnd-01/media-dependencies.toml"
-byte_length = 54205
-sha256 = "6212bbfd7f353674ff353cdb8976ebdb7e7ddbe61449a2669753b313cbe7a8a3"
+byte_length = 54265
+sha256 = "79377060e03ee1ca68ea49e660e3b117713d38e3986124ad52e2d5bc698eeae4"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true

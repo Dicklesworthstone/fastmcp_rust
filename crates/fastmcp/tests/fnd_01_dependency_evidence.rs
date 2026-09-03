@@ -15,7 +15,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 909064;
 const FROZEN_POLICY_SHA256: &str =
-    "152dd63d584ab48be5523254441b29e49c25396539d0b80bc4966ff155db20f2";
+    "6366c41d5c9ae85ebff253a3d75d87aabd8b634e5c73867079b48f6c4ad36371";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -20462,7 +20462,7 @@ mod ordinary {
     const ACQUISITION_SPARSE_CONFIG_PATH: &str = "registry/index/index.crates.io-1949cf8c6b5b557f/config.json";
     const BOOTSTRAP_MANIFEST_BYTES: u64 = 7_329;
     const BOOTSTRAP_MANIFEST_SHA256: &str = "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
-    const SOURCE_TREE_SHA256: &str = "dde288ffdb01d672db786a3de9339d31fdcb6d0256c80685ec01c0284bde7832";
+    const SOURCE_TREE_SHA256: &str = "e9b5deb6d83e3a26b872a1c91074a1021337c3daa66e6beea06cff84bb9b98d0";
     const NEGATIVE_INVENTORY_SHA256: &str = "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
     const POLICY_OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.14";
@@ -21212,7 +21212,7 @@ activate = 1\n";
         ("toolchain", "bd-mcp-2026-07-28-support-ahet.1.6", 7, 61445, "0a8e5976338ea2378e25727a0905001f29d4babd385c4eba842e199031d06941"),
         ("serialization", "bd-mcp-2026-07-28-support-ahet.1.7", 2, 64518, "46dd698e88b6a243aaad0efcd41dc1411efd1f65c0b4d529decaf611896576d0"),
         ("jose", "bd-mcp-2026-07-28-support-ahet.1.11", 4, 11_442, "6a5f5d57a771c6a49b418093f8161d0c5cee74cfe708293edc6bcae99d62b0a7"),
-        ("media", "bd-mcp-2026-07-28-support-ahet.1.12", 10, 564_485, "abed2b6ee906b8c6694bbea0034b88eda013d0cfbab1e2d365a84f17ea396de9"),
+        ("media", "bd-mcp-2026-07-28-support-ahet.1.12", 10, 564_545, "65d85e80198986f5cd4b19ca8fbe2550c624fcc8a5404d64e67b52801c6c9ecd"),
         ("state", "bd-mcp-2026-07-28-support-ahet.1.13", 10, 229_905, "26f3e9c195cadfcce3dafba73f86e88e011d27a9dd8072312472a00ae72b9b9b"),
     ];
 
@@ -25859,7 +25859,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3024745
+            || policy.source_input_total_bytes != 3024805
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
@@ -50053,6 +50053,7 @@ activate = 1\n";
     #[derive(Clone)]
     struct MediaDependencyBundle {
         files: Vec<LoadedFile>,
+        manifest: toml::Value,
         security: toml::Value,
     }
 
@@ -50062,8 +50063,9 @@ activate = 1\n";
             return Err(Diagnostic::error("E_MEDIA_INPUT_SET", "media dependency loader"));
         }
         let files = selected.into_iter().cloned().collect::<Vec<_>>();
+        let manifest = parse_source_toml(&files, MEDIA_INPUT_PATHS[0])?;
         let security = parse_source_toml(&files, MEDIA_INPUT_PATHS[4])?;
-        Ok(MediaDependencyBundle { files, security })
+        Ok(MediaDependencyBundle { files, manifest, security })
     }
 
     fn media_semantic_digest(label: &str, value: &toml::Value) -> VResult<String> {
@@ -50087,9 +50089,11 @@ activate = 1\n";
         Ok(lower_hex(&digest.finalize()))
     }
 
-    fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, _corpus: &[LoadedFile], _policy: &Policy) -> VResult<(String, usize, usize)> {
+    fn validate_media_dependency_bundle(bundle: &MediaDependencyBundle, corpus: &[LoadedFile], policy: &Policy) -> VResult<(String, usize, usize)> {
         const SUBJECT: &str = "media-svg-external-resource-policy-drift";
         const TARGET: &str = "/case/id=svg-external-use/expected";
+        const TOOLCHAIN_SUBJECT: &str = "media-toolchain-authority-drift";
+        const TOOLCHAIN_PATH: &str = "evidence/fnd-01/toolchain-asupersync.toml";
         if bundle.files.len() != MEDIA_INPUT_PATHS.len() || bundle.files.iter().zip(MEDIA_INPUT_PATHS).any(|(file, path)| file.contract.path != *path) {
             return Err(Diagnostic::error("E_MEDIA_INPUT_SET", "media dependency bundle"));
         }
@@ -50110,13 +50114,52 @@ activate = 1\n";
                 return Err(Diagnostic::error("E_MEDIA_INPUT_BINDING", &file.contract.path));
             }
         }
-        let manifest = parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[0])?;
-        let declared = string_array(&manifest, "/phase_a_validation_contract/input_paths_ascending_raw_bytes", "media input paths")?;
+        let manifest = &bundle.manifest;
+        let policy_authorities = policy.source_input.iter().filter(|contract| contract.path == TOOLCHAIN_PATH).collect::<Vec<_>>();
+        let corpus_authorities = corpus.iter().filter(|file| file.contract.path == TOOLCHAIN_PATH).collect::<Vec<_>>();
+        if policy_authorities.len() != 1 || corpus_authorities.len() != 1 {
+            return Err(Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("toolchain target authority"));
+        }
+        let authority = policy_authorities[0];
+        let authority_file = corpus_authorities[0];
+        let authority_document = parse_toml_strict(&authority_file.bytes, TOOLCHAIN_PATH)?;
+        let authority_channel = pointer_get(&authority_document, "/toolchain/channel", TOOLCHAIN_SUBJECT)?.as_str().ok_or_else(|| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("toolchain channel"))?;
+        let authority_rustc_version = pointer_get(&authority_document, "/toolchain/rustc/version", TOOLCHAIN_SUBJECT)?.as_str().ok_or_else(|| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("rustc version"))?;
+        let authority_rust_version = authority_rustc_version.strip_suffix(".0-nightly").ok_or_else(|| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("rust-version derivation"))?;
+        let authority_rustc = format!("rustc {}", pointer_get(&authority_document, "/toolchain/rustc/manifest_version_string", TOOLCHAIN_SUBJECT)?.as_str().ok_or_else(|| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("rustc identity"))?);
+        let authority_cargo = pointer_get(&authority_document, "/toolchain/cargo/executable_version_string", TOOLCHAIN_SUBJECT)?.as_str().ok_or_else(|| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("cargo identity"))?;
+        let authority_bytes = u64::try_from(authority_file.bytes.len()).map_err(|_| Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("authority length"))?;
+        if authority.id != "s35"
+            || authority.family != "toolchain"
+            || authority.owner_bead != "bd-mcp-2026-07-28-support-ahet.1.6"
+            || authority_file.contract.id != authority.id
+            || authority_file.contract.family != authority.family
+            || authority_file.contract.owner_bead != authority.owner_bead
+            || authority_file.contract.byte_length != authority.byte_length
+            || authority_file.contract.sha256 != authority.sha256
+            || authority_bytes != authority.byte_length
+            || authority_file.digest != sha256(&authority_file.bytes)
+            || lower_hex(&authority_file.digest) != authority.sha256
+            || pointer_get(&authority_document, "/bead_id", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority.owner_bead.as_str())
+            || pointer_get(&authority_document, "/decision/rust_toolchain", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority_channel)
+            || pointer_get(manifest, "/toolchain/rust_version", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority_rust_version)
+            || pointer_get(manifest, "/toolchain/channel", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority_channel)
+            || pointer_get(manifest, "/toolchain/rustc", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority_rustc.as_str())
+            || pointer_get(manifest, "/toolchain/cargo", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority_cargo)
+            || pointer_get(manifest, "/toolchain/resolver", TOOLCHAIN_SUBJECT)?.as_str() != Some(policy.nonpromotion_contract.canonical_resolver.as_str())
+            || pointer_get(manifest, "/toolchain/target_authority", TOOLCHAIN_SUBJECT)?.as_str() != Some(TOOLCHAIN_PATH)
+            || pointer_get(manifest, "/toolchain/target_authority_byte_length", TOOLCHAIN_SUBJECT)?.as_integer().and_then(|value| u64::try_from(value).ok()) != Some(authority.byte_length)
+            || pointer_get(manifest, "/toolchain/target_authority_sha256", TOOLCHAIN_SUBJECT)?.as_str() != Some(authority.sha256.as_str())
+        {
+            return Err(Diagnostic::error("E_MEDIA_TOOLCHAIN_AUTHORITY", TOOLCHAIN_SUBJECT).at("toolchain target authority"));
+        }
+        if bundle.manifest != parse_source_toml(&bundle.files, MEDIA_INPUT_PATHS[0])? {
+            return Err(Diagnostic::error("E_MEDIA_DOCUMENT", MEDIA_INPUT_PATHS[0]));
+        }
+        let declared = string_array(manifest, "/phase_a_validation_contract/input_paths_ascending_raw_bytes", "media input paths")?;
         if !string_sequence_is(&declared, MEDIA_INPUT_PATHS)
-            || pointer_get(&manifest, "/root_crate_count", "media manifest")?.as_integer() != Some(3)
-            || pointer_get(&manifest, "/substitution_negative_count", "media manifest")?.as_integer() != Some(34)
-            || pointer_get(&manifest, "/toolchain/target_authority_byte_length", "media toolchain")?.as_integer() != Some(39_211)
-            || pointer_get(&manifest, "/toolchain/target_authority_sha256", "media toolchain")?.as_str() != Some("5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314")
+            || pointer_get(manifest, "/root_crate_count", "media manifest")?.as_integer() != Some(3)
+            || pointer_get(manifest, "/substitution_negative_count", "media manifest")?.as_integer() != Some(34)
         {
             return Err(Diagnostic::error("E_MEDIA_MANIFEST", "media dependency bundle"));
         }
@@ -50126,12 +50169,12 @@ activate = 1\n";
             ("resvg", "0.47.0", "Apache-2.0 OR MIT", "1.87.0", "9be183ad6a216aa96f33e4c8033b0988b8b3ea6fd2359d19af5bac4643fd8e81", &[][..]),
         ] {
             let base = format!("/crate/name={name}");
-            if pointer_get(&manifest, &format!("{base}/version"), name)?.as_str() != Some(version)
-                || pointer_get(&manifest, &format!("{base}/license"), name)?.as_str() != Some(license)
-                || pointer_get(&manifest, &format!("{base}/rust_version"), name)?.as_str() != Some(msrv)
-                || pointer_get(&manifest, &format!("{base}/checksum_sha256"), name)?.as_str() != Some(checksum)
-                || pointer_get(&manifest, &format!("{base}/default_features"), name)?.as_bool() != Some(false)
-                || !string_sequence_is(&string_array(&manifest, &format!("{base}/requested_features"), name)?, features)
+            if pointer_get(manifest, &format!("{base}/version"), name)?.as_str() != Some(version)
+                || pointer_get(manifest, &format!("{base}/license"), name)?.as_str() != Some(license)
+                || pointer_get(manifest, &format!("{base}/rust_version"), name)?.as_str() != Some(msrv)
+                || pointer_get(manifest, &format!("{base}/checksum_sha256"), name)?.as_str() != Some(checksum)
+                || pointer_get(manifest, &format!("{base}/default_features"), name)?.as_bool() != Some(false)
+                || !string_sequence_is(&string_array(manifest, &format!("{base}/requested_features"), name)?, features)
             {
                 return Err(Diagnostic::error("E_MEDIA_ROOT_SELECTION", name));
             }
@@ -50148,12 +50191,13 @@ activate = 1\n";
             return Err(Diagnostic::error("E_MEDIA_DECLARED_SURFACE", "media dependency bundle"));
         }
         for (label, value, expected) in [
-            ("manifest", &manifest, "a73c0c767b326380de3ac0a2149a96004bca8b42af5c52c007c70b49e0994f21"),
+            ("manifest", manifest, "f94601d1e792b74d86556ed780ddaffeac98475fe6b2d8d989a97844dd44488a"),
             ("graph", &graph, "8e0b4ff40d2e2a56d53806c66e81ec359fb4759a4c86ca179997b194017a3988"),
             ("security", &bundle.security, "1fa773447e22acad1af1a886be77d1a0958b2b0477309fc42200c775d23df370"),
         ] {
-            if media_semantic_digest(label, value)? != expected {
-                return Err(Diagnostic::error("E_MEDIA_SEMANTIC_DOCUMENT", label));
+            let actual = media_semantic_digest(label, value)?;
+            if actual != expected {
+                return Err(Diagnostic::error("E_MEDIA_SEMANTIC_DOCUMENT", label).at(format!("expected={expected};actual={actual}")));
             }
         }
         Ok((media_input_digest(&bundle.files)?, 3, cases.len()))
@@ -54098,15 +54142,17 @@ original = "value"
     fn fnd_01_media_dependencies_positive() {
         let (policy, files, bundle) = media_dependency_test_bundle();
         let accepted = validate_media_dependency_bundle(&bundle, &files, &policy).verified();
-        assert_eq!(accepted.0, "415105fceac8e4c4bede1f72a28e37a4170cb8ef21dcfea8eeb58e8585bdc1b4");
+        assert_eq!(accepted.0, "d3bf7f71472c498057dbbc92d6c9373f51a536d367922bc4670dd40517c3a631");
         assert_eq!(bundle.files.len(), 10);
         assert_eq!((accepted.1, accepted.2), (3, 48));
     }
 
     #[test]
     fn fnd_01_media_dependencies_planted_negative() {
-        let (policy, files, bundle) = media_dependency_test_bundle();
+        let (mut policy, files, bundle) = media_dependency_test_bundle();
         let accepted = validate_media_dependency_bundle(&bundle, &files, &policy).verified();
+        let baseline_files = files.clone();
+        let baseline_manifest = bundle.manifest.clone();
         let baseline_security = bundle.security.clone();
         let mut planted = bundle.clone();
         set_pointer(&mut planted.security, "/case/id=svg-external-use/expected", toml::Value::String("admit_to_renderer_gate".to_owned()), "media planted negative").verified();
@@ -54119,6 +54165,90 @@ original = "value"
         set_pointer(&mut planted.security, "/case/id=svg-external-use/expected", toml::Value::String("reject_before_renderer_entry".to_owned()), "media planted restoration").verified();
         assert_eq!(planted.security, baseline_security);
         assert_eq!(validate_media_dependency_bundle(&planted, &files, &policy).verified(), accepted);
+
+        let authority_contract = policy
+            .source_input
+            .iter_mut()
+            .find(|contract| contract.path == "evidence/fnd-01/toolchain-asupersync.toml")
+            .expect("one admitted toolchain authority");
+        let baseline_authority_sha256 = authority_contract.sha256.clone();
+        authority_contract.sha256.replace_range(..1, "d");
+        let policy_error = validate_media_dependency_bundle(&bundle, &files, &policy)
+            .expect_err("one wrong policy-side toolchain binding must fail at the production media validator");
+        assert_eq!(
+            policy_error.stable(),
+            "FND01|Error|E_MEDIA_TOOLCHAIN_AUTHORITY|media-toolchain-authority-drift|toolchain target authority",
+        );
+        assert_eq!(bundle.manifest, baseline_manifest);
+        assert_eq!(bundle.security, baseline_security);
+        assert_sdk_loaded_file_vectors_equal(&baseline_files, &files, "media policy rejection retains corpus").verified();
+        policy
+            .source_input
+            .iter_mut()
+            .find(|contract| contract.path == "evidence/fnd-01/toolchain-asupersync.toml")
+            .expect("restore one admitted toolchain authority")
+            .sha256 = baseline_authority_sha256;
+        assert_eq!(validate_media_dependency_bundle(&bundle, &files, &policy).verified(), accepted);
+
+        let mut corpus_planted = files.clone();
+        let authority_file = corpus_planted
+            .iter_mut()
+            .find(|file| file.contract.path == "evidence/fnd-01/toolchain-asupersync.toml")
+            .expect("one loaded toolchain authority");
+        authority_file.bytes[0] ^= 1;
+        let corpus_error = validate_media_dependency_bundle(&bundle, &corpus_planted, &policy)
+            .expect_err("one-byte corpus-side toolchain drift must fail at the production media validator");
+        assert_eq!(
+            corpus_error.stable(),
+            "FND01|Error|E_MEDIA_TOOLCHAIN_AUTHORITY|media-toolchain-authority-drift|toolchain target authority",
+        );
+        let changed_files = baseline_files
+            .iter()
+            .zip(&corpus_planted)
+            .filter(|(before, after)| before.bytes != after.bytes || before.contract.path != after.contract.path || before.digest != after.digest)
+            .collect::<Vec<_>>();
+        assert_eq!(changed_files.len(), 1, "exactly one corpus file differs");
+        assert_eq!(changed_files[0].0.contract.path, "evidence/fnd-01/toolchain-asupersync.toml");
+        assert_eq!(changed_files[0].0.contract.path, changed_files[0].1.contract.path);
+        assert_eq!(changed_files[0].0.digest, changed_files[0].1.digest);
+        assert_eq!(bundle.manifest, baseline_manifest);
+        assert_eq!(bundle.security, baseline_security);
+        corpus_planted
+            .iter_mut()
+            .find(|file| file.contract.path == "evidence/fnd-01/toolchain-asupersync.toml")
+            .expect("restore one loaded toolchain authority")
+            .bytes[0] ^= 1;
+        assert_sdk_loaded_file_vectors_equal(&baseline_files, &corpus_planted, "media corpus restoration").verified();
+        assert_eq!(validate_media_dependency_bundle(&bundle, &files, &policy).verified(), accepted);
+
+        let mut toolchain_planted = bundle.clone();
+        set_pointer(
+            &mut toolchain_planted.manifest,
+            "/toolchain/target_authority_sha256",
+            toml::Value::String("db11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0".to_owned()),
+            "media toolchain planted negative",
+        )
+        .verified();
+        let rejected_manifest = toolchain_planted.manifest.clone();
+        let toolchain_error = validate_media_dependency_bundle(&toolchain_planted, &files, &policy)
+            .expect_err("one wrong settled toolchain digest must fail at the production media validator");
+        assert_eq!(
+            toolchain_error.stable(),
+            "FND01|Error|E_MEDIA_TOOLCHAIN_AUTHORITY|media-toolchain-authority-drift|toolchain target authority",
+        );
+        assert_eq!(toolchain_planted.manifest, rejected_manifest);
+        assert_eq!(toolchain_planted.security, baseline_security);
+        assert_sdk_loaded_file_vectors_equal(&bundle.files, &toolchain_planted.files, "media toolchain retained inputs").verified();
+        assert_eq!(media_input_digest(&toolchain_planted.files).verified(), accepted.0);
+        set_pointer(
+            &mut toolchain_planted.manifest,
+            "/toolchain/target_authority_sha256",
+            toml::Value::String("cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0".to_owned()),
+            "media toolchain planted restoration",
+        )
+        .verified();
+        assert_eq!(toolchain_planted.manifest, baseline_manifest);
+        assert_eq!(validate_media_dependency_bundle(&toolchain_planted, &files, &policy).verified(), accepted);
 
         let (fresh_policy, fresh_files, fresh) = media_dependency_test_bundle();
         assert_sdk_loaded_file_vectors_equal(&bundle.files, &fresh.files, "media fresh inputs").verified();
