@@ -2134,9 +2134,14 @@ fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
     let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
     let mut task_cx = TaskContext::from_waker(&waker);
     let mut future = std::pin::pin!(future);
+    let mut polls: u64 = 0;
     loop {
         if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
             return output;
+        }
+        polls += 1;
+        if polls % 1000 == 0 {
+            eprintln!("DBG65 poll_on_cx pending polls={polls}");
         }
         if cx.is_cancel_requested()
             && let Poll::Ready(output) = future.as_mut().poll(&mut task_cx)
@@ -13505,9 +13510,19 @@ impl Server {
     /// Runs one modern stdio request. `subscriptions/listen` is detached so the
     /// receive pump can keep accepting tools/call and cancellation instead of
     /// freezing on the listen wait loop.
+    ///
+    /// `cx` is the RECEIVE PUMP's context and owns transport I/O. `dispatch_cx`
+    /// is the caller runtime's context and owns the request future: when the
+    /// pump runs as a blocking child (the stdio arrangement), a handler that
+    /// admits an async child cannot make progress under the pump's blocking
+    /// context, and the request future stays `Pending` forever — the process
+    /// answers `server/discover` and then silently stops responding
+    /// (GitHub #65). Callers whose pump and runtime are the same context pass
+    /// the same `Cx` twice.
     fn dispatch_or_detach_stdio_modern_request<S>(
         server: Arc<Self>,
         cx: &Cx,
+        dispatch_cx: &Cx,
         inbound: InboundRequestContext,
         request: JsonRpcRequest,
         auth_receipt: Option<AuthDispatchCustody>,
@@ -13526,6 +13541,7 @@ impl Server {
             // spawn cannot fall back to inline dispatch — it answers with an
             // internal error instead of freezing the receive pump.
             let send_cx = cx.clone();
+            let listen_dispatch_cx = dispatch_cx.clone();
             let request_id = request.id.clone();
             let detached = std::thread::Builder::new()
                 .name("fastmcp-stdio-listen".to_owned())
@@ -13535,7 +13551,7 @@ impl Server {
                     let request_cancellation = request_cancellation.clone();
                     move || {
                         let response = poll_on_cx(
-                            &send_cx,
+                            &listen_dispatch_cx,
                             server.dispatch_with_protocol_policy_owned(
                                 policy,
                                 &inbound,
@@ -13570,7 +13586,7 @@ impl Server {
             };
         }
         poll_on_cx(
-            cx,
+            dispatch_cx,
             server.dispatch_with_protocol_policy_owned(
                 policy,
                 &inbound,
@@ -15423,7 +15439,7 @@ impl Server {
     fn run_loop_pump_with_policy<R, S>(
         self: Arc<Self>,
         cx: &Cx,
-        _dispatch_cx: &Cx,
+        dispatch_cx: &Cx,
         mut recv: R,
         send: S,
         notification_sender: NotificationSender,
@@ -15467,6 +15483,7 @@ impl Server {
             {
                 break;
             }
+            eprintln!("DBG65 loop-top");
             let message = match recv(cx, &worker_failed) {
                 Ok(message) => message,
                 Err(TransportError::Closed | TransportError::Cancelled) => break,
@@ -15475,9 +15492,11 @@ impl Server {
                     break;
                 }
             };
+            eprintln!("DBG65 recv ok");
             let JsonRpcMessage::Request(request) = message else {
                 continue;
             };
+            eprintln!("DBG65 request method={}", request.method);
             if request.validate().is_err() {
                 exit_code = 1;
                 break;
@@ -15516,16 +15535,21 @@ impl Server {
                 exit_code = i32::from(owns_server_lifecycle);
                 break;
             }
+            // The request context is the DISPATCH runtime's, not the receive
+            // pump's: under the stdio arrangement the pump is a blocking child
+            // and cannot drive an async request child (GitHub #65).
             let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
-                cx.clone(),
+                dispatch_cx.clone(),
                 request_id_to_u64(request.id.as_ref()),
                 InboundRequestTransport::Stdio,
                 &modern_connection,
                 transport_authorization.clone().unwrap_or_default(),
             );
+            eprintln!("DBG65 pre-dispatch");
             let response = Self::dispatch_or_detach_stdio_modern_request(
                 Arc::clone(&server),
                 cx,
+                dispatch_cx,
                 inbound,
                 request,
                 auth_receipt.clone(),
@@ -15533,6 +15557,7 @@ impl Server {
                 Arc::clone(&notification_sender),
                 Arc::clone(&send),
             );
+            eprintln!("DBG65 post-dispatch some={}", response.is_some());
             if let Some(response) = response {
                 let send_err = send
                     .lock()
@@ -15541,6 +15566,7 @@ impl Server {
                     &JsonRpcMessage::Response(response),
                 )
                 .is_err();
+                eprintln!("DBG65 sent err={send_err}");
                 if send_err {
                     exit_code = 1;
                     break;
@@ -17158,6 +17184,7 @@ impl Server {
                         Self::dispatch_or_detach_stdio_modern_request(
                             Arc::clone(&server),
                             cx,
+                            cx,
                             inbound,
                             request,
                             None,
@@ -17568,6 +17595,7 @@ impl Server {
                         );
                         Self::dispatch_or_detach_stdio_modern_request(
                             Arc::clone(&server),
+                            cx,
                             cx,
                             inbound,
                             request,
