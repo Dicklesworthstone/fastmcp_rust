@@ -4837,6 +4837,16 @@ pub mod modern {
             self.inner.next_subscription_event(cx, cancellation)
         }
 
+        /// Takes a ready incremental catalog event, or drives one bounded
+        /// stdio receive turn without retaining the facade's ingress lock.
+        pub fn try_next_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<Option<StdioSubscriptionEvent>> {
+            self.inner.try_next_subscription_event(cx, cancellation)
+        }
+
         /// Drives one incremental official Tasks listener event.
         #[cfg(feature = "tasks")]
         pub fn next_final_task_subscription_event(
