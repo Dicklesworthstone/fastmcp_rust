@@ -998,6 +998,364 @@ pub mod auto {
             self.inner.request_with_raw_result(cx, method, params).await
         }
 
+        /// Sends `ping` through the era selected by Auto negotiation.
+        pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping(cx).await
+        }
+
+        /// Sends `ping` under a caller-owned cancellation domain.
+        pub async fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping_with_cancellation(cx, cancellation).await
+        }
+
+        /// Lists one page of tools through the era selected by Auto negotiation.
+        pub async fn list_tools(&mut self, cx: &Cx, cursor: Option<&str>) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_tools(cx, cursor).await
+        }
+
+        /// Lists one tag-filtered tools page through the selected era.
+        pub async fn list_tools_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListToolsParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_tools_with_params(cx, params).await
+        }
+
+        /// Lists one tools page under a caller-owned cancellation domain.
+        pub async fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_tools_with_cancellation(cx, cancellation, cursor)
+                .await
+        }
+
+        /// Lists one tag-filtered tools page under caller-owned cancellation.
+        pub async fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)
+                .await
+        }
+
+        /// Lists one page of resources through the era selected by Auto negotiation.
+        pub async fn list_resources(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_resources(cx, cursor).await
+        }
+
+        /// Lists one tag-filtered resources page through the selected era.
+        pub async fn list_resources_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_resources_with_params(cx, params).await
+        }
+
+        /// Lists one resources page under a caller-owned cancellation domain.
+        pub async fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_resources_with_cancellation(cx, cancellation, cursor)
+                .await
+        }
+
+        /// Lists one tag-filtered resources page under caller-owned cancellation.
+        pub async fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_resources_with_params_and_cancellation(cx, cancellation, params)
+                .await
+        }
+
+        /// Lists one page of resource templates through the selected era.
+        pub async fn list_resource_templates(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_resource_templates(cx, cursor).await
+        }
+
+        /// Lists one tag-filtered resource-template page through the selected era.
+        pub async fn list_resource_templates_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_resource_templates_with_params(cx, params)
+                .await
+        }
+
+        /// Lists one resource-template page under caller-owned cancellation.
+        pub async fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_resource_templates_with_cancellation(cx, cancellation, cursor)
+                .await
+        }
+
+        /// Lists one tag-filtered resource-template page under cancellation.
+        pub async fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)
+                .await
+        }
+
+        /// Lists one page of prompts through the era selected by Auto negotiation.
+        pub async fn list_prompts(&mut self, cx: &Cx, cursor: Option<&str>) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_prompts(cx, cursor).await
+        }
+
+        /// Lists one tag-filtered prompts page through the selected era.
+        pub async fn list_prompts_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.list_prompts_with_params(cx, params).await
+        }
+
+        /// Lists one prompts page under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_prompts_with_cancellation(cx, cancellation, cursor)
+                .await
+        }
+
+        /// Lists one tag-filtered prompts page under caller-owned cancellation.
+        pub async fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)
+                .await
+        }
+
+        /// Reads one resource through the era selected by Auto negotiation.
+        pub async fn read_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.read_resource(cx, uri).await
+        }
+
+        /// Reads one resource under a caller-owned cancellation domain.
+        pub async fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .read_resource_with_cancellation(cx, cancellation, uri)
+                .await
+        }
+
+        /// Reads one resource while admitting progress for the supplied marker.
+        pub async fn read_resource_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+            progress_marker: crate::ProgressMarker,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .read_resource_with_progress_marker(cx, uri, progress_marker)
+                .await
+        }
+
+        /// Gets one prompt through the era selected by Auto negotiation.
+        pub async fn get_prompt(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.get_prompt(cx, name, arguments).await
+        }
+
+        /// Gets one prompt under a caller-owned cancellation domain.
+        pub async fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Gets one prompt while admitting progress for the supplied marker.
+        pub async fn get_prompt_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: crate::ProgressMarker,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .get_prompt_with_progress_marker(cx, name, arguments, progress_marker)
+                .await
+        }
+
+        /// Calls one tool through the era selected by Auto negotiation.
+        pub async fn call_tool(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.call_tool(cx, name, arguments).await
+        }
+
+        /// Calls one tool under a caller-owned cancellation domain.
+        pub async fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Calls one tool while admitting progress for the supplied marker.
+        pub async fn call_tool_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: crate::ProgressMarker,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_with_progress_marker(cx, name, arguments, progress_marker)
+                .await
+        }
+
         /// Completes through the era selected by Auto negotiation.
         ///
         /// The returned tagged result preserves whether the fresh transport
@@ -1012,6 +1370,36 @@ pub mod auto {
             IO: Send + 'static,
         {
             self.inner.complete(cx, params).await
+        }
+
+        /// Completes under a caller-owned cancellation domain.
+        pub async fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+            params: crate::CompletionParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .complete_with_cancellation(cx, cancellation, params)
+                .await
+        }
+
+        /// Completes while admitting progress for the supplied marker.
+        pub async fn complete_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            params: crate::CompletionParams,
+            progress_marker: crate::ProgressMarker,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .complete_with_progress_marker(cx, params, progress_marker)
+                .await
         }
 
         /// Sends one generic final extension request after bilateral
@@ -1086,6 +1474,83 @@ pub mod auto {
                     "Auto WebSocket MRTR prompts/get received a non-terminal result",
                 )),
             }
+        }
+
+        /// Calls a modern tool and follows bounded input-required rounds.
+        ///
+        /// Exact-2024 Auto sessions reject before sending because MRTR is a
+        /// final-era operation.
+        pub async fn call_tool_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<crate::FinalCallToolResult>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<fastmcp_client::MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .call_tool_with_mrtr_retry(cx, deadline, name, arguments, respond)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Auto WebSocket MRTR tools/call received a non-terminal result",
+                )),
+            }
+        }
+
+        /// Drains exact final progress notifications received by modern requests.
+        #[must_use]
+        pub fn take_progress_notifications(
+            &mut self,
+        ) -> Vec<crate::FinalProgressNotificationParams> {
+            self.inner.take_final_progress_notifications()
+        }
+
+        /// Drains admitted non-progress final server notifications.
+        #[must_use]
+        pub fn take_server_notifications(&mut self) -> Vec<crate::ServerNotification> {
+            self.inner.take_final_server_notifications()
+        }
+
+        /// Drains exact-2024 notifications retained by a legacy-selected session.
+        #[must_use]
+        pub fn take_legacy_notifications(&mut self) -> Vec<crate::JsonRpcRequest> {
+            self.inner.take_legacy_notifications()
+        }
+
+        /// Starts an incremental final catalog listener.
+        ///
+        /// A legacy-selected Auto session rejects before sending because exact
+        /// 2024-11-05 has no final subscriptions/listen operation.
+        pub async fn open_subscriptions_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: crate::SubscriptionFilter,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .open_subscriptions_listener(cx, notifications)
+                .await
+        }
+
+        /// Drives one incremental catalog-listener event.
+        pub async fn next_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &crate::McpRequestCancellation,
+        ) -> McpResult<crate::StdioSubscriptionEvent>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.next_subscription_event(cx, cancellation).await
         }
     }
 
@@ -10073,7 +10538,7 @@ mod tests {
     #[cfg(feature = "websocket-experimental")]
     use std::collections::BTreeMap;
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "websocket-experimental")]
     use std::net::SocketAddr;
     #[cfg(feature = "websocket-experimental")]
@@ -10182,6 +10647,284 @@ mod tests {
         assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
         assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
         assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_websocket_modern_typed_verbs_positive() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            for response in [
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-typed-modern","version":"1.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[],"isError":false}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","messages":[]}}"#,
+            ] {
+                write_facade_server_text_frame(&mut peer_io, response).await;
+            }
+
+            let mut transport = Some(super::AsyncWsClientTransport::from_upgraded(client_io));
+            let mut client = super::auto::client_builder()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    let transport = transport.take();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "modern Auto typed fixture requested a second transport",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect("Auto selects the modern typed WebSocket peer");
+
+            assert_eq!(
+                client.selected_protocol_era(),
+                super::ProtocolEra::Modern2026
+            );
+            assert!(matches!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .expect("Auto exposes modern tools/list"),
+                super::CoreResult::Final(super::FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(matches!(
+                client
+                    .call_tool(&cx, "echo", serde_json::json!({"text": "modern"}))
+                    .await
+                    .expect("Auto exposes modern tools/call"),
+                super::CoreResult::Final(super::FinalCoreResult::ToolsCall { .. })
+            ));
+            assert!(matches!(
+                client
+                    .read_resource(&cx, "resource://modern")
+                    .await
+                    .expect("Auto exposes modern resources/read"),
+                super::CoreResult::Final(super::FinalCoreResult::ResourcesRead { .. })
+            ));
+            assert!(matches!(
+                client
+                    .get_prompt(&cx, "modern", HashMap::new())
+                    .await
+                    .expect("Auto exposes modern prompts/get"),
+                super::CoreResult::Final(super::FinalCoreResult::PromptsGet { .. })
+            ));
+
+            let mut peer = super::AsyncWsServerTransport::from_upgraded(peer_io);
+            let mut observed = Vec::new();
+            for _ in 0..5 {
+                let super::JsonRpcMessage::Request(request) = peer
+                    .recv(&cx)
+                    .await
+                    .expect("peer receives each public Auto request")
+                else {
+                    panic!("Auto typed fixture must send JSON-RPC requests");
+                };
+                observed.push(request.method);
+            }
+            assert_eq!(
+                observed,
+                [
+                    "server/discover",
+                    "tools/list",
+                    "tools/call",
+                    "resources/read",
+                    "prompts/get",
+                ]
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("close Auto modern typed client");
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_websocket_legacy_typed_verbs_positive() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (discovery_client_io, mut discovery_peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut discovery_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"server/discover unavailable"}}"#,
+            )
+            .await;
+            let (legacy_client_io, mut legacy_peer_io) = facade_async_websocket_pair();
+            for response in [
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-typed-legacy","version":"1.0"}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"content":[],"isError":false}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"contents":[]}}"#,
+                r#"{"jsonrpc":"2.0","id":5,"result":{"messages":[]}}"#,
+            ] {
+                write_facade_server_text_frame(&mut legacy_peer_io, response).await;
+            }
+
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&factory_calls);
+            let mut transports = VecDeque::from([
+                super::AsyncWsClientTransport::from_upgraded(discovery_client_io),
+                super::AsyncWsClientTransport::from_upgraded(legacy_client_io),
+            ]);
+            let mut client = super::auto::client_builder()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let transport = transports.pop_front();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "legacy Auto typed fixture exceeded two fresh transports",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect("correlated MethodNotFound selects a fresh legacy transport");
+
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                client.selected_protocol_era(),
+                super::ProtocolEra::Legacy2024
+            );
+            assert!(matches!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .expect("Auto exposes exact-2024 tools/list"),
+                super::CoreResult::Legacy(super::LegacyCoreResult::ToolsList(_))
+            ));
+            assert!(matches!(
+                client
+                    .call_tool(&cx, "echo", serde_json::json!({"text": "legacy"}))
+                    .await
+                    .expect("Auto exposes exact-2024 tools/call"),
+                super::CoreResult::Legacy(super::LegacyCoreResult::ToolsCall(_))
+            ));
+            assert!(matches!(
+                client
+                    .read_resource(&cx, "resource://legacy")
+                    .await
+                    .expect("Auto exposes exact-2024 resources/read"),
+                super::CoreResult::Legacy(super::LegacyCoreResult::ResourcesRead(_))
+            ));
+            assert!(matches!(
+                client
+                    .get_prompt(&cx, "legacy", HashMap::new())
+                    .await
+                    .expect("Auto exposes exact-2024 prompts/get"),
+                super::CoreResult::Legacy(super::LegacyCoreResult::PromptsGet(_))
+            ));
+
+            let mut discovery_peer =
+                super::AsyncWsServerTransport::from_upgraded(discovery_peer_io);
+            let super::JsonRpcMessage::Request(discovery) = discovery_peer
+                .recv(&cx)
+                .await
+                .expect("first peer receives modern discovery")
+            else {
+                panic!("first Auto contact must be a discovery request");
+            };
+            assert_eq!(discovery.method, "server/discover");
+
+            let mut legacy_peer = super::AsyncWsServerTransport::from_upgraded(legacy_peer_io);
+            let mut observed = Vec::new();
+            for _ in 0..6 {
+                let super::JsonRpcMessage::Request(request) = legacy_peer
+                    .recv(&cx)
+                    .await
+                    .expect("legacy peer receives initialization and typed requests")
+                else {
+                    panic!("legacy Auto typed fixture must send JSON-RPC messages");
+                };
+                observed.push(request.method);
+            }
+            assert_eq!(
+                observed,
+                [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call",
+                    "resources/read",
+                    "prompts/get",
+                ]
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("close Auto legacy typed client");
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_websocket_cancelled_typed_verb_preserves_connection_negative() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            for response in [
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-cancel-modern","version":"1.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            ] {
+                write_facade_server_text_frame(&mut peer_io, response).await;
+            }
+            let mut transport = Some(super::AsyncWsClientTransport::from_upgraded(client_io));
+            let mut client = super::auto::client_builder()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    let transport = transport.take();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "cancelled Auto fixture requested a second transport",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect("Auto cancellation fixture selects modern");
+            let selected_era = client.selected_protocol_era();
+            let selected_version = client.session().protocol_version().to_owned();
+            let cancellation = super::McpRequestCancellation::new();
+            assert!(cancellation.cancel());
+
+            let error = client
+                .list_tools_with_cancellation(&cx, &cancellation, None)
+                .await
+                .expect_err("pre-cancelled Auto call rejects before contact");
+            assert_eq!(error.code, super::McpErrorCode::RequestCancelled);
+            assert_eq!(client.selected_protocol_era(), selected_era);
+            assert_eq!(client.session().protocol_version(), selected_version);
+            assert!(matches!(
+                client
+                    .list_tools(&cx, None)
+                    .await
+                    .expect("uncancelled Auto call reuses the untouched request state"),
+                super::CoreResult::Final(super::FinalCoreResult::ToolsList { .. })
+            ));
+
+            let mut peer = super::AsyncWsServerTransport::from_upgraded(peer_io);
+            let _ = peer
+                .recv(&cx)
+                .await
+                .expect("peer receives initial discovery");
+            let super::JsonRpcMessage::Request(tools) = peer
+                .recv(&cx)
+                .await
+                .expect("peer receives only the uncancelled tools request")
+            else {
+                panic!("uncancelled Auto typed call must be a JSON-RPC request");
+            };
+            assert_eq!(tools.method, "tools/list");
+            assert_eq!(tools.id, Some(super::RequestId::Number(2)));
+            client
+                .close(&cx)
+                .await
+                .expect("close Auto cancellation fixture");
+        });
     }
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
