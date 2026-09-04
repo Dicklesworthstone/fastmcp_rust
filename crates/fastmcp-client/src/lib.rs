@@ -13408,16 +13408,26 @@ impl StdioRequestExecutor {
         &self,
         execution: &mut StdioRequestExecution,
     ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
-        let Some((response, raw_result)) = self
+        self.try_take_response_with_raw_result_and_stream(execution)
+            .map(|opt| opt.map(|(resp, raw, _stream)| (resp, raw)))
+    }
+
+    /// Takes one already-routed final response with its exact admitted result
+    /// source and request-owned stream notifications, without reading the transport.
+    pub fn try_take_response_with_raw_result_and_stream(
+        &self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>, Vec<JsonRpcRequest>)>> {
+        let Some((response, raw_result, stream)) = self
             .executor
-            .try_take_response_with_raw_result(&mut execution.execution)?
+            .try_take_response_with_raw_result_and_stream(&mut execution.execution)?
         else {
             return Ok(None);
         };
         if let Some(error) = response.error.clone() {
             return Err(json_rpc_error_to_mcp(error));
         }
-        Ok(Some((response, raw_result)))
+        Ok(Some((response, raw_result, stream)))
     }
 
     fn service(&self, cx: &Cx) -> McpResult<()> {
@@ -15599,6 +15609,22 @@ impl Client {
         Ok(Some(ModernServerNotification::Progress(Box::new(progress))))
     }
 
+    fn retain_stream_notification(&mut self, notification: &JsonRpcRequest) -> McpResult<()> {
+        let decoded = decode_final_server_notification(notification, None).map_err(|error| {
+            McpError::invalid_request(format!("Invalid final server notification: {error}"))
+        })?;
+        self.final_result_cache.invalidate_notification(&decoded);
+        if let ServerNotification::Progress(progress) = decoded {
+            if self.final_progress_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+                return Err(McpError::invalid_request(
+                    FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                ));
+            }
+            self.final_progress_notifications.push_back(progress);
+        }
+        Ok(())
+    }
+
     fn retain_legacy_server_notification(&mut self, request: &JsonRpcRequest) -> McpResult<bool> {
         if self.session.selected_era() != Some(ProtocolEra::Legacy2024) {
             return Ok(false);
@@ -15886,8 +15912,11 @@ impl Client {
                 executor.cancel(&connection_cx, &mut execution)?;
                 return Err(McpError::request_cancelled());
             }
-            if let Some((mut response, raw_result)) =
-                executor.try_take_response_with_raw_result(&mut execution)?
+            for notification in execution.take_stream_notifications()? {
+                self.retain_stream_notification(&notification)?;
+            }
+            if let Some((mut response, raw_result, stream)) =
+                executor.try_take_response_with_raw_result_and_stream(&mut execution)?
             {
                 let receipt = Instant::now();
                 if let Some(error) = response.error.take() {
@@ -15897,6 +15926,9 @@ impl Client {
                     .result
                     .take()
                     .ok_or_else(|| McpError::internal_error("No result in response"))?;
+                for notification in stream {
+                    self.retain_stream_notification(&notification)?;
+                }
                 return Ok(ReceivedPreparedResult {
                     result,
                     raw_result,

@@ -1917,6 +1917,8 @@ where
 
     /// Takes an already-routed final response with its exact admitted result
     /// source, without reading the transport.
+    /// Takes one already-routed final response with its exact admitted result
+    /// source, without reading the transport.
     ///
     /// This is the source-preserving companion to [`Self::try_take_response`]
     /// for a negotiated connection whose Client owns transport ingress.
@@ -1924,13 +1926,23 @@ where
         &self,
         execution: &mut RequestExecution<T>,
     ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        self.try_take_response_with_raw_result_and_stream(execution)
+            .map(|opt| opt.map(|(resp, raw, _stream)| (resp, raw)))
+    }
+
+    /// Takes one already-routed final response with its exact admitted result
+    /// source and request-owned stream notifications, without reading the transport.
+    pub fn try_take_response_with_raw_result_and_stream(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>, Vec<JsonRpcRequest>)>> {
         execution.ensure_owner(&self.state)?;
-        let Some((outcome, _)) = execution.take_terminal_outcome()? else {
+        let Some((outcome, stream)) = execution.take_terminal_outcome()? else {
             return Ok(None);
         };
         match outcome {
             ExecutionOutcome::Response(response) => {
-                Ok(Some((response.response, response.raw_result)))
+                Ok(Some((response.response, response.raw_result, stream)))
             }
             ExecutionOutcome::Failure(error) => Err(error),
         }
