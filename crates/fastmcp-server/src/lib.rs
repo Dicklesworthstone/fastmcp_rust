@@ -175,9 +175,9 @@ use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 #[cfg(feature = "websocket")]
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 #[cfg(feature = "websocket")]
 use std::task::{Context, Poll};
@@ -12967,14 +12967,13 @@ impl Server {
         }
         {
             let sender = notification_sender.clone();
-            request_ctx = request_ctx.with_log_sender(Arc::new(
-                crate::handler::LogNotificationSender::new(
+            request_ctx =
+                request_ctx.with_log_sender(Arc::new(crate::handler::LogNotificationSender::new(
                     move |notification| {
                         sender(notification);
                     },
                     ProtocolEra::Modern2026,
-                ),
-            ));
+                )));
         }
         // The outer request owner retains the sole final-progress runtime.
         // Router/handler derivation sees this reporter and reuses it instead
