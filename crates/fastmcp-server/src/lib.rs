@@ -167,7 +167,7 @@ use std::any::Any;
 use std::cell::Cell;
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 #[cfg(test)]
 use std::io::Read;
@@ -176,7 +176,9 @@ use std::net::{SocketAddr, TcpListener};
 #[cfg(feature = "websocket")]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex, Once};
 #[cfg(feature = "websocket")]
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -4466,6 +4468,11 @@ pub enum ServerHttpEndpointResponse {
 /// request transport; this registry never creates a background runtime.
 const MAX_FINAL_SUBSCRIPTION_STREAMS: usize = 64;
 
+/// Upper bound for events admitted while one subscription's acknowledgement
+/// callback is in flight. Publishers never wait on application callbacks;
+/// exceeding this bound fails the opening stream closed.
+const MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS: usize = 64;
+
 /// Modern Streamable HTTP has no protocol session identifier.  A listen
 /// response nevertheless owns one connection-local cancellation domain, so
 /// give its active-request entry a process-local generation rather than
@@ -4571,6 +4578,10 @@ impl FinalSubscriptionTerminationReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FinalSubscriptionPhase {
     Opening,
+    /// The acknowledgement has returned and one queued event callback is in
+    /// flight. New events still join the opening FIFO so they cannot overtake
+    /// the callback already selected for delivery.
+    OpeningDelivery,
     Active,
     /// One or more notification callbacks are in flight.
     EventDelivery(usize),
@@ -4583,18 +4594,16 @@ enum FinalSubscriptionPhase {
 
 struct FinalSubscriptionElection {
     phase: Mutex<FinalSubscriptionPhase>,
-    phase_changed: Condvar,
+    opening_events: Mutex<VecDeque<JsonRpcRequest>>,
     graceful_completion: AtomicBool,
-    opener_thread: std::thread::ThreadId,
 }
 
 impl FinalSubscriptionElection {
     fn opening() -> Self {
         Self {
             phase: Mutex::new(FinalSubscriptionPhase::Opening),
-            phase_changed: Condvar::new(),
+            opening_events: Mutex::new(VecDeque::new()),
             graceful_completion: AtomicBool::new(false),
-            opener_thread: std::thread::current().id(),
         }
     }
 }
@@ -4651,13 +4660,18 @@ impl Drop for FinalSubscriptionLease {
             if matches!(
                 *phase,
                 FinalSubscriptionPhase::Opening
+                    | FinalSubscriptionPhase::OpeningDelivery
                     | FinalSubscriptionPhase::Active
                     | FinalSubscriptionPhase::EventDelivery(_)
             ) {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
+                entry
+                    .election
+                    .opening_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
             }
-            drop(phase);
-            entry.election.phase_changed.notify_all();
         }
     }
 }
@@ -4737,6 +4751,18 @@ impl FinalSubscriptionRegistry {
             "terminating": self.terminating.load(Ordering::Acquire),
             "entries": entries,
         })
+    }
+
+    fn remove_entry(&self, key: usize) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.entries.remove(&key)
+            && let Some(owner) = entry.modern_http_owner
+        {
+            state.modern_http_owners.remove(&owner);
+        }
     }
 
     fn open(
@@ -4823,16 +4849,7 @@ impl FinalSubscriptionRegistry {
         let acknowledgement_sent =
             catch_extension_unwind(|| notification_sender(acknowledgement)).is_ok();
         if !acknowledgement_sent {
-            let mut state = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = state.entries.remove(&key)
-                && let Some(owner) = entry.modern_http_owner
-            {
-                state.modern_http_owners.remove(&owner);
-            }
-            drop(state);
+            self.remove_entry(key);
             let mut phase = election
                 .phase
                 .lock()
@@ -4840,13 +4857,17 @@ impl FinalSubscriptionRegistry {
             if matches!(
                 *phase,
                 FinalSubscriptionPhase::Opening
+                    | FinalSubscriptionPhase::OpeningDelivery
                     | FinalSubscriptionPhase::Active
                     | FinalSubscriptionPhase::ServerTerminationPending(_)
             ) {
                 *phase = FinalSubscriptionPhase::PeerTerminated;
             }
-            drop(phase);
-            election.phase_changed.notify_all();
+            election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             if let Some(delivery) = &terminal_delivery {
                 delivery.mark_failed();
             }
@@ -4855,80 +4876,149 @@ impl FinalSubscriptionRegistry {
                 "final_subscription_acknowledgement_sender",
             ));
         }
-        let mut phase = election
-            .phase
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *phase {
-            FinalSubscriptionPhase::Opening if !request_cancellation.is_cancel_requested() => {
-                *phase = FinalSubscriptionPhase::Active;
-            }
-            FinalSubscriptionPhase::ServerTerminationPending(0)
-                if !request_cancellation.is_cancel_requested() =>
-            {
-                *phase = FinalSubscriptionPhase::ServerTerminated;
-                drop(phase);
-                election.phase_changed.notify_all();
-                if !complete_final_subscription_server_termination(
-                    &election,
-                    &subscription_id,
-                    modern_http_owner,
-                    terminal_delivery.as_ref(),
-                    &notification_sender,
-                    &request_cancellation,
-                ) {
-                    *election
-                        .phase
+
+        // Publishers append to the bounded FIFO while the acknowledgement or
+        // an earlier queued callback is in flight. Drain one callback at a
+        // time while retaining the opening phase so a concurrent publisher
+        // cannot overtake an already-admitted event.
+        loop {
+            let queued_notification;
+            let mut phase = election
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *phase {
+                FinalSubscriptionPhase::Opening if !request_cancellation.is_cancel_requested() => {
+                    let mut opening_events = election
+                        .opening_events
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        FinalSubscriptionPhase::PeerTerminated;
-                    election.phase_changed.notify_all();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(notification) = opening_events.pop_front() {
+                        *phase = FinalSubscriptionPhase::OpeningDelivery;
+                        queued_notification = notification;
+                    } else {
+                        *phase = FinalSubscriptionPhase::Active;
+                        break;
+                    }
+                }
+                FinalSubscriptionPhase::ServerTerminationPending(0)
+                    if !request_cancellation.is_cancel_requested() =>
+                {
+                    election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    *phase = FinalSubscriptionPhase::ServerTerminated;
+                    drop(phase);
+                    if !complete_final_subscription_server_termination(
+                        &election,
+                        &subscription_id,
+                        modern_http_owner,
+                        terminal_delivery.as_ref(),
+                        &notification_sender,
+                        &request_cancellation,
+                    ) {
+                        *election
+                            .phase
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            FinalSubscriptionPhase::PeerTerminated;
+                        return Err(McpError::request_cancelled());
+                    }
+                    return Ok(FinalSubscriptionLease {
+                        registry: Arc::clone(self),
+                        key,
+                        election,
+                    });
+                }
+                FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::OpeningDelivery
+                | FinalSubscriptionPhase::Active
+                | FinalSubscriptionPhase::EventDelivery(_)
+                | FinalSubscriptionPhase::ServerTerminationPending(_)
+                | FinalSubscriptionPhase::PeerTerminated
+                | FinalSubscriptionPhase::ServerTerminated => {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    drop(phase);
+                    self.remove_entry(key);
+                    if let Some(delivery) = &terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    request_cancellation.cancel();
                     return Err(McpError::request_cancelled());
                 }
-                return Ok(FinalSubscriptionLease {
-                    registry: Arc::clone(self),
-                    key,
-                    election,
-                });
             }
-            FinalSubscriptionPhase::Opening
-            | FinalSubscriptionPhase::Active
-            | FinalSubscriptionPhase::EventDelivery(_) => {
-                *phase = FinalSubscriptionPhase::PeerTerminated;
-                drop(phase);
-                election.phase_changed.notify_all();
-                let mut state = self
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(entry) = state.entries.remove(&key)
-                    && let Some(owner) = entry.modern_http_owner
+            drop(phase);
+
+            let sent = catch_extension_unwind(|| notification_sender(queued_notification)).is_ok();
+            if !sent {
+                let _ = extension_panic_error("final_subscription_event_sender");
+            }
+            let mut phase = election
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *phase {
+                FinalSubscriptionPhase::OpeningDelivery
+                    if sent && !request_cancellation.is_cancel_requested() =>
                 {
-                    state.modern_http_owners.remove(&owner);
+                    *phase = FinalSubscriptionPhase::Opening;
                 }
-                drop(state);
-                request_cancellation.cancel();
-                return Err(McpError::request_cancelled());
-            }
-            FinalSubscriptionPhase::ServerTerminationPending(_) => {
-                *phase = FinalSubscriptionPhase::PeerTerminated;
-                drop(phase);
-                election.phase_changed.notify_all();
-                if let Some(delivery) = &terminal_delivery {
-                    delivery.mark_failed();
+                FinalSubscriptionPhase::ServerTerminationPending(1)
+                    if sent && !request_cancellation.is_cancel_requested() =>
+                {
+                    *phase = FinalSubscriptionPhase::ServerTerminated;
+                    drop(phase);
+                    if !complete_final_subscription_server_termination(
+                        &election,
+                        &subscription_id,
+                        modern_http_owner,
+                        terminal_delivery.as_ref(),
+                        &notification_sender,
+                        &request_cancellation,
+                    ) {
+                        *election
+                            .phase
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            FinalSubscriptionPhase::PeerTerminated;
+                        return Err(McpError::request_cancelled());
+                    }
+                    return Ok(FinalSubscriptionLease {
+                        registry: Arc::clone(self),
+                        key,
+                        election,
+                    });
                 }
-                request_cancellation.cancel();
-                return Err(McpError::request_cancelled());
-            }
-            FinalSubscriptionPhase::PeerTerminated | FinalSubscriptionPhase::ServerTerminated => {
-                drop(phase);
-                election.phase_changed.notify_all();
-                request_cancellation.cancel();
-                return Err(McpError::request_cancelled());
+                FinalSubscriptionPhase::OpeningDelivery
+                | FinalSubscriptionPhase::ServerTerminationPending(_)
+                | FinalSubscriptionPhase::PeerTerminated
+                | FinalSubscriptionPhase::ServerTerminated
+                | FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::Active
+                | FinalSubscriptionPhase::EventDelivery(_) => {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    drop(phase);
+                    self.remove_entry(key);
+                    if let Some(delivery) = &terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    request_cancellation.cancel();
+                    return Err(McpError::request_cancelled());
+                }
             }
         }
-        drop(phase);
-        election.phase_changed.notify_all();
 
         Ok(FinalSubscriptionLease {
             registry: Arc::clone(self),
@@ -4969,123 +5059,7 @@ impl FinalSubscriptionRegistry {
             })?;
             deliveries.push((entry, wire));
         }
-        let mut count = 0;
-        for (entry, notification) in deliveries {
-            let mut phase = entry
-                .election
-                .phase
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(*phase, FinalSubscriptionPhase::Opening)
-                && std::thread::current().id() != entry.election.opener_thread
-            {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while matches!(*phase, FinalSubscriptionPhase::Opening) {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    let timeout = deadline - now;
-                    let (new_phase, timeout_result) = entry
-                        .election
-                        .phase_changed
-                        .wait_timeout(phase, timeout)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    phase = new_phase;
-                    if timeout_result.timed_out() {
-                        break;
-                    }
-                }
-            }
-            match *phase {
-                FinalSubscriptionPhase::Active => {
-                    if entry.request_cancellation.is_cancel_requested() {
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        continue;
-                    }
-                    *phase = FinalSubscriptionPhase::EventDelivery(1);
-                }
-                FinalSubscriptionPhase::EventDelivery(in_flight) => {
-                    let Some(in_flight) = in_flight.checked_add(1) else {
-                        *phase = FinalSubscriptionPhase::PeerTerminated;
-                        entry.request_cancellation.cancel();
-                        continue;
-                    };
-                    *phase = FinalSubscriptionPhase::EventDelivery(in_flight);
-                }
-                FinalSubscriptionPhase::Opening
-                | FinalSubscriptionPhase::ServerTerminationPending(_)
-                | FinalSubscriptionPhase::PeerTerminated
-                | FinalSubscriptionPhase::ServerTerminated => continue,
-            }
-            drop(phase);
-
-            let sent = catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
-            if !sent {
-                let _ = extension_panic_error("final_subscription_event_sender");
-            }
-            let mut phase = entry
-                .election
-                .phase
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match *phase {
-                FinalSubscriptionPhase::EventDelivery(in_flight)
-                    if sent && !entry.request_cancellation.is_cancel_requested() =>
-                {
-                    *phase = if in_flight == 1 {
-                        FinalSubscriptionPhase::Active
-                    } else {
-                        FinalSubscriptionPhase::EventDelivery(in_flight - 1)
-                    };
-                    count += 1;
-                }
-                FinalSubscriptionPhase::ServerTerminationPending(in_flight)
-                    if in_flight > 1
-                        && sent
-                        && !entry.request_cancellation.is_cancel_requested() =>
-                {
-                    *phase = FinalSubscriptionPhase::ServerTerminationPending(in_flight - 1);
-                    count += 1;
-                }
-                FinalSubscriptionPhase::ServerTerminationPending(1)
-                    if sent && !entry.request_cancellation.is_cancel_requested() =>
-                {
-                    *phase = FinalSubscriptionPhase::ServerTerminated;
-                    drop(phase);
-                    if complete_final_subscription_server_termination(
-                        &entry.election,
-                        &entry.subscription_id,
-                        entry.modern_http_owner,
-                        entry.terminal_delivery.as_ref(),
-                        &entry.notification_sender,
-                        &entry.request_cancellation,
-                    ) {
-                        count += 1;
-                    } else {
-                        *entry
-                            .election
-                            .phase
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            FinalSubscriptionPhase::PeerTerminated;
-                    }
-                }
-                FinalSubscriptionPhase::EventDelivery(_)
-                | FinalSubscriptionPhase::ServerTerminationPending(_) => {
-                    *phase = FinalSubscriptionPhase::PeerTerminated;
-                    if let Some(delivery) = &entry.terminal_delivery {
-                        delivery.mark_failed();
-                    }
-                    entry.request_cancellation.cancel();
-                }
-                FinalSubscriptionPhase::Opening
-                | FinalSubscriptionPhase::Active
-                | FinalSubscriptionPhase::PeerTerminated
-                | FinalSubscriptionPhase::ServerTerminated => {}
-            }
-        }
-        Ok(count)
+        Ok(self.publish_prepared(deliveries, "final_subscription_event_sender"))
     }
 
     #[cfg(feature = "tasks")]
@@ -5118,6 +5092,14 @@ impl FinalSubscriptionRegistry {
             let event = tag_task_subscription_notification(&notification, &entry.subscription_id)?;
             deliveries.push((entry, event));
         }
+        Ok(self.publish_prepared(deliveries, "final_task_subscription_sender"))
+    }
+
+    fn publish_prepared(
+        &self,
+        deliveries: Vec<(FinalSubscriptionEntry, JsonRpcRequest)>,
+        panic_boundary: &'static str,
+    ) -> usize {
         let mut count = 0;
         for (entry, notification) in deliveries {
             let mut phase = entry
@@ -5126,6 +5108,38 @@ impl FinalSubscriptionRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match *phase {
+                FinalSubscriptionPhase::Opening | FinalSubscriptionPhase::OpeningDelivery => {
+                    if entry.request_cancellation.is_cancel_requested() {
+                        *phase = FinalSubscriptionPhase::PeerTerminated;
+                        entry
+                            .election
+                            .opening_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
+                        if let Some(delivery) = &entry.terminal_delivery {
+                            delivery.mark_failed();
+                        }
+                        continue;
+                    }
+                    let mut opening_events = entry
+                        .election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if opening_events.len() >= MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS {
+                        opening_events.clear();
+                        *phase = FinalSubscriptionPhase::PeerTerminated;
+                        if let Some(delivery) = &entry.terminal_delivery {
+                            delivery.mark_failed();
+                        }
+                        entry.request_cancellation.cancel();
+                        continue;
+                    }
+                    opening_events.push_back(notification);
+                    count += 1;
+                    continue;
+                }
                 FinalSubscriptionPhase::Active => {
                     if entry.request_cancellation.is_cancel_requested() {
                         *phase = FinalSubscriptionPhase::PeerTerminated;
@@ -5141,8 +5155,7 @@ impl FinalSubscriptionRegistry {
                     };
                     *phase = FinalSubscriptionPhase::EventDelivery(in_flight);
                 }
-                FinalSubscriptionPhase::Opening
-                | FinalSubscriptionPhase::ServerTerminationPending(_)
+                FinalSubscriptionPhase::ServerTerminationPending(_)
                 | FinalSubscriptionPhase::PeerTerminated
                 | FinalSubscriptionPhase::ServerTerminated => continue,
             }
@@ -5150,7 +5163,7 @@ impl FinalSubscriptionRegistry {
 
             let sent = catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
             if !sent {
-                let _ = extension_panic_error("final_task_subscription_sender");
+                let _ = extension_panic_error(panic_boundary);
             }
             let mut phase = entry
                 .election
@@ -5202,18 +5215,25 @@ impl FinalSubscriptionRegistry {
                 FinalSubscriptionPhase::EventDelivery(_)
                 | FinalSubscriptionPhase::ServerTerminationPending(_) => {
                     *phase = FinalSubscriptionPhase::PeerTerminated;
+                    entry
+                        .election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
                     if let Some(delivery) = &entry.terminal_delivery {
                         delivery.mark_failed();
                     }
                     entry.request_cancellation.cancel();
                 }
                 FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::OpeningDelivery
                 | FinalSubscriptionPhase::Active
                 | FinalSubscriptionPhase::PeerTerminated
                 | FinalSubscriptionPhase::ServerTerminated => {}
             }
         }
-        Ok(count)
+        count
     }
 
     fn terminate(&self) -> usize {
@@ -5256,8 +5276,12 @@ impl FinalSubscriptionRegistry {
             FinalSubscriptionPhase::Opening => {
                 if entry.request_cancellation.is_cancel_requested() {
                     *phase = FinalSubscriptionPhase::PeerTerminated;
-                    drop(phase);
-                    entry.election.phase_changed.notify_all();
+                    entry
+                        .election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
                     if let Some(delivery) = &entry.terminal_delivery {
                         delivery.mark_failed();
                     }
@@ -5268,9 +5292,30 @@ impl FinalSubscriptionRegistry {
                 // server's winning election and let `open` finish it after the
                 // callback returns, without waiting under a callback-spanning
                 // lock.
+                entry
+                    .election
+                    .opening_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 *phase = FinalSubscriptionPhase::ServerTerminationPending(0);
-                drop(phase);
-                entry.election.phase_changed.notify_all();
+                (true, entry.terminal_delivery)
+            }
+            FinalSubscriptionPhase::OpeningDelivery => {
+                entry
+                    .election
+                    .opening_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                if entry.request_cancellation.is_cancel_requested() {
+                    *phase = FinalSubscriptionPhase::PeerTerminated;
+                    if let Some(delivery) = &entry.terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    return (false, None);
+                }
+                *phase = FinalSubscriptionPhase::ServerTerminationPending(1);
                 (true, entry.terminal_delivery)
             }
             FinalSubscriptionPhase::Active => {
@@ -5349,11 +5394,17 @@ impl FinalSubscriptionRegistry {
         if matches!(
             *phase,
             FinalSubscriptionPhase::Opening
+                | FinalSubscriptionPhase::OpeningDelivery
                 | FinalSubscriptionPhase::Active
                 | FinalSubscriptionPhase::EventDelivery(_)
         ) {
             *phase = FinalSubscriptionPhase::PeerTerminated;
-            drop(phase);
+            entry
+                .election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             entry.request_cancellation.cancel();
             true
         } else {
@@ -45671,6 +45722,529 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn final_subscription_reentrant_ack_publication_flushes_after_acknowledgement() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let published = Arc::new(AtomicUsize::new(usize::MAX));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let sender_registry = Arc::clone(&registry);
+        let sender_sent = Arc::clone(&sent);
+        let sender_published = Arc::clone(&published);
+        let sender_callback_count = Arc::clone(&callback_count);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            if sender_callback_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                sender_published.store(
+                    sender_registry
+                        .publish(ServerNotification::ToolsListChanged(None))
+                        .expect("reentrant catalogue publication must remain well-formed"),
+                    Ordering::Release,
+                );
+            }
+        });
+        let lease = registry
+            .open(
+                RequestId::Number(721),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                sender,
+            )
+            .expect("a reentrant acknowledgement publication must open");
+
+        assert_eq!(published.load(Ordering::Acquire), 1);
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(sent.len(), 2);
+        assert!(matches!(
+            ServerNotification::decode(&sent[0]),
+            Ok(ServerNotification::SubscriptionsAcknowledged(_))
+        ));
+        assert!(matches!(
+            ServerNotification::decode(&sent[1]),
+            Ok(ServerNotification::ToolsListChanged(_))
+        ));
+        drop(sent);
+        drop(lease);
+
+        let negative_registry = Arc::new(FinalSubscriptionRegistry::default());
+        let negative_sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let negative_published = Arc::new(AtomicUsize::new(usize::MAX));
+        let negative_callback_count = Arc::new(AtomicUsize::new(0));
+        let negative_sender_registry = Arc::clone(&negative_registry);
+        let negative_sender_sent = Arc::clone(&negative_sent);
+        let negative_sender_published = Arc::clone(&negative_published);
+        let negative_sender_callback_count = Arc::clone(&negative_callback_count);
+        let negative_sender: NotificationSender = Arc::new(move |notification| {
+            negative_sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            if negative_sender_callback_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                negative_sender_published.store(
+                    negative_sender_registry
+                        .publish(ServerNotification::ToolsListChanged(None))
+                        .expect("wrong-filter publication must remain well-formed"),
+                    Ordering::Release,
+                );
+            }
+        });
+        let _negative_lease = negative_registry
+            .open(
+                RequestId::Number(722),
+                SubscriptionFilter {
+                    prompts_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                negative_sender,
+            )
+            .expect("the one-filter negative must still acknowledge");
+        assert_eq!(negative_published.load(Ordering::Acquire), 0);
+        assert_eq!(
+            negative_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "changing only the accepted filter must leave the stream at its acknowledgement",
+        );
+    }
+
+    #[test]
+    fn final_subscription_publishers_do_not_wait_for_held_ack_and_flush_fifo() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sender_gate = Arc::clone(&gate);
+        let sender_sent = Arc::clone(&sent);
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let sender_callback_count = Arc::clone(&callback_count);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            if sender_callback_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                let (lock, ready) = &*sender_gate;
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.0 = true;
+                ready.notify_all();
+                while !state.1 {
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        });
+        let opener_registry = Arc::clone(&registry);
+        let opener = thread::spawn(move || {
+            opener_registry.open(
+                RequestId::Number(723),
+                SubscriptionFilter {
+                    resources_list_changed: Some(true),
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                sender,
+            )
+        });
+
+        let (lock, ready) = &*gate;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.0 {
+            state = ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+
+        let publisher_registry = Arc::clone(&registry);
+        let (published_sender, published_receiver) = std::sync::mpsc::channel();
+        let publisher = thread::spawn(move || {
+            let tools = publisher_registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("held-ack tools publication must remain well-formed");
+            let resources = publisher_registry
+                .publish(ServerNotification::ResourcesListChanged(None))
+                .expect("held-ack resources publication must remain well-formed");
+            published_sender
+                .send((tools, resources))
+                .expect("publication result receiver must remain live");
+        });
+        assert_eq!(
+            published_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("publishers must not wait for the acknowledgement callback"),
+            (1, 1),
+        );
+
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+        publisher.join().expect("publisher must not panic");
+        let lease = opener
+            .join()
+            .expect("opener must not panic")
+            .expect("queued publications must preserve stream admission");
+
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(sent.len(), 3);
+        assert!(matches!(
+            ServerNotification::decode(&sent[0]),
+            Ok(ServerNotification::SubscriptionsAcknowledged(_))
+        ));
+        assert!(matches!(
+            ServerNotification::decode(&sent[1]),
+            Ok(ServerNotification::ToolsListChanged(_))
+        ));
+        assert!(matches!(
+            ServerNotification::decode(&sent[2]),
+            Ok(ServerNotification::ResourcesListChanged(_))
+        ));
+        drop(sent);
+        drop(lease);
+    }
+
+    #[test]
+    fn final_subscription_opening_queue_capacity_fails_closed_without_delivery() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sender_gate = Arc::clone(&gate);
+        let sender_sent = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            let (lock, ready) = &*sender_gate;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.0 {
+                state.0 = true;
+                ready.notify_all();
+                while !state.1 {
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        });
+        let cancellation = McpRequestCancellation::new();
+        let opener_registry = Arc::clone(&registry);
+        let opener_cancellation = cancellation.clone();
+        let opener = thread::spawn(move || {
+            opener_registry.open(
+                RequestId::Number(725),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                None,
+                opener_cancellation,
+                None,
+                sender,
+            )
+        });
+
+        let (lock, ready) = &*gate;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.0 {
+            state = ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+
+        for admitted in 0..MAX_FINAL_SUBSCRIPTION_OPENING_EVENTS {
+            assert_eq!(
+                registry
+                    .publish(ServerNotification::ToolsListChanged(None))
+                    .expect("bounded opening publication must remain well-formed"),
+                1,
+                "opening event {admitted} must fit within the frozen bound",
+            );
+        }
+        assert_eq!(
+            registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("the first over-capacity publication must fail closed"),
+            0,
+        );
+        assert!(
+            cancellation.is_cancel_requested(),
+            "capacity exhaustion must cancel the opening stream"
+        );
+
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+        assert!(
+            opener.join().expect("opener must not panic").is_err(),
+            "a capacity-failed opening must not return a live lease"
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "capacity failure must discard every queued event",
+        );
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .is_empty(),
+            "capacity failure must release its registry entry when acknowledgement unwinds",
+        );
+    }
+
+    #[test]
+    fn final_subscription_acknowledgement_panic_discards_reentrant_publication() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let published = Arc::new(AtomicUsize::new(usize::MAX));
+        let sender_registry = Arc::clone(&registry);
+        let sender_sent = Arc::clone(&sent);
+        let sender_published = Arc::clone(&published);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            sender_published.store(
+                sender_registry
+                    .publish(ServerNotification::ToolsListChanged(None))
+                    .expect("reentrant publication before acknowledgement panic must be valid"),
+                Ordering::Release,
+            );
+            panic!("planted acknowledgement sender panic");
+        });
+        let cancellation = McpRequestCancellation::new();
+        assert!(
+            registry
+                .open(
+                    RequestId::Number(726),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    false,
+                    None,
+                    cancellation.clone(),
+                    None,
+                    sender,
+                )
+                .is_err(),
+            "an acknowledgement panic must fail stream admission"
+        );
+        assert_eq!(published.load(Ordering::Acquire), 1);
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the queued event must never be delivered after acknowledgement panic",
+        );
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .is_empty(),
+            "acknowledgement panic must remove the failed opening entry",
+        );
+    }
+
+    #[test]
+    fn final_subscription_peer_cancellation_discards_held_ack_publication() {
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sender_gate = Arc::clone(&gate);
+        let sender_sent = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            let (lock, ready) = &*sender_gate;
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.0 {
+                state.0 = true;
+                ready.notify_all();
+                while !state.1 {
+                    state = ready
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        });
+        let cancellation = McpRequestCancellation::new();
+        let opener_registry = Arc::clone(&registry);
+        let opener_cancellation = cancellation.clone();
+        let opener = thread::spawn(move || {
+            opener_registry.open(
+                RequestId::Number(727),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                false,
+                Some(727),
+                opener_cancellation,
+                None,
+                sender,
+            )
+        });
+
+        let (lock, ready) = &*gate;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.0 {
+            state = ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        assert_eq!(
+            registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("publication during a held acknowledgement must be admitted"),
+            1,
+        );
+        assert!(registry.cancel_modern_http_owner(727));
+        assert!(cancellation.is_cancel_requested());
+
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = true;
+        ready.notify_all();
+        drop(state);
+        assert!(
+            opener.join().expect("opener must not panic").is_err(),
+            "peer cancellation must prevent a live lease"
+        );
+        assert_eq!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "peer cancellation must discard the queued event",
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_task_subscription_reentrant_ack_publication_flushes_after_acknowledgement() {
+        let application_notifications = Arc::new(Mutex::new(Vec::new()));
+        let (server, _service) = final_tasks_test_server(application_notifications);
+        let runtime = server
+            .final_task_runtime()
+            .expect("final Tasks runtime must remain public");
+        let created = runtime
+            .create_task_with_work(
+                final_tasks_test_work_descriptor(),
+                Some("queued".to_owned()),
+            )
+            .expect("task must be durable before subscription");
+        let task_id = created.task.base().task_id.clone();
+        let task_notification = crate::tasks::final_task_notification(&created.task);
+        let registry = Arc::clone(&server.final_subscriptions);
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let published = Arc::new(AtomicUsize::new(usize::MAX));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let sender_registry = Arc::clone(&registry);
+        let sender_sent = Arc::clone(&sent);
+        let sender_published = Arc::clone(&published);
+        let sender_callback_count = Arc::clone(&callback_count);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sender_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+            if sender_callback_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                sender_published.store(
+                    sender_registry
+                        .publish_task(task_notification.clone())
+                        .expect("reentrant Tasks publication must remain well-formed"),
+                    Ordering::Release,
+                );
+            }
+        });
+        let mut requested = SubscriptionFilter::default();
+        set_task_subscription_ids(&mut requested, vec![task_id.clone()])
+            .expect("compose the exact Tasks selection");
+        let _lease = registry
+            .open(
+                RequestId::Number(724),
+                requested,
+                true,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                sender,
+            )
+            .expect("a reentrant Tasks publication must open");
+
+        assert_eq!(published.load(Ordering::Acquire), 1);
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(sent.len(), 2);
+        assert!(matches!(
+            ServerNotification::decode(&sent[0]),
+            Ok(ServerNotification::SubscriptionsAcknowledged(_))
+        ));
+        let delivered: FinalTaskStatusNotification = serde_json::from_value(
+            serde_json::to_value(&sent[1]).expect("queued Tasks event must serialize"),
+        )
+        .expect("queued Tasks event must retain its wire type");
+        assert_eq!(delivered.params.task.base().task_id, task_id);
+    }
+
+    #[test]
     fn final_subscription_acknowledgement_sender_can_reenter_termination() {
         let (done_sender, done_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -47801,7 +48375,10 @@ mod lib_unit_tests {
         let opener = thread::spawn(move || {
             opener_registry.open(
                 RequestId::Number(883),
-                SubscriptionFilter::default(),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
                 false,
                 Some(883),
                 opener_cancellation,
@@ -47820,6 +48397,13 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         drop(state);
+
+        assert_eq!(
+            registry
+                .publish(ServerNotification::ToolsListChanged(None))
+                .expect("publication during a held acknowledgement must be admitted"),
+            1,
+        );
 
         let (started_sender, started_receiver) = sync_channel(1);
         let (terminated_sender, terminated_receiver) = sync_channel(1);
@@ -47882,7 +48466,7 @@ mod lib_unit_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             1,
-            "modern HTTP emits its acknowledgement but no stdio cancellation control"
+            "server termination must discard the queued event and modern HTTP emits no stdio cancellation control"
         );
     }
 
