@@ -3835,11 +3835,13 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// dispatched and neither emit nor accept `MCP-Session-Id`. A final
 /// `subscriptions/listen` SSE body retains its request-owned dispatch only for
 /// that response body. A retained [`ServerHttpSession`] is an embedding
-/// lifecycle handle, but every modern POST still derives request-local
-/// connection state. Eligible stateless MRTR continuations are owned by the
-/// router and bounded by listener shutdown. Exact MCP 2024-11-05 requests
-/// retain the transport-issued session identifier, lifecycle adapter, and SSE
-/// response stream for this one session when the legacy feature is enabled.
+/// lifecycle handle whose repeated [`ServerHttpSession::handle`] calls share
+/// modern mutable component state; it does not own a private MRTR namespace.
+/// Turnkey live ingress opens a fresh embedding session per stateless POST.
+/// Eligible stateless MRTR continuations are owned by the router and bounded
+/// by listener shutdown. Exact MCP 2024-11-05 requests retain the
+/// transport-issued session identifier, lifecycle adapter, and SSE response
+/// stream for this one session when the legacy feature is enabled.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -3907,11 +3909,12 @@ pub struct ServerHttpSession {
     legacy_pending_requests: Arc<PendingRequests>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
-    /// Embedding-owned modern connection control state.
+    /// Embedding-session-owned modern mutable component state.
     ///
-    /// Each stateless POST derives a request-local connection from this value;
-    /// eligible MRTR continuation state lives in the router's listener-bounded
-    /// registry rather than in this public session handle.
+    /// Repeated calls to this public session share the value. Turnkey live
+    /// ingress instead creates a fresh public session per stateless POST.
+    /// Eligible MRTR continuation state lives in the router's listener-bounded
+    /// registry rather than in a session-specific namespace here.
     modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
@@ -7837,10 +7840,11 @@ impl Server {
 impl ServerHttpEndpoint {
     /// Opens one independently bounded live HTTP session.
     ///
-    /// Modern mutable state is request-local. Eligible MRTR continuations are
-    /// instead represented by router-owned opaque, single-use state and may be
-    /// resumed by a later stateless POST only when its operation and principal
-    /// bindings match.
+    /// Repeated calls through the returned embedding handle share modern
+    /// mutable component state. Turnkey live ingress calls this method afresh
+    /// for each stateless POST. Eligible MRTR continuations are represented by
+    /// router-owned opaque, single-use state and may be resumed by a later
+    /// stateless POST only when its operation and principal bindings match.
     pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, ServerHttpEndpointError> {
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         let session = self.open_session_with_legacy_origin(cx, &self.legacy_origin);

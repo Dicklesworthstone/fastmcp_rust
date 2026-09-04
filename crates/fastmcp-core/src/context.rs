@@ -1460,12 +1460,14 @@ pub struct McpContext {
     /// Nested component access follows this surface so a modern parent cannot
     /// bypass final argument admission by calling [`Self::get_prompt`].
     final_request_surface: bool,
-    /// Whether a durable transport connection owns MRTR continuations created
-    /// by this request.
+    /// Whether transport admission installed MRTR continuation ownership or
+    /// eligibility for this request.
     ///
-    /// A one-shot modern HTTP POST has request-local connection state, so this
-    /// flag is false there. Eligible stateless HTTP continuations instead live
-    /// in the router registry until consumption, expiry, or listener shutdown.
+    /// Durable transports own the resulting partition directly. A one-shot
+    /// modern HTTP POST also sets this flag, but its ephemeral partition is
+    /// only an eligibility token: the router substitutes its stateless domain
+    /// and owns that continuation until consumption, expiry, or listener
+    /// shutdown.
     retained_continuation_owner: bool,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
