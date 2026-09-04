@@ -12983,11 +12983,13 @@ impl Server {
         }
         {
             let sender = notification_sender.clone();
-            request_ctx = request_ctx.with_log_sender(Arc::new(
-                crate::handler::LogNotificationSender::new(move |notification| {
-                    sender(notification);
-                }),
-            ));
+            request_ctx =
+                request_ctx.with_log_sender(Arc::new(crate::handler::LogNotificationSender::new(
+                    move |notification| {
+                        sender(notification);
+                    },
+                    ProtocolEra::Modern2026,
+                )));
         }
         // The outer request owner retains the sole final-progress runtime.
         // Router/handler derivation sees this reporter and reuses it instead
@@ -13834,9 +13836,12 @@ impl Server {
             if let Some(runtime) = runtime {
                 let sender = Arc::clone(&runtime.notification_sender);
                 request_ctx = request_ctx.with_log_sender(Arc::new(
-                    crate::handler::LogNotificationSender::new(move |notification| {
-                        sender(notification);
-                    }),
+                    crate::handler::LogNotificationSender::new(
+                        move |notification| {
+                            sender(notification);
+                        },
+                        ProtocolEra::Legacy2024,
+                    ),
                 ));
             }
             if let (Some(marker), Some(runtime)) = (Self::request_progress_marker(request), runtime)

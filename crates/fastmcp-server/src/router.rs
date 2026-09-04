@@ -1999,11 +1999,13 @@ fn derive_handler_context(
 
     if let Some(sender) = notification_sender {
         let sender = sender.clone();
-        handler_ctx = handler_ctx.with_log_sender(Arc::new(
-            crate::handler::LogNotificationSender::new(move |request| {
-                sender(request);
-            }),
-        ));
+        handler_ctx =
+            handler_ctx.with_log_sender(Arc::new(crate::handler::LogNotificationSender::new(
+                move |request| {
+                    sender(request);
+                },
+                protocol_era,
+            )));
     }
 
     if let Some(senders) = bidirectional_senders {
