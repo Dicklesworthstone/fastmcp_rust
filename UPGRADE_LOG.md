@@ -1,5 +1,28 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-09-04  |  **Project:** fastmcp_rust  |  **Language:** Rust
+
+## Summary
+- **Updated:** 2  |  **Skipped:** remaining exact pins already latest stable; frankensqlite / frankensearch are not direct deps  |  **Failed:** 0  |  **Needs attention:** FND-01 evidence re-attest
+
+## Updates
+
+### asupersync: 0.4.9 → 0.4.10
+- **Breaking:** None. Preserves public API floor; adds ambient child region APIs (`asupersync::cx::ChildRegion`).
+- **Notes:** Unblocks `bd-asupersync-ambient-child-region-0fm8l` and FND-04 child region requirements.
+- **Tests:** `cargo check --workspace --all-targets --locked`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, and facade e2e suites all green via RCH.
+
+### flate2: 1.1.9 → 1.1.10
+- **Breaking:** None expected (patch bump).
+- **Notes:** Gzip/deflate compression support for HTTP transport payloads.
+- **Tests:** Included in workspace compilation and HTTP transport test suites.
+
+## Skipped
+- `fsqlite` / `frankensqlite` and `frankensearch` are not current FastMCP dependencies and are not added.
+- No aggregate MCP 2026-07-28 conformance or maturity promotion is claimed from this maintenance bump.
+
+---
+
 **Date:** 2026-08-20  |  **Project:** fastmcp_rust  |  **Language:** Rust
 
 ## Summary
