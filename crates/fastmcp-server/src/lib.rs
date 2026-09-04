@@ -175,10 +175,8 @@ use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 #[cfg(feature = "websocket")]
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once};
 #[cfg(feature = "websocket")]
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
