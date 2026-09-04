@@ -169,6 +169,18 @@ fn fnd_03_policy_receipts_planted_negative() {
 
 #[cfg(test)]
 #[test]
+fn fnd_03_a_positive() {
+    protocol_policy::tests::fnd_03_policy_receipts_positive();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_a_planted_negative() {
+    protocol_policy::tests::fnd_03_policy_receipts_planted_negative();
+}
+
+#[cfg(test)]
+#[test]
 fn fnd_03_era_classification_positive() {
     protocol_policy::tests::fnd_03_era_classification_positive();
 }
@@ -176,6 +188,18 @@ fn fnd_03_era_classification_positive() {
 #[cfg(test)]
 #[test]
 fn fnd_03_era_classification_planted_negative() {
+    protocol_policy::tests::fnd_03_era_classification_planted_negative();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_b_positive() {
+    protocol_policy::tests::fnd_03_era_classification_positive();
+}
+
+#[cfg(test)]
+#[test]
+fn fnd_03_b_planted_negative() {
     protocol_policy::tests::fnd_03_era_classification_planted_negative();
 }
 

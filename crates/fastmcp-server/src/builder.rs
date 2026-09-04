@@ -537,6 +537,11 @@ impl ServerBuilder {
         Ok(())
     }
 
+    /// Returns the currently configured [`ProtocolPolicy`].
+    pub const fn configured_protocol_policy(&self) -> ProtocolPolicy {
+        self.protocol_policy
+    }
+
     /// Installs the server's modern-only extension handlers and discovery settings.
     ///
     /// Descriptor registration remains mutable only until [`Self::build`]. The
@@ -3788,6 +3793,98 @@ mod tests {
             ServerBuilder::try_new_with_fixed_protocol_policy("srv", "1.0", ProtocolPolicy::Auto,),
             Err(ServerLaunchPolicyError::FeatureUnavailable)
         ));
+    }
+
+    #[test]
+    fn fnd_03_i_positive() {
+        fnd_03_integration_positive();
+    }
+
+    #[test]
+    fn fnd_03_integration_positive() {
+        use fastmcp_protocol::protocol_policy::{ProtocolVersion, ProtocolVersionError};
+
+        let builder = ServerBuilder::try_new("fnd03-integration", "1.0.0")
+            .expect("server builder must construct through public try_new");
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(builder.configured_protocol_policy(), ProtocolPolicy::Auto);
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(
+            builder.configured_protocol_policy(),
+            ProtocolPolicy::ModernOnly
+        );
+
+        let mut modern_builder = builder;
+        modern_builder
+            .try_set_protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be settable on any build");
+        assert_eq!(
+            modern_builder.configured_protocol_policy(),
+            ProtocolPolicy::ModernOnly
+        );
+
+        let server = modern_builder.try_build().expect("modern server builds");
+        assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+
+        assert_eq!(
+            ProtocolVersion::parse("2026-07-28"),
+            Ok(ProtocolVersion::MODERN_2026)
+        );
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(
+            ProtocolVersion::parse("2024-11-05"),
+            Ok(ProtocolVersion::LEGACY_2024)
+        );
+        assert_eq!(
+            ProtocolVersion::parse("2025-11-25"),
+            Err(ProtocolVersionError::UnsupportedVersion {
+                received: "2025-11-25".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn fnd_03_i_planted_negative() {
+        fnd_03_integration_planted_negative();
+    }
+
+    #[test]
+    fn fnd_03_integration_planted_negative() {
+        use fastmcp_protocol::protocol_policy::{ProtocolVersion, ProtocolVersionError};
+
+        let mut builder = ServerBuilder::try_new("fnd03-integration-neg", "1.0.0")
+            .expect("server builder must construct through public try_new");
+        let initial_policy = builder.configured_protocol_policy();
+
+        let parse_err = ProtocolVersion::parse("2025-11-25")
+            .expect_err("unsupported 2025-11-25 must fail at mirror/policy boundary");
+        assert_eq!(
+            parse_err,
+            ProtocolVersionError::UnsupportedVersion {
+                received: "2025-11-25".to_owned(),
+            }
+        );
+
+        assert_eq!(builder.configured_protocol_policy(), initial_policy);
+
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        {
+            let err = builder
+                .try_set_protocol_policy(ProtocolPolicy::Auto)
+                .expect_err("Auto must fail on feature-stripped builds");
+            assert_eq!(err, ServerLaunchPolicyError::FeatureUnavailable);
+            assert_eq!(
+                builder.configured_protocol_policy(),
+                ProtocolPolicy::ModernOnly
+            );
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let set_result = builder.try_set_protocol_policy(ProtocolPolicy::Auto);
+            assert!(set_result.is_ok());
+        }
     }
 
     #[test]
