@@ -2043,7 +2043,7 @@ impl MrtrExchangeRegistry {
                 && exchange.expected.has_elicitation()
             {
                 return Err(McpError::invalid_request(
-                    "stateless HTTP cannot resume elicitation requestState without a session",
+                    "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required",
                 ));
             }
             Self::purge_stale(&mut state, now);
@@ -2176,16 +2176,6 @@ impl MrtrExchangeRegistry {
         let Some(exchange) = state.exchanges.get(request_state).cloned() else {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         };
-        if exchange.binding.as_ref() != binding {
-            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
-        }
-        if binding.is_some_and(MrtrExchangeBinding::is_stateless)
-            && exchange.expected.has_elicitation()
-        {
-            return Err(McpError::invalid_request(
-                "stateless HTTP cannot resume elicitation requestState without a session",
-            ));
-        }
         if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
             state.exchanges.remove(request_state);
             return if exchange.owner_cancellation.is_cancel_requested() {
@@ -2193,6 +2183,16 @@ impl MrtrExchangeRegistry {
             } else {
                 Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
             };
+        }
+        if exchange.binding.as_ref() != binding {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
+        if binding.is_some_and(MrtrExchangeBinding::is_stateless)
+            && exchange.expected.has_elicitation()
+        {
+            return Err(McpError::invalid_request(
+                "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required",
+            ));
         }
         if state_only_retry && (!exchange.expected.is_empty() || !exchange.requests.is_empty()) {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
@@ -3015,6 +3015,53 @@ mod tests {
     }
 
     #[test]
+    fn stateless_mrtr_method_binding_rejects_without_consuming_state() {
+        let registry = MrtrExchangeRegistry::new();
+        let binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "bound-target".to_owned(),
+            [23; 32],
+            [29; 32],
+            None,
+        );
+        let required = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                    .expect("unique bound input map"),
+            )
+            .expect("stateless method-bound state issues");
+        let request_state = mrtr_state_from_wire(&required);
+        let method_mismatch = MrtrExchangeBinding::stateless(
+            "resources/read",
+            "bound-target".to_owned(),
+            [23; 32],
+            [29; 32],
+            None,
+        );
+        let response = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(mrtr_roots_response()).expect("roots response must serialize"),
+        )]);
+
+        let rejected = registry
+            .accept_wire_bound(&request_state, &method_mismatch, &response)
+            .expect_err("changing only the bound method must reject");
+        assert_eq!(rejected.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "a method-binding rejection must leave the state available"
+        );
+        assert!(matches!(
+            registry.accept_wire_bound(&request_state, &binding, &response),
+            Ok(MrtrRetry::Complete(_))
+        ));
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
     fn mrtr_state_only_retry_requires_absent_input_responses() {
         let registry = MrtrExchangeRegistry::new();
         let binding = MrtrExchangeBinding::new(
@@ -3056,6 +3103,76 @@ mod tests {
         };
         assert!(inputs.responses().is_empty());
         assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn stateless_elicitation_state_only_retry_observes_cancellation_and_expiry_first() {
+        let binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "elicitation-tool".to_owned(),
+            [17; 32],
+            [19; 32],
+            None,
+        );
+        let input_requests = || {
+            MrtrInputRequests::new([(
+                "approval".to_owned(),
+                MrtrInputRequest::final_elicitation(final_form_elicitation_params())
+                    .expect("final elicitation request must encode"),
+            )])
+            .expect("unique final elicitation input map")
+        };
+
+        let cancelled_registry = MrtrExchangeRegistry::new();
+        let owner = McpRequestCancellation::new();
+        let cancelled = cancelled_registry
+            .issue_bound(owner.clone(), binding.clone(), input_requests())
+            .expect("stateless elicitation state issues before owner cancellation");
+        let cancelled_state = mrtr_state_from_wire(&cancelled);
+        assert!(owner.cancel());
+        let cancellation_error = cancelled_registry
+            .accept_state_only_bound(&cancelled_state, &binding)
+            .expect_err("owner cancellation must precede the stateless elicitation policy");
+        assert_eq!(cancellation_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            cancelled_registry.active_len(),
+            0,
+            "cancelled elicitation state must be removed"
+        );
+
+        let expired_registry = MrtrExchangeRegistry::with_limits(
+            16,
+            DEFAULT_MAX_MRTR_ROUNDS,
+            DEFAULT_MAX_MRTR_INPUT_REQUESTS_PER_ROUND,
+            DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL,
+            Duration::from_millis(1),
+        )
+        .expect("bounded stateless elicitation registry");
+        let issued_at = Instant::now();
+        let expired = expired_registry
+            .issue_at(
+                McpRequestCancellation::new(),
+                Some(binding.clone()),
+                input_requests(),
+                issued_at,
+            )
+            .expect("stateless elicitation state issues before expiry");
+        let expired_state = mrtr_state_from_wire(&expired);
+        let expiry_error = expired_registry
+            .accept_at(
+                &expired_state,
+                Some(&binding),
+                MrtrInputResponses::default(),
+                true,
+                issued_at + Duration::from_millis(1),
+            )
+            .expect_err("expiry must precede the stateless elicitation policy");
+        assert_eq!(expiry_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            expired_registry.active_len(),
+            0,
+            "expired elicitation state must be removed"
+        );
     }
 
     #[test]

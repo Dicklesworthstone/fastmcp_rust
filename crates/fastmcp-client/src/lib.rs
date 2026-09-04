@@ -26356,6 +26356,85 @@ mod tests {
         .expect("HTTP cache tools/list response serializes")
     }
 
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_core_stamps_only_discovery_admitted_tasks_extension() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind public final-core Tasks listener");
+        let address = listener
+            .local_addr()
+            .expect("read public final-core Tasks listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut discovery, _) = listener
+                .accept()
+                .expect("accept public final-core Tasks discovery");
+            let discovery_request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(discovery_request["id"], 1);
+            assert_eq!(discovery_request["method"], "server/discover");
+            let discovery_response = modern_tasks_discovery_response(
+                "public-final-core-tasks-server",
+                serde_json::json!({}),
+            );
+            write_http_cache_test_response(
+                &mut discovery,
+                "application/json",
+                discovery_response.as_bytes(),
+            );
+
+            let (mut tool_call, _) = listener
+                .accept()
+                .expect("accept public final-core Tasks tools/call");
+            let tool_call_request = read_http_cache_test_request(&mut tool_call);
+            assert_eq!(tool_call_request["id"], 2);
+            assert_eq!(tool_call_request["method"], "tools/call");
+            assert_eq!(
+                tool_call_request["params"]["_meta"]
+                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+                serde_json::json!({"io.modelcontextprotocol/tasks": {}}),
+                "the typed core seam must stamp exactly the discovery-admitted Tasks extension"
+            );
+            write_http_cache_test_response(
+                &mut tool_call,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-core-2","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-final-core-tasks-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public final-core Tasks client completes discovery");
+        let result = http_test_runtime_block_on(client.request_final_core(
+            &cx,
+            "tools/call",
+            serde_json::json!({
+                "name": "durable-tool",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"com.example/untrusted": {"enabled": true}}
+                    }
+                }
+            }),
+        ))
+        .expect("discovery-admitted Tasks result remains typed");
+        let CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) = result else {
+            panic!("the public final-core request must retain the Tasks result discriminator");
+        };
+        assert_eq!(result.task.base().task_id.as_str(), "task-core-2");
+        server
+            .join()
+            .expect("public final-core Tasks peer must join");
+    }
+
     #[cfg(unix)]
     fn assert_http_subscription_cache_invalidation(acknowledges_tools_list_changes: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP cache listener");

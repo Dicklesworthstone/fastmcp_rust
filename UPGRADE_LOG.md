@@ -21,7 +21,7 @@
 
 ### argon2: 0.5.3 → 0.6.0
 - **Notes:** Optional `builtin-auth-server` dependency. The current server source does not yet consume Argon2 as a production verifier, so this update earns no authentication or security capability credit.
-- **Verification:** The exact shipped-library profile (`--lib --no-default-features --features builtin-auth-server`) passed at `8535837` via RCH job `30004650421780774`. The first all-targets/no-default-features attempt, RCH job `30004650421780771`, correctly failed because two legacy-only integration targets lacked Cargo feature gates. Commit `7c71457` adds those gates; the unchanged all-targets command and the final workspace batch remain pending.
+- **Verification:** The exact shipped-library profile (`--lib --no-default-features --features builtin-auth-server`) passed at `8535837` via RCH job `30004650421780774`. The first all-targets/no-default-features attempt, RCH job `30004650421780771`, correctly failed because two legacy-only integration targets lacked Cargo feature gates. Commit `7c71457` adds those gates; the unchanged all-targets command passed there via RCH job `30004650421780779`. The final workspace batch remains pending.
 
 ## Skipped
 - `fsqlite` / `frankensqlite` and `frankensearch` are not current FastMCP dependencies and are not added.

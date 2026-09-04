@@ -14949,7 +14949,7 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                     FINAL_CLIENT_CAPABILITIES_META_KEY: {
                         "extensions": {
                             "com.example/untrusted": {"enabled": true},
-                            fastmcp_protocol::TASKS_EXTENSION: {},
+                            "io.modelcontextprotocol/tasks": {},
                         },
                     },
                 },
