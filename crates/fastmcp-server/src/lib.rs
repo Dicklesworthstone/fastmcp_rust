@@ -3834,10 +3834,11 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// Modern Streamable HTTP POSTs, including discovery, are independently
 /// dispatched and neither emit nor accept `MCP-Session-Id`. A final
 /// `subscriptions/listen` SSE body retains its request-owned dispatch only for
-/// that response body. A caller retaining a [`ServerHttpSession`] owns the
-/// modern mutable-state and continuation partition for that session; anonymous
-/// stateless POSTs remain request-local. Exact MCP 2024-11-05 requests retain
-/// the transport-issued session identifier, lifecycle adapter, and SSE
+/// that response body. A retained [`ServerHttpSession`] is an embedding
+/// lifecycle handle, but every modern POST still derives request-local
+/// connection state. Eligible stateless MRTR continuations are owned by the
+/// router and bounded by listener shutdown. Exact MCP 2024-11-05 requests
+/// retain the transport-issued session identifier, lifecycle adapter, and SSE
 /// response stream for this one session when the legacy feature is enabled.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
@@ -3906,9 +3907,11 @@ pub struct ServerHttpSession {
     legacy_pending_requests: Arc<PendingRequests>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_runtime: LiveLegacy2024ConnectionRuntime,
-    /// The admitted modern session's mutable state and continuation namespace.
-    /// Stateless HTTP requests receive a fresh instance, while callers that
-    /// retain this public session may safely continue their own requests.
+    /// Embedding-owned modern connection control state.
+    ///
+    /// Each stateless POST derives a request-local connection from this value;
+    /// eligible MRTR continuation state lives in the router's listener-bounded
+    /// registry rather than in this public session handle.
     modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
@@ -6681,7 +6684,7 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
 }
 
 /// Evacuates the listener-owned modern response-body registry before waiting
-/// for terminal SSE control frames to flush. Endpoint shutdown has already
+/// for terminal SSE control frames to flush. Listener shutdown has already
 /// invalidated MRTR continuations separately.
 fn detach_live_modern_http_sessions(
     sessions: &LiveModernHttpSessionRegistry,
@@ -37549,7 +37552,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_endpoint_shutdown_invalidates_mrtr_before_a_later_stateless_post() {
+    fn live_http_listener_shutdown_invalidates_mrtr_before_a_later_stateless_post() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-mrtr-shutdown", "1.0.0")
@@ -37672,7 +37675,7 @@ mod lib_unit_tests {
                 || calls.load(Ordering::Acquire) != 1
             {
                 return Err(format!(
-                    "endpoint shutdown did not invalidate the later stateless MRTR retry (retry={retry:?}, calls={})",
+                    "listener shutdown did not invalidate the later stateless MRTR retry (retry={retry:?}, calls={})",
                     calls.load(Ordering::Acquire),
                 ));
             }
@@ -47147,7 +47150,11 @@ mod lib_unit_tests {
             active_before_rejection,
             "removing only client elicitation capability cannot mint or consume MRTR state"
         );
-        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "capability rejection occurs inside the handler's elicitation constructor without minting MRTR state"
+        );
 
         let mut url_mismatch = admitted_params;
         url_mismatch["name"] = serde_json::json!("public-final-url-elicitation");
@@ -47173,7 +47180,11 @@ mod lib_unit_tests {
             active_before_rejection,
             "a form-only client cannot mint URL elicitation state"
         );
-        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            3,
+            "mode rejection occurs inside the handler's elicitation constructor without minting MRTR state"
+        );
     }
 
     #[test]
@@ -47344,6 +47355,7 @@ mod lib_unit_tests {
         let endpoint = Server::new("modern-http-mrtr-stateless-resume", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
+            .auth_provider(ModernHttpAuthProvider)
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(&calls),
@@ -47360,9 +47372,22 @@ mod lib_unit_tests {
         let mut other_client = endpoint
             .open_session(&cx)
             .expect("independent modern HTTP session must open");
+        let mut argument_client = endpoint
+            .open_session(&cx)
+            .expect("argument-negative modern HTTP session must open");
+        let mut principal_client = endpoint
+            .open_session(&cx)
+            .expect("principal-negative modern HTTP session must open");
+        let mut valid_client = endpoint
+            .open_session(&cx)
+            .expect("valid retry modern HTTP session must open");
 
         let initial = issuing_client
-            .handle(&cx, modern_http_json_tool_request("live_http_mrtr", 906))
+            .handle(
+                &cx,
+                modern_http_json_tool_request("live_http_mrtr", 906)
+                    .with_header("authorization", "Bearer alpha"),
+            )
             .expect("the issuing session must receive an input-required response");
         let ServerHttpEndpointResponse::Immediate(initial) = initial else {
             panic!("ordinary MRTR requests must return JSON responses");
@@ -47383,7 +47408,8 @@ mod lib_unit_tests {
                 .expect("MRTR roots response must construct"),
         )
         .expect("MRTR roots response must serialize");
-        let retry = |state: &str, name: &str, arguments: serde_json::Value, id: i64| {
+        let retry =
+            |state: &str, name: &str, arguments: serde_json::Value, id: i64, bearer: &str| {
             let request = JsonRpcRequest::new(
                 "tools/call",
                 Some(serde_json::json!({
@@ -47404,14 +47430,21 @@ mod lib_unit_tests {
                 .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                 .with_header("mcp-method", "tools/call")
                 .with_header("mcp-name", name)
+                .with_header("authorization", format!("Bearer {bearer}"))
                 .with_body(serde_json::to_vec(&request).expect("MRTR retry must encode"))
-        };
+            };
 
         let forged_state = format!("{request_state}-foreign");
         let forged = issuing_client
             .handle(
                 &cx,
-                retry(&forged_state, "live_http_mrtr", serde_json::json!({}), 907),
+                retry(
+                    &forged_state,
+                    "live_http_mrtr",
+                    serde_json::json!({}),
+                    907,
+                    "alpha",
+                ),
             )
             .expect("forged MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
@@ -47436,6 +47469,7 @@ mod lib_unit_tests {
                     "other_live_http_mrtr",
                     serde_json::json!({}),
                     908,
+                    "alpha",
                 ),
             )
             .expect("a target-mismatched MRTR retry must receive a JSON-RPC rejection");
@@ -47457,7 +47491,7 @@ mod lib_unit_tests {
             "a target-binding rejection must leave the issued state available",
         );
 
-        let argument_mismatch = other_client
+        let argument_mismatch = argument_client
             .handle(
                 &cx,
                 retry(
@@ -47465,6 +47499,7 @@ mod lib_unit_tests {
                     "live_http_mrtr",
                     serde_json::json!({"city": "Cambridge"}),
                     909,
+                    "alpha",
                 ),
             )
             .expect("an argument-mismatched MRTR retry must receive a JSON-RPC rejection");
@@ -47486,15 +47521,51 @@ mod lib_unit_tests {
             "an argument-binding rejection must leave the issued state available",
         );
 
-        let valid_retry = retry(&request_state, "live_http_mrtr", serde_json::json!({}), 910);
-        let resumed = other_client
+        let principal_mismatch = principal_client
+            .handle(
+                &cx,
+                retry(
+                    &request_state,
+                    "live_http_mrtr",
+                    serde_json::json!({}),
+                    910,
+                    "beta",
+                ),
+            )
+            .expect("a principal-mismatched MRTR retry must receive a JSON-RPC rejection");
+        assert!(matches!(
+            principal_mismatch,
+            ServerHttpEndpointResponse::Immediate(response)
+                if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
+                    response.id == Some(910_i64.into()) && response.error.is_some()
+                })
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "changing only the authenticated principal must not reenter the handler",
+        );
+        assert_eq!(
+            endpoint.server.router.test_active_mrtr_exchange_count(),
+            1,
+            "a principal-binding rejection must leave the issued state available",
+        );
+
+        let valid_retry = retry(
+            &request_state,
+            "live_http_mrtr",
+            serde_json::json!({}),
+            911,
+            "alpha",
+        );
+        let resumed = valid_client
             .handle(&cx, valid_retry.clone())
             .expect("a later stateless session with the bound request must resume");
         assert!(matches!(
             resumed,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
-                    response.id == Some(910_i64.into())
+                    response.id == Some(911_i64.into())
                         && response.error.is_none()
                         && response.result.as_ref().and_then(|result| result.get("resultType"))
                             == Some(&serde_json::json!("complete"))
@@ -47509,7 +47580,7 @@ mod lib_unit_tests {
             replay,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
-                    response.id == Some(910_i64.into()) && response.error.is_some()
+                    response.id == Some(911_i64.into()) && response.error.is_some()
                 })
         ));
         assert_eq!(
@@ -47606,7 +47677,7 @@ mod lib_unit_tests {
         assert_eq!(error.code, McpErrorCode::InvalidRequest.into());
         assert_eq!(
             error.message,
-            "stateless HTTP cannot resume elicitation requestState without a session"
+            "stateless HTTP cannot resume elicitation requestState; a durable MCP transport connection is required"
         );
         assert_eq!(
             calls.load(Ordering::Acquire),

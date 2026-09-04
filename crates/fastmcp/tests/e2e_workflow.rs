@@ -3052,7 +3052,7 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
             }),
         ),
     )
-    .expect("same-session resource retry consumes the retained typed exchange");
+    .expect("a later stateless POST consumes the retained typed resource exchange");
     let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = resource_complete else {
         panic!("resource continuation returns FinalReadResourceResult");
     };
@@ -3121,7 +3121,7 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
             }),
         ),
     )
-    .expect("same-session prompt retry consumes the retained typed exchange");
+    .expect("a later stateless POST consumes the retained typed prompt exchange");
     let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = prompt_complete else {
         panic!("prompt continuation returns FinalGetPromptResult");
     };
