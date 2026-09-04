@@ -2881,10 +2881,7 @@ fn plan_with_modern_post_path(
 
 /// Consumes whichever response lane the real server selected and returns the
 /// final correlated JSON-RPC response document.
-async fn final_response_document(
-    cx: &Cx,
-    response: ModernHttpResponseStream,
-) -> serde_json::Value {
+async fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde_json::Value {
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
             let bytes = response
@@ -3227,8 +3224,7 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
                 release_rx
                     .recv()
                     .expect("the test releases the single stalled worker after its deadline");
-                let _ =
-                    stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
+                let _ = stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
             },
             "stalled overlap worker",
         ),
@@ -7996,10 +7992,8 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                                 format!("the modern tools/list request failed: {error}")
                             })?;
                         let ClientHttpResponse::Modern(response) = response else {
-                            return Err(
-                                "the first client did not retain its modern response lane"
-                                    .to_owned(),
-                            );
+                            return Err("the first client did not retain its modern response lane"
+                                .to_owned());
                         };
                         Ok(final_response_document(&modern_cx, response).await)
                     },
@@ -8026,9 +8020,7 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                         let response = client
                             .request(&legacy_cx, "ping", json!({}))
                             .await
-                            .map_err(|error| {
-                                format!("the legacy ping request failed: {error}")
-                            })?;
+                            .map_err(|error| format!("the legacy ping request failed: {error}"))?;
                         let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) =
                             response
                         else {
