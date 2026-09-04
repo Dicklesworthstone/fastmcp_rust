@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1798,6 +1798,14 @@ fn runtime_block_on_bounded_named<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     let _harness_permit = public_http_harness_permit();
+    runtime_block_on_bounded_after_admission(cx, operation, future)
+}
+
+fn runtime_block_on_bounded_after_admission<F: std::future::Future>(
+    cx: &Cx,
+    operation: &str,
+    future: F,
+) -> F::Output {
     runtime_block_on(async {
         asupersync::time::timeout(cx.now(), HTTP_OPERATION_BOUND, future)
             .await
@@ -2873,10 +2881,15 @@ fn plan_with_modern_post_path(
 
 /// Consumes whichever response lane the real server selected and returns the
 /// final correlated JSON-RPC response document.
-fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde_json::Value {
+async fn final_response_document(
+    cx: &Cx,
+    response: ModernHttpResponseStream,
+) -> serde_json::Value {
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
-            let bytes = runtime_block_on_bounded(cx, response.read_to_end(cx, 1 << 20))
+            let bytes = response
+                .read_to_end(cx, 1 << 20)
+                .await
                 .expect("immediate JSON body reads to end");
             serde_json::from_slice(&bytes).expect("immediate JSON response parses")
         }
@@ -2885,7 +2898,9 @@ fn final_response_document(cx: &Cx, response: ModernHttpResponseStream) -> serde
                 .into_sse_stream(SseLimits::new(65_536, 1 << 20, 64).expect("nonzero SSE limits"))
                 .expect("SSE response admits the shipped parser");
             let mut terminal = None;
-            while let Some(event) = runtime_block_on_bounded(cx, stream.next_event(cx))
+            while let Some(event) = stream
+                .next_event(cx)
+                .await
                 .expect("SSE stream stays readable")
             {
                 let value: serde_json::Value =
@@ -3092,11 +3107,44 @@ enum OverlapWorkerCompletion {
     Legacy(Result<serde_json::Value, String>),
 }
 
+/// Retains a live overlap worker until it has exited and been joined.
+struct OverlapWorker {
+    owner: &'static str,
+    join: Option<JoinHandle<()>>,
+}
+
+impl OverlapWorker {
+    fn spawn(worker: impl FnOnce() + Send + 'static, owner: &'static str) -> Self {
+        Self {
+            owner,
+            join: Some(thread::spawn(worker)),
+        }
+    }
+
+    fn settle(&mut self) -> Result<(), String> {
+        join_finished_thread(&mut self.join, HTTP_SERVER_TEARDOWN_BOUND, self.owner)
+    }
+}
+
+impl Drop for OverlapWorker {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        if let Err(error) = self.settle() {
+            eprintln!("overlap worker settlement failed: {error}");
+            if self.join.is_some() {
+                std::process::abort();
+            }
+        }
+    }
+}
+
 /// Owns the planted stalled worker through both the deadline observation and
 /// panic unwinding. Dropping it releases the worker before a bounded join.
 struct StalledOverlapWorker {
     release: mpsc::SyncSender<()>,
-    join: Option<JoinHandle<()>>,
+    worker: OverlapWorker,
 }
 
 impl StalledOverlapWorker {
@@ -3108,22 +3156,20 @@ impl StalledOverlapWorker {
 
     fn settle(&mut self) -> Result<(), String> {
         self.release();
-        join_finished_thread(
-            &mut self.join,
-            HTTP_SERVER_TEARDOWN_BOUND,
-            "stalled overlap worker",
-        )
+        self.worker.settle()
     }
 }
 
 impl Drop for StalledOverlapWorker {
     fn drop(&mut self) {
-        if self.join.is_none() {
+        if self.worker.join.is_none() {
             return;
         }
         if let Err(error) = self.settle() {
             eprintln!("stalled overlap worker settlement failed: {error}");
-            std::process::abort();
+            if self.worker.join.is_some() {
+                std::process::abort();
+            }
         }
     }
 }
@@ -3176,12 +3222,16 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
     let stalled_completed_tx = completed_tx.clone();
     let mut stalled_worker = StalledOverlapWorker {
         release: release_tx,
-        join: Some(thread::spawn(move || {
-            release_rx
-                .recv()
-                .expect("the test releases the single stalled worker after its deadline");
-            let _ = stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
-        })),
+        worker: OverlapWorker::spawn(
+            move || {
+                release_rx
+                    .recv()
+                    .expect("the test releases the single stalled worker after its deadline");
+                let _ =
+                    stalled_completed_tx.send(OverlapWorkerCompletion::Modern(Ok(json!({}))));
+            },
+            "stalled overlap worker",
+        ),
     };
 
     completed_tx
@@ -3207,7 +3257,7 @@ fn e2e_overlap_worker_timeout_releases_fixture_teardown() {
     stalled_worker
         .settle()
         .expect("the released worker joins without detaching");
-    assert!(stalled_worker.join.is_none());
+    assert!(stalled_worker.worker.join.is_none());
     let teardown = server.settle();
     teardown.expect("the bounded fixture teardown runs after a worker completion timeout");
 }
@@ -7691,7 +7741,7 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the selected modern HTTP client must retain the modern response lane");
     };
-    let document = final_response_document(&cx, response);
+    let document = runtime_block_on_bounded(&cx, final_response_document(&cx, response));
     assert_eq!(document["id"], json!(2));
     assert!(
         document.get("error").is_none(),
@@ -7733,7 +7783,7 @@ fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
     let ClientHttpResponse::Modern(response) = response else {
         panic!("the ModernOnly connection must retain the modern response lane");
     };
-    let document = final_response_document(&cx, response);
+    let document = runtime_block_on_bounded(&cx, final_response_document(&cx, response));
     assert_eq!(document["id"], json!(2));
     assert!(
         document.get("error").is_none(),
@@ -7919,57 +7969,97 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
         ProtocolEra::Legacy2024
     );
 
+    // Each worker reserves one harness lane, then waits until both lanes are
+    // admitted before starting its single bounded request/response operation.
+    // The outer completion clock begins only after that barrier opens.
+    let overlap_start = Arc::new(Barrier::new(3));
     let (completed_tx, completed_rx) = mpsc::channel();
     let modern_completed_tx = completed_tx.clone();
-    let mut modern_worker = Some(thread::spawn(move || {
-        // Move the client and request context into this inner ownership scope.
-        // The completion signal is meaningful only after both have settled.
-        let result = (move || -> Result<serde_json::Value, String> {
-            let mut client = modern_client;
-            let response = runtime_block_on_bounded(
-                &modern_cx,
-                client.request(&modern_cx, "tools/list", json!({ "cursor": null })),
-            )
-            .map_err(|error| format!("the modern tools/list request failed: {error}"))?;
-            let ClientHttpResponse::Modern(response) = response else {
-                return Err("the first client did not retain its modern response lane".to_owned());
-            };
-            Ok(final_response_document(&modern_cx, response))
-        })();
-        let _ = modern_completed_tx.send(OverlapWorkerCompletion::Modern(result));
-    }));
-    let legacy_completed_tx = completed_tx.clone();
-    let mut legacy_worker = Some(thread::spawn(move || {
-        // Match the modern worker's completion boundary so neither protocol
-        // reports success while connection-owned state is still being dropped.
-        let result = (move || -> Result<serde_json::Value, String> {
-            let mut client = legacy_client;
-            let response =
-                runtime_block_on_bounded(&legacy_cx, client.request(&legacy_cx, "ping", json!({})))
-                    .map_err(|error| format!("the legacy ping request failed: {error}"))?;
-            let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
-                return Err("the second client did not retain its legacy response lane".to_owned());
-            };
-            serde_json::to_value(response)
-                .map_err(|error| format!("the legacy response did not serialize: {error}"))
-        })();
-        let _ = legacy_completed_tx.send(OverlapWorkerCompletion::Legacy(result));
-    }));
-    drop(completed_tx);
-
-    let (modern_document, legacy_document) =
-        collect_overlap_worker_results(&completed_rx, HTTP_SERVER_TEARDOWN_BOUND);
-    let modern_join = join_finished_thread(
-        &mut modern_worker,
-        HTTP_SERVER_TEARDOWN_BOUND,
+    let modern_start = Arc::clone(&overlap_start);
+    let mut modern_worker = OverlapWorker::spawn(
+        move || {
+            // Move the client and request context into this inner ownership scope.
+            // The completion signal is meaningful only after both have settled
+            // and the worker's harness lane has been released.
+            let result = (move || -> Result<serde_json::Value, String> {
+                let _harness_permit = public_http_harness_permit();
+                modern_start.wait();
+                let mut client = modern_client;
+                runtime_block_on_bounded_after_admission(
+                    &modern_cx,
+                    "overlapping modern tools/list response",
+                    async {
+                        let response = client
+                            .request(&modern_cx, "tools/list", json!({ "cursor": null }))
+                            .await
+                            .map_err(|error| {
+                                format!("the modern tools/list request failed: {error}")
+                            })?;
+                        let ClientHttpResponse::Modern(response) = response else {
+                            return Err(
+                                "the first client did not retain its modern response lane"
+                                    .to_owned(),
+                            );
+                        };
+                        Ok(final_response_document(&modern_cx, response).await)
+                    },
+                )
+            })();
+            let _ = modern_completed_tx.send(OverlapWorkerCompletion::Modern(result));
+        },
         "modern overlap worker",
     );
-    let legacy_join = join_finished_thread(
-        &mut legacy_worker,
-        HTTP_SERVER_TEARDOWN_BOUND,
+    let legacy_completed_tx = completed_tx.clone();
+    let legacy_start = Arc::clone(&overlap_start);
+    let mut legacy_worker = OverlapWorker::spawn(
+        move || {
+            // Match the modern worker's completion boundary so neither protocol
+            // reports success while connection-owned state is still being dropped.
+            let result = (move || -> Result<serde_json::Value, String> {
+                let _harness_permit = public_http_harness_permit();
+                legacy_start.wait();
+                let mut client = legacy_client;
+                runtime_block_on_bounded_after_admission(
+                    &legacy_cx,
+                    "overlapping legacy ping response",
+                    async {
+                        let response = client
+                            .request(&legacy_cx, "ping", json!({}))
+                            .await
+                            .map_err(|error| {
+                                format!("the legacy ping request failed: {error}")
+                            })?;
+                        let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) =
+                            response
+                        else {
+                            return Err(
+                                "the second client did not retain its legacy response lane"
+                                    .to_owned(),
+                            );
+                        };
+                        serde_json::to_value(response).map_err(|error| {
+                            format!("the legacy response did not serialize: {error}")
+                        })
+                    },
+                )
+            })();
+            let _ = legacy_completed_tx.send(OverlapWorkerCompletion::Legacy(result));
+        },
         "legacy overlap worker",
     );
+    overlap_start.wait();
+    drop(completed_tx);
+
+    let (modern_document, legacy_document) = collect_overlap_worker_results(
+        &completed_rx,
+        HTTP_OPERATION_BOUND + HTTP_SERVER_TEARDOWN_BOUND,
+    );
+    // If either completion is absent, request server shutdown before joining
+    // so a genuinely stalled socket operation gets a cancellation boundary.
+    // The workers retain their join handles until that cleanup has run.
     let teardown = server.settle();
+    let modern_join = modern_worker.settle();
+    let legacy_join = legacy_worker.settle();
 
     teardown.expect("the bounded server teardown runs after overlap completion collection");
     modern_join.expect("the modern overlap worker joins without detaching");
