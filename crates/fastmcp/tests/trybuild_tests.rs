@@ -770,6 +770,8 @@ fn downstream_feature_symbol_probes() {
     let facade_path = toml_path(manifest_dir);
     let target_dir = cargo_target_dir(manifest_dir).join("downstream-feature-symbol-probes");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let asupersync_requirement =
+        workspace_exact_dependency_requirement(workspace_root, "asupersync");
     ensure_workspace_lock_dependencies(&cargo, workspace_root);
 
     for probe in DOWNSTREAM_FEATURE_SYMBOL_PROBES {
@@ -797,7 +799,7 @@ publish = false
 
 [dependencies]
 mcp = {{ package = "fastmcp-rust", path = "{facade_path}", default-features = false, features = [{features}] }}
-asupersync = {{ version = "=0.4.9", default-features = false }}
+asupersync = {{ version = "{asupersync_requirement}", default-features = false }}
 "#,
                 probe.name,
             ),
@@ -1164,7 +1166,7 @@ fn prepare_fixture_lock(
     let workspace_chacha = workspace_packages
         .iter()
         .find(|package| package.name == "chacha20" && package.version == "0.10.1")
-        .expect("workspace lock must freeze chacha20 0.10.1 for asupersync 0.4.9");
+        .expect("workspace lock must freeze chacha20 0.10.1 for the asupersync graph");
     assert!(
         fixture_packages.contains(workspace_chacha),
         "{label} lock must retain the exact workspace chacha20 0.10.1 tuple",
@@ -1725,6 +1727,45 @@ fn workspace_root(manifest_dir: &Path) -> &Path {
         .parent()
         .and_then(Path::parent)
         .expect("facade crate must be nested beneath the workspace")
+}
+
+fn workspace_exact_dependency_requirement(workspace_root: &Path, dependency: &str) -> String {
+    let manifest_path = workspace_root.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display()));
+    let manifest: toml::Value = toml::from_str(&manifest_text)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", manifest_path.display()));
+    let dependency_value = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|dependencies| dependencies.get(dependency))
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace manifest {} has no `{dependency}` dependency",
+                manifest_path.display()
+            )
+        });
+    let requirement = dependency_value
+        .as_str()
+        .or_else(|| {
+            dependency_value
+                .as_table()
+                .and_then(|table| table.get("version"))
+                .and_then(toml::Value::as_str)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace dependency `{dependency}` in {} has no string version requirement",
+                manifest_path.display()
+            )
+        });
+    assert!(
+        requirement
+            .strip_prefix('=')
+            .is_some_and(|version| !version.is_empty()),
+        "workspace dependency `{dependency}` must use an exact version requirement; found {requirement:?}",
+    );
+    requirement.to_owned()
 }
 
 fn shared_compile_probe_target_dir(manifest_dir: &Path) -> PathBuf {
