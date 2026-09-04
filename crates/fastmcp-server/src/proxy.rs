@@ -1465,6 +1465,13 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
+    /// Reports whether this backend uses the sequential stdio ingress loop
+    /// for final Tasks subscriptions without starting one.
+    #[cfg(feature = "tasks")]
+    fn supports_incremental_final_task_listener(&mut self) -> McpResult<bool> {
+        Ok(false)
+    }
+
     /// Starts an incrementally driven final Tasks listener when the backend
     /// itself owns a sequential ingress loop (currently stdio).
     ///
@@ -1502,6 +1509,12 @@ pub trait ProxyBackend: Send {
         &mut self,
         _listener: ModernHttpSubscriptionListener,
     ) -> McpResult<bool> {
+        Ok(false)
+    }
+
+    /// Reports whether this backend uses the sequential stdio ingress loop
+    /// for catalog subscriptions without starting one.
+    fn supports_incremental_catalog_listener(&mut self) -> McpResult<bool> {
         Ok(false)
     }
 
@@ -3298,6 +3311,11 @@ impl ProxyBackend for Client {
     }
 
     #[cfg(feature = "tasks")]
+    fn supports_incremental_final_task_listener(&mut self) -> McpResult<bool> {
+        self.supports_final_tasks_relay()
+    }
+
+    #[cfg(feature = "tasks")]
     fn start_incremental_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -3308,6 +3326,10 @@ impl ProxyBackend for Client {
             ));
         }
         Client::open_final_task_subscription_listener(self, notifications)?;
+        Ok(true)
+    }
+
+    fn supports_incremental_catalog_listener(&mut self) -> McpResult<bool> {
         Ok(true)
     }
 
@@ -3450,11 +3472,11 @@ impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioFinalTaskListener {
     client: ProxyClient,
-    /// Owned context for best-effort Drop-time cancellation. Derived from an
-    /// owned child region when available so this backstop does not inherit an
-    /// already-cancelled request context state (FND-04 / bd-63l5).
+    /// Owned context for best-effort Drop-time cancellation. Derived from the
+    /// retained child region so this backstop does not inherit an
+    /// already-cancelled request-task state (FND-04 / bd-63l5).
     cx: Cx,
-    _child_region: Option<ChildRegion>,
+    _child_region: ChildRegion,
 }
 
 #[cfg(feature = "tasks")]
@@ -3509,11 +3531,11 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
-    /// Owned context for best-effort Drop-time cancellation. Derived from an
-    /// owned child region when available so this backstop does not inherit an
-    /// already-cancelled request context state (FND-04 / bd-63l5).
+    /// Owned context for best-effort Drop-time cancellation. Derived from the
+    /// retained child region so this backstop does not inherit an
+    /// already-cancelled request-task state (FND-04 / bd-63l5).
     cx: Cx,
-    _child_region: Option<ChildRegion>,
+    _child_region: ChildRegion,
 }
 
 #[cfg(feature = "tasks")]
@@ -8740,14 +8762,24 @@ impl ProxyClient {
         {
             return request.open(ctx).await;
         }
-        if self.with_backend(|backend| {
-            backend.start_incremental_final_task_listener(notifications.clone())
-        })? {
-            let (cx, child_region) =
-                match ctx.cx().open_child_region(ChildRegionSpec::inherit()).await {
-                    Ok(region) => (region.cx().clone(), Some(region)),
-                    Err(_) => (ctx.cx().clone(), None),
-                };
+        if self.with_backend(|backend| backend.supports_incremental_final_task_listener())? {
+            let child_region = ctx
+                .cx()
+                .open_child_region(ChildRegionSpec::inherit())
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy final Tasks stdio listener could not create its owned child region: {error}"
+                    ))
+                })?;
+            let cx = child_region.cx().clone();
+            if !self.with_backend(|backend| {
+                backend.start_incremental_final_task_listener(notifications.clone())
+            })? {
+                return Err(McpError::internal_error(
+                    "Proxy final Tasks stdio listener capability changed before installation",
+                ));
+            }
             return Ok(Box::new(ProxyIncrementalStdioFinalTaskListener {
                 client: self.clone(),
                 cx,
@@ -8768,14 +8800,24 @@ impl ProxyClient {
         {
             return request.open(ctx).await;
         }
-        if self.with_backend(|backend| {
-            backend.start_incremental_catalog_listener(notifications.clone())
-        })? {
-            let (cx, child_region) =
-                match ctx.cx().open_child_region(ChildRegionSpec::inherit()).await {
-                    Ok(region) => (region.cx().clone(), Some(region)),
-                    Err(_) => (ctx.cx().clone(), None),
-                };
+        if self.with_backend(|backend| backend.supports_incremental_catalog_listener())? {
+            let child_region = ctx
+                .cx()
+                .open_child_region(ChildRegionSpec::inherit())
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy catalog stdio listener could not create its owned child region: {error}"
+                    ))
+                })?;
+            let cx = child_region.cx().clone();
+            if !self.with_backend(|backend| {
+                backend.start_incremental_catalog_listener(notifications.clone())
+            })? {
+                return Err(McpError::internal_error(
+                    "Proxy catalog stdio listener capability changed before installation",
+                ));
+            }
             return Ok(Box::new(ProxyIncrementalStdioCatalogListener {
                 client: self.clone(),
                 cx,
@@ -10155,6 +10197,156 @@ mod tests {
             .expect_err("polling without a reserved incremental listener must fail closed");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(error.message.contains("incremental catalog listener"));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn incremental_stdio_listeners_fail_closed_without_an_owned_child_region() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            incremental_catalog_listener: true,
+            incremental_final_task_listener: true,
+            ..TestBackend::default()
+        });
+        let context = McpContext::new(Cx::for_testing(), 880);
+
+        let catalog_error = match block_on(proxy.open_catalog_listener_async(
+            &context,
+            SubscriptionFilter::default(),
+        )) {
+            Ok(_) => panic!("a detached context must not open a catalog listener"),
+            Err(error) => error,
+        };
+        assert_eq!(catalog_error.code, McpErrorCode::InternalError);
+        assert!(catalog_error.message.contains("owned child region"));
+        assert!(catalog_error.message.contains("no runtime gateway"));
+
+        let final_task_error = match block_on(proxy.open_final_task_listener_async(
+            &context,
+            SubscriptionFilter::default(),
+        )) {
+            Ok(_) => panic!("a detached context must not open a final Tasks listener"),
+            Err(error) => error,
+        };
+        assert_eq!(final_task_error.code, McpErrorCode::InternalError);
+        assert!(final_task_error.message.contains("owned child region"));
+        assert!(final_task_error.message.contains("no runtime gateway"));
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(state.incremental_catalog_listener_starts, 0);
+        assert_eq!(state.incremental_catalog_listener_cancellations, 0);
+        assert_eq!(state.incremental_catalog_cleanup_cx_cancelled, None);
+        assert_eq!(state.incremental_final_task_listener_starts, 0);
+        assert_eq!(state.incremental_final_task_listener_cancellations, 0);
+        assert_eq!(state.incremental_final_task_cleanup_cx_cancelled, None);
+        assert!(
+            state.last_tool.is_none()
+                && state.last_resource.is_none()
+                && state.last_prompt.is_none(),
+            "child-region admission failure must make no unrelated backend call"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn dropping_incremental_stdio_listener_opening_never_starts_the_listener() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            incremental_catalog_listener: true,
+            incremental_final_task_listener: true,
+            ..TestBackend::default()
+        });
+
+        let ((), _report) = asupersync::lab::run_async_under_lab(0x63_16, move |cx| {
+            let proxy = proxy.clone();
+            async move {
+                let context = McpContext::new(cx, 882);
+                let mut catalog_opening = Box::pin(proxy.open_catalog_listener_async(
+                    &context,
+                    SubscriptionFilter::default(),
+                ));
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        catalog_opening.as_mut().poll(task_cx).is_pending(),
+                        "child-region admission must yield before listener installation"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(catalog_opening);
+
+                let mut final_task_opening = Box::pin(proxy.open_final_task_listener_async(
+                    &context,
+                    SubscriptionFilter::default(),
+                ));
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        final_task_opening.as_mut().poll(task_cx).is_pending(),
+                        "child-region admission must yield before listener installation"
+                    );
+                    Poll::Ready(())
+                })
+                .await;
+                drop(final_task_opening);
+            }
+        });
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(state.incremental_catalog_listener_starts, 0);
+        assert_eq!(state.incremental_catalog_listener_cancellations, 0);
+        assert_eq!(state.incremental_final_task_listener_starts, 0);
+        assert_eq!(state.incremental_final_task_listener_cancellations, 0);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn incremental_stdio_listener_drop_uses_its_live_child_context() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            incremental_catalog_listener: true,
+            incremental_final_task_listener: true,
+            ..TestBackend::default()
+        });
+
+        let ((), _report) = asupersync::lab::run_async_under_lab(0x63_15, move |cx| {
+            let proxy = proxy.clone();
+            async move {
+                let context = McpContext::new(cx.clone(), 881);
+                let catalog_listener = proxy
+                    .open_catalog_listener_async(&context, SubscriptionFilter::default())
+                    .await
+                    .expect("a runtime-owned context opens a catalog listener");
+                let final_task_listener = proxy
+                    .open_final_task_listener_async(&context, SubscriptionFilter::default())
+                    .await
+                    .expect("a runtime-owned context opens a final Tasks listener");
+
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("parent request task completed"),
+                );
+                assert!(
+                    cx.is_cancel_requested(),
+                    "the paired request context is cancelled before listener teardown"
+                );
+                drop(catalog_listener);
+                drop(final_task_listener);
+            }
+        });
+
+        let state = state.lock().expect("state lock poisoned");
+        assert_eq!(state.incremental_catalog_listener_starts, 1);
+        assert_eq!(state.incremental_catalog_listener_cancellations, 1);
+        assert_eq!(state.incremental_catalog_cleanup_cx_cancelled, Some(false));
+        assert_eq!(state.incremental_final_task_listener_starts, 1);
+        assert_eq!(state.incremental_final_task_listener_cancellations, 1);
+        assert_eq!(
+            state.incremental_final_task_cleanup_cx_cancelled,
+            Some(false)
+        );
     }
 
     #[test]
@@ -11928,6 +12120,17 @@ mod tests {
         last_subscribe: Option<String>,
         last_unsubscribe: Option<String>,
         last_prompt: Option<(String, HashMap<String, String>)>,
+        incremental_catalog_listener_starts: usize,
+        #[cfg(feature = "tasks")]
+        incremental_catalog_listener_cancellations: usize,
+        #[cfg(feature = "tasks")]
+        incremental_catalog_cleanup_cx_cancelled: Option<bool>,
+        #[cfg(feature = "tasks")]
+        incremental_final_task_listener_starts: usize,
+        #[cfg(feature = "tasks")]
+        incremental_final_task_listener_cancellations: usize,
+        #[cfg(feature = "tasks")]
+        incremental_final_task_cleanup_cx_cancelled: Option<bool>,
     }
 
     #[derive(Clone, Default)]
@@ -11939,6 +12142,9 @@ mod tests {
         cancel_after_tool: Option<McpRequestCancellation>,
         legacy_progress: Option<(f64, Option<f64>, Option<String>)>,
         pending_updated_uris: Vec<String>,
+        incremental_catalog_listener: bool,
+        #[cfg(feature = "tasks")]
+        incremental_final_task_listener: bool,
     }
 
     impl ProxyBackend for TestBackend {
@@ -12057,6 +12263,68 @@ mod tests {
                     text: "ok".to_string(),
                 },
             }])
+        }
+
+        fn start_incremental_catalog_listener(
+            &mut self,
+            _notifications: SubscriptionFilter,
+        ) -> fastmcp_core::McpResult<bool> {
+            if self.incremental_catalog_listener {
+                self.state
+                    .lock()
+                    .expect("state lock poisoned")
+                    .incremental_catalog_listener_starts += 1;
+            }
+            Ok(self.incremental_catalog_listener)
+        }
+
+        fn supports_incremental_catalog_listener(
+            &mut self,
+        ) -> fastmcp_core::McpResult<bool> {
+            Ok(self.incremental_catalog_listener)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn cancel_incremental_catalog_listener(
+            &mut self,
+            cx: &Cx,
+        ) -> fastmcp_core::McpResult<()> {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state.incremental_catalog_listener_cancellations += 1;
+            state.incremental_catalog_cleanup_cx_cancelled = Some(cx.is_cancel_requested());
+            Ok(())
+        }
+
+        #[cfg(feature = "tasks")]
+        fn start_incremental_final_task_listener(
+            &mut self,
+            _notifications: SubscriptionFilter,
+        ) -> fastmcp_core::McpResult<bool> {
+            if self.incremental_final_task_listener {
+                self.state
+                    .lock()
+                    .expect("state lock poisoned")
+                    .incremental_final_task_listener_starts += 1;
+            }
+            Ok(self.incremental_final_task_listener)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn supports_incremental_final_task_listener(
+            &mut self,
+        ) -> fastmcp_core::McpResult<bool> {
+            Ok(self.incremental_final_task_listener)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn cancel_incremental_final_task_listener(
+            &mut self,
+            cx: &Cx,
+        ) -> fastmcp_core::McpResult<()> {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            state.incremental_final_task_listener_cancellations += 1;
+            state.incremental_final_task_cleanup_cx_cancelled = Some(cx.is_cancel_requested());
+            Ok(())
         }
     }
 
