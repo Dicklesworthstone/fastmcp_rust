@@ -3380,7 +3380,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
     ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
-        self.request_with_optional_cancellation(cx, None, method, parameters, request_id)
+        self.request_with_optional_cancellation(cx, None, method, parameters, request_id, None)
             .await
     }
 
@@ -3391,6 +3391,7 @@ impl ClientHttpConnection {
         method: impl AsRef<str>,
         parameters: serde_json::Value,
         request_id: RequestId,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
         let method = method.as_ref();
         match self {
@@ -3402,12 +3403,19 @@ impl ClientHttpConnection {
                         method,
                         parameters,
                         Some(request_id),
+                        client_extensions,
                     )
                     .await
                     .map(ClientHttpResponse::Modern)
                     .map_err(ClientHttpConnectionError::Modern),
                 None => client
-                    .request(cx, method, parameters, Some(request_id))
+                    .request_with_client_extensions(
+                        cx,
+                        method,
+                        parameters,
+                        Some(request_id),
+                        client_extensions,
+                    )
                     .await
                     .map(ClientHttpResponse::Modern)
                     .map_err(ClientHttpConnectionError::Modern),
@@ -3612,6 +3620,7 @@ impl ClientHttpConnection {
             parameters,
             request_id,
             maximum_response_bytes,
+            None,
         )
         .await
         .map(|(response, result_source, _, _, _)| (response, result_source))
@@ -3631,6 +3640,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -3648,6 +3658,7 @@ impl ClientHttpConnection {
             parameters,
             request_id,
             maximum_response_bytes,
+            client_extensions,
         )
         .await
     }
@@ -3686,6 +3697,7 @@ impl ClientHttpConnection {
             parameters,
             request_id,
             maximum_response_bytes,
+            None,
         )
         .await
     }
@@ -3702,6 +3714,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -3724,6 +3737,7 @@ impl ClientHttpConnection {
             parameters,
             request_id,
             maximum_response_bytes,
+            client_extensions,
         )
         .await
     }
@@ -3736,6 +3750,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -3754,6 +3769,7 @@ impl ClientHttpConnection {
                     method,
                     parameters,
                     request_id.clone(),
+                    client_extensions,
                 )
                 .await?
             }
@@ -5374,15 +5390,31 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        let method = method.as_ref();
+        self.request_with_client_extensions(cx, method.as_ref(), parameters, request_id, None)
+            .await
+    }
+
+    async fn request_with_client_extensions(
+        &self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: Option<RequestId>,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         validate_final_method(method, request_id.is_some())?;
         if request_id.is_none() {
             return Err(ModernHttpClientError::ClientNotificationPostUnsupported {
                 method: method.to_owned(),
             });
         }
-        let request =
-            self.build_post_discovery_request(cx, method, parameters, request_id, None)?;
+        let request = self.build_post_discovery_request(
+            cx,
+            method,
+            parameters,
+            request_id,
+            client_extensions,
+        )?;
         self.execute_post_discovery_request(cx, &request).await
     }
 
@@ -5438,6 +5470,7 @@ impl ModernHttpClient {
         method: &str,
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
+        client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
         if cancellation.is_cancel_requested() {
             return Err(ModernHttpClientError::Executor(
@@ -5450,8 +5483,13 @@ impl ModernHttpClient {
                 method: method.to_owned(),
             });
         }
-        let request =
-            self.build_post_discovery_request(cx, method, parameters, request_id, None)?;
+        let request = self.build_post_discovery_request(
+            cx,
+            method,
+            parameters,
+            request_id,
+            client_extensions,
+        )?;
         self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
             .await
     }
@@ -8218,6 +8256,10 @@ fn build_modern_tasks_request(
     )
 }
 
+/// Overlays only the three core callback capabilities accepted from a typed
+/// request parameter object. Extension advertisements are stamped separately
+/// from frozen client configuration and negotiated discovery state; treating
+/// caller `_meta.extensions` as authoritative would bypass that admission.
 fn retain_inbound_core_client_capabilities(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
     inbound_capabilities: Option<serde_json::Value>,
@@ -8242,22 +8284,6 @@ fn retain_inbound_core_client_capabilities(
             }
             None => {
                 capabilities.remove(key);
-            }
-        }
-    }
-    if let Some(inbound_extensions) = inbound
-        .get("extensions")
-        .and_then(serde_json::Value::as_object)
-    {
-        let extensions = capabilities
-            .entry("extensions".to_owned())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-            .as_object_mut();
-        if let Some(extensions) = extensions {
-            for (key, value) in inbound_extensions {
-                extensions
-                    .entry(key.clone())
-                    .or_insert_with(|| value.clone());
             }
         }
     }
@@ -14853,6 +14879,85 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             )))
         ));
         server.join().expect("stateless HTTP server joins");
+    }
+
+    #[test]
+    fn public_modern_http_request_drops_untrusted_client_extensions() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind immutable-capability HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read immutable-capability HTTP address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener
+                .accept()
+                .expect("accept immutable-capability discovery");
+            let _ = read_request(&mut discovery);
+            write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+
+            let (mut request_stream, _) = listener
+                .accept()
+                .expect("accept immutable-capability core request");
+            let request = read_request(&mut request_stream);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("immutable-capability request is JSON-RPC");
+            assert_eq!(request["method"], "tools/list");
+            assert!(
+                request["params"]["_meta"]
+                    ["io.modelcontextprotocol/clientCapabilities"]
+                    .get("extensions")
+                    .is_none(),
+                "caller-supplied arbitrary or Tasks extensions must not bypass immutable client configuration"
+            );
+            write_response(
+                &mut request_stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "immutable-capability-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the immutable-capability client")
+        .into_modern()
+        .expect("modern-only connection cannot select legacy");
+        let response = runtime_block_on(client.request(
+            &cx,
+            "tools/list",
+            serde_json::json!({
+                "_meta": {
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {
+                        "extensions": {
+                            "com.example/untrusted": {"enabled": true},
+                            fastmcp_protocol::TASKS_EXTENSION: {},
+                        },
+                    },
+                },
+            }),
+            Some(RequestId::Number(2)),
+        ))
+        .expect("ordinary core request receives a response");
+        let body = runtime_block_on(response.read_to_end(&cx, 4_096))
+            .expect("ordinary core response body is bounded");
+        assert!(serde_json::from_slice::<JsonRpcResponse>(&body).is_ok());
+        server
+            .join()
+            .expect("immutable-capability HTTP server joins");
     }
 
     #[test]

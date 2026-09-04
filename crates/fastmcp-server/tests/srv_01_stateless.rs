@@ -148,33 +148,36 @@ fn srv_01_a_positive() {
         "runtime admission cannot mutate caller-owned modern metadata"
     );
 
-    let legacy_initialize = JsonRpcRequest::new(
-        "initialize",
-        Some(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "exact-legacy-client", "version": "1.0.0"},
-        })),
-        72_i64,
-    );
-    let (legacy_transport, legacy_probe) = RuntimeTransport::single_request(legacy_initialize);
-    Server::new("exact-legacy-runtime", "1.0.0")
-        .tool(Greet)
-        .build()
-        .run_transport_returning_with_cx(&Cx::for_testing(), legacy_transport)
-        .expect("the same public runtime preserves exact MCP 2024-11-05 initialization");
-    let legacy_outgoing = legacy_probe.outgoing();
-    assert_eq!(legacy_outgoing.len(), 1);
-    let JsonRpcMessage::Response(legacy_response) = &legacy_outgoing[0] else {
-        panic!("the exact legacy runtime emits a JSON-RPC response");
-    };
-    assert_eq!(
-        legacy_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("protocolVersion")),
-        Some(&serde_json::json!("2024-11-05"))
-    );
+    #[cfg(feature = "legacy-2024-11-05")]
+    {
+        let legacy_initialize = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "exact-legacy-client", "version": "1.0.0"},
+            })),
+            72_i64,
+        );
+        let (legacy_transport, legacy_probe) = RuntimeTransport::single_request(legacy_initialize);
+        Server::new("exact-legacy-runtime", "1.0.0")
+            .tool(Greet)
+            .build()
+            .run_transport_returning_with_cx(&Cx::for_testing(), legacy_transport)
+            .expect("the same public runtime preserves exact MCP 2024-11-05 initialization");
+        let legacy_outgoing = legacy_probe.outgoing();
+        assert_eq!(legacy_outgoing.len(), 1);
+        let JsonRpcMessage::Response(legacy_response) = &legacy_outgoing[0] else {
+            panic!("the exact legacy runtime emits a JSON-RPC response");
+        };
+        assert_eq!(
+            legacy_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("protocolVersion")),
+            Some(&serde_json::json!("2024-11-05"))
+        );
+    }
 }
 
 #[test]

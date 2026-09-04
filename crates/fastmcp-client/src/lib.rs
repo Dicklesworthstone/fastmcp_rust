@@ -11608,6 +11608,7 @@ impl HttpClient {
             .as_ref()
             .map(|key| self.final_result_cache.begin_fetch(key.result_set()));
         let request_id = self.next_request_id()?;
+        let client_extensions = self.final_core_client_extensions();
         let response = match cancellation {
             Some(cancellation) => {
                 self.connection
@@ -11618,6 +11619,7 @@ impl HttpClient {
                         core_parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
+                        client_extensions.as_ref(),
                     )
                     .await
             }
@@ -11629,6 +11631,7 @@ impl HttpClient {
                         core_parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
+                        client_extensions.as_ref(),
                     )
                     .await
             }
@@ -11832,6 +11835,7 @@ impl HttpClient {
         }
         let parameters = self.core_request_parameters(&serde_json::json!({}))?;
         let request_id = self.next_request_id()?;
+        let client_extensions = self.final_core_client_extensions();
         let response = match cancellation {
             Some(cancellation) => {
                 self.connection
@@ -11842,6 +11846,7 @@ impl HttpClient {
                         parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
+                        client_extensions.as_ref(),
                     )
                     .await
             }
@@ -11853,6 +11858,7 @@ impl HttpClient {
                         parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
+                        client_extensions.as_ref(),
                     )
                     .await
             }
@@ -12958,6 +12964,22 @@ impl HttpClient {
         }
         parameters.insert("_meta".to_owned(), metadata);
         Ok(serde_json::Value::Object(parameters))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn final_core_client_extensions(&self) -> Option<BTreeMap<String, serde_json::Value>> {
+        let discovery = self.server_discovery()?;
+        admit_final_tasks_result_discriminator(&discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)
+            .ok()?;
+        Some(BTreeMap::from([(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        )]))
+    }
+
+    #[cfg(not(feature = "tasks"))]
+    const fn final_core_client_extensions(&self) -> Option<BTreeMap<String, serde_json::Value>> {
+        None
     }
 
     fn final_cache_key(
@@ -27042,6 +27064,7 @@ mod tests {
                 serde_json::json!({}),
                 RequestId::Number(2),
                 4_096,
+                None,
             ))
             .expect("HTTP response retains its transport decode receipt");
         server.join().expect("HTTP receipt server must join");

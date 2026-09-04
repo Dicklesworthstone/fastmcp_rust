@@ -1776,6 +1776,7 @@ struct MrtrExchange {
 #[derive(Debug, Default)]
 struct MrtrExchangeState {
     exchanges: HashMap<String, MrtrExchange>,
+    stateless_closed: bool,
 }
 
 /// Process-local, one-use final MRTR request-state storage.
@@ -2085,6 +2086,25 @@ impl MrtrExchangeRegistry {
         state.exchanges.len()
     }
 
+    /// Permanently closes stateless issuance for this registry and removes
+    /// every already-issued stateless exchange.
+    ///
+    /// The closed flag and purge share the registry lock with issuance. An
+    /// in-flight handler therefore either publishes before this fence and is
+    /// purged, or observes the fence and cannot mint a late continuation.
+    pub(crate) fn close_stateless(&self) -> usize {
+        let mut state = self.lock_state();
+        state.stateless_closed = true;
+        let active_before = state.exchanges.len();
+        state.exchanges.retain(|_, exchange| {
+            !exchange
+                .binding
+                .as_ref()
+                .is_some_and(MrtrExchangeBinding::is_stateless)
+        });
+        active_before.saturating_sub(state.exchanges.len())
+    }
+
     fn issue_at(
         &self,
         owner_cancellation: McpRequestCancellation,
@@ -2104,6 +2124,13 @@ impl MrtrExchangeRegistry {
             .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR))?;
         let mut state = self.lock_state();
         Self::purge_stale(&mut state, now);
+        if state.stateless_closed
+            && binding
+                .as_ref()
+                .is_some_and(MrtrExchangeBinding::is_stateless)
+        {
+            return Err(McpError::request_cancelled());
+        }
         if state.exchanges.len() >= self.max_states {
             return Err(McpError::internal_error(MRTR_ROUND_LIMIT_ERROR));
         }
@@ -2900,6 +2927,90 @@ mod tests {
             vec!["second", "first"],
             "handler delivery preserves the accepted wire order rather than BTreeMap key order"
         );
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn closing_stateless_mrtr_is_latched_and_preserves_durable_exchanges() {
+        let registry = MrtrExchangeRegistry::new();
+        let input_requests = || {
+            MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                .expect("unique MRTR input map")
+        };
+        let stateless_binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "stateless-tool".to_owned(),
+            [1; 32],
+            [2; 32],
+            None,
+        );
+        let stateless = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                stateless_binding.clone(),
+                input_requests(),
+            )
+            .expect("stateless MRTR state issues before listener shutdown");
+        let stateless_state = mrtr_state_from_wire(&stateless);
+
+        let durable_binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "durable-tool".to_owned(),
+            [3; 32],
+            [4; 32],
+            None,
+        );
+        let durable = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                durable_binding.clone(),
+                input_requests(),
+            )
+            .expect("durable MRTR state issues beside stateless state");
+        let durable_state = mrtr_state_from_wire(&durable);
+        assert_eq!(registry.active_len(), 2);
+
+        assert_eq!(
+            registry.close_stateless(),
+            1,
+            "listener shutdown removes exactly the retained stateless exchange"
+        );
+        assert_eq!(registry.active_len(), 1);
+        let removed = registry
+            .accept_wire_bound(
+                &stateless_state,
+                &stateless_binding,
+                &BTreeMap::from([(
+                    "roots".to_owned(),
+                    serde_json::to_value(mrtr_roots_response())
+                        .expect("roots response must serialize"),
+                )]),
+            )
+            .expect_err("a purged stateless state cannot resume after shutdown");
+        assert_eq!(removed.code, McpErrorCode::InvalidParams);
+
+        let late_issue = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                stateless_binding,
+                input_requests(),
+            )
+            .expect_err("the latched shutdown fence rejects late stateless issuance");
+        assert_eq!(late_issue.code, McpErrorCode::RequestCancelled);
+        assert_eq!(registry.close_stateless(), 0, "the fence is idempotent");
+
+        assert!(matches!(
+            registry.accept_wire_bound(
+                &durable_state,
+                &durable_binding,
+                &BTreeMap::from([(
+                    "roots".to_owned(),
+                    serde_json::to_value(mrtr_roots_response())
+                        .expect("roots response must serialize"),
+                )]),
+            ),
+            Ok(MrtrRetry::Complete(_))
+        ));
         assert_eq!(registry.active_len(), 0);
     }
 

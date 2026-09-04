@@ -6931,6 +6931,10 @@ impl BoundHttpServer {
             }
         };
         connection_shutdown.request();
+        // Closing stateless issuance is a latched registry fence, not merely a
+        // purge. A handler racing shutdown therefore cannot mint a new
+        // cross-POST continuation after the existing set has been invalidated.
+        let _ = server.router.close_stateless_mrtr_exchanges();
         // Final subscription teardown must commit its correlated cancellation
         // controls while the response writers are still owned. Give those
         // children a bounded scheduling window to flush and close before
@@ -12973,7 +12977,6 @@ impl Server {
                     move |notification| {
                         sender(notification);
                     },
-                    ProtocolEra::Modern2026,
                 )));
         }
         // The outer request owner retains the sole final-progress runtime.
@@ -13825,7 +13828,6 @@ impl Server {
                         move |notification| {
                             sender(notification);
                         },
-                        ProtocolEra::Legacy2024,
                     ),
                 ));
             }
@@ -30398,6 +30400,7 @@ mod lib_unit_tests {
     }
 
     struct LiveHttpMrtrTool {
+        name: &'static str,
         calls: Arc<AtomicUsize>,
     }
 
@@ -30410,6 +30413,7 @@ mod lib_unit_tests {
     struct PublicFinalElicitationTool {
         name: &'static str,
         mode: PublicFinalElicitationMode,
+        calls: Arc<AtomicUsize>,
     }
 
     impl ToolHandler for PublicFinalElicitationTool {
@@ -30445,6 +30449,7 @@ mod lib_unit_tests {
             ctx: &McpContext,
             _arguments: serde_json::Value,
         ) -> McpResult<FinalToolOutcome> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
             let elicitation = match self.mode {
                 PublicFinalElicitationMode::Form => ctx.final_elicitation_form(
                     "approval",
@@ -30574,9 +30579,9 @@ mod lib_unit_tests {
     impl ToolHandler for LiveHttpMrtrTool {
         fn definition(&self) -> Tool {
             Tool {
-                name: "live_http_mrtr".to_owned(),
+                name: self.name.to_owned(),
                 description: Some(
-                    "Proves MRTR resumes only within one admitted HTTP session".to_owned(),
+                    "Proves bound MRTR resume across stateless HTTP POSTs".to_owned(),
                 ),
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: None,
@@ -30808,6 +30813,7 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .tool(LiveHttpMrtrTool {
+                name: "live_http_mrtr",
                 calls: Arc::clone(&calls),
             })
             .build()
@@ -36428,6 +36434,7 @@ mod lib_unit_tests {
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
+                    name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
                 })
                 .build()
@@ -37316,6 +37323,7 @@ mod lib_unit_tests {
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
+                    name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
                 })
                 .build()
@@ -37551,6 +37559,7 @@ mod lib_unit_tests {
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
+                    name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
                 })
                 .build()
@@ -37617,6 +37626,11 @@ mod lib_unit_tests {
             let shutdown =
                 serve.map_err(|error| format!("live HTTP MRTR shutdown server failed: {error}"))?;
             require_quiescent_http_shutdown(shutdown, "live HTTP MRTR shutdown").await?;
+            if endpoint.server.router.test_active_mrtr_exchange_count() != 0 {
+                return Err(
+                    "listener shutdown retained a stateless MRTR continuation".to_owned(),
+                );
+            }
             let request_state = initial
                 .result
                 .as_ref()
@@ -37679,6 +37693,7 @@ mod lib_unit_tests {
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
                 .tool(LiveHttpMrtrTool {
+                    name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
                 })
                 .build()
@@ -47049,16 +47064,19 @@ mod lib_unit_tests {
 
     #[test]
     fn public_final_elicitation_projects_admitted_modes_without_mutating_on_rejection() {
+        let calls = Arc::new(AtomicUsize::new(0));
         let server = Server::new("public-final-elicitation", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("modern-only policy is available")
             .tool(PublicFinalElicitationTool {
                 name: "public-final-form-elicitation",
                 mode: PublicFinalElicitationMode::Form,
+                calls: Arc::clone(&calls),
             })
             .tool(PublicFinalElicitationTool {
                 name: "public-final-url-elicitation",
                 mode: PublicFinalElicitationMode::Url,
+                calls: Arc::clone(&calls),
             })
             .build();
         let cx = Cx::for_testing();
@@ -47097,6 +47115,7 @@ mod lib_unit_tests {
                 .and_then(|result| result.pointer("/inputRequests/approval/params/mode")),
             Some(&serde_json::json!("form"))
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
         let active_before_rejection = server.router.test_active_mrtr_exchange_count();
         assert_eq!(active_before_rejection, 1);
 
@@ -47133,6 +47152,7 @@ mod lib_unit_tests {
             active_before_rejection,
             "removing only client elicitation capability cannot mint or consume MRTR state"
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
 
         let mut url_mismatch = admitted_params;
         url_mismatch["name"] = serde_json::json!("public-final-url-elicitation");
@@ -47158,6 +47178,7 @@ mod lib_unit_tests {
             active_before_rejection,
             "a form-only client cannot mint URL elicitation state"
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -47329,6 +47350,11 @@ mod lib_unit_tests {
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .tool(LiveHttpMrtrTool {
+                name: "live_http_mrtr",
+                calls: Arc::clone(&calls),
+            })
+            .tool(LiveHttpMrtrTool {
+                name: "other_live_http_mrtr",
                 calls: Arc::clone(&calls),
             })
             .build_http_endpoint("http://final.test")
@@ -47362,12 +47388,12 @@ mod lib_unit_tests {
                 .expect("MRTR roots response must construct"),
         )
         .expect("MRTR roots response must serialize");
-        let retry = |state: &str, id: i64| {
+        let retry = |state: &str, name: &str, arguments: serde_json::Value, id: i64| {
             let request = JsonRpcRequest::new(
                 "tools/call",
                 Some(serde_json::json!({
-                    "name": "live_http_mrtr",
-                    "arguments": {},
+                    "name": name,
+                    "arguments": arguments,
                     "inputResponses": {"roots": roots.clone()},
                     "requestState": state,
                     "_meta": {
@@ -47382,13 +47408,21 @@ mod lib_unit_tests {
                 .with_header("accept", "application/json")
                 .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                 .with_header("mcp-method", "tools/call")
-                .with_header("mcp-name", "live_http_mrtr")
+                .with_header("mcp-name", name)
                 .with_body(serde_json::to_vec(&request).expect("MRTR retry must encode"))
         };
 
         let forged_state = format!("{request_state}-foreign");
         let forged = issuing_client
-            .handle(&cx, retry(&forged_state, 907))
+            .handle(
+                &cx,
+                retry(
+                    &forged_state,
+                    "live_http_mrtr",
+                    serde_json::json!({}),
+                    907,
+                ),
+            )
             .expect("forged MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
             forged,
@@ -47402,8 +47436,72 @@ mod lib_unit_tests {
             1,
             "changing only requestState must not consume or resume the issued continuation",
         );
+        assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
 
-        let valid_retry = retry(&request_state, 908);
+        let target_mismatch = other_client
+            .handle(
+                &cx,
+                retry(
+                    &request_state,
+                    "other_live_http_mrtr",
+                    serde_json::json!({}),
+                    908,
+                ),
+            )
+            .expect("a target-mismatched MRTR retry must receive a JSON-RPC rejection");
+        assert!(matches!(
+            target_mismatch,
+            ServerHttpEndpointResponse::Immediate(response)
+                if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
+                    response.id == Some(908_i64.into()) && response.error.is_some()
+                })
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "changing only the registered tool target must not reenter either handler",
+        );
+        assert_eq!(
+            endpoint.server.router.test_active_mrtr_exchange_count(),
+            1,
+            "a target-binding rejection must leave the issued state available",
+        );
+
+        let argument_mismatch = other_client
+            .handle(
+                &cx,
+                retry(
+                    &request_state,
+                    "live_http_mrtr",
+                    serde_json::json!({"city": "Cambridge"}),
+                    909,
+                ),
+            )
+            .expect("an argument-mismatched MRTR retry must receive a JSON-RPC rejection");
+        assert!(matches!(
+            argument_mismatch,
+            ServerHttpEndpointResponse::Immediate(response)
+                if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
+                    response.id == Some(909_i64.into()) && response.error.is_some()
+                })
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "changing only valid arguments must not reenter the handler",
+        );
+        assert_eq!(
+            endpoint.server.router.test_active_mrtr_exchange_count(),
+            1,
+            "an argument-binding rejection must leave the issued state available",
+        );
+
+        let valid_retry = retry(
+            &request_state,
+            "live_http_mrtr",
+            serde_json::json!({}),
+            910,
+        );
         let resumed = other_client
             .handle(&cx, valid_retry.clone())
             .expect("a later stateless session with the bound request must resume");
@@ -47411,7 +47509,7 @@ mod lib_unit_tests {
             resumed,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
-                    response.id == Some(908_i64.into())
+                    response.id == Some(910_i64.into())
                         && response.error.is_none()
                         && response.result.as_ref().and_then(|result| result.get("resultType"))
                             == Some(&serde_json::json!("complete"))
@@ -47426,13 +47524,112 @@ mod lib_unit_tests {
             replay,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
-                    response.id == Some(908_i64.into()) && response.error.is_some()
+                    response.id == Some(910_i64.into()) && response.error.is_some()
                 })
         ));
         assert_eq!(
             calls.load(Ordering::Acquire),
             2,
             "replaying consumed requestState must not reenter the handler",
+        );
+        assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 0);
+    }
+
+    #[test]
+    fn public_http_stateless_elicitation_retry_rejects_without_reentry_or_consumption() {
+        let cx = Cx::for_testing();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let endpoint = Server::new("modern-http-stateless-elicitation", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .tool(PublicFinalElicitationTool {
+                name: "stateless-form-elicitation",
+                mode: PublicFinalElicitationMode::Form,
+                calls: Arc::clone(&calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut issuing_client = endpoint
+            .open_session(&cx)
+            .expect("issuing modern HTTP session must open");
+        let mut retrying_client = endpoint
+            .open_session(&cx)
+            .expect("independent modern HTTP session must open");
+        let request = |request_state: Option<&str>, id: i64| {
+            let mut params = serde_json::json!({
+                "name": "stateless-form-elicitation",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {"elicitation": {"form": {}}},
+                },
+            });
+            if let Some(request_state) = request_state {
+                params["inputResponses"] = serde_json::json!({
+                    "approval": {"action": "accept", "content": {"approved": true}},
+                });
+                params["requestState"] = serde_json::json!(request_state);
+            }
+            let request = JsonRpcRequest::new("tools/call", Some(params), id);
+            HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("content-type", "application/json")
+                .with_header("accept", "application/json")
+                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                .with_header("mcp-method", "tools/call")
+                .with_header("mcp-name", "stateless-form-elicitation")
+                .with_body(serde_json::to_vec(&request).expect("elicitation request must encode"))
+        };
+
+        let initial = issuing_client
+            .handle(&cx, request(None, 912))
+            .expect("stateless elicitation must return input_required");
+        let ServerHttpEndpointResponse::Immediate(initial) = initial else {
+            panic!("ordinary stateless elicitation must use the JSON response lane");
+        };
+        let initial: JsonRpcResponse =
+            serde_json::from_slice(&initial.body).expect("initial response must be JSON-RPC");
+        assert_eq!(initial.id, Some(912_i64.into()));
+        assert!(initial.error.is_none());
+        assert_eq!(
+            initial
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType")),
+            Some(&serde_json::json!("input_required"))
+        );
+        let request_state = initial
+            .result
+            .as_ref()
+            .and_then(|result| result.get("requestState"))
+            .and_then(serde_json::Value::as_str)
+            .expect("initial elicitation result must carry requestState");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
+
+        let rejected = retrying_client
+            .handle(&cx, request(Some(request_state), 913))
+            .expect("stateless elicitation retry must receive a JSON-RPC rejection");
+        let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
+            panic!("stateless elicitation retry rejection must use the JSON response lane");
+        };
+        let rejected: JsonRpcResponse =
+            serde_json::from_slice(&rejected.body).expect("retry rejection must be JSON-RPC");
+        assert_eq!(rejected.id, Some(913_i64.into()));
+        let error = rejected.error.expect("stateless elicitation retry must fail");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest.into());
+        assert_eq!(
+            error.message,
+            "stateless HTTP cannot resume elicitation requestState without a session"
+        );
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "retry rejection must happen before handler reentry"
+        );
+        assert_eq!(
+            endpoint.server.router.test_active_mrtr_exchange_count(),
+            1,
+            "a terminal policy rejection must not silently consume requestState"
         );
     }
 
