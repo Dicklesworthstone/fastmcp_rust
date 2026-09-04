@@ -6767,7 +6767,7 @@ fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
         .expect("the second identical public tools/list observes the selected cache policy");
     assert_eq!(result_identity(&second), first_identity);
 
-    let expected_hits = if cache_enabled { 1 } else { 0 };
+    let expected_hits = u64::from(cache_enabled);
     let expected_misses = if cache_enabled { 1 } else { 2 };
     let expected_requests = if cache_enabled { 2 } else { 3 };
     let after_second = client.final_result_cache_stats();
@@ -7977,16 +7977,17 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
             // Move the client and request context into this inner ownership scope.
             // The completion signal is meaningful only after both have settled
             // and the worker's harness lane has been released.
-            let result = (move || -> Result<serde_json::Value, String> {
+            let result: Result<serde_json::Value, String> = {
                 let _harness_permit = public_http_harness_permit();
                 modern_start.wait();
+                let cx = modern_cx;
                 let mut client = modern_client;
                 runtime_block_on_bounded_after_admission(
-                    &modern_cx,
+                    &cx,
                     "overlapping modern tools/list response",
                     async {
                         let response = client
-                            .request(&modern_cx, "tools/list", json!({ "cursor": null }))
+                            .request(&cx, "tools/list", json!({ "cursor": null }))
                             .await
                             .map_err(|error| {
                                 format!("the modern tools/list request failed: {error}")
@@ -7995,10 +7996,10 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                             return Err("the first client did not retain its modern response lane"
                                 .to_owned());
                         };
-                        Ok(final_response_document(&modern_cx, response).await)
+                        Ok(final_response_document(&cx, response).await)
                     },
                 )
-            })();
+            };
             let _ = modern_completed_tx.send(OverlapWorkerCompletion::Modern(result));
         },
         "modern overlap worker",
@@ -8009,16 +8010,17 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
         move || {
             // Match the modern worker's completion boundary so neither protocol
             // reports success while connection-owned state is still being dropped.
-            let result = (move || -> Result<serde_json::Value, String> {
+            let result: Result<serde_json::Value, String> = {
                 let _harness_permit = public_http_harness_permit();
                 legacy_start.wait();
+                let cx = legacy_cx;
                 let mut client = legacy_client;
                 runtime_block_on_bounded_after_admission(
-                    &legacy_cx,
+                    &cx,
                     "overlapping legacy ping response",
                     async {
                         let response = client
-                            .request(&legacy_cx, "ping", json!({}))
+                            .request(&cx, "ping", json!({}))
                             .await
                             .map_err(|error| format!("the legacy ping request failed: {error}"))?;
                         let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) =
@@ -8034,7 +8036,7 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                         })
                     },
                 )
-            })();
+            };
             let _ = legacy_completed_tx.send(OverlapWorkerCompletion::Legacy(result));
         },
         "legacy overlap worker",
