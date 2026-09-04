@@ -8814,8 +8814,7 @@ impl ProxyClient {
             return request.open(ctx).await;
         }
         if self.with_backend(|backend| backend.supports_incremental_final_task_listener())? {
-            let child_region =
-                open_owned_proxy_listener_region(ctx.cx(), "final Tasks").await?;
+            let child_region = open_owned_proxy_listener_region(ctx.cx(), "final Tasks").await?;
             let cx = child_region.cx().clone();
             if !self.with_backend(|backend| {
                 backend.start_incremental_final_task_listener(notifications.clone())
