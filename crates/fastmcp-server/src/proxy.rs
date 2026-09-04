@@ -10211,10 +10211,9 @@ mod tests {
         });
         let context = McpContext::new(Cx::for_testing(), 880);
 
-        let catalog_error = match block_on(proxy.open_catalog_listener_async(
-            &context,
-            SubscriptionFilter::default(),
-        )) {
+        let catalog_error = match block_on(
+            proxy.open_catalog_listener_async(&context, SubscriptionFilter::default()),
+        ) {
             Ok(_) => panic!("a detached context must not open a catalog listener"),
             Err(error) => error,
         };
@@ -10222,10 +10221,9 @@ mod tests {
         assert!(catalog_error.message.contains("owned child region"));
         assert!(catalog_error.message.contains("no runtime gateway"));
 
-        let final_task_error = match block_on(proxy.open_final_task_listener_async(
-            &context,
-            SubscriptionFilter::default(),
-        )) {
+        let final_task_error = match block_on(
+            proxy.open_final_task_listener_async(&context, SubscriptionFilter::default()),
+        ) {
             Ok(_) => panic!("a detached context must not open a final Tasks listener"),
             Err(error) => error,
         };
@@ -10263,10 +10261,9 @@ mod tests {
             let proxy = proxy.clone();
             async move {
                 let context = McpContext::new(cx, 882);
-                let mut catalog_opening = Box::pin(proxy.open_catalog_listener_async(
-                    &context,
-                    SubscriptionFilter::default(),
-                ));
+                let mut catalog_opening = Box::pin(
+                    proxy.open_catalog_listener_async(&context, SubscriptionFilter::default()),
+                );
                 std::future::poll_fn(|task_cx| {
                     assert!(
                         catalog_opening.as_mut().poll(task_cx).is_pending(),
@@ -10277,10 +10274,9 @@ mod tests {
                 .await;
                 drop(catalog_opening);
 
-                let mut final_task_opening = Box::pin(proxy.open_final_task_listener_async(
-                    &context,
-                    SubscriptionFilter::default(),
-                ));
+                let mut final_task_opening = Box::pin(
+                    proxy.open_final_task_listener_async(&context, SubscriptionFilter::default()),
+                );
                 std::future::poll_fn(|task_cx| {
                     assert!(
                         final_task_opening.as_mut().poll(task_cx).is_pending(),
@@ -12278,17 +12274,12 @@ mod tests {
             Ok(self.incremental_catalog_listener)
         }
 
-        fn supports_incremental_catalog_listener(
-            &mut self,
-        ) -> fastmcp_core::McpResult<bool> {
+        fn supports_incremental_catalog_listener(&mut self) -> fastmcp_core::McpResult<bool> {
             Ok(self.incremental_catalog_listener)
         }
 
         #[cfg(feature = "tasks")]
-        fn cancel_incremental_catalog_listener(
-            &mut self,
-            cx: &Cx,
-        ) -> fastmcp_core::McpResult<()> {
+        fn cancel_incremental_catalog_listener(&mut self, cx: &Cx) -> fastmcp_core::McpResult<()> {
             let mut state = self.state.lock().expect("state lock poisoned");
             state.incremental_catalog_listener_cancellations += 1;
             state.incremental_catalog_cleanup_cx_cancelled = Some(cx.is_cancel_requested());
@@ -12310,9 +12301,7 @@ mod tests {
         }
 
         #[cfg(feature = "tasks")]
-        fn supports_incremental_final_task_listener(
-            &mut self,
-        ) -> fastmcp_core::McpResult<bool> {
+        fn supports_incremental_final_task_listener(&mut self) -> fastmcp_core::McpResult<bool> {
             Ok(self.incremental_final_task_listener)
         }
 
