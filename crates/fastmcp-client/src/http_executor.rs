@@ -8245,6 +8245,22 @@ fn retain_inbound_core_client_capabilities(
             }
         }
     }
+    if let Some(inbound_extensions) = inbound
+        .get("extensions")
+        .and_then(serde_json::Value::as_object)
+    {
+        let extensions = capabilities
+            .entry("extensions".to_owned())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut();
+        if let Some(extensions) = extensions {
+            for (key, value) in inbound_extensions {
+                extensions
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
 }
 
 /// Adds final HTTP metadata after the caller has validated that the method is
