@@ -134,42 +134,6 @@ impl Middleware for McpConfigHttpRequestCounter {
     }
 }
 
-struct FinalCacheControlHttpMiddleware {
-    requests: Arc<AtomicUsize>,
-    omit_next_tools_ttl: Arc<AtomicBool>,
-}
-
-impl Middleware for FinalCacheControlHttpMiddleware {
-    fn on_request(
-        &self,
-        _ctx: &McpContext,
-        _request: &JsonRpcRequest,
-    ) -> McpResult<MiddlewareDecision> {
-        self.requests.fetch_add(1, Ordering::SeqCst);
-        Ok(MiddlewareDecision::Continue)
-    }
-
-    fn on_response(
-        &self,
-        _ctx: &McpContext,
-        request: &JsonRpcRequest,
-        mut response: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
-        if request.method == "tools/list" && self.omit_next_tools_ttl.swap(false, Ordering::SeqCst)
-        {
-            let result = response.as_object_mut().ok_or_else(|| {
-                McpError::internal_error("tools/list middleware response must be an object")
-            })?;
-            if result.remove("ttlMs").is_none() {
-                return Err(McpError::internal_error(
-                    "tools/list middleware response must carry ttlMs",
-                ));
-            }
-        }
-        Ok(response)
-    }
-}
-
 // RH-5: the frozen positive and zero-contact negative call this same constructor,
 // changing only `disabled`.
 fn mcp_config_for_live_modern_endpoint(address: SocketAddr, disabled: bool) -> McpConfig {
@@ -6646,6 +6610,64 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
     server.shutdown();
 }
 
+fn assert_modern_stdio_cache_diagnostic_drain_preserves_entry() {
+    let script = "IFS= read -r discovery || exit 1; \
+        case \"$discovery\" in *'\"method\":\"server/discover\"'*2026-07-28*) ;; *) exit 1 ;; esac; \
+        printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"facade-cache-diagnostic\",\"version\":\"1.0.0\"}},\"ttlMs\":60000,\"cacheScope\":\"private\"}}'; \
+        IFS= read -r cacheable || exit 1; \
+        case \"$cacheable\" in *'\"method\":\"tools/list\"'*) ;; *) exit 1 ;; esac; \
+        case \"$cacheable\" in *'\"cursor\"'*) exit 1 ;; *) ;; esac; \
+        printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":60000,\"cacheScope\":\"private\"}}'; \
+        IFS= read -r incompatible || exit 1; \
+        case \"$incompatible\" in *'\"method\":\"tools/list\"'*'\"cursor\":\"diagnostic\"'*) ;; *) exit 1 ;; esac; \
+        printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"cacheScope\":\"private\"}}'; \
+        IFS= read -r unexpected && exit 1; \
+        exit 0";
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-modern-facade-cache-diagnostic", "1.0.0")
+            .connect_stdio_with_cx("sh", &["-c", script], &cx),
+    )
+    .expect("the public modern stdio facade completes final discovery");
+
+    client
+        .list_tools(None)
+        .expect("the valid peer page fills the public modern facade cache");
+    assert_eq!(client.final_result_cache_stats().hits, 0);
+    assert_eq!(client.final_result_cache_stats().misses, 1);
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+
+    client
+        .list_tools(Some("diagnostic"))
+        .expect("a peer page missing only ttlMs remains usable but immediately stale");
+    let before_drain = client.final_result_cache_stats();
+    assert_eq!(before_drain.hits, 0);
+    assert_eq!(before_drain.misses, 2);
+    assert_eq!(before_drain.fills, 1);
+    assert_eq!(
+        client.take_final_cache_ttl_diagnostics(),
+        vec![modern::FinalCacheTtlDiagnostic::Missing]
+    );
+    assert_eq!(
+        client.final_result_cache_stats(),
+        before_drain,
+        "draining a nonempty diagnostic queue preserves cache counters"
+    );
+
+    client
+        .list_tools(None)
+        .expect("diagnostic draining preserves the unrelated retained entry");
+    assert_eq!(client.final_result_cache_stats().hits, 1);
+    assert_eq!(client.final_result_cache_stats().misses, 2);
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+    assert!(client.take_final_cache_ttl_diagnostics().is_empty());
+    client
+        .close()
+        .expect("the public modern stdio diagnostic client closes cleanly");
+}
+
 fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
     fn result_identity(result: &fastmcp_rust::FinalListToolsResult) -> serde_json::Value {
         serde_json::to_value(result)
@@ -6654,12 +6676,10 @@ fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
 
     let cx = Cx::for_request();
     let requests = Arc::new(AtomicUsize::new(0));
-    let omit_next_tools_ttl = Arc::new(AtomicBool::new(false));
     let server = HttpServerFixture::spawn_with_policy_and_middleware(
         ProtocolPolicy::ModernOnly,
-        Some(Arc::new(FinalCacheControlHttpMiddleware {
+        Some(Arc::new(McpConfigHttpRequestCounter {
             requests: Arc::clone(&requests),
-            omit_next_tools_ttl: Arc::clone(&omit_next_tools_ttl),
         })),
     );
     let mut client = runtime_block_on_bounded(
@@ -6742,47 +6762,9 @@ fn evaluate_modern_facade_final_cache_controls(cache_enabled: bool) {
     assert_eq!(after_clear.misses, expected_misses + 1);
     assert_eq!(after_clear.fills, 2);
 
-    // Plant a one-dimensional incompatible peer response on a distinct cache
-    // key. The facade must drain the nonempty diagnostic without disturbing
-    // the already-cached cursorless page.
-    omit_next_tools_ttl.store(true, Ordering::SeqCst);
-    let diagnostic_page = runtime_block_on_bounded(
-        &cx,
-        client.list_tools_with_params(
-            &cx,
-            ListToolsParams {
-                include_tags: Some(vec!["cursor".to_owned()]),
-                ..ListToolsParams::default()
-            },
-        ),
-    )
-    .expect("a missing peer TTL remains a usable immediately-stale result");
-    assert!(!diagnostic_page.tools.is_empty());
-    assert!(!omit_next_tools_ttl.load(Ordering::SeqCst));
-    assert_eq!(requests.load(Ordering::SeqCst), expected_requests + 2);
-    let before_diagnostic_drain = client.final_result_cache_stats();
-    assert_eq!(before_diagnostic_drain.hits, expected_hits + 1);
-    assert_eq!(before_diagnostic_drain.misses, expected_misses + 2);
-    assert_eq!(before_diagnostic_drain.fills, 2);
-    assert_eq!(
-        client.take_final_cache_ttl_diagnostics(),
-        vec![modern::FinalCacheTtlDiagnostic::Missing]
-    );
-    assert_eq!(
-        client.final_result_cache_stats(),
-        before_diagnostic_drain,
-        "draining a nonempty diagnostic queue preserves cache counters"
-    );
-
-    let cached_after_drain = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
-        .expect("diagnostic draining preserves the unrelated retained entry");
-    assert_eq!(result_identity(&cached_after_drain), first_identity);
-    assert_eq!(requests.load(Ordering::SeqCst), expected_requests + 2);
-    assert_eq!(client.final_result_cache_stats().hits, expected_hits + 2);
-    assert!(client.take_final_cache_ttl_diagnostics().is_empty());
-
     drop(client);
     server.shutdown();
+    assert_modern_stdio_cache_diagnostic_drain_preserves_entry();
 }
 
 #[test]
