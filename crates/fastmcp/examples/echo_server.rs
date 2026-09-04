@@ -1163,6 +1163,10 @@ impl ApplicationTaskSupervisor for DurableTaskSupervisor {
 
 const TASK_SERVICE_STARTUP_BOUND: Duration = Duration::from_secs(2);
 const TASK_SERVICE_SETTLEMENT_BOUND: Duration = Duration::from_secs(4);
+// The shipped example is exercised through long live-proxy scenarios in the
+// fully parallel workspace suite. Keep retention finite without letting batch
+// scheduler contention expire a Task before the scenario first observes it.
+const TASK_RETENTION_MS: u64 = 10 * 60 * 1_000;
 
 async fn run_tasks_stdio(
     server: fastmcp_server::Server,
@@ -1244,7 +1248,7 @@ async fn run_stdio(server: fastmcp_server::Server, cx: &Cx) -> McpResult<()> {
 fn main() -> ExitCode {
     let task_runtime = FinalTaskRuntime::in_memory_with_capacity(
         1,
-        FinalTaskRuntimeConfig::new(60_000, Some(1_000))
+        FinalTaskRuntimeConfig::new(TASK_RETENTION_MS, Some(1_000))
             .expect("the example Task retention policy is finite"),
         std::sync::Arc::new(|_| {}),
     )

@@ -5606,6 +5606,11 @@ fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
     )
     .expect("a ModernOnly facade client connects to the shipped echo server");
 
+    // This scenario proves server-side session visibility, not final-result
+    // cache semantics. A cached one-hour resources/read result would correctly
+    // remain usable without a modern subscriptions/listen invalidation stream.
+    client.set_final_result_cache_enabled(false);
+
     let before = client
         .read_resource("info://server")
         .expect("the shipped echo resource must be readable before hide_catalog");
@@ -7917,7 +7922,9 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     let (completed_tx, completed_rx) = mpsc::channel();
     let modern_completed_tx = completed_tx.clone();
     let mut modern_worker = Some(thread::spawn(move || {
-        let result = (|| -> Result<serde_json::Value, String> {
+        // Move the client and request context into this inner ownership scope.
+        // The completion signal is meaningful only after both have settled.
+        let result = (move || -> Result<serde_json::Value, String> {
             let mut client = modern_client;
             let response = runtime_block_on_bounded(
                 &modern_cx,
@@ -7933,7 +7940,9 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     }));
     let legacy_completed_tx = completed_tx.clone();
     let mut legacy_worker = Some(thread::spawn(move || {
-        let result = (|| -> Result<serde_json::Value, String> {
+        // Match the modern worker's completion boundary so neither protocol
+        // reports success while connection-owned state is still being dropped.
+        let result = (move || -> Result<serde_json::Value, String> {
             let mut client = legacy_client;
             let response =
                 runtime_block_on_bounded(&legacy_cx, client.request(&legacy_cx, "ping", json!({})))

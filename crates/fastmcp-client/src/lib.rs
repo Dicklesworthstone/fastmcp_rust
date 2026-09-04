@@ -42,6 +42,9 @@
 //! orchestration, or local agent tooling), this is the crate that drives the
 //! client side of the protocol.
 
+// Raised for the trait solver: proving `Send` for nested async request futures
+// in the all-features WebSocket tests overflows rustc's default limit.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
