@@ -659,9 +659,6 @@ where
     }
 
     fn send_catalog_changed(&self, kind: McpCatalogKind) {
-        if self.era == ProtocolEra::Modern2026 {
-            return;
-        }
         let method = match kind {
             McpCatalogKind::Tools => "notifications/tools/list_changed",
             McpCatalogKind::Resources => "notifications/resources/list_changed",
@@ -677,9 +674,6 @@ where
     }
 
     fn send_resource_updated(&self, uri: &str) {
-        if self.era == ProtocolEra::Modern2026 {
-            return;
-        }
         let params = fastmcp_protocol::ResourceUpdatedNotificationParams {
             uri: uri.to_owned(),
         };
