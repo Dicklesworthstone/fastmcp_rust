@@ -8633,8 +8633,9 @@ mod tests {
     use fastmcp_protocol::protocol_policy::LEGACY_PROTOCOL_VERSION;
     use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolEra};
     use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, CoreResult, FinalCoreResult, JsonRpcRequest, RequestId,
-        ServerNotification, SubscriptionFilter,
+        ClientCapabilities, ClientInfo, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY,
+        FinalCoreResult, JsonRpcRequest, JsonRpcResponse, RequestId, ServerNotification,
+        SubscriptionFilter,
     };
 
     #[cfg(feature = "apps")]
