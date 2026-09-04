@@ -12944,6 +12944,9 @@ impl HttpClient {
         if let Some(object) = metadata.as_object_mut() {
             insert_final_request_log_level(object, self.final_log_level)
                 .map_err(HttpClientError::CoreResult)?;
+            #[cfg(feature = "tasks")]
+            insert_negotiated_tasks_client_extension(object, self.server_discovery().as_ref())
+                .map_err(HttpClientError::CoreResult)?;
             if let Some(caller) = parameters
                 .get("_meta")
                 .and_then(serde_json::Value::as_object)
