@@ -16430,9 +16430,7 @@ impl Server {
                             transport_authorization.clone().unwrap_or_default();
                         let task_auth_receipt = auth_receipt.clone();
                         let task_auth_custody_generation = auth_custody_generation;
-                        eprintln!("DBG65B pre-spawn_blocking");
                         let submitted = dispatch_cx.spawn_blocking(move |request_cx| {
-                            eprintln!("DBG65B in blocking child");
                             let mut reservation = reservation;
                             match task_principal_admission
                                 .wait_timeout(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
@@ -16510,7 +16508,6 @@ impl Server {
                                             )
                                         }
                                         ModernDispatchStart::Ready => {
-                                            eprintln!("DBG65B modern dispatch ready");
                                             let inbound = InboundRequestContext::with_modern_connection_context(
                                                 request_cx.clone(),
                                                 request_id_to_u64(request.id.as_ref()),

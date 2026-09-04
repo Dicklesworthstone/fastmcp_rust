@@ -30,8 +30,10 @@ use fastmcp_server::Server;
 use fastmcp_transport::{Transport, TransportError, TransportRecvHalf, TransportSendHalf};
 
 /// A regression must fail, not hang. Generous next to the milliseconds a
-/// scripted in-memory transport needs, far below any CI job timeout.
-const SCENARIO_DEADLINE: Duration = Duration::from_secs(20);
+/// scripted in-memory transport needs (a healthy run finishes in well under a
+/// second), and far below any CI job timeout, with enough slack that a loaded
+/// shared runner cannot turn scheduling latency into a false red.
+const SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
 
 const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 
@@ -284,7 +286,9 @@ fn run_stdio_shaped_scenario(
             let run = block_on(async move {
                 let cx = Cx::current().expect("the asupersync runtime installs a current Cx");
                 let dispatch_cx = cx.clone();
-                let server = Server::new("srv-65-stdio-shaped", "1.0.0").tool(Echo).build();
+                let server = Server::new("srv-65-stdio-shaped", "1.0.0")
+                    .tool(Echo)
+                    .build();
                 let mut pump = match cx.spawn_blocking(move |pump_cx| {
                     server.run_split_transport_returning_with_dispatch_cx(
                         &pump_cx,
@@ -295,7 +299,9 @@ fn run_stdio_shaped_scenario(
                 }) {
                     Ok(pump) => pump,
                     Err(error) => {
-                        panic!("the caller runtime must admit the pump as a blocking child: {error:?}")
+                        panic!(
+                            "the caller runtime must admit the pump as a blocking child: {error:?}"
+                        )
                     }
                 };
                 pump.join(&cx)
@@ -327,16 +333,36 @@ fn run_stdio_shaped_scenario(
     }
 }
 
-fn assert_ok_response(response: &JsonRpcResponse, expected_id: i64, label: &str) {
+/// Find the response correlated to `expected_id`.
+///
+/// JSON-RPC responses are correlated by id, not by arrival order, and the
+/// dual-era dispatcher answers concurrently — so the contract under test is
+/// "every request is answered", never "answers arrive in request order".
+fn response_for<'a>(
+    responses: &'a [JsonRpcResponse],
+    expected_id: i64,
+    label: &str,
+) -> &'a JsonRpcResponse {
+    let wanted = JsonRpcRequest::new("probe", None, expected_id).id;
+    responses
+        .iter()
+        .find(|response| response.id == wanted)
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: no response correlated to request id {expected_id}; got {:?}",
+                responses
+                    .iter()
+                    .map(|response| response.id.clone())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+fn assert_ok_response(response: &JsonRpcResponse, label: &str) {
     assert!(
         response.error.is_none(),
         "{label}: expected a result, got error {:?}",
         response.error
-    );
-    assert_eq!(
-        response.id,
-        JsonRpcRequest::new("probe", None, expected_id).id,
-        "{label}: response is not correlated to its request id"
     );
 }
 
@@ -376,14 +402,13 @@ fn srv_65_one_process_answers_a_modern_request_sequence() {
             .map(|response| response.id.clone())
             .collect::<Vec<_>>()
     );
-    for (index, expected_id) in [1_i64, 2, 3, 4].into_iter().enumerate() {
+    for expected_id in [1_i64, 2, 3, 4] {
         assert_ok_response(
-            &outcome.responses[index],
-            expected_id,
+            response_for(&outcome.responses, expected_id, "modern request sequence"),
             "modern request sequence",
         );
     }
-    let discover = outcome.responses[0]
+    let discover = response_for(&outcome.responses, 1, "modern request sequence")
         .result
         .as_ref()
         .expect("server/discover returns a result");
@@ -392,15 +417,16 @@ fn srv_65_one_process_answers_a_modern_request_sequence() {
         Some(&serde_json::json!([MODERN_PROTOCOL_VERSION])),
         "the first response must still be the modern discovery result"
     );
-    let tools = outcome.responses[1]
+    let tools = response_for(&outcome.responses, 2, "modern request sequence")
         .result
         .as_ref()
         .and_then(|result| result.get("tools"))
         .and_then(serde_json::Value::as_array)
         .expect("tools/list returns a tools array");
     assert!(
-        tools.iter().any(|tool| tool.get("name")
-            == Some(&serde_json::json!("echo"))),
+        tools
+            .iter()
+            .any(|tool| tool.get("name") == Some(&serde_json::json!("echo"))),
         "the second response must be this server's real tool catalog: {tools:?}"
     );
     assert!(
@@ -430,7 +456,14 @@ fn srv_65_second_request_after_discover_is_answered() {
         2,
         "the reported transcript produced only the server/discover response"
     );
-    assert_ok_response(&outcome.responses[1], 2, "tools/list after discover");
+    assert_ok_response(
+        response_for(&outcome.responses, 1, "discover then list"),
+        "server/discover",
+    );
+    assert_ok_response(
+        response_for(&outcome.responses, 2, "discover then list"),
+        "tools/list after discover",
+    );
 }
 
 /// Planted negative: the era gate must still refuse a second request that
@@ -451,9 +484,14 @@ fn srv_65_second_request_without_modern_metadata_is_refused() {
         2,
         "the refusal itself must be delivered, not silently dropped"
     );
-    assert_ok_response(&outcome.responses[0], 1, "server/discover");
+    assert_ok_response(
+        response_for(&outcome.responses, 1, "downgrade"),
+        "server/discover",
+    );
     assert!(
-        outcome.responses[1].error.is_some(),
+        response_for(&outcome.responses, 2, "downgrade")
+            .error
+            .is_some(),
         "a second request without the 2026-07-28 envelope must be refused, not served"
     );
 }
@@ -496,10 +534,13 @@ fn srv_65_stdio_shaped_pump_answers_a_modern_request_sequence() {
             .map(|response| response.id.clone())
             .collect::<Vec<_>>()
     );
-    for (index, expected_id) in [1_i64, 2, 3, 4].into_iter().enumerate() {
+    for expected_id in [1_i64, 2, 3, 4] {
         assert_ok_response(
-            &outcome.responses[index],
-            expected_id,
+            response_for(
+                &outcome.responses,
+                expected_id,
+                "stdio-shaped request sequence",
+            ),
             "stdio-shaped request sequence",
         );
     }
