@@ -26359,8 +26359,8 @@ mod tests {
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn public_http_final_core_stamps_only_discovery_admitted_tasks_extension() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind public final-core Tasks listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind public final-core Tasks listener");
         let address = listener
             .local_addr()
             .expect("read public final-core Tasks listener address");
@@ -26389,8 +26389,8 @@ mod tests {
             assert_eq!(tool_call_request["id"], 2);
             assert_eq!(tool_call_request["method"], "tools/call");
             assert_eq!(
-                tool_call_request["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"],
+                tool_call_request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                    ["extensions"],
                 serde_json::json!({"io.modelcontextprotocol/tasks": {}}),
                 "the typed core seam must stamp exactly the discovery-admitted Tasks extension"
             );

@@ -2094,7 +2094,8 @@ impl McpContext {
         self.final_request_surface
     }
 
-    /// Marks this request as owning any retained MRTR continuation it emits.
+    /// Marks this request as having transport-authorized MRTR continuation
+    /// ownership or stateless eligibility.
     ///
     /// Only transport admission may install this fact. Ordinary stateful or
     /// request-local contexts do not gain continuation authority merely by
@@ -2107,7 +2108,7 @@ impl McpContext {
     }
 
     /// Returns whether transport admission installed retained-continuation
-    /// ownership for this request.
+    /// ownership or stateless eligibility for this request.
     #[doc(hidden)]
     #[must_use]
     pub fn has_retained_continuation_owner(&self) -> bool {

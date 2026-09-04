@@ -3838,10 +3838,11 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// lifecycle handle whose repeated [`ServerHttpSession::handle`] calls share
 /// modern mutable component state; it does not own a private MRTR namespace.
 /// Turnkey live ingress opens a fresh embedding session per stateless POST.
-/// Eligible stateless MRTR continuations are owned by the router and bounded
-/// by listener shutdown. Exact MCP 2024-11-05 requests retain the
-/// transport-issued session identifier, lifecycle adapter, and SSE response
-/// stream for this one session when the legacy feature is enabled.
+/// Eligible stateless MRTR continuations are owned by the router; listener
+/// shutdown additionally closes them for turnkey live ingress. Exact MCP
+/// 2024-11-05 requests retain the transport-issued session identifier,
+/// lifecycle adapter, and SSE response stream for this one session when the
+/// legacy feature is enabled.
 pub struct ServerHttpEndpoint {
     server: Arc<Server>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -3913,8 +3914,9 @@ pub struct ServerHttpSession {
     ///
     /// Repeated calls to this public session share the value. Turnkey live
     /// ingress instead creates a fresh public session per stateless POST.
-    /// Eligible MRTR continuation state lives in the router's listener-bounded
-    /// registry rather than in a session-specific namespace here.
+    /// Eligible MRTR continuation state lives in the router-owned registry
+    /// rather than in a session-specific namespace here. Listener shutdown
+    /// closes that registry for turnkey live ingress.
     modern_connection: Arc<ModernConnection>,
     /// Owned modern listen dispatches whose SSE bodies were returned to the
     /// embedding caller. Handles are retained because dropping an asupersync
@@ -12579,8 +12581,10 @@ impl Server {
     /// authority, authenticates before extension middleware, and delegates only
     /// to the router's final dispatch surface. It neither reads nor mutates a
     /// legacy [`Session`]. A transport that supplies a connection-bound
-    /// [`InboundRequestContext`] also carries its durable MRTR partition and
-    /// retained-continuation cancellation authority.
+    /// [`InboundRequestContext`] also carries retained-continuation authority.
+    /// Durable connections contribute their exact MRTR partition; ephemeral
+    /// HTTP contributes an eligibility partition that the router replaces with
+    /// its stateless domain.
     ///
     /// Requests that require connection-local lifecycle state remain available
     /// exclusively through the legacy adapter. Modern list results still come
@@ -47414,28 +47418,28 @@ mod lib_unit_tests {
         .expect("MRTR roots response must serialize");
         let retry =
             |state: &str, name: &str, arguments: serde_json::Value, id: i64, bearer: &str| {
-            let request = JsonRpcRequest::new(
-                "tools/call",
-                Some(serde_json::json!({
-                    "name": name,
-                    "arguments": arguments,
-                    "inputResponses": {"roots": roots.clone()},
-                    "requestState": state,
-                    "_meta": {
-                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                    },
-                })),
-                id,
-            );
-            HttpRequest::new(HttpMethod::Post, "/mcp")
-                .with_header("content-type", "application/json")
-                .with_header("accept", "application/json")
-                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-                .with_header("mcp-method", "tools/call")
-                .with_header("mcp-name", name)
-                .with_header("authorization", format!("Bearer {bearer}"))
-                .with_body(serde_json::to_vec(&request).expect("MRTR retry must encode"))
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": name,
+                        "arguments": arguments,
+                        "inputResponses": {"roots": roots.clone()},
+                        "requestState": state,
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                    })),
+                    id,
+                );
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", name)
+                    .with_header("authorization", format!("Bearer {bearer}"))
+                    .with_body(serde_json::to_vec(&request).expect("MRTR retry must encode"))
             };
 
         let forged_state = format!("{request_state}-foreign");

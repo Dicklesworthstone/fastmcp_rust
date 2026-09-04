@@ -3968,8 +3968,9 @@ impl Router {
     /// This is the modern server-side routing seam. It deliberately has no
     /// `Session` argument: final catalog pages and cursors are independent of
     /// connection state. A supplied modern connection context still controls
-    /// individual request admission and binds MRTR retries to its durable
-    /// partition.
+    /// individual request admission. Durable contexts bind MRTR retries to
+    /// their exact partition; an ephemeral HTTP partition is only an
+    /// eligibility token that this router replaces with its stateless domain.
     /// Every successful response is re-emitted through the final
     /// complete-result contract. State-bearing lifecycle methods and exact
     /// 2024-11-05 wire results stay on the legacy adapter rather than
