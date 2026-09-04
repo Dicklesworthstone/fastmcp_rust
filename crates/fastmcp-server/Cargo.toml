@@ -93,5 +93,15 @@ name = "pxy_leg_01_translation"
 path = "tests/pxy_leg_01_translation.rs"
 required-features = ["proxy-legacy"]
 
+[[test]]
+name = "leg_02_a_contract"
+path = "tests/leg_02_a_contract.rs"
+required-features = ["legacy-2024-11-05"]
+
+[[test]]
+name = "leg_02_b_contract"
+path = "tests/leg_02_b_contract.rs"
+required-features = ["legacy-2024-11-05"]
+
 [lints]
 workspace = true
