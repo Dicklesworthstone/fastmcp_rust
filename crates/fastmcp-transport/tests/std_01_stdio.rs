@@ -322,3 +322,87 @@ fn std_01_b_planted_negative() {
     assert!(status.success());
     assert!(!forced);
 }
+
+#[test]
+fn std_01_i_positive() {
+    std_01_integration_positive();
+}
+
+#[test]
+fn std_01_integration_positive() {
+    let input = b"{\"jsonrpc\":\"2.0\",\"result\":{\"ready\":true},\"id\":\"std-req-1\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"},\"id\":\"std-req-2\"}\n";
+    let writer = SharedWriter::default();
+    let mut transport = StdioTransport::new(Cursor::new(input.to_vec()), writer.clone());
+    let cx = Cx::for_testing();
+    let mut waiters = HashMap::from([
+        (CorrelationKey::String("std-req-1".to_owned()), "waiter-1"),
+        (
+            CorrelationKey::String("std-req-99".to_owned()),
+            "waiter-unrelated",
+        ),
+    ]);
+    let mut requests = Vec::new();
+    let mut responses = Vec::new();
+    let mut uncorrelated = Vec::new();
+
+    for _ in 0..3 {
+        transport
+            .dispatch_next_multiplexed(
+                &cx,
+                &mut waiters,
+                &mut |req| requests.push(req.method),
+                &mut |waiter, resp| responses.push((waiter, resp.id)),
+                &mut |resp| uncorrelated.push(resp.id),
+            )
+            .expect("each complete newline frame routes exactly once");
+    }
+
+    assert_eq!(
+        requests,
+        vec![
+            "notifications/initialized".to_owned(),
+            "tools/call".to_owned()
+        ]
+    );
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, "waiter-1");
+    assert_eq!(uncorrelated.len(), 0);
+    assert_eq!(waiters.len(), 1);
+    assert!(waiters.contains_key(&CorrelationKey::String("std-req-99".to_owned())));
+    assert!(writer.recorded().is_empty());
+}
+
+#[test]
+fn std_01_i_planted_negative() {
+    std_01_integration_planted_negative();
+}
+
+#[test]
+fn std_01_integration_planted_negative() {
+    let forbidden = b"[{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"id\":\"std-req-2\"}]\n";
+    let writer = SharedWriter::default();
+    let mut transport = StdioTransport::new(Cursor::new(forbidden.to_vec()), writer.clone());
+    let cx = Cx::for_testing();
+    let mut waiters = HashMap::from([(CorrelationKey::String("std-req-2".to_owned()), "waiter-2")]);
+    let waiters_before = waiters.clone();
+    let mut request_count = 0;
+    let mut response_count = 0;
+    let mut uncorrelated_count = 0;
+
+    let error = transport
+        .dispatch_next_multiplexed(
+            &cx,
+            &mut waiters,
+            &mut |_| request_count += 1,
+            &mut |_, _| response_count += 1,
+            &mut |_| uncorrelated_count += 1,
+        )
+        .expect_err("a top-level batch array must reject at framing boundary");
+
+    assert!(matches!(error, TransportError::Codec(_)));
+    assert_eq!(request_count, 0);
+    assert_eq!(response_count, 0);
+    assert_eq!(uncorrelated_count, 0);
+    assert_eq!(waiters, waiters_before);
+    assert!(writer.recorded().is_empty());
+}

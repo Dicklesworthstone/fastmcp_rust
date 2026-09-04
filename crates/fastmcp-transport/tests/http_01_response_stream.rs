@@ -411,3 +411,153 @@ fn http_02_b_planted_negative() {
         HttpResponseRepresentation::Sse
     );
 }
+
+#[test]
+fn http_01_i_positive() {
+    let mut transport = StreamableHttpTransport::new();
+    let responses = transport
+        .response_stream()
+        .expect("the public HTTP response stream can be externalized once");
+    let request_id = RequestId::Number(991);
+    let response_body = responses
+        .for_request(request_id.clone())
+        .expect("one public response body is registered for the request");
+    let cancellation = response_body.cancellation();
+    let cx = Cx::for_testing();
+
+    transport
+        .send_response_for_request(
+            &cx,
+            &cancellation,
+            JsonRpcResponse::success(
+                request_id.clone(),
+                serde_json::json!({"status": "integrated"}),
+            ),
+        )
+        .expect("the request-bound final response is admitted");
+
+    assert_eq!(
+        response_body
+            .recv_response(&cx)
+            .expect("the public response body receives its own final response")
+            .id,
+        Some(request_id)
+    );
+    assert!(response_body.is_finished());
+    assert!(cancellation.is_cancelled());
+    assert_eq!(responses.pending_responses(), 0);
+}
+
+#[test]
+fn http_01_i_planted_negative() {
+    let mut transport = StreamableHttpTransport::new();
+    let responses = transport
+        .response_stream()
+        .expect("the public HTTP response stream can be externalized once");
+    let request_id = RequestId::Number(992);
+    let response_body = responses
+        .for_request(request_id.clone())
+        .expect("one public response body is registered for the request");
+    let cancellation = response_body.cancellation();
+    let cx = Cx::for_testing();
+    let pending_before = responses.pending_responses();
+
+    // Planted forbidden dimension: disconnected body before commit
+    drop(response_body);
+
+    assert!(matches!(
+        transport.send_response_for_request(
+            &cx,
+            &cancellation,
+            JsonRpcResponse::success(request_id, serde_json::json!({"status": "integrated"})),
+        ),
+        Err(TransportError::Cancelled)
+    ));
+    assert_eq!(responses.pending_responses(), pending_before);
+    assert!(!responses.is_closed());
+}
+
+#[test]
+fn http_02_i_positive() {
+    http_02_integration_positive();
+}
+
+#[test]
+fn http_02_integration_positive() {
+    let handler = modern_handler();
+    let admission = handler
+        .admit_modern_request(&modern_sse_request())
+        .expect("the public modern HTTP boundary admits a matching 2026 request");
+    assert_eq!(
+        admission.response_representation(),
+        HttpResponseRepresentation::Sse
+    );
+
+    let mut transport = StreamableHttpTransport::with_capacity(2)
+        .expect("bounded response slot is valid public configuration");
+    let responses = transport
+        .response_stream()
+        .expect("one public response stream can be externalized");
+
+    let response_body = admission
+        .bind_sse_response_body(&responses)
+        .expect("admitted request receives an SSE response body");
+    let cancellation = response_body.cancellation();
+    let cx = Cx::for_testing();
+
+    transport
+        .send_response_for_request(
+            &cx,
+            &cancellation,
+            JsonRpcResponse::success(
+                RequestId::Number(901),
+                serde_json::json!({"forecast": "sunny"}),
+            ),
+        )
+        .expect("the request-owned SSE body admits terminal response");
+
+    assert_eq!(
+        response_body
+            .recv_response(&cx)
+            .expect("the SSE body consumes its own terminal response")
+            .id,
+        Some(RequestId::Number(901))
+    );
+    assert!(response_body.is_finished());
+    assert!(cancellation.is_cancelled());
+    assert_eq!(responses.pending_responses(), 0);
+}
+
+#[test]
+fn http_02_i_planted_negative() {
+    http_02_integration_planted_negative();
+}
+
+#[test]
+fn http_02_integration_planted_negative() {
+    let handler = modern_handler();
+    let baseline = modern_sse_request();
+    let mut rejected = baseline.clone();
+    // Planted forbidden dimension: unsupported protocol version 2025-11-25
+    rejected
+        .headers
+        .insert("mcp-protocol-version".to_owned(), "2025-11-25".to_owned());
+
+    let mut transport = StreamableHttpTransport::new();
+    let responses = transport
+        .response_stream()
+        .expect("one public response stream can be externalized");
+    let before_pending = responses.pending_responses();
+
+    let error = handler
+        .admit_modern_request(&rejected)
+        .expect_err("unsupported 2025-11-25 version must reject at protocol admission boundary");
+    assert!(matches!(
+        error,
+        HttpError::ProtocolAdmission(RequestAdmissionError::HeaderMismatch(err))
+            if err.reason() == HeaderMismatchReason::HeaderBodyVersionMismatch
+    ));
+    assert_eq!(rejected.method, baseline.method);
+    assert_eq!(rejected.path, baseline.path);
+    assert_eq!(responses.pending_responses(), before_pending);
+}

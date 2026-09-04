@@ -373,3 +373,106 @@ fn srv_01_b_planted_negative() {
         "typed handler refusal changed the public catalog"
     );
 }
+
+#[test]
+fn srv_01_i_positive() {
+    let server = Server::new("stateless-integration-runtime", "1.0.0")
+        .tool(Greet)
+        .build();
+    let inbound =
+        InboundRequestContext::new(Cx::for_testing(), 75, InboundRequestTransport::Memory);
+    let request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "greet",
+            "arguments": {"name": "FastMCP"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        75_i64,
+    );
+
+    let response = server
+        .dispatch_stateless(&inbound, &request)
+        .expect("stateless integration dispatch with id must receive response");
+
+    assert!(response.error.is_none());
+    assert_eq!(
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/content/0/text"))
+            .and_then(serde_json::Value::as_str),
+        Some("Hello, FastMCP!")
+    );
+    assert_eq!(response.id, request.id);
+}
+
+#[test]
+fn srv_01_i_planted_negative() {
+    let server = Server::new("stateless-integration-refusal", "1.0.0")
+        .tool(Greet)
+        .build();
+    let inbound =
+        InboundRequestContext::new(Cx::for_testing(), 76, InboundRequestTransport::Memory);
+    let baseline = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "greet",
+            "arguments": {"name": "FastMCP"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        76_i64,
+    );
+    let mut planted = baseline.clone();
+    planted
+        .params
+        .as_mut()
+        .and_then(|params| params.pointer_mut("/_meta/io.modelcontextprotocol~1protocolVersion"))
+        .expect("modern metadata must contain protocolVersion")
+        .clone_from(&serde_json::json!("2025-11-25"));
+
+    assert_eq!(baseline.method, planted.method);
+    assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+    assert_eq!(baseline.id, planted.id);
+    let planted_input_before =
+        serde_json::to_vec(&planted).expect("planted request must serialize");
+    let catalog_before = stateless_public_catalog_snapshot(&server);
+
+    let baseline_response = server
+        .dispatch_stateless(&inbound, &baseline)
+        .expect("baseline request receives response");
+    assert!(baseline_response.error.is_none());
+
+    let (transport, probe) = RuntimeTransport::single_request(planted.clone());
+    let error = Server::new("stateless-integration-refusal-rt", "1.0.0")
+        .tool(Greet)
+        .build()
+        .run_transport_returning_with_cx(&Cx::for_testing(), transport)
+        .expect_err("unsupported 2025-11-25 must fail at runtime version admission boundary");
+    assert_eq!(error.code, McpErrorCode::InternalError);
+    let outgoing = probe.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    let JsonRpcMessage::Response(refusal) = &outgoing[0] else {
+        panic!("emits JSON-RPC response");
+    };
+    assert_eq!(
+        refusal.error.as_ref().map(|err| err.code.clone()),
+        Some(McpErrorCode::InvalidRequest.into())
+    );
+    assert_eq!(
+        serde_json::to_vec(&planted).expect("planted request remains serializable"),
+        planted_input_before,
+        "typed refusal changed caller input"
+    );
+    assert_eq!(
+        stateless_public_catalog_snapshot(&server),
+        catalog_before,
+        "typed refusal changed server catalog"
+    );
+}

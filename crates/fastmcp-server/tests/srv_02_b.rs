@@ -280,6 +280,102 @@ fn srv_02_b_planted_negative() {
     );
 }
 
+#[test]
+fn srv_02_i_positive() {
+    let server = Server::new("discoverable-integration", "1.0.0")
+        .instructions("Integration instructions")
+        .tool(Discoverable)
+        .build();
+    let inbound =
+        InboundRequestContext::new(Cx::for_testing(), 405, InboundRequestTransport::Memory);
+    let discover = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        405_i64,
+    );
+
+    let response = server
+        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &discover)
+        .expect("modern discovery request receives response");
+    assert!(response.error.is_none());
+    let result = response.result.expect("discovery result is present");
+    assert_eq!(
+        result["supportedVersions"],
+        json!([MODERN_PROTOCOL_VERSION])
+    );
+    assert_eq!(result["instructions"], json!("Integration instructions"));
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        json!("discoverable-integration")
+    );
+    assert!(result["capabilities"].get("tools").is_some());
+}
+
+#[test]
+fn srv_02_i_planted_negative() {
+    let server = Server::new("discoverable-integration-refusal", "1.0.0")
+        .tool(Discoverable)
+        .build();
+    let inbound =
+        InboundRequestContext::new(Cx::for_testing(), 406, InboundRequestTransport::Memory);
+    let baseline = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        406_i64,
+    );
+    let mut planted = baseline.clone();
+    planted
+        .params
+        .as_mut()
+        .and_then(|params| params.as_object_mut())
+        .and_then(|obj| obj.get_mut("_meta"))
+        .and_then(|meta| meta.as_object_mut())
+        .expect("modern metadata object")
+        .insert(
+            FINAL_PROTOCOL_VERSION_META_KEY.to_owned(),
+            json!("2025-11-25"),
+        );
+
+    assert_eq!(baseline.method, planted.method);
+    assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+    assert_eq!(baseline.id, planted.id);
+    let input_before = serde_json::to_vec(&planted).expect("planted request must serialize");
+    let catalog_before = public_catalog_snapshot(&server);
+
+    let baseline_response = server
+        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &baseline)
+        .expect("baseline discovery request responds");
+    assert!(baseline_response.error.is_none());
+
+    let planted_response = server
+        .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &planted)
+        .expect("planted request receives response");
+    let planted_error = planted_response
+        .error
+        .expect("unsupported version 2025-11-25 must be refused at version boundary");
+    assert_eq!(planted_error.code.as_i32(), Some(-32600));
+    assert_eq!(
+        serde_json::to_vec(&planted).expect("planted request remains serializable"),
+        input_before,
+        "typed refusal changed caller input"
+    );
+    assert_eq!(
+        public_catalog_snapshot(&server),
+        catalog_before,
+        "typed refusal changed server state"
+    );
+}
+
 // This integration target compiles `fastmcp-server` as an ordinary dependency.
 // Therefore `cargo test -p fastmcp-server --no-default-features --test srv_02_b`
 // exercises the shipped `modern_http_only` composition rather than the
