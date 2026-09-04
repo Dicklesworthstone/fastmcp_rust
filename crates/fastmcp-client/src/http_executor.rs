@@ -14883,8 +14883,8 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
 
     #[test]
     fn public_modern_http_request_drops_untrusted_client_extensions() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind immutable-capability HTTP listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind immutable-capability HTTP listener");
         let address = listener
             .local_addr()
             .expect("read immutable-capability HTTP address");
@@ -14894,7 +14894,12 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 .accept()
                 .expect("accept immutable-capability discovery");
             let _ = read_request(&mut discovery);
-            write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
 
             let (mut request_stream, _) = listener
                 .accept()
@@ -14904,8 +14909,7 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 .expect("immutable-capability request is JSON-RPC");
             assert_eq!(request["method"], "tools/list");
             assert!(
-                request["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]
+                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
                     .get("extensions")
                     .is_none(),
                 "caller-supplied arbitrary or Tasks extensions must not bypass immutable client configuration"
