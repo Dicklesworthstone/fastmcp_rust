@@ -10776,6 +10776,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn public_http_auto_commits_missing_result_type_discovery_before_final_traffic() {
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("bind missing-resultType modern listener");
