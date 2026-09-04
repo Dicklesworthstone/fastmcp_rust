@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 #[cfg(feature = "tasks")]
+use asupersync::channel::oneshot;
+#[cfg(feature = "tasks")]
 use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(feature = "tasks")]
 use fastmcp_client::FinalToolCallOutcome;
@@ -3536,6 +3538,55 @@ struct ProxyIncrementalStdioCatalogListener {
     /// already-cancelled request-task state (FND-04 / bd-63l5).
     cx: Cx,
     _child_region: ChildRegion,
+}
+
+/// Opens a listener-owned region without abandoning an admitted region when
+/// the request that asked for the listener stops awaiting admission.
+///
+/// [`asupersync::cx::ChildRegionOpening`] does not own a published
+/// [`ChildRegion`] until its result is polled. A request future dropped after
+/// enqueueing the create command could therefore leave a late scheduler
+/// admission with no handle to close it. This short structured task always
+/// consumes that result. The oneshot receiver either takes ownership or, when
+/// its request has gone away, makes `send_blocking` return the result so the
+/// task drops the child handle and triggers its close backstop.
+#[cfg(feature = "tasks")]
+async fn open_owned_proxy_listener_region(
+    cx: &Cx,
+    listener_kind: &'static str,
+) -> McpResult<ChildRegion> {
+    let (sender, mut receiver) = oneshot::channel();
+    let _opening_task = cx
+        .spawn(move |task_cx| async move {
+            let result = task_cx
+                .open_child_region(ChildRegionSpec::inherit())
+                .await;
+            if let Err(error) = sender.send_blocking(result) {
+                match error {
+                    oneshot::SendError::Disconnected(abandoned)
+                    | oneshot::SendError::Cancelled(abandoned) => drop(abandoned),
+                }
+            }
+        })
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "Proxy {listener_kind} stdio listener could not start its owned child-region admission guard: {error}"
+            ))
+        })?;
+
+    match receiver.recv(cx).await {
+        Ok(Ok(child_region)) => Ok(child_region),
+        Ok(Err(error)) => Err(McpError::internal_error(format!(
+            "Proxy {listener_kind} stdio listener could not create its owned child region: {error}"
+        ))),
+        Err(oneshot::RecvError::Cancelled) => Err(McpError::request_cancelled()),
+        Err(oneshot::RecvError::Closed) => Err(McpError::internal_error(format!(
+            "Proxy {listener_kind} stdio listener child-region admission guard ended without a result"
+        ))),
+        Err(oneshot::RecvError::PolledAfterCompletion) => Err(McpError::internal_error(format!(
+            "Proxy {listener_kind} stdio listener child-region admission result was consumed twice"
+        ))),
+    }
 }
 
 #[cfg(feature = "tasks")]
@@ -8763,15 +8814,8 @@ impl ProxyClient {
             return request.open(ctx).await;
         }
         if self.with_backend(|backend| backend.supports_incremental_final_task_listener())? {
-            let child_region = ctx
-                .cx()
-                .open_child_region(ChildRegionSpec::inherit())
-                .await
-                .map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Proxy final Tasks stdio listener could not create its owned child region: {error}"
-                    ))
-                })?;
+            let child_region =
+                open_owned_proxy_listener_region(ctx.cx(), "final Tasks").await?;
             let cx = child_region.cx().clone();
             if !self.with_backend(|backend| {
                 backend.start_incremental_final_task_listener(notifications.clone())
@@ -8801,15 +8845,7 @@ impl ProxyClient {
             return request.open(ctx).await;
         }
         if self.with_backend(|backend| backend.supports_incremental_catalog_listener())? {
-            let child_region = ctx
-                .cx()
-                .open_child_region(ChildRegionSpec::inherit())
-                .await
-                .map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Proxy catalog stdio listener could not create its owned child region: {error}"
-                    ))
-                })?;
+            let child_region = open_owned_proxy_listener_region(ctx.cx(), "catalog").await?;
             let cx = child_region.cx().clone();
             if !self.with_backend(|backend| {
                 backend.start_incremental_catalog_listener(notifications.clone())
@@ -10132,6 +10168,25 @@ mod tests {
     use std::task::Poll;
 
     #[cfg(feature = "tasks")]
+    fn catalog_listener_filter() -> SubscriptionFilter {
+        SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn final_task_listener_filter() -> SubscriptionFilter {
+        let mut notifications = SubscriptionFilter::default();
+        set_task_subscription_ids(
+            &mut notifications,
+            vec![final_task_relay_result().task.base().task_id.clone()],
+        )
+        .expect("the final Tasks listener test filter is valid");
+        notifications
+    }
+
+    #[cfg(feature = "tasks")]
     #[test]
     fn stdio_inbound_capability_overlay_preserves_official_tasks_extension() {
         let parameters = stdio_parameters_with_inbound_identity(
@@ -10212,24 +10267,24 @@ mod tests {
         let context = McpContext::new(Cx::for_testing(), 880);
 
         let catalog_error = match block_on(
-            proxy.open_catalog_listener_async(&context, SubscriptionFilter::default()),
+            proxy.open_catalog_listener_async(&context, catalog_listener_filter()),
         ) {
             Ok(_) => panic!("a detached context must not open a catalog listener"),
             Err(error) => error,
         };
         assert_eq!(catalog_error.code, McpErrorCode::InternalError);
-        assert!(catalog_error.message.contains("owned child region"));
-        assert!(catalog_error.message.contains("no runtime gateway"));
+        assert!(catalog_error.message.contains("owned child-region"));
+        assert!(catalog_error.message.contains("ASUP-E001"));
 
         let final_task_error = match block_on(
-            proxy.open_final_task_listener_async(&context, SubscriptionFilter::default()),
+            proxy.open_final_task_listener_async(&context, final_task_listener_filter()),
         ) {
             Ok(_) => panic!("a detached context must not open a final Tasks listener"),
             Err(error) => error,
         };
         assert_eq!(final_task_error.code, McpErrorCode::InternalError);
-        assert!(final_task_error.message.contains("owned child region"));
-        assert!(final_task_error.message.contains("no runtime gateway"));
+        assert!(final_task_error.message.contains("owned child-region"));
+        assert!(final_task_error.message.contains("ASUP-E001"));
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(state.incremental_catalog_listener_starts, 0);
@@ -10257,12 +10312,12 @@ mod tests {
             ..TestBackend::default()
         });
 
-        let ((), _report) = asupersync::lab::run_async_under_lab(0x63_16, move |cx| {
+        let ((), report) = asupersync::lab::run_async_under_lab(0x63_16, move |cx| {
             let proxy = proxy.clone();
             async move {
                 let context = McpContext::new(cx, 882);
                 let mut catalog_opening = Box::pin(
-                    proxy.open_catalog_listener_async(&context, SubscriptionFilter::default()),
+                    proxy.open_catalog_listener_async(&context, catalog_listener_filter()),
                 );
                 std::future::poll_fn(|task_cx| {
                     assert!(
@@ -10275,7 +10330,7 @@ mod tests {
                 drop(catalog_opening);
 
                 let mut final_task_opening = Box::pin(
-                    proxy.open_final_task_listener_async(&context, SubscriptionFilter::default()),
+                    proxy.open_final_task_listener_async(&context, final_task_listener_filter()),
                 );
                 std::future::poll_fn(|task_cx| {
                     assert!(
@@ -10286,8 +10341,21 @@ mod tests {
                 })
                 .await;
                 drop(final_task_opening);
+
+                // Let both structured admission guards consume their pending
+                // scheduler results while the parent region is still live.
+                // Their disconnected oneshots must drop any admitted child
+                // handles instead of relying on root shutdown for cleanup.
+                for _ in 0..4 {
+                    asupersync::runtime::yield_now().await;
+                }
             }
         });
+
+        assert!(
+            report.lab_test_passed(),
+            "abandoned listener admissions must remain quiescent: {report:?}"
+        );
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(state.incremental_catalog_listener_starts, 0);
@@ -10312,11 +10380,11 @@ mod tests {
             async move {
                 let context = McpContext::new(cx.clone(), 881);
                 let catalog_listener = proxy
-                    .open_catalog_listener_async(&context, SubscriptionFilter::default())
+                    .open_catalog_listener_async(&context, catalog_listener_filter())
                     .await
                     .expect("a runtime-owned context opens a catalog listener");
                 let final_task_listener = proxy
-                    .open_final_task_listener_async(&context, SubscriptionFilter::default())
+                    .open_final_task_listener_async(&context, final_task_listener_filter())
                     .await
                     .expect("a runtime-owned context opens a final Tasks listener");
 
