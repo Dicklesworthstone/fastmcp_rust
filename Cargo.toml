@@ -58,7 +58,7 @@ base64 = { version = "=0.23.1" }
 # FND-01 ROOT-SEMVER (facade evidence / future gates; CLI must not depend on this)
 semver = { version = "=1.0.28" }
 # FND-01 ROOT-FLATE2 (facade evidence / supply archive paths)
-flate2 = { version = "=1.1.9" }
+flate2 = { version = "=1.1.10" }
 
 # Date/time
 chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock"] }
