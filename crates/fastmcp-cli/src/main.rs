@@ -14809,8 +14809,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
 
             const HEX: &[u8; 16] = b"0123456789abcdef";
-            let temp_root = std::fs::canonicalize(std::env::temp_dir())
-                .expect("resolve the test temporary directory without symlink components");
+            // These tests exercise the secure-ancestry policy itself. Build farms may
+            // rewrite TMPDIR beneath a non-sticky shared mirror, which production code
+            // correctly refuses before the behavior under test can run. Linux /tmp is
+            // the stable root-owned, sticky fixture boundary these positive cases need.
+            let temp_root = std::fs::canonicalize("/tmp")
+                .expect("resolve the sticky test temporary directory without symlinks");
             for _ in 0..16 {
                 let identifier = fastmcp_core::draw_security_identifier()
                     .expect("operating-system randomness for atomic test fixture");
