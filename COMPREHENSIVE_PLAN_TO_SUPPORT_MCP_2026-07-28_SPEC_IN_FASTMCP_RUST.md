@@ -1,6 +1,8 @@
 # Comprehensive Plan to Support MCP 2026-07-28 in FastMCP Rust
 
 - Status: active implementation campaign; aggregate support remains unverified
+- Latest source/tracker reality check: 2026-09-04, sections 7.23 and 7.24.
+  Earlier dated implementation inventories are historical observations.
 - Required protocol eras: MCP `2026-07-28` final and MCP `2024-11-05`
 - Required default product policy: automatic, downgrade-resistant negotiation
   between those two exact eras; explicit modern-only and legacy-only policies
@@ -3696,7 +3698,60 @@ They must never be reachable from a modern transport policy.
 
 ### 7.23 Reality-check vision checklist
 
-This checklist applies the reality-check status vocabulary to the
+#### Current assessment: 2026-09-04
+
+The project contains substantial usable framework code and a published `0.8.1`
+CLI. It is not a qualified implementation of the complete dual-era product
+specified by section 0. The older checklist below is a historical observation;
+its claims that modern discovery, the concurrent client, and all modern HTTP
+are absent are no longer a description of the current source. Neither source
+presence, a feature flag, a closed Bead, nor a historical test receipt proves
+current aggregate behavior.
+
+This assessment inspected the complete root README and AGENTS, the porting,
+existing-structure, proposed-architecture and console plans, canonical campaign
+requirements, all 145 formal package headings and tracker parents, all 288
+unfinished A/B implementation titles, and selected implementation and test
+paths. Detailed source inspection was concentrated on runtime ownership,
+schema validation, client/transport wiring, auth, Tasks, Apps, CLI, and proof
+machinery. It is not a line-by-line review of every source file or every
+historical paragraph of this approximately 40,000-line campaign document.
+
+The starting tracker snapshot contained 1,060 non-tombstone issues: 316 closed,
+724 open, 18 review, one in progress, and one blocked. All 145 formal package
+parents were present. BV counted another 23 tombstones and reported no graph
+cycles. `br ready` returned only `bd-deft5`, the RCH capability-prober defect;
+BV's broader actionable count was 19. These different scheduling views must
+not be reported as 19 claimable implementation tasks or as a completion
+percentage. The forecast's low-confidence effort estimate is not a delivery
+date.
+
+| # | Testable vision goal and source | Current status | Concrete evidence and remaining gap | Existing owner |
+|---|---|---|---|---|
+| 1 | Install and invoke the published CLI (README installation/CLI) | `WORKING` for this narrow smoke | Official macOS arm64 `0.8.1` archive checksum passed; version, help, inspect help and install dry-run executed. No full server interoperability claim follows. | CLI-CORE-01, CLI-01, REL-01/02 |
+| 2 | Coherent facade, macros, tools/resources/prompts/completion (README; sections 12–18) | `PARTIAL` | Nine crates and real handler/derive implementations exist. Public packaged and renamed-facade consumers still need current, complete mapped evidence. | API-CORE-01, API-01, MAC-01, TOOL/RES/PRM/CMP, DX-TEST-01 |
+| 3 | Exact modern stateless discovery and per-request negotiation (section 0; PRT/SRV) | `PARTIAL` | Modern protocol types, discovery, policy and raw HTTP tests now exist. Old July absence claims are obsolete; complete current wire matrices remain unqualified. | FND-03, PRT-01..05, SRV-01..04 |
+| 4 | Exact legacy `2024-11-05` with Auto selection and era isolation (section 0) | `PARTIAL` | Legacy adapters and dual-era tests exist; Auto is exposed in the published inspect CLI. All selection, negative and compatibility consumers still need revision-bound proof. | LEG packages, CLT-02, PXY-LEG packages |
+| 5 | Consumer-owned structured concurrency, cleanup and cancellation (AGENTS; FND-04) | `WRONG_APPROACH` on remaining ambient adapters | `fastmcp-core/src/runtime.rs` still publicly exposes lazy thread-local runtime/block_on. Pinned asupersync `0.4.10` already exposes `open_child_region`; proxy code uses it. The blocker is completing and proving migration, not waiting for that API to exist. | FND-04/05, LIMIT-01, STD-01, HTTP-01/03 |
+| 6 | Concurrent client correlation, deadlines, MRTR and subscriptions (CLT/MRTR/SUB) | `PARTIAL` | `client/execution.rs` is real bounded correlation/timeout machinery; MRTR/subscription code exists. Cancellation, cross-request isolation, overload and public transport compositions need complete qualification. | CLT-01/02, MRTR-01..03, SUB-01..03 |
+| 7 | Production stdio and Streamable HTTP on every supported platform (STD/HTTP/XPORT) | `PARTIAL` | Native HTTP/client/server and live socket tests exist. Platform reactor, child-process, half-close, routing-header, notification and cancellation obligations remain. | STD-01, HTTP-01..06, XPORT-01, TST-02/03 |
+| 8 | Full applicable Draft 2020-12 with bounded work (SCH-01) | `WRONG_APPROACH` relative to the frozen design; behavioral coverage unqualified | A substantial custom validator supports refs, dynamic refs, conditionals and unevaluated keywords, but rejects unknown keywords and uses Rust regex. SCH-01 requires the full applicable suite, explicit regex/work policy and pinned instrumented engine. A toy-subset or refusal-only closure cannot satisfy it. | SCH-01..03 |
+| 9 | Secure auth discovery, registration, issuer/resource binding and custody (AUTH-00..07) | `PARTIAL` | Static/custom, OAuth and fail-closed OIDC paths exist. AUTH-05 children are mislabeled as static-token work although the parent requires protected credential persistence; AUTH-07 children describe authorization policy although the parent requires an interactive authorization driver. | AUTH-00..07, FND-06/09 |
+| 10 | Enterprise OIDC/SAML and OAuth client credentials extensions (section 0.2) | `NOT_STARTED` for inspected runtime implementations | Protocol feature names exist, but no corresponding operational enterprise-auth/client-credentials implementation was found in the inspected runtime paths. These are mandatory final-product implementations even when activation is optional. | AUTHX-01..05 |
+| 11 | Principal-safe cache hints, lookup, invalidation and middleware (CACHE/SRV-MW) | `PARTIAL` | Cache code and paired live HTTP tests exist. Partition identity, auth changes, expiry, error precedence and composition require joint proof. | CACHE-01..03, SRV-MW-01, AUTH packages |
+| 12 | Tasks including persistence and distributed profile (TASK/TASKP/TASKR) | `PARTIAL` | Real final Tasks machinery and default `InMemoryFinalTaskStore` exist. Its contract explicitly lacks crash persistence; retained Docket source is excluded, Redis absent. Durable/distributed capability is still required by its own profiles. | TASK-01..03, TASKP-01, TASKR-01 |
+| 13 | Apps resources and host lifecycle (APP packages) | `PARTIAL` | Typed UI resources, CSP metadata and `McpAppsHost<T,P>` with activation/lifecycle state exist. Browser embedding, policy enforcement and composed end-to-end behavior remain unqualified. | APP-01..04, COMP-ALL-01 |
+| 14 | Proxy catalog, credentials, Tasks and dual-era isolation (PXY packages) | `PARTIAL` | Substantial proxy code and owned child regions exist. Upstream failure, custody, shutdown and mixed-profile qualification remain. | PXY and PXY-LEG packages |
+| 15 | Complete CLI including specified Tasks command surface (CLI-02) | `PARTIAL` | Published dispatch has run/inspect/install/list/test/dev; `fastmcp tasks --help` exits 2 as an unknown command. The planned Tasks CLI is not delivered by `0.8.1`. | CLI-02, TASK packages |
+| 16 | Safe rich stderr, predictable diagnostics and docs (README; console plan) | `PARTIAL` | Real console sanitization/redaction and stderr output exist. Console README license text and old feature/status tables need reconciliation with the current root claims and packaged files. | DOC-01/02, CLI-CORE-01 |
+| 17 | Security, platform, interoperability and aggregate conformance (section 28) | `UNPROVEN` | Extensive tests exist. This audit has no current complete compiling/executed matrix; one foundation harness controller path still explicitly returns platform failure. No aggregate PASS is inferred. | TST, CONF, INTEROP, CI packages |
+| 18 | Measured performance, capacity and eight-hour soak (OPS/PERF) | `UNPROVEN` | Existing microbenchmarks are not evidence of full modern transport/auth/profile latency, resource bounds or soak targets. | OPS-01, PERF-01 |
+| 19 | Safe publication and truthful final-product support claim (section 0.7; REL/DOC) | `PARTIAL` | GitHub and crates.io published `0.8.1` on 2026-08-30. Availability is verified; stable aggregate MCP support is not. Provider-side quarantine still has externally blocked work. | REL-QUAR-00, REL-PREP-01, REL-01/02, DOC-02 |
+| 20 | Executable tracker coverage of the complete vision (section 36) | `PARTIAL` | No missing top-level package parent was found. Semantic child mismatches and 578 unfinished issues containing broad workspace test selectors prevent parent presence from proving executable coverage. | FND-02 and the affected existing A/B/I/V records |
+
+#### Historical assessment: 2026-07-31/2026-08-01
+
+This historical checklist applies the reality-check status vocabulary to the
 observable 2026-07-31/2026-08-01 repository, not to intended work or
 Bead labels. `WORKING` means usable evidence exists for that narrow
 item; it never implies aggregate MCP 2026-07-28 support.
@@ -3722,6 +3777,213 @@ item; it never implies aggregate MCP 2026-07-28 support.
 | Published stable MCP 2026-07-28 product | `NOT_STARTED` | crates.io remains the old `0.3.2` family and neither the local tree nor provider evidence satisfies the modern stable profile | complete the self-inclusive 142-package `AllMcpReleaseProfileInventory` and separately authorize/read back the exact `(StableAggregateEvidenceBundle, StableEvidenceCaptureReceipt)` success pair |
 
 ### 7.24 Gap classification and bridge plan
+
+#### Current bridge: 2026-09-04
+
+Implementing every unfinished issue's **complete parent requirements** could
+close the documented vision gap. Completing only the current child headlines
+and generic positive/negative tests would not. No new product epic is justified
+merely by the audit: all 145 formal parents already exist. Correct the existing
+decomposition and preserve unmet acceptance on its original implementation
+Bead (RH-8/RH-9). This plan revision earns no capability credit.
+
+1. Restore a trustworthy execution baseline. Finish the RCH capability-prober
+   repair, retain failed attempts, compile the source snapshot before counting
+   tests, and use the central serialized verification lane. The audit's initial
+   check stopped in source transfer because an existing untracked `rich_rust`
+   symlink was not a regular-file receipt subject; no compiler ran. Do not
+   delete that file or treat this infrastructure failure as a Rust diagnostic.
+2. Correct scheduling facts. asupersync is pinned to `0.4.10`, whose
+   `Cx::open_child_region` and explicit async close exist and are consumed by
+   proxy code. Keep FND-04 open for the remaining migrations and platform/
+   quiescence tests. Section 0.7's release-only quarantine must not be a blocker
+   of unrelated FND-02 implementation; publication still retains its gate.
+3. Repair semantic implementation slices before dispatch. AUTH-05 A owns
+   credential partition/provider contracts and usable protected storage; B owns
+   rollback/crash/path/permission/lifecycle hardening of that same store.
+   AUTH-07 A owns the actual browser/loopback/PKCE flow; B owns issuer/state/
+   callback/timeout/cancellation/commit enforcement. Both A and B contain their
+   own real positive and near-identical forbidden-dimension tests. I adds public
+   composition coverage; V independently maps the result without self-closing.
+4. Finish a public vertical path through existing SRV/CLT/HTTP/STD, macro,
+   auth and schema packages. A facade-only consumer must discover, negotiate,
+   call a tool, read a resource, render a prompt and complete an argument using
+   a caller-owned runtime; repeat the exact legacy adapter path. Assert returned
+   values, observable effects, routing and cleanup, then introduce a single
+   invalid version/capability/auth/routing dimension and prove unchanged state.
+5. Complete all mandatory extension implementations and cross-profile behavior:
+   Tasks, Apps, enterprise OIDC/SAML, OAuth client credentials, persistence,
+   distributed Tasks and proxy profiles retain their explicit activation and
+   qualification boundaries. Feature names and refused requests do not prove
+   a positive implementation. CLI Tasks and the public extension authoring
+   surface remain product work, not documentation follow-ups.
+6. Resolve schema parity through the SCH-01 full applicable suite, trusted
+   resource registry, bounded regex/ref/branch work and public validator
+   consumers. Preserve valid behavior already supported by the current engine;
+   measure architectural replacement against semantic parity and resource
+   ceilings. Do not make rejection of valid official input a passing negative.
+7. Qualify complete shipped surfaces with platform/security/interoperability
+   tests, saturation and cancellation workloads, performance baselines and the
+   specified soak. Bind exact targets/features/source/test inventories to each
+   mapped Bead; retain failures and first-attempt results. Finish documentation
+   reconciliation and authorized release evidence only after these capabilities
+   have their own proof. The published CLI smoke is a separate narrow result.
+
+The FND-02 plan/tracker checker is the existing executable gate for coverage
+repair. Its consumer is preclaim/preclose/snapshot admission; its observed
+defects are parent/child semantic drift and unresolvable test selection. It must
+reject an AUTH-05 child that only implements static tokens, an AUTH-07 child
+that only implements permission policy, and any required test inventory that
+discovers or executes zero tests. Fixing these defects inside that existing
+gate avoids another human-only status ledger. The added mutation cases remain
+until the corresponding bad transition cannot pass admission.
+
+##### Ambition round 1: prove complete user journeys
+
+Qualification must join existing packages at their public boundaries. The
+following additions are acceptance refinements of existing work, not new
+ceremonial epics or permission to defer A/B tests to an integration child.
+
+| Journey | Existing implementation and integration owners | Positive observable | Closely matched forbidden case |
+|---|---|---|---|
+| Author a facade-only server, connect and use each core operation | API/MAC, SRV/CLT, STD/HTTP, TST-03 | expected typed result and one handler effect over real stdio and HTTP | change only era/version/capability; zero protected effects and no leaked child |
+| Log in, persist, restart and reuse credentials | AUTH-05 A/B/I, AUTH-07 A/B/I | browser/callback/exchange completes, durable commit precedes success, restarted client succeeds | change issuer or restore generation; no exchange/effect or unauthorized store mutation |
+| Paginate an authorized multi-provider catalog | SRV-03 A/B/I | every item exactly once in registered order with consistent private scope | change principal or catalog revision; cursor refuses and no cursor/quota leak |
+| Invoke an annotated tool through HTTP | HTTP-05 A/B/I, TOOL-01/02, AUTH-02 | body preserved; required projected headers match; handler runs once | change one recognized header; pre-dispatch `-32020`; null omission retains the specified tool-error semantics |
+| Receive progress and opted-in logs | HTTP-04 A/B/I, SRV-04 | events stay on their originating response; final result is last | remove log opt-in or swap progress token; no cross-request/log/subscription leakage |
+| Resume MRTR after losing a response | MRTR-02 A/B/I | one side effect and exact retained result/successor on retry | change principal, handler revision or one-use nonce; no reinvocation |
+| Reuse cacheable data without identity leakage | CACHE-01..03, AUTH-00, SRV-MW-01 | valid method-specific hints and live sealed public proof where permitted | revoke one result-affecting policy revision; private fallback or refusal before exposure |
+| Run Tasks/Apps/enterprise auth/client credentials through a proxy | extension and PXY packages, COMP-ALL-01 | actual task completion/UI policy/authenticated call with correct cleanup and downstream identity | change one activation/custody/issuer binding; no unauthorized effect or feature downgrade |
+
+HTTP-04, HTTP-05, SRV-03, MRTR-02, CACHE-01 and TST-04 child roles must
+describe these actual parent capabilities. Listener binding, generic middleware,
+cache memoization or a differential harness alone cannot close those parents.
+
+##### Ambition round 2: close composition and recovery gaps
+
+For COMP-ALL-01 and TST-04, use one executable pairwise interaction
+inventory plus mandatory higher-order cases where authority crosses three
+boundaries: auth → cache → proxy, auth → MRTR → Tasks, browser callback →
+credential commit → restart, and schema → parameter headers → authorization.
+Pairwise selection reduces redundant cases; it never substitutes for a named
+normative scenario, security regression or profile-specific acceptance item.
+Exercise both activation and absence of each optional feature through the
+shipped facade and transport. The oracle observes effects, state and cleanup,
+not just exit status or whether a feature name appears in a manifest.
+
+Each owner must inventory resources acquired before its first await: child
+regions, listeners, connections, permits, queue bytes, cursor/continuation
+records, durable intents and retained response bytes. Inject cancellation at
+each acquisition/commit boundary and assert eventual quiescence within the
+declared bound. For irreversible effects, assert the specified retained receipt
+or idempotency contract; do not demand impossible rollback of an already
+committed authorized effect. Rejection before commit leaves protected state
+unchanged, while authorized cleanup is measured separately.
+
+AUTH-05 recovery tests bind the actual credential-file/anchor/envelope provider
+configuration. A correct in-memory adapter cannot prove disk durability or a
+lying external provider's honesty. MRTR-02 reserves worst-case receipt bytes
+before side effects and proves one-use transition/response retention under
+concurrent replay. SRV-03 proves exact cursor quota release under expiry,
+rotation, abandonment, restart and collision exhaustion. These remain tests of
+usable positive implementations on their owning A/B Beads.
+
+Performance qualification measures the complete matrix of serialization,
+validation, handler work, transport, auth and active profiles. PERF-01 reports
+throughput together with tail latency, memory/descriptor/queue growth, rejection
+rates and recovery time at saturation. Preserve cold/warm separation, sample
+counts, seeds, platform and confidence intervals; compare the same workload and
+hardware before claiming an improvement. Microbenchmark wins cannot replace
+the eight-hour soak or supported-platform proof.
+
+##### Ambition round 3: use tractable correctness models
+
+Use a small reference state machine for each high-risk lifecycle rather than
+an elaborate proof framework detached from running code. Model MRTR nonce
+states, credential prepare/commit/recovery and request open/terminal/closed
+states explicitly; compare generated public-operation histories against that
+model. Enumerate short concurrent histories and cancellation schedules with
+LabRuntime/DPOR where available, then repeat named races through real sockets
+and processes. Deterministic model agreement is one proof class; it does not
+replace platform I/O or persistence evidence.
+
+For MRTR and durable credentials, a history must admit an ordering consistent
+with the externally observed commit points. Concurrent retries cannot create
+two effects, an acknowledged credential commit cannot disappear after a
+supported recovery, and a request cannot emit a second terminal result. Use
+conservation checks for permits, charged bytes and child ownership: acquired =
+released + currently owned, with currently owned returning to the declared
+baseline after quiescence. Include expiry/overflow and N-1/N/N+1 boundaries so
+the model detects silent resource debt rather than only wrong return values.
+
+For schema/header/catalog code, add metamorphic checks: changing an unrelated
+JSON member must not change a header projection; reordering transport header
+names must preserve permitted case-insensitive semantics; unchanged catalog
+walks must conserve exactly the registered items; narrowing caller authority
+must never expose an additional private result. Explicit specification
+exceptions, such as annotated null omission and server-side tool validation,
+remain primary and must not be erased by an overbroad property.
+
+Apply these methods within the existing MRTR-02, AUTH-05/07, SRV-03,
+HTTP-04/05, SCH, LIMIT, TST-04, PERF-01 and COMP-ALL-01 Beads. Start with
+the smallest model that catches the named defect; expand only when it discovers
+a counterexample or covers a remaining acceptance item. No independent
+mathematical sophistication claim, extra status dashboard or new process gate
+earns capability credit.
+
+##### Evidence limits and implementation handoff
+
+The published artifact observation is GitHub release `v0.8.1`, published
+2026-08-30, and crates.io `fastmcp-rust/0.8.1`, not a build of this worktree.
+The macOS arm64 archive passed its supplied SHA-256 check. Executed commands
+were version/help, inspect/install help, a configuration-preserving install
+dry-run, and the negative `tasks --help` invocation. The first commands
+succeeded; Tasks was unrecognized (exit 2). These results prove that narrow
+CLI surface, not authenticated MCP interoperability.
+
+`cargo fmt --all -- --check` passed during the audit. The attempted
+`RCH_REQUIRE_REMOTE=1 rch exec --source-content-receipt -- cargo check
+--locked --workspace --all-targets` stopped before compilation on the existing
+untracked `rich_rust` symlink (RCH job `30006034961531062`, source hash
+`41826785fd4bd6971379f3a4489d659f8ca45957fae29286a630206c663bc36c`, exit 103).
+An attempted clean-baseline receipt invocation was rejected by RCH argument
+validation because `--clean-overlay` and `--source-content-receipt` are
+mutually exclusive (exit 2). Both failed attempts are retained. Other agents
+subsequently occupied the serialized FastMCP verification lane. There is no
+successful compiler, clippy, full-suite, performance or aggregate conformance
+result from this audit, and no gate provider or implementation status was
+changed.
+
+The corrected 32 child records preserve their inherited parent capabilities,
+existing role test IDs, assignees and status. Their planned public tests use
+the existing facade `e2e_modern_http` Cargo target as a complete unfiltered
+batch, plus the owning implementation's inline unit tests and the separately
+frozen shipped-platform/profile matrix. The two named role tests are required
+members, not the full suite count. All nested required scenarios must have
+outcomes; unrelated green tests cannot compensate for an absent planned ID.
+This selects an existing executable boundary without adding more test files.
+The central verifier may decompose the target only through an explicit
+inventory-preserving source/test mapping review, never by filtering away debt.
+
+The remaining broad-selector records were not blanket-rewritten. FND-02 must
+check each against its real specialized contract before claim; the audit does
+not certify all 595 executable leaves as semantically complete. The intended
+next work is the existing RCH/FND verification and checker critical path,
+followed by the corrected capability slices. Do not create another status
+epic, count this planning work as delivered MCP behavior, or relax release
+quarantine to make a ready queue appear larger.
+
+The audit applied three ambition rounds and six refinement passes. The first
+four passes corrected capability slices, exact test inventories, composed
+recovery obligations and current-source claims. Pass five found the missing
+AUTH-01 → OPS-01 tracker edge and the three stronger authorization-gate edges
+already present in Beads; the plan now agrees with the mandatory complete-role
+scope. Pass six found no further discrepancy in the revised role scopes,
+preserved test IDs/ownership/status, or all 145 formal parents' 784 exact
+prerequisites. BV reported no cycles. This is structural and scoped semantic
+validation, not a certificate for every remaining leaf or running capability.
+
+#### Historical bridge baseline
 
 The rest of this document is the executable bridge plan. Its major
 tracks close the checklist gaps in this order:
@@ -5695,12 +5957,13 @@ Acceptance:
   across the documented line-ending normalization only.
 - No single checker/verifier source becomes an unreviewable substitute
   for independent modules, negative oracles, and end-to-end evidence.
-- Before the checker exists, the manual bootstrap permits only
-  REL-QUAR-00 emergency closure under Section 36.1; after that closure
-  is independently verified, FND-01's validated lineage; and then
-  FND-02's validated lineage, in that order. REL-QUAR-00 is the
-  independent safety barrier, not an implementation lineage, and is not
-  presently satisfied merely because this plan names it. A lineage is either its directly claimable formal issue
+- Before the checker exists, a fresh manually validated bootstrap permits
+  FND-01's validated lineage and then FND-02's validated lineage, in that
+  order, under Section 36.4. REL-QUAR-00 gates release preparation and
+  publication-capable paths only, as required by Section 0.7; externally
+  blocked provider-state work does not gate this implementation lineage.
+  The checker still validates the complete quarantine graph and evidence
+  without assuming it is closed or authorizing publication. A lineage is either its directly claimable formal issue
   or, if the package exceeds the ownership/480-minute boundary, its
   manually validated implementation-child → integration-child →
   aggregate chain under the exact Section 11 schema. Use the frozen
@@ -5753,7 +6016,6 @@ Tests:
 Dependencies:
 
 - FND-01.
-- REL-QUAR-00.
 
 ### FND-03 — Define exact 2026/2024 protocol-era policy
 
@@ -30568,12 +30830,14 @@ Dependencies:
 - CONF-01.
 - CI-BASE-01.
 
-### GATE-EMA-READY — Aggregate enterprise authorization readiness
+### GATE-EMA-READY — Aggregate complete EMA OIDC and SAML readiness
 
 Outcome:
 
-Prove the enterprise-managed authorization profile can be claimed
-independently of core OAuth.
+Prove complete enterprise-managed authorization readiness by independently
+verifying and composing AUTHX-01's OIDC/ID-JAG branch and AUTHX-04's SAML
+branch. Neither branch inherits the other's evidence; core OAuth stays
+independently operable.
 
 Reason:
 
@@ -30585,6 +30849,12 @@ Implementation:
 - Aggregate the exact authorization-server metadata, both exchange
   stages, assertion validation, JWKS, downgrade, redaction, and
   no-invented-MCP-capability evidence.
+- Independently aggregate AUTHX-04's metadata, bounded XML/signature
+  processing, binding/condition/issuer/audience/recipient/time validation,
+  replay denial, normalized identity provenance and exchange evidence.
+  OIDC and SAML each require positive coverage and cross-branch substitution
+  negatives. The OIDC branch's input exclusions do not exclude SAML from
+  this aggregate gate.
 - Aggregate Section 5.24's requested/IdP-granted/final-granted scope
   chain and required stage-two scalar-resource/explicit-nonempty-scope
   overlay, plus exact `EnterpriseClientIdModel`/
@@ -30767,11 +31037,15 @@ Acceptance:
   secret source or self-attested environment cannot open the gate.
 - Core OAuth remains independently operable.
 - Profile-specific documentation has evidence.
-- The evidence manifest says `identity_assertion_input=oidc_id_token`
-  and `jose_algorithms=RS256-only`; it explicitly excludes SAML,
-  refresh-token subject exchange, RAR, actor/alias authorization,
-  non-RS256 JOSE, and bundled browser UX while naming the required
-  external OIDC adapter, while identifying policy-approved
+- The aggregate manifest contains independent revision-bound
+  `ema_oidc_branch` and `ema_saml_branch` records. The OIDC record says
+  `identity_assertion_input=oidc_id_token` and
+  `jose_algorithms=RS256-only`, excludes SAML input, refresh-token subject
+  exchange, RAR, actor/alias authorization, non-RS256 JOSE and bundled
+  browser UX, and names its external OIDC adapter. The SAML record binds
+  AUTHX-04 parser/signature/audience/replay/provenance/exchange evidence;
+  no aggregate OIDC-only record or `saml_supported=false` is valid. Retain
+  the OIDC record's identification of policy-approved
   optional `email` as ignored/non-authoritative rather than
   unsupported.
 - The manifest separately identifies OIDC ID-token algorithm metadata
@@ -30951,6 +31225,7 @@ Dependencies:
 
 - GATE-CORE-READY.
 - AUTHX-01.
+- AUTHX-04.
 - CONF-01.
 - CI-BASE-01.
 
@@ -31008,7 +31283,7 @@ Dependencies:
 - CONF-01.
 - CI-BASE-01.
 
-### GATE-EMA-BUILTIN-READY — Aggregate enterprise/built-in composition readiness
+### GATE-EMA-BUILTIN-READY — Aggregate complete EMA OIDC/SAML with built-in issuer
 
 Outcome:
 
@@ -31025,6 +31300,10 @@ Implementation:
 
 - Aggregate AUTHX-03 only after both GATE-EMA-READY and
   GATE-BUILTIN-AUTH-READY pass independently.
+- Require independent OIDC-derived and SAML-derived normalized provenance
+  to reach the ID-JAG/built-in issuance path. The issuer consumes that
+  validated contract; it does not parse SAML or borrow one branch's proof
+  to satisfy the other.
 - Run the literal two-feature metadata/token endpoint, durable
   replay, resource/audience, IdP trust, client-authentication,
   exact inbound RS256-only out-of-band `IdJagIssuerCryptoPolicy`,
@@ -31161,12 +31440,16 @@ Tests:
 - Issuer/redeemer trust-domain distinction, recorded client domain, and
   exact one-RAS binding aggregation.
 - Base-manifest nonmutation and scenario-inventory completeness.
+- OIDC-derived and SAML-derived built-in positives with one-variable
+  signature/audience/replay/provenance and cross-branch substitution
+  negatives; neither source branch may be empty or skipped.
 
 Dependencies:
 
 - GATE-EMA-READY.
 - GATE-BUILTIN-AUTH-READY.
 - AUTHX-03.
+- AUTHX-04.
 - CONF-01.
 - CI-BASE-01.
 
@@ -31255,13 +31538,14 @@ Dependencies:
 - CONF-01.
 - CI-BASE-01.
 
-### GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY — Aggregate official pinned-Draft OAuth Client Credentials safety
+### GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY — Gate complete official-draft OAuth Client Credentials readiness
 
 Outcome:
 
-Prove the official pinned-Draft OAuth Client Credentials profile builds,
-remains isolated, and meets its pinned security contract without implying an
-aggregate or final-release claim.
+Prove complete official-draft OAuth Client Credentials readiness across
+AUTHX-02 external-AS client behavior and AUTHX-05 discovery/advertisement,
+protected-resource validation and enabled built-in issuer composition.
+This gate alone cannot establish aggregate MCP support or release readiness.
 
 Reason:
 
@@ -31270,7 +31554,10 @@ needs its own gate without contributing aggregate conformance.
 
 Implementation:
 
-- Aggregate AUTHX-02 feature isolation, no-invented-MCP-capability,
+- Aggregate AUTHX-02 and AUTHX-05; neither alone satisfies this gate.
+  Preserve AUTHX-02's client-role subgroup and feature isolation, with the
+  exact `io.modelcontextprotocol/oauth-client-credentials` per-request `{}`
+  and optional `server/discover` advertisement rather than an invented ID,
   exact grant, token-endpoint authentication, metadata,
   exact issuer-bound `ClientCredentialsRegistrationReceipt`, client
   `grant_types=client_credentials`, explicit matching
@@ -31309,14 +31596,16 @@ Implementation:
   provenance, cache bypass/no-store diagnostics, refresh/ID-token
   rejection, no DPoP/mTLS/`cnf`, and all-validation-before atomic
   AUTH-05 commit with zero mutation on failure or unknown dispatch.
-- Require the evidence record to say `role=oauth_client`,
+- Require the AUTHX-02 subgroup evidence to say `role=oauth_client`,
   `authorization_server=external`, and
   `builtin_client_credentials_issuer=false`; the four-way feature
   cross-product must prove AUTH-06 metadata and endpoint behavior are
-  unchanged.
+  unchanged for that isolated subgroup. The complete gate additionally
+  requires every AUTHX-05 role and enabled built-in composition; the
+  subgroup's issuer exclusion is not an aggregate exclusion.
 - Require core OAuth to pass independently with the feature disabled.
-- Emit an evidence record whose extension status is always `official-pinned-
-  draft` and whose aggregate claim is false.
+- Emit an evidence record whose maturity is exactly `official-draft`, bound
+  to the pinned source/drift evidence, and whose aggregate MCP claim is false.
 - Freeze exact scenario `auth/client-credentials-jwt` with its ordered
   ES256/raw-PEM/missing-registration-receipt/missing-`kid`
   incompatibility vector and actual first pre-dispatch rejection, not
@@ -31352,8 +31641,8 @@ Acceptance:
 - The exact preregistration, custody, dispatch, singleflight/cache,
   nonempty-scope/no-default, JWT-preference/Basic-deviation, response-
   admission, sender-constraint, and atomic-commit evidence is nonempty;
-  the package remains external-AS client-only in every feature
-  combination.
+  the AUTHX-02 subgroup remains external-AS client-only in its isolation
+  matrix, while the enabled complete profile proves all AUTHX-05 roles.
 - No support matrix can convert this gate into an aggregate or final-release
   claim.
 - No manifest counts the incompatible raw JWT scenario or local
@@ -31366,6 +31655,10 @@ Tests:
 - Feature-off/on builds.
 - Invalid-combination and maturity-label checks.
 - AUTHX-02 security aggregation.
+- AUTHX-05 discovery/advertisement/protected-resource/enabled built-in
+  issuer positives and near-identical negatives with nonempty role
+  inventories. Core OAuth and the AUTHX-02-only isolation matrix remain
+  independently required; neither is full-profile evidence.
 - Client-only/external-AS four-way feature matrix; exact preregistration
   and no-DCR/CIMD; exact client registration receipt/`grant_types`/
   auth-method versus separate server metadata; wrong-field/default/
@@ -31391,6 +31684,7 @@ Dependencies:
 
 - GATE-CORE-READY.
 - AUTHX-02.
+- AUTHX-05.
 - CONF-01.
 - CI-BASE-01.
 
@@ -35483,10 +35777,10 @@ endpoint itself. They are inventory checks, not support claims:
 | `CI-TASKS-01` Tasks | `profile-tasks` | 90 |
 | `CI-REDIS-TASKS-01` Redis Tasks | `profile-redis-tasks` | 93 |
 | `CI-APPS-01` Apps | `profile-apps` | 86 |
-| `CI-EMA-01` enterprise authorization | `profile-enterprise-auth` | 85 |
+| `CI-EMA-01` enterprise authorization | `profile-enterprise-auth` | 87 |
 | `CI-BUILTIN-AUTH-01` built-in authorization server | `profile-builtin-auth-server` | 86 |
-| `CI-EMA-BUILTIN-01` enterprise + built-in composition | `profile-enterprise-builtin` | 92 |
-| `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01` official pinned-Draft OAuth Client Credentials | `profile-oauth-client-credentials-draft` | 86 |
+| `CI-EMA-BUILTIN-01` enterprise + built-in composition | `profile-enterprise-builtin` | 93 |
+| `CI-OAUTH-CLIENT-CREDENTIALS-DRAFT-01` official pinned-Draft OAuth Client Credentials | `profile-oauth-client-credentials-draft` | 88 |
 | `CI-PROXY-01` modern proxy | `profile-proxy` | 88 |
 | `CI-PROXY-DUAL-01` proxy + dual era | `profile-proxy-dual` | 102 |
 | `CI-PROXY-TASKS-01` proxy + Tasks | `profile-proxy-tasks` | 99 |
@@ -35497,8 +35791,13 @@ formal issue may therefore carry multiple labels when it belongs to
 multiple closures. The checker derives membership from package edges and
 rejects an omitted/extra label or a delta-only projection.
 
-The formal corpus has exactly 145 work packages and 782 prerequisite bullets
-in this plan revision. On 2026-09-01 the designated security structure owner
+The formal corpus has exactly 145 work packages and 784 prerequisite bullets
+in this plan revision. The 2026-09-04 reality check removed the stale FND-02
+dependency on REL-QUAR-00 to enforce Section 0.7 and aligned three
+authorization-gate dependencies with the tracker's existing mandatory SAML
+and complete client-credentials coverage. The enterprise, enterprise+built-in
+and client-credentials endpoint closures are now 87, 93 and 88 respectively.
+Release endpoint membership and the longest path are unchanged. On 2026-09-01 the designated security structure owner
 applied the three frozen name-only authorization-profile corrections: the two
 retired gate references now name
 `GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY`, and the retired CI reference now
@@ -38515,7 +38814,9 @@ and executable evidence.
 Current formal-plan truth, independently extracted from the package-local
 `Dependencies:` blocks, is:
 
-- 145 unique packages and 782 prerequisite bullets;
+- 145 unique packages and 784 prerequisite bullets after the 2026-09-04
+  release-only and complete-authorization-gate reconciliation; the earlier
+  materialization had 782;
 - no unresolved package ID, duplicate edge, self-edge, or cycle after the
   designated security structure owner applied the three frozen name-only
   authorization-profile corrections on 2026-09-01;
@@ -38529,8 +38830,8 @@ Current formal-plan truth, independently extracted from the package-local
 - `AllMcpReleaseCandidateInventory`: 141 packages through REL-01;
 - `AllMcpReleaseProfileInventory`: 142 packages through REL-02;
 - optional endpoint closures in that intended projection: dual 93,
-  Tasks 90, Redis Tasks 93, Apps 86, enterprise auth 85, built-in auth
-  86, enterprise+built-in 92, OAuth client-credentials Draft 86,
+  Tasks 90, Redis Tasks 93, Apps 86, enterprise auth 87, built-in auth
+  86, enterprise+built-in 93, OAuth client-credentials Draft 88,
   modern proxy 88, proxy+dual 102, and proxy+Tasks 99. CI-ALL-MCP-01's
   self-inclusive closure is 140.
 
@@ -39127,7 +39428,8 @@ obsolete EXT-SRC-01 edge from the parent and any A/B slice that retained it;
 REL-QUAR-00 likewise removes the obsolete CI-ALL-MCP-01 edge. DX-TEST-01 is
 reconciled to FND-04, API-CORE-01, MAC-01, EXT-DEV-01, STD-01, HTTP-01,
 HTTP-02, HTTP-03, and XPORT-01. EXT-DEV-01 is reconciled to EXT-01, FND-04,
-MAC-01, and API-CORE-01. CI-BASE-01 and FND-02 add REL-QUAR-00; CI-CORE-01
+MAC-01, and API-CORE-01. CI-BASE-01 adds REL-QUAR-00; FND-02 does not,
+because Section 0.7 confines that prerequisite to release paths. CI-CORE-01
 adds DX-TEST-01, PERF-01, and REL-PREP-01; LEG-NEG-01 adds SUB-02, LEG-02,
 and LEG-03; and TASK-02 adds OPS-01. Parent edges follow the canonical
 `Dependencies:` blocks exactly. A/B receives a changed prerequisite only when
@@ -39169,9 +39471,9 @@ B, or I and forbidden native `parent-child` execution edges are removed.
 | Violating parent | A — disjoint production slice | B — disjoint production slice | I — exact public wiring | V — receipt-only independent check | Rationale |
 |---|---|---|---|---|---|
 | AUTH-01 | transport credential extraction and principal admission | verifier/provider policy, challenge and typed rejection | server auth boundary through public builder | revision, principal-isolation and test-inventory receipt | none |
-| AUTH-05 | static/custom token configuration and safe public builder | error taxonomy, redaction, expiry and revocation behavior | configured server/client auth entrypoints | public diagnostics and zero-skip receipt | none |
-| AUTH-07 | authorization policy declarations and resource mapping | enforcement precedence and denial diagnostics | public protected-operation path | policy/revision/negative receipt | none |
-| CACHE-01 | cache key/value and partition model | expiry, invalidation and capacity admission | public server cache middleware | partition/isolation receipt | none |
+| AUTH-05 | credential partitions, secure-store API and protected persistence | credential crash recovery, rollback protection and custody hardening | public credential persistence, issuer migration and restart integration | independent credential custody and persistence proof verification | corrected against the unchanged parent capability on 2026-09-04 |
+| AUTH-07 | interactive browser, loopback callback and PKCE authorization driver | interactive authorization validation, bounded cancellation and cleanup | public authorization-to-credential-to-protected-request integration | independent interactive authorization and cleanup proof verification | corrected against the unchanged parent capability on 2026-09-04 |
+| CACHE-01 | mandatory protocol cache-hint method and TTL semantics | sealed public-cache proof and identity attenuation | public result cache hints and auth-invariance | independent hint and public-proof verification | corrected against the unchanged parent capability on 2026-09-04 |
 | CACHE-02 | request cacheability and response metadata rules | revalidation, mutation and error-path behavior | public client/server cache use | observable cache-state receipt | none |
 | CACHE-03 | cross-layer cache partition primitives | invalidation propagation and stale-entry denial | public cache/proxy composition | partition-digest receipt | none |
 | CI-APPS-01 | Apps profile job/inventory execution | Apps evidence, failure and skip detection | shipped Apps profile CI entrypoint | exact job/result receipt | none |
@@ -39209,14 +39511,14 @@ B, or I and forbidden native `parent-child` execution edges are removed.
 | GATE-TASKS-READY | Tasks closure evaluator | task evidence substitution rejection | public Tasks readiness evaluator | zero-capability gate receipt | none |
 | HDR-01 | canonical HTTP header syntax and singleton admission | routing projection, collision and normalization rules | public HTTP header/routing boundary | header-table/digest receipt | none |
 | HTTP-01 | per-request response stream abstraction | cancellation, backpressure and terminal closure | public HTTP server response path | stream-lifetime receipt | none |
-| HTTP-04 | HTTP server routing and listener binding | connection lifecycle, bounds and shutdown | public HTTP server entrypoint | listener/route receipt | none |
-| HTTP-05 | HTTP middleware/error response composition | request guard, drain and close failure handling | public HTTP middleware path | error/teardown receipt | none |
+| HTTP-04 | request-owned progress and opted-in log routing | notification ordering, cancellation and stream isolation | public concurrent HTTP notification routing | independent request-stream isolation proof | corrected against the unchanged parent capability on 2026-09-04 |
+| HTTP-05 | schema-derived client parameter-header projection | authorized server header validation and safe refresh retry | public parameter-header and tool-validation ordering | independent parameter-header security proof | corrected against the unchanged parent capability on 2026-09-04 |
 | HTTP-06 | generic HTTP origin/security/preflight handling | forwarding headers, limits and denial precedence | public HTTP security boundary | origin/header receipt | none |
 | INTEROP-01 | pinned peer-client interoperability matrix | pinned peer-server interoperability matrix | public cross-SDK harness | peer/version/result receipt | none |
 | MAC-01 | core tool/resource/prompt attribute expansion | schema/timeout/error diagnostics and renamed facade resolution | packaged facade-only macro consumer | expansion/use receipt | none |
 | MAC-TASK-01 | Tasks attribute parsing and feature gating | task result conversion and runtime registration denial | packaged Tasks macro consumer | feature/use receipt | none |
 | MRTR-01 | input-required wire/state model | request validation, errors and result transitions | public MRTR protocol boundary | state/schema receipt | none |
-| MRTR-02 | server resolver/broker ownership and correlation | consent, cancellation, expiry and persistence behavior | public MRTR resolver entrypoint | owner/terminal receipt | none |
+| MRTR-02 | authenticated request-state codecs and continuation bindings | atomic one-use replay receipts and bounded continuation lifecycle | public continuation retry and lost-response recovery | independent request-state and one-effect proof | corrected against the unchanged parent capability on 2026-09-04 |
 | OBS-01 | typed W3C trace metadata parsing, cross-field validation, exact field recovery and `McpContext` preservation | versioned outbound trace policy, origin/trust-boundary forwarding, cache isolation and redacted diagnostics | public server/client/proxy trace-context path | W3C corpus, recovery, propagation-policy and revision receipt | none |
 | OBS-02 | final logging wire types, request metadata/capability/opt-in policy and HTTP/stdio attribution | bounded sink/queue/drop handling, disclosure classification/redaction and terminal-safe rendering | public server/client/CLI request-logging path | wire/capability, attribution, bounds, disclosure/display and revision receipt | none |
 | OBS-03 | progress wire/token model, exact bounded-number representation and monotonic validation | active-token ownership, terminal lifecycle, stdio/HTTP routing and bounded queue/coalescing | public client/server progress path through stdio and HTTP | token/number, routing, terminal-state and test-inventory receipt | none |
@@ -39236,7 +39538,7 @@ B, or I and forbidden native `parent-child` execution edges are removed.
 | SCH-03 | schema validator integration | reference/error/handler enforcement | public schema validation path | validator/result receipt | none |
 | SRV-01 | immutable server/router dispatch | handler invocation, result conversion and errors | public server builder/dispatch | request/result receipt | none |
 | SRV-02 | catalog registration and server composition | capability/discovery and lifecycle freeze | public server construction path | catalog/freeze receipt | none |
-| SRV-03 | middleware chain ordering | cache/rate/transform cancellation and failures | public middleware server path | ordering/state receipt | none |
+| SRV-03 | deterministic stateless catalogs and authenticated cursors | cursor isolation, bounded storage and lifecycle enforcement | public multi-provider pagination and principal isolation | independent catalog ordering and cursor proof | corrected against the unchanged parent capability on 2026-09-04 |
 | SRV-04 | handler deadlines and request execution | cancellation, budgets and terminal result gate | public handler execution path | deadline/terminal receipt | none |
 | SRV-MW-01 | middleware traits/context propagation | ordering, error and short-circuit semantics | public middleware API | chain/observable receipt | none |
 | SUB-01 | subscription protocol/handle model | server registration and event dispatch | public subscription API | handle/event receipt | none |
@@ -39247,7 +39549,7 @@ B, or I and forbidden native `parent-child` execution edges are removed.
 | TST-01 | canonical positive wire fixtures | planted-invalid wire fixtures and mutation oracle | public codec fixture runner | fixture/result receipt | none |
 | TST-02 | fuzz/property corpus generation | seed, shrink, timeout and regression handling | public test harness runner | corpus/seed receipt | none |
 | TST-03 | real end-to-end process harness | failure, cancellation and cleanup diagnosis | public E2E runner | process/result receipt | none |
-| TST-04 | differential/reference test harness | discrepancy triage and regression corpus | public differential runner | peer/result receipt | none |
+| TST-04 | raw transport and authorization boundary attack suite | state replay, tenant isolation and panic-redaction suite | public transport and authorization security matrix | independent attack-coverage and protected-effect proof | corrected against the unchanged parent capability on 2026-09-04 |
 | XPORT-01 | modern/exact-2024 transport disposition table | role/direction codec and experimental transport isolation | public transport builder/codec path | disposition/role receipt | none |
 | API-CORE-01 | existing bounded ModernOnly facade/builders/prelude Bead, rematerialized and retained as A | legacy-off feature admission, unavailable-policy diagnostics, and renamed-facade generated paths | shipped no-legacy public facade through A+B | independent export/feature/profile receipt | formalizes the former API-01 child as a core package |
 | CLI-CORE-01 | existing bounded ModernOnly run/inspect Bead, rematerialized and retained as A | machine JSON, diagnostic/display, process cleanup, and legacy-off denial surface | shipped no-legacy binary through A+B | independent binary/feature/profile receipt | formalizes the former CLI-01 child as a core package |
