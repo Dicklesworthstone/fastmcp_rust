@@ -155,10 +155,12 @@ impl InboundRequestContext {
     }
 
     /// Creates sanitized facts for a request that belongs to one live modern
-    /// transport connection. The connection owns both the opaque partition
-    /// used to bind MRTR retries and the cancellation authority that makes
-    /// retained continuations unusable after peer disconnect. The partition
-    /// may be request-local and therefore ineligible for response caching.
+    /// transport connection. Durable connections contribute the opaque
+    /// partition used to bind MRTR retries and the cancellation authority that
+    /// makes retained continuations unusable after peer disconnect. An
+    /// ephemeral HTTP partition proves transport ownership only; the router
+    /// maps it to the operation- and principal-bound stateless domain so a
+    /// later POST can resume without inventing a durable session.
     #[must_use]
     pub fn with_modern_connection(
         cx: Cx,
@@ -2002,7 +2004,6 @@ fn derive_handler_context(
                 move |request| {
                     sender(request);
                 },
-                protocol_era,
             )));
     }
 
@@ -2132,6 +2133,12 @@ impl Router {
     #[cfg(test)]
     pub(crate) fn test_active_mrtr_exchange_count(&self) -> usize {
         self.mrtr_exchanges.active_len()
+    }
+
+    /// Closes stateless MRTR issuance and removes every retained stateless
+    /// continuation when the owning HTTP listener begins shutdown.
+    pub(crate) fn close_stateless_mrtr_exchanges(&self) -> usize {
+        self.mrtr_exchanges.close_stateless()
     }
 
     #[cfg(feature = "tasks")]

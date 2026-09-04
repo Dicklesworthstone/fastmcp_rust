@@ -24,7 +24,6 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
-use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
     CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
@@ -622,15 +621,14 @@ where
 /// Emits `notifications/message` from handler `ctx.info()` and friends.
 pub(crate) struct LogNotificationSender<F> {
     send_fn: F,
-    era: ProtocolEra,
 }
 
 impl<F> LogNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
 {
-    pub(crate) fn new(send_fn: F, era: ProtocolEra) -> Self {
-        Self { send_fn, era }
+    pub(crate) fn new(send_fn: F) -> Self {
+        Self { send_fn }
     }
 }
 

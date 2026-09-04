@@ -2112,13 +2112,16 @@ impl McpContext {
         self.request_scope_is_active() && self.retained_continuation_owner
     }
 
-    /// Returns the transport-authorized partition used to bind retained
+    /// Returns the transport-authorized partition associated with retained
     /// continuations created by this request.
     ///
-    /// Request-local HTTP state deliberately has no response-cache partition,
-    /// but still carries a unique per-request identity. Requiring the explicit
-    /// transport owner flag prevents an ordinary context with state from
-    /// manufacturing continuation authority.
+    /// Durable transports bind retries to this exact partition. Request-local
+    /// HTTP state deliberately has no response-cache partition and contributes
+    /// only an ownership/eligibility identity; the server router replaces that
+    /// ephemeral value with its operation- and principal-bound stateless
+    /// continuation domain. Requiring the explicit transport owner flag keeps
+    /// an ordinary context with state from manufacturing continuation
+    /// authority.
     #[doc(hidden)]
     #[must_use]
     pub fn retained_continuation_partition(&self) -> Option<[u8; 32]> {
