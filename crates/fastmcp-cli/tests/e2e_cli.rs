@@ -50,6 +50,13 @@ impl TestTempDir {
             .expect("system time before Unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        // Unix CLI security checks require a trusted sticky ancestor. Build farms may
+        // rewrite TMPDIR beneath a shared non-sticky mirror, so positive fixtures use
+        // the platform's standard sticky temporary root instead.
+        #[cfg(unix)]
+        let temp_root = std::fs::canonicalize("/tmp")
+            .expect("resolve the sticky test temporary directory without symlinks");
+        #[cfg(not(unix))]
         let temp_root = std::fs::canonicalize(std::env::temp_dir())
             .expect("resolve the test temporary directory without symlink components");
         let path = temp_root.join(format!(

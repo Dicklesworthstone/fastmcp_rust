@@ -38,8 +38,10 @@ impl TestTempDir {
             .expect("system time before unix epoch")
             .as_nanos();
         let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_root = std::fs::canonicalize(std::env::temp_dir())
-            .expect("resolve the test temporary directory without symlink components");
+        // Install-path security checks require a root-owned sticky ancestor, while
+        // build farms may rewrite TMPDIR beneath a shared non-sticky mirror.
+        let temp_root = std::fs::canonicalize("/tmp")
+            .expect("resolve the sticky test temporary directory without symlinks");
         let path = temp_root.join(format!(
             "fastmcp-cli-{prefix}-{}-{nanos}-{sequence}",
             std::process::id()
