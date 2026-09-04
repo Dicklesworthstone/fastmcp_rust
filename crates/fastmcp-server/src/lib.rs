@@ -12972,12 +12972,11 @@ impl Server {
         }
         {
             let sender = notification_sender.clone();
-            request_ctx =
-                request_ctx.with_log_sender(Arc::new(crate::handler::LogNotificationSender::new(
-                    move |notification| {
-                        sender(notification);
-                    },
-                )));
+            request_ctx = request_ctx.with_log_sender(Arc::new(
+                crate::handler::LogNotificationSender::new(move |notification| {
+                    sender(notification);
+                }),
+            ));
         }
         // The outer request owner retains the sole final-progress runtime.
         // Router/handler derivation sees this reporter and reuses it instead
@@ -13824,11 +13823,9 @@ impl Server {
             if let Some(runtime) = runtime {
                 let sender = Arc::clone(&runtime.notification_sender);
                 request_ctx = request_ctx.with_log_sender(Arc::new(
-                    crate::handler::LogNotificationSender::new(
-                        move |notification| {
-                            sender(notification);
-                        },
-                    ),
+                    crate::handler::LogNotificationSender::new(move |notification| {
+                        sender(notification);
+                    }),
                 ));
             }
             if let (Some(marker), Some(runtime)) = (Self::request_progress_marker(request), runtime)
@@ -37627,9 +37624,7 @@ mod lib_unit_tests {
                 serve.map_err(|error| format!("live HTTP MRTR shutdown server failed: {error}"))?;
             require_quiescent_http_shutdown(shutdown, "live HTTP MRTR shutdown").await?;
             if endpoint.server.router.test_active_mrtr_exchange_count() != 0 {
-                return Err(
-                    "listener shutdown retained a stateless MRTR continuation".to_owned(),
-                );
+                return Err("listener shutdown retained a stateless MRTR continuation".to_owned());
             }
             let request_state = initial
                 .result
@@ -47416,12 +47411,7 @@ mod lib_unit_tests {
         let forged = issuing_client
             .handle(
                 &cx,
-                retry(
-                    &forged_state,
-                    "live_http_mrtr",
-                    serde_json::json!({}),
-                    907,
-                ),
+                retry(&forged_state, "live_http_mrtr", serde_json::json!({}), 907),
             )
             .expect("forged MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
@@ -47496,12 +47486,7 @@ mod lib_unit_tests {
             "an argument-binding rejection must leave the issued state available",
         );
 
-        let valid_retry = retry(
-            &request_state,
-            "live_http_mrtr",
-            serde_json::json!({}),
-            910,
-        );
+        let valid_retry = retry(&request_state, "live_http_mrtr", serde_json::json!({}), 910);
         let resumed = other_client
             .handle(&cx, valid_retry.clone())
             .expect("a later stateless session with the bound request must resume");
@@ -47615,7 +47600,9 @@ mod lib_unit_tests {
         let rejected: JsonRpcResponse =
             serde_json::from_slice(&rejected.body).expect("retry rejection must be JSON-RPC");
         assert_eq!(rejected.id, Some(913_i64.into()));
-        let error = rejected.error.expect("stateless elicitation retry must fail");
+        let error = rejected
+            .error
+            .expect("stateless elicitation retry must fail");
         assert_eq!(error.code, McpErrorCode::InvalidRequest.into());
         assert_eq!(
             error.message,
