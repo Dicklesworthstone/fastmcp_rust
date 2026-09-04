@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 #[cfg(feature = "tasks")]
+use asupersync::cx::{ChildRegion, ChildRegionSpec};
+#[cfg(feature = "tasks")]
 use fastmcp_client::FinalToolCallOutcome;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::StdioRequestExecution;
@@ -3448,16 +3450,11 @@ impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioFinalTaskListener {
     client: ProxyClient,
-    /// Owned handle for best-effort Drop-time cancellation. Cloning the
-    /// request context means this backstop inherits its cancellation state:
-    /// if the owning context is already cancelled when the listener is
-    /// abandoned without polling, the transport checkpoint refuses the
-    /// `notifications/cancelled` frame and only the local tombstone is
-    /// committed. Full coverage of that window requires an owned uncancelled
-    /// child region from an ambient `&Cx` — the absent asupersync primitive
-    /// tracked by FND-04 (bd-63l5). The inline cancel in `next_async` covers
-    /// the polled path with a live context.
+    /// Owned context for best-effort Drop-time cancellation. Derived from an
+    /// owned child region when available so this backstop does not inherit an
+    /// already-cancelled request context state (FND-04 / bd-63l5).
     cx: Cx,
+    _child_region: Option<ChildRegion>,
 }
 
 #[cfg(feature = "tasks")]
@@ -3512,13 +3509,11 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
-    /// Owned handle for best-effort Drop-time cancellation. Inherits the
-    /// request context's cancellation state: an already-cancelled context
-    /// refuses the transport checkpoint, so the backstop commits only the
-    /// local tombstone in that window. The polled path cancels through
-    /// `next_async` with a live context. Owned uncancelled child regions are
-    /// the absent asupersync primitive tracked by FND-04 (bd-63l5).
+    /// Owned context for best-effort Drop-time cancellation. Derived from an
+    /// owned child region when available so this backstop does not inherit an
+    /// already-cancelled request context state (FND-04 / bd-63l5).
     cx: Cx,
+    _child_region: Option<ChildRegion>,
 }
 
 #[cfg(feature = "tasks")]
@@ -8748,9 +8743,15 @@ impl ProxyClient {
         if self.with_backend(|backend| {
             backend.start_incremental_final_task_listener(notifications.clone())
         })? {
+            let (cx, child_region) =
+                match ctx.cx().open_child_region(ChildRegionSpec::inherit()).await {
+                    Ok(region) => (region.cx().clone(), Some(region)),
+                    Err(_) => (ctx.cx().clone(), None),
+                };
             return Ok(Box::new(ProxyIncrementalStdioFinalTaskListener {
                 client: self.clone(),
-                cx: ctx.cx().clone(),
+                cx,
+                _child_region: child_region,
             }));
         }
         self.with_backend(|backend| backend.open_final_task_listener(notifications))
@@ -8770,9 +8771,15 @@ impl ProxyClient {
         if self.with_backend(|backend| {
             backend.start_incremental_catalog_listener(notifications.clone())
         })? {
+            let (cx, child_region) =
+                match ctx.cx().open_child_region(ChildRegionSpec::inherit()).await {
+                    Ok(region) => (region.cx().clone(), Some(region)),
+                    Err(_) => (ctx.cx().clone(), None),
+                };
             return Ok(Box::new(ProxyIncrementalStdioCatalogListener {
                 client: self.clone(),
-                cx: ctx.cx().clone(),
+                cx,
+                _child_region: child_region,
             }));
         }
         Err(McpError::invalid_request(
