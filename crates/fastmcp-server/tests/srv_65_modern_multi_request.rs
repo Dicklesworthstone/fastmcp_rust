@@ -191,9 +191,9 @@ fn run_scenario(label: &'static str, requests: Vec<JsonRpcRequest>) -> ScenarioO
             worker.join().expect("the scenario worker must not panic");
             outcome
         }
-        Err(_) => panic!(
-            "[{label}] the server stopped answering: no outcome within {SCENARIO_DEADLINE:?}. \
-             Responses observed so far: {:?}",
+        Err(timeout) => panic!(
+            "[{label}] the server stopped answering ({timeout}): no outcome within \
+             {SCENARIO_DEADLINE:?}. Responses observed so far: {:?}",
             probe
                 .responses()
                 .iter()
@@ -321,9 +321,9 @@ fn run_stdio_shaped_scenario(
             worker.join().expect("the scenario worker must not panic");
             outcome
         }
-        Err(_) => panic!(
-            "[{label}] the stdio-shaped pump stopped answering: no outcome within \
-             {SCENARIO_DEADLINE:?}. Responses observed so far: {:?}",
+        Err(timeout) => panic!(
+            "[{label}] the stdio-shaped pump stopped answering ({timeout}): no outcome \
+             within {SCENARIO_DEADLINE:?}. Responses observed so far: {:?}",
             probe
                 .responses()
                 .iter()
