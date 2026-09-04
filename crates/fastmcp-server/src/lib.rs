@@ -9262,7 +9262,9 @@ impl ServerHttpSession {
             return Vec::new();
         }
         self.closed = true;
-        self.modern_connection.disconnect();
+        if !self.modern_connection.is_ephemeral() {
+            self.modern_connection.disconnect();
+        }
         let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         self.legacy_admissions.cancel_all();

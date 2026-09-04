@@ -133,6 +133,7 @@ pub(crate) struct MrtrExchangeBinding {
     arguments_digest: [u8; 32],
     session_partition: [u8; 32],
     principal_digest: Option<[u8; 32]>,
+    is_stateless: bool,
 }
 
 impl MrtrExchangeBinding {
@@ -151,7 +152,32 @@ impl MrtrExchangeBinding {
             arguments_digest,
             session_partition,
             principal_digest,
+            is_stateless: false,
         }
+    }
+
+    /// Captures the operation identity for an ephemeral stateless HTTP retry.
+    #[must_use]
+    pub(crate) fn stateless(
+        method: &'static str,
+        target: String,
+        arguments_digest: [u8; 32],
+        session_partition: [u8; 32],
+        principal_digest: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            method,
+            target,
+            arguments_digest,
+            session_partition,
+            principal_digest,
+            is_stateless: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_stateless(&self) -> bool {
+        self.is_stateless
     }
 }
 const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
@@ -1723,6 +1749,12 @@ impl ExpectedInputLedger {
     fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
+
+    fn has_elicitation(&self) -> bool {
+        self.kinds
+            .values()
+            .any(|kind| *kind == MrtrInputKind::Elicitation)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2006,6 +2038,13 @@ impl MrtrExchangeRegistry {
             if exchange.binding.as_ref() != binding {
                 return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
             }
+            if binding.is_some_and(MrtrExchangeBinding::is_stateless)
+                && exchange.expected.has_elicitation()
+            {
+                return Err(McpError::invalid_request(
+                    "stateless HTTP cannot resume elicitation requestState without a session",
+                ));
+            }
             Self::purge_stale(&mut state, now);
             exchange.expected
         };
@@ -2112,6 +2151,13 @@ impl MrtrExchangeRegistry {
         };
         if exchange.binding.as_ref() != binding {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
+        if binding.is_some_and(MrtrExchangeBinding::is_stateless)
+            && exchange.expected.has_elicitation()
+        {
+            return Err(McpError::invalid_request(
+                "stateless HTTP cannot resume elicitation requestState without a session",
+            ));
         }
         if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
             state.exchanges.remove(request_state);

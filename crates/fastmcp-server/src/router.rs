@@ -317,6 +317,10 @@ impl ModernConnection {
         self.continuation_cancellation.cancel();
     }
 
+    pub fn is_ephemeral(&self) -> bool {
+        self.state.is_ephemeral()
+    }
+
     pub(crate) fn request_context(&self) -> ModernConnectionRequestContext {
         ModernConnectionRequestContext {
             state: self.state.clone(),
@@ -334,7 +338,9 @@ impl Default for ModernConnection {
 
 impl Drop for ModernConnection {
     fn drop(&mut self) {
-        self.disconnect();
+        if !self.is_ephemeral() {
+            self.disconnect();
+        }
     }
 }
 
@@ -676,11 +682,17 @@ fn final_mrtr_binding(
         return Err(McpError::invalid_params("MRTR target exceeds its limit"));
     }
     // A binding is only consumable where transport admission installed an
-    // owner. Request-local HTTP state is intentionally cache-ineligible, but
-    // its unique per-request continuation partition still prevents a later
-    // POST from consuming the issued state.
+    // owner. Ephemeral modern HTTP state shares the stateless continuation
+    // partition across POSTs so subsequent retries from the client can consume
+    // the continuation within its expiration deadline.
     let Some(session_partition) = request_ctx.retained_continuation_partition() else {
         return Ok(None);
+    };
+    let is_stateless = request_ctx.session_is_ephemeral();
+    let session_partition = if is_stateless {
+        mrtr_digest(&"fastmcp-mrtr-stateless-partition-v1")?
+    } else {
+        session_partition
     };
     let principal_digest = request_ctx
         .auth()
@@ -690,13 +702,24 @@ fn final_mrtr_binding(
                 .unwrap_or_else(|| mrtr_digest(&auth))
         })
         .transpose()?;
-    Ok(Some(MrtrExchangeBinding::new(
-        method,
-        target,
-        mrtr_digest(arguments)?,
-        session_partition,
-        principal_digest,
-    )))
+    let binding = if is_stateless {
+        MrtrExchangeBinding::stateless(
+            method,
+            target,
+            mrtr_digest(arguments)?,
+            session_partition,
+            principal_digest,
+        )
+    } else {
+        MrtrExchangeBinding::new(
+            method,
+            target,
+            mrtr_digest(arguments)?,
+            session_partition,
+            principal_digest,
+        )
+    };
+    Ok(Some(binding))
 }
 
 fn handler_mrtr_input_requests(
