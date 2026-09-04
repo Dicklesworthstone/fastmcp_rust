@@ -1915,8 +1915,6 @@ where
         }
     }
 
-    /// Takes an already-routed final response with its exact admitted result
-    /// source, without reading the transport.
     /// Takes one already-routed final response with its exact admitted result
     /// source, without reading the transport.
     ///
