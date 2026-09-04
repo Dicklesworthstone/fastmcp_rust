@@ -7830,9 +7830,10 @@ impl Server {
 impl ServerHttpEndpoint {
     /// Opens one independently bounded live HTTP session.
     ///
-    /// Modern mutable state and MRTR continuations are scoped to the returned
-    /// session. A stateless request that does not retain this session therefore
-    /// cannot share state with another client request.
+    /// Modern mutable state is request-local. Eligible MRTR continuations are
+    /// instead represented by router-owned opaque, single-use state and may be
+    /// resumed by a later stateless POST only when its operation and principal
+    /// bindings match.
     pub fn open_session(&self, cx: &Cx) -> Result<ServerHttpSession, ServerHttpEndpointError> {
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         let session = self.open_session_with_legacy_origin(cx, &self.legacy_origin);
@@ -37248,7 +37249,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_mrtr_rejects_server_issued_state_across_separate_stateless_posts() {
+    fn live_http_mrtr_resumes_server_issued_state_across_separate_stateless_posts() {
         run_live_http_test(|cx| async move {
             let (initial, retry, calls) = run_live_http_mrtr_retry(&cx, "").await?;
             if initial.id != Some(922_i64.into())
@@ -37263,9 +37264,17 @@ mod lib_unit_tests {
                     "initial stateless MRTR POST did not yield input_required: {initial:?}"
                 ));
             }
-            if retry.id != Some(923_i64.into()) || retry.error.is_none() || calls != 1 {
+            if retry.id != Some(923_i64.into())
+                || retry.error.is_some()
+                || retry
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("complete"))
+                || calls != 2
+            {
                 return Err(format!(
-                    "an anonymous stateless retry resumed or reentered the handler (retry={retry:?}, calls={calls})"
+                    "an anonymous bound stateless retry did not resume exactly once (retry={retry:?}, calls={calls})"
                 ));
             }
             Ok(())
@@ -37300,7 +37309,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_mrtr_stateless_retries_do_not_reenter_or_consume_issued_state() {
+    fn live_http_mrtr_wrong_kind_rejects_without_consuming_stateless_state() {
         run_live_http_test(|cx| async move {
             let calls = Arc::new(AtomicUsize::new(0));
             let bound = Server::new("live-http-mrtr-wrong-kind", "1.0.0")
@@ -37317,6 +37326,7 @@ mod lib_unit_tests {
                 .local_addr()
                 .map_err(|error| format!("live HTTP MRTR wrong-kind address failed: {error}"))?;
             let caller_cx = cx.clone();
+            let client_calls = Arc::clone(&calls);
             let mut client = cx
                 .spawn(move |_client_cx| async move {
                     let result = async {
@@ -37423,6 +37433,7 @@ mod lib_unit_tests {
                                 String::from_utf8_lossy(&wrong_kind),
                             )
                         })?;
+                        let calls_after_wrong_kind = client_calls.load(Ordering::Acquire);
                         let roots = serde_json::to_value(
                             bidirectional::MrtrInputResponse::roots(
                                 fastmcp_protocol::ListRootsResult::empty(),
@@ -37471,7 +37482,7 @@ mod lib_unit_tests {
                         .map_err(|error| {
                             format!("MRTR valid response was not valid JSON-RPC: {error}")
                         })?;
-                        Ok::<_, String>((initial, wrong_kind, valid))
+                        Ok::<_, String>((initial, wrong_kind, calls_after_wrong_kind, valid))
                     }
                     .await;
                     caller_cx.cancel_with(
@@ -37485,7 +37496,7 @@ mod lib_unit_tests {
                 })?;
 
             let serve = bound.serve(&cx).await;
-            let (initial, wrong_kind, valid) = client
+            let (initial, wrong_kind, calls_after_wrong_kind, valid) = client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("live HTTP MRTR wrong-kind client failed: {error:?}"))??;
@@ -37509,12 +37520,22 @@ mod lib_unit_tests {
                     "wrong-kind inputResponses did not yield a JSON-RPC error: {wrong_kind:?}"
                 ));
             }
+            if calls_after_wrong_kind != 1 {
+                return Err(format!(
+                    "wrong-kind inputResponses reentered the handler before the valid retry (calls={calls_after_wrong_kind})"
+                ));
+            }
             if valid.id != Some(928_i64.into())
-                || valid.error.is_none()
-                || calls.load(Ordering::Acquire) != 1
+                || valid.error.is_some()
+                || valid
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType"))
+                    != Some(&serde_json::json!("complete"))
+                || calls.load(Ordering::Acquire) != 2
             {
                 return Err(format!(
-                    "stateless retries consumed or reentered the issued state (valid={valid:?}, calls={})",
+                    "wrong-kind rejection consumed state or valid retry did not resume exactly once (valid={valid:?}, calls={})",
                     calls.load(Ordering::Acquire),
                 ));
             }
@@ -47301,10 +47322,10 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn public_http_mrtr_resumes_only_in_the_admitted_session() {
+    fn public_http_mrtr_cross_session_resume_is_bound_and_single_use() {
         let cx = Cx::for_testing();
         let calls = Arc::new(AtomicUsize::new(0));
-        let endpoint = Server::new("modern-http-mrtr-session-isolation", "1.0.0")
+        let endpoint = Server::new("modern-http-mrtr-stateless-resume", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
             .tool(LiveHttpMrtrTool {
@@ -47341,33 +47362,36 @@ mod lib_unit_tests {
                 .expect("MRTR roots response must construct"),
         )
         .expect("MRTR roots response must serialize");
-        let retry = JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "live_http_mrtr",
-                "arguments": {},
-                "inputResponses": {"roots": roots},
-                "requestState": request_state,
-                "_meta": {
-                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                },
-            })),
-            907_i64,
-        );
-        let retry = HttpRequest::new(HttpMethod::Post, "/mcp")
-            .with_header("content-type", "application/json")
-            .with_header("accept", "application/json")
-            .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-            .with_header("mcp-method", "tools/call")
-            .with_header("mcp-name", "live_http_mrtr")
-            .with_body(serde_json::to_vec(&retry).expect("MRTR retry must encode"));
+        let retry = |state: &str, id: i64| {
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "live_http_mrtr",
+                    "arguments": {},
+                    "inputResponses": {"roots": roots.clone()},
+                    "requestState": state,
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                id,
+            );
+            HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("content-type", "application/json")
+                .with_header("accept", "application/json")
+                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                .with_header("mcp-method", "tools/call")
+                .with_header("mcp-name", "live_http_mrtr")
+                .with_body(serde_json::to_vec(&request).expect("MRTR retry must encode"))
+        };
 
-        let foreign = other_client
-            .handle(&cx, retry.clone())
-            .expect("foreign-session MRTR retry must receive JSON-RPC rejection");
+        let forged_state = format!("{request_state}-foreign");
+        let forged = issuing_client
+            .handle(&cx, retry(&forged_state, 907))
+            .expect("forged MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
-            foreign,
+            forged,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
                     response.id == Some(907_i64.into()) && response.error.is_some()
@@ -47376,23 +47400,40 @@ mod lib_unit_tests {
         assert_eq!(
             calls.load(Ordering::Acquire),
             1,
-            "a foreign admitted session must not consume or resume the issuing client's MRTR state",
+            "changing only requestState must not consume or resume the issued continuation",
         );
 
-        let resumed = issuing_client
-            .handle(&cx, retry)
-            .expect("issuing session MRTR retry must dispatch");
+        let valid_retry = retry(&request_state, 908);
+        let resumed = other_client
+            .handle(&cx, valid_retry.clone())
+            .expect("a later stateless session with the bound request must resume");
         assert!(matches!(
             resumed,
             ServerHttpEndpointResponse::Immediate(response)
                 if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
-                    response.id == Some(907_i64.into())
+                    response.id == Some(908_i64.into())
                         && response.error.is_none()
                         && response.result.as_ref().and_then(|result| result.get("resultType"))
                             == Some(&serde_json::json!("complete"))
                 })
         ));
         assert_eq!(calls.load(Ordering::Acquire), 2);
+
+        let replay = issuing_client
+            .handle(&cx, valid_retry)
+            .expect("a consumed MRTR state must receive a JSON-RPC rejection");
+        assert!(matches!(
+            replay,
+            ServerHttpEndpointResponse::Immediate(response)
+                if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
+                    response.id == Some(908_i64.into()) && response.error.is_some()
+                })
+        ));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "replaying consumed requestState must not reenter the handler",
+        );
     }
 
     #[test]

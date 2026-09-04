@@ -1947,7 +1947,7 @@ fn typed_roots_input_required() -> InputRequiredResult {
         "resultType": "input_required",
         "inputRequests": requests,
         // This handler-authored value is deliberately forged. The framework
-        // must replace it with its session-bound opaque request state.
+        // must replace it with opaque state bound to the admitted operation.
         "requestState": "handler-forged-resource-prompt-state",
     })
     .to_string();

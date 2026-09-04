@@ -268,13 +268,13 @@ impl InboundRequestContext {
     }
 }
 
-/// Durable state and retained-continuation ownership for one modern stdio
-/// connection or retained modern HTTP session.
+/// State and retained-continuation ownership for a modern transport boundary.
 ///
-/// Dropping the owner is a terminal peer-disconnect event: it cancels every
-/// MRTR continuation minted by requests on this connection or session.
-/// Request contexts retain only clones of its state and cancellation capability, so a retained
-/// continuation cannot outlive the connection or session that issued it.
+/// Durable stdio and custom-transport owners cancel their MRTR continuations
+/// when disconnected or dropped. Ephemeral HTTP request owners are different:
+/// their mutable state is request-local, while eligible router-owned opaque
+/// continuations can survive that one POST for a later bound stateless retry.
+/// Request contexts retain only clones of the state and cancellation capability.
 pub struct ModernConnection {
     state: SessionState,
     continuation_cancellation: fastmcp_core::McpRequestCancellation,
@@ -298,7 +298,9 @@ impl ModernConnection {
 
     /// One modern HTTP POST. The bag is request-local: disable/enable can
     /// publish `list_changed` without a durable `Mcp-Session-Id`, and the
-    /// response cache must not treat it as a partition identity.
+    /// response cache must not treat it as a partition identity. Eligible
+    /// MRTR state is owned separately by the router and bound to the resumed
+    /// operation rather than to this ephemeral bag.
     pub(crate) fn new_request_local() -> Self {
         Self::with_state(SessionState::ephemeral())
     }
@@ -317,7 +319,7 @@ impl ModernConnection {
         self.continuation_cancellation.cancel();
     }
 
-    pub fn is_ephemeral(&self) -> bool {
+    pub(crate) fn is_ephemeral(&self) -> bool {
         self.state.is_ephemeral()
     }
 
