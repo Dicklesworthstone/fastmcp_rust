@@ -27,10 +27,7 @@ const FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE: Duration = Duration::from_millis(
 const LOOPBACK_FIXTURE_DEADLINE: Duration = Duration::from_secs(2);
 const LOOPBACK_FIXTURE_ACK_DEADLINE: Duration = Duration::from_millis(2500);
 const LOOPBACK_FIXTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/static_mcp_server.sh"
-);
+const STATIC_MCP_SERVER_FIXTURE: &str = include_str!("fixtures/static_mcp_server.sh");
 const INSPECT_PROTOCOL_WIRE_PREFIX: &str = "FASTMCP_E2E_WIRE ";
 
 const MODERN_INSPECT_FIXTURE: &str = r#"
@@ -193,6 +190,7 @@ const LEGACY_PLANTED_INITIALIZED_NOTIFICATION: &str =
 const LEGACY_PLANTED_TOOLS_LIST_REQUEST: &str =
     r#"{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}"#;
 
+#[cfg(feature = "legacy-2024-11-05")]
 const UNAUTHORIZED_DISCOVERY_REJECTION_INSPECT_FIXTURE: &str = r#"
 emit_wire() {
     printf 'FASTMCP_E2E_WIRE %s\n' "$1" >&2
@@ -461,6 +459,7 @@ fn assert_modern_negotiation_wire(wire: &[serde_json::Value]) {
     assert_exact_modern_discovery_request(&wire[0]);
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn assert_legacy_lifecycle_wire(wire: &[serde_json::Value]) {
     assert_eq!(
         wire.iter().map(request_method).collect::<Vec<_>>(),
@@ -481,10 +480,12 @@ fn assert_legacy_lifecycle_wire(wire: &[serde_json::Value]) {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn assert_legacy_negotiation_wire(wire: &[serde_json::Value]) {
     assert_legacy_lifecycle_wire(wire);
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn assert_auto_legacy_fallback_wire(wire: &[serde_json::Value]) {
     assert_eq!(
         request_method(
@@ -1756,6 +1757,7 @@ fn e2e_test_json_report_against_static_protocol_fixture() {
         "120",
         "/bin/sh",
         "--",
+        "-c",
         STATIC_MCP_SERVER_FIXTURE,
     ]);
 
@@ -2780,7 +2782,7 @@ printf "FASTMCP_TEST_STUBBORN_PID=%s\n" "$stubborn_pid" >&2
 # to /dev/null. Save the inherited MCP request pipe before starting the
 # asynchronous list, then close both extra descriptor copies promptly.
 exec 3<&0
-/bin/sh -c 'exec 3<&-; trap "" HUP; printf "FASTMCP_TEST_DESCENDANT_PID=%s\n" "$$" >&2; exec /bin/sh "$1"' fastmcp-descendant "$1" <&3 &
+/bin/sh -c 'exec 3<&-; trap "" HUP; printf "FASTMCP_TEST_DESCENDANT_PID=%s\n" "$$" >&2; exec /bin/sh -c "$1"' fastmcp-descendant "$1" <&3 &
 exec 3<&-
 exit 0
 "#;
@@ -2852,7 +2854,7 @@ fn reality_check_regression_e2e_test_owner_death_stops_anchored_group() {
     const DELAYED_SERVER: &str = r#"
 printf "FASTMCP_TEST_OWNER_DEATH_PID=%s\n" "$$" >&2
 /bin/sleep 30
-exec /bin/sh "$1"
+exec /bin/sh -c "$1"
 "#;
 
     let mut command = Command::new(fastmcp_bin());
@@ -3114,7 +3116,7 @@ fn e2e_static_protocol_fixture_ignores_nested_notification_ids() {
     let mut command = Command::new("/bin/sh");
     command.args([
         "-c",
-        r#"printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":99}}' '{"jsonrpc":"2.0","method":"ping","id":7}' | /bin/sh "$1""#,
+        r#"printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"id":99}}' '{"jsonrpc":"2.0","method":"ping","id":7}' | /bin/sh -c "$1""#,
         "fixture-notification-probe",
         STATIC_MCP_SERVER_FIXTURE,
     ]);

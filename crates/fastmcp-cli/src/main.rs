@@ -632,6 +632,10 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
 
+        /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
+        #[arg(long, value_name = "PATH", requires = "http_url")]
+        bearer_token_file: Option<PathBuf>,
+
         /// Explicit MCP 2024-11-05 SSE GET endpoint (requires the legacy feature).
         #[arg(long, value_name = "URL")]
         legacy_sse_url: Option<String>,
@@ -857,6 +861,9 @@ struct TaskConnection {
     /// Explicit modern Streamable HTTP POST endpoint.
     #[arg(long, global = true)]
     http_url: Option<String>,
+    /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
+    #[arg(long, global = true, value_name = "PATH", requires = "http_url")]
+    bearer_token_file: Option<PathBuf>,
     /// Emit one JSON document per snapshot, acknowledgement, or watch event.
     #[arg(long, global = true)]
     json: bool,
@@ -1193,6 +1200,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
         Commands::Inspect {
             server,
             http_url,
+            bearer_token_file,
             legacy_sse_url,
             legacy_message_url,
             args,
@@ -1217,12 +1225,16 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             {
                 Box::pin(cmd_inspect_http(
                     cx,
-                    http_url.as_deref(),
-                    legacy_sse_url.as_deref(),
-                    legacy_message_url.as_deref(),
+                    http_inspect_protocol_plan(
+                        http_url.as_deref(),
+                        legacy_sse_url.as_deref(),
+                        legacy_message_url.as_deref(),
+                        protocol_policy,
+                    )?,
                     format,
                     output.as_deref(),
                     protocol_policy,
+                    bearer_token_file.as_deref(),
                 ))
                 .await
             }
@@ -5785,6 +5797,89 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
     Ok(())
 }
 
+/// Read only a bounded regular file, without echoing its path or contents in
+/// diagnostics. Nonblocking open prevents a Unix FIFO from hanging admission.
+fn read_http_bearer_credential(
+    resource: CanonicalHttpUrl,
+    path: &Path,
+) -> McpResult<fastmcp_client::http_auth::BoundBearerCredential> {
+    const MAX_FILE_BYTES: u64 = 16 * 1024;
+    let invalid = || {
+        fastmcp_core::McpError::invalid_params(
+            "--bearer-token-file must be a readable regular UTF-8 token file of 1-16384 bytes, with at most one trailing LF or CRLF and no other whitespace or control bytes",
+        )
+    };
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        File::from(
+            rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|_| invalid())?,
+        )
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
+            return Err(invalid());
+        }
+        File::open(path).map_err(|_| invalid())?
+    };
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > MAX_FILE_BYTES as usize {
+        return Err(invalid());
+    }
+    let token = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    let token = token
+        .strip_suffix("\r\n")
+        .or_else(|| token.strip_suffix('\n'))
+        .unwrap_or(token);
+    if token
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(invalid());
+    }
+    fastmcp_client::http_auth::BoundBearerCredential::bind(resource, token).map_err(|_| invalid())
+}
+
+/// Both HTTP command families use the SDK's exact-endpoint credential binding.
+fn http_client_builder(
+    plan: ClientProtocolPlan,
+    bearer_token_file: Option<&Path>,
+) -> McpResult<ClientBuilder> {
+    let credential = bearer_token_file
+        .map(|path| {
+            let target = plan
+                .modern_post_target()
+                .and_then(|target| CanonicalHttpUrl::parse(target).ok())
+                .filter(|target| target.as_str().starts_with("https://"))
+                .filter(|_| !matches!(plan.policy(), ProtocolPolicy::LegacyOnly))
+                .ok_or_else(|| {
+                    fastmcp_core::McpError::invalid_params(
+                        "--bearer-token-file requires an HTTPS --http-url and a modern or auto protocol policy",
+                    )
+                })?;
+            read_http_bearer_credential(target, path)
+        })
+        .transpose()?;
+    let mut builder = ClientBuilder::new().protocol_plan(plan);
+    if let Some(credential) = credential {
+        builder = builder.http_bearer_credential(credential);
+    }
+    Ok(builder)
+}
+
 #[cfg(feature = "tasks")]
 fn read_task_inputs(path: &Path) -> McpResult<fastmcp_protocol::TaskInputResponses> {
     const MAX_INPUT_BYTES: u64 = 1024 * 1024;
@@ -6080,7 +6175,10 @@ async fn run_http_task(
         None,
         CliProtocolPolicy::ModernOnly,
     )?;
-    let mut client = Client::http_with_cx(plan, cx).await.map_err(error)?;
+    let mut client = http_client_builder(plan, connection.bearer_token_file.as_deref())?
+        .connect_http_client_with_cx(cx)
+        .await
+        .map_err(error)?;
     if matches!(action, TaskAction::Cancel { .. }) {
         let result = client.cancel_final_task(cx, task_id).await.map_err(error)?;
         return write_task_event(connection.json, "cancellation-acknowledged", &result);
@@ -6452,21 +6550,15 @@ fn parse_http_inspect_endpoint(
 /// shipped dual-era client.
 async fn cmd_inspect_http(
     cx: &Cx,
-    http_url: Option<&str>,
-    legacy_sse_url: Option<&str>,
-    legacy_message_url: Option<&str>,
+    protocol_plan: ClientProtocolPlan,
     format: InspectFormat,
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
+    bearer_token_file: Option<&Path>,
 ) -> McpResult<()> {
     validate_cli_protocol_policy(protocol_policy)?;
-    let protocol_plan = http_inspect_protocol_plan(
-        http_url,
-        legacy_sse_url,
-        legacy_message_url,
-        protocol_policy,
-    )?;
-    let mut client = Client::http_with_cx(protocol_plan, cx)
+    let mut client = http_client_builder(protocol_plan, bearer_token_file)?
+        .connect_http_client_with_cx(cx)
         .await
         .map_err(|error| {
             fastmcp_core::McpError::internal_error(format!(

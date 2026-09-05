@@ -34,10 +34,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
-const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/static_mcp_server.sh"
-);
+const STATIC_MCP_SERVER_FIXTURE: &str = include_str!("fixtures/static_mcp_server.sh");
 
 struct TestTempDir {
     path: PathBuf,
@@ -680,11 +677,13 @@ fn run_cli(args: &[&str]) -> Output {
 
 #[cfg(unix)]
 fn fixture_server_args<'a>(prefix: &[&'a str], after_server: &[&'a str]) -> Vec<&'a str> {
-    let mut args = Vec::with_capacity(prefix.len() + after_server.len() + 3);
+    let mut args = Vec::with_capacity(prefix.len() + after_server.len() + 4);
     args.extend_from_slice(prefix);
     args.push("/bin/sh");
     args.extend_from_slice(after_server);
-    args.extend_from_slice(&["--", STATIC_MCP_SERVER_FIXTURE]);
+    // The same fixture bytes remain usable when RCH reuses this test binary
+    // after retiring its original compilation checkout.
+    args.extend_from_slice(&["--", "-c", STATIC_MCP_SERVER_FIXTURE]);
     args
 }
 
@@ -1768,6 +1767,146 @@ fn e2e_cli_test_json_option() {
     assert!(stdout.contains("--json"), "Should support --json output");
 }
 
+#[test]
+fn cli_http_bearer_file_grammar() {
+    let read_help = |args: &[&str]| {
+        let mut command = Command::new(get_binary_path());
+        command
+            .args(args)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("FORCE_COLOR");
+        run_command(command)
+    };
+    let help = read_help(&["inspect", "--help"]);
+    assert!(help.status.success());
+    assert!(
+        stdout_str(&help).contains("--bearer-token-file <PATH>"),
+        "{}",
+        stdout_str(&help)
+    );
+    let missing_http = run_cli(&["inspect", "--bearer-token-file", "token.txt"]);
+    assert!(!missing_http.status.success());
+    assert!(stderr_str(&missing_http).contains("--http-url"));
+    #[cfg(feature = "tasks")]
+    {
+        let help = read_help(&["tasks", "get", "--help"]);
+        assert!(help.status.success());
+        assert!(
+            stdout_str(&help).contains("--bearer-token-file <PATH>"),
+            "{}",
+            stdout_str(&help)
+        );
+        let missing_http = run_cli(&[
+            "tasks",
+            "get",
+            "task-id",
+            "--bearer-token-file",
+            "token.txt",
+        ]);
+        assert!(!missing_http.status.success());
+        assert!(stderr_str(&missing_http).contains("--http-url"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_http_bearer_file_refuses_invalid_inputs_before_contact() {
+    let root = TestTempDir::new("bearer-file-admission");
+    let path = root.join("credential-path-canary");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let https = format!("https://{address}/mcp");
+    let invoke = |endpoint: &str, file: &Path| {
+        let mut command = Command::new(get_binary_path());
+        command
+            .args([
+                "inspect",
+                "--protocol-policy",
+                "modern-only",
+                "--http-url",
+                endpoint,
+                "--bearer-token-file",
+            ])
+            .arg(file);
+        let result = run_with_deadline(command, Duration::from_secs(3))
+            .expect("invalid credential admission must not wait for network traffic");
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(!stderr_str(&result).contains("credential-path-canary"));
+        assert!(!stderr_str(&result).contains("credential-content-canary"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        result
+    };
+    std::fs::write(&path, "credential-content-canary\n").unwrap();
+    let cleartext = invoke(&format!("http://{address}/mcp"), &path);
+    assert!(stderr_str(&cleartext).contains("requires an HTTPS --http-url"));
+    for (index, bytes) in [
+        Vec::new(),
+        b"\n".to_vec(),
+        b"credential-content-canary\nsecond-line".to_vec(),
+        b"credential-content-canary\r".to_vec(),
+        b"Bearer credential-content-canary".to_vec(),
+        b"credential-content-canary\0".to_vec(),
+        "credential-content-canary\u{009b}".as_bytes().to_vec(),
+        vec![0xff],
+        vec![b'x'; 16 * 1024 + 1],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(&path, &bytes).unwrap();
+        let result = invoke(&https, &path);
+        assert!(stderr_str(&result).contains("readable regular UTF-8 token file"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(root.join(format!("case-{index}.stderr")), &result.stderr).unwrap();
+    }
+    invoke(&https, &root.join("missing"));
+    invoke(&https, &root);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_http_bearer_file_refuses_fifo_without_blocking() {
+    let root = TestTempDir::new("bearer-fifo");
+    let fifo = root.join("token.fifo");
+    let created = Command::new("mkfifo").arg(&fifo).output().unwrap();
+    assert!(created.status.success(), "{}", stderr_str(&created));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = Command::new(get_binary_path());
+    command
+        .args([
+            "inspect",
+            "--protocol-policy",
+            "modern-only",
+            "--http-url",
+            &format!("https://{}/mcp", listener.local_addr().unwrap()),
+            "--bearer-token-file",
+        ])
+        .arg(&fifo);
+    let result = run_with_deadline(command, Duration::from_secs(3))
+        .expect("a FIFO with no writer must not block credential admission");
+    assert!(!result.status.success());
+    assert!(stderr_str(&result).contains("readable regular UTF-8 token file"));
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(
+        std::fs::symlink_metadata(fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
 #[cfg(not(feature = "tasks"))]
 #[test]
 fn cli_02_feature_off_is_actionable_and_absent_from_help() {
@@ -1801,6 +1940,392 @@ fn cli_02_a_planted_negative() {
             "removed custom task command: {removed}"
         );
     }
+}
+
+/// Actual TLS termination and bearer admission in front of the compiled
+/// framework fixture. This does not claim native server auth qualification.
+#[cfg(all(unix, feature = "e2e-fixture", feature = "native-tls-roots"))]
+mod authenticated_http {
+    use super::*;
+    use serde_json::Value;
+
+    pub(super) struct TlsProxy {
+        pub(super) root: TestTempDir,
+        pub(super) token: String,
+        pub(super) endpoint: String,
+        process: ProcessGroupGuard,
+    }
+
+    fn openssl(root: &Path, label: &str, arguments: &[&str]) {
+        let mut command = Command::new("openssl");
+        command.current_dir(root).args(arguments);
+        let output = run_command(command);
+        std::fs::write(root.join(format!("openssl-{label}.stdout")), &output.stdout).unwrap();
+        std::fs::write(root.join(format!("openssl-{label}.stderr")), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "openssl {label}: {}",
+            stderr_str(&output)
+        );
+    }
+
+    fn wait_for_text(path: &Path, text: &str) {
+        let start = Instant::now();
+        while !std::fs::read_to_string(path).is_ok_and(|value| value.contains(text)) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "readiness missing: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn framework_http(root: &Path) -> (ProcessGroupGuard, String) {
+        let ready = root.join("backend.ready");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"));
+        command
+            .arg("--http-ready")
+            .arg(&ready)
+            .stdout(std::fs::File::create(root.join("backend.stdout")).unwrap())
+            .stderr(std::fs::File::create(root.join("backend.stderr")).unwrap());
+        let process = ProcessGroupGuard::spawn(&mut command);
+        wait_for_text(&ready, "http://");
+        (process, std::fs::read_to_string(ready).unwrap())
+    }
+
+    impl TlsProxy {
+        pub(super) fn new(backend: &str) -> Self {
+            let root = TestTempDir::new("bearer-tls");
+            std::fs::create_dir(root.join("empty-roots")).unwrap();
+            std::fs::write(root.join("leaf.ext"), "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
+            openssl(
+                &root,
+                "ca",
+                &[
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    "ca.key",
+                    "-out",
+                    "ca.pem",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=FastMCP CLI ephemeral CA",
+                ],
+            );
+            openssl(
+                &root,
+                "leaf",
+                &[
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    "leaf.key",
+                    "-out",
+                    "leaf.csr",
+                    "-subj",
+                    "/CN=localhost",
+                ],
+            );
+            openssl(
+                &root,
+                "sign",
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "leaf.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-out",
+                    "leaf.pem",
+                    "-days",
+                    "1",
+                    "-extfile",
+                    "leaf.ext",
+                ],
+            );
+            let token = format!("cli-bearer-{}", root.file_name().unwrap().to_string_lossy());
+            std::fs::write(root.join("token.txt"), format!("{token}\r\n")).unwrap();
+            let mut command = Command::new("python3");
+            command
+                .arg("-c")
+                .arg(TLS_PROXY)
+                .current_dir(&root)
+                .env("CLI_TLS_BACKEND", backend)
+                .env("CLI_TLS_TOKEN", &token)
+                .stdout(std::fs::File::create(root.join("proxy.stdout")).unwrap())
+                .stderr(std::fs::File::create(root.join("proxy.stderr")).unwrap());
+            let process = ProcessGroupGuard::spawn(&mut command);
+            wait_for_text(&root.join("ready"), "https://");
+            let endpoint = std::fs::read_to_string(root.join("ready")).unwrap();
+            println!("CLI TLS observations retained at {}", root.display());
+            Self {
+                root,
+                token,
+                endpoint,
+                process,
+            }
+        }
+
+        pub(super) fn command(&self, arguments: &[&str]) -> Command {
+            let mut command = Command::new(get_binary_path());
+            command
+                .args(arguments)
+                .args(["--http-url", &self.endpoint, "--bearer-token-file"])
+                .arg(self.root.join("token.txt"))
+                .env("SSL_CERT_FILE", self.root.join("ca.pem"))
+                .env("SSL_CERT_DIR", self.root.join("empty-roots"));
+            command
+        }
+
+        pub(super) fn run(&self, label: &str, arguments: &[&str]) -> Output {
+            let output = run_command(self.command(arguments));
+            std::fs::write(self.root.join(format!("{label}.stdout")), &output.stdout).unwrap();
+            std::fs::write(self.root.join(format!("{label}.stderr")), &output.stderr).unwrap();
+            assert!(!stdout_str(&output).contains(&self.token));
+            assert!(!stderr_str(&output).contains(&self.token));
+            output
+        }
+
+        pub(super) fn observations(&self) -> Vec<Value> {
+            let path = self.root.join("requests.jsonl");
+            if !path.exists() {
+                return Vec::new();
+            }
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        pub(super) fn stop(&mut self) {
+            self.process
+                .kill_and_reap()
+                .expect("TLS proxy process group cleanup");
+        }
+    }
+
+    const INSPECT: &[&str] = &[
+        "inspect",
+        "--protocol-policy",
+        "modern-only",
+        "--format",
+        "json",
+    ];
+
+    fn assert_catalog(output: &Output) {
+        assert!(output.status.success(), "{}", stderr_str(output));
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["server"]["name"], "fastmcp-cli-e2e-server");
+        assert_eq!(document["protocol"]["version"], "2026-07-28");
+        assert!(
+            document["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "echo")
+        );
+        assert!(
+            document["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["uri"] == "test://status")
+        );
+        assert!(
+            document["prompts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt["name"] == "greeting")
+        );
+    }
+
+    #[test]
+    fn cli_http_bearer_file_positive() {
+        let root = TestTempDir::new("bearer-inspect");
+        let (mut backend, endpoint) = framework_http(&root);
+        let mut proxy = TlsProxy::new(&endpoint);
+        assert_catalog(&proxy.run("inspect", INSPECT));
+        let rows = proxy.observations();
+        assert!(rows.len() >= 4);
+        assert!(rows.iter().all(|row| row["authorized"] == true
+            && row["forwarded"] == true
+            && row["path"] == "/mcp"));
+        for method in [
+            "server/discover",
+            "tools/list",
+            "resources/list",
+            "prompts/list",
+        ] {
+            assert!(rows.iter().any(|row| row["method"] == method));
+        }
+        proxy.stop();
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+
+    #[test]
+    fn cli_http_bearer_file_planted_negative() {
+        let root = TestTempDir::new("bearer-inspect-negative");
+        let (mut backend, endpoint) = framework_http(&root);
+        let mut proxy = TlsProxy::new(&endpoint);
+        std::fs::write(
+            proxy.root.join("token.txt"),
+            format!("{}-wrong\r\n", proxy.token),
+        )
+        .unwrap();
+        let rejected = proxy.run("wrong-token", INSPECT);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        let rows = proxy.observations();
+        assert_eq!(rows.len(), 1, "no authenticated fallback or retry");
+        assert_eq!(rows[0]["authorized"], false);
+        assert_eq!(rows[0]["forwarded"], false);
+        // Change only the token bytes in the same file; the same CLI now reads the catalog.
+        std::fs::write(proxy.root.join("token.txt"), format!("{}\r\n", proxy.token)).unwrap();
+        assert_catalog(&proxy.run("correct-token", INSPECT));
+        assert!(
+            proxy.observations()[1..]
+                .iter()
+                .all(|row| row["forwarded"] == true)
+        );
+        proxy.stop();
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+
+    #[test]
+    fn cli_http_bearer_file_untrusted_ca() {
+        let root = TestTempDir::new("bearer-inspect-ca");
+        let (mut backend, endpoint) = framework_http(&root);
+        let mut proxy = TlsProxy::new(&endpoint);
+        openssl(
+            &proxy.root,
+            "untrusted",
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                "untrusted.key",
+                "-out",
+                "untrusted.pem",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=Unrelated CLI CA",
+            ],
+        );
+        let mut command = proxy.command(INSPECT);
+        command.env("SSL_CERT_FILE", proxy.root.join("untrusted.pem"));
+        let rejected = run_command(command);
+        std::fs::write(proxy.root.join("untrusted.stderr"), &rejected.stderr).unwrap();
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(!stderr_str(&rejected).contains(&proxy.token));
+        assert!(
+            proxy.observations().is_empty(),
+            "untrusted TLS cannot reach HTTP admission"
+        );
+        assert_catalog(&proxy.run("trusted", INSPECT));
+        proxy.stop();
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+
+    #[test]
+    fn cli_http_bearer_file_reflected_error_is_redacted() {
+        let root = TestTempDir::new("bearer-inspect-reflection");
+        let (mut backend, endpoint) = framework_http(&root);
+        let mut proxy = TlsProxy::new(&endpoint);
+        assert_catalog(&proxy.run("ordinary", INSPECT));
+        let before = proxy.observations().len();
+        std::fs::write(proxy.root.join("reflect-error"), "enabled").unwrap();
+        let rejected = proxy.run("reflected", INSPECT);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(stderr_str(&rejected).contains("payload withheld"));
+        let rows = proxy.observations();
+        assert_eq!(rows.len(), before + 1);
+        assert_eq!(rows[before]["authorized"], true);
+        assert_eq!(rows[before]["forwarded"], false);
+        proxy.stop();
+        backend.kill_and_reap().expect("framework HTTP cleanup");
+    }
+
+    const TLS_PROXY: &str = r"
+import http.client, http.server, json, os, pathlib, ssl, threading, urllib.parse
+backend = urllib.parse.urlsplit(os.environ['CLI_TLS_BACKEND'])
+log_lock = threading.Lock()
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *args): pass
+    def do_POST(self):
+        length = int(self.headers['Content-Length'])
+        assert 0 < length <= 1048576
+        body = self.rfile.read(length)
+        request = json.loads(body)
+        authorized = self.headers.get('Authorization') == 'Bearer ' + os.environ['CLI_TLS_TOKEN']
+        reflect = pathlib.Path('reflect-error').exists()
+        with log_lock:
+            with open('requests.jsonl', 'a') as log:
+                log.write(json.dumps({'method':request.get('method'), 'path':self.path, 'authorized':authorized, 'forwarded':authorized and not reflect})+'\n')
+        if not authorized:
+            self.respond(401, b'Unauthorized', 'text/plain')
+            return
+        if reflect:
+            payload = {'jsonrpc':'2.0','id':request['id'],'error':{'code':-32603,'message':os.environ['CLI_TLS_TOKEN']}}
+            self.respond(200, json.dumps(payload).encode(), 'application/json')
+            return
+        connection = http.client.HTTPConnection(backend.hostname, backend.port, timeout=30)
+        try:
+            headers = {key:value for key,value in self.headers.items() if key.lower() not in ['host','connection','authorization']}
+            connection.request('POST', self.path, body, headers)
+            response = connection.getresponse()
+            self.send_response(response.status)
+            for key,value in response.getheaders():
+                if key.lower() not in ['connection','content-length','transfer-encoding']:
+                    self.send_header(key,value)
+            self.send_header('Transfer-Encoding','chunked')
+            self.end_headers()
+            while True:
+                chunk = response.read1(65536)
+                if not chunk: break
+                self.wfile.write(('%x\r\n' % len(chunk)).encode()+chunk+b'\r\n')
+                self.wfile.flush()
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            connection.close()
+    def respond(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header('Content-Type',content_type)
+        self.send_header('Content-Length',str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+server = http.server.ThreadingHTTPServer(('127.0.0.1',0),Proxy)
+server.daemon_threads = True
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain('leaf.pem','leaf.key')
+server.socket = context.wrap_socket(server.socket,server_side=True)
+pathlib.Path('ready').write_text('https://127.0.0.1:%d/mcp' % server.server_port)
+server.serve_forever()
+";
 }
 
 #[cfg(all(unix, feature = "tasks", feature = "e2e-fixture"))]
@@ -2090,6 +2615,153 @@ mod task_commands {
         let wrong = run_cli(&["tasks", "get", &wrong_id, "--http-url", &endpoint, "--json"]);
         assert!(!wrong.status.success());
         assert!(wrong.stdout.is_empty());
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[cfg(feature = "native-tls-roots")]
+    #[test]
+    fn cli_02_b_authenticated_http_watch_update_cancel() {
+        let fixture = TaskFixture::new(true);
+        let (mut server, endpoint) = fixture.http();
+        let mut proxy = super::authenticated_http::TlsProxy::new(&endpoint);
+        let snapshot = proxy.run("get", &["tasks", "get", fixture.id(), "--json"]);
+        assert_eq!(document(&snapshot)["data"], fixture.task);
+
+        let output_path = proxy.root.join("watch.stdout");
+        let error_path = proxy.root.join("watch.stderr");
+        let mut command = proxy.command(&[
+            "tasks",
+            "watch",
+            fixture.id(),
+            "--json",
+            "--max-events",
+            "1",
+            "--timeout",
+            "20",
+        ]);
+        command
+            .stdout(std::fs::File::create(&output_path).unwrap())
+            .stderr(std::fs::File::create(&error_path).unwrap());
+        let mut watch = ProcessGroupGuard::spawn(&mut command);
+        wait_for_file(&output_path, "watch-acknowledged");
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let update = proxy.run(
+            "update",
+            &[
+                "tasks",
+                "update",
+                fixture.id(),
+                "--json",
+                "--input-file",
+                input.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(document(&update)["event"], "update-acknowledged");
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("bounded authenticated watch exits after update");
+        assert!(status.success());
+        let stdout = std::fs::read_to_string(output_path).unwrap();
+        let stderr = std::fs::read_to_string(error_path).unwrap();
+        assert!(!stdout.contains(&proxy.token));
+        assert!(!stderr.contains(&proxy.token));
+        let events: Vec<Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["data"], fixture.task);
+        assert_eq!(events[2]["event"], "task-updated");
+        assert_eq!(events[2]["data"]["taskId"], fixture.task["taskId"]);
+        assert_eq!(events[2]["data"]["status"], "working");
+        assert_eq!(events[3]["data"]["reason"], "max-events");
+        let changed: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(changed["taskId"], fixture.task["taskId"]);
+        assert_eq!(changed["status"], "working");
+        assert!(changed.get("inputRequests").is_none());
+        let cancel = proxy.run("cancel", &["tasks", "cancel", fixture.id(), "--json"]);
+        let cancel = document(&cancel);
+        assert_eq!(cancel["event"], "cancellation-acknowledged");
+        assert!(cancel["data"].get("status").is_none());
+        let observations = proxy.observations();
+        assert!(
+            observations
+                .iter()
+                .all(|row| row["authorized"] == true && row["forwarded"] == true)
+        );
+        for method in [
+            "server/discover",
+            "tasks/get",
+            "subscriptions/listen",
+            "tasks/update",
+            "tasks/cancel",
+        ] {
+            assert!(
+                observations.iter().any(|row| row["method"] == method),
+                "missing authenticated {method}"
+            );
+        }
+        proxy.stop();
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[cfg(feature = "native-tls-roots")]
+    #[test]
+    fn cli_02_b_authenticated_http_planted_negative() {
+        let fixture = TaskFixture::new(true);
+        let original = std::fs::read(fixture.root.join("task.json")).unwrap();
+        let (mut server, endpoint) = fixture.http();
+        let mut proxy = super::authenticated_http::TlsProxy::new(&endpoint);
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let args = [
+            "tasks",
+            "update",
+            fixture.id(),
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+        ];
+        std::fs::write(
+            proxy.root.join("token.txt"),
+            format!("{}-wrong\r\n", proxy.token),
+        )
+        .unwrap();
+        let rejected = proxy.run("wrong-token", &args);
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        let observations = proxy.observations();
+        assert_eq!(
+            observations.len(),
+            1,
+            "credential rejection must not retry or fall back"
+        );
+        assert_eq!(observations[0]["authorized"], false);
+        assert_eq!(observations[0]["forwarded"], false);
+        assert_eq!(
+            std::fs::read(fixture.root.join("task.json")).unwrap(),
+            original
+        );
+        assert!(!fixture.root.join("changed.json").exists());
+
+        std::fs::write(proxy.root.join("token.txt"), format!("{}\r\n", proxy.token)).unwrap();
+        let admitted = proxy.run("correct-token", &args);
+        assert_eq!(document(&admitted)["event"], "update-acknowledged");
+        let changed: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(changed["taskId"], fixture.task["taskId"]);
+        assert_eq!(changed["status"], "working");
+        assert!(changed.get("inputRequests").is_none());
+        assert!(
+            proxy.observations()[1..]
+                .iter()
+                .all(|row| row["authorized"] == true && row["forwarded"] == true)
+        );
+        proxy.stop();
         server.kill_and_reap().expect("HTTP server cleanup");
     }
 

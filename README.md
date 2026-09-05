@@ -470,8 +470,18 @@ sanitizes fields and redacts recognizable credentials.
 
 Use `--server EXECUTABLE` and repeat `--server-arg ARGUMENT` for stdio. Each
 command starts a fresh process, so previously issued task IDs require a store
-retained outside the prior process. HTTP bearer-token configuration is not yet
-exposed by these commands. Core-only builds omit Tasks from help and explain
+retained outside the prior process. For authenticated HTTPS, Tasks commands and
+`inspect` accept `--bearer-token-file PATH`:
+
+```bash
+cargo run -p fastmcp-cli --features tasks,native-tls-roots -- tasks get TASK_ID --http-url https://mcp.example.com/mcp --bearer-token-file token.txt --json
+```
+
+The file must contain a UTF-8 token of at most 16 KiB, including an optional
+trailing LF or CRLF. Do not include a `Bearer ` prefix or other whitespace or
+control characters. The CLI reads a regular file once per invocation; callers
+own token acquisition and refresh. Credentials require HTTPS and a modern or
+auto protocol policy. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
 ### Authenticated HTTP clients (current source tree)
@@ -494,14 +504,14 @@ The same credential binding covers discovery, later request/subscription
 POSTs, and reverse-response POSTs. It never attaches to cleartext HTTP, a different path or query, or a
 redirect target. An authenticated Auto client refuses legacy fallback.
 Applications own token acquisition and refresh; create a new client when the
-credential changes. The Tasks CLI still has no bearer-token option.
+credential changes. The CLI's `--bearer-token-file` uses this same binding.
 
 The bounded JSON/SSE readers withhold JSON-RPC errors that reflect the exact
 credential into their message or data, returning a typed diagnostic instead.
 Successful application results and the raw native-stream API remain unmodified.
 
 HTTPS uses the transport's bundled WebPKI roots by default. Enable
-`native-tls-roots` on `fastmcp-rust` or `fastmcp-client` for the platform trust
+`native-tls-roots` on `fastmcp-rust`, `fastmcp-client`, or `fastmcp-cli` for the platform trust
 store. That profile also honors the native certificate provider's
 `SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
 and do not disable certificate or hostname verification.

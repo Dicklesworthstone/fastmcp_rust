@@ -32,16 +32,26 @@ fn greeting(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
 }
 
 fn main() {
+    let http_ready = (std::env::args().nth(1).as_deref() == Some("--http-ready")).then(|| {
+        std::env::args()
+            .nth(2)
+            .expect("--http-ready requires an output path")
+    });
     let builder = ServerBuilder::new("fastmcp-cli-e2e-server", "1.0.0")
         .tool(Echo)
         .tool(SizedOutput)
         .resource(StatusResource)
         .prompt(GreetingPrompt);
     #[cfg(feature = "tasks")]
-    let builder = install_task_fixture(builder);
+    let builder = if http_ready.is_some() {
+        builder
+    } else {
+        install_task_fixture(builder)
+    };
     let server = builder.build();
     #[cfg(feature = "tasks")]
-    if let Some(ready_file) = std::env::args().nth(3) {
+    let http_ready = http_ready.or_else(|| std::env::args().nth(3));
+    if let Some(ready_file) = http_ready {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().expect("HTTP reactor"))
             .blocking_threads(0, 16)

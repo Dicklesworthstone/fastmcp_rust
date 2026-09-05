@@ -31,6 +31,8 @@ doc = false
 # ModernOnly CLI profile; it keeps unavailable policy spellings diagnostic but
 # cannot link legacy transport code.
 default = ["legacy-2024-11-05"]
+# Opt-in platform trust roots for HTTPS commands, including private-CA deployments.
+native-tls-roots = ["fastmcp-client/native-tls-roots"]
 legacy-2024-11-05 = [
     "fastmcp-protocol/legacy-2024-11-05",
     "fastmcp-transport/legacy-2024-11-05",
