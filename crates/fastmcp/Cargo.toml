@@ -38,6 +38,8 @@ tasks = [
     "fastmcp-derive/tasks",
     "fastmcp-console/tasks",
 ]
+# Opt-in platform trust roots, including the provider's certificate-file overrides.
+native-tls-roots = ["fastmcp-client/native-tls-roots"]
 apps = [
     "fastmcp-protocol/apps",
     "fastmcp-server/apps",

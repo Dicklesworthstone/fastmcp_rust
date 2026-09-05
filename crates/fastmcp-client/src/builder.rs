@@ -58,7 +58,7 @@ use fastmcp_transport::websocket::AsyncWsClientTransport;
 use crate::ReverseRequestCancellation;
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
-use crate::http_executor::ModernHttpExecutorError;
+use crate::http_executor::{HttpConnectionSettings, ModernHttpExecutorError};
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
@@ -200,6 +200,8 @@ pub struct ClientBuilder {
     mcp_apps_settings: Option<McpAppsClientSettings>,
     /// Frozen generic final extension descriptors, local settings, and resolver.
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    /// Caller-supplied credential bound to the exact modern HTTPS resource.
+    http_bearer_credential: Option<crate::http_auth::BoundBearerCredential>,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
     /// Whether the subprocess must be isolated in an owned Unix process group.
@@ -234,6 +236,10 @@ impl std::fmt::Debug for ClientBuilder {
                 &self.client_extension_runtime.is_some(),
             )
             .field("auto_initialize", &self.auto_initialize)
+            .field(
+                "http_bearer_configured",
+                &self.http_bearer_credential.is_some(),
+            )
             .field("owned_process_group", &self.owned_process_group)
             .finish()
     }
@@ -275,6 +281,7 @@ impl ClientBuilder {
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
             mcp_apps_settings: None,
             client_extension_runtime: None,
+            http_bearer_credential: None,
             auto_initialize: false,
             owned_process_group: false,
             protocol_plan: ClientProtocolPlan::stdio(DEFAULT_PROTOCOL_POLICY),
@@ -669,6 +676,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Supplies a caller-acquired bearer credential for modern HTTP.
+    ///
+    /// Before any connection, the credential must bind the plan's exact HTTPS
+    /// POST endpoint. Discovery, requests, subscriptions and reverse-response
+    /// POSTs use that binding. Authentication never follows a redirect or
+    /// falls back to a legacy endpoint; this setter does not acquire or refresh
+    /// credentials. The token is never included in builder diagnostics.
+    #[must_use]
+    pub fn http_bearer_credential(
+        mut self,
+        credential: crate::http_auth::BoundBearerCredential,
+    ) -> Self {
+        self.http_bearer_credential = Some(credential);
+        self
+    }
+
     /// Returns the immutable protocol plan that will be validated before connect.
     #[must_use]
     pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
@@ -725,13 +748,16 @@ impl ClientBuilder {
         let legacy_capabilities =
             legacy_capabilities_for_handlers(&client_capabilities, &reverse_request_handlers);
         let client_implementation = builder.client_implementation_for_session();
-        let mut connection = ClientHttpConnection::connect_with_extensions(
+        let mut connection = ClientHttpConnection::connect_with_settings(
             cx,
             builder.protocol_plan,
             builder.client_info.clone(),
             client_capabilities,
-            builder.mcp_apps_settings,
-            builder.client_extension_runtime,
+            HttpConnectionSettings {
+                mcp_apps: builder.mcp_apps_settings,
+                extensions: builder.client_extension_runtime,
+                bearer: builder.http_bearer_credential,
+            },
         )
         .await?;
         if let Some(implementation) = client_implementation {
@@ -801,13 +827,16 @@ impl ClientBuilder {
             reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
         }
         let client_implementation = builder.client_implementation_for_session();
-        let mut client = HttpClient::connect_with_extensions(
+        let mut client = HttpClient::connect_with_settings(
             cx,
             builder.protocol_plan,
             builder.client_info,
             client_capabilities,
-            builder.mcp_apps_settings,
-            builder.client_extension_runtime,
+            HttpConnectionSettings {
+                mcp_apps: builder.mcp_apps_settings,
+                extensions: builder.client_extension_runtime,
+                bearer: builder.http_bearer_credential,
+            },
             reverse_request_handlers,
         )
         .await?;

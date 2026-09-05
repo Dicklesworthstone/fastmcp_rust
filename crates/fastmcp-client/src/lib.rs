@@ -11039,34 +11039,35 @@ impl HttpClient {
         mcp_apps_settings: Option<McpAppsClientSettings>,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
-        Self::connect_with_extensions(
+        Self::connect_with_settings(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
-            mcp_apps_settings,
-            None,
+            http_executor::HttpConnectionSettings {
+                mcp_apps: mcp_apps_settings,
+                ..http_executor::HttpConnectionSettings::default()
+            },
             reverse_request_handlers,
         )
         .await
     }
 
-    pub(crate) async fn connect_with_extensions(
+    pub(crate) async fn connect_with_settings(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        mcp_apps_settings: Option<McpAppsClientSettings>,
-        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        settings: http_executor::HttpConnectionSettings,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
-        let mut connection = ClientHttpConnection::connect_with_extensions(
+        let mcp_apps_settings = settings.mcp_apps.clone();
+        let mut connection = ClientHttpConnection::connect_with_settings(
             cx,
             protocol_plan,
             client_info.clone(),
             client_capabilities.clone(),
-            mcp_apps_settings.clone(),
-            client_extension_runtime,
+            settings,
         )
         .await
         .map_err(HttpClientError::Connection)?;

@@ -117,6 +117,29 @@ impl BoundBearerCredential {
             None
         }
     }
+
+    /// Detects a peer reflecting this credential into an error's diagnostics.
+    /// Inspect decoded strings so JSON escaping cannot hide the token.
+    pub(crate) fn is_reflected_by_error(&self, error: &fastmcp_protocol::JsonRpcError) -> bool {
+        error.message.contains(&self.token)
+            || error
+                .data
+                .as_ref()
+                .is_some_and(|data| self.is_reflected_by_value(data))
+    }
+
+    fn is_reflected_by_value(&self, value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => text.contains(&self.token),
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| self.is_reflected_by_value(value))
+            }
+            serde_json::Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key.contains(&self.token) || self.is_reflected_by_value(value)),
+            value => value.to_string().contains(&self.token),
+        }
+    }
 }
 
 #[cfg(test)]

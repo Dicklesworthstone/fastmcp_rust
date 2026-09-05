@@ -319,17 +319,24 @@ impl ModernHttpRequest {
     }
 
     /// Attaches the bound bearer credential's `Authorization` header when —
-    /// and only when — `target` is canonically identical to the credential's
+    /// and only when — this request's target is canonically identical to the credential's
     /// bound HTTPS resource. Any other target leaves the request
     /// credential-free rather than downgrading or redirecting the token.
     #[must_use]
     pub fn with_authorization(
         mut self,
         credential: &crate::http_auth::BoundBearerCredential,
-        target: &fastmcp_core::CanonicalHttpUrl,
     ) -> Self {
-        self.authorization = credential.authorization_for_target(target);
+        self.authorization = self.bound_authorization(credential);
         self
+    }
+
+    fn bound_authorization(
+        &self,
+        credential: &crate::http_auth::BoundBearerCredential,
+    ) -> Option<String> {
+        let target = fastmcp_core::CanonicalHttpUrl::parse(&self.target).ok()?;
+        credential.authorization_for_target(&target)
     }
 
     /// Returns the configured absolute target supplied by the caller.
@@ -351,6 +358,13 @@ impl ModernHttpRequest {
     /// JSON-RPC body is not encoded.
     #[must_use]
     pub fn headers(&self) -> Vec<(String, String)> {
+        self.headers_with_credential(None)
+    }
+
+    fn headers_with_credential(
+        &self,
+        credential: Option<&crate::http_auth::BoundBearerCredential>,
+    ) -> Vec<(String, String)> {
         let mut headers = vec![
             (
                 "Content-Type".to_owned(),
@@ -372,8 +386,12 @@ impl ModernHttpRequest {
         if let Some(name) = &self.name {
             headers.push(("Mcp-Name".to_owned(), name.clone()));
         }
-        if let Some(authorization) = &self.authorization {
-            headers.push(("Authorization".to_owned(), authorization.clone()));
+        let authorization = match credential {
+            Some(credential) => self.bound_authorization(credential),
+            None => self.authorization.clone(),
+        };
+        if let Some(authorization) = authorization {
+            headers.push(("Authorization".to_owned(), authorization));
         }
         headers
     }
@@ -415,10 +433,21 @@ impl ModernHttpResponseMetadata {
 }
 
 /// A live native response stream, owned by one modern POST.
-#[derive(Debug)]
 pub struct ModernHttpResponseStream {
     metadata: ModernHttpResponseMetadata,
-    response: ClientStreamingResponse<ClientIo>,
+    // Keep the native connection state out of each enclosing request future.
+    // Ownership remains exclusive, including on cancellation and stream refusal.
+    response: Box<ClientStreamingResponse<ClientIo>>,
+    diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
+}
+
+impl fmt::Debug for ModernHttpResponseStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModernHttpResponseStream")
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModernHttpResponseStream {
@@ -431,7 +460,7 @@ impl ModernHttpResponseStream {
     /// Consumes this wrapper and returns the native cancel-aware response stream.
     #[must_use]
     pub fn into_native(self) -> ClientStreamingResponse<ClientIo> {
-        self.response
+        *self.response
     }
 
     /// Converts a validated modern SSE response into a bounded event stream.
@@ -452,6 +481,7 @@ impl ModernHttpResponseStream {
         }
         Ok(ModernHttpSseResponseStream {
             response: Some(self.response),
+            diagnostic_credential: self.diagnostic_credential,
             parser: Some(BoundedSseParser::new(limits)),
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
@@ -624,8 +654,27 @@ impl ModernHttpResponseStream {
             }
         }
 
+        reject_reflected_credential(self.diagnostic_credential.as_deref(), &bytes)?;
         Ok(bytes)
     }
+}
+
+/// Refuse a credential-bearing error before any public decoder can retain it
+/// in Display/Debug diagnostics. Unrelated errors and successful result bytes
+/// remain unchanged. This is not a general sanitizer for application content.
+fn reject_reflected_credential(
+    credential: Option<&crate::http_auth::BoundBearerCredential>,
+    bytes: &[u8],
+) -> Result<(), ModernHttpExecutorError> {
+    if let Some(credential) = credential
+        && let Ok(JsonRpcMessage::Response(response)) =
+            decode_strict_jsonrpc_message(bytes, bytes.len())
+        && let Some(error) = response.error
+        && credential.is_reflected_by_error(&error)
+    {
+        return Err(ModernHttpExecutorError::CredentialInPeerError);
+    }
+    Ok(())
 }
 
 /// One accepted record from a live final HTTP `subscriptions/listen` response.
@@ -1383,13 +1432,25 @@ fn decode_final_core_terminal(
 /// This owns both the native response body and the parser, so a parser
 /// refusal immediately drops the response body instead of allowing callers
 /// to continue using a malformed stream.
-#[derive(Debug)]
 pub struct ModernHttpSseResponseStream {
-    response: Option<ClientStreamingResponse<ClientIo>>,
+    response: Option<Box<ClientStreamingResponse<ClientIo>>>,
+    diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
     parser: Option<BoundedSseParser>,
     pending_events: VecDeque<String>,
     pending_event_bytes: usize,
     end_of_stream: Option<SseEndOfStream>,
+}
+
+impl fmt::Debug for ModernHttpSseResponseStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModernHttpSseResponseStream")
+            .field("response_open", &self.response.is_some())
+            .field("pending_event_count", &self.pending_events.len())
+            .field("pending_event_bytes", &self.pending_event_bytes)
+            .field("end_of_stream", &self.end_of_stream)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModernHttpSseResponseStream {
@@ -1400,6 +1461,7 @@ impl ModernHttpSseResponseStream {
     /// stream.
     fn close(&mut self) {
         self.response = None;
+        self.diagnostic_credential = None;
         self.parser = None;
         self.pending_events.clear();
         self.pending_event_bytes = 0;
@@ -1409,6 +1471,7 @@ impl ModernHttpSseResponseStream {
     fn released() -> Self {
         Self {
             response: None,
+            diagnostic_credential: None,
             parser: None,
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
@@ -1439,6 +1502,7 @@ impl ModernHttpSseResponseStream {
                 maximum_bytes: MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
             })?;
         debug_assert!(event_count <= MAX_PENDING_MODERN_HTTP_SSE_EVENTS);
+        reject_reflected_credential(self.diagnostic_credential.as_deref(), event.as_bytes())?;
         self.pending_events.push_back(event);
         self.pending_event_bytes = event_bytes;
         Ok(())
@@ -2136,6 +2200,9 @@ pub enum ModernHttpExecutorError {
     },
     /// The native response body could not be decoded while being consumed.
     ResponseBodyReadFailed,
+    /// A peer reflected the request's bearer credential into a JSON-RPC error.
+    /// The error payload is withheld so diagnostics cannot reproduce the token.
+    CredentialInPeerError,
     /// The bounded SSE parser refused a response body.
     SseParse(SseParseError),
     /// The SSE stream was already consumed, closed, or refused.
@@ -2193,6 +2260,8 @@ impl fmt::Display for ModernHttpExecutorError {
             Self::ResponseBodyReadFailed => {
                 formatter.write_str("modern MCP response body could not be read")
             }
+            Self::CredentialInPeerError => formatter
+                .write_str("modern MCP peer error disclosed a bearer credential; payload withheld"),
             Self::SseParse(error) => error.fmt(formatter),
             Self::SseStreamClosed => {
                 formatter.write_str("modern MCP SSE response stream is closed")
@@ -2215,6 +2284,7 @@ impl std::error::Error for ModernHttpExecutorError {}
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
     client: HttpClient,
+    bearer_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
 }
 
 impl Default for ModernHttpExecutor {
@@ -2229,6 +2299,16 @@ impl ModernHttpExecutor {
     pub fn new() -> Self {
         Self {
             client: native_http_client(),
+            bearer_credential: None,
+        }
+    }
+
+    fn with_bearer_credential(
+        bearer_credential: Option<crate::http_auth::BoundBearerCredential>,
+    ) -> Self {
+        Self {
+            client: native_http_client(),
+            bearer_credential: bearer_credential.map(Arc::new),
         }
     }
 
@@ -2273,7 +2353,7 @@ impl ModernHttpExecutor {
             cx,
             Method::Post,
             request.target(),
-            request.headers(),
+            request.headers_with_credential(self.bearer_credential.as_deref()),
             request.body().to_vec(),
         ));
         let response = match cancellation {
@@ -2300,7 +2380,18 @@ impl ModernHttpExecutor {
             return Err(ModernHttpExecutorError::Cancelled);
         }
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
-        Ok(ModernHttpResponseStream { metadata, response })
+        let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
+            let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
+            let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
+            crate::http_auth::BoundBearerCredential::bind(target, token)
+                .ok()
+                .map(Arc::new)
+        });
+        Ok(ModernHttpResponseStream {
+            metadata,
+            response: Box::new(response),
+            diagnostic_credential,
+        })
     }
 }
 
@@ -2311,6 +2402,15 @@ fn native_http_client() -> HttpClient {
         .no_cookie_store()
         .no_proxy()
         .build()
+}
+
+/// Immutable optional configuration shared by the public HTTP builder's
+/// discovery and ready-client construction paths.
+#[derive(Default)]
+pub(crate) struct HttpConnectionSettings {
+    pub(crate) mcp_apps: Option<McpAppsClientSettings>,
+    pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
+    pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
 }
 
 /// A configured native modern HTTP client after one successful modern probe.
@@ -3002,36 +3102,36 @@ impl ClientHttpConnection {
         client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
     ) -> Result<Self, ClientHttpConnectionError> {
-        Self::connect_with_extensions(
+        Self::connect_with_settings(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
-            mcp_apps_settings,
-            None,
+            HttpConnectionSettings {
+                mcp_apps: mcp_apps_settings,
+                ..HttpConnectionSettings::default()
+            },
         )
         .await
     }
 
-    pub(crate) async fn connect_with_extensions(
+    pub(crate) async fn connect_with_settings(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        mcp_apps_settings: Option<McpAppsClientSettings>,
-        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        settings: HttpConnectionSettings,
     ) -> Result<Self, ClientHttpConnectionError> {
         #[cfg(feature = "legacy-2024-11-05")]
         let legacy_client_capabilities = client_capabilities.clone();
         #[cfg(feature = "legacy-2024-11-05")]
-        let legacy_client_extension_runtime = client_extension_runtime.clone();
-        match ModernHttpClient::connect_with_extensions(
+        let legacy_client_extension_runtime = settings.extensions.clone();
+        match ModernHttpClient::connect_with_settings(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
-            mcp_apps_settings,
-            client_extension_runtime,
+            settings,
         )
         .await
         .map_err(ClientHttpConnectionError::Modern)?
@@ -4679,6 +4779,10 @@ pub enum ModernHttpClientError {
     },
     /// The supplied plan has no configured modern HTTP POST target.
     MissingModernPostTarget,
+    /// The credential does not bind the exact configured modern HTTPS target.
+    CredentialTargetMismatch,
+    /// An authenticated modern connection cannot fall back to a legacy route.
+    AuthenticatedLegacyFallback,
     /// A normal modern request requires object parameters so final metadata can
     /// be bound without changing the method-specific parameter shape.
     RequestParametersMustBeObject,
@@ -4803,6 +4907,11 @@ pub enum ModernHttpClientError {
 impl fmt::Display for ModernHttpClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CredentialTargetMismatch => formatter.write_str(
+                "HTTP bearer credential must bind the exact configured modern HTTPS endpoint",
+            ),
+            Self::AuthenticatedLegacyFallback => formatter
+                .write_str("authenticated modern HTTP cannot fall back to a legacy endpoint"),
             Self::FeatureUnavailable(error) => error.fmt(formatter),
             Self::ReverseRequestDispatch(error) => error.fmt(formatter),
             Self::ReverseResponsePostRejected { status } => write!(
@@ -4959,6 +5068,8 @@ impl std::error::Error for ModernHttpClientError {
             Self::InvalidJsonRpcResponse(error) => Some(error),
             Self::TypedResult(error) => Some(error),
             Self::MissingModernPostTarget
+            | Self::CredentialTargetMismatch
+            | Self::AuthenticatedLegacyFallback
             | Self::ReverseResponsePostRejected { .. }
             | Self::RequestParametersMustBeObject
             | Self::MissingRequestName { .. }
@@ -5019,27 +5130,43 @@ impl ModernHttpClient {
         client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
-        Self::connect_with_extensions(
+        Self::connect_with_settings(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
-            mcp_apps_settings,
-            None,
+            HttpConnectionSettings {
+                mcp_apps: mcp_apps_settings,
+                ..HttpConnectionSettings::default()
+            },
         )
         .await
     }
 
-    pub(crate) async fn connect_with_extensions(
+    pub(crate) async fn connect_with_settings(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        mcp_apps_settings: Option<McpAppsClientSettings>,
-        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        settings: HttpConnectionSettings,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
         validate_protocol_plan_feature(&protocol_plan)
             .map_err(ModernHttpClientError::FeatureUnavailable)?;
+        let HttpConnectionSettings {
+            mcp_apps: mcp_apps_settings,
+            extensions: client_extension_runtime,
+            bearer: bearer_credential,
+        } = settings;
+        if let Some(credential) = &bearer_credential {
+            let target = protocol_plan
+                .modern_post_target()
+                .and_then(|target| fastmcp_core::CanonicalHttpUrl::parse(target).ok());
+            if target.as_ref() != Some(credential.resource())
+                || matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly)
+            {
+                return Err(ModernHttpClientError::CredentialTargetMismatch);
+            }
+        }
         if cx.checkpoint().is_err() {
             return Err(ModernHttpClientError::Executor(
                 ModernHttpExecutorError::Cancelled,
@@ -5087,7 +5214,7 @@ impl ModernHttpClient {
             client_extensions.as_ref(),
         )?;
 
-        let probe_response = ModernHttpExecutor::new()
+        let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
             .execute(cx, &probe_request)
             .await
             .map_err(ModernHttpClientError::Executor)?;
@@ -5142,12 +5269,15 @@ impl ModernHttpClient {
                         server_discovery,
                         negotiated_extensions,
                     }),
-                    executor: ModernHttpExecutor::new(),
+                    executor: ModernHttpExecutor::with_bearer_credential(bearer_credential),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
                 }))
             }
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
+                if bearer_credential.is_some() {
+                    return Err(ModernHttpClientError::AuthenticatedLegacyFallback);
+                }
                 LegacySseHttpClient::connect(cx, protocol_plan)
                     .await
                     .map(ModernHttpConnectOutcome::LegacySse)
@@ -8689,6 +8819,39 @@ mod tests {
     const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
     const LEGACY_TEST_PEER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+    #[test]
+    fn pending_sse_debug_never_exposes_peer_payload() {
+        let token = "private-sse-diagnostic-canary";
+        let credential = crate::http_auth::BoundBearerCredential::bind(
+            CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap(),
+            token,
+        )
+        .unwrap();
+        let mut stream = super::ModernHttpSseResponseStream::released();
+        stream.diagnostic_credential = Some(Arc::new(credential));
+        stream.parser = Some(crate::sse::BoundedSseParser::new(
+            SseLimits::new(4096, 16384, 16).unwrap(),
+        ));
+        // A complete data line remains unadmitted until the blank terminator.
+        let pending = format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32603,\"message\":\"{token}\"}}}}\n"
+        );
+        stream.push_body_frame(pending.as_bytes()).unwrap();
+        assert!(stream.parser.as_ref().unwrap().buffered_bytes() >= token.len());
+        assert!(stream.pending_events.is_empty());
+        let diagnostic = format!("{stream:?}");
+        assert!(diagnostic.contains("pending_event_count: 0"));
+        assert!(!diagnostic.contains(token));
+        // Change only the missing event terminator: admission now refuses it.
+        assert!(matches!(
+            stream.push_body_frame(b"\n"),
+            Err(ModernHttpExecutorError::CredentialInPeerError)
+        ));
+        assert!(stream.parser.is_none());
+        assert!(stream.pending_events.is_empty());
+        assert!(!format!("{stream:?}").contains(token));
+    }
+
     fn persistent_state_with_waiter(
         request_id: RequestId,
         cancelled_response_ids: VecDeque<RequestId>,
@@ -8945,7 +9108,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let connection = runtime_block_on(ClientHttpConnection::connect_with_extensions(
+        let connection = runtime_block_on(ClientHttpConnection::connect_with_settings(
             &cx,
             plan(
                 &modern_target,
@@ -8958,11 +9121,14 @@ mod tests {
                 version: "1.0.0".to_owned(),
             },
             ClientCapabilities::default(),
-            Some(
-                McpAppsClientSettings::new(vec![compatibility_mime_type.to_owned()])
-                    .expect("compatibility Apps test MIME is valid"),
-            ),
-            Some(generic_mcp_apps_runtime(generic_mime_type)),
+            super::HttpConnectionSettings {
+                mcp_apps: Some(
+                    McpAppsClientSettings::new(vec![compatibility_mime_type.to_owned()])
+                        .expect("compatibility Apps test MIME is valid"),
+                ),
+                extensions: Some(generic_mcp_apps_runtime(generic_mime_type)),
+                bearer: None,
+            },
         ))
         .expect("generic Apps discovery selects the modern connection");
         assert_eq!(

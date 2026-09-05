@@ -1878,8 +1878,27 @@ mod tests {
 
     #[test]
     fn config_loader_load_all_surfaces_an_existing_malformed_file() {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        let error = ConfigLoader::from_path(manifest)
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock is after the epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fastmcp-config-loader-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("exclusively create the runtime fixture directory");
+        let path = directory.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{"fixture":{"command":"echo"}}}"#)
+            .expect("write a valid config at the runtime path");
+        let loader = ConfigLoader::from_path(&path);
+        let valid = loader.load_all().expect("read the existing valid config");
+        assert_eq!(valid.server_names(), vec!["fixture"]);
+        assert_eq!(valid.get_server("fixture").unwrap().command, "echo");
+
+        // Change only the contents of the same existing file. Its error must
+        // propagate instead of being treated like a missing optional config.
+        std::fs::write(&path, "{malformed JSON").expect("plant invalid config contents");
+        let error = loader
             .load_all()
             .expect_err("an existing non-JSON file must not be silently omitted");
 

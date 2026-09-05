@@ -1648,6 +1648,13 @@ pub mod auto {
             Self::from_inner(self.inner.protocol_plan(protocol_plan))
         }
 
+        /// Binds caller-acquired authentication to the exact modern HTTPS endpoint.
+        /// Authenticated discovery never falls back to an exact-2024 endpoint.
+        #[must_use]
+        pub fn http_bearer_credential(self, credential: crate::BoundBearerCredential) -> Self {
+            Self::from_inner(self.inner.http_bearer_credential(credential))
+        }
+
         /// Returns the protocol plan that this builder will validate on connect.
         #[must_use]
         pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
@@ -3071,6 +3078,15 @@ pub mod modern {
                 .connect_websocket_with_cx(cx, transport)
                 .await
                 .map(WebSocketClient::from_inner)
+        }
+
+        /// Binds caller-acquired authentication to the exact modern HTTPS endpoint.
+        /// The endpoint passed to connect must match the credential's resource.
+        #[must_use]
+        pub fn http_bearer_credential(self, credential: crate::BoundBearerCredential) -> Self {
+            Self {
+                inner: self.inner.http_bearer_credential(credential),
+            }
         }
 
         /// Connects this configured final-only builder over one final HTTP endpoint

@@ -474,6 +474,38 @@ retained outside the prior process. HTTP bearer-token configuration is not yet
 exposed by these commands. Core-only builds omit Tasks from help and explain
 the required feature when a Tasks command is attempted.
 
+### Authenticated HTTP clients (current source tree)
+
+The SDK accepts a caller-acquired bearer credential bound to one exact HTTPS
+endpoint. For example, with a caller-owned `cx` and an existing `token`:
+
+```rust
+use fastmcp_rust::{BoundBearerCredential, CanonicalHttpUrl, modern};
+
+let endpoint = CanonicalHttpUrl::parse("https://mcp.example.com/mcp")?;
+let credential = BoundBearerCredential::bind(endpoint.clone(), token)?;
+let client = modern::ClientBuilder::new()
+    .http_bearer_credential(credential)
+    .connect_http_with_cx(endpoint, cx)
+    .await?;
+```
+
+The same credential binding covers discovery, later request/subscription
+POSTs, and reverse-response POSTs. It never attaches to cleartext HTTP, a different path or query, or a
+redirect target. An authenticated Auto client refuses legacy fallback.
+Applications own token acquisition and refresh; create a new client when the
+credential changes. The Tasks CLI still has no bearer-token option.
+
+The bounded JSON/SSE readers withhold JSON-RPC errors that reflect the exact
+credential into their message or data, returning a typed diagnostic instead.
+Successful application results and the raw native-stream API remain unmodified.
+
+HTTPS uses the transport's bundled WebPKI roots by default. Enable
+`native-tls-roots` on `fastmcp-rust` or `fastmcp-client` for the platform trust
+store. That profile also honors the native certificate provider's
+`SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
+and do not disable certificate or hostname verification.
+
 ---
 
 ## Quick Start

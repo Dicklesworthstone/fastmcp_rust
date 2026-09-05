@@ -17,6 +17,9 @@ default = ["legacy-2024-11-05"]
 legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "fastmcp-transport/legacy-2024-11-05"]
 tasks = ["fastmcp-protocol/tasks"]
 apps = ["fastmcp-protocol/apps", "dep:html5ever"]
+# Use the operating system trust store for private-CA HTTPS deployments.
+# Without this option, the transport's bundled WebPKI roots remain in use.
+native-tls-roots = ["asupersync/tls-native-roots"]
 # Opt-in caller-upgraded async WebSocket client. This does not add URI parsing,
 # HTTP Upgrade, or a blocking byte-stream client.
 websocket-experimental = ["fastmcp-transport/websocket-experimental"]
