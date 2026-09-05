@@ -50,11 +50,11 @@
   identity and revision. Uncommitted authentication, local-only state views,
   allocation failure, or state mutation during a request cause cache admission
   to fail closed rather than sharing an entry.
-- **Authentication admission is incomplete:** recognized credentials in JSON-RPC
-  params are supported only as a legacy fallback and are stripped before
-  extension middleware and handlers. The public turnkey HTTP path is live,
-  but no complete transport-boundary native `Authorization`
-  admission/challenge integration is qualified.
+- **Authentication admission is incomplete:** native HTTP accepts credentials
+  only from `Authorization`; recognized body/meta and query credential fields
+  are rejected before the provider or application runs. Other adapters retain
+  a stripped legacy JSON-RPC credential fallback. Complete authorization,
+  lease/revocation, and OAuth challenge qualification remain open.
 - **Legacy Tasks RPC stays dead:** `tasks/list` and `tasks/submit` return
   JSON-RPC `MethodNotFound`. Official MCP 2026-07-28 methods `tasks/get`,
   `tasks/update`, and `tasks/cancel` are served by default (process-local
@@ -757,7 +757,7 @@ fn commit_revision(
 | **Request Cancellation Ownership** | Unix modern stdio request work runs in independently owned bounded child contexts, but process-exiting shutdown does not wait unboundedly for a non-cooperative child; cancellation therefore is not yet a complete quiescence or `awaitCleanup` guarantee |
 | **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
-| **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. Public turnkey HTTP is live, but no complete transport-boundary native `Authorization` admission/challenge path is qualified |
+| **Authentication Admission** | Native HTTP requires `Authorization` for protected requests and rejects recognized body/meta and query credential fields before provider invocation. Other adapters retain a stripped legacy fallback. Complete authorization, lease/revocation, and OAuth challenge qualification remain open |
 | **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store |
 | **HTTP as_proxy auto-follow** | A gateway HTTP `as_proxy` does not auto-follow an upstream server `input_required` task across POSTs; per-request dispatch is stateless and upstream request state cannot resume. Callers resume such upstream tasks through an explicit matching `tasks/update` |
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
@@ -777,13 +777,13 @@ A: Stdio integration exists, but compatibility must be checked against the clien
 
 **Q: How do I add authentication?**
 
-A: Static-token, OAuth, and OIDC implementation code exists, but OAuth/OIDC
-production security and profile conformance remain unverified. Recognized
-credentials in JSON-RPC params are only a legacy fallback; FastMCP authenticates
-them and strips those fields before extension middleware and handlers. The
-quarantined private HTTP helper carries native `Authorization` metadata through
-pre-dispatch admission, but a public transport integration still needs a
-qualified admission/challenge boundary, TLS, and profile-specific validation.
+A: Install an `AuthProvider` through the server builder. Native HTTP uses the
+`Authorization` header and rejects recognized credentials in JSON-RPC params,
+their `_meta`/`headers` containers, and query parameters with a fixed migration
+diagnostic. Static tokens remain a non-OAuth deployment mode; applications own
+TLS termination and token provisioning. Other transport adapters retain a
+stripped legacy JSON-RPC credential fallback. OAuth/OIDC production security,
+continuous authorization and profile conformance remain unverified.
 
 **Q: What's the performance overhead of checkpoints?**
 

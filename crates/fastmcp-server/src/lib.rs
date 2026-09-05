@@ -5879,12 +5879,26 @@ impl HttpLegacyCancellationControl {
                             .inner
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let authorization = match transport_authorization_from_http_request(request)
+                        {
+                            Ok(authorization) => authorization,
+                            Err(response) => return response,
+                        };
+                        let receipt = match self.server.preauthenticate_http_request(
+                            cx,
+                            &notification,
+                            &authorization,
+                        ) {
+                            Ok(receipt) => receipt,
+                            Err(response) => return response,
+                        };
                         let cancellation =
                             match self.server.authenticate_cancelled_control_notification(
                                 cx,
                                 &self.session_principal,
                                 ProtocolEra::Legacy2024,
                                 &mut notification,
+                                Some(&receipt),
                             ) {
                                 Ok(cancellation) => cancellation,
                                 Err(_) => return HttpResponse::bad_request(),
@@ -9437,6 +9451,11 @@ fn h1_request_to_transport(
 fn h1_transport_authorization(
     request: &asupersync::http::h1::Request,
 ) -> Result<TransportAuthorization, HttpResponse> {
+    if let Some((_, query)) = request.uri.split_once('?')
+        && auth::query_has_access_credentials(query)
+    {
+        return Err(native_http_credential_location_rejection());
+    }
     let mut singleton = None;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("authorization") {
@@ -9455,6 +9474,13 @@ fn h1_transport_authorization(
 fn transport_authorization_from_http_request(
     request: &HttpRequest,
 ) -> Result<TransportAuthorization, HttpResponse> {
+    if request
+        .query
+        .keys()
+        .any(|name| auth::query_has_access_credentials(name))
+    {
+        return Err(native_http_credential_location_rejection());
+    }
     let mut singleton = None;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("authorization") {
@@ -9471,6 +9497,15 @@ fn transport_authorization_from_http_request(
 /// detail and never reflects a credential.
 fn native_http_authentication_rejection() -> HttpResponse {
     HttpResponse::new(HttpStatus::UNAUTHORIZED).with_header("www-authenticate", "Bearer")
+}
+
+/// A fixed migration diagnostic: neither the source name nor its value is
+/// reflected, and no provider has been invoked for this credential location.
+fn native_http_credential_location_rejection() -> HttpResponse {
+    native_http_authentication_rejection().with_json(&serde_json::json!({
+        "error": "invalid_request",
+        "message": "HTTP credentials must use the Authorization header"
+    }))
 }
 
 fn oauth_http_no_store(response: HttpResponse) -> HttpResponse {
@@ -16281,6 +16316,7 @@ impl Server {
                         &session_principal,
                         era,
                         &mut request,
+                        None,
                     ) {
                         Ok(cancellation) => {
                             let cancellation_accepted = if matches!(era, ProtocolEra::Modern2026) {
@@ -19449,25 +19485,36 @@ impl Server {
             request.params.as_ref(),
             request_id_to_u64(request.id.as_ref()),
         );
-        if self.auth_provider.is_some() && !auth_request.has_any_credential_source() {
+        if auth_request.has_in_band_credential_source() {
+            return Err(native_http_credential_location_rejection());
+        }
+        if self.auth_provider.is_some() && auth_request.transport_authorization.is_none() {
             return Err(native_http_authentication_rejection());
         }
-        self.authenticate_request_without_commit(
-            &McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref())),
-            auth_request,
-        )
-        .map(|(fingerprint, authenticated)| {
-            let mut sanitized = request.clone();
-            auth::strip_recognized_access_credentials(&mut sanitized.params);
-            AuthAdmissionReceipt {
-                method: sanitized.method,
-                request_id: request_id_to_u64(sanitized.id.as_ref()),
-                sanitized_params: sanitized.params,
-                fingerprint,
-                authenticated,
-            }
-        })
-        .map_err(|_| native_http_authentication_rejection())
+        let budget = self.create_request_budget(cx);
+        Self::enforce_request_budget(cx, budget)
+            .map_err(|_| native_http_authentication_rejection())?;
+        let (request_ctx, _request_lease_guard) =
+            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
+                .with_budget_ceiling(budget)
+                .begin_request_scope()
+                .ok_or_else(native_http_authentication_rejection)?;
+        let admitted = self.authenticate_request_without_commit(&request_ctx, auth_request);
+        Self::enforce_request_context(&request_ctx)
+            .map_err(|_| native_http_authentication_rejection())?;
+        admitted
+            .map(|(fingerprint, authenticated)| {
+                let mut sanitized = request.clone();
+                auth::strip_recognized_access_credentials(&mut sanitized.params);
+                AuthAdmissionReceipt {
+                    method: sanitized.method,
+                    request_id: request_id_to_u64(sanitized.id.as_ref()),
+                    sanitized_params: sanitized.params,
+                    fingerprint,
+                    authenticated,
+                }
+            })
+            .map_err(|_| native_http_authentication_rejection())
     }
 
     /// Authenticates one modern ingress request before extension middleware
@@ -19627,6 +19674,7 @@ impl Server {
         principal_binding: &SessionPrincipalBinding,
         era: ProtocolEra,
         request: &mut JsonRpcRequest,
+        http_receipt: Option<&AuthAdmissionReceipt>,
     ) -> McpResult<CancellationWireMessage> {
         let budget = self.create_request_budget(cx);
         Self::enforce_request_budget(cx, budget)?;
@@ -19637,13 +19685,18 @@ impl Server {
                 .ok_or_else(|| {
                     McpError::internal_error("request scope could not be established")
                 })?;
-        let auth_request = AuthRequest {
-            method: &request.method,
-            params: request.params.as_ref(),
-            transport_authorization: None,
-            request_id: request_id_to_u64(request.id.as_ref()),
+        let fingerprint = match http_receipt {
+            Some(receipt) => receipt.commit_legacy(&request_ctx, request)?,
+            None => self.authenticate_request(
+                &request_ctx,
+                AuthRequest {
+                    method: &request.method,
+                    params: request.params.as_ref(),
+                    transport_authorization: None,
+                    request_id: request_id_to_u64(request.id.as_ref()),
+                },
+            )?,
         };
-        let fingerprint = self.authenticate_request(&request_ctx, auth_request)?;
         auth::strip_recognized_access_credentials(&mut request.params);
         let cancellation =
             CancellationWireMessage::decode(era, CancellationSender::Client, request)
@@ -28314,6 +28367,7 @@ mod lib_unit_tests {
                 &binding,
                 ProtocolEra::Legacy2024,
                 &mut cancellation,
+                None,
             )
             .expect_err("a control frame must not establish session ownership");
         assert_eq!(error.code, McpErrorCode::ResourceForbidden);
@@ -28338,6 +28392,7 @@ mod lib_unit_tests {
                     &binding,
                     ProtocolEra::Legacy2024,
                     &mut cancellation,
+                    None,
                 )
                 .is_ok()
         );
@@ -36755,6 +36810,470 @@ mod lib_unit_tests {
             }
             Ok(())
         });
+    }
+
+    #[derive(Clone)]
+    struct HttpHeaderAuthProbe {
+        provider: Arc<auth::TokenAuthProvider>,
+        provider_calls: Arc<AtomicUsize>,
+        middleware_calls: Arc<AtomicUsize>,
+        handler_calls: Arc<AtomicUsize>,
+        token: String,
+        subject: String,
+    }
+
+    impl HttpHeaderAuthProbe {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock must follow the Unix epoch")
+                .as_nanos();
+            let token = format!("auth01-{}-{nonce}", std::process::id());
+            let subject = format!("http-principal-{nonce}");
+            let verifier = auth::StaticTokenVerifier::new([(
+                token.clone(),
+                AuthContext::with_subject(subject.clone()),
+            )])
+            .expect("runtime-selected static credential must be admissible");
+            Self {
+                provider: Arc::new(auth::TokenAuthProvider::new(verifier)),
+                provider_calls: Arc::new(AtomicUsize::new(0)),
+                middleware_calls: Arc::new(AtomicUsize::new(0)),
+                handler_calls: Arc::new(AtomicUsize::new(0)),
+                token,
+                subject,
+            }
+        }
+
+        fn effects(&self) -> (usize, usize, usize) {
+            (
+                self.provider_calls.load(Ordering::Acquire),
+                self.middleware_calls.load(Ordering::Acquire),
+                self.handler_calls.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    impl AuthProvider for HttpHeaderAuthProbe {
+        fn authenticate(
+            &self,
+            ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            self.provider_calls.fetch_add(1, Ordering::AcqRel);
+            self.provider.authenticate(ctx, request)
+        }
+    }
+
+    impl Middleware for HttpHeaderAuthProbe {
+        fn on_request(
+            &self,
+            ctx: &McpContext,
+            request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            self.middleware_calls.fetch_add(1, Ordering::AcqRel);
+            let serialized = serde_json::to_string(request)
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            if serialized.contains(&self.token)
+                || ctx.auth().and_then(|auth| auth.subject).as_deref() != Some(&self.subject)
+            {
+                return Err(McpError::internal_error(
+                    "HTTP credential custody or principal changed",
+                ));
+            }
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+
+    impl ToolHandler for HttpHeaderAuthProbe {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "http_header_auth_probe".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.handler_calls.fetch_add(1, Ordering::AcqRel);
+            if arguments
+                != serde_json::json!({"token": "application-data", "access_token": "application-data"})
+            {
+                return Err(McpError::internal_error(
+                    "application arguments changed during authentication",
+                ));
+            }
+            Ok(vec![Content::text(
+                ctx.auth().and_then(|auth| auth.subject).unwrap_or_default(),
+            )])
+        }
+    }
+
+    fn require_http_credential_location_rejection(
+        response: &[u8],
+        token: &str,
+    ) -> Result<(), String> {
+        if !response.starts_with(b"HTTP/1.1 401")
+            || live_http_response_header(response, "www-authenticate")? != "Bearer"
+            || response
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        {
+            return Err("credential location did not produce a secret-free HTTP 401".to_owned());
+        }
+        let body: serde_json::Value = serde_json::from_slice(live_http_response_body(response)?)
+            .map_err(|error| error.to_string())?;
+        if body
+            != serde_json::json!({
+                "error": "invalid_request",
+                "message": "HTTP credentials must use the Authorization header",
+            })
+        {
+            return Err(
+                "credential location rejection lost its fixed migration message".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn auth_01_http_header_probe(reject_forbidden_locations: bool) {
+        run_live_http_test(move |cx| async move {
+            let probe = HttpHeaderAuthProbe::new();
+            let bound = Server::new("auth-01-http-header", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern policy must be available")
+                .auth_provider(probe.clone())
+                .middleware(probe.clone())
+                .tool(probe.clone())
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let caller_cx = cx.clone();
+            let mut client = cx.spawn(move |_client_cx| async move {
+                let result = async {
+                    let authorization = format!("Bearer {}", probe.token);
+                    let mut request = modern_http_json_tool_request("http_header_auth_probe", 945);
+                    let mut body: serde_json::Value = serde_json::from_slice(&request.body)
+                        .map_err(|error| error.to_string())?;
+                    body["params"]["arguments"] = serde_json::json!({
+                        "token": "application-data", "access_token": "application-data",
+                    });
+                    request.body = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+                    for (index, accept) in ["application/json", "text/event-stream"].into_iter().enumerate() {
+                        let common = [
+                            ("Accept", accept),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "tools/call"),
+                            ("Mcp-Name", "http_header_auth_probe"),
+                        ];
+                        let mut headers = common.to_vec();
+                        headers.push(("Authorization", authorization.as_str()));
+                        let mut rejected_locations = 0;
+                        if reject_forbidden_locations {
+                            let before = probe.effects();
+                            for container in [None, Some("_meta"), Some("headers")] {
+                                for field in ["authorization", "Authorization", "auth", "token", "access_token", "accessToken"] {
+                                    let mut forbidden = body.clone();
+                                    let destination = match container {
+                                        Some(container) => &mut forbidden["params"][container],
+                                        None => &mut forbidden["params"],
+                                    };
+                                    destination[field] = serde_json::json!(authorization);
+                                    let forbidden = serde_json::to_vec(&forbidden).map_err(|error| error.to_string())?;
+                                    for credential_headers in [&common[..], &headers[..]] {
+                                        let rejected = live_http_exchange(address, live_http_post("/mcp?application_context=permitted", &forbidden, credential_headers)).await?;
+                                        require_http_credential_location_rejection(&rejected, &probe.token)?;
+                                        rejected_locations += 1;
+                                        if probe.effects() != before {
+                                            return Err(format!("body credential invoked provider/middleware/handler: container={container:?}, field={field}"));
+                                        }
+                                    }
+                                }
+                            }
+                            for field in ["access_token", "%61ccess_token", "ACCESS_TOKEN", "authorization", "auth", "token", "accessToken"] {
+                                for credential_headers in [&common[..], &headers[..]] {
+                                    let rejected = live_http_exchange(address, live_http_post(
+                                        &format!("/mcp?application_context=permitted&{field}={}", probe.token), &request.body, credential_headers,
+                                    )).await?;
+                                    require_http_credential_location_rejection(&rejected, &probe.token)?;
+                                    rejected_locations += 1;
+                                    if probe.effects() != before {
+                                        return Err(format!("query credential invoked provider/middleware/handler: field={field}"));
+                                    }
+                                }
+                            }
+                        }
+                        let accepted = live_http_exchange(address, live_http_post(
+                            "/mcp?application_context=permitted", &request.body, &headers,
+                        )).await?;
+                        if !accepted.starts_with(b"HTTP/1.1 200") {
+                            return Err(format!("native header did not reach the {accept} handler"));
+                        }
+                        let responses = if accept == "application/json" {
+                            vec![serde_json::from_slice::<JsonRpcResponse>(live_http_response_body(&accepted)?)
+                                .map_err(|error| error.to_string())?]
+                        } else {
+                            live_http_chunked_sse_messages(&accepted)?.into_iter().filter_map(|message| {
+                                if let JsonRpcMessage::Response(response) = message { Some(response) } else { None }
+                            }).collect::<Vec<_>>()
+                        };
+                        if responses.len() != 1 || responses[0].id != Some(945_i64.into())
+                            || responses[0].error.is_some()
+                            || responses[0].result.as_ref().and_then(|result| result.pointer("/content/0/text")).and_then(serde_json::Value::as_str) != Some(probe.subject.as_str())
+                            || probe.effects() != (index + 1, index + 1, index + 1)
+                        {
+                            return Err(format!("native header lost its principal, response, or exactly-once effects: {accept}"));
+                        }
+                        eprintln!("{}", serde_json::json!({
+                            "proof": "auth_01_http_header", "bead": "bd-f6apv",
+                            "transport": accept, "listener": address.to_string(),
+                            "runtime_subject": probe.subject, "request_id": 945,
+                            "response_frame": String::from_utf8_lossy(&accepted),
+                            "response_sha256": sha256_bounded(&accepted, 65_536).map_err(|error| error.to_string())?.as_bytes(),
+                            "effects": probe.effects(), "responses": responses.len(),
+                            "rejected_locations": rejected_locations,
+                            "expected_rejections": if reject_forbidden_locations { 50 } else { 0 },
+                            "finished_unix_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos(),
+                        }));
+                    }
+                    Ok::<_, String>(())
+                }.await;
+                caller_cx.cancel_with(CancelKind::User, Some("AUTH-01 HTTP probe complete"));
+                result
+            }).map_err(|error| error.to_string())?;
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("HTTP auth probe client failed: {error:?}"))??;
+            require_quiescent_http_shutdown(
+                serve.map_err(|error| error.to_string())?,
+                "AUTH-01 HTTP",
+            )
+            .await
+        });
+    }
+
+    #[test]
+    fn auth_01_http_header_only_positive() {
+        auth_01_http_header_probe(false);
+    }
+
+    #[test]
+    fn auth_01_http_body_query_planted_negative() {
+        auth_01_http_header_probe(true);
+        // Direct embedding retains raw query names too: the same encoded
+        // credential must be rejected before a session era or provider changes.
+        let cx = Cx::for_testing();
+        let probe = HttpHeaderAuthProbe::new();
+        let endpoint = Server::new("auth-01-direct-http", "1.0.0")
+            .auth_provider(probe.clone())
+            .middleware(probe.clone())
+            .tool(probe.clone())
+            .build_http_endpoint("http://auth.test")
+            .expect("endpoint must build");
+        let mut session = endpoint.open_session(&cx).expect("session must open");
+        for request in [
+            modern_http_json_tool_request("http_header_auth_probe", 945),
+            HttpRequest::new(HttpMethod::Get, "/sse"),
+        ] {
+            let response = session
+                .handle(
+                    &cx,
+                    request
+                        .with_header("Authorization", format!("Bearer {}", probe.token))
+                        .with_query("%61ccess_token", &probe.token),
+                )
+                .expect("credential refusal must be an HTTP response");
+            assert!(
+                matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
+            );
+            assert_eq!(session.selected_era, None);
+            assert_eq!(probe.effects(), (0, 0, 0));
+        }
+        cx.cancel_with(CancelKind::User, Some("cancel before HTTP authentication"));
+        let response = session
+            .handle(
+                &cx,
+                modern_http_json_tool_request("http_header_auth_probe", 945)
+                    .with_header("Authorization", format!("Bearer {}", probe.token)),
+            )
+            .expect("cancelled authentication must return an HTTP refusal");
+        assert!(
+            matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
+        );
+        assert_eq!(session.selected_era, None);
+        assert_eq!(probe.effects(), (0, 0, 0));
+        let expired =
+            Cx::for_testing_with_budget(Budget::new().with_deadline(asupersync::Time::ZERO));
+        let mut session = endpoint
+            .open_session(&Cx::for_testing())
+            .expect("deadline probe must start with a fresh live session");
+        let response = session
+            .handle(
+                &expired,
+                modern_http_json_tool_request("http_header_auth_probe", 945)
+                    .with_header("Authorization", format!("Bearer {}", probe.token)),
+            )
+            .expect("expired authentication must return an HTTP refusal");
+        assert!(
+            matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
+        );
+        assert_eq!(session.selected_era, None);
+        assert_eq!(probe.effects(), (0, 0, 0));
+    }
+
+    fn auth_01_http_legacy_cancellation_probe(reject_forbidden_locations: bool) {
+        run_live_http_test(move |cx| async move {
+            let probe = HttpHeaderAuthProbe::new();
+            let started = Arc::new(AtomicBool::new(false));
+            let observed_cancellation = Arc::new(AtomicBool::new(false));
+            let bound = Server::new("auth-01-legacy-cancellation", "1.0.0")
+                .auth_provider(probe.clone())
+                .middleware(probe.clone())
+                .tool(LiveLegacyCancellationTool {
+                    started: Arc::clone(&started),
+                    observed_cancellation: Arc::clone(&observed_cancellation),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let legacy_sessions = Arc::clone(&bound.legacy_sessions);
+            let caller_cx = cx.clone();
+            let mut client = cx.spawn(move |client_cx| async move {
+                let result = async {
+                    let authorization = format!("Bearer {}", probe.token);
+                    let headers = [("Authorization", authorization.as_str())];
+                    let (_sse, session_id, _received) = open_live_legacy_http_session(address, &headers).await?;
+                    let path = format!("/messages?session_id={session_id}");
+                    for request in [
+                        JsonRpcRequest::new("initialize", Some(serde_json::json!({
+                            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "clientInfo": {"name": "auth-01-legacy", "version": "1.0.0"},
+                        })), 946_i64),
+                        JsonRpcRequest::notification("notifications/initialized", None),
+                    ] {
+                        let body = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+                        let response = live_http_exchange(address, live_http_post(&path, &body, &headers)).await?;
+                        if !response.starts_with(b"HTTP/1.1 202") {
+                            return Err("header-authenticated legacy setup failed".to_owned());
+                        }
+                    }
+                    let target_id = RequestId::Number(947);
+                    let target = JsonRpcRequest::new("tools/call", Some(serde_json::json!({
+                        "name": "live_legacy_cancellation_tool", "arguments": {},
+                    })), target_id.clone());
+                    let target_body = serde_json::to_vec(&target).map_err(|error| error.to_string())?;
+                    let target_request = live_http_post(&path, &target_body, &headers);
+                    let mut target = client_cx.spawn(move |_| async move {
+                        live_http_exchange(address, target_request).await
+                    }).map_err(|error| error.to_string())?;
+                    let deadline = client_cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                    while !started.load(Ordering::Acquire) {
+                        asupersync::time::timeout_at(deadline,
+                            asupersync::time::sleep(client_cx.now(), Duration::from_millis(1)))
+                            .await.map_err(|_| live_http_test_timeout("AUTH-01 active legacy handler"))?;
+                    }
+                    let session = legacy_sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&session_id).cloned().ok_or_else(|| "legacy session missing".to_owned())?;
+                    let cancellation = session.cancellation.admissions.admitted_request_cancellation(&target_id)
+                        .ok_or_else(|| "active legacy cancellation authority missing".to_owned())?;
+                    let notification = serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": target_id, "reason": "AUTH-01 header cancellation"},
+                    });
+                    let before = probe.effects();
+                    let mut rejected_locations = 0;
+                    if reject_forbidden_locations {
+                        for container in [None, Some("_meta"), Some("headers")] {
+                            let mut forbidden = notification.clone();
+                            match container {
+                                Some(container) => forbidden["params"][container]["token"] = serde_json::json!(probe.token),
+                                None => forbidden["params"]["token"] = serde_json::json!(probe.token),
+                            }
+                            let body = serde_json::to_vec(&forbidden).map_err(|error| error.to_string())?;
+                            for credential_headers in [&[][..], &headers[..]] {
+                                let rejected = live_http_exchange(address, live_http_post(&path, &body, credential_headers)).await?;
+                                require_http_credential_location_rejection(&rejected, &probe.token)?;
+                                rejected_locations += 1;
+                                if probe.effects() != before || cancellation.is_cancel_requested()
+                                    || observed_cancellation.load(Ordering::Acquire) || !matches!(target.try_join(), Ok(None))
+                                {
+                                    return Err("body credential changed provider or active cancellation state".to_owned());
+                                }
+                            }
+                        }
+                        let body = serde_json::to_vec(&notification).map_err(|error| error.to_string())?;
+                        let rejected = live_http_exchange(address, live_http_post(
+                            &format!("{path}&%61ccess_token={}", probe.token), &body, &headers,
+                        )).await?;
+                        require_http_credential_location_rejection(&rejected, &probe.token)?;
+                        rejected_locations += 1;
+                        if probe.effects() != before || cancellation.is_cancel_requested()
+                            || observed_cancellation.load(Ordering::Acquire) || !matches!(target.try_join(), Ok(None))
+                        {
+                            return Err("query credential changed provider or active cancellation state".to_owned());
+                        }
+                    }
+                    let body = serde_json::to_vec(&notification).map_err(|error| error.to_string())?;
+                    let accepted = live_http_exchange(address, live_http_post(&path, &body, &headers)).await?;
+                    if !accepted.starts_with(b"HTTP/1.1 202") {
+                        return Err("header-only cancellation was rejected".to_owned());
+                    }
+                    let response = target.join(&client_cx).await.map_err(|error| format!("legacy target failed: {error:?}"))??;
+                    if !response.starts_with(b"HTTP/1.1 202") || !observed_cancellation.load(Ordering::Acquire)
+                        || !cancellation.is_cancel_requested() || probe.effects() != (before.0 + 1, before.1, before.2)
+                    {
+                        return Err("header-only cancellation lost its exactly-once authenticated effect".to_owned());
+                    }
+                    eprintln!("{}", serde_json::json!({
+                        "proof": "auth_01_http_legacy_cancellation", "bead": "bd-f6apv",
+                        "listener": address.to_string(), "runtime_subject": probe.subject,
+                        "request_id": target_id, "session_id": session_id,
+                        "response_frame": String::from_utf8_lossy(&accepted),
+                        "response_sha256": sha256_bounded(&accepted, 65_536).map_err(|error| error.to_string())?.as_bytes(),
+                        "effects_before": before, "effects_after": probe.effects(),
+                        "handler_observed_cancellation": observed_cancellation.load(Ordering::Acquire),
+                        "rejected_locations": rejected_locations,
+                        "expected_rejections": if reject_forbidden_locations { 7 } else { 0 },
+                        "finished_unix_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos(),
+                    }));
+                    Ok::<_, String>(())
+                }.await;
+                caller_cx.cancel_with(CancelKind::User, Some("AUTH-01 legacy cancellation probe complete"));
+                result
+            }).map_err(|error| error.to_string())?;
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("legacy auth client failed: {error:?}"))??;
+            require_quiescent_http_shutdown(
+                serve.map_err(|error| error.to_string())?,
+                "AUTH-01 legacy cancellation",
+            )
+            .await
+        });
+    }
+
+    #[test]
+    fn auth_01_http_legacy_cancellation_header_positive() {
+        auth_01_http_legacy_cancellation_probe(false);
+    }
+
+    #[test]
+    fn auth_01_http_legacy_cancellation_body_planted_negative() {
+        auth_01_http_legacy_cancellation_probe(true);
     }
 
     #[test]

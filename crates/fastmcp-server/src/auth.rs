@@ -1,7 +1,8 @@
 //! Authentication provider hooks for MCP servers.
 //!
-//! Auth providers are transport-agnostic and operate on the JSON-RPC request
-//! payload. Successful authentication is committed exactly once to the
+//! Native HTTP admits credentials only from its `Authorization` header.
+//! Other transport adapters retain a legacy JSON-RPC credential fallback.
+//! Successful authentication is committed exactly once to the
 //! request-local [`McpContext`]; credentials and identity are never persisted
 //! in session state.
 
@@ -22,6 +23,16 @@ const ACCESS_TOKEN_FIELDS: [&str; 6] = [
     "access_token",
     "accessToken",
 ];
+
+/// HTTP query maps retain raw names. Decode form names once before matching,
+/// using the same rule for wire queries and direct transport requests.
+pub(crate) fn query_has_access_credentials(query: &str) -> bool {
+    url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| {
+        ACCESS_TOKEN_FIELDS
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(&name))
+    })
+}
 
 const MAX_AUTH_SUBJECT_BYTES: usize = 1024;
 const MAX_AUTH_SCOPES: usize = 64;
@@ -283,7 +294,11 @@ impl AuthRequest<'_> {
     }
 
     pub(crate) fn has_any_credential_source(&self) -> bool {
-        self.transport_authorization.is_some() || single_in_band_credential(self.params).is_some()
+        self.transport_authorization.is_some() || self.has_in_band_credential_source()
+    }
+
+    pub(crate) fn has_in_band_credential_source(&self) -> bool {
+        single_in_band_credential(self.params).is_some()
     }
 }
 
