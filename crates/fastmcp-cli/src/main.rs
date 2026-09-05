@@ -5,6 +5,7 @@
 //! - `inspect` - Inspect a server's capabilities
 //! - `install` - Install server config for Claude Desktop etc.
 //! - `test` - Exercise a local server with per-request idle/absolute timeouts
+//! - `tasks` - Get/watch/update/cancel official tasks (requires `tasks` feature)
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
 //! CLI builds with default features include the exact `2024-11-05` adapter;
@@ -18,7 +19,7 @@
 //! - Running local servers with stdio transport
 //! - Inspecting tools/resources/prompts for debugging
 //! - Installing client configs for Claude Desktop, Cursor, and Cline
-//! - Diagnosing legacy custom task RPCs (not MCP 2026 task support)
+//! - Operating the negotiated official Tasks extension with bounded watches
 
 #![forbid(unsafe_code)]
 
@@ -101,12 +102,29 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = CLI_PROTOCOL_STATUS_HELP;
 /// Independently authored normalized root-help frame. It freezes every
 /// non-whitespace byte from the Clap construction below; normalization permits
 /// line wrapping only, not punctuation or wording variance.
+#[cfg(not(feature = "tasks"))]
 const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
     "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
     "Commands: ",
     "run Run an MCP server binary ",
     "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
+
+#[cfg(feature = "tasks")]
+const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "tasks Get, watch, update, or cancel an official MCP task ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
     "test Test MCP server connectivity ",
@@ -643,6 +661,15 @@ enum Commands {
         protocol_policy: CliProtocolPolicy,
     },
 
+    /// Get, watch, update, or cancel an official MCP task.
+    #[cfg(feature = "tasks")]
+    Tasks {
+        #[command(flatten)]
+        connection: TaskConnection,
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+
     /// Install server configuration into Claude Desktop or other clients.
     ///
     /// Generates configuration snippets for various MCP clients.
@@ -811,6 +838,65 @@ impl Commands {
                 protocol_policy, ..
             } => Some(*protocol_policy),
             Self::List { .. } => None,
+            #[cfg(feature = "tasks")]
+            Self::Tasks { .. } => Some(CliProtocolPolicy::ModernOnly),
+        }
+    }
+}
+
+/// Tasks never fall back to a legacy custom task protocol.
+#[cfg(feature = "tasks")]
+#[derive(clap::Args, Clone)]
+struct TaskConnection {
+    /// Stdio server executable; choose this or --http-url.
+    #[arg(long, global = true, conflicts_with = "http_url")]
+    server: Option<String>,
+    /// Argument passed literally to the stdio server (repeatable).
+    #[arg(long, global = true, requires = "server", allow_hyphen_values = true)]
+    server_arg: Vec<String>,
+    /// Explicit modern Streamable HTTP POST endpoint.
+    #[arg(long, global = true)]
+    http_url: Option<String>,
+    /// Emit one JSON document per snapshot, acknowledgement, or watch event.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Request/watch timeout in seconds. A watch never reconnects automatically.
+    #[arg(long, global = true, default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=900))]
+    timeout: u64,
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Subcommand, Clone)]
+enum TaskAction {
+    /// Read the current task snapshot.
+    Get { task_id: String },
+    /// Read a snapshot, then watch live notifications until a bound or stream end.
+    Watch {
+        task_id: String,
+        /// Maximum task notifications after the initial snapshot.
+        #[arg(long, default_value_t = 100,
+            value_parser = clap::value_parser!(u64).range(1..=10_000))]
+        max_events: u64,
+    },
+    /// Answer the current input requests using a bounded JSON inputResponses file.
+    Update {
+        task_id: String,
+        #[arg(long)]
+        input_file: PathBuf,
+    },
+    /// Request cancellation; acknowledgement does not prove terminal task state.
+    Cancel { task_id: String },
+}
+
+#[cfg(feature = "tasks")]
+impl TaskAction {
+    fn task_id(&self) -> &str {
+        match self {
+            Self::Get { task_id }
+            | Self::Watch { task_id, .. }
+            | Self::Update { task_id, .. }
+            | Self::Cancel { task_id } => task_id,
         }
     }
 }
@@ -996,6 +1082,13 @@ impl std::str::FromStr for InstallTarget {
 
 fn main() -> ExitCode {
     let args = env::args_os().collect::<Vec<_>>();
+    #[cfg(not(feature = "tasks"))]
+    if args.get(1).is_some_and(|argument| argument == "tasks") {
+        eprintln!(
+            "FeatureUnavailable: Tasks commands require fastmcp-cli built with --features tasks"
+        );
+        return ExitCode::FAILURE;
+    }
     let is_exact_root_help = is_exact_root_help_request(&args);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -1015,6 +1108,7 @@ fn main() -> ExitCode {
         Err(error) => error.exit(),
     };
     // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
+    let forwards_child_exit = matches!(&cli.command, Commands::Run { .. } | Commands::Dev { .. });
 
     let runtime = match build_cli_runtime() {
         Ok(runtime) => runtime,
@@ -1040,25 +1134,25 @@ fn main() -> ExitCode {
             // We encode that in `McpError.data.exit_code` so the top-level can
             // return the right `ExitCode` without changing the command handler
             // signatures for the whole CLI.
-            if let Some(code) = e
-                .data
-                .as_ref()
-                .and_then(|data| data.get("exit_code"))
-                .and_then(serde_json::Value::as_i64)
-            {
-                if let Ok(code) = u8::try_from(code) {
-                    // Avoid duplicating the child's inherited stderr with a
-                    // wrapper error line for representable non-zero exits.
-                    return ExitCode::from(code);
-                }
-                write_cli_error(&e);
-                return ExitCode::FAILURE;
+            if let Some(code) = forwarded_child_exit(&e, forwards_child_exit) {
+                return code;
             }
 
             write_cli_error(&e);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Only local process-launch commands may forward child status. A remote
+/// JSON-RPC error can carry arbitrary data, including a forged `exit_code`.
+fn forwarded_child_exit(error: &fastmcp_core::McpError, allowed: bool) -> Option<ExitCode> {
+    if !allowed {
+        return None;
+    }
+    let code = error.data.as_ref()?.get("exit_code")?.as_u64()?;
+    let code = u8::try_from(code).ok()?;
+    (code != 0).then(|| ExitCode::from(code))
 }
 
 fn build_cli_runtime() -> McpResult<Runtime> {
@@ -1069,6 +1163,7 @@ fn build_cli_runtime() -> McpResult<Runtime> {
     })?;
     RuntimeBuilder::current_thread()
         .with_reactor(reactor)
+        .blocking_threads(0, 16)
         .build()
         .map_err(|error| {
             fastmcp_core::McpError::internal_error(format!(
@@ -1084,6 +1179,10 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
     }
 
     match cli.command {
+        #[cfg(feature = "tasks")]
+        Commands::Tasks { connection, action } => {
+            Box::pin(cmd_tasks(cx, &connection, &action)).await
+        }
         Commands::Run {
             server,
             args,
@@ -5686,6 +5785,363 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "tasks")]
+fn read_task_inputs(path: &Path) -> McpResult<fastmcp_protocol::TaskInputResponses> {
+    const MAX_INPUT_BYTES: u64 = 1024 * 1024;
+    let invalid = || {
+        fastmcp_core::McpError::invalid_params(
+            "--input-file must be a readable regular JSON inputResponses file of at most 1 MiB",
+        )
+    };
+    let metadata = std::fs::metadata(path).map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > MAX_INPUT_BYTES {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|_| invalid())?
+        .take(MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > MAX_INPUT_BYTES as usize {
+        return Err(invalid());
+    }
+    // Do not echo parser errors: embedded input responses can contain secrets.
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
+#[cfg(feature = "tasks")]
+fn write_task_event<T: Serialize>(json: bool, event: &str, data: &T) -> McpResult<()> {
+    let stdout = io::stdout();
+    write_task_event_to(&mut stdout.lock(), json, event, data)
+}
+
+#[cfg(feature = "tasks")]
+fn write_task_event_to<T: Serialize, W: Write>(
+    output: &mut W,
+    json: bool,
+    event: &str,
+    data: &T,
+) -> McpResult<()> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TaskEvent<'a, T> {
+        event: &'a str,
+        protocol_version: &'a str,
+        extension: &'a str,
+        maturity_at_pin: &'a str,
+        support: &'a str,
+        data: &'a T,
+    }
+    if json {
+        // JSON is the typed value, not the truncated/redacted terminal preview.
+        // Serialize directly so completed-task RawValue results retain their
+        // admitted numeric lexemes and member spellings.
+        serde_json::to_writer(
+            &mut *output,
+            &TaskEvent {
+                event,
+                protocol_version: "2026-07-28",
+                extension: fastmcp_protocol::TASKS_EXTENSION,
+                maturity_at_pin: "experimental",
+                support: "provisional",
+                data,
+            },
+        )
+        .map_err(|_| fastmcp_core::McpError::internal_error("could not write task JSON"))?;
+        writeln!(output)
+    } else {
+        let value = serde_json::to_value(data).map_err(|_| {
+            fastmcp_core::McpError::internal_error("could not render task output")
+        })?;
+        let preview = task_terminal_fields(bounded_json_preview_inner(
+            &value,
+            0,
+            &mut JsonPreviewBudget::default(),
+        ));
+        let preview = serde_json::to_string(&preview).map_err(|_| {
+            fastmcp_core::McpError::internal_error("could not render task output")
+        })?;
+        writeln!(output, "{event} (io.modelcontextprotocol/tasks; experimental; MCP 2026-07-28; provisional): {preview}")
+    }
+    .and_then(|()| output.flush())
+    .map_err(|_| fastmcp_core::McpError::internal_error("could not write task output"))
+}
+
+/// Sanitize each field before JSON quoting joins them. Redacting a whole
+/// serialized object can mistake subsequent fields for part of a credential
+/// in a status message and erase the task ID or other useful fields.
+#[cfg(feature = "tasks")]
+fn task_terminal_fields(value: serde_json::Value) -> serde_json::Value {
+    use fastmcp_console::console::UntrustedDisplayText;
+    use serde_json::Value;
+    match value {
+        Value::String(text) => {
+            Value::String(UntrustedDisplayText::with_max_chars(&text, 4096).to_string())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(task_terminal_fields).collect()),
+        Value::Object(fields) => {
+            let mut output = serde_json::Map::new();
+            for (key, value) in fields {
+                let key =
+                    collision_safe_map_key(&output, UntrustedDisplayText::new(&key).to_string());
+                output.insert(key, task_terminal_fields(value));
+            }
+            Value::Object(output)
+        }
+        value => value,
+    }
+}
+
+#[cfg(feature = "tasks")]
+async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) -> McpResult<()> {
+    use fastmcp_protocol::tasks_extension::TaskId;
+    let task_id = TaskId::parse(action.task_id()).map_err(|_| {
+        fastmcp_core::McpError::invalid_params(
+            "task ID must contain 1-1024 UTF-8 bytes and no control characters",
+        )
+    })?;
+    if connection.server.is_none() == connection.http_url.is_none() {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "tasks requires exactly one of --server or --http-url",
+        ));
+    }
+    let inputs = match action {
+        TaskAction::Update { input_file, .. } => Some(read_task_inputs(input_file)?),
+        _ => None,
+    };
+    if let Some(server) = &connection.server {
+        let duration = std::time::Duration::from_secs(connection.timeout);
+        let args = connection
+            .server_arg
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut client = client_builder_for_protocol_policy(CliProtocolPolicy::ModernOnly)?
+            .request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                duration, duration,
+            )?)
+            .connect_stdio_with_cx(server, &args, cx)
+            .await?;
+        let connection = connection.clone();
+        let action = action.clone();
+        // The synchronous stdio ingress pump must not occupy the runtime's
+        // reactor thread while a watch waits for peer traffic.
+        let mut work = cx
+            .spawn_blocking(move |worker_cx| {
+                let outcome = run_stdio_task(
+                    &worker_cx,
+                    &mut client,
+                    &connection,
+                    &action,
+                    task_id,
+                    inputs,
+                );
+                finish_inspect_acquisition(outcome, || client.close())
+            })
+            .map_err(|error| {
+                fastmcp_core::McpError::internal_error(format!(
+                    "could not start task command: {error}"
+                ))
+            })?;
+        work.join(cx).await.map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "task command did not finish normally: {error}"
+            ))
+        })?
+    } else {
+        asupersync::time::timeout(
+            cx.now(),
+            std::time::Duration::from_secs(connection.timeout),
+            Box::pin(run_http_task(cx, connection, action, task_id, inputs)),
+        ).await.map_err(|_| fastmcp_core::McpError::internal_error(
+            "Tasks HTTP operation reached --timeout; the request stream was closed; task completion is unknown",
+        ))?
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn run_stdio_task(
+    cx: &Cx,
+    client: &mut Client,
+    connection: &TaskConnection,
+    action: &TaskAction,
+    task_id: fastmcp_protocol::tasks_extension::TaskId,
+    inputs: Option<fastmcp_protocol::TaskInputResponses>,
+) -> McpResult<()> {
+    let cancellation = fastmcp_core::McpRequestCancellation::new();
+    if matches!(action, TaskAction::Cancel { .. }) {
+        let result = client.cancel_task_final_with_cancellation(cx, &cancellation, task_id)?;
+        return write_task_event(connection.json, "cancellation-acknowledged", &result);
+    }
+    let task = client
+        .get_task_final_with_cancellation(cx, &cancellation, task_id.clone())?
+        .task;
+    match action {
+        TaskAction::Get { .. } => write_task_event(connection.json, "snapshot", &task),
+        TaskAction::Update { .. } => {
+            let result = client.update_task_final_with_cancellation(
+                cx,
+                &cancellation,
+                &task,
+                inputs.ok_or_else(|| {
+                    fastmcp_core::McpError::invalid_params("missing input responses")
+                })?,
+            )?;
+            write_task_event(connection.json, "update-acknowledged", &result)
+        }
+        TaskAction::Watch { max_events, .. } => {
+            write_task_event(connection.json, "snapshot", &task)?;
+            let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+            fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
+            client.open_final_task_subscription_listener(filter)?;
+            let outcome =
+                watch_stdio_task(cx, client, connection, &task_id, *max_events, &cancellation);
+            let cleanup = client.cancel_live_final_task_subscription(cx);
+            finish_inspect_acquisition(outcome, || cleanup)
+        }
+        TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn watch_stdio_task(
+    cx: &Cx,
+    client: &mut Client,
+    connection: &TaskConnection,
+    task_id: &fastmcp_protocol::tasks_extension::TaskId,
+    max_events: u64,
+    cancellation: &fastmcp_core::McpRequestCancellation,
+) -> McpResult<()> {
+    use fastmcp_client::StdioTaskSubscriptionEvent;
+    let started = std::time::Instant::now();
+    let mut updates = 0;
+    loop {
+        if started.elapsed() >= std::time::Duration::from_secs(connection.timeout) {
+            return Err(fastmcp_core::McpError::internal_error(
+                "task watch reached --timeout; task completion is unknown",
+            ));
+        }
+        match client.try_next_final_task_subscription_event(cx, cancellation)? {
+            None => {}
+            Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
+                let ids = fastmcp_protocol::task_subscription_ids(&filter).map_err(|_| {
+                    fastmcp_core::McpError::invalid_request("invalid task watch acknowledgement")
+                })?;
+                if ids.as_deref() != Some(std::slice::from_ref(task_id)) {
+                    return Err(fastmcp_core::McpError::invalid_request(
+                        "task watch did not accept exactly the requested task",
+                    ));
+                }
+                write_task_event(connection.json, "watch-acknowledged", &filter)?;
+            }
+            Some(StdioTaskSubscriptionEvent::Notification(notification)) => {
+                if &notification.params.task.base().task_id != task_id {
+                    return Err(fastmcp_core::McpError::invalid_request(
+                        "task watch returned a different task ID",
+                    ));
+                }
+                write_task_event(connection.json, "task-updated", &notification.params.task)?;
+                updates += 1;
+                if updates >= max_events {
+                    return write_task_event(
+                        connection.json,
+                        "watch-ended",
+                        &serde_json::json!({"reason": "max-events", "updates": updates}),
+                    );
+                }
+            }
+            Some(StdioTaskSubscriptionEvent::Terminal) => {
+                return write_task_event(
+                    connection.json,
+                    "watch-ended",
+                    &serde_json::json!({"reason": "stream-ended", "updates": updates}),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+async fn run_http_task(
+    cx: &Cx,
+    connection: &TaskConnection,
+    action: &TaskAction,
+    task_id: fastmcp_protocol::tasks_extension::TaskId,
+    inputs: Option<fastmcp_protocol::TaskInputResponses>,
+) -> McpResult<()> {
+    let error = |error: fastmcp_client::HttpClientError| {
+        fastmcp_core::McpError::internal_error(error.to_string())
+    };
+    let plan = http_inspect_protocol_plan(
+        connection.http_url.as_deref(),
+        None,
+        None,
+        CliProtocolPolicy::ModernOnly,
+    )?;
+    let mut client = Client::http_with_cx(plan, cx).await.map_err(error)?;
+    if matches!(action, TaskAction::Cancel { .. }) {
+        let result = client.cancel_final_task(cx, task_id).await.map_err(error)?;
+        return write_task_event(connection.json, "cancellation-acknowledged", &result);
+    }
+    let mut handle = client.attach_final_task(cx, task_id).await.map_err(error)?;
+    match action {
+        TaskAction::Get { .. } => write_task_event(connection.json, "snapshot", handle.task()),
+        TaskAction::Update { .. } => {
+            let result = handle
+                .resume_input(
+                    cx,
+                    &mut client,
+                    inputs.ok_or_else(|| {
+                        fastmcp_core::McpError::invalid_params("missing input responses")
+                    })?,
+                )
+                .await
+                .map_err(error)?;
+            write_task_event(connection.json, "update-acknowledged", &result)
+        }
+        TaskAction::Watch { max_events, .. } => {
+            write_task_event(connection.json, "snapshot", handle.task())?;
+            let limits = fastmcp_client::sse::SseLimits::new(1024 * 1024, 2 * 1024 * 1024, 256)
+                .ok_or_else(|| fastmcp_core::McpError::internal_error("invalid CLI SSE bounds"))?;
+            let mut watch = handle.watch(cx, &mut client, limits).await.map_err(error)?;
+            let mut updates = 0;
+            while let Some(event) = watch.next_event(cx).await.map_err(error)? {
+                match event {
+                    fastmcp_client::FinalTaskWatchEvent::Acknowledged { accepted_filter } => {
+                        write_task_event(connection.json, "watch-acknowledged", &accepted_filter)?;
+                    }
+                    fastmcp_client::FinalTaskWatchEvent::TaskUpdated(notification) => {
+                        write_task_event(
+                            connection.json,
+                            "task-updated",
+                            &notification.params.task,
+                        )?;
+                        updates += 1;
+                        if updates >= *max_events {
+                            // The watcher owns its HTTP response stream. Dropping
+                            // it closes this listen without cancelling the task.
+                            return write_task_event(
+                                connection.json,
+                                "watch-ended",
+                                &serde_json::json!({"reason": "max-events", "updates": updates}),
+                            );
+                        }
+                    }
+                    fastmcp_client::FinalTaskWatchEvent::Terminal { .. } => break,
+                }
+            }
+            write_task_event(
+                connection.json,
+                "watch-ended",
+                &serde_json::json!({"reason": "stream-ended", "updates": updates}),
+            )
+        }
+        TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
+    }
+}
+
 /// Inspect command: Connect to a server and display its capabilities.
 async fn cmd_inspect(
     cx: &Cx,
@@ -5801,7 +6257,7 @@ where
         (Err(acquisition_error), Ok(())) => Err(acquisition_error),
         (Ok(_), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
             fastmcp_core::McpErrorCode::InternalError,
-            format!("inspect client cleanup failed: {cleanup_error}"),
+            format!("client cleanup failed: {cleanup_error}"),
             serde_json::json!({
                 CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
                 "cleanup": cleanup_error,
@@ -5811,7 +6267,7 @@ where
         )),
         (Err(acquisition_error), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
             fastmcp_core::McpErrorCode::InternalError,
-            format!("inspect client cleanup failed after an acquisition failure: {cleanup_error}"),
+            format!("client cleanup failed after an operation failure: {cleanup_error}"),
             serde_json::json!({
                 CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
                 "operation": acquisition_error,
@@ -5828,6 +6284,7 @@ where
 /// discovery is retained as its complete protocol object.
 #[derive(Clone, Debug)]
 enum InspectCapabilities {
+    #[cfg(any(test, feature = "legacy-2024-11-05"))]
     Legacy(fastmcp_protocol::ServerCapabilities),
     /// Final discovery capabilities are an open object. Retain its complete
     /// object shape so the inspect renderer never recasts a modern peer into
@@ -5838,6 +6295,7 @@ enum InspectCapabilities {
 impl InspectCapabilities {
     fn advertises(&self, member: &str) -> bool {
         match self {
+            #[cfg(any(test, feature = "legacy-2024-11-05"))]
             Self::Legacy(capabilities) => match member {
                 "tools" => capabilities.tools.is_some(),
                 "resources" => capabilities.resources.is_some(),
@@ -5868,6 +6326,7 @@ impl InspectCapabilities {
 
     fn text_summary(&self) -> String {
         match self {
+            #[cfg(any(test, feature = "legacy-2024-11-05"))]
             Self::Legacy(capabilities) => format!(
                 "Capabilities: tools={} resources={} prompts={} logging={}",
                 capabilities.tools.is_some(),
@@ -5891,6 +6350,7 @@ impl InspectCapabilities {
 
     fn json_value(&self, budget: &mut JsonPreviewBudget) -> serde_json::Value {
         match self {
+            #[cfg(any(test, feature = "legacy-2024-11-05"))]
             Self::Legacy(capabilities) => serde_json::json!({
                 "tools": capabilities.tools.is_some(),
                 "resources": capabilities.resources.is_some(),
@@ -11111,6 +11571,86 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_drives_and_joins_caller_owned_blocking_work() {
+        let observe = |runtime: Runtime| {
+            runtime.block_on(async {
+                let cx = Cx::current().expect("caller context");
+                // block_on polls its root future on the calling thread;
+                // admitted children run on the scheduler's sole worker.
+                // Enter that worker before measuring pool dispatch.
+                let mut task = cx
+                    .spawn(|task_cx| async move {
+                        let executor_thread = std::thread::current().id();
+                        let mut work = task_cx
+                            .spawn_blocking(|worker_cx| {
+                                worker_cx.checkpoint().expect("live worker context");
+                                (42_u8, std::thread::current().id())
+                            })
+                            .expect("start caller-owned blocking work");
+                        (
+                            work.join(&task_cx).await.expect("join caller-owned work"),
+                            executor_thread,
+                        )
+                    })
+                    .expect("enter scheduler worker");
+                task.join(&cx).await.expect("join scheduler task")
+            })
+        };
+        let observed = observe(build_cli_runtime().expect("CLI runtime"));
+        assert_eq!(observed.0.0, 42);
+        assert_ne!(observed.0.1, observed.1);
+
+        let bare = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("same reactor configuration"))
+            .blocking_threads(0, 0)
+            .build()
+            .expect("bare runtime");
+        let inline = observe(bare);
+        assert_eq!(inline.0.0, 42);
+        assert_eq!(
+            inline.0.1, inline.1,
+            "without a pool the same consumer blocks the reactor thread"
+        );
+    }
+
+    #[test]
+    fn remote_error_data_cannot_forge_a_success_or_child_exit() {
+        for code in [0, 7, 255, 256, -1] {
+            let error = fastmcp_core::McpError::with_data(
+                fastmcp_core::McpErrorCode::InvalidRequest,
+                "peer error",
+                serde_json::json!({"exit_code": code}),
+            );
+            assert_eq!(forwarded_child_exit(&error, false), None);
+            if (1..=255).contains(&code) {
+                assert_eq!(
+                    forwarded_child_exit(&error, true),
+                    Some(ExitCode::from(u8::try_from(code).unwrap()))
+                );
+            } else {
+                assert_eq!(forwarded_child_exit(&error, true), None);
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn task_json_writer_preserves_the_admitted_completed_result_source() {
+        let result = r#"{"structuredContent":{"negativeZero":-0,"decimal":1.2300,"large":9007199254740993},"content":[]}"#;
+        let wire = format!(
+            r#"{{"taskId":"raw-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{result}}}"#
+        );
+        let task: fastmcp_protocol::tasks_extension::Task = serde_json::from_str(&wire).unwrap();
+        let mut output = Vec::new();
+        write_task_event_to(&mut output, true, "snapshot", &task).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(result),
+            "the writer must preserve the admitted result, including -0 and member order: {output}"
+        );
+    }
+
+    #[test]
     fn production_cli_has_one_runtime_boundary_and_no_library_runtime_entry() {
         let source = include_str!("main.rs");
         let (production, _) = source
@@ -11318,10 +11858,8 @@ mod tests {
         #[test]
         fn cli_without_legacy_is_modern_only_and_refuses_legacy_before_contact() {
             assert_eq!(CliProtocolPolicy::default(), CliProtocolPolicy::ModernOnly);
-            assert_eq!(
-                validate_cli_protocol_policy(CliProtocolPolicy::ModernOnly),
-                Ok(())
-            );
+            validate_cli_protocol_policy(CliProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must execute in the core-only profile");
 
             for policy in [CliProtocolPolicy::Auto, CliProtocolPolicy::LegacyOnly] {
                 let error = validate_cli_protocol_policy(policy).expect_err(
@@ -14389,7 +14927,10 @@ mod tests {
             assert_eq!(value["redacted"], false);
             assert_eq!(value["sanitized"], false);
             assert_eq!(value["truncated"], false);
+            #[cfg(feature = "legacy-2024-11-05")]
             assert_eq!(value["protocol"]["policy"], "auto");
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            assert_eq!(value["protocol"]["policy"], "modern-only");
             assert_eq!(value["protocol"]["version"], "2026-07-28");
             assert_eq!(value["protocol"]["era"], "modern-2026");
         }

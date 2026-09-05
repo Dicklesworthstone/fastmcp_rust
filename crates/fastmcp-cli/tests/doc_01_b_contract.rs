@@ -23,12 +23,13 @@ const PROVISIONAL_PUBLIC_HELP_ORACLE: PublicHelpOracle = PublicHelpOracle {
     protocol_2026_under_implementation: true,
     public_protocol_version: "2024-11-05",
     modern_only_executable: true,
-    auto_executable: true,
-    legacy_only_executable: true,
+    auto_executable: cfg!(feature = "legacy-2024-11-05"),
+    legacy_only_executable: cfg!(feature = "legacy-2024-11-05"),
     mcp_2025_unsupported: true,
     aggregate_claims_are_evidence: false,
 };
 
+#[cfg(feature = "legacy-2024-11-05")]
 const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
@@ -42,8 +43,21 @@ const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
     "failures rather than fabricating an empty catalog or selection."
 );
 
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
+    "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
+    "This --no-default-features build executes ModernOnly only. Auto and LegacyOnly remain ",
+    "parseable only to report that legacy-2024-11-05 is unavailable before contact. MCP ",
+    "2025-11-25 is unsupported: it has no alias, compatibility profile, route, or diagnostic ",
+    "selection. Help, inspect output, and examples are not conformance, runtime-readiness, ",
+    "maturity, or release evidence. Machine-readable diagnostics are separate from human-facing ",
+    "examples, redact secrets and peer-controlled terminal text, and preserve nonzero failures ",
+    "rather than fabricating an empty catalog or selection."
+);
+
 /// Independently authored normalized frame for the public binary. It freezes
 /// every non-whitespace byte; wrapping is the only renderer variance allowed.
+#[cfg(not(feature = "tasks"))]
 const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
     "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
@@ -58,14 +72,30 @@ const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
     "Options: -h, --help Print help -V, --version Print version "
 );
 
+#[cfg(feature = "tasks")]
+const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "tasks Get, watch, update, or cancel an official MCP task ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicHelpRefusal {
     InvalidOutputEnvelope,
     ProtocolStatusIsNotProvisional,
     UnexpectedPublicProtocolVersion,
     ModernOnlyIsNotExecutable,
-    AutoIsNotExecutable,
-    LegacyOnlyIsNotExecutable,
+    AutoAvailabilityMismatch,
+    LegacyOnlyAvailabilityMismatch,
     Mcp2025IsNotUnsupported,
     AggregateClaimTreatedAsEvidence,
     MissingBaseFrame,
@@ -111,11 +141,11 @@ fn validate_public_help_oracle(oracle: PublicHelpOracle) -> Result<(), PublicHel
     if !oracle.modern_only_executable {
         return Err(PublicHelpRefusal::ModernOnlyIsNotExecutable);
     }
-    if !oracle.auto_executable {
-        return Err(PublicHelpRefusal::AutoIsNotExecutable);
+    if oracle.auto_executable != cfg!(feature = "legacy-2024-11-05") {
+        return Err(PublicHelpRefusal::AutoAvailabilityMismatch);
     }
-    if !oracle.legacy_only_executable {
-        return Err(PublicHelpRefusal::LegacyOnlyIsNotExecutable);
+    if oracle.legacy_only_executable != cfg!(feature = "legacy-2024-11-05") {
+        return Err(PublicHelpRefusal::LegacyOnlyAvailabilityMismatch);
     }
     if !oracle.mcp_2025_unsupported {
         return Err(PublicHelpRefusal::Mcp2025IsNotUnsupported);
@@ -214,6 +244,29 @@ fn raw_help_with_windows_executable_suffix(bytes: &[u8]) -> Vec<u8> {
     normalized.replacen(expected, toggled, 1).into_bytes()
 }
 
+fn raw_help_with_toggled_tasks_command(bytes: &[u8]) -> Vec<u8> {
+    let normalized = String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tasks_command = "tasks Get, watch, update, or cancel an official MCP task ";
+    if cfg!(feature = "tasks") {
+        assert!(normalized.contains(tasks_command));
+        normalized.replacen(tasks_command, "", 1).into_bytes()
+    } else {
+        assert!(!normalized.contains(tasks_command));
+        let following_command = "install Install server configuration";
+        assert!(normalized.contains(following_command));
+        normalized
+            .replacen(
+                following_command,
+                &format!("{tasks_command}{following_command}"),
+                1,
+            )
+            .into_bytes()
+    }
+}
+
 fn admit_public_root_help(
     state: &mut AcceptedPublicHelp,
     candidate: PublicHelpCandidate,
@@ -244,6 +297,31 @@ fn doc_01_b_public_binary_positive() {
         normalized_stdout(&long_help),
         format!("{PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX}{PROVISIONAL_PUBLIC_STATUS_STANZA}")
     );
+    #[cfg(not(feature = "tasks"))]
+    {
+        assert!(
+            !normalized_stdout(&long_help)
+                .contains("tasks Get, watch, update, or cancel an official MCP task ")
+        );
+        let task_id = format!(
+            "doc-01-b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("runtime-selected task ID clock")
+                .as_nanos()
+        );
+        let tasks_output = Command::new(env!("CARGO_BIN_EXE_fastmcp"))
+            .args(["tasks", "get", task_id.as_str()])
+            .output()
+            .expect("spawn the shipped Tasks-disabled binary");
+        assert!(!tasks_output.status.success());
+        assert!(tasks_output.stdout.is_empty());
+        assert_eq!(
+            tasks_output.stderr,
+            b"FeatureUnavailable: Tasks commands require fastmcp-cli built with --features tasks\n"
+        );
+    }
     let mut long_state = AcceptedPublicHelp::default();
     assert_eq!(
         admit_public_root_help(
@@ -291,6 +369,51 @@ fn doc_01_b_public_binary_planted_negative() {
     admit_public_root_help(&mut state, baseline.clone())
         .expect("baseline public help must satisfy the independent oracle");
     let accepted_before = state.clone();
+
+    for (oracle, refusal) in [
+        (
+            PublicHelpOracle {
+                auto_executable: !baseline.oracle.auto_executable,
+                ..baseline.oracle
+            },
+            PublicHelpRefusal::AutoAvailabilityMismatch,
+        ),
+        (
+            PublicHelpOracle {
+                legacy_only_executable: !baseline.oracle.legacy_only_executable,
+                ..baseline.oracle
+            },
+            PublicHelpRefusal::LegacyOnlyAvailabilityMismatch,
+        ),
+    ] {
+        let availability_mutation = PublicHelpCandidate {
+            oracle,
+            stdout: baseline.stdout.clone(),
+        };
+        assert_eq!(
+            admit_public_root_help(&mut state, availability_mutation),
+            Err(refusal),
+            "an opposite-profile availability assertion must be rejected"
+        );
+        assert_eq!(
+            state, accepted_before,
+            "a rejected availability mutation must preserve the accepted oracle and bytes"
+        );
+    }
+
+    let tasks_command_mutation = PublicHelpCandidate {
+        oracle: baseline.oracle,
+        stdout: raw_help_with_toggled_tasks_command(&baseline.stdout),
+    };
+    assert_eq!(
+        admit_public_root_help(&mut state, tasks_command_mutation),
+        Err(PublicHelpRefusal::RootHelpFrameMismatch),
+        "Tasks command presence must match the compiled feature profile"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected Tasks command mutation must preserve the accepted oracle and bytes"
+    );
 
     let planted_candidate = PublicHelpCandidate {
         oracle: baseline.oracle,

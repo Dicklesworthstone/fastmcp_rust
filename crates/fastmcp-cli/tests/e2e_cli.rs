@@ -1767,3 +1767,374 @@ fn e2e_cli_test_json_option() {
     let stdout = stdout_str(&output);
     assert!(stdout.contains("--json"), "Should support --json output");
 }
+
+#[cfg(not(feature = "tasks"))]
+#[test]
+fn cli_02_feature_off_is_actionable_and_absent_from_help() {
+    let help = run_cli(&["--help"]);
+    assert!(help.status.success());
+    assert!(!stdout_str(&help).contains("tasks Get, watch"));
+    let disabled = run_cli(&["tasks", "get", "task-1"]);
+    assert!(!disabled.status.success());
+    assert!(disabled.stdout.is_empty());
+    assert!(stderr_str(&disabled).contains("--features tasks"));
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn cli_02_a_planted_negative() {
+    for id in [
+        String::new(),
+        "x".repeat(1025),
+        "unsafe\u{1b}[2J".to_owned(),
+    ] {
+        let output = run_cli(&["tasks", "get", &id, "--server", "/must-not-be-spawned"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(stderr_str(&output).contains("task ID must contain"));
+        assert!(!stderr_str(&output).contains("unsafe"));
+    }
+    for removed in ["list", "submit", "result", "stats"] {
+        let output = run_cli(&["tasks", removed]);
+        assert!(
+            !output.status.success(),
+            "removed custom task command: {removed}"
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "tasks", feature = "e2e-fixture"))]
+mod task_commands {
+    use super::*;
+    use serde_json::{Value, json};
+
+    struct TaskFixture {
+        root: TestTempDir,
+        task: Value,
+    }
+
+    impl TaskFixture {
+        fn new(input_required: bool) -> Self {
+            let root = TestTempDir::new("official-tasks");
+            let task_id = format!("task-{}", root.file_name().unwrap().to_string_lossy());
+            let mut task = json!({
+                "taskId": task_id,
+                "status": if input_required { "input_required" } else { "working" },
+                "statusMessage": "[bold]work\u{1b}[2J\nAuthorization: Bearer test-secret-123",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                "ttlMs": null,
+            });
+            if input_required {
+                task["inputRequests"] = json!({"roots": {"method": "roots/list"}});
+            }
+            std::fs::write(root.join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
+            Self { root, task }
+        }
+
+        fn id(&self) -> &str {
+            self.task["taskId"].as_str().unwrap()
+        }
+
+        fn stdio(&self, action: &str, extra: &[&str]) -> Output {
+            self.stdio_for(self.id(), action, extra)
+        }
+
+        fn stdio_for(&self, task_id: &str, action: &str, extra: &[&str]) -> Output {
+            let mut command = Command::new(get_binary_path());
+            command
+                .args([
+                    "tasks",
+                    action,
+                    task_id,
+                    "--server",
+                    env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"),
+                    "--server-arg",
+                ])
+                .arg(self.root.join("task.json"))
+                .arg("--server-arg")
+                .arg(self.root.join("changed.json"))
+                .args(extra);
+            run_command(command)
+        }
+
+        fn http(&self) -> (ProcessGroupGuard, String) {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"));
+            command
+                .arg(self.root.join("task.json"))
+                .arg(self.root.join("changed.json"))
+                .arg(self.root.join("ready"))
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(self.root.join("server.stderr")).unwrap());
+            let process = ProcessGroupGuard::spawn(&mut command);
+            wait_for_file(&self.root.join("ready"), "http://");
+            let endpoint = std::fs::read_to_string(self.root.join("ready")).unwrap();
+            (process, endpoint)
+        }
+    }
+
+    fn wait_for_file(path: &Path, text: &str) {
+        let started = Instant::now();
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|value| value.contains(text)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "timed out waiting for {text} in {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn document(output: &Output) -> Value {
+        assert!(
+            output.status.success(),
+            "CLI failed: {}",
+            stderr_str(output)
+        );
+        serde_json::from_slice(&output.stdout).expect("one exact JSON document")
+    }
+
+    #[test]
+    fn cli_02_a_positive() {
+        let fixture = TaskFixture::new(false);
+        let output = fixture.stdio("get", &["--json"]);
+        let result = document(&output);
+        assert_eq!(result["event"], "snapshot");
+        assert_eq!(result["data"], fixture.task);
+        assert_eq!(result["extension"], "io.modelcontextprotocol/tasks");
+        assert_eq!(result["maturityAtPin"], "experimental");
+        assert_eq!(result["support"], "provisional");
+        assert!(!output.stdout.contains(&0x1b));
+        let human = fixture.stdio("get", &[]);
+        assert!(human.status.success(), "{}", stderr_str(&human));
+        let text = stdout_str(&human);
+        assert!(text.contains("working"));
+        assert!(text.contains(fixture.id()));
+        assert!(!text.contains("test-secret-123"));
+        assert!(!human.stdout.contains(&0x1b));
+        assert_eq!(text.lines().count(), 1);
+        let help = run_cli(&["--help"]);
+        assert!(help.status.success(), "{}", stderr_str(&help));
+        assert!(stdout_str(&help).contains("tasks"));
+    }
+
+    #[test]
+    fn cli_02_b_positive() {
+        let fixture = TaskFixture::new(true);
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let output = fixture.stdio(
+            "update",
+            &["--json", "--input-file", input.to_str().unwrap()],
+        );
+        assert_eq!(document(&output)["event"], "update-acknowledged");
+        let changed: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(changed["taskId"], fixture.task["taskId"]);
+        assert_eq!(changed["status"], "working");
+        assert!(changed.get("inputRequests").is_none());
+    }
+
+    #[test]
+    fn cli_02_a_completed_result_json_preserves_numeric_values() {
+        let fixture = TaskFixture::new(false);
+        let mut completed = fixture.task.clone();
+        completed["status"] = json!("completed");
+        let base = serde_json::to_string(&completed).unwrap();
+        let raw_result = r#"{"content":[],"structuredContent":{"decimal":1.2300,"large":9007199254740993,"negativeZero":-0}}"#;
+        let wire = format!(
+            "{},\"result\":{raw_result}}}",
+            base.strip_suffix('}').unwrap()
+        );
+        std::fs::write(fixture.root.join("task.json"), wire).unwrap();
+        let output = fixture.stdio("get", &["--json"]);
+        let result = document(&output);
+        assert_eq!(result["data"]["status"], "completed");
+        assert_eq!(
+            result["data"]["result"],
+            serde_json::from_str::<Value>(raw_result).unwrap()
+        );
+        assert!(stdout_str(&output).contains("\"decimal\":1.2300"));
+        assert!(stdout_str(&output).contains("\"large\":9007199254740993"));
+    }
+
+    #[test]
+    fn cli_02_b_planted_negative() {
+        let fixture = TaskFixture::new(true);
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"action":"cancel"}}"#).unwrap();
+        let (mut process, endpoint) = fixture.http();
+        let before = run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ]);
+        assert_eq!(document(&before)["data"], fixture.task);
+        let output = run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let unchanged = run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ]);
+        assert_eq!(document(&unchanged)["data"], fixture.task);
+        assert_eq!(unchanged.stdout, before.stdout);
+        assert!(!fixture.root.join("changed.json").exists());
+
+        // Change only the response kind, keeping the same task, server,
+        // endpoint, input path, command, and negotiated extension. The same
+        // public path must now admit the update and change the real store.
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let admitted = run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(document(&admitted)["event"], "update-acknowledged");
+        let changed: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(changed["taskId"], fixture.task["taskId"]);
+        assert_eq!(changed["status"], "working");
+        assert!(changed.get("inputRequests").is_none());
+        process.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_live_watch_update_cancel_and_wrong_id() {
+        let fixture = TaskFixture::new(true);
+        let (mut server, endpoint) = fixture.http();
+        let output_path = fixture.root.join("watch.stdout");
+        let mut command = Command::new(get_binary_path());
+        command
+            .args([
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--max-events",
+                "1",
+                "--timeout",
+                "20",
+            ])
+            .stdout(std::fs::File::create(&output_path).unwrap())
+            .stderr(std::fs::File::create(fixture.root.join("watch.stderr")).unwrap());
+        let mut watch = ProcessGroupGuard::spawn(&mut command);
+        wait_for_file(&output_path, "watch-acknowledged");
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let update = document(&run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]));
+        assert_eq!(update["event"], "update-acknowledged");
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("bounded watch exits after update");
+        assert!(status.success());
+        let events: Vec<Value> = std::fs::read_to_string(output_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["data"], fixture.task);
+        assert_eq!(events[2]["event"], "task-updated");
+        assert_eq!(events[2]["data"]["taskId"], fixture.task["taskId"]);
+        assert_eq!(events[2]["data"]["status"], "working");
+        assert_eq!(events[3]["data"]["reason"], "max-events");
+        let cancel = document(&run_cli(&[
+            "tasks",
+            "cancel",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ]));
+        assert_eq!(cancel["event"], "cancellation-acknowledged");
+        assert!(cancel["data"].get("status").is_none());
+        let wrong_id = format!("{}-wrong", fixture.id());
+        let wrong = run_cli(&["tasks", "get", &wrong_id, "--http-url", &endpoint, "--json"]);
+        assert!(!wrong.status.success());
+        assert!(wrong.stdout.is_empty());
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_timeout_is_not_task_completion() {
+        let fixture = TaskFixture::new(false);
+        let started = Instant::now();
+        let output = fixture.stdio("watch", &["--json", "--timeout", "1"]);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(stderr_str(&output).contains("--timeout"));
+        let events: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "snapshot");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "watch-acknowledged")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "task-completed")
+        );
+    }
+
+    #[test]
+    fn cli_02_b_peer_error_data_cannot_forge_cli_success() {
+        let fixture = TaskFixture::new(false);
+        assert_eq!(
+            document(&fixture.stdio("get", &["--json"]))["data"],
+            fixture.task
+        );
+        let wrong_id = format!("{}-wrong", fixture.id());
+        let output = fixture.stdio_for(&wrong_id, "get", &["--json"]);
+        let peer_error: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(peer_error["data"]["exit_code"], 0);
+        assert!(
+            !output.status.success(),
+            "a failed RPC remains a failed CLI command despite peer exit_code=0"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}

@@ -440,6 +440,40 @@ portable process-tree containment or a substitute for Windows Job Objects.
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
+### Tasks commands (current source tree, optional)
+
+Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,
+and `cancel`. These commands require modern MCP and bilateral
+`io.modelcontextprotocol/tasks` support. The pinned extension is experimental;
+this source implementation remains provisional. The published 0.8.1 binary
+does not include these commands.
+
+```bash
+cargo run -p fastmcp-cli --features tasks -- tasks get TASK_ID --http-url http://127.0.0.1:8000/mcp --json
+cargo run -p fastmcp-cli --features tasks -- tasks watch TASK_ID --http-url http://127.0.0.1:8000/mcp --timeout 60 --max-events 100 --json
+cargo run -p fastmcp-cli --features tasks -- tasks update TASK_ID --http-url http://127.0.0.1:8000/mcp --input-file responses.json --json
+cargo run -p fastmcp-cli --features tasks -- tasks cancel TASK_ID --http-url http://127.0.0.1:8000/mcp --json
+```
+
+The input file contains the `inputResponses` map itself, for example
+`{"roots":{"roots":[]}}` when the task's outstanding input key is `roots`
+and its method is `roots/list`. Files are limited to 1 MiB. Updates use the
+current task's input request types. Update and cancellation success mean
+acknowledgement; use `get` or `watch` to observe subsequent task state.
+
+Watch emits an initial snapshot, subscription acknowledgement, live task
+updates, and an exit reason. It does not reconnect or promise replay across
+disconnects. `--timeout` defaults to 30 seconds; timeout is a failed command,
+while reaching `--max-events` ends the watch successfully without cancelling
+the task. JSON mode emits one document per event; human output bounds and
+sanitizes fields and redacts recognizable credentials.
+
+Use `--server EXECUTABLE` and repeat `--server-arg ARGUMENT` for stdio. Each
+command starts a fresh process, so previously issued task IDs require a store
+retained outside the prior process. HTTP bearer-token configuration is not yet
+exposed by these commands. Core-only builds omit Tasks from help and explain
+the required feature when a Tasks command is attempted.
+
 ---
 
 ## Quick Start

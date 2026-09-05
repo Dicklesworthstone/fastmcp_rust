@@ -43,6 +43,7 @@ tasks = [
     "fastmcp-client/tasks",
     "fastmcp-console/tasks",
     "fastmcp-server?/tasks",
+    "fastmcp-rust?/tasks",
 ]
 apps = [
     "fastmcp-protocol/apps",
