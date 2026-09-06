@@ -4582,9 +4582,11 @@ impl Router {
                 // Tasks operations. Admit only the branch that can mutate the
                 // Tasks store, immediately before that mutation.
                 let runtime = self.admit_final_task_tool(&request_metadata)?;
-                encode_final_task_result(
-                    runtime.create_task_with_work(work_descriptor, status_message)?,
-                )
+                encode_final_task_result(runtime.create_task_for_request(
+                    request_ctx,
+                    work_descriptor,
+                    status_message,
+                )?)
             }
         }
     }

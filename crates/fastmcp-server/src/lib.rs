@@ -1057,8 +1057,8 @@ impl ServerExtensionRuntime {
             .register(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_GET,
-                move |_context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_get(&get_runtime, parameters)
+                move |context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_get(&get_runtime, context, parameters)
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
@@ -1068,8 +1068,8 @@ impl ServerExtensionRuntime {
             .register(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_UPDATE,
-                move |_context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_update(&update_runtime, parameters)
+                move |context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_update(&update_runtime, context, parameters)
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
@@ -1079,8 +1079,8 @@ impl ServerExtensionRuntime {
             .register(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_CANCEL,
-                move |_context: &McpContext, parameters: serde_json::Value| {
-                    tasks::dispatch_final_tasks_cancel(&cancel_runtime, parameters)
+                move |context: &McpContext, parameters: serde_json::Value| {
+                    tasks::dispatch_final_tasks_cancel(&cancel_runtime, context, parameters)
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
@@ -4553,6 +4553,8 @@ struct FinalSubscriptionEntry {
     subscription_id: RequestId,
     modern_http_owner: Option<u64>,
     accepted_filter: SubscriptionFilter,
+    #[cfg(feature = "tasks")]
+    task_principal: Option<Sha256Digest>,
     notification_sender: NotificationSender,
     request_cancellation: McpRequestCancellation,
     terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
@@ -4781,6 +4783,31 @@ impl FinalSubscriptionRegistry {
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
         notification_sender: NotificationSender,
     ) -> McpResult<FinalSubscriptionLease> {
+        self.open_with_task_principal(
+            subscription_id,
+            requested,
+            accept_tasks,
+            modern_http_owner,
+            request_cancellation,
+            terminal_delivery,
+            notification_sender,
+            None,
+        )
+    }
+
+    fn open_with_task_principal(
+        self: &Arc<Self>,
+        subscription_id: RequestId,
+        requested: SubscriptionFilter,
+        accept_tasks: bool,
+        modern_http_owner: Option<u64>,
+        request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+        notification_sender: NotificationSender,
+        task_principal: Option<Sha256Digest>,
+    ) -> McpResult<FinalSubscriptionLease> {
+        #[cfg(not(feature = "tasks"))]
+        let _ = task_principal;
         if subscription_id.validate().is_err() {
             return Err(McpError::invalid_request(
                 "subscriptions/listen requires a valid JSON-RPC request id",
@@ -4834,6 +4861,8 @@ impl FinalSubscriptionRegistry {
                 subscription_id: subscription_id.clone(),
                 modern_http_owner,
                 accepted_filter,
+                #[cfg(feature = "tasks")]
+                task_principal,
                 notification_sender: notification_sender.clone(),
                 request_cancellation: request_cancellation.clone(),
                 terminal_delivery: terminal_delivery.clone(),
@@ -5070,6 +5099,15 @@ impl FinalSubscriptionRegistry {
 
     #[cfg(feature = "tasks")]
     fn publish_task(&self, notification: FinalTaskStatusNotification) -> McpResult<usize> {
+        self.publish_owned_task(notification, None)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn publish_owned_task(
+        &self,
+        notification: FinalTaskStatusNotification,
+        principal: Option<Sha256Digest>,
+    ) -> McpResult<usize> {
         let task_id = notification.params.task.base().task_id.as_str();
         let targets = {
             let state = self
@@ -5080,14 +5118,15 @@ impl FinalSubscriptionRegistry {
                 .entries
                 .values()
                 .filter(|entry| {
-                    task_subscription_ids(&entry.accepted_filter)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|task_ids| {
-                            task_ids
-                                .iter()
-                                .any(|candidate| candidate.as_str() == task_id)
-                        })
+                    entry.task_principal == principal
+                        && task_subscription_ids(&entry.accepted_filter)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|task_ids| {
+                                task_ids
+                                    .iter()
+                                    .any(|candidate| candidate.as_str() == task_id)
+                            })
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -12188,6 +12227,8 @@ impl Server {
     /// unregisters the listener. Events are delivered through
     /// `notification_sender`; this method does not block on stream lifetime.
     /// Wire transports should keep using their owned listen dispatch.
+    /// This is a trusted embedding control without caller authentication;
+    /// never expose it as a request adapter for protected Tasks.
     ///
     /// # Errors
     ///
@@ -12224,6 +12265,9 @@ impl Server {
     /// Only subscriptions whose acknowledged `taskIds` set contains the
     /// notification's exact opaque task identifier receive it. The server adds
     /// the request's subscription ID without changing Task state.
+    /// This embedding publisher has no authenticated event custody and reaches
+    /// only unprotected subscriptions. Authenticated task transitions publish
+    /// internally with their committed principal.
     #[cfg(feature = "tasks")]
     pub fn publish_task_status_notification(
         &self,
@@ -13407,6 +13451,40 @@ impl Server {
         #[cfg(feature = "tasks")]
         let tasks_requested =
             self.admit_final_task_subscription(&params.notifications, client_capabilities)?;
+        #[cfg(feature = "tasks")]
+        let notification_sender =
+            if tasks_requested && let Some(runtime) = self.final_task_runtime.as_ref() {
+                let mut admitted_tasks = BTreeMap::new();
+                for task_id in task_subscription_ids(&params.notifications)
+                    .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+                    .unwrap_or_default()
+                {
+                    let snapshot = runtime.task_for_request(request_ctx, &task_id)?;
+                    admitted_tasks.insert(task_id, snapshot);
+                }
+                let runtime = runtime.clone();
+                let guarded: NotificationSender = Arc::new(move |notification| {
+                    if notification.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION {
+                        let event = serde_json::to_value(&notification).ok().and_then(|wire| {
+                            serde_json::from_value::<FinalTaskStatusNotification>(wire).ok()
+                        });
+                        let Some(event) = event else {
+                            return;
+                        };
+                        let Some(admitted) = admitted_tasks.get(&event.params.task.base().task_id)
+                        else {
+                            return;
+                        };
+                        if !runtime.notification_matches_task_owner(admitted, &event) {
+                            return;
+                        }
+                    }
+                    notification_sender(notification);
+                });
+                guarded
+            } else {
+                notification_sender
+            };
         #[cfg(not(feature = "tasks"))]
         let tasks_requested = false;
 
@@ -13478,7 +13556,19 @@ impl Server {
             catalog_relay_listener = Some(listener);
         }
 
-        let lease = self.final_subscriptions.open(
+        #[cfg(feature = "tasks")]
+        let task_principal = if tasks_requested && self.final_task_runtime.is_some() {
+            request_ctx
+                .auth()
+                .as_ref()
+                .map(|auth| auth::principal_fingerprint(Some(auth)))
+                .transpose()?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "tasks"))]
+        let task_principal = None;
+        let lease = self.final_subscriptions.open_with_task_principal(
             subscription_id.clone(),
             params.notifications,
             tasks_requested,
@@ -13486,6 +13576,7 @@ impl Server {
             request_cancellation.clone(),
             terminal_delivery.clone(),
             notification_sender,
+            task_principal,
         )?;
 
         while !self.final_subscriptions.is_terminating() {
@@ -36984,6 +37075,344 @@ mod lib_unit_tests {
             );
         }
         Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    struct AuthTaskSupervisor;
+
+    #[cfg(feature = "tasks")]
+    impl ApplicationTaskSupervisor for AuthTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.require_input(
+                            serde_json::from_value(
+                                serde_json::json!({"roots": {"method": "roots/list"}}),
+                            )
+                            .unwrap(),
+                            None,
+                        )?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(serde_json::from_value(serde_json::json!({"content": [{"type": "text", "text": "owner input consumed"}]})).unwrap(), None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn auth_task_http_frame(request: &JsonRpcRequest, authorization: &str) -> Vec<u8> {
+        let mut headers = vec![
+            (
+                "Accept",
+                if request.method == SUBSCRIPTIONS_LISTEN {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            ),
+            ("Authorization", authorization),
+            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+            ("Mcp-Method", request.method.as_str()),
+        ];
+        if request.method == "tools/call" {
+            headers.push(("Mcp-Name", "durable_final_task"));
+        } else if let Some(task_id) = request.params.as_ref().and_then(|params| params.get("taskId")).and_then(serde_json::Value::as_str) {
+            headers.push(("Mcp-Name", task_id));
+        }
+        live_http_post("/mcp", &serde_json::to_vec(request).unwrap(), &headers)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn auth_task_http_rpc(
+        address: SocketAddr,
+        request: &JsonRpcRequest,
+        authorization: &str,
+    ) -> Result<JsonRpcResponse, String> {
+        let frame =
+            live_http_exchange(address, auth_task_http_frame(request, authorization)).await?;
+        let response = if live_http_response_header(&frame, "content-type")?
+            .starts_with("text/event-stream")
+        {
+            live_http_sse_jsonrpc_response(&frame)?
+        } else {
+            serde_json::from_slice(live_http_response_body(&frame)?)
+                .map_err(|error| error.to_string())?
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"proof": "auth_00_local_task_owner", "method": request.method, "response": response, "frame_sha256": sha256_bounded(&frame, 65_536).unwrap().as_bytes()})
+        );
+        Ok(response)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn auth_00_local_task_owner_probe(plant_foreign_caller: bool) {
+        run_live_http_test(move |cx| async move {
+            let subject = format!(
+                "task-owner-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let mut refreshed = AuthContext::with_subject(subject.clone());
+            refreshed.scopes = vec!["tasks".to_owned()];
+            let verifier = StaticTokenVerifier::new([
+                ("owner-first", AuthContext::with_subject(subject.clone())),
+                ("owner-refreshed", refreshed),
+                (
+                    "foreign-valid",
+                    AuthContext::with_subject(format!("foreign-{subject}")),
+                ),
+            ])
+            .map_err(|error| error.to_string())?;
+            let store = Arc::new(tasks::InMemoryFinalTaskStore::default());
+            let task_runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let runner = task_runtime
+                .install_task_service(1, Arc::new(AuthTaskSupervisor))
+                .map_err(|error| error.to_string())?;
+            let scope = cx.scope();
+            let mut service = cx
+                .spawn_in(&scope, move |service_cx| async move {
+                    runner.run(&service_cx).await
+                })
+                .map_err(|error| error.to_string())?;
+            let ready_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            while !task_runtime.is_task_service_ready() {
+                if cx.now() >= ready_deadline {
+                    return Err("task service did not become ready".to_owned());
+                }
+                asupersync::runtime::yield_now().await;
+            }
+            let bound = Server::new("auth-task-owner", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .tool(FinalTaskCreatingTool)
+                .final_tasks(task_runtime.clone())
+                .unwrap()
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let task_server = Arc::clone(&bound.endpoint.server);
+            let caller_cx = cx.clone();
+            let mut client = cx.spawn(move |client_cx| async move {
+                struct CancelServerOnDrop(Cx);
+                impl Drop for CancelServerOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel_with(CancelKind::User, Some("task owner probe exited"));
+                    }
+                }
+                let _shutdown = CancelServerOnDrop(caller_cx.clone());
+                let result = async {
+                    let mut streams = Vec::new();
+                    for method in [fastmcp_protocol::tasks_extension::TASK_UPDATE, fastmcp_protocol::TASK_CANCEL] {
+                        let created = auth_task_http_rpc(address, &final_task_creating_tool_request(true), "Bearer owner-first").await?;
+                        let created = created.result.ok_or_else(|| format!("authenticated task creation failed: {:?}", created.error))?;
+                        let task_id = fastmcp_protocol::FinalTaskId::parse(created["taskId"].as_str().ok_or("task handle missing")?).map_err(|error| error.to_string())?;
+                        let deadline = client_cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                        loop {
+                            if matches!(task_runtime.get_task(&task_id).unwrap().task, fastmcp_protocol::Task::InputRequired { .. }) { break; }
+                            if client_cx.now() >= deadline { return Err("application did not request task input".to_owned()); }
+                            asupersync::time::sleep(client_cx.now(), Duration::from_millis(5)).await;
+                        }
+                        let params = final_tasks_params(&task_id, serde_json::json!({}));
+                        let get = JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(params.clone()), 951_i64);
+                        let mut update_params = params.clone();
+                        update_params["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+                        let update = JsonRpcRequest::new(fastmcp_protocol::tasks_extension::TASK_UPDATE, Some(update_params), 952_i64);
+                        let cancel = JsonRpcRequest::new(fastmcp_protocol::TASK_CANCEL, Some(params.clone()), 953_i64);
+                        let mut notifications = SubscriptionFilter::default();
+                        set_task_subscription_ids(&mut notifications, vec![task_id.clone()]).unwrap();
+                        let listen = JsonRpcRequest::new(SUBSCRIPTIONS_LISTEN, Some(serde_json::json!({"_meta": params["_meta"], "notifications": notifications})), 954_i64);
+                        if plant_foreign_caller {
+                            let before = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                            let notification_before = serde_json::to_value(store.latest_notification(&task_id)).unwrap();
+                            for request in [&get, &update, &cancel, &listen] {
+                                let foreign = auth_task_http_rpc(address, request, "Bearer foreign-valid").await?;
+                                let mut missing = request.clone();
+                                if request.method == SUBSCRIPTIONS_LISTEN {
+                                    let mut absent_filter = SubscriptionFilter::default();
+                                    set_task_subscription_ids(&mut absent_filter, vec![fastmcp_protocol::FinalTaskId::parse("absent-task").unwrap()]).unwrap();
+                                    missing.params.as_mut().unwrap()["notifications"] = serde_json::to_value(absent_filter).unwrap();
+                                } else {
+                                    missing.params.as_mut().unwrap()["taskId"] = serde_json::json!("absent-task");
+                                }
+                                let absent = auth_task_http_rpc(address, &missing, "Bearer foreign-valid").await?;
+                                assert!(foreign.result.is_none());
+                                assert_eq!(serde_json::to_value(&foreign.error).unwrap(), serde_json::to_value(&absent.error).unwrap());
+                                assert_eq!(foreign.error.unwrap().message, "Task not found");
+                                let after = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                                assert_eq!(after.generation(), before.generation());
+                                assert_eq!(serde_json::to_value(after.task()).unwrap(), serde_json::to_value(before.task()).unwrap());
+                                assert_eq!(after.authenticated_principal(), before.authenticated_principal());
+                                assert_eq!(serde_json::to_value(store.latest_notification(&task_id)).unwrap(), notification_before);
+                                assert!(!store.is_cancellation_requested(&task_id).unwrap());
+                                assert!(store.next_accepted_input_snapshot().unwrap().is_none());
+                            }
+                        }
+                        let read = auth_task_http_rpc(address, &get, "Bearer owner-refreshed").await?;
+                        assert!(read.error.is_none());
+                        assert_eq!(read.result.unwrap()["taskId"], serde_json::json!(task_id));
+                        let mut stream = AsyncTcpStream::connect(address).await.map_err(|error| error.to_string())?;
+                        stream.write_all(&auth_task_http_frame(&listen, "Bearer owner-refreshed")).await.map_err(|error| error.to_string())?;
+                        stream.flush().await.map_err(|error| error.to_string())?;
+                        let mut received = Vec::new();
+                        read_live_http_until(&mut stream, &mut received, b"notifications/subscriptions/acknowledged").await?;
+                        let control = if method == fastmcp_protocol::tasks_extension::TASK_UPDATE { &update } else { &cancel };
+                        let controlled = auth_task_http_rpc(address, control, "Bearer owner-refreshed").await?;
+                        assert!(controlled.error.is_none());
+                        assert_eq!(controlled.result.unwrap()["resultType"], "complete");
+                        let terminal = if method == fastmcp_protocol::tasks_extension::TASK_UPDATE { "completed" } else { "cancelled" };
+                        read_live_http_until(&mut stream, &mut received, format!("\"status\":\"{terminal}\"").as_bytes()).await?;
+                        streams.push((stream, received, task_id, terminal));
+                    }
+                    assert_eq!(task_server.terminate_subscription_streams(), 2);
+                    for (mut stream, mut received, task_id, terminal) in streams {
+                        read_live_http_to_end(&mut stream, &mut received, "owner subscription terminal EOF").await?;
+                        let messages = live_http_chunked_sse_messages(&received)?;
+                        let Some(JsonRpcMessage::Request(acknowledgement)) = messages.first() else { panic!("missing subscription acknowledgement"); };
+                        let ServerNotification::SubscriptionsAcknowledged(acknowledgement) = ServerNotification::decode(acknowledgement).unwrap() else { panic!("first event must acknowledge subscription"); };
+                        assert_eq!(task_subscription_ids(&acknowledgement.notifications).unwrap().unwrap(), vec![task_id.clone()]);
+                        let events = messages.iter().filter_map(|message| {
+                            let JsonRpcMessage::Request(request) = message else { return None; };
+                            (request.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION).then(|| serde_json::from_value::<FinalTaskStatusNotification>(serde_json::to_value(request).unwrap()).unwrap())
+                        }).collect::<Vec<_>>();
+                        assert!(!events.is_empty());
+                        assert!(events.iter().all(|event| event.params.task.base().task_id == task_id));
+                        let terminal_events = events.iter().filter(|event| serde_json::to_value(&event.params.task).unwrap()["status"] == terminal).collect::<Vec<_>>();
+                        assert_eq!(terminal_events.len(), 1);
+                        if terminal == "completed" {
+                            let task = serde_json::to_value(&terminal_events[0].params.task).unwrap();
+                            assert_eq!(task["result"]["content"][0]["text"], "owner input consumed");
+                        }
+                        eprintln!("{}", serde_json::json!({"proof": "auth_00_local_task_owner", "subject": subject, "task_id": task_id, "terminal": terminal, "subscription_events": events.len(), "subscription_frame_sha256": sha256_bounded(&received, 65_536).unwrap().as_bytes(), "negative": plant_foreign_caller}));
+                    }
+                    Ok::<_, String>(())
+                }.await;
+                caller_cx.cancel_with(CancelKind::User, Some("task owner probe complete"));
+                result
+            }).map_err(|error| error.to_string())?;
+            let serve = bound.serve(&cx).await;
+            client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("task owner client failed: {error:?}"))??;
+            match service.join(&cx).await {
+                Ok(Ok(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                other => return Err(format!("task service failed during owner probe: {other:?}")),
+            }
+            require_quiescent_http_shutdown(serve.map_err(|error| error.to_string())?, "task owner")
+                .await
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn auth_00_local_task_owner_positive() {
+        auth_00_local_task_owner_probe(false);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn auth_00_local_task_owner_planted_negative() {
+        auth_00_local_task_owner_probe(true);
+    }
+
+    #[cfg(feature = "tasks")]
+    fn auth_00_task_notification_origin_probe(foreign_origin: bool) {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        );
+        let _service = start_final_tasks_test_service(&runtime);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_by_emitter = Arc::clone(&captured);
+        runtime.add_owned_notification_emitter(Arc::new(move |notification, principal| {
+            captured_by_emitter
+                .lock()
+                .unwrap()
+                .push((notification, principal));
+        }));
+        let owner = McpContext::new(Cx::for_testing(), 1)
+            .with_auth(AuthContext::with_subject("notification-owner"));
+        let created = runtime
+            .create_task_for_request(&owner, final_tasks_test_work_descriptor(), None)
+            .unwrap();
+        let task_id = created.task.base().task_id.clone();
+        let (notification, principal) = captured.lock().unwrap()[0].clone();
+        assert_eq!(
+            principal,
+            Some(auth::principal_fingerprint(owner.auth().as_ref()).unwrap())
+        );
+        let registry = Arc::new(FinalSubscriptionRegistry::default());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_by_sender = Arc::clone(&sent);
+        let mut requested = SubscriptionFilter::default();
+        set_task_subscription_ids(&mut requested, vec![task_id]).unwrap();
+        let _lease = registry
+            .open_with_task_principal(
+                1_i64.into(),
+                requested,
+                true,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                Arc::new(move |event| sent_by_sender.lock().unwrap().push(event)),
+                principal,
+            )
+            .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let origin = if foreign_origin {
+            Some(
+                auth::principal_fingerprint(Some(&AuthContext::with_subject("old-foreign-owner")))
+                    .unwrap(),
+            )
+        } else {
+            principal
+        };
+        let published = registry
+            .publish_owned_task(notification.clone(), origin)
+            .unwrap();
+        assert_eq!(published, usize::from(!foreign_origin));
+        assert_eq!(sent.lock().unwrap().len(), 1 + published);
+        if foreign_origin {
+            // A task ID, timestamp, and payload may all be identical after
+            // store reuse. Origin custody alone prevents the stale owner event.
+            assert_eq!(
+                registry
+                    .publish_owned_task(notification, principal)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(sent.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn auth_00_task_notification_origin_positive() {
+        auth_00_task_notification_origin_probe(false);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn auth_00_task_notification_origin_planted_negative() {
+        auth_00_task_notification_origin_probe(true);
     }
 
     fn auth_01_http_header_probe(reject_forbidden_locations: bool) {

@@ -2685,14 +2685,19 @@ impl ServerBuilder {
         #[cfg(feature = "tasks")]
         if let Some(task_runtime) = final_task_runtime.as_ref() {
             let subscriptions = Arc::clone(&final_subscriptions);
-            task_runtime.add_notification_emitter(Arc::new(move |notification| {
-                if subscriptions.publish_task(notification).is_err() {
-                    log::error!(
-                        target: "fastmcp_rust::server",
-                        "Failed to publish a typed final Task notification"
-                    );
-                }
-            }));
+            task_runtime.add_owned_notification_emitter(Arc::new(
+                move |notification, principal| {
+                    if subscriptions
+                        .publish_owned_task(notification, principal)
+                        .is_err()
+                    {
+                        log::error!(
+                            target: "fastmcp_rust::server",
+                            "Failed to publish a typed final Task notification"
+                        );
+                    }
+                },
+            ));
         }
         #[cfg(feature = "tasks")]
         self.router

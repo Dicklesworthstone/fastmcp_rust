@@ -63,6 +63,14 @@
   application to run a caller-owned task supervisor in its own `Cx`
   region. The historical `with_task_manager` path does not install the
   official methods.
+- **Authenticated local Tasks retain their caller:** task creation atomically
+  stores a private principal binding. Request get/update/cancel and Tasks
+  subscriptions enforce that binding; a refreshed credential for the same
+  verified owner can continue the task. Custom stores must implement atomic
+  authenticated creation and preserve the binding in every snapshot.
+  Context-free runtime and subscription APIs are trusted embedding controls.
+  Anonymous client isolation, proxy Tasks ownership, durable authorization,
+  grant revalidation, and revocation remain unqualified.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
