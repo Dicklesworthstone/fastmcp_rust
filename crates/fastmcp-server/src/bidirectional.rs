@@ -1685,12 +1685,33 @@ pub enum MrtrRetry {
 }
 
 /// Accumulated, type-bound responses from a completed MRTR input exchange.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MrtrCompletedInputs {
     responses: MrtrInputResponses,
+    handler_request_state: Option<MrtrRequestState>,
+}
+
+impl std::fmt::Debug for MrtrCompletedInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MrtrCompletedInputs")
+            .field("responses", &self.responses)
+            .field("handler_request_state", &self.handler_request_state)
+            .finish()
+    }
 }
 
 impl MrtrCompletedInputs {
+    /// Private state returned by the handler that issued this exchange. It is
+    /// never a downstream credential and becomes available only after the
+    /// framework has admitted the bound, one-use continuation.
+    #[cfg(any(feature = "proxy", test))]
+    pub(crate) fn handler_request_state(&self) -> Option<&str> {
+        self.handler_request_state
+            .as_ref()
+            .map(|state| state.0.as_str())
+    }
+
     /// Returns every accepted response, including values accepted in earlier
     /// partial retries of this logical exchange.
     #[must_use]
@@ -1771,6 +1792,7 @@ struct MrtrExchange {
     expected: ExpectedInputLedger,
     responses: MrtrInputResponses,
     binding: Option<MrtrExchangeBinding>,
+    handler_request_state: Option<MrtrRequestState>,
 }
 
 #[derive(Debug, Default)]
@@ -1857,7 +1879,13 @@ impl MrtrExchangeRegistry {
         owner_cancellation: McpRequestCancellation,
         input_requests: MrtrInputRequests,
     ) -> McpResult<MrtrInputRequired> {
-        self.issue_at(owner_cancellation, None, input_requests, Instant::now())
+        self.issue_at(
+            owner_cancellation,
+            None,
+            input_requests,
+            None,
+            Instant::now(),
+        )
     }
 
     /// Issues an `input_required` result bound to one router-admitted modern
@@ -1867,11 +1895,13 @@ impl MrtrExchangeRegistry {
         owner_cancellation: McpRequestCancellation,
         binding: MrtrExchangeBinding,
         input_requests: MrtrInputRequests,
+        handler_request_state: Option<String>,
     ) -> McpResult<MrtrInputRequired> {
         self.issue_at(
             owner_cancellation,
             Some(binding),
             input_requests,
+            handler_request_state,
             Instant::now(),
         )
     }
@@ -2110,6 +2140,7 @@ impl MrtrExchangeRegistry {
         owner_cancellation: McpRequestCancellation,
         binding: Option<MrtrExchangeBinding>,
         input_requests: MrtrInputRequests,
+        handler_request_state: Option<String>,
         now: Instant,
     ) -> McpResult<MrtrInputRequired> {
         if owner_cancellation.is_cancel_requested() {
@@ -2117,6 +2148,12 @@ impl MrtrExchangeRegistry {
         }
         if input_requests.len() > self.max_inputs_per_round {
             return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+        }
+        if handler_request_state
+            .as_ref()
+            .is_some_and(|value| value.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES)
+        {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
 
         let expires_at = now
@@ -2149,6 +2186,7 @@ impl MrtrExchangeRegistry {
                 requests: input_requests.clone().unwrap_or_default(),
                 responses: MrtrInputResponses::default(),
                 binding,
+                handler_request_state: handler_request_state.map(MrtrRequestState),
             },
         );
         Ok(MrtrInputRequired {
@@ -2229,6 +2267,7 @@ impl MrtrExchangeRegistry {
             state.exchanges.remove(request_state);
             return Ok(MrtrRetry::Complete(MrtrCompletedInputs {
                 responses: accepted_responses,
+                handler_request_state: exchange.handler_request_state,
             }));
         }
 
@@ -2261,6 +2300,7 @@ impl MrtrExchangeRegistry {
             requests: missing_requests.clone(),
             responses: accepted_responses,
             binding: exchange.binding,
+            handler_request_state: exchange.handler_request_state,
         };
         state.exchanges.remove(request_state);
         state.exchanges.insert(next_state.0.clone(), successor);
@@ -2897,6 +2937,7 @@ mod tests {
                     ("first".to_owned(), MrtrInputRequest::roots()),
                 ])
                 .expect("unique MRTR input keys"),
+                None,
             )
             .expect("MRTR input result must issue");
         let request_state = mrtr_state_from_wire(&required);
@@ -2949,6 +2990,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 stateless_binding.clone(),
                 input_requests(),
+                None,
             )
             .expect("stateless MRTR state issues before listener shutdown");
         let stateless_state = mrtr_state_from_wire(&stateless);
@@ -2965,6 +3007,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 durable_binding.clone(),
                 input_requests(),
+                None,
             )
             .expect("durable MRTR state issues beside stateless state");
         let durable_state = mrtr_state_from_wire(&durable);
@@ -2994,6 +3037,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 stateless_binding,
                 input_requests(),
+                None,
             )
             .expect_err("the latched shutdown fence rejects late stateless issuance");
         assert_eq!(late_issue.code, McpErrorCode::RequestCancelled);
@@ -3030,6 +3074,7 @@ mod tests {
                 binding.clone(),
                 MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
                     .expect("unique bound input map"),
+                None,
             )
             .expect("stateless method-bound state issues");
         let request_state = mrtr_state_from_wire(&required);
@@ -3076,6 +3121,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 binding.clone(),
                 MrtrInputRequests::default(),
+                None,
             )
             .expect("a state-only exchange issues");
         let wire = serde_json::to_value(&required).expect("state-only exchange serializes");
@@ -3105,6 +3151,125 @@ mod tests {
         assert_eq!(registry.active_len(), 0);
     }
 
+    fn mrtr_handler_state_probe(wrong_binding: bool) {
+        let registry = MrtrExchangeRegistry::new();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "shared-tool".to_owned(),
+            [7; 32],
+            [9; 32],
+            None,
+        );
+        let mut foreign = binding.clone();
+        foreign.session_partition = [10; 32];
+        let mut states = Vec::new();
+        for upstream_state in ["conversation-a", "conversation-b"] {
+            let issued = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    MrtrInputRequests::new([
+                        ("first".to_owned(), MrtrInputRequest::roots()),
+                        ("second".to_owned(), MrtrInputRequest::roots()),
+                    ])
+                    .unwrap(),
+                    Some(upstream_state.to_owned()),
+                )
+                .unwrap();
+            let wire = serde_json::to_string(&issued).unwrap();
+            assert!(
+                !wire.contains(upstream_state),
+                "upstream state stays private"
+            );
+            states.push(mrtr_state_from_wire(&issued));
+        }
+        assert_ne!(states[0], states[1]);
+        assert_eq!(registry.active_len(), 2);
+        // Rotate both conversations after a partial response, then complete
+        // them in reverse order. Identical tool/arguments/input keys must not
+        // collapse their distinct private state.
+        for state in &mut states {
+            let responses = BTreeMap::from([(
+                "first".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            if wrong_binding {
+                let snapshot = || {
+                    let locked = registry.lock_state();
+                    let exchange = locked.exchanges.get(state).unwrap();
+                    (
+                        format!("{exchange:?}"),
+                        exchange
+                            .handler_request_state
+                            .as_ref()
+                            .map(|value| value.0.clone()),
+                    )
+                };
+                let before = snapshot();
+                let error = registry
+                    .accept_wire_bound(state, &foreign, &responses)
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(registry.active_len(), 2);
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "binding refusal preserves all retained fields and private state"
+                );
+            }
+            let MrtrRetry::InputRequired(partial) = registry
+                .accept_wire_bound(state, &binding, &responses)
+                .unwrap()
+            else {
+                panic!("one outstanding response must remain");
+            };
+            assert!(
+                registry
+                    .accept_wire_bound(state, &binding, &responses)
+                    .is_err()
+            );
+            *state = mrtr_state_from_wire(&partial);
+        }
+        for index in [1, 0] {
+            let responses = BTreeMap::from([(
+                "second".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&states[index], &binding, &responses)
+                .unwrap()
+            else {
+                panic!("both responses complete the exchange");
+            };
+            assert_eq!(
+                completed.handler_request_state(),
+                Some(["conversation-a", "conversation-b"][index])
+            );
+            assert!(
+                !format!("{completed:?}").contains("conversation-"),
+                "debug output must redact retained upstream state"
+            );
+            assert!(completed.roots("first").unwrap().is_some());
+            assert!(completed.roots("second").unwrap().is_some());
+            assert_eq!(registry.active_len(), index);
+            assert!(
+                registry
+                    .accept_wire_bound(&states[index], &binding, &responses)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_handler_state_conversation_positive() {
+        mrtr_handler_state_probe(false);
+    }
+
+    #[test]
+    fn mrtr_handler_state_binding_planted_negative() {
+        mrtr_handler_state_probe(true);
+    }
+
     #[test]
     fn stateless_elicitation_state_only_retry_observes_cancellation_and_expiry_first() {
         let binding = MrtrExchangeBinding::stateless(
@@ -3126,7 +3291,7 @@ mod tests {
         let cancelled_registry = MrtrExchangeRegistry::new();
         let owner = McpRequestCancellation::new();
         let cancelled = cancelled_registry
-            .issue_bound(owner.clone(), binding.clone(), input_requests())
+            .issue_bound(owner.clone(), binding.clone(), input_requests(), None)
             .expect("stateless elicitation state issues before owner cancellation");
         let cancelled_state = mrtr_state_from_wire(&cancelled);
         assert!(owner.cancel());
@@ -3154,6 +3319,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 Some(binding.clone()),
                 input_requests(),
+                None,
                 issued_at,
             )
             .expect("stateless elicitation state issues before expiry");

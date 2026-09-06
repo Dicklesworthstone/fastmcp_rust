@@ -4461,12 +4461,16 @@ impl Router {
         handler_result: InputRequiredResult,
     ) -> McpResult<serde_json::Value> {
         // The handler may describe the input it needs, but it never controls
-        // requestState. Its former state member and open result siblings are
-        // intentionally not forwarded across this framework boundary.
+        // downstream requestState. Retain its state privately for this exact
+        // conversation; only admitted resume inputs can return it to a proxy.
+        // Open result siblings are not forwarded across this boundary.
         let input_requests = handler_mrtr_input_requests(request_ctx, &handler_result)?;
-        let required =
-            self.mrtr_exchanges
-                .issue_bound(continuation_cancellation, binding, input_requests)?;
+        let required = self.mrtr_exchanges.issue_bound(
+            continuation_cancellation,
+            binding,
+            input_requests,
+            handler_result.request_state().map(str::to_owned),
+        )?;
         encode_mrtr_input_required_result(required)
     }
 
@@ -10949,6 +10953,11 @@ mod router_tests {
                 match resume_inputs.roots("roots") {
                     Ok(Some(_)) => {
                         self.calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(
+                            resume_inputs.handler_request_state(),
+                            Some("one-shot-handler-state"),
+                            "the router returns the original handler state only after bound admission"
+                        );
                         Outcome::Ok(FinalToolOutcome::Complete(final_tool_complete_result(
                             FinalCallToolResult {
                                 content: vec![ContentBlock::text("one-shot resumed")],

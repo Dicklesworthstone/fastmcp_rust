@@ -5444,6 +5444,7 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
         additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        omit_tasks: bool,
     ) -> Result<ModernHttpRequest, ModernHttpClientError> {
         let mcp_apps_active = self.discovery_state.mcp_apps_activation_receipt.is_some();
         let generic_apps_configured = self
@@ -5452,12 +5453,16 @@ impl ModernHttpClient {
             .is_some_and(|runtime| runtime.configures_mcp_apps());
         let client_extension_settings =
             self.configured_client_extensions(additional_client_extensions);
-        let client_extensions = merge_client_extensions(
+        let mut client_extensions = merge_client_extensions(
             (mcp_apps_active && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
                 .flatten(),
             client_extension_settings.as_ref(),
         );
+        if omit_tasks && let Some(extensions) = client_extensions.as_mut() {
+            // This wire-level refusal also applies when Tasks is compiled out.
+            extensions.remove("io.modelcontextprotocol/tasks");
+        }
         let mut parameters = parameters;
         if let Some(level) = self.final_log_level {
             if let Some(object) = parameters.as_object_mut() {
@@ -5524,6 +5529,58 @@ impl ModernHttpClient {
             .await
     }
 
+    /// Starts one final tool call, including caller-managed MRTR retries.
+    ///
+    /// `allow_tasks` controls this request alone. Enabling it requires bilateral
+    /// discovery admission; disabling it removes Tasks even from configured
+    /// extensions. Other extensions, identity, and method metadata are retained.
+    /// The returned decoder is built from the exact stamped request sent on the
+    /// wire. The caller owns response streaming, cancellation, and result admission.
+    pub async fn request_tool_call(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        parameters: serde_json::Value,
+        allow_tasks: bool,
+    ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
+        if request_id.validate().is_err() {
+            return Err(ModernHttpClientError::InvalidRequestId);
+        }
+        let extensions = if allow_tasks {
+            #[cfg(feature = "tasks")]
+            {
+                admit_final_tasks_result_discriminator(
+                    &self.server_discovery(),
+                    OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+                )
+                .map_err(|_| ModernHttpClientError::TasksNegotiation)?;
+                BTreeMap::from([(
+                    fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID.to_owned(),
+                    serde_json::json!({}),
+                )])
+            }
+            #[cfg(not(feature = "tasks"))]
+            return Err(ModernHttpClientError::TasksNegotiation);
+        } else {
+            BTreeMap::new()
+        };
+        let request = self.build_post_discovery_request(
+            cx,
+            TOOLS_CALL,
+            parameters,
+            Some(request_id),
+            Some(&extensions),
+            !allow_tasks,
+        )?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
+            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+        let decoder =
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, wire.params.as_ref())
+                .map_err(ModernHttpClientError::TypedResult)?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
+        Ok((decoder, response))
+    }
+
     async fn request_with_client_extensions(
         &self,
         cx: &Cx,
@@ -5544,6 +5601,7 @@ impl ModernHttpClient {
             parameters,
             request_id,
             client_extensions,
+            false,
         )?;
         self.execute_post_discovery_request(cx, &request).await
     }
@@ -5619,6 +5677,7 @@ impl ModernHttpClient {
             parameters,
             request_id,
             client_extensions,
+            false,
         )?;
         self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
             .await
@@ -5834,7 +5893,14 @@ impl ModernHttpClient {
         maximum_response_bytes: usize,
     ) -> Result<CoreResult, ModernHttpMrtrError> {
         let request = self
-            .build_post_discovery_request(cx, method, parameters, Some(request_id.clone()), None)
+            .build_post_discovery_request(
+                cx,
+                method,
+                parameters,
+                Some(request_id.clone()),
+                None,
+                false,
+            )
             .map_err(ModernHttpMrtrError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
@@ -5905,7 +5971,14 @@ impl ModernHttpClient {
         }
         let method = method.as_ref();
         let request = self
-            .build_post_discovery_request(cx, method, parameters, Some(request_id.clone()), None)
+            .build_post_discovery_request(
+                cx,
+                method,
+                parameters,
+                Some(request_id.clone()),
+                None,
+                false,
+            )
             .map_err(ModernHttpFinalCoreListenError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
@@ -5995,6 +6068,7 @@ impl ModernHttpClient {
                 parameters,
                 Some(request_id.clone()),
                 Some(&task_extensions),
+                false,
             )
             .map_err(ModernHttpFinalCoreListenError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
@@ -6067,6 +6141,7 @@ impl ModernHttpClient {
                 serde_json::json!({ "notifications": notifications.clone() }),
                 Some(request_id.clone()),
                 client_extensions.as_ref(),
+                false,
             )
             .map_err(ModernHttpSubscriptionListenError::Request)?;
         let response = self
@@ -6125,6 +6200,7 @@ impl ModernHttpClient {
             parameters,
             Some(request_id.clone()),
             Some(&task_extensions),
+            false,
         )?;
         let response = self.execute_post_discovery_request(cx, &request).await?;
         let body = response
@@ -9532,6 +9608,267 @@ mod tests {
         });
         response["result"]["supportedVersions"] = serde_json::json!(["2026-07-28"]);
         serde_json::to_vec(&response).expect("typed Tasks discovery response")
+    }
+
+    #[cfg(feature = "tasks")]
+    fn modern_tool_call_request_tasks_policy_probe(server_tasks: bool, configure_tasks: bool) {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettings,
+            official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
+            register_official_tasks_extension,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let subject = format!("policy-tool-{}", address.port());
+        let peer_subject = subject.clone();
+        let (done, finished) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let accept = || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => return stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "policy HTTP accept bound"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("policy peer accept: {error}"),
+                    }
+                }
+            };
+            let mut discovery = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut discovery).body).unwrap();
+            assert_eq!(request["method"], SERVER_DISCOVER);
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&modern_tasks_discovery_body()).unwrap();
+            let extensions = body["result"]["capabilities"]["extensions"]
+                .as_object_mut()
+                .unwrap();
+            extensions.insert(
+                "io.modelcontextprotocol/ui".to_owned(),
+                serde_json::json!({}),
+            );
+            if !server_tasks {
+                extensions.remove(fastmcp_protocol::TASKS_EXTENSION);
+            }
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                &serde_json::to_vec(&body).unwrap(),
+            );
+            drop(discovery);
+            if configure_tasks && !server_tasks {
+                finished.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                    "configured Tasks refusal cannot post a tool request"
+                );
+                return Vec::new();
+            }
+            let mut requests = Vec::new();
+            for (index, allow_tasks) in [false, true, false].into_iter().enumerate() {
+                if allow_tasks && !server_tasks {
+                    continue;
+                }
+                let mut stream = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+                assert_eq!(request["method"], TOOLS_CALL);
+                assert_eq!(request["id"], serde_json::json!(index + 2));
+                assert_eq!(request["params"]["name"], peer_subject);
+                assert_eq!(request["params"]["requestState"], "upstream-state");
+                assert_eq!(
+                    request["params"]["inputResponses"],
+                    serde_json::json!({"roots": {"roots": []}})
+                );
+                assert_eq!(
+                    request["params"]["_meta"]["com.example/retained"],
+                    serde_json::json!({"exact": true})
+                );
+                let metadata = &request["params"]["_meta"];
+                assert_eq!(
+                    metadata["io.modelcontextprotocol/clientInfo"]["name"],
+                    "inbound-client"
+                );
+                let capabilities = &metadata[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY];
+                assert_eq!(
+                    capabilities["roots"],
+                    serde_json::json!({"listChanged": false})
+                );
+                assert_eq!(
+                    capabilities["extensions"]["io.modelcontextprotocol/ui"],
+                    serde_json::json!({"mimeTypes": ["text/html;profile=mcp-app"]})
+                );
+                assert_eq!(
+                    capabilities["extensions"][fastmcp_protocol::TASKS_EXTENSION],
+                    if allow_tasks {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+                let result = serde_json::json!({"jsonrpc":"2.0", "id": request["id"],
+                    "result":{"resultType":"complete", "content":[{"type":"text","text":peer_subject}]}});
+                write_response(
+                    &mut stream,
+                    200,
+                    "text/event-stream",
+                    format!("event: message\ndata: {result}\n\n").as_bytes(),
+                );
+                requests.push(request);
+            }
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "negotiation refusal must not contact the peer"
+            );
+            requests
+        });
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let tasks = register_official_tasks_extension(&mut descriptors).unwrap();
+        let apps = register_official_mcp_apps_extension(&mut descriptors).unwrap();
+        let mut extensions = BTreeMap::from([(
+            apps,
+            ExtensionSettings::new(serde_json::json!({"mimeTypes":["text/html;profile=mcp-app"]}))
+                .unwrap(),
+        )]);
+        if configure_tasks {
+            extensions.insert(
+                tasks,
+                ExtensionSettings::new(serde_json::json!({})).unwrap(),
+            );
+        }
+        let settings = Arc::new(
+            crate::session::ClientExtensionRuntime::new(
+                descriptors,
+                ClientExtensionDiscovery { extensions },
+                official_mcp_apps_negotiation_resolver,
+            )
+            .unwrap(),
+        );
+        let before = settings.client_wire_extensions();
+        let cx = Cx::for_request();
+        runtime_block_on(async {
+            let connection = ClientHttpConnection::connect_with_settings(
+                &cx,
+                plan(
+                    &format!("http://{address}/mcp"),
+                    "http://127.0.0.1:9/sse",
+                    "http://127.0.0.1:9/messages",
+                    ProtocolPolicy::ModernOnly,
+                ),
+                ClientInfo {
+                    name: "policy-client".to_owned(),
+                    version: "1".to_owned(),
+                },
+                ClientCapabilities {
+                    roots: Some(fastmcp_protocol::RootsCapability {
+                        list_changed: false,
+                    }),
+                    ..ClientCapabilities::default()
+                },
+                super::HttpConnectionSettings {
+                    mcp_apps: None,
+                    extensions: Some(Arc::clone(&settings)),
+                    bearer: None,
+                },
+            )
+            .await;
+            if configure_tasks && !server_tasks {
+                assert!(matches!(
+                    connection,
+                    Err(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::ClientExtensionNegotiation { .. }
+                    ))
+                ));
+                assert_eq!(settings.client_wire_extensions(), before);
+                return;
+            }
+            let client = match connection.unwrap() {
+                ClientHttpConnection::Modern(client) => client,
+                #[cfg(feature = "legacy-2024-11-05")]
+                ClientHttpConnection::LegacySse(_) => panic!("modern-only connection"),
+            };
+            for (index, allow_tasks) in [false, true, false].into_iter().enumerate() {
+                let id = RequestId::Number(i64::try_from(index + 2).unwrap());
+                let request = client.request_tool_call(&cx, id.clone(), serde_json::json!({
+                    "name": subject, "arguments": {}, "requestState": "upstream-state",
+                    "inputResponses": {"roots": {"roots": []}},
+                    "_meta": {"com.example/retained": {"exact": true},
+                        "io.modelcontextprotocol/clientInfo": {"name": "inbound-client", "version": "2"},
+                        fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY: {"roots": {"listChanged": false}, "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}}}
+                }), allow_tasks).await;
+                if allow_tasks && !server_tasks {
+                    assert!(matches!(
+                        request,
+                        Err(super::ModernHttpClientError::TasksNegotiation)
+                    ));
+                } else {
+                    let (decoder, response) = request.unwrap();
+                    let result = response
+                        .into_final_core_listener(
+                            id,
+                            decoder,
+                            SseLimits::new(4096, 8192, 16).unwrap(),
+                        )
+                        .unwrap()
+                        .collect(&cx)
+                        .await
+                        .unwrap();
+                    let observed: serde_json::Value =
+                        serde_json::from_str(&CoreResult::Final(result.terminal).encode().unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        observed,
+                        serde_json::json!({"resultType": "complete", "content": [{"type": "text", "text": subject}]})
+                    );
+                }
+                assert_eq!(
+                    settings.client_wire_extensions(),
+                    before,
+                    "request policy cannot mutate frozen configuration"
+                );
+            }
+        });
+        if configure_tasks && !server_tasks {
+            done.send(()).unwrap();
+        }
+        let requests = peer.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            if server_tasks {
+                3
+            } else if configure_tasks {
+                0
+            } else {
+                2
+            }
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"proof":"modern_tool_call_request_tasks_policy", "server_tasks":server_tasks, "configure_tasks":configure_tasks, "subject":subject, "peer_requests":requests})
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn modern_tool_call_request_tasks_policy_positive() {
+        for configure_tasks in [true, false] {
+            modern_tool_call_request_tasks_policy_probe(true, configure_tasks);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn modern_tool_call_request_tasks_policy_planted_negative() {
+        for configure_tasks in [true, false] {
+            modern_tool_call_request_tasks_policy_probe(false, configure_tasks);
+        }
     }
 
     fn subscriptions_listen_sse_events(acknowledgement_id: &str) -> [String; 4] {

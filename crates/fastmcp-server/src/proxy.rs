@@ -26,7 +26,9 @@ use fastmcp_client::FinalToolCallOutcome;
 use fastmcp_client::StdioRequestExecution;
 #[cfg(feature = "tasks")]
 use fastmcp_client::StdioTaskSubscriptionEvent;
-use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpResponseKind};
+use fastmcp_client::http_executor::{
+    ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
+};
 #[cfg(feature = "tasks")]
 use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
@@ -63,7 +65,7 @@ use fastmcp_protocol::{
     FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
     FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
-    InputRequiredResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
     LegacyResourceContent, ProgressParams, Prompt, PromptMessage, ReadResourceResult, RequestId,
     Resource, ResourceContent, ResourceTemplate, RootsCapability, SamplingCapability,
@@ -87,11 +89,9 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::bidirectional::{MrtrCompletedInputs, MrtrInputKind};
-#[cfg(feature = "tasks")]
-use crate::handler::FinalToolOutcome;
 use crate::handler::{
     BoxFuture, CompletionHandler, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+    FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
     UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
@@ -105,6 +105,77 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<Strin
 /// Callers that selected the modern upstream receive the admitted final
 /// parameters, including their raw decimal/exponent lexemes.
 pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
+
+/// One native HTTP tool request reserved without starting I/O or holding the
+/// proxy backend lock while its response is awaited.
+#[doc(hidden)]
+pub struct ProxyFinalToolRequest {
+    client: ModernHttpClient,
+    request_id: RequestId,
+}
+
+impl ProxyFinalToolRequest {
+    async fn execute(
+        self,
+        ctx: &McpContext,
+        mut parameters: serde_json::Value,
+        allow_tasks: bool,
+        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
+    ) -> McpResult<CoreResult> {
+        let Self {
+            mut client,
+            request_id,
+        } = self;
+        if let Some(identity) = ctx
+            .client_implementation()
+            .and_then(implementation_from_request_identity)
+        {
+            client.set_client_implementation(identity);
+        }
+        if let Some(level) = inbound_logging_level(ctx) {
+            client.set_log_level(level);
+        }
+        if let Some(capabilities) = inbound_client_capabilities(ctx) {
+            client.overlay_client_capabilities(capabilities);
+        }
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        let (request, response) = await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async {
+                client
+                    .request_tool_call(ctx.cx(), request_id.clone(), parameters, allow_tasks)
+                    .await
+                    .map_err(|error| {
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP final tools/call failed: {error}"
+                        ))
+                    })
+            }),
+        )
+        .await?;
+        let response =
+            receive_modern_response_body_with_cancellation(response, ctx, &request_id, on_progress)
+                .await?;
+        if let Some(error) = response.response.error.as_ref() {
+            return Err(proxy_http_upstream_rpc_error(
+                fastmcp_protocol::methods::TOOLS_CALL,
+                error,
+            ));
+        }
+        let raw_result = response.raw_result.as_deref().ok_or_else(|| {
+            McpError::invalid_request("Proxy HTTP modern response lost its admitted result source")
+        })?;
+        request
+            .decode_response_result(&response.response, raw_result)
+            .map_err(|error| {
+                McpError::invalid_request(format!(
+                    "Proxy HTTP upstream response is invalid for the selected era: {error}"
+                ))
+            })
+    }
+}
 
 /// One final Tasks request that has reserved its route-local request ID but
 /// has not started upstream I/O.  Modern HTTP clients are cloneable and
@@ -1290,6 +1361,13 @@ pub trait ProxyBackend: Send {
         ))
     }
 
+    /// Reserves native HTTP tool I/O for execution on the caller's runtime.
+    /// Custom and stdio backends retain their current synchronous path.
+    #[doc(hidden)]
+    fn prepare_final_tool_request(&mut self) -> McpResult<Option<ProxyFinalToolRequest>> {
+        Ok(None)
+    }
+
     /// Resumes a final continuation without advertising Tasks upstream.
     #[cfg(feature = "tasks")]
     fn request_final_core_without_tasks_with_parameters(
@@ -1790,10 +1868,6 @@ fn overlay_inbound_client_capabilities(
     base
 }
 
-fn mrtr_operation_key(method: &str, target: &str) -> String {
-    format!("{method}:{target}")
-}
-
 fn mrtr_input_responses_from_completed(
     resume: &MrtrCompletedInputs,
 ) -> McpResult<BTreeMap<String, serde_json::Value>> {
@@ -1817,13 +1891,12 @@ fn mrtr_input_responses_from_completed(
 
 fn overlay_upstream_mrtr_resume(
     mut parameters: serde_json::Value,
-    pending: &InputRequiredResult,
     resume: &MrtrCompletedInputs,
 ) -> McpResult<serde_json::Value> {
     let object = parameters.as_object_mut().ok_or_else(|| {
         McpError::internal_error("Proxy MRTR resume parameters must remain an object")
     })?;
-    if let Some(request_state) = pending.request_state() {
+    if let Some(request_state) = resume.handler_request_state() {
         object.insert(
             "requestState".to_owned(),
             serde_json::Value::String(request_state.to_owned()),
@@ -3816,9 +3889,6 @@ impl ProxyCatalog {
 pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
     upstream_binding: Option<ProxyUpstreamBinding>,
-    /// Last upstream `input_required` per operation, used to resume that
-    /// exact requestState when the downstream MRTR exchange completes.
-    pending_mrtr: Arc<Mutex<HashMap<String, InputRequiredResult>>>,
     /// Maps an upstream resource URI onto the inbound prefixed URI that
     /// subscribed through this route, so relayed `resources/updated` frames
     /// match the gateway session subscription.
@@ -5898,6 +5968,17 @@ impl ProxyBackend for ProxyHttpClient {
         self.request_result_with_context(ctx, method, parameters)
     }
 
+    fn prepare_final_tool_request(&mut self) -> McpResult<Option<ProxyFinalToolRequest>> {
+        let Some(client) = modern_http_client(&self.connection) else {
+            return Ok(None);
+        };
+        let client = client.clone();
+        Ok(Some(ProxyFinalToolRequest {
+            client,
+            request_id: self.next_request_id()?,
+        }))
+    }
+
     fn read_resource_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -6952,6 +7033,15 @@ async fn receive_modern_response_with_cancellation(
         }),
     )
     .await?;
+    receive_modern_response_body_with_cancellation(response, ctx, request_id, on_progress).await
+}
+
+async fn receive_modern_response_body_with_cancellation(
+    response: ModernHttpResponseStream,
+    ctx: &McpContext,
+    request_id: &RequestId,
+    on_progress: &mut (impl FnMut(FinalProgressNotificationParams) + ?Sized),
+) -> McpResult<ProxyHttpResponse> {
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
             let body = await_proxy_request_or_cancellation(
@@ -7055,7 +7145,7 @@ fn decode_modern_server_notification(
 fn forward_modern_progress_notification(
     raw_frame: &[u8],
     request: &JsonRpcRequest,
-    on_progress: FinalProgressCallback<'_>,
+    on_progress: &mut (impl FnMut(FinalProgressNotificationParams) + ?Sized),
     ctx: Option<&McpContext>,
 ) -> McpResult<()> {
     let notification = decode_modern_server_notification(raw_frame, request)?;
@@ -7715,7 +7805,6 @@ impl ProxyClient {
         Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: None,
-            pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
             subscription_rewrites: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
@@ -7745,7 +7834,6 @@ impl ProxyClient {
         Ok(Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: Some(binding),
-            pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
             subscription_rewrites: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
@@ -8595,121 +8683,126 @@ impl ProxyClient {
         if !matches!(outcome, FinalToolCallOutcome::Task(_)) {
             ctx.checkpoint()?;
         }
-        if let FinalToolCallOutcome::InputRequired(result) = &outcome {
-            self.store_pending_mrtr(
-                mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name),
-                result.clone(),
-            )?;
-        }
         Ok(outcome)
     }
 
-    /// Forwards an ordinary final tools/call without advertising Tasks to the
-    /// upstream. Complete and MRTR outcomes remain available; an unsolicited
-    /// Task is rejected because the downstream request did not negotiate a
-    /// route capable of relaying it.
-    #[cfg(feature = "tasks")]
-    fn call_tool_final_non_task_outcome(
-        &self,
-        ctx: &McpContext,
-        name: &str,
-        arguments: serde_json::Value,
-    ) -> McpResult<FinalToolCallOutcome> {
-        let mut progress_error = None;
-        let mut forward_progress = |progress: FinalProgressNotificationParams| {
-            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
-                progress_error = Some(error);
-            }
-        };
-        let result = self.call_tool_typed_without_tasks_with_final_progress(
-            ctx,
-            name,
-            arguments,
-            &mut forward_progress,
-        )?;
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
-        match result {
-            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
-                Ok(FinalToolCallOutcome::Complete(result))
-            }
-            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
-                self.store_pending_mrtr(
-                    mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name),
-                    result.clone(),
-                )?;
-                Ok(FinalToolCallOutcome::InputRequired(result))
-            }
-            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }) => {
-                Err(McpError::invalid_request(
-                    "Proxy upstream returned a Task without a negotiated downstream Tasks relay",
-                ))
-            }
-            CoreResult::Legacy(LegacyCoreResult::ToolsCall(_)) => Err(McpError::invalid_request(
-                "Proxy cannot use an exact legacy tools/call result for a final handler path",
-            )),
-            _ => Err(unexpected_proxy_result("tools/call")),
-        }
-    }
-
     /// Forwards a tools/call, optionally resuming a stored upstream
-    /// `input_required` with the downstream-admitted MRTR inputs.
-    #[cfg(feature = "tasks")]
-    fn call_tool_final_outcome_with_resume(
+    /// `input_required` with the downstream-admitted MRTR inputs. Native HTTP
+    /// I/O is detached from the backend lock and awaited on the request Cx.
+    async fn call_tool_final_outcome_with_resume(
         &self,
         ctx: &McpContext,
         name: &str,
         arguments: serde_json::Value,
         resume_inputs: Option<&MrtrCompletedInputs>,
         allow_tasks: bool,
-    ) -> McpResult<FinalToolCallOutcome> {
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
         let tasks_negotiated = allow_tasks && ctx.client_supports_tasks();
-        if let Some(resume) = resume_inputs {
-            let key = mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name);
-            let pending = self.take_pending_mrtr(&key)?;
-            let parameters = overlay_upstream_mrtr_resume(
-                serde_json::json!({"name": name, "arguments": arguments}),
-                &pending,
+        #[cfg(feature = "tasks")]
+        if tasks_negotiated && resume_inputs.is_none() {
+            let result = match self.call_tool_final_outcome(ctx, name, arguments).await? {
+                FinalToolCallOutcome::Complete(result) => FinalCoreResult::ToolsCall {
+                    result,
+                    diagnostic: None,
+                },
+                FinalToolCallOutcome::InputRequired(result) => {
+                    FinalCoreResult::ToolsCallInputRequired {
+                        result,
+                        diagnostic: None,
+                    }
+                }
+                FinalToolCallOutcome::Task(result) => FinalCoreResult::ToolsCallTask { result },
+            };
+            return self.admit_upstream_result(
+                fastmcp_protocol::methods::TOOLS_CALL,
+                CoreResult::Final(result),
+            );
+        }
+        let parameters = if let Some(resume) = resume_inputs {
+            overlay_upstream_mrtr_resume(
+                serde_json::json!({"name": name, "arguments": arguments.clone()}),
                 resume,
-            )?;
-            let result = if tasks_negotiated {
+            )?
+        } else {
+            serde_json::json!({"name": name, "arguments": arguments.clone()})
+        };
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let prepared = self.with_backend(|backend| backend.prepare_final_tool_request())?;
+        let result = if let Some(request) = prepared {
+            request
+                .execute(ctx, parameters, tasks_negotiated, &mut forward_progress)
+                .await?
+        } else if resume_inputs.is_some() {
+            #[cfg(feature = "tasks")]
+            {
+                if tasks_negotiated {
+                    self.request_upstream_final_core(
+                        ctx,
+                        fastmcp_protocol::methods::TOOLS_CALL,
+                        parameters,
+                    )?
+                } else {
+                    self.request_upstream_final_core_without_tasks(
+                        ctx,
+                        fastmcp_protocol::methods::TOOLS_CALL,
+                        parameters,
+                    )?
+                }
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
                 self.request_upstream_final_core(
                     ctx,
                     fastmcp_protocol::methods::TOOLS_CALL,
                     parameters,
-                )
-            } else {
-                self.request_upstream_final_core_without_tasks(
-                    ctx,
-                    fastmcp_protocol::methods::TOOLS_CALL,
-                    parameters,
-                )
-            }?;
-            match result {
-                CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
-                    Ok(FinalToolCallOutcome::Complete(result))
-                }
-                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
-                    self.store_pending_mrtr(key, result.clone())?;
-                    Ok(FinalToolCallOutcome::InputRequired(result))
-                }
-                CoreResult::Final(FinalCoreResult::ToolsCallTask { result, .. }) => {
-                    if tasks_negotiated {
-                        Ok(FinalToolCallOutcome::Task(result))
-                    } else {
-                        Err(McpError::invalid_request(
-                            "Proxy upstream returned a Task without a negotiated downstream Tasks relay",
-                        ))
-                    }
-                }
-                _ => Err(unexpected_proxy_result("tools/call")),
+                )?
             }
-        } else if tasks_negotiated {
-            block_on(self.call_tool_final_outcome(ctx, name, arguments))
         } else {
-            self.call_tool_final_non_task_outcome(ctx, name, arguments)
+            #[cfg(feature = "tasks")]
+            {
+                self.call_tool_typed_without_tasks_with_final_progress(
+                    ctx,
+                    name,
+                    arguments,
+                    &mut forward_progress,
+                )?
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
+                self.call_tool_typed_with_final_progress(
+                    ctx,
+                    name,
+                    arguments,
+                    &mut forward_progress,
+                )?
+            }
+        };
+        if let Some(error) = progress_error {
+            return Err(error);
         }
+        let result = self.admit_upstream_result(fastmcp_protocol::methods::TOOLS_CALL, result)?;
+        #[cfg(feature = "tasks")]
+        if matches!(
+            &result,
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+        ) {
+            if !tasks_negotiated {
+                return Err(McpError::invalid_request(
+                    "Proxy upstream returned a Task without a negotiated downstream Tasks relay",
+                ));
+            }
+            // Retain a committed upstream Task handle even when cancellation
+            // races after result admission, just as for an initial call.
+            return Ok(result);
+        }
+        ctx.checkpoint()?;
+        Ok(result)
     }
 
     #[cfg(feature = "tasks")]
@@ -9201,11 +9294,8 @@ impl ProxyClient {
         uri: &str,
         resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
-        let key = mrtr_operation_key(fastmcp_protocol::methods::RESOURCES_READ, uri);
         let result = if let Some(resume) = resume_inputs {
-            let pending = self.take_pending_mrtr(&key)?;
-            let parameters =
-                overlay_upstream_mrtr_resume(serde_json::json!({"uri": uri}), &pending, resume)?;
+            let parameters = overlay_upstream_mrtr_resume(serde_json::json!({"uri": uri}), resume)?;
             self.request_upstream_final_core(
                 ctx,
                 fastmcp_protocol::methods::RESOURCES_READ,
@@ -9219,7 +9309,6 @@ impl ProxyClient {
                 Ok(FinalMethodOutcome::Complete(result))
             }
             CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }) => {
-                self.store_pending_mrtr(key, result.clone())?;
                 Ok(FinalMethodOutcome::InputRequired(result))
             }
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_)) => {
@@ -9250,12 +9339,9 @@ impl ProxyClient {
         arguments: HashMap<String, String>,
         resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
-        let key = mrtr_operation_key(fastmcp_protocol::methods::PROMPTS_GET, name);
         let result = if let Some(resume) = resume_inputs {
-            let pending = self.take_pending_mrtr(&key)?;
             let parameters = overlay_upstream_mrtr_resume(
                 serde_json::json!({"name": name, "arguments": arguments}),
-                &pending,
                 resume,
             )?;
             self.request_upstream_final_core(
@@ -9271,7 +9357,6 @@ impl ProxyClient {
                 Ok(FinalMethodOutcome::Complete(result))
             }
             CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) => {
-                self.store_pending_mrtr(key, result.clone())?;
                 Ok(FinalMethodOutcome::InputRequired(result))
             }
             CoreResult::Legacy(LegacyCoreResult::PromptsGet(_)) => Err(McpError::invalid_request(
@@ -9279,26 +9364,6 @@ impl ProxyClient {
             )),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
-    }
-
-    fn store_pending_mrtr(&self, key: String, result: InputRequiredResult) -> McpResult<()> {
-        self.pending_mrtr
-            .lock()
-            .map_err(|_| McpError::internal_error("Proxy MRTR resume lock poisoned"))?
-            .insert(key, result);
-        Ok(())
-    }
-
-    fn take_pending_mrtr(&self, key: &str) -> McpResult<InputRequiredResult> {
-        self.pending_mrtr
-            .lock()
-            .map_err(|_| McpError::internal_error("Proxy MRTR resume lock poisoned"))?
-            .remove(key)
-            .ok_or_else(|| {
-                McpError::invalid_request(
-                    "Proxy has no upstream input_required to resume for this operation",
-                )
-            })
     }
 
     fn request_upstream_final_core(
@@ -9633,6 +9698,43 @@ impl ProxyToolHandler {
         handler.task_relay = Some(task_relay);
         Ok(handler)
     }
+
+    fn has_task_relay(&self) -> bool {
+        #[cfg(feature = "tasks")]
+        {
+            self.task_relay.is_some()
+        }
+        #[cfg(not(feature = "tasks"))]
+        {
+            false
+        }
+    }
+
+    fn admit_final_tool_result(&self, result: CoreResult) -> McpResult<FinalToolOutcome> {
+        match result {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolOutcome::InputRequired(result))
+            }
+            #[cfg(feature = "tasks")]
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                let relay = self.task_relay.as_ref().ok_or_else(|| {
+                    McpError::internal_error("Proxy official Task result has no route-bound relay")
+                })?;
+                let reservation = relay.reserve_task_creation()?;
+                Ok(FinalToolOutcome::CreateTask {
+                    work_descriptor: relay.encode_task_carrier(reservation, result)?,
+                    status_message: None,
+                })
+            }
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(_)) => Err(McpError::invalid_request(
+                "Proxy cannot use an exact legacy tools/call result for a final handler path",
+            )),
+            _ => Err(unexpected_proxy_result("tools/call")),
+        }
+    }
 }
 
 impl ToolHandler for ProxyToolHandler {
@@ -9695,46 +9797,56 @@ impl ToolHandler for ProxyToolHandler {
             .call_tool_final(ctx, &self.external_name, arguments)
     }
 
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .call_tool_final_outcome_with_resume(
+                    ctx,
+                    &self.external_name,
+                    arguments,
+                    None,
+                    false,
+                )
+                .await
+            {
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { result, .. })) => {
+                    Outcome::Ok(result)
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("tools/call")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     #[cfg(feature = "tasks")]
     fn declares_final_tasks(&self) -> bool {
         self.task_relay.is_some()
     }
 
-    #[cfg(feature = "tasks")]
     fn call_final_outcome(
         &self,
         ctx: &McpContext,
         arguments: serde_json::Value,
     ) -> McpResult<FinalToolOutcome> {
-        match self.client.call_tool_final_outcome_with_resume(
+        let result = block_on(self.client.call_tool_final_outcome_with_resume(
             ctx,
             &self.external_name,
             arguments,
             None,
-            self.task_relay.is_some(),
-        )? {
-            FinalToolCallOutcome::Complete(result) => Ok(FinalToolOutcome::Complete(result)),
-            FinalToolCallOutcome::InputRequired(result) => {
-                Ok(FinalToolOutcome::InputRequired(result))
-            }
-            FinalToolCallOutcome::Task(result) => {
-                let task_relay = self.task_relay.as_ref().ok_or_else(|| {
-                    McpError::internal_error("Proxy official Task result has no route-bound relay")
-                })?;
-                let reservation = task_relay.reserve_task_creation()?;
-                Ok(FinalToolOutcome::CreateTask {
-                    work_descriptor: task_relay.encode_task_carrier(reservation, result)?,
-                    status_message: None,
-                })
-            }
-        }
+            self.has_task_relay(),
+        ))?;
+        self.admit_final_tool_result(result)
     }
 
     fn declares_final_mrtr(&self) -> bool {
         self.final_tool.is_some()
     }
 
-    #[cfg(feature = "tasks")]
     fn call_final_outcome_async<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -9743,7 +9855,6 @@ impl ToolHandler for ProxyToolHandler {
         self.call_final_outcome_async_resuming_in_request(ctx, ctx.cx(), arguments, None)
     }
 
-    #[cfg(feature = "tasks")]
     fn call_final_outcome_async_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -9752,52 +9863,20 @@ impl ToolHandler for ProxyToolHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         Box::pin(async move {
-            let result = if resume_inputs.is_none()
-                && self.task_relay.is_some()
-                && ctx.client_supports_tasks()
-            {
-                self.client
-                    .call_tool_final_outcome(ctx, &self.external_name, arguments)
-                    .await
-            } else {
-                self.client.call_tool_final_outcome_with_resume(
+            let result = self
+                .client
+                .call_tool_final_outcome_with_resume(
                     ctx,
                     &self.external_name,
                     arguments,
                     resume_inputs,
-                    self.task_relay.is_some(),
+                    self.has_task_relay(),
                 )
-            };
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(error) => return Outcome::Err(error),
-            };
-            match outcome {
-                FinalToolCallOutcome::Complete(result) => {
-                    Outcome::Ok(FinalToolOutcome::Complete(result))
-                }
-                FinalToolCallOutcome::InputRequired(result) => {
-                    Outcome::Ok(FinalToolOutcome::InputRequired(result))
-                }
-                FinalToolCallOutcome::Task(result) => {
-                    let Some(task_relay) = self.task_relay.as_ref() else {
-                        return Outcome::Err(McpError::internal_error(
-                            "Proxy official Task result has no route-bound relay",
-                        ));
-                    };
-                    match task_relay.reserve_task_creation() {
-                        Ok(reservation) => {
-                            match task_relay.encode_task_carrier(reservation, result) {
-                                Ok(work_descriptor) => Outcome::Ok(FinalToolOutcome::CreateTask {
-                                    work_descriptor,
-                                    status_message: None,
-                                }),
-                                Err(error) => Outcome::Err(error),
-                            }
-                        }
-                        Err(error) => Outcome::Err(error),
-                    }
-                }
+                .await
+                .and_then(|result| self.admit_final_tool_result(result));
+            match result {
+                Ok(outcome) => Outcome::Ok(outcome),
+                Err(error) => Outcome::Err(error),
             }
         })
     }
@@ -10159,33 +10238,33 @@ mod tests {
     use fastmcp_protocol::{
         CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
         Content, CoreResult, FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams,
-        FinalRequestMeta, JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+        JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
         LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent,
         ServerNotification, SubscriptionFilter, Tool, decode_strict_jsonrpc_message,
     };
     #[cfg(feature = "tasks")]
     use fastmcp_protocol::{
-        CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, set_task_subscription_ids,
+        CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, FinalRequestMeta,
+        set_task_subscription_ids,
     };
 
     use super::{
         ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog,
         ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
         ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
-        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, await_proxy_operation_or_cancellation,
-        decode_modern_server_notification, final_tool_legacy_fallback,
-        forward_modern_progress_notification, legacy_contents_to_handler,
-        legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, decode_modern_server_notification,
+        final_tool_legacy_fallback, forward_modern_progress_notification,
+        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
         legacy_tool_result_to_handler, stdio_parameters_with_inbound_identity,
     };
     #[cfg(feature = "tasks")]
     use super::{
         ProxyFinalTaskListener, ProxyFinalTaskListenerEvent,
         await_proxy_final_task_listener_event_or_cancellation,
+        await_proxy_operation_or_cancellation,
     };
+    use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     #[cfg(feature = "tasks")]
-    use crate::handler::FinalToolOutcome;
-    use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     use std::task::Poll;
 
     #[cfg(feature = "tasks")]
@@ -10774,6 +10853,340 @@ mod tests {
     #[test]
     fn proxy_task_tool_caller_runtime_planted_negative() {
         proxy_task_tool_caller_runtime_probe(true);
+    }
+
+    fn proxy_tool_resume_caller_runtime_probe(cancel: bool) {
+        use crate::bidirectional::{
+            MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest, MrtrInputRequests,
+            MrtrRetry,
+        };
+        use fastmcp_core::Outcome;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .expect("caller runtime with native reactor");
+        for allow_tasks in [false, true] {
+            if allow_tasks && !cfg!(feature = "tasks") {
+                continue;
+            }
+            // 0: complete immediately; 1: state only; 2: roots and state;
+            // 3: roots without upstream state (the downstream state is still bound).
+            for mode in 0..4 {
+                if allow_tasks && mode == 0 {
+                    continue;
+                }
+                for sse in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let subject = format!("resume-tool-{}", address.port());
+                    let initial_rounds = if mode == 0 {
+                        0
+                    } else if allow_tasks {
+                        1
+                    } else {
+                        2
+                    };
+                    let rounds = if mode == 0 { 1 } else { initial_rounds * 2 };
+                    let upstream_state = format!("upstream-{subject}");
+                    let upstream = serde_json::json!({"resultType": "complete",
+                        "content": [{"type": "text", "text": subject}]});
+                    #[cfg(feature = "tasks")]
+                    let upstream = if allow_tasks {
+                        serde_json::to_value(final_task_relay_result_with_ttl(&subject, None))
+                            .unwrap()
+                    } else {
+                        upstream
+                    };
+                    let peer_result = upstream.clone();
+                    let peer_subject = subject.clone();
+                    let peer_state = upstream_state.clone();
+                    let received = Arc::new(AtomicUsize::new(0));
+                    let peer_received = Arc::clone(&received);
+                    let (release, replies) = std::sync::mpsc::sync_channel::<()>(1);
+                    let peer = thread::spawn(move || {
+                        let accept = || {
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            loop {
+                                match listener.accept() {
+                                    Ok((stream, _)) => {
+                                        stream
+                                            .set_read_timeout(Some(Duration::from_secs(10)))
+                                            .unwrap();
+                                        stream
+                                            .set_write_timeout(Some(Duration::from_secs(10)))
+                                            .unwrap();
+                                        return stream;
+                                    }
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                    {
+                                        assert!(
+                                            Instant::now() < deadline,
+                                            "native peer accept deadline"
+                                        );
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    Err(error) => panic!("native peer accept: {error}"),
+                                }
+                            }
+                        };
+                        let mut discovery = accept();
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&read_http_request(&mut discovery).body)
+                                .unwrap();
+                        assert_eq!(request["method"], "server/discover");
+                        write_http_discovery_response(&mut discovery, &serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": {
+                                "supportedVersions": ["2026-07-28"],
+                                "capabilities": {"extensions": {"io.modelcontextprotocol/tasks": {}}},
+                                "ttlMs": 0, "cacheScope": "private"
+                            }
+                        })).unwrap());
+                        drop(discovery);
+                        let mut wires = Vec::new();
+                        for round in 0..rounds {
+                            let conversation = if round < initial_rounds {
+                                round
+                            } else {
+                                rounds - 1 - round
+                            };
+                            let mut stream = accept();
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&read_http_request(&mut stream).body)
+                                    .unwrap();
+                            assert_eq!(request["method"], "tools/call");
+                            let params = &request["params"];
+                            assert_eq!(params["name"], peer_subject);
+                            assert_eq!(
+                                params["arguments"],
+                                serde_json::json!({"subject": peer_subject})
+                            );
+                            assert_eq!(params["_meta"]["progressToken"], peer_subject);
+                            assert_eq!(
+                                params["_meta"]
+                                    [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"],
+                                serde_json::json!({})
+                            );
+                            let tasks = &params["_meta"]
+                                [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                                ["io.modelcontextprotocol/tasks"];
+                            assert_eq!(
+                                tasks,
+                                &if allow_tasks {
+                                    serde_json::json!({})
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            );
+                            if round < initial_rounds || mode == 0 || mode == 3 {
+                                assert!(params.get("requestState").is_none());
+                            } else {
+                                assert_eq!(
+                                    params["requestState"],
+                                    format!("{peer_state}-{conversation}")
+                                );
+                            }
+                            if round >= initial_rounds && mode >= 2 {
+                                assert_eq!(
+                                    params["inputResponses"],
+                                    serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{peer_subject}-{conversation}")} ]}})
+                                );
+                            } else {
+                                assert!(params.get("inputResponses").is_none());
+                            }
+                            let result = if round < initial_rounds {
+                                let mut required =
+                                    serde_json::json!({"resultType": "input_required"});
+                                if mode != 3 {
+                                    required["requestState"] =
+                                        serde_json::json!(format!("{peer_state}-{conversation}"));
+                                }
+                                if mode >= 2 {
+                                    required["inputRequests"] =
+                                        serde_json::json!({"roots": {"method": "roots/list"}});
+                                }
+                                required
+                            } else {
+                                peer_result.clone()
+                            };
+                            peer_received.store(round + 1, Ordering::Release);
+                            replies
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("caller sibling releases each reply");
+                            let response = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+                            let (content_type, body) = if sse {
+                                let marker = serde_json::to_string(&peer_subject).unwrap();
+                                ("text/event-stream", format!("event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{marker},\"progress\":1.20e+4,\"total\":12000.0,\"message\":\"relayed\"}}}}\n\nevent: message\ndata: {response}\n\n").into_bytes())
+                            } else {
+                                ("application/json", serde_json::to_vec(&response).unwrap())
+                            };
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let written = stream
+                                .write_all(head.as_bytes())
+                                .and_then(|()| stream.write_all(&body))
+                                .is_ok();
+                            if !(cancel && round + 1 == rounds) {
+                                assert!(written);
+                            }
+                            wires.push(
+                                serde_json::json!({"request": request, "reply_written": written}),
+                            );
+                        }
+                        wires
+                    });
+                    let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                    let cancellation = McpRequestCancellation::new();
+                    let registry = MrtrExchangeRegistry::new();
+                    let capture = Arc::new(ExactProgressCapture::default());
+                    let proxy = runtime.block_on(async {
+                        let plan = ClientProtocolPlan::http(ProtocolPolicy::ModernOnly,
+                            Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                            None, None, "resume-credential".to_owned(), "resume-owner".to_owned(),
+                            "native-resume".to_owned(), 1, 1, 0).unwrap();
+                        let capabilities = ClientCapabilities::default();
+                        let connection = ClientHttpConnection::connect(&cx, plan, proxy_http_client_info(), capabilities.clone()).await.unwrap();
+                        let binding = ProxyUpstreamBinding { adapter: ProxyUpstreamAdapter::ModernHttp, ..proxy_binding(ProtocolEra::Modern2026) };
+                        let proxy = ProxyClient::from_backend_with_upstream_binding(
+                            ProxyHttpClient::new(binding, connection, cx.clone(), proxy_http_client_info(), capabilities), binding, "2026-07-28").unwrap();
+                        let mut tool = final_catalog_tool();
+                        tool.name.clone_from(&subject);
+                        let handler = ProxyToolHandler::from_final(tool, proxy.clone()).unwrap();
+                        #[cfg(feature = "tasks")]
+                        let handler = if allow_tasks { let mut handler = handler; handler.task_relay = proxy.final_tasks_relay().unwrap(); handler } else { handler };
+                        let capabilities = fastmcp_core::ClientCapabilityInfo::new().with_roots(false);
+                        #[cfg(feature = "tasks")]
+                        let capabilities = if allow_tasks { capabilities.with_tasks() } else { capabilities };
+                        let ctx = McpContext::with_progress(cx.clone(), 891,
+                            ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
+                            .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities);
+                        let exchange_binding = MrtrExchangeBinding::new("tools/call", subject.clone(), [7;32], [9;32], None);
+                        let mut resumes = Vec::new();
+                        #[cfg(feature = "tasks")]
+                        let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+                        for round in 0..rounds {
+                            let resume = if round < initial_rounds || mode == 0 { None } else { resumes.get(rounds - 1 - round) };
+                            let sibling_received = Arc::clone(&received);
+                            let sibling_cancel = cancellation.clone();
+                            let sibling_release = release.clone();
+                            let cancelling_round = cancel && round + 1 == rounds;
+                            let mut sibling = cx.spawn(move |sibling_cx| async move {
+                                let deadline = sibling_cx.now().saturating_add_nanos(8_000_000_000);
+                                while sibling_received.load(Ordering::Acquire) <= round {
+                                    assert!(sibling_cx.now() < deadline, "tool round reaches native peer");
+                                    asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
+                                }
+                                if cancelling_round { assert!(sibling_cancel.cancel()); }
+                                else { sibling_release.send(()).unwrap(); }
+                            }).unwrap();
+                            let outcome = asupersync::time::timeout_at(cx.now().saturating_add_nanos(9_000_000_000),
+                                handler.call_final_outcome_async_resuming_in_request(&ctx, &cx,
+                                    serde_json::json!({"subject": subject}), resume)).await.expect("finite caller-owned tool round");
+                            sibling.join(&cx).await.unwrap();
+                            if cancelling_round {
+                                let Outcome::Err(error) = outcome else { panic!("cancelled round must refuse the late result"); };
+                                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                                assert_eq!(registry.active_len(), 0);
+                                #[cfg(feature = "tasks")]
+                                assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before);
+                                release.send(()).unwrap();
+                            } else {
+                                let outcome = match outcome { Outcome::Ok(value) => value, Outcome::Err(error) => panic!("native round: {error}"), _ => panic!("unexpected round outcome") };
+                                match outcome {
+                                    FinalToolOutcome::InputRequired(result) => {
+                                        assert!(round < initial_rounds);
+                                        assert_ne!(mode, 0);
+                                        let expected_state = format!("{upstream_state}-{round}");
+                                        assert_eq!(result.request_state(), (mode != 3).then_some(expected_state.as_str()));
+                                        assert_eq!(result.input_requests().map(|value| fastmcp_protocol::exact_json_to_serde(&fastmcp_protocol::ExactJsonValue::Object(value.clone())).unwrap()),
+                                            (mode >= 2).then(|| serde_json::json!({"roots": {"method": "roots/list"}})));
+                                        let inputs = if mode >= 2 { MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap() } else { MrtrInputRequests::default() };
+                                        let issued = registry.issue_bound(cancellation.clone(), exchange_binding.clone(), inputs, result.request_state().map(str::to_owned)).unwrap();
+                                        let wire = serde_json::to_value(&issued).unwrap();
+                                        let state = wire["requestState"].as_str().unwrap();
+                                        assert_ne!(state, expected_state);
+                                        let completed = if mode >= 2 {
+                                            registry.accept_wire_bound(state, &exchange_binding,
+                                                &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": [{"uri": format!("file:///{subject}-{round}")}]}))])).unwrap()
+                                        } else { registry.accept_state_only_bound(state, &exchange_binding).unwrap() };
+                                        let MrtrRetry::Complete(inputs) = completed else { panic!("admitted retry completes input exchange"); };
+                                        resumes.push(inputs);
+                                    }
+                                    FinalToolOutcome::Complete(result) => {
+                                        assert!(round >= initial_rounds);
+                                        assert!(!allow_tasks);
+                                        let observed: serde_json::Value = serde_json::from_str(&CoreResult::Final(FinalCoreResult::ToolsCall { result, diagnostic: None }).encode().unwrap()).unwrap();
+                                        assert_eq!(observed, upstream);
+                                    }
+                                    #[cfg(feature = "tasks")]
+                                    FinalToolOutcome::CreateTask { work_descriptor, .. } => {
+                                        assert!(allow_tasks);
+                                        assert_eq!(round, 1);
+                                        let retained = handler.task_relay.as_ref().unwrap().admit_carried_task(&work_descriptor).unwrap().unwrap();
+                                        assert_eq!(serde_json::to_value(retained).unwrap(), upstream);
+                                    }
+                                }
+                            }
+                        }
+                        proxy
+                    });
+                    let wires = peer.join().expect("native peer quiesced");
+                    assert_eq!(wires.len(), rounds);
+                    assert_eq!(
+                        registry.active_len(),
+                        0,
+                        "all explicitly admitted input exchanges were consumed"
+                    );
+                    #[cfg(feature = "tasks")]
+                    if cancel {
+                        assert_eq!(
+                            proxy.final_task_registry_snapshot_for_test().unwrap(),
+                            serde_json::json!({"pendingCreations": 0, "tasks": {}})
+                        );
+                    }
+                    drop(proxy);
+                    let observed_progress = capture.values.lock().unwrap();
+                    assert_eq!(
+                        observed_progress.len(),
+                        if sse { rounds - usize::from(cancel) } else { 0 }
+                    );
+                    for observed in observed_progress.iter() {
+                        assert_eq!(
+                            observed,
+                            &(
+                                "1.20e+4".to_owned(),
+                                Some("12000.0".to_owned()),
+                                Some("relayed".to_owned())
+                            )
+                        );
+                    }
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"proof": "proxy_tool_resume_caller_runtime", "cancelled": cancel,
+                        "allow_tasks": allow_tasks, "mode": mode, "sse": sse, "subject": subject,
+                        "peer_requests": wires, "progress_count": observed_progress.len()})
+                    );
+                }
+            }
+        }
+        assert!(
+            runtime.shutdown_timeout(Duration::from_secs(2)),
+            "caller runtime quiesced"
+        );
+    }
+
+    #[test]
+    fn proxy_tool_resume_caller_runtime_positive() {
+        proxy_tool_resume_caller_runtime_probe(false);
+    }
+
+    #[test]
+    fn proxy_tool_resume_caller_runtime_planted_negative() {
+        proxy_tool_resume_caller_runtime_probe(true);
     }
 
     #[cfg(feature = "tasks")]
