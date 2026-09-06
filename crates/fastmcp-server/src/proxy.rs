@@ -8532,7 +8532,7 @@ impl ProxyClient {
     }
 
     #[cfg(feature = "tasks")]
-    fn call_tool_final_outcome(
+    async fn call_tool_final_outcome(
         &self,
         ctx: &McpContext,
         name: &str,
@@ -8566,7 +8566,7 @@ impl ProxyClient {
         };
         let outcome =
             match self.with_backend(|backend| backend.start_final_task_request(operation))? {
-                Some(request) => match block_on(request.execute(ctx, &mut forward_progress))? {
+                Some(request) => match request.execute(ctx, &mut forward_progress).await? {
                     ProxyFinalTaskResponse::CallTool(outcome) => outcome,
                     ProxyFinalTaskResponse::Get(_)
                     | ProxyFinalTaskResponse::Update(_)
@@ -8706,7 +8706,7 @@ impl ProxyClient {
                 _ => Err(unexpected_proxy_result("tools/call")),
             }
         } else if tasks_negotiated {
-            self.call_tool_final_outcome(ctx, name, arguments)
+            block_on(self.call_tool_final_outcome(ctx, name, arguments))
         } else {
             self.call_tool_final_non_task_outcome(ctx, name, arguments)
         }
@@ -9735,6 +9735,15 @@ impl ToolHandler for ProxyToolHandler {
     }
 
     #[cfg(feature = "tasks")]
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        self.call_final_outcome_async_resuming_in_request(ctx, ctx.cx(), arguments, None)
+    }
+
+    #[cfg(feature = "tasks")]
     fn call_final_outcome_async_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -9743,13 +9752,23 @@ impl ToolHandler for ProxyToolHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         Box::pin(async move {
-            let outcome = match self.client.call_tool_final_outcome_with_resume(
-                ctx,
-                &self.external_name,
-                arguments,
-                resume_inputs,
-                self.task_relay.is_some(),
-            ) {
+            let result = if resume_inputs.is_none()
+                && self.task_relay.is_some()
+                && ctx.client_supports_tasks()
+            {
+                self.client
+                    .call_tool_final_outcome(ctx, &self.external_name, arguments)
+                    .await
+            } else {
+                self.client.call_tool_final_outcome_with_resume(
+                    ctx,
+                    &self.external_name,
+                    arguments,
+                    resume_inputs,
+                    self.task_relay.is_some(),
+                )
+            };
+            let outcome = match result {
                 Ok(outcome) => outcome,
                 Err(error) => return Outcome::Err(error),
             };
@@ -10470,6 +10489,291 @@ mod tests {
     #[test]
     fn proxy_task_controls_caller_runtime_planted_negative() {
         proxy_task_controls_caller_runtime_probe(true);
+    }
+
+    /// Native HTTP plus the shipped handler; the peer supplies protocol
+    /// fixtures, not a running upstream Tasks service. Only the cancellation
+    /// flag differs between the positive and negative runs.
+    #[cfg(feature = "tasks")]
+    fn proxy_task_tool_caller_runtime_probe(cancel: bool) {
+        use fastmcp_core::Outcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .expect("caller runtime with native reactor");
+        for task_result in [false, true] {
+            for request_entry in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let subject = format!("runtime-tool-{}", address.port());
+                let upstream = if task_result {
+                    serde_json::to_value(final_task_relay_result_with_ttl(&subject, None)).unwrap()
+                } else {
+                    serde_json::json!({
+                        "resultType": "complete", "content": [{"type": "text", "text": subject}]
+                    })
+                };
+                let peer_result = upstream.clone();
+                let peer_subject = subject.clone();
+                let received = Arc::new(AtomicBool::new(false));
+                let peer_received = Arc::clone(&received);
+                let (release, replies) = std::sync::mpsc::sync_channel::<()>(1);
+                let peer = thread::spawn(move || {
+                    let accept = || {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        loop {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    stream
+                                        .set_read_timeout(Some(Duration::from_secs(10)))
+                                        .unwrap();
+                                    stream
+                                        .set_write_timeout(Some(Duration::from_secs(10)))
+                                        .unwrap();
+                                    return stream;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    assert!(
+                                        Instant::now() < deadline,
+                                        "native peer accept deadline"
+                                    );
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                Err(error) => panic!("native peer accept: {error}"),
+                            }
+                        }
+                    };
+                    let mut discovery = accept();
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+                    assert_eq!(request["method"], "server/discover");
+                    write_http_discovery_response(&mut discovery, &serde_json::to_vec(
+                        &serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}},
+                            "ttlMs": 0, "cacheScope": "private"
+                        }})
+                    ).unwrap());
+                    drop(discovery);
+                    let mut stream = accept();
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_http_request(&mut stream).body).unwrap();
+                    assert_eq!(request["method"], "tools/call");
+                    assert_eq!(request["params"]["name"], peer_subject);
+                    assert_eq!(request["params"]["arguments"]["subject"], peer_subject);
+                    assert_eq!(
+                        request["params"]["_meta"]
+                            [fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                            [fastmcp_protocol::TASKS_EXTENSION],
+                        serde_json::json!({})
+                    );
+                    peer_received.store(true, Ordering::Release);
+                    replies
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("caller-runtime sibling must release the withheld tool response");
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": peer_result
+                    }))
+                    .unwrap();
+                    let written = if cancel {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream
+                            .write_all(head.as_bytes())
+                            .and_then(|()| stream.write_all(&body))
+                            .is_ok()
+                    } else {
+                        write_http_response(&mut stream, 200, "application/json", &body);
+                        true
+                    };
+                    (request, written)
+                });
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let cancellation = McpRequestCancellation::new();
+                let (proxy, before) = runtime.block_on(async {
+                    let plan = ClientProtocolPlan::http(
+                        ProtocolPolicy::ModernOnly,
+                        Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                        None,
+                        None,
+                        "tool-runtime-credential".to_owned(),
+                        "tool-runtime-owner".to_owned(),
+                        "native-tool-runtime".to_owned(),
+                        1,
+                        1,
+                        0,
+                    )
+                    .unwrap();
+                    let capabilities = ClientCapabilities::default();
+                    let connection = ClientHttpConnection::connect(
+                        &cx,
+                        plan,
+                        proxy_http_client_info(),
+                        capabilities.clone(),
+                    )
+                    .await
+                    .expect("native discovery");
+                    let binding = final_task_relay_binding(ProtocolEra::Modern2026);
+                    let proxy = ProxyClient::from_backend_with_upstream_binding(
+                        ProxyHttpClient::new(
+                            binding,
+                            connection,
+                            cx.clone(),
+                            proxy_http_client_info(),
+                            capabilities,
+                        ),
+                        binding,
+                        "2026-07-28",
+                    )
+                    .unwrap();
+                    let relay = proxy
+                        .final_tasks_relay()
+                        .unwrap()
+                        .expect("discovered Tasks relay");
+                    let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+                    let mut tool = final_catalog_tool();
+                    tool.name.clone_from(&subject);
+                    let handler = ProxyToolHandler::from_final_with_task_relay(
+                        tool,
+                        proxy.clone(),
+                        relay.clone(),
+                    )
+                    .unwrap();
+                    let ctx = McpContext::new(cx.clone(), 883)
+                        .with_request_cancellation(cancellation.clone())
+                        .with_client_capabilities(
+                            fastmcp_core::ClientCapabilityInfo::new().with_tasks(),
+                        );
+                    let sibling_received = Arc::clone(&received);
+                    let sibling_cancel = cancellation.clone();
+                    let sibling_release = release.clone();
+                    let mut sibling = cx
+                        .spawn(move |sibling_cx| async move {
+                            let deadline = sibling_cx.now().saturating_add_nanos(8_000_000_000);
+                            while !sibling_received.load(Ordering::Acquire) {
+                                assert!(
+                                    sibling_cx.now() < deadline,
+                                    "tool call must reach native peer"
+                                );
+                                asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1))
+                                    .await;
+                            }
+                            if cancel {
+                                assert!(sibling_cancel.cancel());
+                            } else {
+                                sibling_release.send(()).unwrap();
+                            }
+                        })
+                        .expect("sibling belongs to caller runtime");
+                    let arguments = serde_json::json!({"subject": subject});
+                    let call = if request_entry {
+                        handler.call_final_outcome_async_resuming_in_request(
+                            &ctx, &cx, arguments, None,
+                        )
+                    } else {
+                        handler.call_final_outcome_async(&ctx, arguments)
+                    };
+                    let outcome = asupersync::time::timeout_at(
+                        cx.now().saturating_add_nanos(9_000_000_000),
+                        call,
+                    )
+                    .await
+                    .expect("caller-owned tool has a finite completion bound");
+                    sibling
+                        .join(&cx)
+                        .await
+                        .expect("caller runtime sibling quiesced");
+                    assert!(
+                        received.load(Ordering::Acquire),
+                        "tool waited on the withheld reply"
+                    );
+                    if cancel {
+                        let Outcome::Err(error) = outcome else {
+                            panic!("cancelled tool must return the request cancellation error");
+                        };
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        assert_eq!(
+                            proxy.final_task_registry_snapshot_for_test().unwrap(),
+                            before
+                        );
+                        release.send(()).unwrap();
+                    } else {
+                        let Outcome::Ok(outcome) = outcome else {
+                            panic!("caller runtime must admit the real upstream result");
+                        };
+                        let observed = match outcome {
+                            FinalToolOutcome::Complete(result) => {
+                                assert!(!task_result);
+                                assert_eq!(
+                                    proxy.final_task_registry_snapshot_for_test().unwrap(),
+                                    before
+                                );
+                                serde_json::from_str(
+                                    &CoreResult::Final(FinalCoreResult::ToolsCall {
+                                        result,
+                                        diagnostic: None,
+                                    })
+                                    .encode()
+                                    .unwrap(),
+                                )
+                                .unwrap()
+                            }
+                            FinalToolOutcome::CreateTask {
+                                work_descriptor, ..
+                            } => {
+                                assert!(task_result);
+                                serde_json::to_value(
+                                    relay.admit_carried_task(&work_descriptor).unwrap().unwrap(),
+                                )
+                                .unwrap()
+                            }
+                            FinalToolOutcome::InputRequired(_) => panic!("unexpected MRTR result"),
+                        };
+                        assert_eq!(
+                            observed, upstream,
+                            "preserve the exact complete result or upstream Task handle"
+                        );
+                    }
+                    (proxy, before)
+                });
+                let (wire, written) = peer.join().expect("native peer quiesced");
+                if cancel {
+                    assert_eq!(
+                        proxy.final_task_registry_snapshot_for_test().unwrap(),
+                        before,
+                        "late upstream reply cannot create a Task after request cancellation"
+                    );
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "proof": "proxy_task_tool_caller_runtime", "cancelled": cancel,
+                        "task_result": task_result, "request_entry": request_entry,
+                        "subject": subject, "peer_request": wire, "reply_written": written,
+                    })
+                );
+            }
+        }
+        assert!(
+            runtime.shutdown_timeout(Duration::from_secs(2)),
+            "caller runtime quiesced"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_task_tool_caller_runtime_positive() {
+        proxy_task_tool_caller_runtime_probe(false);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_task_tool_caller_runtime_planted_negative() {
+        proxy_task_tool_caller_runtime_probe(true);
     }
 
     #[cfg(feature = "tasks")]
@@ -11439,13 +11743,12 @@ mod tests {
             .expect("relay discovery is available")
             .expect("the modern HTTP route installs the relay");
 
-        let outcome = proxy
-            .call_tool_final_outcome(
-                &McpContext::new(Cx::for_testing(), 733),
-                "task-tool",
-                serde_json::json!({"city": "Boston"}),
-            )
-            .expect("the selected upstream creates a Task");
+        let outcome = block_on(proxy.call_tool_final_outcome(
+            &McpContext::new(Cx::for_testing(), 733),
+            "task-tool",
+            serde_json::json!({"city": "Boston"}),
+        ))
+        .expect("the selected upstream creates a Task");
         let FinalToolCallOutcome::Task(created) = outcome else {
             panic!("the final proxy outcome retains the upstream Task branch");
         };
@@ -11875,9 +12178,9 @@ mod tests {
         let reservation = relay
             .reserve_task_creation()
             .expect("the route reserves a task slot before the upstream side effect");
-        let FinalToolCallOutcome::Task(created) = proxy
-            .call_tool_final_outcome(&context, "task-tool", serde_json::json!({}))
-            .expect("post-commit cancellation must not erase the returned upstream Task")
+        let FinalToolCallOutcome::Task(created) =
+            block_on(proxy.call_tool_final_outcome(&context, "task-tool", serde_json::json!({})))
+                .expect("post-commit cancellation must not erase the returned upstream Task")
         else {
             panic!("fixture always commits a Task branch");
         };
@@ -11923,9 +12226,9 @@ mod tests {
         )
         .expect("the modern route binding is exact");
 
-        let outcome = proxy
-            .call_tool_final_outcome(&context, "task-tool", serde_json::json!({}))
-            .expect("the selected upstream creates a Task");
+        let outcome =
+            block_on(proxy.call_tool_final_outcome(&context, "task-tool", serde_json::json!({})))
+                .expect("the selected upstream creates a Task");
 
         assert!(matches!(outcome, FinalToolCallOutcome::Task(_)));
         assert_eq!(
@@ -11970,9 +12273,11 @@ mod tests {
         )
         .expect("the modern route binding is exact");
 
-        let outcome = proxy
-            .call_tool_final_outcome(&context, "task-tool", serde_json::json!({}))
-            .expect("the task branch remains valid when one unrelated progress frame is rejected");
+        let outcome =
+            block_on(proxy.call_tool_final_outcome(&context, "task-tool", serde_json::json!({})))
+                .expect(
+                    "the task branch remains valid when one unrelated progress frame is rejected",
+                );
 
         assert!(matches!(outcome, FinalToolCallOutcome::Task(_)));
         assert!(
