@@ -37124,7 +37124,12 @@ mod lib_unit_tests {
         ];
         if request.method == "tools/call" {
             headers.push(("Mcp-Name", "durable_final_task"));
-        } else if let Some(task_id) = request.params.as_ref().and_then(|params| params.get("taskId")).and_then(serde_json::Value::as_str) {
+        } else if let Some(task_id) = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("taskId"))
+            .and_then(serde_json::Value::as_str)
+        {
             headers.push(("Mcp-Name", task_id));
         }
         live_http_post("/mcp", &serde_json::to_vec(request).unwrap(), &headers)
@@ -37308,14 +37313,29 @@ mod lib_unit_tests {
                 result
             }).map_err(|error| error.to_string())?;
             let serve = bound.serve(&cx).await;
-            client
+            // The application service has its own context. Cancelling the
+            // HTTP caller does not stop that context or its idle receiver.
+            service.abort();
+            let client_result = client
                 .join(&cx)
                 .await
-                .map_err(|error| format!("task owner client failed: {error:?}"))??;
-            match service.join(&cx).await {
+                .map_err(|error| format!("task owner client failed: {error:?}"));
+            let mut service_shutdown = Box::pin(asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
+                service.join(&cx),
+            ));
+            // Keep the real cleanup deadline while shielding its timer from
+            // the caller's cancellation. The service's own abort stays active.
+            let service_result = std::future::poll_fn(|task_context| {
+                cx.masked(|| service_shutdown.as_mut().poll(task_context))
+            })
+            .await
+            .map_err(|_| live_http_test_timeout("task owner service shutdown"))?;
+            match service_result {
                 Ok(Ok(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
                 other => return Err(format!("task service failed during owner probe: {other:?}")),
             }
+            client_result??;
             require_quiescent_http_shutdown(serve.map_err(|error| error.to_string())?, "task owner")
                 .await
         });

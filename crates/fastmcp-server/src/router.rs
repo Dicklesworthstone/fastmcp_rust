@@ -5168,16 +5168,6 @@ impl Router {
             return Ok(FinalToolOutcome::Complete(result));
         }
 
-        // A task-capable tool is a Tasks-extension operation. Refuse it with
-        // the typed -32021 shape BEFORE the handler runs: the capability gate
-        // in the CreateTask outcome branch fires only after the handler has
-        // already executed, so a caller that never declared Tasks could still
-        // drive the handler's side effects and only then be refused.
-        #[cfg(feature = "tasks")]
-        if declares_final_tasks {
-            require_final_tasks_capability(&params.meta)?;
-        }
-
         let ctx = derive_handler_context(
             request_ctx,
             progress_marker,

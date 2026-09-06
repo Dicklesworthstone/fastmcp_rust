@@ -4402,7 +4402,7 @@ impl FinalTaskRuntime {
     #[cfg(test)]
     fn add_notification_emitter(&self, emitter: FinalTaskNotificationEmitter) {
         self.add_owned_notification_emitter(Arc::new(move |notification, _principal| {
-            emitter(notification)
+            emitter(notification);
         }));
     }
 
@@ -5585,7 +5585,7 @@ impl FinalTaskRuntime {
         let mut panicked_emitter_count = 0usize;
         for emitter in emitters {
             if catch_unwind(AssertUnwindSafe(|| {
-                emitter(notification.clone(), principal)
+                emitter(notification.clone(), principal);
             }))
             .is_err()
             {
@@ -6164,12 +6164,10 @@ impl AuthorizedTaskServiceRunner {
                         if cancellation_boundary_granted {
                             return std::task::Poll::Ready(Some(Ok(())));
                         }
-                        // Yield without self-waking: the supervisor's own
-                        // wake (its retry timer) drives the next poll, so it
-                        // gets a real window rather than a zero-length one.
-                        // The heartbeat below remains the backstop if the
-                        // supervisor never wakes again.
+                        // Schedule the promised final poll even when the
+                        // application future has no timer or other wakeup.
                         cancellation_boundary_granted = true;
+                        task_context.waker().wake_by_ref();
                         return std::task::Poll::Pending;
                     }
                     Ok(false) => {}
