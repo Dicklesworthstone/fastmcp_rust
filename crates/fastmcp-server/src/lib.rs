@@ -8022,7 +8022,7 @@ impl ServerHttpEndpoint {
 #[derive(Clone)]
 struct AuthAdmissionReceipt {
     method: String,
-    request_id: u64,
+    request_id: Option<RequestId>,
     sanitized_params: Option<serde_json::Value>,
     fingerprint: Sha256Digest,
     authenticated: Option<AuthContext>,
@@ -8036,7 +8036,7 @@ impl AuthAdmissionReceipt {
         request: &mut JsonRpcRequest,
     ) -> Result<Sha256Digest, McpError> {
         if self.method != request.method
-            || request_id_to_u64(request.id.as_ref()) != self.request_id
+            || request.id != self.request_id
             || !inbound
                 .auth_request(&request.method, request.params.as_ref())
                 .credential_sources_are_admissible()
@@ -8069,9 +8069,7 @@ impl AuthAdmissionReceipt {
         ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> Result<Sha256Digest, McpError> {
-        if self.method != request.method
-            || request_id_to_u64(request.id.as_ref()) != self.request_id
-        {
+        if self.method != request.method || request.id != self.request_id {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
                 "Authentication failed",
@@ -8228,7 +8226,7 @@ impl ServerHttpSession {
         cx: &Cx,
         request: HttpRequest,
     ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
-        self.handle_with_modern_request_cancellation_async(cx, request, None, false)
+        self.handle_with_modern_request_cancellation_async(cx, request, None, false, None)
             .await
             .map_err(ServerHttpEndpointError::from_internal)
     }
@@ -8240,7 +8238,7 @@ impl ServerHttpSession {
         request: HttpRequest,
         _verified: IngressVerifiedLegacyResponse,
     ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
-        self.handle_with_modern_request_cancellation_async(cx, request, None, true)
+        self.handle_with_modern_request_cancellation_async(cx, request, None, true, None)
             .await
             .map_err(ServerHttpEndpointError::from_internal)
     }
@@ -8258,6 +8256,7 @@ impl ServerHttpSession {
             request,
             modern_request_cancellation,
             false,
+            None,
         ))
     }
 
@@ -8267,6 +8266,7 @@ impl ServerHttpSession {
         request: HttpRequest,
         modern_request_cancellation: Option<McpRequestCancellation>,
         legacy_response_preclassified_unmatched: bool,
+        legacy_auth_receipt: Option<AuthAdmissionReceipt>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let transport_authorization = match transport_authorization_from_http_request(&request) {
             Ok(authorization) => authorization,
@@ -8278,6 +8278,7 @@ impl ServerHttpSession {
             transport_authorization,
             modern_request_cancellation,
             legacy_response_preclassified_unmatched,
+            legacy_auth_receipt,
         )
         .await
     }
@@ -8296,6 +8297,7 @@ impl ServerHttpSession {
                 transport_authorization,
                 modern_request_cancellation,
                 false,
+                None,
             ),
         )
     }
@@ -8311,9 +8313,10 @@ impl ServerHttpSession {
         transport_authorization: TransportAuthorization,
         modern_request_cancellation: Option<McpRequestCancellation>,
         legacy_response_preclassified_unmatched: bool,
+        legacy_auth_receipt: Option<AuthAdmissionReceipt>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
-        let _ = legacy_response_preclassified_unmatched;
+        let _ = (legacy_response_preclassified_unmatched, legacy_auth_receipt);
         self.reap_modern_dispatches();
         let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
@@ -8398,13 +8401,30 @@ impl ServerHttpSession {
                 Some(Legacy2024HttpPostEnvelope::ClientMessage(request)) => Some(request),
                 _ => None,
             };
-            let receipt = match self.preauthenticate_legacy_http_request(
-                cx,
-                admitted_request,
-                &transport_authorization,
-            ) {
-                Ok(receipt) => receipt,
-                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+            let receipt = match legacy_auth_receipt {
+                Some(receipt) => {
+                    // Recheck the exact admitted payload after waiting for
+                    // exclusive session ownership. A receipt never authorizes
+                    // a different method, request, or notification.
+                    if !admitted_request.is_some_and(|request| {
+                        receipt.method == request.method
+                            && receipt.request_id == request.id
+                            && receipt.sanitized_params == request.params
+                    }) {
+                        return Ok(ServerHttpEndpointResponse::Immediate(
+                            native_http_authentication_rejection(),
+                        ));
+                    }
+                    receipt
+                }
+                None => match self.preauthenticate_legacy_http_request(
+                    cx,
+                    admitted_request,
+                    &transport_authorization,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+                },
             };
             if matches!(
                 legacy_post_admission,
@@ -10870,9 +10890,17 @@ enum LiveHttpLegacyDispatchMode {
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
+struct HttpLegacyIngressAdmission {
+    // Notifications have no correlated cancellation guard, but still carry
+    // their authenticated decision across the session-ownership wait.
+    _request_guard: Option<HttpLegacyRequestAdmissionGuard>,
+    auth_receipt: AuthAdmissionReceipt,
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 enum LiveHttpLegacyIngress {
     Dispatch {
-        admission: Option<HttpLegacyRequestAdmissionGuard>,
+        admission: Option<Box<HttpLegacyIngressAdmission>>,
         mode: LiveHttpLegacyDispatchMode,
     },
     Immediate(HttpResponse),
@@ -10992,7 +11020,10 @@ fn admit_live_http_legacy_request(
         .ok_or_else(|| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE))?
         .map_err(|()| HttpResponse::bad_request())?;
     Ok(LiveHttpLegacyIngress::Dispatch {
-        admission,
+        admission: Some(Box::new(HttpLegacyIngressAdmission {
+            _request_guard: admission,
+            auth_receipt: receipt,
+        })),
         mode: dispatch_mode,
     })
 }
@@ -11200,7 +11231,7 @@ fn dispatch_http_request(
     legacy_sessions: &LiveHttpSessionRegistry,
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
-    legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
+    legacy_admission: Option<Box<HttpLegacyIngressAdmission>>,
     legacy_dispatch_mode: LiveHttpLegacyDispatchMode,
 ) -> HttpResponse {
     block_on(dispatch_http_request_async(
@@ -11221,7 +11252,7 @@ async fn dispatch_http_request_async(
     legacy_sessions: &LiveHttpSessionRegistry,
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
-    legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
+    legacy_admission: Option<Box<HttpLegacyIngressAdmission>>,
     legacy_dispatch_mode: LiveHttpLegacyDispatchMode,
 ) -> HttpResponse {
     let is_legacy_message = request.method == HttpMethod::Post
@@ -11262,7 +11293,7 @@ async fn dispatch_http_request_async(
         // dispatch. Direct embedding callers create it here instead. In both
         // cases it remains live through the serialized adapter/session mutex,
         // active guard, and response finalization.
-        let _admission = match legacy_admission {
+        let admission = match legacy_admission {
             Some(admission) => Some(admission),
             None => match &admitted {
                 Legacy2024HttpPostEnvelope::ClientMessage(message) => {
@@ -11291,7 +11322,10 @@ async fn dispatch_http_request_async(
                         return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
                     };
                     match admission {
-                        Ok(admission) => admission,
+                        Ok(admission) => Some(Box::new(HttpLegacyIngressAdmission {
+                            _request_guard: admission,
+                            auth_receipt: receipt,
+                        })),
                         Err(()) => return HttpResponse::bad_request(),
                     }
                 }
@@ -11333,7 +11367,18 @@ async fn dispatch_http_request_async(
                 .handle_preclassified_unmatched_legacy_response(cx, request, verified)
                 .await
         } else {
-            owned.handle_async(cx, request).await
+            owned
+                .handle_with_modern_request_cancellation_async(
+                    cx,
+                    request,
+                    None,
+                    false,
+                    admission
+                        .as_ref()
+                        .map(|admission| admission.auth_receipt.clone()),
+                )
+                .await
+                .map_err(ServerHttpEndpointError::from_internal)
         }
         .map_err(|_| HttpResponse::bad_request());
         let closing_dispatches = restore_live_http_session(&session, owned);
@@ -19508,7 +19553,7 @@ impl Server {
                 auth::strip_recognized_access_credentials(&mut sanitized.params);
                 AuthAdmissionReceipt {
                     method: sanitized.method,
-                    request_id: request_id_to_u64(sanitized.id.as_ref()),
+                    request_id: sanitized.id,
                     sanitized_params: sanitized.params,
                     fingerprint,
                     authenticated,
@@ -37128,6 +37173,36 @@ mod lib_unit_tests {
         );
         assert_eq!(session.selected_era, None);
         assert_eq!(probe.effects(), (0, 0, 0));
+
+        // The provider's numeric context ID is not a wire identity: a
+        // notification and request ID zero both map to zero. Receipt reuse
+        // must preserve that distinction without another provider call.
+        let cx = Cx::for_testing();
+        let authorization = transport_authorization_from_http_request(
+            &HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("Authorization", format!("Bearer {}", probe.token)),
+        )
+        .expect("native header must be captured");
+        let original = JsonRpcRequest::new("tools/list", None, 0_i64);
+        let receipt = endpoint
+            .server
+            .preauthenticate_http_request(&cx, &original, &authorization)
+            .expect("the original request must authenticate");
+        assert_eq!(probe.effects(), (1, 0, 0));
+        let changed = JsonRpcRequest::notification("tools/list", None);
+        let rejected_ctx = McpContext::new(cx.clone(), 0);
+        assert!(receipt.commit_legacy(&rejected_ctx, &changed).is_err());
+        assert!(rejected_ctx.auth().is_none());
+        assert_eq!(probe.effects(), (1, 0, 0));
+        let accepted_ctx = McpContext::new(cx, 0);
+        receipt
+            .commit_legacy(&accepted_ctx, &original)
+            .expect("the unchanged request must consume its authenticated receipt");
+        assert_eq!(
+            accepted_ctx.auth().and_then(|auth| auth.subject),
+            Some(probe.subject.clone()),
+        );
+        assert_eq!(probe.effects(), (1, 0, 0));
     }
 
     fn auth_01_http_legacy_cancellation_probe(reject_forbidden_locations: bool) {
@@ -37154,19 +37229,25 @@ mod lib_unit_tests {
                     let authorization = format!("Bearer {}", probe.token);
                     let headers = [("Authorization", authorization.as_str())];
                     let (_sse, session_id, _received) = open_live_legacy_http_session(address, &headers).await?;
+                    if probe.provider_calls.load(Ordering::Acquire) != 1 {
+                        return Err("legacy SSE opener must authenticate exactly once".to_owned());
+                    }
                     let path = format!("/messages?session_id={session_id}");
-                    for request in [
+                    for (index, request) in [
                         JsonRpcRequest::new("initialize", Some(serde_json::json!({
                             "protocolVersion": LEGACY_PROTOCOL_VERSION,
                             "capabilities": {},
                             "clientInfo": {"name": "auth-01-legacy", "version": "1.0.0"},
                         })), 946_i64),
                         JsonRpcRequest::notification("notifications/initialized", None),
-                    ] {
+                    ].into_iter().enumerate() {
                         let body = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
                         let response = live_http_exchange(address, live_http_post(&path, &body, &headers)).await?;
                         if !response.starts_with(b"HTTP/1.1 202") {
                             return Err("header-authenticated legacy setup failed".to_owned());
+                        }
+                        if probe.provider_calls.load(Ordering::Acquire) != index + 2 {
+                            return Err(format!("legacy {} must authenticate exactly once", request.method));
                         }
                     }
                     let target_id = RequestId::Number(947);
@@ -37193,6 +37274,9 @@ mod lib_unit_tests {
                         "params": {"requestId": target_id, "reason": "AUTH-01 header cancellation"},
                     });
                     let before = probe.effects();
+                    if before.0 != 4 {
+                        return Err("legacy tool must authenticate exactly once".to_owned());
+                    }
                     let mut rejected_locations = 0;
                     if reject_forbidden_locations {
                         for container in [None, Some("_meta"), Some("headers")] {
