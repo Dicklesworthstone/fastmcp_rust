@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::BoxFuture;
+
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::extensions::{
     ExtensionDispatchError, ExtensionRegistryError, MAX_EXTENSION_MEMBER_NAME_BYTES,
@@ -150,6 +152,51 @@ where
 /// Object-safe bridge that retains each registered handler's Rust types.
 trait ErasedExtensionHandler: Send + Sync {
     fn invoke(&self, context: &McpContext, parameters: Value) -> McpResult<Value>;
+
+    fn invoke_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        parameters: Value,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move { self.invoke(context, parameters) })
+    }
+}
+
+/// Typed async callback retained without constructing an executor or holding
+/// registry mutation state while the callback is suspended.
+struct AsyncSerdeExtensionHandler<Request, Response, Handler> {
+    handler: Handler,
+    marker: PhantomData<fn(Request) -> Response>,
+}
+
+impl<Request, Response, Handler> ErasedExtensionHandler
+    for AsyncSerdeExtensionHandler<Request, Response, Handler>
+where
+    Request: DeserializeOwned + Send,
+    Response: Serialize,
+    Handler:
+        for<'a> Fn(&'a McpContext, Request) -> BoxFuture<'a, McpResult<Response>> + Send + Sync,
+{
+    fn invoke(&self, _context: &McpContext, _parameters: Value) -> McpResult<Value> {
+        Err(McpError::invalid_request(
+            "this extension handler requires asynchronous request dispatch",
+        ))
+    }
+
+    fn invoke_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        parameters: Value,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move {
+            let request = serde_json::from_value(parameters)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            let response = (self.handler)(context, request).await?;
+            serde_json::to_value(response).map_err(|_| {
+                McpError::internal_error("typed extension handler response serialization failed")
+            })
+        })
+    }
 }
 
 /// Typed serde adapter retained behind the heterogeneous handler map.
@@ -538,6 +585,50 @@ impl ExtensionHandlerRegistry {
         Response: Serialize + 'static,
         Handler: ExtensionHandler<Request, Response> + 'static,
     {
+        self.register_handler(
+            extension_id,
+            method.into(),
+            Box::new(SerdeExtensionHandler::<Request, Response, Handler> {
+                handler,
+                marker: PhantomData,
+            }),
+        )
+    }
+
+    /// Registers a typed asynchronous handler polled on the caller's context.
+    ///
+    /// Invoke it through [`Self::invoke_async`] or an owned server transport.
+    /// The synchronous invocation API rejects it before executing the callback.
+    pub fn register_async<Request, Response, Handler>(
+        &mut self,
+        extension_id: ExtensionId,
+        method: impl Into<String>,
+        handler: Handler,
+    ) -> Result<(), ExtensionHandlerRegistrationError>
+    where
+        Request: DeserializeOwned + Send + 'static,
+        Response: Serialize + 'static,
+        Handler: for<'a> Fn(&'a McpContext, Request) -> BoxFuture<'a, McpResult<Response>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_handler(
+            extension_id,
+            method.into(),
+            Box::new(AsyncSerdeExtensionHandler::<Request, Response, Handler> {
+                handler,
+                marker: PhantomData,
+            }),
+        )
+    }
+
+    fn register_handler(
+        &mut self,
+        extension_id: ExtensionId,
+        method: String,
+        handler: Box<dyn ErasedExtensionHandler>,
+    ) -> Result<(), ExtensionHandlerRegistrationError> {
         if self.frozen {
             return Err(ExtensionHandlerRegistrationError::Frozen);
         }
@@ -571,13 +662,7 @@ impl ExtensionHandlerRegistry {
             return Err(ExtensionHandlerRegistrationError::DuplicateHandler(key));
         }
 
-        self.handlers.insert(
-            key,
-            Box::new(SerdeExtensionHandler::<Request, Response, Handler> {
-                handler,
-                marker: PhantomData,
-            }),
-        );
+        self.handlers.insert(key, handler);
         Ok(())
     }
 
@@ -652,6 +737,55 @@ impl ExtensionHandlerRegistry {
         request: &JsonRpcRequest,
         context: &McpContext,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
+        let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
+        handler
+            .invoke(
+                context,
+                request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .map_err(ExtensionHandlerInvocationError::Handler)
+    }
+
+    /// Admits and awaits a typed handler without entering another runtime.
+    /// Synchronous and asynchronous handlers use the same frozen admission.
+    pub async fn invoke_async(
+        &self,
+        context: &McpContext,
+        negotiated: &NegotiatedExtensionSet,
+        protocol_era: ProtocolEra,
+        extension_id: &ExtensionId,
+        request: &JsonRpcRequest,
+    ) -> Result<Value, ExtensionHandlerInvocationError> {
+        let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        let response = handler
+            .invoke_async(
+                context,
+                request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .await
+            .map_err(ExtensionHandlerInvocationError::Handler)?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        Ok(response)
+    }
+
+    fn admitted_handler(
+        &self,
+        negotiated: &NegotiatedExtensionSet,
+        protocol_era: ProtocolEra,
+        extension_id: &ExtensionId,
+        request: &JsonRpcRequest,
+    ) -> Result<&dyn ErasedExtensionHandler, ExtensionHandlerInvocationError> {
         if !self.frozen {
             return Err(ExtensionHandlerInvocationError::RegistryNotFrozen);
         }
@@ -685,15 +819,7 @@ impl ExtensionHandlerRegistry {
             .handlers
             .get(key)
             .ok_or_else(|| ExtensionHandlerInvocationError::HandlerNotFound(key.clone()))?;
-        handler
-            .invoke(
-                context,
-                request
-                    .params
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({})),
-            )
-            .map_err(ExtensionHandlerInvocationError::Handler)
+        Ok(handler.as_ref())
     }
 }
 
@@ -727,6 +853,135 @@ mod tests {
         let id = register_official_tasks_extension(&mut descriptors)
             .expect("official Tasks descriptor registers");
         (descriptors, id)
+    }
+
+    fn async_extension_dispatch_probe(notification: bool, cancel: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller owns the runtime");
+        let context = McpContext::new(
+            runtime.request_cx_with_budget(asupersync::Budget::default()),
+            71,
+        );
+        let (descriptors, id) = tasks_descriptors();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        handlers
+            .register_async(
+                id.clone(),
+                "tasks/get",
+                move |context: &McpContext, request: GetTaskRequest| {
+                    let calls = Arc::clone(&callback_calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        asupersync::runtime::yield_now().await;
+                        if cancel {
+                            assert!(context.request_cancellation().cancel());
+                        }
+                        get_task(context, request)
+                    })
+                },
+            )
+            .expect("async typed handler registers");
+        handlers.freeze().expect("freeze descriptors and callbacks");
+        let negotiated = negotiated_tasks(handlers.descriptor_registry(), &id);
+        let mut request = JsonRpcRequest::new("tasks/get", Some(json!({"value": 41})), 1_i64);
+        if notification {
+            request.id = None;
+        }
+        let result = runtime.block_on(handlers.invoke_async(
+            &context,
+            &negotiated,
+            ProtocolEra::Modern2026,
+            &id,
+            &request,
+        ));
+        if cancel {
+            assert!(
+                matches!(result, Err(ExtensionHandlerInvocationError::Handler(error))
+                if error.code == McpErrorCode::RequestCancelled)
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "callback ran and returned a value, but cancellation must reject its result"
+            );
+            return;
+        }
+        if notification {
+            assert!(matches!(
+                result,
+                Err(ExtensionHandlerInvocationError::RequestEnvelopeRequired(_))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "rejected envelope must not poll the handler"
+            );
+        } else {
+            assert_eq!(
+                result.expect("async handler completes"),
+                json!({"next": 42})
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(handlers.len(), 1);
+        request.id = Some(1_i64.into());
+        let before = calls.load(Ordering::SeqCst);
+        assert!(matches!(handlers.invoke(
+            &negotiated, ProtocolEra::Modern2026, &id, &request, &context,
+        ), Err(ExtensionHandlerInvocationError::Handler(error))
+            if error.code == McpErrorCode::InvalidRequest));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "sync entry must not start a hidden runtime"
+        );
+        assert_eq!(
+            runtime
+                .block_on(handlers.invoke_async(
+                    &context,
+                    &negotiated,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    &request,
+                ))
+                .expect("same admitted handler remains callable"),
+            json!({"next": 42})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+
+        let plain_server = crate::ServerBuilder::new("plain-extension-host", "1.0.0").build();
+        let unknown = JsonRpcRequest::new(
+            "example/unknown",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            })),
+            71_i64,
+        );
+        let error = runtime
+            .block_on(plain_server.dispatch_extension_fallback_async(&context, &unknown))
+            .expect_err("unregistered modern methods retain method-not-found semantics");
+        assert_eq!(error.code, McpErrorCode::MethodNotFound);
+    }
+
+    #[test]
+    fn async_extension_dispatch_positive() {
+        async_extension_dispatch_probe(false, false);
+    }
+
+    #[test]
+    fn async_extension_dispatch_planted_negative() {
+        async_extension_dispatch_probe(true, false);
+    }
+
+    #[test]
+    fn async_extension_dispatch_rejects_callback_cancelled_result() {
+        async_extension_dispatch_probe(false, true);
     }
 
     fn primary_tasks_descriptor_with_direction(

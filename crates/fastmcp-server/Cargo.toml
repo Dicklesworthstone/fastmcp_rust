@@ -23,6 +23,7 @@ legacy-2024-11-05 = [
     "fastmcp-protocol/legacy-2024-11-05",
     "fastmcp-transport/legacy-2024-11-05",
     "fastmcp-console/legacy-2024-11-05",
+    "fastmcp-client?/legacy-2024-11-05",
 ]
 # When proxy activates the optional client, keep its Tasks protocol surface in
 # lockstep with the server. The `?` avoids adding a client dependency to a

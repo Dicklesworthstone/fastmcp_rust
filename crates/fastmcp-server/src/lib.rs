@@ -1145,30 +1145,33 @@ impl ServerExtensionRuntime {
 
         let get_relay = Arc::clone(&task_relay);
         self.handlers
-            .register(
+            .register_async(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_GET,
                 move |context: &McpContext, parameters: serde_json::Value| {
-                    get_relay.dispatch_get(context, parameters)
+                    let relay = Arc::clone(&get_relay);
+                    Box::pin(async move { relay.dispatch_get(context, parameters).await })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
         let update_relay = Arc::clone(&task_relay);
         self.handlers
-            .register(
+            .register_async(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_UPDATE,
                 move |context: &McpContext, parameters: serde_json::Value| {
-                    update_relay.dispatch_update(context, parameters)
+                    let relay = Arc::clone(&update_relay);
+                    Box::pin(async move { relay.dispatch_update(context, parameters).await })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
         self.handlers
-            .register(
+            .register_async(
                 tasks_id.clone(),
                 fastmcp_protocol::tasks_extension::TASK_CANCEL,
                 move |context: &McpContext, parameters: serde_json::Value| {
-                    task_relay.dispatch_cancel(context, parameters)
+                    let relay = Arc::clone(&task_relay);
+                    Box::pin(async move { relay.dispatch_cancel(context, parameters).await })
                 },
             )
             .map_err(ServerExtensionConfigurationError::Handler)?;
@@ -12516,6 +12519,73 @@ impl Server {
         self.invoke_negotiated_extension(request_ctx, negotiated, extension_id, request)
     }
 
+    /// Dispatches a negotiated extension on the caller's runtime, including
+    /// handlers that suspend for upstream I/O. The synchronous dispatch API
+    /// remains suitable only for synchronous extension handlers.
+    pub async fn dispatch_negotiated_extension_async(
+        &self,
+        request_ctx: &McpContext,
+        negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        require_exact_modern_extension_metadata(request)?;
+        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
+            return Err(McpError::method_not_found(&request.method));
+        };
+        if negotiated.active(extension_id).is_none() {
+            return Err(McpError::invalid_params(
+                "Extension request is not admitted",
+            ));
+        }
+        let mut request = request.clone();
+        remove_modern_protocol_metadata(&mut request);
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or_else(|| McpError::method_not_found(&request.method))?;
+        runtime
+            .handlers
+            .invoke_async(
+                request_ctx,
+                negotiated,
+                ProtocolEra::Modern2026,
+                extension_id,
+                &request,
+            )
+            .await
+            .map_err(|error| match error {
+                ExtensionHandlerInvocationError::Handler(error) => error,
+                ExtensionHandlerInvocationError::RegistryNotFrozen => {
+                    McpError::internal_error("server extension handlers were not frozen")
+                }
+                ExtensionHandlerInvocationError::Protocol(_)
+                | ExtensionHandlerInvocationError::HandlerNotFound(_)
+                | ExtensionHandlerInvocationError::RequestEnvelopeRequired(_) => {
+                    McpError::invalid_params("Extension request is not admitted")
+                }
+            })
+    }
+
+    async fn dispatch_extension_fallback_async(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        require_exact_modern_extension_metadata(request)?;
+        if self
+            .registered_extension_handler_id(&request.method)?
+            .is_none()
+        {
+            return Err(McpError::method_not_found(&request.method));
+        }
+        let client = final_client_extension_discovery(request)?;
+        let negotiated = self
+            .negotiate_extensions(&client)
+            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+        self.dispatch_negotiated_extension_async(request_ctx, &negotiated, request)
+            .await
+    }
+
     fn dispatch_extension_fallback(
         &self,
         request_ctx: &McpContext,
@@ -13216,7 +13286,8 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback(&request_ctx, &request)
+                        self.dispatch_extension_fallback_async(&request_ctx, &request)
+                            .await
                     }
                     result => result,
                 },

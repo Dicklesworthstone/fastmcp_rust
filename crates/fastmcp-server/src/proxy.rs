@@ -159,7 +159,7 @@ impl ProxyFinalTaskRequest {
     async fn execute(
         self,
         ctx: &McpContext,
-        on_progress: FinalProgressCallback<'_>,
+        on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
     ) -> McpResult<ProxyFinalTaskResponse> {
         let Self {
             mut client,
@@ -4254,7 +4254,7 @@ impl ProxyFinalTaskRelay {
             .ok_or_else(|| McpError::invalid_params("Unknown proxy-relayed final Task handle"))
     }
 
-    pub(crate) fn dispatch_get(
+    pub(crate) async fn dispatch_get(
         &self,
         ctx: &McpContext,
         parameters: serde_json::Value,
@@ -4268,7 +4268,8 @@ impl ProxyFinalTaskRelay {
         // snapshot before any later update or cancellation can use the ID.
         let result = self
             .client
-            .get_final_task(ctx, parameters.task_id.clone())?;
+            .get_final_task(ctx, parameters.task_id.clone())
+            .await?;
         if result.task.base().task_id != parameters.task_id {
             return Err(McpError::invalid_request(
                 "Proxy upstream tasks/get response taskId does not match its request",
@@ -4280,7 +4281,7 @@ impl ProxyFinalTaskRelay {
         })
     }
 
-    pub(crate) fn dispatch_update(
+    pub(crate) async fn dispatch_update(
         &self,
         ctx: &McpContext,
         parameters: serde_json::Value,
@@ -4291,13 +4292,14 @@ impl ProxyFinalTaskRelay {
         let task = self.known_task(&parameters.task_id)?;
         let result = self
             .client
-            .update_final_task(ctx, &task, parameters.input_responses)?;
+            .update_final_task(ctx, &task, parameters.input_responses)
+            .await?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/update response serialization failed")
         })
     }
 
-    pub(crate) fn dispatch_cancel(
+    pub(crate) async fn dispatch_cancel(
         &self,
         ctx: &McpContext,
         parameters: serde_json::Value,
@@ -4308,7 +4310,8 @@ impl ProxyFinalTaskRelay {
         let task = self.known_task(&parameters.task_id)?;
         let result = self
             .client
-            .cancel_final_task(ctx, task.base().task_id.clone())?;
+            .cancel_final_task(ctx, task.base().task_id.clone())
+            .await?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/cancel response serialization failed")
         })
@@ -8710,7 +8713,7 @@ impl ProxyClient {
     }
 
     #[cfg(feature = "tasks")]
-    fn get_final_task(
+    async fn get_final_task(
         &self,
         ctx: &McpContext,
         task_id: FinalTaskId,
@@ -8721,7 +8724,7 @@ impl ProxyClient {
         match self.with_backend(|backend| backend.start_final_task_request(operation))? {
             Some(request) => {
                 let mut ignore_progress = |_| {};
-                match block_on(request.execute(ctx, &mut ignore_progress))? {
+                match request.execute(ctx, &mut ignore_progress).await? {
                     ProxyFinalTaskResponse::Get(result) => Ok(result),
                     ProxyFinalTaskResponse::CallTool(_)
                     | ProxyFinalTaskResponse::Update(_)
@@ -8735,7 +8738,7 @@ impl ProxyClient {
     }
 
     #[cfg(feature = "tasks")]
-    fn update_final_task(
+    async fn update_final_task(
         &self,
         ctx: &McpContext,
         task: &FinalTask,
@@ -8748,7 +8751,7 @@ impl ProxyClient {
         match self.with_backend(|backend| backend.start_final_task_request(operation))? {
             Some(request) => {
                 let mut ignore_progress = |_| {};
-                match block_on(request.execute(ctx, &mut ignore_progress))? {
+                match request.execute(ctx, &mut ignore_progress).await? {
                     ProxyFinalTaskResponse::Update(result) => Ok(result),
                     ProxyFinalTaskResponse::CallTool(_)
                     | ProxyFinalTaskResponse::Get(_)
@@ -8764,7 +8767,7 @@ impl ProxyClient {
     }
 
     #[cfg(feature = "tasks")]
-    fn cancel_final_task(
+    async fn cancel_final_task(
         &self,
         ctx: &McpContext,
         task_id: FinalTaskId,
@@ -8775,7 +8778,7 @@ impl ProxyClient {
         match self.with_backend(|backend| backend.start_final_task_request(operation))? {
             Some(request) => {
                 let mut ignore_progress = |_| {};
-                match block_on(request.execute(ctx, &mut ignore_progress))? {
+                match request.execute(ctx, &mut ignore_progress).await? {
                     ProxyFinalTaskResponse::Cancel(result) => Ok(result),
                     ProxyFinalTaskResponse::CallTool(_)
                     | ProxyFinalTaskResponse::Get(_)
@@ -10185,6 +10188,290 @@ mod tests {
         notifications
     }
 
+    /// Real native HTTP I/O against a protocol peer that withholds each reply
+    /// until a sibling on the caller's runtime runs. The peer supplies wire
+    /// fixtures; this proves dispatch/runtime custody, not an upstream Task
+    /// implementation or persistent backend.
+    #[cfg(feature = "tasks")]
+    fn proxy_task_controls_caller_runtime_probe(cancel: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .expect("application runtime with native reactor");
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let task_id = format!(
+                "runtime-task-{}-{}",
+                address.port(),
+                method.rsplit('/').next().unwrap()
+            );
+            let task = final_task_relay_result_with_ttl(&task_id, None).task;
+            let peer_task = task.clone();
+            let received = Arc::new(AtomicBool::new(false));
+            let peer_received = Arc::clone(&received);
+            let (release, replies) = std::sync::mpsc::sync_channel::<()>(1);
+            let peer = thread::spawn(move || {
+                let accept = || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(10)))
+                                    .unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(10)))
+                                    .unwrap();
+                                return stream;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "native peer accept deadline");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("native peer accept: {error}"),
+                        }
+                    }
+                };
+                let mut discovery = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+                assert_eq!(request["method"], "server/discover");
+                write_http_discovery_response(
+                    &mut discovery,
+                    &serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": {
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}},
+                            "ttlMs": 0, "cacheScope": "private"
+                        }
+                    }))
+                    .unwrap(),
+                );
+                drop(discovery);
+                let mut stream = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_http_request(&mut stream).body).unwrap();
+                assert_eq!(request["method"], method);
+                assert_eq!(
+                    request["params"]["taskId"],
+                    peer_task.base().task_id.as_str()
+                );
+                peer_received.store(true, Ordering::Release);
+                replies
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller-runtime sibling must release the withheld response");
+                let result = if method == "tasks/get" {
+                    let mut result = serde_json::to_value(peer_task).unwrap();
+                    result["resultType"] = serde_json::json!("complete");
+                    result
+                } else {
+                    serde_json::json!({"resultType": "complete"})
+                };
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result
+                }))
+                .unwrap();
+                if cancel {
+                    // Attempt the same late reply after cancellation has won.
+                    // A closed socket is an expected transport consequence.
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let late_write = stream
+                        .write_all(head.as_bytes())
+                        .and_then(|()| stream.write_all(&body));
+                    (request, late_write.is_ok())
+                } else {
+                    write_http_response(&mut stream, 200, "application/json", &body);
+                    (request, true)
+                }
+            });
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let request_cancellation = McpRequestCancellation::new();
+            let observed = runtime.block_on(async {
+                let target = format!("http://{address}/mcp");
+                let plan = ClientProtocolPlan::http(
+                    ProtocolPolicy::ModernOnly,
+                    Some(CanonicalHttpUrl::parse(&target).unwrap()),
+                    None,
+                    None,
+                    "runtime-control-credential".to_owned(),
+                    "runtime-control-owner".to_owned(),
+                    "native-h1-runtime-control".to_owned(),
+                    1,
+                    1,
+                    0,
+                )
+                .unwrap();
+                let capabilities = ClientCapabilities::default();
+                let connection = ClientHttpConnection::connect(
+                    &cx,
+                    plan,
+                    proxy_http_client_info(),
+                    capabilities.clone(),
+                )
+                .await
+                .expect("native upstream discovery");
+                let binding = final_task_relay_binding(ProtocolEra::Modern2026);
+                let proxy = ProxyClient::from_backend_with_upstream_binding(
+                    ProxyHttpClient::new(
+                        binding,
+                        connection,
+                        cx.clone(),
+                        proxy_http_client_info(),
+                        capabilities,
+                    ),
+                    binding,
+                    "2026-07-28",
+                )
+                .unwrap();
+                let relay = proxy
+                    .final_tasks_relay()
+                    .unwrap()
+                    .expect("discovery admits Tasks");
+                if method != "tasks/get" {
+                    relay.record_task(task.clone()).unwrap();
+                }
+                let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+                let server = crate::ServerBuilder::new("runtime-control-proxy", "1.0.0")
+                    .proxy(
+                        proxy.clone(),
+                        ProxyCatalog {
+                            tool_catalog_era: Some(ProtocolEra::Modern2026),
+                            ..ProxyCatalog::default()
+                        },
+                    )
+                    .unwrap()
+                    .build();
+                let server = Arc::new(server);
+                let mut parameters = serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}
+                        }
+                    },
+                    "taskId": task_id,
+                });
+                if method == "tasks/update" {
+                    parameters["inputResponses"] = serde_json::json!({});
+                }
+                let request =
+                    fastmcp_protocol::JsonRpcRequest::new(method, Some(parameters), 882_i64);
+                let inbound = crate::InboundRequestContext::new(
+                    cx.clone(),
+                    crate::request_id_to_u64(request.id.as_ref()),
+                    crate::InboundRequestTransport::Stdio,
+                );
+                let sibling_release = release.clone();
+                let sibling_cancel = request_cancellation.clone();
+                let sibling_received = Arc::clone(&received);
+                let mut sibling = cx
+                    .spawn(move |sibling_cx| async move {
+                        let deadline = sibling_cx.now().saturating_add_nanos(8_000_000_000);
+                        while !sibling_received.load(Ordering::Acquire) {
+                            assert!(
+                                sibling_cx.now() < deadline,
+                                "control request must reach native peer"
+                            );
+                            asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1))
+                                .await;
+                        }
+                        if cancel {
+                            assert!(sibling_cancel.cancel());
+                        } else {
+                            sibling_release.send(()).unwrap();
+                        }
+                    })
+                    .expect("sibling belongs to caller runtime");
+                let result = asupersync::time::timeout_at(
+                    cx.now().saturating_add_nanos(9_000_000_000),
+                    server.dispatch_with_protocol_policy_owned(
+                        ProtocolPolicy::ModernOnly, &inbound, request,
+                        None, None, None, None,
+                        request_cancellation.clone(), None, Arc::new(|_| {}),
+                    ),
+                )
+                .await
+                .expect("caller-owned dispatch has a finite completion bound");
+                sibling
+                    .join(&cx)
+                    .await
+                    .expect("caller runtime sibling quiesced");
+                assert!(
+                    received.load(Ordering::Acquire),
+                    "request was parked awaiting a withheld reply"
+                );
+                if cancel {
+                    let response = result.expect("cancelled request still has a response id");
+                    assert_eq!(response.id, Some(882_i64.into()));
+                    assert!(response.result.is_none(), "cancelled response has no success payload");
+                    let error = response.error.expect("cancelled request must produce an error frame");
+                    assert_eq!(error.code, i32::from(McpErrorCode::RequestCancelled).into());
+                    assert_eq!(
+                        proxy.final_task_registry_snapshot_for_test().unwrap(),
+                        before,
+                        "cancelled control preserves the registry before releasing the late response"
+                    );
+                    release.send(()).unwrap();
+                } else {
+                    let response = result.expect("async control receives its correlated response");
+                    assert_eq!(response.id, Some(882_i64.into()));
+                    assert!(response.error.is_none(), "unexpected proxy error: {:?}", response.error);
+                    let result = response.result.expect("async control receives its correlated result");
+                    assert_eq!(result["resultType"], "complete");
+                    if method == "tasks/get" {
+                        assert_eq!(result["taskId"], task_id);
+                        assert_eq!(
+                            serde_json::to_value(relay.known_task(&task.base().task_id).unwrap())
+                                .unwrap(),
+                            serde_json::to_value(&task).unwrap(),
+                        );
+                    }
+                }
+                (method, cancel, task_id.clone(), proxy, before)
+            });
+            let (wire, reply_written) = peer
+                .join()
+                .expect("native peer completed within its deadlines");
+            if cancel {
+                assert_eq!(
+                    observed.3.final_task_registry_snapshot_for_test().unwrap(),
+                    observed.4,
+                    "retained proxy state is unchanged after the native peer attempted its late reply"
+                );
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "proof": "proxy_task_controls_caller_runtime", "method": observed.0,
+                    "cancelled": observed.1, "task_id": observed.2, "peer_request": wire,
+                    "reply_written": reply_written,
+                })
+            );
+        }
+        assert!(
+            runtime.shutdown_timeout(Duration::from_secs(2)),
+            "application runtime quiesced"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_task_controls_caller_runtime_positive() {
+        proxy_task_controls_caller_runtime_probe(false);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_task_controls_caller_runtime_planted_negative() {
+        proxy_task_controls_caller_runtime_probe(true);
+    }
+
     #[cfg(feature = "tasks")]
     #[test]
     fn stdio_inbound_capability_overlay_preserves_official_tasks_extension() {
@@ -10311,7 +10598,7 @@ mod tests {
             ..TestBackend::default()
         });
 
-        let ((), report) = asupersync::lab::run_async_under_lab(0x63_16, move |cx| {
+        let ((), report) = asupersync::lab::run_async_under_lab(0x6316_u64, move |cx| {
             let proxy = proxy.clone();
             async move {
                 let context = McpContext::new(cx, 882);
@@ -10374,31 +10661,50 @@ mod tests {
             ..TestBackend::default()
         });
 
-        let ((), _report) = asupersync::lab::run_async_under_lab(0x63_15, move |cx| {
+        let ((), report) = asupersync::lab::run_async_under_lab(0x63_15, move |cx| {
             let proxy = proxy.clone();
             async move {
-                let context = McpContext::new(cx.clone(), 881);
-                let catalog_listener = proxy
-                    .open_catalog_listener_async(&context, catalog_listener_filter())
-                    .await
-                    .expect("a runtime-owned context opens a catalog listener");
-                let final_task_listener = proxy
-                    .open_final_task_listener_async(&context, final_task_listener_filter())
-                    .await
-                    .expect("a runtime-owned context opens a final Tasks listener");
+                let mut request = cx
+                    .spawn(move |request_cx| async move {
+                        let context = McpContext::new(request_cx.clone(), 881);
+                        let catalog_listener = proxy
+                            .open_catalog_listener_async(&context, catalog_listener_filter())
+                            .await
+                            .expect("a runtime-owned context opens a catalog listener");
+                        let final_task_listener = proxy
+                            .open_final_task_listener_async(&context, final_task_listener_filter())
+                            .await
+                            .expect("a runtime-owned context opens a final Tasks listener");
 
-                cx.cancel_with(
-                    asupersync::CancelKind::User,
-                    Some("parent request task completed"),
-                );
+                        request_cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("parent request task completed"),
+                        );
+                        assert!(
+                            request_cx.is_cancel_requested(),
+                            "the paired request context is cancelled before listener teardown"
+                        );
+                        drop(catalog_listener);
+                        drop(final_task_listener);
+                    })
+                    .expect("the live lab owner admits a supervised request task");
+                match request.join(&cx).await {
+                    Err(asupersync::runtime::JoinError::Cancelled(reason)) => {
+                        assert_eq!(reason.kind, asupersync::CancelKind::User);
+                    }
+                    other => panic!("the request must join with its cancellation: {other:?}"),
+                }
                 assert!(
-                    cx.is_cancel_requested(),
-                    "the paired request context is cancelled before listener teardown"
+                    !cx.is_cancel_requested(),
+                    "the lab owner remains live after observing request teardown"
                 );
-                drop(catalog_listener);
-                drop(final_task_listener);
             }
         });
+
+        assert!(
+            report.lab_test_passed(),
+            "cancelled request teardown must leave the lab owner quiescent: {report:?}"
+        );
 
         let state = state.lock().expect("state lock poisoned");
         assert_eq!(state.incremental_catalog_listener_starts, 1);
@@ -11165,31 +11471,28 @@ mod tests {
         let meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact final Task metadata serializes");
         let task_context = McpContext::new(Cx::for_testing(), 732);
-        let get = relay
-            .dispatch_get(
-                &task_context,
-                serde_json::json!({"_meta": meta.clone(), "taskId": task_id}),
-            )
-            .expect("the retained upstream handle permits tasks/get");
+        let get = block_on(relay.dispatch_get(
+            &task_context,
+            serde_json::json!({"_meta": meta.clone(), "taskId": task_id}),
+        ))
+        .expect("the retained upstream handle permits tasks/get");
         assert_eq!(get["taskId"], "proxy-task-73");
         assert_eq!(get["resultType"], "complete");
-        let update = relay
-            .dispatch_update(
-                &task_context,
-                serde_json::json!({
-                    "_meta": meta.clone(),
-                    "taskId": "proxy-task-73",
-                    "inputResponses": {},
-                }),
-            )
-            .expect("the retained upstream handle permits tasks/update");
+        let update = block_on(relay.dispatch_update(
+            &task_context,
+            serde_json::json!({
+                "_meta": meta.clone(),
+                "taskId": "proxy-task-73",
+                "inputResponses": {},
+            }),
+        ))
+        .expect("the retained upstream handle permits tasks/update");
         assert_eq!(update["resultType"], "complete");
-        let cancel = relay
-            .dispatch_cancel(
-                &task_context,
-                serde_json::json!({"_meta": meta, "taskId": "proxy-task-73"}),
-            )
-            .expect("the retained upstream handle permits tasks/cancel");
+        let cancel = block_on(relay.dispatch_cancel(
+            &task_context,
+            serde_json::json!({"_meta": meta, "taskId": "proxy-task-73"}),
+        ))
+        .expect("the retained upstream handle permits tasks/cancel");
         assert_eq!(cancel["resultType"], "complete");
 
         let mut notifications = SubscriptionFilter::default();
@@ -11351,19 +11654,17 @@ mod tests {
             .expect("exact task metadata serializes");
         let context = McpContext::new(Cx::for_testing(), 736);
 
-        let recovered = relay
-            .dispatch_get(
-                &context,
-                serde_json::json!({"_meta": metadata.clone(), "taskId": task_id}),
-            )
-            .expect("a fresh relay recovers an upstream task through its bound route");
+        let recovered = block_on(relay.dispatch_get(
+            &context,
+            serde_json::json!({"_meta": metadata.clone(), "taskId": task_id}),
+        ))
+        .expect("a fresh relay recovers an upstream task through its bound route");
         assert_eq!(recovered["taskId"], "proxy-task-73");
-        relay
-            .dispatch_cancel(
-                &context,
-                serde_json::json!({"_meta": metadata, "taskId": "proxy-task-73"}),
-            )
-            .expect("the recovered snapshot enables a later route-bound control");
+        block_on(relay.dispatch_cancel(
+            &context,
+            serde_json::json!({"_meta": metadata, "taskId": "proxy-task-73"}),
+        ))
+        .expect("the recovered snapshot enables a later route-bound control");
         assert_eq!(
             calls.lock().expect("calls are not poisoned").as_slice(),
             &["tasks/get", "tasks/cancel"],
@@ -11401,12 +11702,11 @@ mod tests {
             .expect("modern stdio installs the same final Tasks relay");
         let metadata = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact task metadata serializes");
-        relay
-            .dispatch_get(
-                &McpContext::new(Cx::for_testing(), 738),
-                serde_json::json!({"_meta": metadata, "taskId": task_id}),
-            )
-            .expect("modern stdio recovery remains route-bound");
+        block_on(relay.dispatch_get(
+            &McpContext::new(Cx::for_testing(), 738),
+            serde_json::json!({"_meta": metadata, "taskId": task_id}),
+        ))
+        .expect("modern stdio recovery remains route-bound");
         assert_eq!(
             calls.lock().expect("calls are not poisoned").as_slice(),
             &["tasks/get"],
