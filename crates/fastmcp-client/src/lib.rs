@@ -13141,12 +13141,13 @@ pub struct StdioRequestExecution {
     execution: RequestExecution<SelectedStdioTransport>,
 }
 
-/// One source-preserving, non-Tasks MRTR request on the shared stdio ingress.
+/// One source-preserving MRTR request on the shared stdio ingress.
 /// The retained decoder is bound to the exact parameters committed upstream.
 #[derive(Debug)]
 pub struct StdioFinalMrtrExecution {
     request: CoreRequest,
     execution: StdioRequestExecution,
+    allow_tasks: bool,
 }
 
 /// One incrementally driven final Tasks subscription on a stdio client.
@@ -14890,15 +14891,16 @@ impl Client {
         self.start_multiplexed_request(&connection_cx, method, params)
     }
 
-    /// Starts an ordinary final tools/call, resources/read or prompts/get,
+    /// Starts a final tools/call, resources/read or prompts/get,
     /// including a continuation, without waiting for the upstream response.
-    /// Tasks are disabled on this request even when configured on the client.
+    /// Tasks require explicit admission for this tools/call request.
     #[doc(hidden)]
     pub fn start_yielding_final_mrtr_request(
         &mut self,
         cx: &Cx,
         method: &str,
         parameters: serde_json::Value,
+        allow_tasks: bool,
     ) -> McpResult<StdioFinalMrtrExecution> {
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
@@ -14911,11 +14913,27 @@ impl Client {
                 "Yielding final MRTR requires a modern core method",
             ));
         }
+        if allow_tasks && (method != "tools/call" || !cfg!(feature = "tasks")) {
+            return Err(McpError::invalid_params(
+                "Yielding Tasks require a Tasks-enabled tools/call",
+            ));
+        }
         let parameters = self.prepare_request_parameters(parameters)?;
         #[cfg(feature = "tasks")]
         let parameters = {
             let mut parameters = parameters;
-            remove_tasks_client_extension(&mut parameters);
+            if allow_tasks {
+                let discovery = self.server_discovery().ok_or_else(|| {
+                    McpError::invalid_params("Modern Tasks requires retained server discovery")
+                })?;
+                admit_final_tasks_result_discriminator(
+                    discovery,
+                    OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+                )?;
+                parameters = self.with_final_tasks_client_capability(parameters)?;
+            } else {
+                remove_tasks_client_extension(&mut parameters);
+            }
             parameters
         };
         let request = self
@@ -14929,7 +14947,11 @@ impl Client {
         // The connection owns I/O; the caller owns only this execution.
         executor.service(&self.cx)?;
         let execution = executor.execute(&self.cx, method, parameters)?;
-        Ok(StdioFinalMrtrExecution { request, execution })
+        Ok(StdioFinalMrtrExecution {
+            request,
+            execution,
+            allow_tasks,
+        })
     }
 
     /// Takes an already-routed final MRTR response and retains its progress.
@@ -14938,25 +14960,84 @@ impl Client {
     pub fn try_take_yielding_final_mrtr_response(
         &mut self,
         execution: &mut StdioFinalMrtrExecution,
+        cancelled: bool,
     ) -> McpResult<Option<CoreResult>> {
-        for notification in execution.execution.take_stream_notifications()? {
-            self.retain_stream_notification(&notification)
-                .map_err(|error| self.terminate_connection(error))?;
-        }
-        let Some((response, raw_result)) =
-            self.try_take_yielding_stdio_response(&mut execution.execution)?
+        let executor = self.multiplexed_stdio_executor()?;
+        // Take the terminal and its stream atomically before applying caller
+        // cancellation. A fully validated Task is already durable upstream.
+        let terminal = executor
+            .executor
+            .try_take_response_with_raw_result_and_stream(&mut execution.execution.execution);
+        let Some((response, raw_result, stream)) = terminal.map_err(|error| {
+            if cancelled {
+                McpError::request_cancelled()
+            } else {
+                error
+            }
+        })?
         else {
+            if cancelled {
+                self.cancel_yielding_final_mrtr_request(execution)?;
+                return Err(McpError::request_cancelled());
+            }
+            for notification in execution.execution.take_stream_notifications()? {
+                self.retain_stream_notification(&notification)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
             return Ok(None);
         };
-        let result = response.result.ok_or_else(|| {
-            self.terminate_connection(McpError::internal_error("No result in response"))
-        })?;
-        let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
-            &execution.request,
-            &result,
-            raw_result.as_deref(),
-        )
-        .map_err(|error| self.terminate_connection(error))?;
+        if let Some(error) = response.error {
+            if !cancelled {
+                for notification in stream {
+                    self.retain_stream_notification(&notification)
+                        .map_err(|error| self.terminate_connection(error))?;
+                }
+            }
+            return Err(if cancelled {
+                McpError::request_cancelled()
+            } else {
+                json_rpc_error_to_mcp(error)
+            });
+        }
+        let decoded = if let Some(result) = response.result {
+            decode_core_result_with_cache_ttl_from_source(
+                &execution.request,
+                &result,
+                raw_result.as_deref(),
+            )
+        } else {
+            Err(McpError::internal_error("No result in response"))
+        };
+        let retains_task = execution.allow_tasks && {
+            #[cfg(feature = "tasks")]
+            {
+                raw_result.is_some()
+                    && matches!(
+                        &decoded,
+                        Ok((CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }), _))
+                    )
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
+                false
+            }
+        };
+        if cancelled && !retains_task {
+            // The terminal already retired the request; no cancellation
+            // control is due for a completed execution.
+            return Err(McpError::request_cancelled());
+        }
+        let (result, diagnostic) = decoded.map_err(|error| self.terminate_connection(error))?;
+        if !cancelled {
+            for notification in stream {
+                if let Err(error) = self.retain_stream_notification(&notification) {
+                    let error = self.terminate_connection(error);
+                    if !retains_task {
+                        return Err(error);
+                    }
+                }
+            }
+        }
         if let Some(diagnostic) = diagnostic {
             self.retain_final_cache_ttl_diagnostic(diagnostic);
         }
@@ -34310,6 +34391,129 @@ mod tests {
     fn forced_stdio_error_terminal_remains_cancellation_first() {
         assert_forced_stdio_task_terminal_cancellation_election(
             r#"{"jsonrpc":"2.0","id":91,"error":{"code":-32000,"message":"task creation failed"}}"#,
+            false,
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_yielding_stdio_terminal_election(mut result: serde_json::Value, wins: bool) {
+        let subject = format!("yielding-task-{}", std::process::id());
+        if result.get("result").is_some() {
+            result["result"]["taskId"] = serde_json::json!(subject);
+        }
+        let script = modern_final_tool_task_client_script(&result.to_string());
+        let cx = Cx::for_request();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", &script],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            cx.clone(),
+        )
+        .unwrap();
+        let mut execution = client
+            .start_yielding_final_mrtr_request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "durable-tool", "arguments": {}, "_meta": {"progressToken": "race"}}),
+                true,
+            )
+            .unwrap();
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        // Force the ordering at the shipped multiplexed ingress, independently
+        // of scheduler timing: progress, exact terminal, then cancellation.
+        executor
+            .drive_frame(
+                &cx,
+                ReceivedTransportFrame::admit(
+                    br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"race","progress":1.20e+4}}"#.to_vec(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                ReceivedTransportFrame::admit(result.to_string().into_bytes()).unwrap(),
+            )
+            .unwrap();
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+        let observed = client.try_take_yielding_final_mrtr_response(
+            &mut execution,
+            cancellation.is_cancel_requested(),
+        );
+        if wins {
+            let Some(CoreResult::Final(FinalCoreResult::ToolsCallTask { result: task })) =
+                observed.unwrap()
+            else {
+                panic!("already-admitted valid Task must survive cancellation");
+            };
+            assert_eq!(serde_json::to_value(task).unwrap(), result["result"]);
+        } else {
+            assert_eq!(observed.unwrap_err().code, McpErrorCode::RequestCancelled);
+        }
+        assert!(client.take_final_progress_notifications().is_empty());
+        assert_eq!(
+            execution
+                .execution
+                .take_stream_notifications()
+                .unwrap_err()
+                .code,
+            McpErrorCode::InvalidRequest,
+            "terminal consumption also retires its progress queue"
+        );
+        assert!(client.is_initialized());
+        assert!(!cx.is_cancel_requested());
+        client.close().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_valid_task_terminal_survives_cancellation() {
+        assert_yielding_stdio_terminal_election(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "resultType": "task", "status": "working",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null
+            }}),
+            true,
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_complete_terminal_remains_cancellation_first() {
+        assert_yielding_stdio_terminal_election(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "resultType": "complete", "status": "working",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null
+            }}),
+            false,
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_malformed_task_terminal_remains_cancellation_first() {
+        assert_yielding_stdio_terminal_election(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "resultType": "task", "status": "working",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null,
+                "serverInfo": {"name": "injected", "version": "1"}
+            }}),
+            false,
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_error_terminal_remains_cancellation_first() {
+        assert_yielding_stdio_terminal_election(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "error": {
+                "code": -32000, "message": "Task creation failed"
+            }}),
             false,
         );
     }

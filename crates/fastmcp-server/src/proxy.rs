@@ -1386,13 +1386,14 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
-    /// Starts a non-Tasks modern stdio MRTR request on the shared ingress.
+    /// Starts a modern stdio MRTR request on the shared ingress.
     #[doc(hidden)]
     fn start_final_stdio_request(
         &mut self,
         _ctx: &McpContext,
         _method: &str,
         _parameters: serde_json::Value,
+        _allow_tasks: bool,
     ) -> McpResult<Option<StdioFinalMrtrExecution>> {
         Ok(None)
     }
@@ -2497,6 +2498,7 @@ impl ProxyBackend for Client {
         ctx: &McpContext,
         method: &str,
         mut parameters: serde_json::Value,
+        allow_tasks: bool,
     ) -> McpResult<Option<StdioFinalMrtrExecution>> {
         if self.selected_protocol_era() != Some(ProtocolEra::Modern2026) {
             return Ok(None);
@@ -2512,7 +2514,7 @@ impl ProxyBackend for Client {
             inbound_logging_level(ctx),
             inbound_client_capabilities(ctx),
         );
-        self.start_yielding_final_mrtr_request(ctx.cx(), method, parameters)
+        self.start_yielding_final_mrtr_request(ctx.cx(), method, parameters, allow_tasks)
             .map(Some)
     }
 
@@ -2521,15 +2523,21 @@ impl ProxyBackend for Client {
         ctx: &McpContext,
         request: &mut StdioFinalMrtrExecution,
     ) -> McpResult<Option<CoreResult>> {
-        if ctx.ensure_live().is_err() {
-            self.cancel_yielding_final_mrtr_request(request)?;
-            return Err(McpError::request_cancelled());
+        let result =
+            self.try_take_yielding_final_mrtr_response(request, ctx.ensure_live().is_err())?;
+        let retains_task = result.as_ref().is_some_and(final_result_retains_task);
+        if let Err(error) = relay_upstream_catalog_resource_updates(ctx, self)
+            && !retains_task
+        {
+            return Err(error);
         }
-        let result = self.try_take_yielding_final_mrtr_response(request)?;
-        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
-            forward_final_progress_to_context(ctx, progress)?;
+            if let Err(error) = forward_final_progress_to_context(ctx, progress)
+                && !retains_task
+            {
+                return Err(error);
+            }
         }
         if result.is_none() {
             self.drive_yielding_stdio_slice()?;
@@ -7344,6 +7352,22 @@ fn proxy_http_connection_error(error: ClientHttpConnectionError) -> McpError {
     }
 }
 
+fn final_result_retains_task(
+    #[cfg_attr(not(feature = "tasks"), allow(unused_variables))] result: &CoreResult,
+) -> bool {
+    #[cfg(feature = "tasks")]
+    {
+        matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+        )
+    }
+    #[cfg(not(feature = "tasks"))]
+    {
+        false
+    }
+}
+
 fn unexpected_proxy_result(method: &str) -> McpError {
     McpError::invalid_request(format!(
         "Proxy HTTP upstream returned a result for another method instead of {method}"
@@ -8778,6 +8802,28 @@ impl ProxyClient {
                 "Proxy final Tasks relay is unavailable for this upstream route",
             ));
         }
+        if let Some(result) = self
+            .try_final_stdio_request(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                serde_json::json!({"name": name, "arguments": arguments}),
+                true,
+            )
+            .await?
+        {
+            return match result {
+                CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                    Ok(FinalToolCallOutcome::Complete(result))
+                }
+                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                    Ok(FinalToolCallOutcome::InputRequired(result))
+                }
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                    Ok(FinalToolCallOutcome::Task(result))
+                }
+                _ => Err(unexpected_proxy_result("tools/call")),
+            };
+        }
         let operation = ProxyFinalTaskOperation::CallTool {
             name: name.to_owned(),
             arguments: arguments.clone(),
@@ -8880,14 +8926,14 @@ impl ProxyClient {
                     &mut forward_progress,
                 )
                 .await?
-        } else if !tasks_negotiated
-            && let Some(result) = self
-                .try_final_stdio_request(
-                    ctx,
-                    fastmcp_protocol::methods::TOOLS_CALL,
-                    parameters.clone(),
-                )
-                .await?
+        } else if let Some(result) = self
+            .try_final_stdio_request(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                parameters.clone(),
+                tasks_negotiated,
+            )
+            .await?
         {
             result
         } else if resume_inputs.is_some() {
@@ -9601,9 +9647,11 @@ impl ProxyClient {
         ctx: &McpContext,
         method: &str,
         parameters: serde_json::Value,
+        allow_tasks: bool,
     ) -> McpResult<Option<CoreResult>> {
-        let Some(mut request) = self
-            .with_backend(|backend| backend.start_final_stdio_request(ctx, method, parameters))?
+        let Some(mut request) = self.with_backend(|backend| {
+            backend.start_final_stdio_request(ctx, method, parameters, allow_tasks)
+        })?
         else {
             return Ok(None);
         };
@@ -9611,7 +9659,9 @@ impl ProxyClient {
             if let Some(result) =
                 self.with_backend(|backend| backend.poll_final_stdio_request(ctx, &mut request))?
             {
-                ctx.ensure_live()?;
+                if !final_result_retains_task(&result) {
+                    ctx.ensure_live()?;
+                }
                 return self.admit_upstream_result(method, result).map(Some);
             }
             asupersync::runtime::yield_now().await;
@@ -9629,7 +9679,9 @@ impl ProxyClient {
         ctx.checkpoint()?;
         let Some(request) = self.with_backend(|backend| backend.prepare_final_core_request())?
         else {
-            return self.try_final_stdio_request(ctx, method, parameters).await;
+            return self
+                .try_final_stdio_request(ctx, method, parameters, false)
+                .await;
         };
         let mut progress_error = None;
         let mut forward_progress = |progress| {
@@ -12027,7 +12079,19 @@ mod tests {
                     "name": target, "inputSchema": {"type": "object"}
                 }))
                 .unwrap();
+                #[cfg(feature = "tasks")]
+                let relay = if ctx.client_supports_tasks() {
+                    proxy.final_tasks_relay().unwrap()
+                } else {
+                    None
+                };
                 let handler = ProxyToolHandler::with_prefix(tool, "tenant/remote", proxy);
+                #[cfg(feature = "tasks")]
+                let handler = {
+                    let mut handler = handler;
+                    handler.task_relay.clone_from(&relay);
+                    handler
+                };
                 match handler
                     .call_final_outcome_async_resuming_in_request(
                         ctx,
@@ -12048,7 +12112,18 @@ mod tests {
                         }
                     }
                     Outcome::Err(error) => return Err(error),
-                    _ => panic!("ordinary stdio tool must not publish a Task"),
+                    #[cfg(feature = "tasks")]
+                    Outcome::Ok(FinalToolOutcome::CreateTask {
+                        work_descriptor, ..
+                    }) => {
+                        let result = relay
+                            .expect("Tasks must be explicitly negotiated")
+                            .admit_carried_task(&work_descriptor)
+                            .unwrap()
+                            .unwrap();
+                        return Ok(serde_json::to_value(result).unwrap());
+                    }
+                    _ => panic!("stdio tool has a typed final outcome"),
                 }
             }
             "resources/read" => {
@@ -12116,7 +12191,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn proxy_modern_stdio_caller_runtime_probe(cancel: bool, context_deadline: bool) {
+    fn proxy_modern_stdio_caller_runtime_probe(
+        cancel: bool,
+        context_deadline: bool,
+        task_result: Option<bool>,
+    ) {
         use crate::bidirectional::{
             MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest, MrtrInputRequests,
             MrtrRetry,
@@ -12127,7 +12206,12 @@ mod tests {
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .build()
             .unwrap();
-        for method in ["tools/call", "resources/read", "prompts/get"] {
+        let methods: &[&str] = if task_result.is_some() {
+            &["tools/call"]
+        } else {
+            &["tools/call", "resources/read", "prompts/get"]
+        };
+        for &method in methods {
             for mode in 0..4 {
                 let subject = format!(
                     "stdio-{}",
@@ -12141,11 +12225,15 @@ mod tests {
                 } else {
                     subject.clone()
                 };
-                let payload = match method {
-                    "tools/call" => {
+                let payload = match (method, task_result) {
+                    ("tools/call", Some(true)) => serde_json::json!({
+                        "status": "working", "createdAt": "2026-07-28T12:00:00.000Z",
+                        "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null
+                    }),
+                    ("tools/call", _) => {
                         serde_json::json!({"content": [{"type": "text", "text": subject}]})
                     }
-                    "resources/read" => {
+                    ("resources/read", _) => {
                         serde_json::json!({"contents": [{"uri": target, "text": subject}], "ttlMs": 123, "cacheScope": "private"})
                     }
                     _ => {
@@ -12154,6 +12242,18 @@ mod tests {
                 };
                 let payload_members = serde_json::to_string(&payload).unwrap();
                 let payload_members = &payload_members[1..payload_members.len() - 1];
+                let result_type = if task_result == Some(true) {
+                    "task"
+                } else {
+                    "complete"
+                };
+                let recovery_payload = if task_result == Some(true) {
+                    serde_json::json!({"content": [{"type": "text", "text": subject}]})
+                } else {
+                    payload.clone()
+                };
+                let recovery_members = serde_json::to_string(&recovery_payload).unwrap();
+                let recovery_members = &recovery_members[1..recovery_members.len() - 1];
                 let mut discovery: serde_json::Value = serde_json::from_str(
                     &modern_discovery_response_line(&subject, &["2026-07-28"]),
                 )
@@ -12191,14 +12291,16 @@ while [ "$pair" -lt {pairs} ]; do
       if [ '{mode}' -ge 2 ]; then inputs=',"inputRequests":{{"roots":{{"method":"roots/list"}}}}'; fi
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"input_required"%s%s}}}}\n' "$response_id" "$state" "$inputs"
     else
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete",{payload_members},"_meta":{{"owner":%s}}}}}}\n' "$response_id" "$response_id"
+      task=''
+      if [ '{result_type}' = task ]; then task=',"taskId":"{subject}-'"$response_id"'"'; fi
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"{result_type}",{payload_members}%s,"_meta":{{"owner":%s}}}}}}\n' "$response_id" "$task" "$response_id"
     fi
   done
   id=$((id+2))
   pair=$((pair+1))
 done
 IFS= read -r recovery || exit 94
-printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete",{payload_members},"_meta":{{"wires":[%s],"control":%s,"recovery":%s}}}}}}\n' "$id" "$wires" "$control" "$recovery"
+printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete",{recovery_members},"_meta":{{"wires":[%s],"control":%s,"recovery":%s}}}}}}\n' "$id" "$wires" "$control" "$recovery"
 IFS= read -r end
 "#
                 );
@@ -12227,12 +12329,16 @@ IFS= read -r end
                     MrtrExchangeBinding::new(method, target.clone(), [3; 32], [4; 32], None);
                 runtime.block_on(async {
                     let mut resumes = Vec::new();
+                    let mut expected_tasks = serde_json::Map::new();
                     for pair in 0..pairs {
                         let cancelling_pair = cancel && pair + 1 == pairs;
                         let make_ctx = |marker: &str| {
+                            let capabilities = fastmcp_core::ClientCapabilityInfo::new().with_roots(false);
+                            #[cfg(feature = "tasks")]
+                            let capabilities = if task_result.is_some() { capabilities.with_tasks() } else { capabilities };
                             McpContext::with_progress(cx.clone(), 893,
                                 ProgressReporter::with_marker(serde_json::json!(marker), Arc::clone(&capture) as Arc<dyn NotificationSender>))
-                                .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_roots(false))
+                                .with_client_capabilities(capabilities)
                                 .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "18"))
                         };
                         let first_ctx = make_ctx("first").with_request_cancellation(cancellation.clone());
@@ -12301,7 +12407,16 @@ IFS= read -r end
                                 assert!(!cx.is_cancel_requested());
                                 assert!(cx.now() >= first_deadline.unwrap());
                             }
-                            assert_eq!(second["resultType"], "complete");
+                            assert_eq!(second["resultType"], result_type);
+                            assert_eq!(second["_meta"]["owner"], 3 + pair*2);
+                            for (key, value) in payload.as_object().unwrap() { assert_eq!(&second[key], value); }
+                            if task_result == Some(true) {
+                                assert_eq!(second["taskId"], format!("{subject}-{}", 3 + pair*2));
+                                let mut task = second.as_object().unwrap().clone();
+                                task.remove("resultType");
+                                task.remove("_meta");
+                                expected_tasks.insert(second["taskId"].as_str().unwrap().to_owned(), serde_json::Value::Object(task));
+                            }
                         } else {
                             let first = first.unwrap();
                             if mode != 0 && pair == 0 {
@@ -12323,8 +12438,15 @@ IFS= read -r end
                                 assert_eq!(first["_meta"]["owner"], 2 + pair*2);
                                 assert_eq!(second["_meta"]["owner"], 3 + pair*2);
                                 for result in [&first, &second] {
-                                    assert_eq!(result["resultType"], "complete");
+                                    assert_eq!(result["resultType"], result_type);
                                     for (key, value) in payload.as_object().unwrap() { assert_eq!(&result[key], value); }
+                                    if task_result == Some(true) {
+                                        assert_eq!(result["taskId"], format!("{subject}-{}", result["_meta"]["owner"]));
+                                        let mut task = result.as_object().unwrap().clone();
+                                        task.remove("resultType");
+                                        task.remove("_meta");
+                                        expected_tasks.insert(result["taskId"].as_str().unwrap().to_owned(), serde_json::Value::Object(task));
+                                    }
                                 }
                             }
                         }
@@ -12341,7 +12463,9 @@ IFS= read -r end
                         assert_eq!(params["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
                         assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], subject);
                         assert_eq!(params["_meta"]["progressToken"], if index % 2 == 0 { "first" } else { "second" });
-                        assert!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks").is_none());
+                        let tasks = params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks");
+                        if task_result.is_some() { assert_eq!(tasks, Some(&serde_json::json!({}))); }
+                        else { assert!(tasks.is_none()); }
                         assert_eq!(params.get("requestState"), (index >= 2 && mode != 3).then(|| serde_json::json!(format!("{subject}-{}", index))).as_ref());
                         assert_eq!(params.get("inputResponses"), (index >= 2 && mode >= 2).then(|| serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{subject}-{}", index-2)}]}})).as_ref());
                     }
@@ -12352,8 +12476,12 @@ IFS= read -r end
                     } else { assert!(meta["control"].is_null()); }
                     assert_eq!(registry.active_len(), 0);
                     #[cfg(feature = "tasks")]
-                    assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), serde_json::json!({"pendingCreations": 0, "tasks": {}}));
-                    eprintln!("{}", serde_json::json!({"proof": "proxy_modern_stdio_caller_runtime", "method": method, "mode": mode, "cancelled": cancel, "context_deadline": context_deadline, "subject": subject, "peer": meta}));
+                    let task_snapshot = proxy.final_task_registry_snapshot_for_test().unwrap();
+                    #[cfg(feature = "tasks")]
+                    assert_eq!(task_snapshot, serde_json::json!({"pendingCreations": 0, "tasks": expected_tasks}));
+                    #[cfg(not(feature = "tasks"))]
+                    let task_snapshot = serde_json::Value::Null;
+                    eprintln!("{}", serde_json::json!({"proof": if task_result.is_some() { "proxy_stdio_task_tool_caller_runtime" } else { "proxy_modern_stdio_caller_runtime" }, "task_result": task_result, "method": method, "mode": mode, "cancelled": cancel, "context_deadline": context_deadline, "subject": subject, "task_registry": task_snapshot, "peer": meta}));
                 });
                 let progress = capture.values.lock().unwrap();
                 assert_eq!(progress.len(), pairs * 2 - usize::from(cancel));
@@ -12370,25 +12498,57 @@ IFS= read -r end
     #[cfg(unix)]
     #[test]
     fn proxy_modern_stdio_caller_runtime_positive() {
-        proxy_modern_stdio_caller_runtime_probe(false, false);
+        proxy_modern_stdio_caller_runtime_probe(false, false, None);
     }
 
     #[cfg(unix)]
     #[test]
     fn proxy_modern_stdio_caller_runtime_planted_negative() {
-        proxy_modern_stdio_caller_runtime_probe(true, false);
+        proxy_modern_stdio_caller_runtime_probe(true, false, None);
     }
 
     #[cfg(unix)]
     #[test]
     fn proxy_modern_stdio_mcp_deadline_positive() {
-        proxy_modern_stdio_caller_runtime_probe(false, true);
+        proxy_modern_stdio_caller_runtime_probe(false, true, None);
     }
 
     #[cfg(unix)]
     #[test]
     fn proxy_modern_stdio_mcp_deadline_planted_negative() {
-        proxy_modern_stdio_caller_runtime_probe(true, true);
+        proxy_modern_stdio_caller_runtime_probe(true, true, None);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_tool_caller_runtime_positive() {
+        for task in [false, true] {
+            proxy_modern_stdio_caller_runtime_probe(false, false, Some(task));
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_tool_caller_runtime_planted_negative() {
+        for task in [false, true] {
+            proxy_modern_stdio_caller_runtime_probe(true, false, Some(task));
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_tool_mcp_deadline_positive() {
+        for task in [false, true] {
+            proxy_modern_stdio_caller_runtime_probe(false, true, Some(task));
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_tool_mcp_deadline_planted_negative() {
+        for task in [false, true] {
+            proxy_modern_stdio_caller_runtime_probe(true, true, Some(task));
+        }
     }
 
     #[cfg(feature = "tasks")]
