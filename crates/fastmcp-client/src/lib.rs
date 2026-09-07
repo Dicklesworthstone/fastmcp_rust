@@ -34836,7 +34836,11 @@ IFS= read -r end
                 }
                 let observed = loop {
                     match client.try_take_yielding_final_task_response(&mut request, false) {
-                        Ok(None) => client.drive_yielding_stdio_slice().unwrap(),
+                        Ok(None) => {
+                            if let Err(error) = client.drive_yielding_stdio_slice() {
+                                break Err(error);
+                            }
+                        }
                         result => break result,
                     }
                 };
@@ -34852,7 +34856,15 @@ IFS= read -r end
                     assert_eq!(observed.unwrap().unwrap(), result);
                     assert!(client.is_initialized());
                 } else {
-                    assert_eq!(observed.unwrap_err().code, McpErrorCode::InvalidRequest);
+                    let error = observed.unwrap_err();
+                    if invalid == 2 {
+                        // Raw admission rejects duplicate members before a
+                        // method-specific result can enter the executor.
+                        assert_eq!(error.code, McpErrorCode::InternalError);
+                        assert_eq!(error.message, TRANSPORT_CODEC_ERROR);
+                    } else {
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    }
                     assert!(!client.is_initialized(), "{method} invalid case {invalid}");
                     assert!(
                         client
