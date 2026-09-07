@@ -5585,9 +5585,8 @@ impl ModernHttpClient {
         )?;
         let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
             .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
-        let decoder =
-            CoreRequest::decode(ProtocolEra::Modern2026, method, wire.params.as_ref())
-                .map_err(ModernHttpClientError::TypedResult)?;
+        let decoder = CoreRequest::decode(ProtocolEra::Modern2026, method, wire.params.as_ref())
+            .map_err(ModernHttpClientError::TypedResult)?;
         let response = self.execute_post_discovery_request(cx, &request).await?;
         Ok((decoder, response))
     }
@@ -9809,12 +9808,16 @@ mod tests {
                 let id = RequestId::Number(i64::try_from(index + 2).unwrap());
                 for method in [super::RESOURCES_READ, super::PROMPTS_GET] {
                     assert!(matches!(
-                        client.request_mrtr(&cx, method, id.clone(), serde_json::json!({}), true).await,
+                        client
+                            .request_mrtr(&cx, method, id.clone(), serde_json::json!({}), true)
+                            .await,
                         Err(ModernHttpClientError::TasksNegotiation)
                     ));
                 }
                 assert!(matches!(
-                    client.request_mrtr(&cx, "tools/list", id.clone(), serde_json::json!({}), false).await,
+                    client
+                        .request_mrtr(&cx, "tools/list", id.clone(), serde_json::json!({}), false)
+                        .await,
                     Err(ModernHttpClientError::UnsupportedFinalMethod { .. })
                 ));
                 assert_eq!(settings.client_wire_extensions(), before);
