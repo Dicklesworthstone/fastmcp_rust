@@ -13141,6 +13141,14 @@ pub struct StdioRequestExecution {
     execution: RequestExecution<SelectedStdioTransport>,
 }
 
+/// One source-preserving, non-Tasks MRTR request on the shared stdio ingress.
+/// The retained decoder is bound to the exact parameters committed upstream.
+#[derive(Debug)]
+pub struct StdioFinalMrtrExecution {
+    request: CoreRequest,
+    execution: StdioRequestExecution,
+}
+
 /// One incrementally driven final Tasks subscription on a stdio client.
 ///
 /// It deliberately remains inside [`Client`]: only the client owns the
@@ -14880,6 +14888,88 @@ impl Client {
         self.install_multiplexed_stdio_executor();
         let connection_cx = self.cx.clone();
         self.start_multiplexed_request(&connection_cx, method, params)
+    }
+
+    /// Starts an ordinary final tools/call, resources/read or prompts/get,
+    /// including a continuation, without waiting for the upstream response.
+    /// Tasks are disabled on this request even when configured on the client.
+    #[doc(hidden)]
+    pub fn start_yielding_final_mrtr_request(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<StdioFinalMrtrExecution> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.ensure_initialized()?;
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026)
+            || !matches!(method, "tools/call" | "resources/read" | "prompts/get")
+        {
+            return Err(McpError::invalid_params(
+                "Yielding final MRTR requires a modern core method",
+            ));
+        }
+        let parameters = self.prepare_request_parameters(parameters)?;
+        #[cfg(feature = "tasks")]
+        let parameters = {
+            let mut parameters = parameters;
+            remove_tasks_client_extension(&mut parameters);
+            parameters
+        };
+        let request = self
+            .prepared_core_request(method, &parameters)?
+            .ok_or_else(|| McpError::invalid_params("Unsupported final MRTR request"))?;
+        let parameters = request.encode_params().map_err(|error| {
+            McpError::invalid_params(format!("Invalid final MRTR parameters: {error}"))
+        })?;
+        let executor = self.multiplexed_stdio_executor()?;
+        // Do not prepare the parameters again: that would re-advertise Tasks.
+        // The connection owns I/O; the caller owns only this execution.
+        executor.service(&self.cx)?;
+        let execution = executor.execute(&self.cx, method, parameters)?;
+        Ok(StdioFinalMrtrExecution { request, execution })
+    }
+
+    /// Takes an already-routed final MRTR response and retains its progress.
+    /// This performs no receive; the caller drives bounded ingress turns.
+    #[doc(hidden)]
+    pub fn try_take_yielding_final_mrtr_response(
+        &mut self,
+        execution: &mut StdioFinalMrtrExecution,
+    ) -> McpResult<Option<CoreResult>> {
+        for notification in execution.execution.take_stream_notifications()? {
+            self.retain_stream_notification(&notification)
+                .map_err(|error| self.terminate_connection(error))?;
+        }
+        let Some((response, raw_result)) =
+            self.try_take_yielding_stdio_response(&mut execution.execution)?
+        else {
+            return Ok(None);
+        };
+        let result = response.result.ok_or_else(|| {
+            self.terminate_connection(McpError::internal_error("No result in response"))
+        })?;
+        let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &execution.request,
+            &result,
+            raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        if let Some(diagnostic) = diagnostic {
+            self.retain_final_cache_ttl_diagnostic(diagnostic);
+        }
+        Ok(Some(result))
+    }
+
+    /// Retires one yielding final MRTR execution using the connection context.
+    #[doc(hidden)]
+    pub fn cancel_yielding_final_mrtr_request(
+        &mut self,
+        execution: &mut StdioFinalMrtrExecution,
+    ) -> McpResult<()> {
+        self.cancel_yielding_stdio_request(&mut execution.execution)
     }
 
     /// Takes one already-routed stdio response without reading the transport.

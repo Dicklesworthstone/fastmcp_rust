@@ -35,7 +35,7 @@ use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientProtocolPlan, CompletionParams,
     CompletionReference, ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
-    StdioSubscriptionEvent,
+    StdioFinalMrtrExecution, StdioSubscriptionEvent,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::{
@@ -1380,10 +1380,33 @@ pub trait ProxyBackend: Send {
     }
 
     /// Reserves native HTTP core I/O for execution on the caller's runtime.
-    /// Custom and stdio backends retain their current synchronous path.
+    /// Native stdio uses the separate shared-ingress hooks below.
     #[doc(hidden)]
     fn prepare_final_core_request(&mut self) -> McpResult<Option<ProxyFinalCoreRequest>> {
         Ok(None)
+    }
+
+    /// Starts a non-Tasks modern stdio MRTR request on the shared ingress.
+    #[doc(hidden)]
+    fn start_final_stdio_request(
+        &mut self,
+        _ctx: &McpContext,
+        _method: &str,
+        _parameters: serde_json::Value,
+    ) -> McpResult<Option<StdioFinalMrtrExecution>> {
+        Ok(None)
+    }
+
+    /// Observes a response or drives one bounded native stdio receive turn.
+    #[doc(hidden)]
+    fn poll_final_stdio_request(
+        &mut self,
+        _ctx: &McpContext,
+        _request: &mut StdioFinalMrtrExecution,
+    ) -> McpResult<Option<CoreResult>> {
+        Err(McpError::invalid_request(
+            "Backend has no final stdio execution",
+        ))
     }
 
     /// Resumes a final continuation without advertising Tasks upstream.
@@ -2469,6 +2492,51 @@ fn collect_modern_proxy_catalog_pages<T>(
 }
 
 impl ProxyBackend for Client {
+    fn start_final_stdio_request(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        mut parameters: serde_json::Value,
+    ) -> McpResult<Option<StdioFinalMrtrExecution>> {
+        if self.selected_protocol_era() != Some(ProtocolEra::Modern2026) {
+            return Ok(None);
+        }
+        ctx.ensure_live()?;
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        let parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        self.start_yielding_final_mrtr_request(ctx.cx(), method, parameters)
+            .map(Some)
+    }
+
+    fn poll_final_stdio_request(
+        &mut self,
+        ctx: &McpContext,
+        request: &mut StdioFinalMrtrExecution,
+    ) -> McpResult<Option<CoreResult>> {
+        if ctx.ensure_live().is_err() {
+            self.cancel_yielding_final_mrtr_request(request)?;
+            return Err(McpError::request_cancelled());
+        }
+        let result = self.try_take_yielding_final_mrtr_response(request)?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        for progress in self.take_final_progress_notifications() {
+            forward_final_progress_to_context(ctx, progress)?;
+        }
+        if result.is_none() {
+            self.drive_yielding_stdio_slice()?;
+        }
+        Ok(result)
+    }
+
     fn bind_inbound_legacy_reverse(&mut self, ctx: &McpContext) -> McpResult<()> {
         Client::bind_inbound_legacy_reverse(self, ctx)
     }
@@ -8812,6 +8880,16 @@ impl ProxyClient {
                     &mut forward_progress,
                 )
                 .await?
+        } else if !tasks_negotiated
+            && let Some(result) = self
+                .try_final_stdio_request(
+                    ctx,
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                    parameters.clone(),
+                )
+                .await?
+        {
+            result
         } else if resume_inputs.is_some() {
             #[cfg(feature = "tasks")]
             {
@@ -9194,7 +9272,7 @@ impl ProxyClient {
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
         if let Some(result) = self
-            .try_final_http_request(
+            .try_final_mrtr_request(
                 ctx,
                 fastmcp_protocol::methods::RESOURCES_READ,
                 serde_json::json!({"uri": uri}),
@@ -9298,7 +9376,7 @@ impl ProxyClient {
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
         if let Some(result) = self
-            .try_final_http_request(
+            .try_final_mrtr_request(
                 ctx,
                 fastmcp_protocol::methods::PROMPTS_GET,
                 serde_json::json!({"name": name, "arguments": arguments}),
@@ -9516,10 +9594,33 @@ impl ProxyClient {
         }
     }
 
-    /// Reserves a native HTTP request under the short backend lock, then
-    /// releases that lock before any network I/O. Non-HTTP backends return
-    /// None so their existing transport-specific dispatch remains explicit.
-    async fn try_final_http_request(
+    /// Drives one shared stdio request with the lock released between bounded
+    /// ingress turns, so other requests on the caller runtime can progress.
+    async fn try_final_stdio_request(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<CoreResult>> {
+        let Some(mut request) = self
+            .with_backend(|backend| backend.start_final_stdio_request(ctx, method, parameters))?
+        else {
+            return Ok(None);
+        };
+        loop {
+            if let Some(result) =
+                self.with_backend(|backend| backend.poll_final_stdio_request(ctx, &mut request))?
+            {
+                ctx.ensure_live()?;
+                return self.admit_upstream_result(method, result).map(Some);
+            }
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    /// Reserves native HTTP I/O outside the backend lock, or cooperatively
+    /// drives the selected stdio ingress. Custom backends return None.
+    async fn try_final_mrtr_request(
         &self,
         ctx: &McpContext,
         method: &str,
@@ -9528,7 +9629,7 @@ impl ProxyClient {
         ctx.checkpoint()?;
         let Some(request) = self.with_backend(|backend| backend.prepare_final_core_request())?
         else {
-            return Ok(None);
+            return self.try_final_stdio_request(ctx, method, parameters).await;
         };
         let mut progress_error = None;
         let mut forward_progress = |progress| {
@@ -9553,7 +9654,7 @@ impl ProxyClient {
         parameters: serde_json::Value,
     ) -> McpResult<CoreResult> {
         if let Some(result) = self
-            .try_final_http_request(ctx, method, parameters.clone())
+            .try_final_mrtr_request(ctx, method, parameters.clone())
             .await?
         {
             return Ok(result);
@@ -11907,6 +12008,387 @@ mod tests {
     #[test]
     fn proxy_resource_prompt_mcp_deadline_planted_negative() {
         proxy_resource_prompt_caller_runtime_probe(true, true);
+    }
+
+    #[cfg(unix)]
+    async fn invoke_modern_stdio_handler(
+        ctx: &McpContext,
+        proxy: ProxyClient,
+        method: &str,
+        target: &str,
+        resume: Option<&crate::bidirectional::MrtrCompletedInputs>,
+    ) -> fastmcp_core::McpResult<serde_json::Value> {
+        use super::ProxyResourceHandler;
+        use crate::handler::{FinalMethodOutcome, FinalToolOutcome, ResourceHandler, UriParams};
+        use fastmcp_core::{McpError, Outcome};
+        let result = match method {
+            "tools/call" => {
+                let tool = serde_json::from_value(serde_json::json!({
+                    "name": target, "inputSchema": {"type": "object"}
+                }))
+                .unwrap();
+                let handler = ProxyToolHandler::with_prefix(tool, "tenant/remote", proxy);
+                match handler
+                    .call_final_outcome_async_resuming_in_request(
+                        ctx,
+                        ctx.cx(),
+                        serde_json::json!({"subject": target}),
+                        resume,
+                    )
+                    .await
+                {
+                    Outcome::Ok(FinalToolOutcome::Complete(result)) => FinalCoreResult::ToolsCall {
+                        result,
+                        diagnostic: None,
+                    },
+                    Outcome::Ok(FinalToolOutcome::InputRequired(result)) => {
+                        FinalCoreResult::ToolsCallInputRequired {
+                            result,
+                            diagnostic: None,
+                        }
+                    }
+                    Outcome::Err(error) => return Err(error),
+                    _ => panic!("ordinary stdio tool must not publish a Task"),
+                }
+            }
+            "resources/read" => {
+                let resource =
+                    serde_json::from_value(serde_json::json!({"uri": target, "name": target}))
+                        .unwrap();
+                let handler = ProxyResourceHandler::with_prefix(resource, "tenant/remote", proxy);
+                match handler
+                    .read_final_outcome_async_with_uri_resuming_in_request(
+                        ctx,
+                        ctx.cx(),
+                        &format!("tenant/remote/{target}"),
+                        &UriParams::new(),
+                        resume,
+                    )
+                    .await
+                {
+                    Outcome::Ok(FinalMethodOutcome::Complete(result)) => {
+                        FinalCoreResult::ResourcesRead {
+                            result,
+                            diagnostic: None,
+                        }
+                    }
+                    Outcome::Ok(FinalMethodOutcome::InputRequired(result)) => {
+                        FinalCoreResult::ResourcesReadInputRequired {
+                            result,
+                            diagnostic: None,
+                        }
+                    }
+                    Outcome::Err(error) => return Err(error),
+                    _ => panic!("resource operation has a typed final outcome"),
+                }
+            }
+            "prompts/get" => {
+                let prompt = serde_json::from_value(serde_json::json!({"name": target})).unwrap();
+                let handler = ProxyPromptHandler::with_prefix(prompt, "tenant/remote", proxy);
+                match handler
+                    .get_final_outcome_async_resuming_in_request(
+                        ctx,
+                        ctx.cx(),
+                        HashMap::from([("subject".to_owned(), target.to_owned())]),
+                        resume,
+                    )
+                    .await
+                {
+                    Outcome::Ok(FinalMethodOutcome::Complete(result)) => {
+                        FinalCoreResult::PromptsGet {
+                            result,
+                            diagnostic: None,
+                        }
+                    }
+                    Outcome::Ok(FinalMethodOutcome::InputRequired(result)) => {
+                        FinalCoreResult::PromptsGetInputRequired {
+                            result,
+                            diagnostic: None,
+                        }
+                    }
+                    Outcome::Err(error) => return Err(error),
+                    _ => panic!("prompt operation has a typed final outcome"),
+                }
+            }
+            _ => panic!("probe has three real MRTR consumers"),
+        };
+        serde_json::from_str(&CoreResult::Final(result).encode().unwrap()).map_err(McpError::from)
+    }
+
+    #[cfg(unix)]
+    fn proxy_modern_stdio_caller_runtime_probe(cancel: bool, context_deadline: bool) {
+        use crate::bidirectional::{
+            MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest, MrtrInputRequests,
+            MrtrRetry,
+        };
+        use fastmcp_protocol::{FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            for mode in 0..4 {
+                let subject = format!(
+                    "stdio-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                let target = if method == "resources/read" {
+                    format!("db://{subject}")
+                } else {
+                    subject.clone()
+                };
+                let payload = match method {
+                    "tools/call" => {
+                        serde_json::json!({"content": [{"type": "text", "text": subject}]})
+                    }
+                    "resources/read" => {
+                        serde_json::json!({"contents": [{"uri": target, "text": subject}], "ttlMs": 123, "cacheScope": "private"})
+                    }
+                    _ => {
+                        serde_json::json!({"messages": [{"role": "user", "content": {"type": "text", "text": subject}}]})
+                    }
+                };
+                let payload_members = serde_json::to_string(&payload).unwrap();
+                let payload_members = &payload_members[1..payload_members.len() - 1];
+                let mut discovery: serde_json::Value = serde_json::from_str(
+                    &modern_discovery_response_line(&subject, &["2026-07-28"]),
+                )
+                .unwrap();
+                discovery["result"]["capabilities"]["extensions"] =
+                    serde_json::json!({"io.modelcontextprotocol/tasks": {}});
+                let discovery = serde_json::to_string(&discovery).unwrap();
+                let pairs = if mode == 0 { 1 } else { 2 };
+                // The child withholds both replies until two real requests
+                // arrive. A synchronous first request prevents the second
+                // caller-runtime task from sending and hits the client bound.
+                let script = format!(
+                    r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+wires=''
+control=null
+id=2
+pair=0
+while [ "$pair" -lt {pairs} ]; do
+  IFS= read -r first || exit 91
+  IFS= read -r second || exit 92
+  if [ -n "$wires" ]; then wires="$wires,$first,$second"; else wires="$first,$second"; fi
+  next=$((id+1))
+  if [ "$pair" -eq $(({pairs}-1)) ] && [ '{cancel}' = true ]; then
+    IFS= read -r control || exit 93
+  fi
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":"first","progress":1.20e+4,"total":12000.0}}}}'
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":"second","progress":1.20e+4,"total":12000.0}}}}'
+  for response_id in "$next" "$id"; do
+    if [ '{mode}' -ne 0 ] && [ "$pair" -eq 0 ]; then
+      state=''
+      inputs=''
+      if [ '{mode}' -ne 3 ]; then state=',"requestState":"{subject}-'"$response_id"'"'; fi
+      if [ '{mode}' -ge 2 ]; then inputs=',"inputRequests":{{"roots":{{"method":"roots/list"}}}}'; fi
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"input_required"%s%s}}}}\n' "$response_id" "$state" "$inputs"
+    else
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete",{payload_members},"_meta":{{"owner":%s}}}}}}\n' "$response_id" "$response_id"
+    fi
+  done
+  id=$((id+2))
+  pair=$((pair+1))
+done
+IFS= read -r recovery || exit 94
+printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete",{payload_members},"_meta":{{"wires":[%s],"control":%s,"recovery":%s}}}}}}\n' "$id" "$wires" "$control" "$recovery"
+IFS= read -r end
+"#
+                );
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    "sh",
+                    &["-c", &script],
+                    ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                    cx.clone(),
+                )
+                .unwrap();
+                client
+                    .set_request_timeout_policy(
+                        fastmcp_client::RequestTimeoutPolicy::new(
+                            Duration::from_secs(2),
+                            Duration::from_secs(4),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let proxy = ProxyClient::from_client(client).unwrap();
+                let capture = Arc::new(ExactProgressCapture::default());
+                let cancellation = McpRequestCancellation::new();
+                let registry = MrtrExchangeRegistry::new();
+                let binding =
+                    MrtrExchangeBinding::new(method, target.clone(), [3; 32], [4; 32], None);
+                runtime.block_on(async {
+                    let mut resumes = Vec::new();
+                    for pair in 0..pairs {
+                        let cancelling_pair = cancel && pair + 1 == pairs;
+                        let make_ctx = |marker: &str| {
+                            McpContext::with_progress(cx.clone(), 893,
+                                ProgressReporter::with_marker(serde_json::json!(marker), Arc::clone(&capture) as Arc<dyn NotificationSender>))
+                                .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_roots(false))
+                                .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "18"))
+                        };
+                        let first_ctx = make_ctx("first").with_request_cancellation(cancellation.clone());
+                        let second_ctx = make_ctx("second");
+                        let started = Arc::new(AtomicBool::new(false));
+                        let observer_started = Arc::clone(&started);
+                        let observer_cancellation = cancellation.clone();
+                        let mut observer = cx.spawn(move |observer_cx| async move {
+                            let deadline = observer_cx.now().saturating_add_nanos(3_000_000_000);
+                            while !observer_started.load(Ordering::Acquire) {
+                                assert!(observer_cx.now() < deadline, "second request starts within its bound");
+                                asupersync::runtime::yield_now().await;
+                            }
+                            if cancelling_pair && !context_deadline {
+                                asupersync::time::sleep(observer_cx.now(), Duration::from_millis(20)).await;
+                                assert!(observer_cancellation.cancel());
+                            }
+                        }).unwrap();
+                        let first_pending = Arc::new(AtomicBool::new(false));
+                        let pending_signal = Arc::clone(&first_pending);
+                        let worker_thread = Arc::new(Mutex::new(None));
+                        let first_thread = Arc::clone(&worker_thread);
+                        let first_proxy = proxy.clone();
+                        let first_target = target.clone();
+                        let first_resume = resumes.first().cloned();
+                        // Runtime::block_on polls its root on the driving
+                        // thread. Put BOTH operations on the single worker,
+                        // and observe Pending only after the first releases
+                        // its bounded receive guard.
+                        let mut first_request = cx.spawn(move |first_cx| async move {
+                            *first_thread.lock().unwrap() = Some(thread::current().id());
+                            let first_ctx = if context_deadline {
+                                first_ctx.with_operation_deadline(Some(first_cx.now().saturating_add_nanos(
+                                    if cancelling_pair { 100_000_000 } else { 5_000_000_000 })))
+                            } else { first_ctx };
+                            let deadline = first_ctx.budget().deadline;
+                            let mut request = Box::pin(invoke_modern_stdio_handler(&first_ctx, first_proxy, method, &first_target, first_resume.as_ref()));
+                            let result = std::future::poll_fn(|task_cx| {
+                                let poll = request.as_mut().poll(task_cx);
+                                if poll.is_pending() { pending_signal.store(true, Ordering::Release); }
+                                poll
+                            }).await;
+                            (result, deadline)
+                        }).unwrap();
+                        let second_proxy = proxy.clone();
+                        let second_target = target.clone();
+                        let second_resume = resumes.get(1).cloned();
+                        let mut sibling = cx.spawn(move |sibling_cx| async move {
+                            let deadline = sibling_cx.now().saturating_add_nanos(3_000_000_000);
+                            while !first_pending.load(Ordering::Acquire) {
+                                assert!(sibling_cx.now() < deadline, "first request yields within its bound");
+                                asupersync::runtime::yield_now().await;
+                            }
+                            assert_eq!(*worker_thread.lock().unwrap(), Some(thread::current().id()), "both operations run on the same caller worker");
+                            assert!(second_proxy.inner.try_lock().is_ok(), "first request released backend lock");
+                            started.store(true, Ordering::Release);
+                            invoke_modern_stdio_handler(&second_ctx, second_proxy, method, &second_target, second_resume.as_ref()).await
+                        }).unwrap();
+                        let (first, first_deadline) = first_request.join(&cx).await.unwrap();
+                        let second = sibling.join(&cx).await.unwrap().unwrap();
+                        observer.join(&cx).await.unwrap();
+                        if cancelling_pair {
+                            assert_eq!(first.unwrap_err().code, McpErrorCode::RequestCancelled);
+                            if context_deadline {
+                                assert!(!cancellation.is_cancel_requested());
+                                assert!(!cx.is_cancel_requested());
+                                assert!(cx.now() >= first_deadline.unwrap());
+                            }
+                            assert_eq!(second["resultType"], "complete");
+                        } else {
+                            let first = first.unwrap();
+                            if mode != 0 && pair == 0 {
+                                for (index, result) in [first, second].into_iter().enumerate() {
+                                    assert_eq!(result["resultType"], "input_required");
+                                    let state = format!("{subject}-{}", index+2);
+                                    assert_eq!(result.get("requestState").and_then(serde_json::Value::as_str), (mode != 3).then_some(state.as_str()));
+                                    let inputs = if mode >= 2 { MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap() } else { MrtrInputRequests::default() };
+                                    let issued = registry.issue_bound(cancellation.clone(), binding.clone(), inputs, result.get("requestState").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap();
+                                    let issued = serde_json::to_value(issued).unwrap();
+                                    let token = issued["requestState"].as_str().unwrap();
+                                    let retry = if mode >= 2 {
+                                        registry.accept_wire_bound(token, &binding, &BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": [{"uri": format!("file:///{subject}-{index}")}]}))])).unwrap()
+                                    } else { registry.accept_state_only_bound(token, &binding).unwrap() };
+                                    let MrtrRetry::Complete(inputs) = retry else { panic!("continuation inputs admitted"); };
+                                    resumes.push(inputs);
+                                }
+                            } else {
+                                assert_eq!(first["_meta"]["owner"], 2 + pair*2);
+                                assert_eq!(second["_meta"]["owner"], 3 + pair*2);
+                                for result in [&first, &second] {
+                                    assert_eq!(result["resultType"], "complete");
+                                    for (key, value) in payload.as_object().unwrap() { assert_eq!(&result[key], value); }
+                                }
+                            }
+                        }
+                    }
+                    let recovery = invoke_modern_stdio_handler(&McpContext::new(cx.clone(), 894), proxy.clone(), method, &target, None).await.unwrap();
+                    let meta = &recovery["_meta"];
+                    let wires = meta["wires"].as_array().unwrap();
+                    assert_eq!(wires.len(), pairs*2);
+                    for (index, wire) in wires.iter().enumerate() {
+                        assert_eq!(wire["id"], index+2);
+                        assert_eq!(wire["method"], method);
+                        let params = &wire["params"];
+                        assert_eq!(params[if method == "resources/read" { "uri" } else { "name" }], target);
+                        assert_eq!(params["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], subject);
+                        assert_eq!(params["_meta"]["progressToken"], if index % 2 == 0 { "first" } else { "second" });
+                        assert!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks").is_none());
+                        assert_eq!(params.get("requestState"), (index >= 2 && mode != 3).then(|| serde_json::json!(format!("{subject}-{}", index))).as_ref());
+                        assert_eq!(params.get("inputResponses"), (index >= 2 && mode >= 2).then(|| serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{subject}-{}", index-2)}]}})).as_ref());
+                    }
+                    assert_eq!(meta["recovery"]["id"], 2+pairs*2);
+                    if cancel {
+                        assert_eq!(meta["control"]["method"], "notifications/cancelled");
+                        assert_eq!(meta["control"]["params"]["requestId"], pairs*2);
+                    } else { assert!(meta["control"].is_null()); }
+                    assert_eq!(registry.active_len(), 0);
+                    #[cfg(feature = "tasks")]
+                    assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), serde_json::json!({"pendingCreations": 0, "tasks": {}}));
+                    eprintln!("{}", serde_json::json!({"proof": "proxy_modern_stdio_caller_runtime", "method": method, "mode": mode, "cancelled": cancel, "context_deadline": context_deadline, "subject": subject, "peer": meta}));
+                });
+                let progress = capture.values.lock().unwrap();
+                assert_eq!(progress.len(), pairs * 2 - usize::from(cancel));
+                for (value, total, message) in progress.iter() {
+                    assert_eq!(value, "1.20e+4");
+                    assert_eq!(total.as_deref(), Some("12000.0"));
+                    assert!(message.is_none());
+                }
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_modern_stdio_caller_runtime_positive() {
+        proxy_modern_stdio_caller_runtime_probe(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_modern_stdio_caller_runtime_planted_negative() {
+        proxy_modern_stdio_caller_runtime_probe(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_modern_stdio_mcp_deadline_positive() {
+        proxy_modern_stdio_caller_runtime_probe(false, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_modern_stdio_mcp_deadline_planted_negative() {
+        proxy_modern_stdio_caller_runtime_probe(true, true);
     }
 
     #[cfg(feature = "tasks")]
