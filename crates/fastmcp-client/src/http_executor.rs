@@ -5529,20 +5529,31 @@ impl ModernHttpClient {
             .await
     }
 
-    /// Starts one final tool call, including caller-managed MRTR retries.
+    /// Starts a tool call, resource read, or prompt request, including
+    /// caller-managed MRTR retries.
     ///
-    /// `allow_tasks` controls this request alone. Enabling it requires bilateral
+    /// `allow_tasks` is valid only for tools/call and controls this request
+    /// alone. Enabling it requires bilateral
     /// discovery admission; disabling it removes Tasks even from configured
     /// extensions. Other extensions, identity, and method metadata are retained.
     /// The returned decoder is built from the exact stamped request sent on the
     /// wire. The caller owns response streaming, cancellation, and result admission.
-    pub async fn request_tool_call(
+    pub async fn request_mrtr(
         &self,
         cx: &Cx,
+        method: &str,
         request_id: RequestId,
         parameters: serde_json::Value,
         allow_tasks: bool,
     ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
+        if !matches!(method, TOOLS_CALL | RESOURCES_READ | PROMPTS_GET) {
+            return Err(ModernHttpClientError::UnsupportedFinalMethod {
+                method: method.to_owned(),
+            });
+        }
+        if allow_tasks && method != TOOLS_CALL {
+            return Err(ModernHttpClientError::TasksNegotiation);
+        }
         if request_id.validate().is_err() {
             return Err(ModernHttpClientError::InvalidRequestId);
         }
@@ -5566,7 +5577,7 @@ impl ModernHttpClient {
         };
         let request = self.build_post_discovery_request(
             cx,
-            TOOLS_CALL,
+            method,
             parameters,
             Some(request_id),
             Some(&extensions),
@@ -5575,7 +5586,7 @@ impl ModernHttpClient {
         let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
             .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
         let decoder =
-            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, wire.params.as_ref())
+            CoreRequest::decode(ProtocolEra::Modern2026, method, wire.params.as_ref())
                 .map_err(ModernHttpClientError::TypedResult)?;
         let response = self.execute_post_discovery_request(cx, &request).await?;
         Ok((decoder, response))
@@ -9796,7 +9807,18 @@ mod tests {
             };
             for (index, allow_tasks) in [false, true, false].into_iter().enumerate() {
                 let id = RequestId::Number(i64::try_from(index + 2).unwrap());
-                let request = client.request_tool_call(&cx, id.clone(), serde_json::json!({
+                for method in [super::RESOURCES_READ, super::PROMPTS_GET] {
+                    assert!(matches!(
+                        client.request_mrtr(&cx, method, id.clone(), serde_json::json!({}), true).await,
+                        Err(ModernHttpClientError::TasksNegotiation)
+                    ));
+                }
+                assert!(matches!(
+                    client.request_mrtr(&cx, "tools/list", id.clone(), serde_json::json!({}), false).await,
+                    Err(ModernHttpClientError::UnsupportedFinalMethod { .. })
+                ));
+                assert_eq!(settings.client_wire_extensions(), before);
+                let request = client.request_mrtr(&cx, super::TOOLS_CALL, id.clone(), serde_json::json!({
                     "name": subject, "arguments": {}, "requestState": "upstream-state",
                     "inputResponses": {"roots": {"roots": []}},
                     "_meta": {"com.example/retained": {"exact": true},

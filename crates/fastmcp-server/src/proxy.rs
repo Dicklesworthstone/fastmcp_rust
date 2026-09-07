@@ -106,18 +106,19 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<Strin
 /// parameters, including their raw decimal/exponent lexemes.
 pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
 
-/// One native HTTP tool request reserved without starting I/O or holding the
+/// One native HTTP core request reserved without starting I/O or holding the
 /// proxy backend lock while its response is awaited.
 #[doc(hidden)]
-pub struct ProxyFinalToolRequest {
+pub struct ProxyFinalCoreRequest {
     client: ModernHttpClient,
     request_id: RequestId,
 }
 
-impl ProxyFinalToolRequest {
+impl ProxyFinalCoreRequest {
     async fn execute(
         self,
         ctx: &McpContext,
+        method: &str,
         mut parameters: serde_json::Value,
         allow_tasks: bool,
         on_progress: &mut (dyn FnMut(FinalProgressNotificationParams) + Send),
@@ -145,11 +146,11 @@ impl ProxyFinalToolRequest {
             ctx,
             Box::pin(async {
                 client
-                    .request_tool_call(ctx.cx(), request_id.clone(), parameters, allow_tasks)
+                    .request_mrtr(ctx.cx(), method, request_id.clone(), parameters, allow_tasks)
                     .await
                     .map_err(|error| {
                         McpError::invalid_request(format!(
-                            "Proxy HTTP final tools/call failed: {error}"
+                            "Proxy HTTP final {method} failed: {error}"
                         ))
                     })
             }),
@@ -160,7 +161,7 @@ impl ProxyFinalToolRequest {
                 receive_modern_response_body(response, ctx, &request_id, on_progress).await?;
             if let Some(error) = response.response.error.as_ref() {
                 return Err(proxy_http_upstream_rpc_error(
-                    fastmcp_protocol::methods::TOOLS_CALL,
+                    method,
                     error,
                 ));
             }
@@ -1375,10 +1376,10 @@ pub trait ProxyBackend: Send {
         ))
     }
 
-    /// Reserves native HTTP tool I/O for execution on the caller's runtime.
+    /// Reserves native HTTP core I/O for execution on the caller's runtime.
     /// Custom and stdio backends retain their current synchronous path.
     #[doc(hidden)]
-    fn prepare_final_tool_request(&mut self) -> McpResult<Option<ProxyFinalToolRequest>> {
+    fn prepare_final_core_request(&mut self) -> McpResult<Option<ProxyFinalCoreRequest>> {
         Ok(None)
     }
 
@@ -5982,12 +5983,12 @@ impl ProxyBackend for ProxyHttpClient {
         self.request_result_with_context(ctx, method, parameters)
     }
 
-    fn prepare_final_tool_request(&mut self) -> McpResult<Option<ProxyFinalToolRequest>> {
+    fn prepare_final_core_request(&mut self) -> McpResult<Option<ProxyFinalCoreRequest>> {
         let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         let client = client.clone();
-        Ok(Some(ProxyFinalToolRequest {
+        Ok(Some(ProxyFinalCoreRequest {
             client,
             request_id: self.next_request_id()?,
         }))
@@ -8797,10 +8798,10 @@ impl ProxyClient {
                 progress_error = Some(error);
             }
         };
-        let prepared = self.with_backend(|backend| backend.prepare_final_tool_request())?;
+        let prepared = self.with_backend(|backend| backend.prepare_final_core_request())?;
         let result = if let Some(request) = prepared {
             request
-                .execute(ctx, parameters, tasks_negotiated, &mut forward_progress)
+                .execute(ctx, fastmcp_protocol::methods::TOOLS_CALL, parameters, tasks_negotiated, &mut forward_progress)
                 .await?
         } else if resume_inputs.is_some() {
             #[cfg(feature = "tasks")]
@@ -9183,6 +9184,12 @@ impl ProxyClient {
         uri: &str,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        if let Some(result) = self.try_final_http_request(
+            ctx, fastmcp_protocol::methods::RESOURCES_READ, serde_json::json!({"uri": uri}),
+        ).await? {
+            self.relay_resource_updated_notifications(ctx)?;
+            return Ok(result);
+        }
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
         self.forward_inbound_log_level(ctx)?;
@@ -9276,6 +9283,13 @@ impl ProxyClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        if let Some(result) = self.try_final_http_request(
+            ctx, fastmcp_protocol::methods::PROMPTS_GET,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        ).await? {
+            self.relay_resource_updated_notifications(ctx)?;
+            return Ok(result);
+        }
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
         self.forward_inbound_log_level(ctx)?;
@@ -9368,6 +9382,27 @@ impl ProxyClient {
         } else {
             self.read_resource_typed(ctx, uri)?
         };
+        Self::resource_final_outcome(result)
+    }
+
+    async fn read_resource_final_outcome_async(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        let result = if let Some(resume) = resume_inputs {
+            self.request_upstream_final_core_async(
+                ctx, fastmcp_protocol::methods::RESOURCES_READ,
+                overlay_upstream_mrtr_resume(serde_json::json!({"uri": uri}), resume)?,
+            ).await?
+        } else {
+            self.read_resource_typed_async(ctx, uri).await?
+        };
+        Self::resource_final_outcome(result)
+    }
+
+    fn resource_final_outcome(result: CoreResult) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         match result {
             CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
                 Ok(FinalMethodOutcome::Complete(result))
@@ -9416,6 +9451,28 @@ impl ProxyClient {
         } else {
             self.get_prompt_typed(ctx, name, arguments)?
         };
+        Self::prompt_final_outcome(result)
+    }
+
+    async fn get_prompt_final_outcome_async(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        let result = if let Some(resume) = resume_inputs {
+            self.request_upstream_final_core_async(
+                ctx, fastmcp_protocol::methods::PROMPTS_GET,
+                overlay_upstream_mrtr_resume(serde_json::json!({"name": name, "arguments": arguments}), resume)?,
+            ).await?
+        } else {
+            self.get_prompt_typed_async(ctx, name, arguments).await?
+        };
+        Self::prompt_final_outcome(result)
+    }
+
+    fn prompt_final_outcome(result: CoreResult) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         match result {
             CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => {
                 Ok(FinalMethodOutcome::Complete(result))
@@ -9428,6 +9485,45 @@ impl ProxyClient {
             )),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
+    }
+
+    /// Reserves a native HTTP request under the short backend lock, then
+    /// releases that lock before any network I/O. Non-HTTP backends return
+    /// None so their existing transport-specific dispatch remains explicit.
+    async fn try_final_http_request(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<CoreResult>> {
+        ctx.checkpoint()?;
+        let Some(request) = self.with_backend(|backend| backend.prepare_final_core_request())? else {
+            return Ok(None);
+        };
+        let mut progress_error = None;
+        let mut forward_progress = |progress| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = request.execute(ctx, method, parameters, false, &mut forward_progress).await?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
+        ctx.ensure_live()?;
+        self.admit_upstream_result(method, result).map(Some)
+    }
+
+    async fn request_upstream_final_core_async(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        if let Some(result) = self.try_final_http_request(ctx, method, parameters.clone()).await? {
+            return Ok(result);
+        }
+        self.request_upstream_final_core(ctx, method, parameters)
     }
 
     fn request_upstream_final_core(
@@ -10155,6 +10251,30 @@ impl ResourceHandler for ProxyResourceHandler {
         self.client.read_resource_final(ctx, self.upstream_uri(uri))
     }
 
+    fn read_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            self.read_final_async_with_uri(ctx, &self.resource.uri, &UriParams::new()).await
+        })
+    }
+
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self.client.read_resource_final_outcome_async(ctx, self.upstream_uri(uri), None).await {
+                Ok(FinalMethodOutcome::Complete(result)) => Outcome::Ok(result),
+                Ok(FinalMethodOutcome::InputRequired(_)) => Outcome::Err(unexpected_proxy_result("resources/read")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn read_final_outcome(
         &self,
         ctx: &McpContext,
@@ -10173,6 +10293,24 @@ impl ResourceHandler for ProxyResourceHandler {
             .read_resource_final_outcome(ctx, self.upstream_uri(uri), None)
     }
 
+    fn read_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            self.read_final_outcome_async_with_uri(ctx, &self.resource.uri, &UriParams::new()).await
+        })
+    }
+
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.read_final_outcome_async_with_uri_resuming_in_request(ctx, ctx.cx(), uri, params, None)
+    }
+
     fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -10182,11 +10320,11 @@ impl ResourceHandler for ProxyResourceHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
         Box::pin(async move {
-            match self.client.read_resource_final_outcome(
+            match self.client.read_resource_final_outcome_async(
                 ctx,
                 self.upstream_uri(uri),
                 resume_inputs,
-            ) {
+            ).await {
                 Ok(result) => Outcome::Ok(result),
                 Err(error) => Outcome::Err(error),
             }
@@ -10269,6 +10407,20 @@ impl PromptHandler for ProxyPromptHandler {
             .get_prompt_final(ctx, &self.external_name, arguments)
     }
 
+    fn get_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.client.get_prompt_final_outcome_async(ctx, &self.external_name, arguments, None).await {
+                Ok(FinalMethodOutcome::Complete(result)) => Outcome::Ok(result),
+                Ok(FinalMethodOutcome::InputRequired(_)) => Outcome::Err(unexpected_proxy_result("prompts/get")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn get_final_outcome(
         &self,
         ctx: &McpContext,
@@ -10276,6 +10428,14 @@ impl PromptHandler for ProxyPromptHandler {
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         self.client
             .get_prompt_final_outcome(ctx, &self.external_name, arguments, None)
+    }
+
+    fn get_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.get_final_outcome_async_resuming_in_request(ctx, ctx.cx(), arguments, None)
     }
 
     fn get_final_outcome_async_resuming_in_request<'a>(
@@ -10286,12 +10446,12 @@ impl PromptHandler for ProxyPromptHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         Box::pin(async move {
-            match self.client.get_prompt_final_outcome(
+            match self.client.get_prompt_final_outcome_async(
                 ctx,
                 &self.external_name,
                 arguments,
                 resume_inputs,
-            ) {
+            ).await {
                 Ok(result) => Outcome::Ok(result),
                 Err(error) => Outcome::Err(error),
             }
