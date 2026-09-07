@@ -15129,6 +15129,32 @@ impl Client {
         request: &mut StdioFinalTaskExecution,
         cancelled: bool,
     ) -> McpResult<Option<serde_json::Value>> {
+        self.try_take_yielding_final_task_source(request, cancelled)?
+            .map(|source| {
+                let result = match request.method {
+                    TASK_GET => serde_json::from_str::<FinalGetTaskResult>(&source)
+                        .and_then(serde_json::to_value),
+                    TASK_UPDATE => serde_json::from_str::<FinalUpdateTaskResult>(&source)
+                        .and_then(serde_json::to_value),
+                    TASK_CANCEL => serde_json::from_str::<FinalCancelTaskResult>(&source)
+                        .and_then(serde_json::to_value),
+                    _ => unreachable!("the source was validated for this Tasks method"),
+                };
+                result.map_err(|_| {
+                    self.terminate_connection(McpError::invalid_request(
+                        "Final Tasks control lost its validated result source",
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    #[cfg(feature = "tasks")]
+    fn try_take_yielding_final_task_source(
+        &mut self,
+        request: &mut StdioFinalTaskExecution,
+        cancelled: bool,
+    ) -> McpResult<Option<String>> {
         let executor = self.multiplexed_stdio_executor()?;
         let already_consumed = request.execution.execution.is_completed();
         let terminal = executor
@@ -15174,24 +15200,25 @@ impl Client {
         };
         let decoded = (|| {
             let source = raw_result.as_deref().ok_or_else(invalid)?;
-            let value = match request.method {
+            match request.method {
                 TASK_GET => {
                     let result: FinalGetTaskResult =
                         serde_json::from_str(source).map_err(|_| invalid())?;
                     if result.task.base().task_id != request.task_id {
                         return Err(invalid());
                     }
-                    serde_json::to_value(result)
                 }
-                TASK_UPDATE => serde_json::to_value(
-                    serde_json::from_str::<FinalUpdateTaskResult>(source).map_err(|_| invalid())?,
-                ),
-                TASK_CANCEL => serde_json::to_value(
-                    serde_json::from_str::<FinalCancelTaskResult>(source).map_err(|_| invalid())?,
-                ),
+                TASK_UPDATE => {
+                    serde_json::from_str::<FinalUpdateTaskResult>(source).map_err(|_| invalid())?;
+                }
+                TASK_CANCEL => {
+                    serde_json::from_str::<FinalCancelTaskResult>(source).map_err(|_| invalid())?;
+                }
                 _ => return Err(invalid()),
-            };
-            value.map_err(|_| McpError::internal_error("Final Tasks control serialization failed"))
+            }
+            // Typed callers must deserialize the admitted source directly:
+            // a Value round trip rewrites completed-task RawValue payloads.
+            Ok(source.to_owned())
         })();
         decoded
             .map(Some)
@@ -20699,6 +20726,9 @@ impl Client {
     /// A gateway listen must release the route mutex between receive turns so
     /// a peer `tasks/cancel` can write on the same stdio session. `None` means
     /// the bounded receive completed without a Tasks event.
+    /// The supplied context cancels only the listener; receive turns and
+    /// cancellation writes use the retained connection context so a cancelled
+    /// caller cannot strand its listener or cancel sibling requests.
     #[cfg(feature = "tasks")]
     pub fn try_next_final_task_subscription_event(
         &mut self,
@@ -20714,18 +20744,18 @@ impl Client {
             return Err(error);
         }
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_final_task_subscription(cx)?;
+            self.cancel_live_final_task_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
         if let Some(event) = self.take_ready_final_task_subscription_event()? {
             return Ok(Some(event));
         }
         self.drive_multiplexed_stdio_until(
-            cx,
+            &self.cx.clone(),
             Some(Instant::now() + STDIO_TASK_LISTEN_RECEIVE_BOUND),
         )?;
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_final_task_subscription(cx)?;
+            self.cancel_live_final_task_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
         self.take_ready_final_task_subscription_event()
@@ -21052,6 +21082,98 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
         // attacker-controlled enum value or control characters. The peer's
         // frame is never safe diagnostic text, so expose a fixed error here.
         TransportError::Codec(_) => McpError::internal_error(TRANSPORT_CODEC_ERROR),
+    }
+}
+
+impl Client {
+    /// Reads one final task while yielding the caller's Unix stdio runtime.
+    ///
+    /// Each ingress turn has a bounded readiness wait; this is cooperative
+    /// polling, not an asynchronous OS pipe. Cancellation retires only this
+    /// request. Completed task payloads retain their admitted JSON source.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn get_task_final_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalGetTaskResult> {
+        self.send_yielding_final_task_request(
+            cx,
+            cancellation,
+            TASK_GET,
+            serde_json::json!({"taskId": task_id}),
+            None,
+        )
+        .await
+    }
+
+    /// Updates the exact retained input ledger while yielding Unix stdio.
+    /// Invalid responses are rejected before allocating an ID or sending.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn update_task_final_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.send_yielding_final_task_request(
+            cx,
+            cancellation,
+            TASK_UPDATE,
+            serde_json::json!({"taskId": task.base().task_id, "inputResponses": input_responses}),
+            Some(task),
+        )
+        .await
+    }
+
+    /// Cancels one final task while yielding the caller's Unix stdio runtime.
+    /// The result acknowledges the cancellation request, not task completion.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn cancel_task_final_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalCancelTaskResult> {
+        self.send_yielding_final_task_request(
+            cx,
+            cancellation,
+            TASK_CANCEL,
+            serde_json::json!({"taskId": task_id}),
+            None,
+        )
+        .await
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn send_yielding_final_task_request<R: serde::de::DeserializeOwned>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+        task: Option<&FinalTask>,
+    ) -> McpResult<R> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let mut request = self.start_yielding_final_task_request(cx, method, parameters, task)?;
+        loop {
+            let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
+            if let Some(source) =
+                self.try_take_yielding_final_task_source(&mut request, cancelled)?
+            {
+                return serde_json::from_str(&source).map_err(|_| {
+                    self.terminate_connection(McpError::invalid_request(
+                        "Final Tasks control lost its validated typed result",
+                    ))
+                });
+            }
+            self.drive_yielding_stdio_slice()?;
+            asupersync::runtime::yield_now().await;
+        }
     }
 }
 
@@ -34740,6 +34862,137 @@ IFS= read -r end
             "update-task"
         );
         client.close().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn direct_stdio_tasks_caller_runtime_positive() {
+        assert_direct_stdio_tasks_caller_runtime(false);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn direct_stdio_tasks_caller_runtime_planted_negative() {
+        assert_direct_stdio_tasks_caller_runtime(true);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_direct_stdio_tasks_caller_runtime(cancel: bool) {
+        for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+            let subject = format!(
+                "direct-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let nested =
+                r#"{"content":[],"x-number":123456789012345678901234567890,"x-ratio":1.2300e+40}"#;
+            let task_source = format!(
+                r#"{{"resultType":"complete","taskId":"{subject}","status":"completed","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"result":{nested}}}"#
+            );
+            let discovery =
+                modern_tasks_discovery_response("direct-runtime", serde_json::json!({}));
+            let initial = if method == TASK_GET {
+                task_source.as_str()
+            } else {
+                r#"{"resultType":"complete"}"#
+            };
+            let script = format!(
+                r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r first || exit 91
+case "$first" in *'"method":"{method}"'*'{subject}'*'"id":2'*) ;; *) exit 92 ;; esac
+IFS= read -r sibling || exit 93
+case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 94 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{initial}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete"}}}}'
+IFS= read -r recovery || exit 96
+control=false
+case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":4'*) ;; *) exit 97 ;; esac
+printf '{{"jsonrpc":"2.0","id":4,"result":{{"statusMessage":"%s",' "$control"
+printf '%s\n' '"resultType":"complete","taskId":"{subject}","status":"completed","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"result":{nested}}}}}'
+IFS= read -r end
+"#
+            );
+            let mut client = Client::stdio_with_protocol_plan_with_cx(
+                "sh",
+                &["-c", &script],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                Cx::for_request(),
+            )
+            .unwrap();
+            client
+                .set_request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5))
+                        .unwrap(),
+                )
+                .unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let root = Cx::current().unwrap();
+                let mut work = root.spawn(move |cx| async move {
+                    let worker = std::thread::current().id();
+                    let task_id = FinalTaskId::parse(subject.clone()).unwrap();
+                    let task: FinalTask = serde_json::from_value(serde_json::json!({
+                        "taskId": subject, "status": "input_required", "inputRequests": {"roots": {"method": "roots/list"}},
+                        "createdAt": "2026-07-28T12:00:00Z", "lastUpdatedAt": "2026-07-28T12:00:00Z", "ttlMs": null,
+                    })).unwrap();
+                    let pre_cancelled = McpRequestCancellation::new();
+                    pre_cancelled.cancel();
+                    let before = client.next_id.load(Ordering::SeqCst);
+                    let pending_before = client.responses.pending_len();
+                    assert_eq!(client.get_task_final_with_cx(&cx, &pre_cancelled, task_id.clone()).await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), before);
+                    let cancellation = McpRequestCancellation::new();
+                    let invalid_inputs = serde_json::from_value(serde_json::json!({"roots": {"action": "accept"}})).unwrap();
+                    assert_eq!(client.update_task_final_with_cx(&cx, &cancellation, &task, invalid_inputs).await.unwrap_err().code, McpErrorCode::InvalidParams);
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), before);
+                    assert_eq!(client.responses.pending_len(), pending_before);
+                    let sibling_cancellation = cancellation.clone();
+                    let valid_inputs = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+                    let executor = client.multiplexed_stdio_executor().unwrap();
+                    let sibling_executor = executor.clone();
+                    let mut sibling = cx.spawn(move |sibling_cx| async move {
+                        assert_eq!(std::thread::current().id(), worker);
+                        if cancel { sibling_cancellation.cancel(); }
+                        sibling_executor.execute(&sibling_cx, "ping", Some(serde_json::json!({}))).unwrap()
+                    }).unwrap();
+                    let outcome = match method {
+                        TASK_GET => client.get_task_final_with_cx(&cx, &cancellation, task_id.clone()).await.map(|r| serde_json::to_string(&r).unwrap()),
+                        TASK_UPDATE => client.update_task_final_with_cx(&cx, &cancellation, &task, valid_inputs).await.map(|r| serde_json::to_string(&r).unwrap()),
+                        TASK_CANCEL => client.cancel_task_final_with_cx(&cx, &cancellation, task_id.clone()).await.map(|r| serde_json::to_string(&r).unwrap()),
+                        _ => unreachable!(),
+                    };
+                    if cancel {
+                        assert_eq!(outcome.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        let source = outcome.unwrap();
+                        if method == TASK_GET { assert!(source.contains(nested), "{source}"); }
+                    }
+                    assert!(client.is_initialized());
+                    cx.checkpoint().unwrap();
+                    let recovered = client.get_task_final_with_cx(&cx, &McpRequestCancellation::new(), task_id.clone()).await.unwrap();
+                    assert_eq!(recovered.task.base().task_id, task_id);
+                    assert_eq!(recovered.task.base().status_message.as_deref(), Some(if cancel { "true" } else { "false" }));
+                    assert!(serde_json::to_string(&recovered).unwrap().contains(nested));
+                    let mut sibling_request = sibling.join(&cx).await.unwrap();
+                    assert!(executor.try_take_response(&mut sibling_request).unwrap().unwrap().error.is_none());
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+                    assert!(!client.cx.is_cancel_requested());
+                    eprintln!("DIRECT_TASK_RUNTIME_PROOF {}", serde_json::json!({"method": method, "cancel": cancel, "subject": subject, "sibling": true, "recovery": true, "rawResult": serde_json::to_string(&recovered).unwrap(), "nextId": client.next_id.load(Ordering::SeqCst), "controlObserved": recovered.task.base().status_message, "pendingBefore": pending_before}));
+                    client.close().unwrap();
+                }).unwrap();
+                work.join(&root).await.unwrap();
+                root.checkpoint().unwrap();
+            });
+        }
     }
 
     #[cfg(all(unix, feature = "tasks"))]
