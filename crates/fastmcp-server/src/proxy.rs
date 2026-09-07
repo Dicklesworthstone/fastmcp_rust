@@ -155,25 +155,29 @@ impl ProxyFinalToolRequest {
             }),
         )
         .await?;
-        let response =
-            receive_modern_response_body_with_cancellation(response, ctx, &request_id, on_progress)
-                .await?;
-        if let Some(error) = response.response.error.as_ref() {
-            return Err(proxy_http_upstream_rpc_error(
-                fastmcp_protocol::methods::TOOLS_CALL,
-                error,
-            ));
-        }
-        let raw_result = response.raw_result.as_deref().ok_or_else(|| {
-            McpError::invalid_request("Proxy HTTP modern response lost its admitted result source")
-        })?;
-        request
-            .decode_response_result(&response.response, raw_result)
-            .map_err(|error| {
-                McpError::invalid_request(format!(
-                    "Proxy HTTP upstream response is invalid for the selected era: {error}"
-                ))
-            })
+        let receive = async {
+            let response =
+                receive_modern_response_body(response, ctx, &request_id, on_progress).await?;
+            if let Some(error) = response.response.error.as_ref() {
+                return Err(proxy_http_upstream_rpc_error(
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                    error,
+                ));
+            }
+            let raw_result = response.raw_result.as_deref().ok_or_else(|| {
+                McpError::invalid_request(
+                    "Proxy HTTP modern response lost its admitted result source",
+                )
+            })?;
+            request
+                .decode_response_result(&response.response, raw_result)
+                .map_err(|error| {
+                    McpError::invalid_request(format!(
+                        "Proxy HTTP upstream response is invalid for the selected era: {error}"
+                    ))
+                })
+        };
+        await_proxy_final_tool_body_or_cancellation(ctx, receive, allow_tasks).await
     }
 }
 
@@ -258,8 +262,9 @@ impl ProxyFinalTaskRequest {
                 // owns a progress token or an inbound logLevel that must
                 // ride the same response body as notifications/message.
                 if progress_marker.is_none() && inbound_logging_level(ctx).is_none() {
-                    return await_proxy_request_or_cancellation(
-                        ctx,
+                    return await_proxy_operation_with_cancellation_priority(
+                        ctx.cx(),
+                        &ctx.request_cancellation(),
                         Box::pin(async {
                             client
                                 .call_tool_final_outcome(
@@ -276,6 +281,15 @@ impl ProxyFinalTaskRequest {
                                         "Proxy HTTP final tools/call failed: {error}"
                                     ))
                                 })
+                        }),
+                        Some(ctx),
+                        Some(|result| {
+                            matches!(
+                                result,
+                                Ok(ProxyFinalTaskResponse::CallTool(
+                                    FinalToolCallOutcome::Task(_)
+                                ))
+                            )
                         }),
                     )
                     .await;
@@ -6886,11 +6900,45 @@ fn receive_modern_response(
 /// control on the pinned message endpoint.
 async fn await_proxy_request_or_cancellation<T>(
     ctx: &McpContext,
-    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
+    operation: impl std::future::Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
-    ctx.checkpoint()?;
     let cancellation = ctx.request_cancellation();
-    await_proxy_operation_with_cancellation_priority(ctx.cx(), &cancellation, operation).await
+    await_proxy_operation_with_cancellation_priority(
+        ctx.cx(),
+        &cancellation,
+        operation,
+        Some(ctx),
+        None,
+    )
+    .await
+}
+
+/// Decode the complete tool body before electing cancellation so an admitted
+/// Task handle can reach its relay. Ordinary results still lose that race.
+async fn await_proxy_final_tool_body_or_cancellation(
+    ctx: &McpContext,
+    operation: impl std::future::Future<Output = McpResult<CoreResult>>,
+    allow_tasks: bool,
+) -> McpResult<CoreResult> {
+    #[cfg(feature = "tasks")]
+    if allow_tasks {
+        return await_proxy_operation_with_cancellation_priority(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            operation,
+            Some(ctx),
+            Some(|result| {
+                matches!(
+                    result,
+                    Ok(CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }))
+                )
+            }),
+        )
+        .await;
+    }
+    #[cfg(not(feature = "tasks"))]
+    let _ = allow_tasks;
+    await_proxy_request_or_cancellation(ctx, operation).await
 }
 
 /// Awaits an upstream operation or a request-owned cancellation token when no
@@ -6902,7 +6950,14 @@ async fn await_proxy_operation_or_cancellation<T>(
     request_cancellation: &fastmcp_core::McpRequestCancellation,
     operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
 ) -> McpResult<T> {
-    await_proxy_operation_with_cancellation_priority(cx, request_cancellation, operation).await
+    await_proxy_operation_with_cancellation_priority(
+        cx,
+        request_cancellation,
+        operation,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Awaits one final Tasks `tools/call` listener event while preserving a
@@ -6917,7 +6972,7 @@ async fn await_proxy_operation_or_cancellation<T>(
 #[cfg(feature = "tasks")]
 async fn await_proxy_final_task_listener_event_or_cancellation(
     ctx: &McpContext,
-    mut operation: std::pin::Pin<
+    operation: std::pin::Pin<
         Box<
             dyn std::future::Future<Output = McpResult<Option<ModernHttpFinalCoreEvent>>>
                 + Send
@@ -6925,37 +6980,26 @@ async fn await_proxy_final_task_listener_event_or_cancellation(
         >,
     >,
 ) -> McpResult<Option<ModernHttpFinalCoreEvent>> {
-    ctx.checkpoint()?;
     let cancellation = ctx.request_cancellation();
-    let mut cancellation_wait = Box::pin(async move {
-        cancellation.cancelled().await;
-    });
-    std::future::poll_fn(move |task_cx| {
-        let cancellation_ready = cancellation_wait.as_mut().poll(task_cx).is_ready();
-        let Poll::Ready(result) = operation.as_mut().poll(task_cx) else {
-            return if cancellation_ready {
-                Poll::Ready(Err(McpError::request_cancelled()))
-            } else {
-                Poll::Pending
-            };
-        };
-        if matches!(
-            &result,
-            Ok(Some(ModernHttpFinalCoreEvent::Terminal(
-                FinalCoreResult::ToolsCallTask { .. }
-            )))
-        ) {
-            return Poll::Ready(result);
-        }
-        if cancellation_ready || cancellation_wait.as_mut().poll(task_cx).is_ready() {
-            return Poll::Ready(Err(McpError::request_cancelled()));
-        }
-        Poll::Ready(result)
-    })
+    await_proxy_operation_with_cancellation_priority(
+        ctx.cx(),
+        &cancellation,
+        operation,
+        Some(ctx),
+        Some(|result| {
+            matches!(
+                result,
+                Ok(Some(ModernHttpFinalCoreEvent::Terminal(
+                    FinalCoreResult::ToolsCallTask { .. }
+                )))
+            )
+        }),
+    )
     .await
 }
 
-/// Elects request cancellation ahead of a simultaneously-ready upstream step.
+/// Elects request cancellation ahead of a simultaneously-ready upstream step,
+/// except for an explicitly selected, already-admitted committed Task result.
 ///
 /// Both futures are registered before the upstream operation can remain
 /// pending.  When an upstream frame and cancellation are both ready in one
@@ -6969,11 +7013,25 @@ const PROXY_OPERATION_CANCEL_POLL: std::time::Duration = std::time::Duration::fr
 async fn await_proxy_operation_with_cancellation_priority<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
-    mut operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
+    operation: impl std::future::Future<Output = McpResult<T>>,
+    context: Option<&McpContext>,
+    retain_ready: Option<fn(&McpResult<T>) -> bool>,
 ) -> McpResult<T> {
-    if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
+    if let Some(ctx) = context {
+        ctx.checkpoint()?;
+    }
+    let cancelled = || {
+        // Wakeups observe liveness without spending another poll unit. In
+        // particular, exact quota depletion must not revoke admitted work.
+        context.map_or_else(
+            || cx.checkpoint().is_err(),
+            |ctx| ctx.ensure_live().is_err(),
+        ) || request_cancellation.is_cancel_requested()
+    };
+    if cancelled() {
         return Err(McpError::request_cancelled());
     }
+    let mut operation = Box::pin(operation);
     let cancellation = request_cancellation.clone();
     let mut cancellation_wait = Box::pin(async move {
         cancellation.cancelled().await;
@@ -6983,28 +7041,30 @@ async fn await_proxy_operation_with_cancellation_priority<T>(
         PROXY_OPERATION_CANCEL_POLL,
     ));
     std::future::poll_fn(move |task_cx| {
-        if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
-            return Poll::Ready(Err(McpError::request_cancelled()));
-        }
-        if cancellation_wait.as_mut().poll(task_cx).is_ready() {
+        let cancellation_ready = cancelled() || cancellation_wait.as_mut().poll(task_cx).is_ready();
+        if cancellation_ready && retain_ready.is_none() {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
         let Poll::Ready(result) = operation.as_mut().poll(task_cx) else {
+            if cancellation_ready {
+                return Poll::Ready(Err(McpError::request_cancelled()));
+            }
             if cancel_poll.as_mut().poll(task_cx).is_ready() {
                 cancel_poll = Box::pin(asupersync::time::sleep(
                     cx.now(),
                     PROXY_OPERATION_CANCEL_POLL,
                 ));
                 let _ = cancel_poll.as_mut().poll(task_cx);
-                if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
+                if cancelled() {
                     return Poll::Ready(Err(McpError::request_cancelled()));
                 }
             }
             return Poll::Pending;
         };
-        if cancellation_wait.as_mut().poll(task_cx).is_ready()
-            || cx.checkpoint().is_err()
-            || request_cancellation.is_cancel_requested()
+        if retain_ready.is_some_and(|retain| retain(&result)) {
+            return Poll::Ready(result);
+        }
+        if cancellation_ready || cancellation_wait.as_mut().poll(task_cx).is_ready() || cancelled()
         {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
@@ -7033,10 +7093,14 @@ async fn receive_modern_response_with_cancellation(
         }),
     )
     .await?;
-    receive_modern_response_body_with_cancellation(response, ctx, request_id, on_progress).await
+    await_proxy_request_or_cancellation(
+        ctx,
+        receive_modern_response_body(response, ctx, request_id, on_progress),
+    )
+    .await
 }
 
-async fn receive_modern_response_body_with_cancellation(
+async fn receive_modern_response_body(
     response: ModernHttpResponseStream,
     ctx: &McpContext,
     request_id: &RequestId,
@@ -7044,20 +7108,14 @@ async fn receive_modern_response_body_with_cancellation(
 ) -> McpResult<ProxyHttpResponse> {
     match response.metadata().kind() {
         ModernHttpResponseKind::Json => {
-            let body = await_proxy_request_or_cancellation(
-                ctx,
-                Box::pin(async {
-                    response
-                        .read_to_end(ctx.cx(), ProxyHttpClient::MAX_RESPONSE_BYTES)
-                        .await
-                        .map_err(|error| {
-                            McpError::internal_error(format!(
-                                "Proxy HTTP modern JSON response could not be read: {error}"
-                            ))
-                        })
-                }),
-            )
-            .await?;
+            let body = response
+                .read_to_end(ctx.cx(), ProxyHttpClient::MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern JSON response could not be read: {error}"
+                    ))
+                })?;
             response_for_request(&body, request_id)
         }
         ModernHttpResponseKind::Sse => {
@@ -7069,17 +7127,12 @@ async fn receive_modern_response_body_with_cancellation(
                     ))
                 })?;
             loop {
-                let event = await_proxy_request_or_cancellation(
-                    ctx,
-                    Box::pin(async {
-                        stream.next_event(ctx.cx()).await.map_err(|error| {
-                            McpError::internal_error(format!(
-                                "Proxy HTTP modern SSE response could not be read: {error}"
-                            ))
-                        })
-                    }),
-                )
-                .await?;
+                ctx.checkpoint()?;
+                let event = stream.next_event(ctx.cx()).await.map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern SSE response could not be read: {error}"
+                    ))
+                })?;
                 let Some(event) = event else {
                     return Err(McpError::invalid_request(
                         "Proxy HTTP modern SSE response ended before its correlated result",
@@ -7148,9 +7201,20 @@ fn forward_modern_progress_notification(
     on_progress: &mut (impl FnMut(FinalProgressNotificationParams) + ?Sized),
     ctx: Option<&McpContext>,
 ) -> McpResult<()> {
+    if let Some(ctx) = ctx {
+        ctx.ensure_live()?;
+        if ctx.request_cancellation().is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+    }
     let notification = decode_modern_server_notification(raw_frame, request)?;
     match notification {
         ServerNotification::Progress(params) => on_progress(params),
+        ServerNotification::Cancelled(_) => {
+            return Err(McpError::invalid_request(
+                "Proxy HTTP does not permit server cancellation notifications",
+            ));
+        }
         ServerNotification::Message(params) => {
             if let Some(ctx) = ctx {
                 relay_upstream_log_message(ctx, &params);
@@ -8673,14 +8737,14 @@ impl ProxyClient {
                     )
                 })?,
             };
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
         // Once the upstream has returned a Task branch, the caller must be
         // allowed to retain its route-bound handle even if downstream
         // cancellation raced the response. Dropping it here would orphan a
         // real upstream task: the remote `tools/call` has already committed.
         if !matches!(outcome, FinalToolCallOutcome::Task(_)) {
+            if let Some(error) = progress_error {
+                return Err(error);
+            }
             ctx.checkpoint()?;
         }
         Ok(outcome)
@@ -8783,9 +8847,6 @@ impl ProxyClient {
                 )?
             }
         };
-        if let Some(error) = progress_error {
-            return Err(error);
-        }
         let result = self.admit_upstream_result(fastmcp_protocol::methods::TOOLS_CALL, result)?;
         #[cfg(feature = "tasks")]
         if matches!(
@@ -8800,6 +8861,9 @@ impl ProxyClient {
             // Retain a committed upstream Task handle even when cancellation
             // races after result admission, just as for an initial call.
             return Ok(result);
+        }
+        if let Some(error) = progress_error {
+            return Err(error);
         }
         ctx.checkpoint()?;
         Ok(result)
@@ -9710,7 +9774,27 @@ impl ProxyToolHandler {
         }
     }
 
-    fn admit_final_tool_result(&self, result: CoreResult) -> McpResult<FinalToolOutcome> {
+    #[cfg(feature = "tasks")]
+    fn reserve_final_task_creation(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<Option<ProxyFinalTaskReservation>> {
+        ctx.ensure_live()?;
+        if ctx.client_supports_tasks() {
+            self.task_relay
+                .as_ref()
+                .map(|relay| relay.reserve_task_creation())
+                .transpose()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn admit_final_tool_result(
+        &self,
+        result: CoreResult,
+        #[cfg(feature = "tasks")] reservation: Option<ProxyFinalTaskReservation>,
+    ) -> McpResult<FinalToolOutcome> {
         match result {
             CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
                 Ok(FinalToolOutcome::Complete(result))
@@ -9723,7 +9807,9 @@ impl ProxyToolHandler {
                 let relay = self.task_relay.as_ref().ok_or_else(|| {
                     McpError::internal_error("Proxy official Task result has no route-bound relay")
                 })?;
-                let reservation = relay.reserve_task_creation()?;
+                let reservation = reservation.ok_or_else(|| {
+                    McpError::internal_error("Proxy Task creation has no pre-admitted capacity")
+                })?;
                 Ok(FinalToolOutcome::CreateTask {
                     work_descriptor: relay.encode_task_carrier(reservation, result)?,
                     status_message: None,
@@ -9833,6 +9919,8 @@ impl ToolHandler for ProxyToolHandler {
         ctx: &McpContext,
         arguments: serde_json::Value,
     ) -> McpResult<FinalToolOutcome> {
+        #[cfg(feature = "tasks")]
+        let reservation = self.reserve_final_task_creation(ctx)?;
         let result = block_on(self.client.call_tool_final_outcome_with_resume(
             ctx,
             &self.external_name,
@@ -9840,7 +9928,11 @@ impl ToolHandler for ProxyToolHandler {
             None,
             self.has_task_relay(),
         ))?;
-        self.admit_final_tool_result(result)
+        self.admit_final_tool_result(
+            result,
+            #[cfg(feature = "tasks")]
+            reservation,
+        )
     }
 
     fn declares_final_mrtr(&self) -> bool {
@@ -9863,6 +9955,11 @@ impl ToolHandler for ProxyToolHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
         Box::pin(async move {
+            #[cfg(feature = "tasks")]
+            let reservation = match self.reserve_final_task_creation(ctx) {
+                Ok(reservation) => reservation,
+                Err(error) => return Outcome::Err(error),
+            };
             let result = self
                 .client
                 .call_tool_final_outcome_with_resume(
@@ -9873,7 +9970,13 @@ impl ToolHandler for ProxyToolHandler {
                     self.has_task_relay(),
                 )
                 .await
-                .and_then(|result| self.admit_final_tool_result(result));
+                .and_then(|result| {
+                    self.admit_final_tool_result(
+                        result,
+                        #[cfg(feature = "tasks")]
+                        reservation,
+                    )
+                });
             match result {
                 Ok(outcome) => Outcome::Ok(outcome),
                 Err(error) => Outcome::Err(error),
@@ -10855,7 +10958,7 @@ mod tests {
         proxy_task_tool_caller_runtime_probe(true);
     }
 
-    fn proxy_tool_resume_caller_runtime_probe(cancel: bool) {
+    fn proxy_tool_resume_caller_runtime_probe(cancel: bool, context_deadline: bool) {
         use crate::bidirectional::{
             MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest, MrtrInputRequests,
             MrtrRetry,
@@ -11011,10 +11114,6 @@ mod tests {
                             } else {
                                 peer_result.clone()
                             };
-                            peer_received.store(round + 1, Ordering::Release);
-                            replies
-                                .recv_timeout(Duration::from_secs(10))
-                                .expect("caller sibling releases each reply");
                             let response = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
                             let (content_type, body) = if sse {
                                 let marker = serde_json::to_string(&peer_subject).unwrap();
@@ -11026,10 +11125,23 @@ mod tests {
                                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
-                            let written = stream
-                                .write_all(head.as_bytes())
-                                .and_then(|()| stream.write_all(&body))
-                                .is_ok();
+                            // Deadline probes park after the HTTP head, proving
+                            // the live response-body wait observes MCP budgets.
+                            if context_deadline {
+                                stream.write_all(head.as_bytes()).unwrap();
+                            }
+                            peer_received.store(round + 1, Ordering::Release);
+                            replies
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("caller sibling releases each reply");
+                            let written = if context_deadline {
+                                stream.write_all(&body)
+                            } else {
+                                stream
+                                    .write_all(head.as_bytes())
+                                    .and_then(|()| stream.write_all(&body))
+                            }
+                            .is_ok();
                             if !(cancel && round + 1 == rounds) {
                                 assert!(written);
                             }
@@ -11074,22 +11186,34 @@ mod tests {
                             let sibling_cancel = cancellation.clone();
                             let sibling_release = release.clone();
                             let cancelling_round = cancel && round + 1 == rounds;
+                            let round_ctx = if context_deadline {
+                                ctx.clone().with_operation_deadline(Some(cx.now().saturating_add_nanos(
+                                    if cancelling_round { 100_000_000 } else { 5_000_000_000 }
+                                )))
+                            } else { ctx.clone() };
                             let mut sibling = cx.spawn(move |sibling_cx| async move {
                                 let deadline = sibling_cx.now().saturating_add_nanos(8_000_000_000);
                                 while sibling_received.load(Ordering::Acquire) <= round {
                                     assert!(sibling_cx.now() < deadline, "tool round reaches native peer");
                                     asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
                                 }
-                                if cancelling_round { assert!(sibling_cancel.cancel()); }
+                                if cancelling_round {
+                                    if !context_deadline { assert!(sibling_cancel.cancel()); }
+                                }
                                 else { sibling_release.send(()).unwrap(); }
                             }).unwrap();
                             let outcome = asupersync::time::timeout_at(cx.now().saturating_add_nanos(9_000_000_000),
-                                handler.call_final_outcome_async_resuming_in_request(&ctx, &cx,
+                                handler.call_final_outcome_async_resuming_in_request(&round_ctx, &cx,
                                     serde_json::json!({"subject": subject}), resume)).await.expect("finite caller-owned tool round");
                             sibling.join(&cx).await.unwrap();
                             if cancelling_round {
                                 let Outcome::Err(error) = outcome else { panic!("cancelled round must refuse the late result"); };
                                 assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                                if context_deadline {
+                                    assert!(!cancellation.is_cancel_requested(), "only the MCP deadline expires");
+                                    assert!(!cx.is_cancel_requested(), "the caller Cx remains uncancelled");
+                                    assert!(cx.now() >= round_ctx.budget().deadline.unwrap());
+                                }
                                 assert_eq!(registry.active_len(), 0);
                                 #[cfg(feature = "tasks")]
                                 assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap(), before);
@@ -11168,6 +11292,7 @@ mod tests {
                         "{}",
                         serde_json::json!({"proof": "proxy_tool_resume_caller_runtime", "cancelled": cancel,
                         "allow_tasks": allow_tasks, "mode": mode, "sse": sse, "subject": subject,
+                        "context_deadline": context_deadline,
                         "peer_requests": wires, "progress_count": observed_progress.len()})
                     );
                 }
@@ -11181,12 +11306,22 @@ mod tests {
 
     #[test]
     fn proxy_tool_resume_caller_runtime_positive() {
-        proxy_tool_resume_caller_runtime_probe(false);
+        proxy_tool_resume_caller_runtime_probe(false, false);
     }
 
     #[test]
     fn proxy_tool_resume_caller_runtime_planted_negative() {
-        proxy_tool_resume_caller_runtime_probe(true);
+        proxy_tool_resume_caller_runtime_probe(true, false);
+    }
+
+    #[test]
+    fn proxy_tool_resume_mcp_deadline_positive() {
+        proxy_tool_resume_caller_runtime_probe(false, true);
+    }
+
+    #[test]
+    fn proxy_tool_resume_mcp_deadline_planted_negative() {
+        proxy_tool_resume_caller_runtime_probe(true, true);
     }
 
     #[cfg(feature = "tasks")]
@@ -11526,6 +11661,175 @@ mod tests {
         ))
         .expect_err("a silent final Tasks listener must wake when its downstream request cancels");
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[cfg(feature = "tasks")]
+    fn proxy_final_tool_body_task_cancellation_probe(task_terminal: bool) {
+        let cancellation = McpRequestCancellation::new();
+        let context =
+            McpContext::new(Cx::for_testing(), 496).with_request_cancellation(cancellation.clone());
+        let terminal = if task_terminal {
+            CoreResult::Final(FinalCoreResult::ToolsCallTask {
+                result: final_task_relay_result(),
+            })
+        } else {
+            final_tool_result_with_open_members()
+        };
+        let expected = terminal.encode().unwrap();
+        let mut terminal = Some(terminal);
+        let result = block_on(super::await_proxy_final_tool_body_or_cancellation(
+            &context,
+            std::future::poll_fn(|_| {
+                assert!(cancellation.cancel());
+                std::task::Poll::Ready(Ok(terminal.take().unwrap()))
+            }),
+            true,
+        ));
+        assert!(cancellation.is_cancel_requested());
+        if task_terminal {
+            assert_eq!(
+                result.unwrap().encode().unwrap(),
+                expected,
+                "the entire admitted Task remains available to the relay"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap_err().code,
+                McpErrorCode::RequestCancelled,
+                "changing only the terminal kind to complete preserves cancellation priority"
+            );
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_tool_body_task_cancellation_positive() {
+        proxy_final_tool_body_task_cancellation_probe(true);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_tool_body_task_cancellation_planted_negative() {
+        proxy_final_tool_body_task_cancellation_probe(false);
+    }
+
+    fn proxy_modern_http_server_cancellation_probe(server_cancel: bool) {
+        let wire = if server_cancel {
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1.20e+4}}"#
+        };
+        let JsonRpcMessage::Request(request) =
+            decode_strict_jsonrpc_message(wire.as_bytes(), 4096).unwrap()
+        else {
+            panic!("fixture must be a notification");
+        };
+        let mut observed = Vec::new();
+        let result = forward_modern_progress_notification(
+            wire.as_bytes(),
+            &request,
+            &mut |params| observed.push(params),
+            None,
+        );
+        if server_cancel {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+            assert!(
+                observed.is_empty(),
+                "invalid HTTP cancellation cannot reach callbacks"
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].progress.as_str(), "1.20e+4");
+        }
+    }
+
+    #[test]
+    fn proxy_modern_http_server_cancellation_positive() {
+        proxy_modern_http_server_cancellation_probe(false);
+    }
+
+    #[test]
+    fn proxy_modern_http_server_cancellation_planted_negative() {
+        proxy_modern_http_server_cancellation_probe(true);
+    }
+
+    fn proxy_modern_http_cancelled_progress_probe(cancel: bool) {
+        let context = McpContext::new(Cx::for_testing(), 498);
+        if cancel {
+            assert!(context.request_cancellation().cancel());
+        }
+        let wire = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1.20e+4}}"#;
+        let JsonRpcMessage::Request(request) =
+            decode_strict_jsonrpc_message(wire.as_bytes(), 4096).unwrap()
+        else {
+            panic!("fixture must be a notification");
+        };
+        let mut observed = Vec::new();
+        let result = forward_modern_progress_notification(
+            wire.as_bytes(),
+            &request,
+            &mut |params| observed.push(params),
+            Some(&context),
+        );
+        if cancel {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert!(
+                observed.is_empty(),
+                "cancelled progress cannot reach callbacks"
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].progress.as_str(), "1.20e+4");
+        }
+    }
+
+    #[test]
+    fn proxy_modern_http_cancelled_progress_positive() {
+        proxy_modern_http_cancelled_progress_probe(false);
+    }
+
+    #[test]
+    fn proxy_modern_http_cancelled_progress_planted_negative() {
+        proxy_modern_http_cancelled_progress_probe(true);
+    }
+
+    fn proxy_wait_final_poll_quota_probe(allowed: bool) {
+        let context = McpContext::new(Cx::for_testing(), 497)
+            .with_budget_ceiling(asupersync::Budget::new().with_poll_quota(u32::from(allowed)));
+        let mut polls = 0;
+        let result = block_on(super::await_proxy_request_or_cancellation(
+            &context,
+            std::future::poll_fn(|task_cx| {
+                polls += 1;
+                if polls == 3 {
+                    std::task::Poll::Ready(Ok("completed"))
+                } else {
+                    task_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }),
+        ));
+        assert_eq!(context.budget().poll_quota, 0);
+        if allowed {
+            assert_eq!(result.unwrap(), "completed");
+            assert_eq!(polls, 3, "wakeups must not revoke admitted work");
+            context.ensure_live().unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(polls, 0, "zero quota refuses before touching the operation");
+        }
+    }
+
+    #[test]
+    fn proxy_wait_final_poll_quota_positive() {
+        proxy_wait_final_poll_quota_probe(true);
+    }
+
+    #[test]
+    fn proxy_wait_final_poll_quota_planted_negative() {
+        proxy_wait_final_poll_quota_probe(false);
     }
 
     #[cfg(feature = "tasks")]
@@ -12132,6 +12436,115 @@ mod tests {
             },
             configuration_generation: 73,
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn proxy_final_task_capacity_admission_probe(available: bool) {
+        use fastmcp_core::Outcome;
+        for asynchronous in [false, true] {
+            for cancel_after_commit in [false, true] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let cancellation = McpRequestCancellation::new();
+                let task = final_task_relay_result();
+                let proxy = ProxyClient::from_backend_with_upstream_binding(
+                    FinalTaskRelayBackend {
+                        calls: Arc::clone(&calls),
+                        task: task.clone(),
+                        listener_events: None,
+                        cancel_after_task_commit: cancel_after_commit.then(|| cancellation.clone()),
+                        final_progress: None,
+                    },
+                    final_task_relay_binding(ProtocolEra::Modern2026),
+                    "2026-07-28",
+                )
+                .unwrap();
+                let relay = proxy.final_tasks_relay().unwrap().unwrap();
+                for index in 0..(super::MAX_RELAYED_FINAL_TASKS - usize::from(available)) {
+                    relay
+                        .record_task(
+                            final_task_relay_result_with_ttl(&format!("occupied-{index}"), None)
+                                .task,
+                        )
+                        .unwrap();
+                }
+                let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+                let handler = ProxyToolHandler::from_final_with_task_relay(
+                    final_catalog_tool(),
+                    proxy.clone(),
+                    Arc::clone(&relay),
+                )
+                .unwrap();
+                let context = McpContext::new(Cx::for_testing(), 499)
+                    .with_request_cancellation(cancellation.clone())
+                    .with_client_capabilities(
+                        fastmcp_core::ClientCapabilityInfo::new().with_tasks(),
+                    );
+                let result = if asynchronous {
+                    match block_on(
+                        handler.call_final_outcome_async(&context, serde_json::json!({})),
+                    ) {
+                        Outcome::Ok(result) => Ok(result),
+                        Outcome::Err(error) => Err(error),
+                        _ => panic!("unexpected handler outcome"),
+                    }
+                } else {
+                    handler.call_final_outcome(&context, serde_json::json!({}))
+                };
+                if available {
+                    let FinalToolOutcome::CreateTask {
+                        work_descriptor, ..
+                    } = result.unwrap()
+                    else {
+                        panic!("one reserved slot must retain the upstream Task");
+                    };
+                    assert_eq!(
+                        serde_json::to_value(
+                            relay.admit_carried_task(&work_descriptor).unwrap().unwrap()
+                        )
+                        .unwrap(),
+                        serde_json::to_value(&task).unwrap()
+                    );
+                    assert_eq!(calls.lock().unwrap().as_slice(), ["tools/call"]);
+                    assert_eq!(cancellation.is_cancel_requested(), cancel_after_commit);
+                    let retained = proxy.final_task_registry_snapshot_for_test().unwrap();
+                    assert_eq!(retained["pendingCreations"], 0);
+                    assert_eq!(
+                        retained["tasks"].as_object().unwrap().len(),
+                        super::MAX_RELAYED_FINAL_TASKS
+                    );
+                } else {
+                    let Err(error) = result else {
+                        panic!("full capacity must refuse before creation");
+                    };
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert!(error.message.contains("capacity exhausted"));
+                    assert!(
+                        calls.lock().unwrap().is_empty(),
+                        "refusal must not invoke the backend"
+                    );
+                    assert!(
+                        !cancellation.is_cancel_requested(),
+                        "backend cancellation hook never ran"
+                    );
+                    assert_eq!(
+                        proxy.final_task_registry_snapshot_for_test().unwrap(),
+                        before
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_capacity_admission_positive() {
+        proxy_final_task_capacity_admission_probe(true);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_capacity_admission_planted_negative() {
+        proxy_final_task_capacity_admission_probe(false);
     }
 
     #[cfg(feature = "tasks")]
@@ -14606,6 +15019,11 @@ exec sleep 2
     }
 
     fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+        // BSD-derived systems can preserve a listener's O_NONBLOCK on accept.
+        // This synchronous fixture reader expects complete request bytes.
+        stream
+            .set_nonblocking(false)
+            .expect("make HTTP peer reads blocking");
         let mut wire = Vec::new();
         let mut buffer = [0_u8; 4_096];
         let head_end = loop {
