@@ -3857,7 +3857,13 @@ impl TestTimeoutSource {
 }
 
 fn allowlisted_test_timeout_source(error: &fastmcp_core::McpError) -> Option<TestTimeoutSource> {
-    if error.code != fastmcp_core::McpErrorCode::InternalError {
+    // Initialization reports InternalError; request-owned executor deadlines
+    // retain the RequestCancelled terminal code. Both carry the same bounded
+    // timeout tuple, while an ordinary cancellation has no timeout source.
+    if !matches!(
+        error.code,
+        fastmcp_core::McpErrorCode::InternalError | fastmcp_core::McpErrorCode::RequestCancelled
+    ) {
         return None;
     }
     let source = error
@@ -4221,50 +4227,63 @@ async fn cmd_test(
     let capabilities = stdio_inspect_capabilities(&client)?;
     let advertised = |member: &str| capabilities.advertises(member).then_some(());
 
-    let ping_result = run_test("ping", || {
-        client.ping()?;
+    let ping_result = run_test(cx, "ping", async |cx| {
+        #[cfg(unix)]
+        client
+            .ping_with_cx(cx, &fastmcp_core::McpRequestCancellation::new())
+            .await?;
+        #[cfg(not(unix))]
+        {
+            cx.checkpoint()
+                .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+            client.ping()?;
+        }
         Ok("server responded".to_owned())
-    });
+    })
+    .await;
     if !json_output {
         finish_test_output(print_test_result(&ping_result, verbose), || client.close())?;
     }
     results.push(ping_result);
 
     // Only invoke capability-specific methods the server advertised.
-    let tools_result = advertised("tools").map_or_else(
-        || skipped_test("list_tools", "server did not advertise tools"),
-        |()| {
-            run_test("list_tools", || {
-                let (items, truncated) = inspect_tools_result(client.list_tools_typed(None)?)?;
-                let qualifier = if truncated {
-                    " in the bounded first page; more were omitted"
-                } else {
-                    ""
-                };
-                Ok(format!("{} tools{qualifier}", items.len()))
-            })
-        },
-    );
+    let tools_result = if advertised("tools").is_some() {
+        run_test(cx, "list_tools", async |cx| {
+            let (items, truncated) = inspect_tools_result(
+                stdio_inspect_core_request(cx, &mut client, "tools/list").await?,
+            )?;
+            let qualifier = if truncated {
+                " in the bounded first page; more were omitted"
+            } else {
+                ""
+            };
+            Ok(format!("{} tools{qualifier}", items.len()))
+        })
+        .await
+    } else {
+        skipped_test("list_tools", "server did not advertise tools")
+    };
     if !json_output {
         finish_test_output(print_test_result(&tools_result, verbose), || client.close())?;
     }
     results.push(tools_result);
 
-    let resources_result = advertised("resources").map_or_else(
-        || skipped_test("list_resources", "server did not advertise resources"),
-        |()| {
-            run_test("list_resources", || {
-                let (items, truncated) =
-                    inspect_resources_result(client.list_resources_typed(None)?)?;
-                let qualifier = if truncated {
-                    " in the bounded first page; more were omitted"
-                } else {
-                    ""
-                };
-                Ok(format!("{} resources{qualifier}", items.len()))
-            })
-        },
-    );
+    let resources_result = if advertised("resources").is_some() {
+        run_test(cx, "list_resources", async |cx| {
+            let (items, truncated) = inspect_resources_result(
+                stdio_inspect_core_request(cx, &mut client, "resources/list").await?,
+            )?;
+            let qualifier = if truncated {
+                " in the bounded first page; more were omitted"
+            } else {
+                ""
+            };
+            Ok(format!("{} resources{qualifier}", items.len()))
+        })
+        .await
+    } else {
+        skipped_test("list_resources", "server did not advertise resources")
+    };
     if !json_output {
         finish_test_output(print_test_result(&resources_result, verbose), || {
             client.close()
@@ -4272,20 +4291,22 @@ async fn cmd_test(
     }
     results.push(resources_result);
 
-    let prompts_result = advertised("prompts").map_or_else(
-        || skipped_test("list_prompts", "server did not advertise prompts"),
-        |()| {
-            run_test("list_prompts", || {
-                let (items, truncated) = inspect_prompts_result(client.list_prompts_typed(None)?)?;
-                let qualifier = if truncated {
-                    " in the bounded first page; more were omitted"
-                } else {
-                    ""
-                };
-                Ok(format!("{} prompts{qualifier}", items.len()))
-            })
-        },
-    );
+    let prompts_result = if advertised("prompts").is_some() {
+        run_test(cx, "list_prompts", async |cx| {
+            let (items, truncated) = inspect_prompts_result(
+                stdio_inspect_core_request(cx, &mut client, "prompts/list").await?,
+            )?;
+            let qualifier = if truncated {
+                " in the bounded first page; more were omitted"
+            } else {
+                ""
+            };
+            Ok(format!("{} prompts{qualifier}", items.len()))
+        })
+        .await
+    } else {
+        skipped_test("list_prompts", "server did not advertise prompts")
+    };
     if !json_output {
         finish_test_output(print_test_result(&prompts_result, verbose), || {
             client.close()
@@ -4338,12 +4359,12 @@ async fn cmd_test(
 }
 
 /// Run a single test and measure its duration.
-fn run_test<F>(name: &str, test_fn: F) -> TestResult
+async fn run_test<F>(cx: &Cx, name: &str, test_fn: F) -> TestResult
 where
-    F: FnOnce() -> McpResult<String>,
+    F: AsyncFnOnce(&Cx) -> McpResult<String>,
 {
     let start = std::time::Instant::now();
-    match test_fn() {
+    match test_fn(cx).await {
         Ok(details) => {
             let (details, mutation) = sanitize_peer_text_with_metadata(&details, PEER_DETAIL_LIMIT);
             TestResult {
@@ -6153,8 +6174,10 @@ async fn run_yielding_stdio_task(
             // caller-owned future, with a yield between bounded receive turns.
             cx.checkpoint()
                 .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
-            client.open_final_task_subscription_listener(filter)?;
+            // Start the watch bound before the listener's own request timers,
+            // so an expiring listener cannot outrun the CLI timeout diagnostic.
             let started = std::time::Instant::now();
+            client.open_final_task_subscription_listener(filter)?;
             let mut updates = 0;
             let outcome = loop {
                 match poll_stdio_task_watch(
@@ -6220,12 +6243,20 @@ fn poll_stdio_task_watch(
     updates: &mut u64,
 ) -> McpResult<bool> {
     use fastmcp_client::StdioTaskSubscriptionEvent;
-    if started.elapsed() >= std::time::Duration::from_secs(connection.timeout) {
+    let timeout = std::time::Duration::from_secs(connection.timeout);
+    let event = if started.elapsed() < timeout {
+        client.try_next_final_task_subscription_event(cx, cancellation)
+    } else {
+        Ok(None)
+    };
+    // A bounded receive may itself cross the watch deadline. Apply that
+    // deadline before interpreting either its event or its request error.
+    if started.elapsed() >= timeout {
         return Err(fastmcp_core::McpError::internal_error(
             "task watch reached --timeout; task completion is unknown",
         ));
     }
-    match client.try_next_final_task_subscription_event(cx, cancellation)? {
+    match event? {
         None => {}
         Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
             let ids = fastmcp_protocol::task_subscription_ids(&filter).map_err(|_| {
@@ -6370,7 +6401,7 @@ async fn cmd_inspect(
     // Preserve the negotiated era's capability model. Modern discovery is an
     // open final model, so rendering it through the legacy capability struct
     // would silently discard advertised final members.
-    let inspection = (|| {
+    let inspection = async {
         let server_info = client.server_info().clone();
         let capabilities = stdio_inspect_capabilities(&client)?;
 
@@ -6380,7 +6411,9 @@ async fn cmd_inspect(
         // peer cursor into the client's larger auto-pagination budget.
         let mut acquisition_truncated = false;
         let tools = if capabilities.advertises("tools") {
-            let (items, truncated) = inspect_tools_result(client.list_tools_typed(None)?)?;
+            let (items, truncated) = inspect_tools_result(
+                stdio_inspect_core_request(cx, &mut client, "tools/list").await?,
+            )?;
             acquisition_truncated |= truncated;
             items
         } else {
@@ -6388,7 +6421,9 @@ async fn cmd_inspect(
         };
 
         let resources = if capabilities.advertises("resources") {
-            let (items, truncated) = inspect_resources_result(client.list_resources_typed(None)?)?;
+            let (items, truncated) = inspect_resources_result(
+                stdio_inspect_core_request(cx, &mut client, "resources/list").await?,
+            )?;
             acquisition_truncated |= truncated;
             items
         } else {
@@ -6396,8 +6431,9 @@ async fn cmd_inspect(
         };
 
         let resource_templates = if capabilities.advertises("resources") {
-            let (items, truncated) =
-                inspect_resource_templates_result(client.list_resource_templates_typed(None)?)?;
+            let (items, truncated) = inspect_resource_templates_result(
+                stdio_inspect_core_request(cx, &mut client, "resources/templates/list").await?,
+            )?;
             acquisition_truncated |= truncated;
             items
         } else {
@@ -6405,7 +6441,9 @@ async fn cmd_inspect(
         };
 
         let prompts = if capabilities.advertises("prompts") {
-            let (items, truncated) = inspect_prompts_result(client.list_prompts_typed(None)?)?;
+            let (items, truncated) = inspect_prompts_result(
+                stdio_inspect_core_request(cx, &mut client, "prompts/list").await?,
+            )?;
             acquisition_truncated |= truncated;
             items
         } else {
@@ -6421,7 +6459,8 @@ async fn cmd_inspect(
             prompts,
             acquisition_truncated,
         ))
-    })();
+    }
+    .await;
     let (
         server_info,
         capabilities,
@@ -6446,6 +6485,31 @@ async fn cmd_inspect(
         format,
         output,
     )
+}
+
+/// Acquires one selected-era catalog page for both stdio CLI commands.
+async fn stdio_inspect_core_request(
+    cx: &Cx,
+    client: &mut Client,
+    method: &str,
+) -> McpResult<fastmcp_protocol::CoreResult> {
+    let cancellation = fastmcp_core::McpRequestCancellation::new();
+    #[cfg(unix)]
+    {
+        client
+            .request_core_with_cx(cx, &cancellation, method, serde_json::json!({}))
+            .await
+    }
+    #[cfg(not(unix))]
+    {
+        client.request_core_with_cancellation(
+            cx,
+            &cancellation,
+            method,
+            serde_json::json!({}),
+            |_| {},
+        )
+    }
 }
 
 /// Ensures a live stdio inspect client is explicitly closed after either a
@@ -11754,6 +11818,188 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[cfg(unix)]
+    #[test]
+    fn stdio_catalog_commands_caller_runtime_positive() {
+        assert_stdio_catalog_commands_caller_runtime(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_catalog_commands_caller_runtime_planted_negative() {
+        assert_stdio_catalog_commands_caller_runtime(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_stdio_catalog_commands_caller_runtime(cancel: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        for policy in [CliProtocolPolicy::ModernOnly, CliProtocolPolicy::LegacyOnly] {
+            if policy == CliProtocolPolicy::LegacyOnly && !LEGACY_PROTOCOL_POLICY_ENABLED {
+                continue;
+            }
+            let modern = policy == CliProtocolPolicy::ModernOnly;
+            for inspect in [true, false] {
+                let subject = format!(
+                    "cli-core-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                let directory = std::env::temp_dir().join(&subject);
+                std::fs::create_dir(&directory).unwrap();
+                let ready = directory.join("ready");
+                let release = directory.join("release");
+                std::fs::File::create_new(&ready).unwrap();
+                std::fs::File::create_new(&release).unwrap();
+                let quote =
+                    |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+                let handshake = if modern {
+                    let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                        &fastmcp_protocol::ServerBehaviorRegistry::default(),
+                        std::collections::BTreeMap::new(),
+                    )
+                    .unwrap();
+                    let mut capabilities = serde_json::to_value(capabilities).unwrap();
+                    for capability in ["tools", "resources", "prompts"] {
+                        capabilities[capability] = serde_json::json!({});
+                    }
+                    let discovery = fastmcp_protocol::ServerDiscoverResult::new(
+                        serde_json::from_value(capabilities).unwrap(),
+                        fastmcp_protocol::ServerInfo {
+                            name: subject.clone(),
+                            version: "1".to_owned(),
+                        },
+                        None,
+                        fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+                    );
+                    let response =
+                        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": discovery});
+                    format!("IFS= read -r init || exit 90\nprintf '%s\\n' '{response}'")
+                } else {
+                    format!(
+                        "IFS= read -r init || exit 90\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || exit 91"
+                    )
+                };
+                let methods = if inspect {
+                    [
+                        "tools/list",
+                        "resources/list",
+                        "resources/templates/list",
+                        "prompts/list",
+                    ]
+                } else {
+                    ["ping", "tools/list", "resources/list", "prompts/list"]
+                };
+                let mut script = handshake;
+                for (index, method) in methods.into_iter().enumerate() {
+                    let id = index + 2;
+                    let mut result = match method {
+                        "tools/list" => {
+                            serde_json::json!({"tools": [{"name": subject, "inputSchema": {"type": "object"}}]})
+                        }
+                        "resources/list" => {
+                            serde_json::json!({"resources": [{"name": subject, "uri": format!("file:///{subject}")}]})
+                        }
+                        "resources/templates/list" => {
+                            serde_json::json!({"resourceTemplates": [{"name": subject, "uriTemplate": "file:///{name}"}]})
+                        }
+                        "prompts/list" => serde_json::json!({"prompts": [{"name": subject}]}),
+                        "ping" => serde_json::json!({}),
+                        _ => unreachable!(),
+                    };
+                    if modern {
+                        result["resultType"] = serde_json::json!("complete");
+                        if method != "ping" {
+                            result["ttlMs"] = serde_json::json!(0);
+                            result["cacheScope"] = serde_json::json!("private");
+                        }
+                    }
+                    script.push_str(&format!(
+                        r#"
+IFS= read -r request || exit 92
+case "$request" in
+    *'"method":"notifications/cancelled"'*) exit 0 ;;
+    *'"method":"{method}"'*'"id":{id}'*) ;;
+    *) exit 93 ;;
+esac
+printf '%s' '{id}' > {ready}
+remaining=1000
+while [ "$(cat {release})" != '{id}' ]; do
+    remaining=$((remaining - 1))
+    [ "$remaining" -gt 0 ] || exit 94
+    sleep 0.01
+done
+printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
+"#,
+                        ready = quote(&ready),
+                        release = quote(&release)
+                    ));
+                }
+                script.push_str("IFS= read -r end\n");
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let root = Cx::current().unwrap();
+                    let sibling_root = root.clone();
+                    let completed = std::sync::Arc::new(AtomicBool::new(false));
+                    let observed_completion = completed.clone();
+                    let mut work = root.spawn(move |cx| async move {
+                        let command_cx = cx.clone();
+                        let worker = std::thread::current().id();
+                        let mut sibling = sibling_root.spawn(move |_sibling_cx| async move {
+                            assert_eq!(std::thread::current().id(), worker);
+                            for id in 2..=5 {
+                                let expected = id.to_string();
+                                let deadline = Instant::now() + Duration::from_secs(15);
+                                while std::fs::read_to_string(&ready).unwrap() != expected {
+                                    assert!(Instant::now() < deadline, "catalog command must yield at every request");
+                                    asupersync::runtime::yield_now().await;
+                                }
+                                if cancel { command_cx.set_cancel_requested(true); }
+                                std::fs::write(&release, expected).unwrap();
+                                if cancel { return 1; }
+                            }
+                            4
+                        }).unwrap();
+                        let args = vec!["-c".to_owned(), script];
+                        let outcome = if inspect {
+                            cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy).await
+                        } else {
+                            cmd_test(&cx, "sh", &args, policy, 5, 5, false, true).await
+                        };
+                        if cancel {
+                            let error = outcome.unwrap_err();
+                            assert!(cx.checkpoint().is_err());
+                            assert!(!fastmcp_client::is_cleanup_unverified(&error));
+                            if inspect {
+                                assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                            } else {
+                                assert!(error.message.contains("Some tests failed"), "{error}");
+                            }
+                        } else { outcome.unwrap(); }
+                        sibling_root.checkpoint().unwrap();
+                        let releases = sibling.join(&sibling_root).await.unwrap();
+                        assert_eq!(releases, if cancel { 1 } else { 4 });
+                        eprintln!("CLI_CORE_RUNTIME_PROOF {}", serde_json::json!({"inspect": inspect, "modern": modern, "cancel": cancel, "subject": subject, "sameWorker": true, "releasedRequests": releases, "commandCompleted": true, "cleanupVerified": true}));
+                        observed_completion.store(true, Ordering::SeqCst);
+                    }).unwrap();
+                    let joined = work.join(&root).await;
+                    if cancel {
+                        assert!(matches!(joined, Err(asupersync::runtime::JoinError::Cancelled(_))));
+                    } else { joined.unwrap(); }
+                    assert!(completed.load(Ordering::SeqCst));
+                    root.checkpoint().unwrap();
+                });
+            }
+        }
+    }
+
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn stdio_tasks_command_caller_runtime_positive() {
@@ -14686,6 +14932,43 @@ IFS= read -r end
             assert_eq!(value["tests"][0]["timeout_source"], "idle");
             assert!(!value.to_string().contains(SECRET));
 
+            for (source, message, expected) in [
+                (
+                    "idle",
+                    "Request timed out at the idle deadline",
+                    TestTimeoutSource::Idle,
+                ),
+                (
+                    "absolute",
+                    "Request timed out at the absolute deadline",
+                    TestTimeoutSource::Absolute,
+                ),
+            ] {
+                let cancelled_timeout = fastmcp_core::McpError::with_data(
+                    fastmcp_core::McpErrorCode::RequestCancelled,
+                    message,
+                    serde_json::json!({"timeoutSource": source, "secret": SECRET}),
+                );
+                let result =
+                    failed_test_result("ping", std::time::Duration::ZERO, &cancelled_timeout);
+                assert_eq!(result.timeout_source, Some(expected));
+                let value = bounded_test_report_value(&TestReport {
+                    server: "server".to_owned(),
+                    success: false,
+                    tests: vec![result],
+                    total_duration_ms: 0.0,
+                });
+                assert_eq!(value["tests"][0]["timeout_source"], source);
+                assert!(!value.to_string().contains(SECRET));
+
+                let mut ordinary_cancellation = cancelled_timeout;
+                ordinary_cancellation.message = fastmcp_core::McpError::request_cancelled().message;
+                assert_eq!(
+                    allowlisted_test_timeout_source(&ordinary_cancellation),
+                    None
+                );
+            }
+
             let spoofed = fastmcp_core::McpError::with_data(
                 fastmcp_core::McpErrorCode::InternalError,
                 "peer supplied unrelated failure",
@@ -17445,7 +17728,12 @@ IFS= read -r end
         #[test]
         fn test_run_test_helper() {
             // Test the run_test helper function with a successful closure
-            let result = run_test("test_success", || Ok("details".to_string()));
+            let result = build_cli_runtime().unwrap().block_on(async {
+                run_test(&Cx::current().unwrap(), "test_success", async |_| {
+                    Ok("details".to_string())
+                })
+                .await
+            });
 
             assert!(result.success);
             assert_eq!(result.name, "test_success");
@@ -17457,8 +17745,11 @@ IFS= read -r end
         #[test]
         fn test_run_test_helper_failure() {
             // Test the run_test helper function with a failing closure
-            let result = run_test("test_failure", || {
-                Err(fastmcp_core::McpError::internal_error("test error"))
+            let result = build_cli_runtime().unwrap().block_on(async {
+                run_test(&Cx::current().unwrap(), "test_failure", async |_| {
+                    Err(fastmcp_core::McpError::internal_error("test error"))
+                })
+                .await
             });
 
             assert!(!result.success);
@@ -17471,11 +17762,14 @@ IFS= read -r end
         #[test]
         fn run_test_bounds_and_redacts_raw_error_text_at_capture_time() {
             const SECRET: &str = "RUN-TEST-SECRET";
-            let result = run_test("failure", || {
-                Err(fastmcp_core::McpError::internal_error(format!(
-                    "Authorization: Bearer {SECRET}{}",
-                    "x".repeat(PEER_DETAIL_LIMIT * 8)
-                )))
+            let result = build_cli_runtime().unwrap().block_on(async {
+                run_test(&Cx::current().unwrap(), "failure", async |_| {
+                    Err(fastmcp_core::McpError::internal_error(format!(
+                        "Authorization: Bearer {SECRET}{}",
+                        "x".repeat(PEER_DETAIL_LIMIT * 8)
+                    )))
+                })
+                .await
             });
             let error = result.error.expect("captured error");
 
@@ -17487,7 +17781,12 @@ IFS= read -r end
         #[test]
         fn test_run_test_helper_empty_details() {
             // Test that empty details are converted to None
-            let result = run_test("test_empty", || Ok(String::new()));
+            let result = build_cli_runtime().unwrap().block_on(async {
+                run_test(&Cx::current().unwrap(), "test_empty", async |_| {
+                    Ok(String::new())
+                })
+                .await
+            });
 
             assert!(result.success);
             assert!(result.details.is_none());

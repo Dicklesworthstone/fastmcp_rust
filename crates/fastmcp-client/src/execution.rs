@@ -43,7 +43,9 @@ use fastmcp_protocol::{
 use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
 use serde_json::Value;
 
-use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
+use crate::{
+    RequestTimeoutPolicy, RequestTimeoutSource, request_timeout_error, transport_error_to_mcp,
+};
 
 /// Bounded compatibility diagnostic for a peer's final cache TTL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2744,6 +2746,18 @@ where
         state
             .stream_notifications
             .remove(&(owned_request_id.clone(), generation));
+        let mut error = match reason {
+            ExecutionTerminalReason::IdleTimeout => {
+                request_timeout_error(RequestTimeoutSource::Idle)
+            }
+            ExecutionTerminalReason::AbsoluteTimeout => {
+                request_timeout_error(RequestTimeoutSource::Absolute)
+            }
+            _ => McpError::request_cancelled(),
+        };
+        // Deadlines elect the same cancellation terminal as caller teardown,
+        // while retaining their cause for diagnostics at the client boundary.
+        error.code = McpErrorCode::RequestCancelled;
         state.retain_terminal(
             (owned_request_id.clone(), generation),
             ExecutionTerminalRecord {
@@ -2756,7 +2770,7 @@ where
                 waiter_release: true,
                 tombstone: true,
             },
-            ExecutionOutcome::Failure(McpError::request_cancelled()),
+            ExecutionOutcome::Failure(error),
         );
         if state.cancellation_events.len() >= MAX_RETAINED_PEER_ACTIVITY {
             // Cancellation is never held behind observer backpressure. The
@@ -4036,7 +4050,13 @@ mod tests {
         timed
             .poll_timeouts_at(&cx, idle_deadline)
             .expect("idle deadline selects cancellation");
-        assert!(timed.wait(&cx, &mut idle_execution).is_err());
+        let idle_error = timed.wait(&cx, &mut idle_execution).unwrap_err();
+        assert_eq!(idle_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(idle_error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            idle_error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
         assert_eq!(
             timed.take_cancellation_events()[0].reason,
             ExecutionTerminalReason::IdleTimeout,
@@ -4053,7 +4073,16 @@ mod tests {
         absolute
             .poll_timeouts_at(&cx, absolute_deadline)
             .expect("absolute deadline cannot be reset by peer activity");
-        assert!(absolute.wait(&cx, &mut absolute_execution).is_err());
+        let absolute_error = absolute.wait(&cx, &mut absolute_execution).unwrap_err();
+        assert_eq!(absolute_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            absolute_error.message,
+            "Request timed out at the absolute deadline"
+        );
+        assert_eq!(
+            absolute_error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
         assert_eq!(
             absolute.take_cancellation_events()[0].reason,
             ExecutionTerminalReason::AbsoluteTimeout,
@@ -5052,12 +5081,14 @@ mod tests {
             )
             .expect("raw ingress gates expiry before it considers the final response");
 
+        let error = executor
+            .wait(&cx, &mut expired)
+            .expect_err("changing only the lifetime to expired rejects the final");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timed out at the absolute deadline");
         assert_eq!(
-            executor
-                .wait(&cx, &mut expired)
-                .expect_err("changing only the lifetime to expired rejects the final")
-                .code,
-            McpErrorCode::RequestCancelled,
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
         );
         assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(executor.take_uncorrelated_responses().len(), 0);

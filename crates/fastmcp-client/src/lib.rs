@@ -15979,6 +15979,15 @@ impl Client {
     }
 
     fn retain_stream_notification(&mut self, notification: &JsonRpcRequest) -> McpResult<()> {
+        if self.session.selected_era() == Some(ProtocolEra::Legacy2024) {
+            return if self.retain_legacy_server_notification(notification)? {
+                Ok(())
+            } else {
+                Err(McpError::invalid_request(
+                    "Unexpected exact-2024 request stream notification",
+                ))
+            };
+        }
         let decoded = decode_final_server_notification(notification, None).map_err(|error| {
             McpError::invalid_request(format!("Invalid final server notification: {error}"))
         })?;
@@ -21086,6 +21095,155 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
 }
 
 impl Client {
+    /// Sends one ordinary core stdio request while yielding the caller's Unix runtime.
+    ///
+    /// Supports catalog lists, tools/call, resources/read, prompts/get and
+    /// completion/complete in the negotiated era. This sends one uncached
+    /// request; it does not follow cursors or MRTR continuations. Tasks are
+    /// not advertised. Inputs are validated before committing any bytes, and
+    /// results are decoded from their admitted source with the same typed
+    /// contracts as the synchronous client.
+    #[cfg(unix)]
+    pub async fn request_core_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if !matches!(
+            method,
+            "tools/list"
+                | "tools/call"
+                | "resources/list"
+                | "resources/templates/list"
+                | "resources/read"
+                | "prompts/list"
+                | "prompts/get"
+                | "completion/complete"
+        ) {
+            return Err(McpError::invalid_params(
+                "Method is not an ordinary core catalog, content or completion request",
+            ));
+        }
+        self.ensure_initialized()?;
+        let parameters = self.prepare_request_parameters(parameters)?;
+        #[cfg(feature = "tasks")]
+        let parameters = {
+            let mut parameters = parameters;
+            remove_tasks_client_extension(&mut parameters);
+            parameters
+        };
+        let request = self
+            .prepared_core_request(method, &parameters)?
+            .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
+        let parameters = request.encode_params().map_err(|error| {
+            McpError::invalid_params(format!("Invalid selected-era core parameters: {error}"))
+        })?;
+        self.last_core_result_receipt = None;
+        let received = self
+            .send_yielding_prepared_request(cx, cancellation, method, parameters)
+            .await?;
+        let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &received.result,
+            received.raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        self.last_core_result_receipt = Some(received.receipt);
+        if let Some(diagnostic) = diagnostic {
+            self.retain_final_cache_ttl_diagnostic(diagnostic);
+        }
+        Ok(result)
+    }
+
+    /// Pings the selected stdio peer without monopolizing the Unix runtime.
+    #[cfg(unix)]
+    pub async fn ping_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<()> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.ensure_initialized()?;
+        let parameters = self.prepare_request_parameters(serde_json::json!({}))?;
+        self.send_yielding_prepared_request(cx, cancellation, "ping", Some(parameters))
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn send_yielding_prepared_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Option<serde_json::Value>,
+    ) -> McpResult<ReceivedPreparedResult> {
+        let connection_cx = self.cx.clone();
+        let executor = self.multiplexed_stdio_executor()?;
+        executor.service(&connection_cx)?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        // Parameters are already typed and extension-admitted. Preparing them
+        // again here would re-advertise Tasks on an ordinary tools/call.
+        let mut execution = executor.execute(&connection_cx, method, parameters)?;
+        loop {
+            let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
+            let mut terminal = executor
+                .executor
+                .try_take_response_with_raw_result_and_stream(&mut execution.execution)
+                .map_err(|error| {
+                    if cancelled {
+                        McpError::request_cancelled()
+                    } else if error.code == McpErrorCode::InvalidRequest {
+                        self.terminate_connection(error)
+                    } else {
+                        error
+                    }
+                })?;
+            if cancelled {
+                if terminal.is_none() {
+                    self.cancel_multiplexed_request_with_connection_cx(
+                        &connection_cx,
+                        &executor,
+                        &mut execution,
+                    )?;
+                }
+                return Err(McpError::request_cancelled());
+            }
+            let notifications = match &mut terminal {
+                Some((_, _, stream)) => std::mem::take(stream),
+                None => execution.take_stream_notifications()?,
+            };
+            for notification in notifications {
+                self.retain_stream_notification(&notification)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
+            if let Some((mut response, raw_result, _)) = terminal {
+                if let Some(error) = response.error.take() {
+                    return Err(json_rpc_error_to_mcp(error));
+                }
+                let result = response.result.take().ok_or_else(|| {
+                    self.terminate_connection(McpError::invalid_request("No result in response"))
+                })?;
+                return Ok(ReceivedPreparedResult {
+                    result,
+                    raw_result,
+                    receipt: Instant::now(),
+                });
+            }
+            self.drive_yielding_stdio_slice()?;
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
     /// Reads one final task while yielding the caller's Unix stdio runtime.
     ///
     /// Each ingress turn has a bounded readiness wait; this is cooperative
@@ -34862,6 +35020,210 @@ IFS= read -r end
             "update-task"
         );
         client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_stdio_core_caller_runtime_positive() {
+        assert_direct_stdio_core_caller_runtime(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_stdio_core_caller_runtime_planted_negative() {
+        assert_direct_stdio_core_caller_runtime(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_direct_stdio_core_caller_runtime(cancel: bool) {
+        for policy in [ProtocolPolicy::ModernOnly, ProtocolPolicy::LegacyOnly] {
+            if policy == ProtocolPolicy::LegacyOnly && !cfg!(feature = "legacy-2024-11-05") {
+                continue;
+            }
+            let modern = policy == ProtocolPolicy::ModernOnly;
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+                "tools/call",
+                "resources/read",
+                "prompts/get",
+                "completion/complete",
+                "ping",
+            ] {
+                let subject = format!(
+                    "core-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                let (parameters, mut result) = match method {
+                    "tools/list" => (
+                        serde_json::json!({}),
+                        serde_json::json!({"tools": [{"name": subject, "inputSchema": {"type": "object"}}]}),
+                    ),
+                    "resources/list" => (
+                        serde_json::json!({}),
+                        serde_json::json!({"resources": [{"name": subject, "uri": format!("file:///{subject}")}]}),
+                    ),
+                    "resources/templates/list" => (
+                        serde_json::json!({}),
+                        serde_json::json!({"resourceTemplates": [{"name": subject, "uriTemplate": "file:///{name}"}]}),
+                    ),
+                    "prompts/list" => (
+                        serde_json::json!({}),
+                        serde_json::json!({"prompts": [{"name": subject}]}),
+                    ),
+                    "tools/call" => (
+                        serde_json::json!({"name": subject, "arguments": {}, "_meta": {"progressToken": subject}}),
+                        serde_json::json!({"content": [{"type": "text", "text": subject}], "isError": false}),
+                    ),
+                    "resources/read" => (
+                        serde_json::json!({"uri": format!("file:///{subject}")}),
+                        serde_json::json!({"contents": [{"uri": format!("file:///{subject}"), "text": subject}]}),
+                    ),
+                    "prompts/get" => (
+                        serde_json::json!({"name": subject}),
+                        serde_json::json!({"messages": [{"role": "user", "content": {"type": "text", "text": subject}}]}),
+                    ),
+                    "completion/complete" => (
+                        serde_json::json!({"ref": {"type": "ref/prompt", "name": subject}, "argument": {"name": "value", "value": "a"}}),
+                        serde_json::json!({"completion": {"values": [subject], "total": 1, "hasMore": false}}),
+                    ),
+                    "ping" => (serde_json::json!({}), serde_json::json!({})),
+                    _ => unreachable!(),
+                };
+                let huge_total = "922337203685477580812345678901234567890";
+                if modern {
+                    result["resultType"] = serde_json::json!("complete");
+                    if method.ends_with("/list") || method == "resources/read" {
+                        result["ttlMs"] = serde_json::json!(0);
+                        result["cacheScope"] = serde_json::json!("private");
+                    }
+                    if method == "completion/complete" {
+                        result["completion"]["total"] = serde_json::from_str(huge_total).unwrap();
+                    }
+                }
+                let handshake = if modern {
+                    #[cfg(feature = "tasks")]
+                    let discovery =
+                        modern_tasks_discovery_response(&subject, serde_json::json!({}));
+                    #[cfg(not(feature = "tasks"))]
+                    let discovery = modern_discovery_response(&subject, &[MODERN_PROTOCOL_VERSION]);
+                    format!("IFS= read -r init || exit 90\nprintf '%s\\n' '{discovery}'")
+                } else {
+                    format!(
+                        "IFS= read -r init || exit 90\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"{subject}\",\"version\":\"1\"}}}}}}'\nIFS= read -r initialized || exit 91"
+                    )
+                };
+                let progress = if method == "tools/call" {
+                    format!(
+                        "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":\"{subject}\",\"progress\":0.5}}}}'"
+                    )
+                } else {
+                    String::new()
+                };
+                let no_tasks = if method == "ping" {
+                    ""
+                } else {
+                    "case \"$first\" in *'io.modelcontextprotocol/tasks'*) exit 92 ;; esac"
+                };
+                let ping_result = if modern {
+                    r#"{"resultType":"complete"}"#
+                } else {
+                    "{}"
+                };
+                let recovery_prefix = if modern {
+                    r#""resultType":"complete","ttlMs":0,"cacheScope":"private","#
+                } else {
+                    ""
+                };
+                let script = format!(
+                    r#"
+{handshake}
+IFS= read -r first || exit 92
+case "$first" in *'"method":"{method}"'*'"id":2'*) ;; *) exit 93 ;; esac
+{no_tasks}
+IFS= read -r sibling || exit 94
+case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 95 ;; esac
+{progress}
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{result}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{ping_result}}}'
+IFS= read -r recovery || exit 96
+control=false
+case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+case "$recovery" in *'"method":"tools/list"'*'"id":4'*) ;; *) exit 97 ;; esac
+printf '{{"jsonrpc":"2.0","id":4,"result":{{{recovery_prefix}"tools":[{{"name":"%s","inputSchema":{{"type":"object"}}}}]}}}}\n' "$control"
+IFS= read -r end
+"#
+                );
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let root = Cx::current().unwrap();
+                    let client = Client::stdio_with_protocol_plan_with_cx("sh", &["-c", &script], ClientProtocolPlan::stdio(policy), root.clone()).unwrap();
+                    let mut work = root.spawn(move |cx| async move {
+                        let mut client = client;
+                        client.set_request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5)).unwrap()).unwrap();
+                        let executor = client.multiplexed_stdio_executor().unwrap();
+                        let before = client.next_id.load(Ordering::SeqCst);
+                        assert!(executor.executor.pending_records().is_empty());
+                        let cancelled = McpRequestCancellation::new();
+                        cancelled.cancel();
+                        assert_eq!(client.request_core_with_cx(&cx, &cancelled, "tools/list", serde_json::json!({})).await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert_eq!(client.request_core_with_cx(&cx, &McpRequestCancellation::new(), "tools/call", serde_json::json!({})).await.unwrap_err().code, McpErrorCode::InvalidParams);
+                        assert_eq!(client.next_id.load(Ordering::SeqCst), before);
+                        assert!(executor.executor.pending_records().is_empty());
+                        let cancellation = McpRequestCancellation::new();
+                        let sibling_cancellation = cancellation.clone();
+                        let sibling_executor = executor.clone();
+                        let worker = std::thread::current().id();
+                        let mut sibling = cx.spawn(move |sibling_cx| async move {
+                            assert_eq!(std::thread::current().id(), worker);
+                            if cancel { sibling_cancellation.cancel(); }
+                            sibling_executor.execute(&sibling_cx, "ping", Some(serde_json::json!({}))).unwrap()
+                        }).unwrap();
+                        let outcome = if method == "ping" {
+                            client.ping_with_cx(&cx, &cancellation).await.map(|()| None)
+                        } else {
+                            client.request_core_with_cx(&cx, &cancellation, method, parameters).await.map(Some)
+                        };
+                        if cancel {
+                            assert_eq!(outcome.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        } else if let Some(result) = outcome.unwrap() {
+                            assert_eq!(result.method(), method);
+                            assert_eq!(result.era(), if modern { ProtocolEra::Modern2026 } else { ProtocolEra::Legacy2024 });
+                            let encoded = result.encode().unwrap();
+                            assert!(encoded.contains(&subject), "{encoded}");
+                            if modern && method == "completion/complete" { assert!(encoded.contains(huge_total)); }
+                            if method == "tools/call" {
+                                if modern { assert_eq!(client.take_final_progress_notifications().len(), 1); }
+                                else { assert_eq!(client.take_legacy_notifications().iter().filter(|n| n.method == NOTIFICATIONS_PROGRESS).count(), 1); }
+                            }
+                        }
+                        assert!(client.is_initialized());
+                        cx.checkpoint().unwrap();
+                        let recovered = client.request_core_with_cx(&cx, &McpRequestCancellation::new(), "tools/list", serde_json::json!({})).await.unwrap();
+                        let recovered: serde_json::Value = serde_json::from_str(&recovered.encode().unwrap()).unwrap();
+                        assert_eq!(recovered["tools"][0]["name"], cancel.to_string());
+                        let mut sibling_request = sibling.join(&cx).await.unwrap();
+                        assert!(executor.try_take_response(&mut sibling_request).unwrap().unwrap().error.is_none());
+                        assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+                        assert!(executor.executor.pending_records().is_empty());
+                        assert!(!client.cx.is_cancel_requested());
+                        eprintln!("DIRECT_CORE_RUNTIME_PROOF {}", serde_json::json!({"method": method, "modern": modern, "cancel": cancel, "subject": subject, "sameWorker": true, "recovery": true, "controlObserved": recovered["tools"][0]["name"], "nextId": 5, "pendingAfter": 0}));
+                        client.close().unwrap();
+                    }).unwrap();
+                    work.join(&root).await.unwrap();
+                    root.checkpoint().unwrap();
+                });
+            }
+        }
     }
 
     #[cfg(all(unix, feature = "tasks"))]
