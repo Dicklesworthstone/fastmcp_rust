@@ -13150,6 +13150,16 @@ pub struct StdioFinalMrtrExecution {
     allow_tasks: bool,
 }
 
+/// One Tasks control request on the shared stdio ingress, retaining the
+/// method and task identity used to validate its response.
+#[cfg(feature = "tasks")]
+#[derive(Debug)]
+pub struct StdioFinalTaskExecution {
+    execution: StdioRequestExecution,
+    method: &'static str,
+    task_id: FinalTaskId,
+}
+
 /// One incrementally driven final Tasks subscription on a stdio client.
 ///
 /// It deliberately remains inside [`Client`]: only the client owns the
@@ -15051,6 +15061,141 @@ impl Client {
         execution: &mut StdioFinalMrtrExecution,
     ) -> McpResult<()> {
         self.cancel_yielding_stdio_request(&mut execution.execution)
+    }
+
+    /// Starts an admitted Tasks control without waiting for its response.
+    /// `tasks/update` requires the retained task snapshot so its input ledger
+    /// can be checked before allocating an ID or writing any request bytes.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    pub fn start_yielding_final_task_request(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+        task: Option<&FinalTask>,
+    ) -> McpResult<StdioFinalTaskExecution> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        self.admit_final_tasks_method(method)?;
+        let parameters = self.with_final_tasks_client_capability(parameters)?;
+        let invalid = || McpError::invalid_params("Invalid final Tasks control parameters");
+        let (method, task_id) = match method {
+            TASK_GET => {
+                let params: FinalGetTaskParams =
+                    serde_json::from_value(parameters.clone()).map_err(|_| invalid())?;
+                (TASK_GET, params.task_id)
+            }
+            TASK_CANCEL => {
+                let params: FinalCancelTaskParams =
+                    serde_json::from_value(parameters.clone()).map_err(|_| invalid())?;
+                (TASK_CANCEL, params.task_id)
+            }
+            TASK_UPDATE => {
+                let params: FinalUpdateTaskParams =
+                    serde_json::from_value(parameters.clone()).map_err(|_| invalid())?;
+                let Some(FinalTask::InputRequired {
+                    base,
+                    input_requests,
+                }) = task
+                else {
+                    return Err(McpError::invalid_params(
+                        "tasks/update requires an input_required final task",
+                    ));
+                };
+                if base.task_id != params.task_id {
+                    return Err(invalid());
+                }
+                TaskInputLedger::from_requests(input_requests)
+                    .and_then(|ledger| ledger.validate_responses(&params.input_responses))
+                    .map_err(|_| invalid())?;
+                (TASK_UPDATE, params.task_id)
+            }
+            _ => return Err(invalid()),
+        };
+        let execution = self.start_yielding_stdio_request(method, Some(parameters))?;
+        Ok(StdioFinalTaskExecution {
+            execution,
+            method,
+            task_id,
+        })
+    }
+
+    /// Polls one Tasks control using its exact admitted result source.
+    /// Controls remain cancellation-first, including when a reply is ready.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    pub fn try_take_yielding_final_task_response(
+        &mut self,
+        request: &mut StdioFinalTaskExecution,
+        cancelled: bool,
+    ) -> McpResult<Option<serde_json::Value>> {
+        let executor = self.multiplexed_stdio_executor()?;
+        let already_consumed = request.execution.execution.is_completed();
+        let terminal = executor
+            .executor
+            .try_take_response_with_raw_result_and_stream(&mut request.execution.execution)
+            .map_err(|error| {
+                if cancelled {
+                    McpError::request_cancelled()
+                } else if !already_consumed && error.code == McpErrorCode::InvalidRequest {
+                    // The executor can reject the result discriminator before
+                    // our method-specific decoder sees the admitted source.
+                    self.terminate_connection(error)
+                } else {
+                    error
+                }
+            })?;
+        if cancelled {
+            // Consume a ready terminal too: a caller retaining this handle
+            // must not recover its rejected success on a later poll.
+            if terminal.is_none() {
+                self.cancel_yielding_stdio_request(&mut request.execution)?;
+            }
+            return Err(McpError::request_cancelled());
+        }
+        let Some((response, raw_result, stream)) = terminal else {
+            for notification in request.execution.take_stream_notifications()? {
+                self.retain_stream_notification(&notification)
+                    .map_err(|error| self.terminate_connection(error))?;
+            }
+            return Ok(None);
+        };
+        for notification in stream {
+            self.retain_stream_notification(&notification)
+                .map_err(|error| self.terminate_connection(error))?;
+        }
+        if let Some(error) = response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let invalid = || {
+            McpError::invalid_request(
+                "Peer response does not match the admitted final Tasks control",
+            )
+        };
+        let decoded = (|| {
+            let source = raw_result.as_deref().ok_or_else(invalid)?;
+            let value = match request.method {
+                TASK_GET => {
+                    let result: FinalGetTaskResult =
+                        serde_json::from_str(source).map_err(|_| invalid())?;
+                    if result.task.base().task_id != request.task_id {
+                        return Err(invalid());
+                    }
+                    serde_json::to_value(result)
+                }
+                TASK_UPDATE => serde_json::to_value(
+                    serde_json::from_str::<FinalUpdateTaskResult>(source).map_err(|_| invalid())?,
+                ),
+                TASK_CANCEL => serde_json::to_value(
+                    serde_json::from_str::<FinalCancelTaskResult>(source).map_err(|_| invalid())?,
+                ),
+                _ => return Err(invalid()),
+            };
+            value.map_err(|_| McpError::internal_error("Final Tasks control serialization failed"))
+        })();
+        decoded
+            .map(Some)
+            .map_err(|error| self.terminate_connection(error))
     }
 
     /// Takes one already-routed stdio response without reading the transport.
@@ -34516,6 +34661,213 @@ mod tests {
             }}),
             false,
         );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_task_control_rejects_invalid_update_before_send() {
+        let discovery = modern_tasks_discovery_response("control-update", serde_json::json!({}));
+        let script = format!(
+            r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r update || exit 91
+printf '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","_meta":{{"request":%s}}}}}}\n' "$update"
+IFS= read -r end
+"#
+        );
+        let cx = Cx::for_request();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", &script],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            cx.clone(),
+        )
+        .unwrap();
+        let task: FinalTask = serde_json::from_value(serde_json::json!({
+            "taskId": "update-task", "status": "input_required",
+            "createdAt": "2026-07-28T12:00:00Z", "lastUpdatedAt": "2026-07-28T12:00:00Z",
+            "ttlMs": null, "inputRequests": {"roots": {"method": "roots/list"}}
+        }))
+        .unwrap();
+        let parameters = serde_json::json!({"taskId": "update-task", "inputResponses": {
+            "roots": {"roots": [{"uri": "file:///update-task"}]}
+        }});
+        let before = client.next_id.load(Ordering::SeqCst);
+        for invalid in 0..4 {
+            let mut params = parameters.clone();
+            let mut snapshot = serde_json::to_value(&task).unwrap();
+            if invalid == 1 {
+                snapshot["status"] = serde_json::json!("working");
+                snapshot.as_object_mut().unwrap().remove("inputRequests");
+            } else if invalid == 2 {
+                params["taskId"] = serde_json::json!("wrong-task");
+            } else if invalid == 3 {
+                params["inputResponses"]["roots"] =
+                    serde_json::json!({"action": "accept", "content": {}});
+            }
+            let snapshot = serde_json::from_value(snapshot).unwrap();
+            let result = client.start_yielding_final_task_request(
+                &cx,
+                TASK_UPDATE,
+                params,
+                (invalid != 0).then_some(&snapshot),
+            );
+            assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidParams);
+            assert_eq!(client.next_id.load(Ordering::SeqCst), before);
+            assert!(client.is_initialized());
+        }
+        let mut request = client
+            .start_yielding_final_task_request(&cx, TASK_UPDATE, parameters.clone(), Some(&task))
+            .unwrap();
+        let result = loop {
+            if let Some(result) = client
+                .try_take_yielding_final_task_response(&mut request, false)
+                .unwrap()
+            {
+                break result;
+            }
+            client.drive_yielding_stdio_slice().unwrap();
+        };
+        assert_eq!(result["_meta"]["request"]["id"], before);
+        assert_eq!(result["_meta"]["request"]["method"], TASK_UPDATE);
+        assert_eq!(
+            result["_meta"]["request"]["params"]["inputResponses"],
+            parameters["inputResponses"]
+        );
+        assert_eq!(
+            result["_meta"]["request"]["params"]["taskId"],
+            "update-task"
+        );
+        client.close().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn yielding_stdio_task_control_rejects_invalid_result() {
+        for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+            for invalid in 0..6 {
+                if invalid == 3 && method != TASK_GET {
+                    continue;
+                }
+                let task: FinalTask = serde_json::from_value(serde_json::json!({
+                    "taskId": "control-task", "status": "input_required", "inputRequests": {},
+                    "createdAt": "2026-07-28T12:00:00Z", "lastUpdatedAt": "2026-07-28T12:00:00Z", "ttlMs": null,
+                })).unwrap();
+                let mut result = if method == TASK_GET {
+                    serde_json::to_value(&task).unwrap()
+                } else {
+                    serde_json::json!({})
+                };
+                result["resultType"] =
+                    serde_json::json!(if invalid == 1 { "task" } else { "complete" });
+                if invalid == 3 {
+                    result["taskId"] = serde_json::json!("another-task");
+                }
+                let source = if invalid == 2 {
+                    let encoded = result.to_string();
+                    format!("{{\"resultType\":\"complete\",{}", &encoded[1..])
+                } else {
+                    result.to_string()
+                };
+                let discovery =
+                    modern_tasks_discovery_response("control-result", serde_json::json!({}));
+                let response = if invalid == 5 {
+                    r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"rejected control"}}"#.to_owned()
+                } else {
+                    format!(r#"{{"jsonrpc":"2.0","id":2,"result":{source}}}"#)
+                };
+                let script = format!(
+                    r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r control || exit 91
+printf '%s\n' '{response}'
+IFS= read -r end
+"#
+                );
+                let cx = Cx::for_request();
+                let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    "sh",
+                    &["-c", &script],
+                    ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                    cx.clone(),
+                )
+                .unwrap();
+                let mut params = serde_json::json!({"taskId": "control-task"});
+                if method == TASK_UPDATE {
+                    params["inputResponses"] = serde_json::json!({});
+                }
+                let mut request = client
+                    .start_yielding_final_task_request(&cx, method, params, Some(&task))
+                    .unwrap();
+                if invalid == 4 {
+                    // Force response-before-cancellation at the real ingress.
+                    let executor = client.multiplexed_stdio_executor().unwrap();
+                    executor
+                        .drive_frame(
+                            &cx,
+                            ReceivedTransportFrame::admit(
+                                serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": result})
+                                    .to_string()
+                                    .into_bytes(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        client
+                            .try_take_yielding_final_task_response(&mut request, true)
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(
+                        client
+                            .try_take_yielding_final_task_response(&mut request, false)
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::InvalidRequest,
+                        "cancelled ready success cannot be published by polling again"
+                    );
+                    assert!(client.is_initialized());
+                    client.close().unwrap();
+                    continue;
+                }
+                let observed = loop {
+                    match client.try_take_yielding_final_task_response(&mut request, false) {
+                        Ok(None) => client.drive_yielding_stdio_slice().unwrap(),
+                        result => break result,
+                    }
+                };
+                if invalid == 5 {
+                    let error = observed.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert_eq!(error.message, "rejected control");
+                    assert!(
+                        client.is_initialized(),
+                        "an ordinary RPC error preserves the connection"
+                    );
+                } else if invalid == 0 {
+                    assert_eq!(observed.unwrap().unwrap(), result);
+                    assert!(client.is_initialized());
+                } else {
+                    assert_eq!(observed.unwrap_err().code, McpErrorCode::InvalidRequest);
+                    assert!(!client.is_initialized(), "{method} invalid case {invalid}");
+                    assert!(
+                        client
+                            .start_yielding_final_task_request(
+                                &cx,
+                                TASK_GET,
+                                serde_json::json!({"taskId": "control-task"}),
+                                None
+                            )
+                            .is_err()
+                    );
+                }
+                client.close().unwrap();
+            }
+        }
     }
 
     #[cfg(all(unix, feature = "tasks"))]

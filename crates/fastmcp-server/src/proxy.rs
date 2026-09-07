@@ -24,8 +24,6 @@ use asupersync::cx::{ChildRegion, ChildRegionSpec};
 use fastmcp_client::FinalToolCallOutcome;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::StdioRequestExecution;
-#[cfg(feature = "tasks")]
-use fastmcp_client::StdioTaskSubscriptionEvent;
 use fastmcp_client::http_executor::{
     ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
 };
@@ -42,6 +40,8 @@ use fastmcp_client::{
     ClientHttpResponse, LegacyHttpRequest, ReverseRequestHandlers,
     http_executor::LegacySsePersistentReceiver,
 };
+#[cfg(feature = "tasks")]
+use fastmcp_client::{StdioFinalTaskExecution, StdioTaskSubscriptionEvent};
 use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
     Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole, block_on,
@@ -1554,9 +1554,9 @@ pub trait ProxyBackend: Send {
     /// Reserves a final Tasks request without beginning upstream I/O.
     ///
     /// Native modern HTTP backends override this to detach a cloneable,
-    /// stateless request from the route mutex. Other backends retain their
-    /// existing synchronous implementation until they can offer the same
-    /// ownership guarantee.
+    /// stateless request from the route mutex. Shared stdio controls use
+    /// `start_final_stdio_task_control`; backends declining both hooks retain
+    /// their synchronous implementation.
     #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn start_final_task_request(
@@ -1564,6 +1564,30 @@ pub trait ProxyBackend: Send {
         _operation: ProxyFinalTaskOperation,
     ) -> McpResult<Option<ProxyFinalTaskRequest>> {
         Ok(None)
+    }
+
+    /// Starts a Tasks control on a shared native stdio connection.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    fn start_final_stdio_task_control(
+        &mut self,
+        _ctx: &McpContext,
+        _operation: ProxyFinalTaskOperation,
+    ) -> McpResult<Option<StdioFinalTaskExecution>> {
+        Ok(None)
+    }
+
+    /// Polls a Tasks control and drives at most one bounded ingress turn.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    fn poll_final_stdio_task_control(
+        &mut self,
+        _ctx: &McpContext,
+        _request: &mut StdioFinalTaskExecution,
+    ) -> McpResult<Option<serde_json::Value>> {
+        Err(McpError::internal_error(
+            "Backend has no stdio Tasks control",
+        ))
     }
 
     /// Reserves a final Tasks listener opening without beginning upstream I/O.
@@ -2493,6 +2517,66 @@ fn collect_modern_proxy_catalog_pages<T>(
 }
 
 impl ProxyBackend for Client {
+    #[cfg(feature = "tasks")]
+    fn start_final_stdio_task_control(
+        &mut self,
+        ctx: &McpContext,
+        operation: ProxyFinalTaskOperation,
+    ) -> McpResult<Option<StdioFinalTaskExecution>> {
+        ctx.ensure_live()?;
+        if !self.supports_final_tasks_relay()? {
+            return Err(McpError::invalid_request(
+                "Proxy upstream does not admit the complete final Tasks relay surface",
+            ));
+        }
+        let (method, parameters, task) = match operation {
+            ProxyFinalTaskOperation::Get { task_id } => {
+                ("tasks/get", serde_json::json!({"taskId": task_id}), None)
+            }
+            ProxyFinalTaskOperation::Cancel { task_id } => {
+                ("tasks/cancel", serde_json::json!({"taskId": task_id}), None)
+            }
+            ProxyFinalTaskOperation::Update {
+                task,
+                input_responses,
+            } => (
+                "tasks/update",
+                serde_json::json!({"taskId": task.base().task_id, "inputResponses": input_responses}),
+                Some(task),
+            ),
+            ProxyFinalTaskOperation::CallTool { .. } => {
+                return Err(McpError::invalid_params(
+                    "Tasks control path does not accept tools/call",
+                ));
+            }
+        };
+        let parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        self.start_yielding_final_task_request(ctx.cx(), method, parameters, task.as_ref())
+            .map(Some)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn poll_final_stdio_task_control(
+        &mut self,
+        ctx: &McpContext,
+        request: &mut StdioFinalTaskExecution,
+    ) -> McpResult<Option<serde_json::Value>> {
+        let result =
+            self.try_take_yielding_final_task_response(request, ctx.ensure_live().is_err())?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        if result.is_none() {
+            self.drive_yielding_stdio_slice()?;
+        }
+        Ok(result)
+    }
+
     fn start_final_stdio_request(
         &mut self,
         ctx: &McpContext,
@@ -9004,6 +9088,32 @@ impl ProxyClient {
     }
 
     #[cfg(feature = "tasks")]
+    async fn try_final_stdio_task_control<R: serde::de::DeserializeOwned>(
+        &self,
+        ctx: &McpContext,
+        operation: ProxyFinalTaskOperation,
+    ) -> McpResult<Option<R>> {
+        let Some(mut request) =
+            self.with_backend(|backend| backend.start_final_stdio_task_control(ctx, operation))?
+        else {
+            return Ok(None);
+        };
+        loop {
+            if let Some(result) = self
+                .with_backend(|backend| backend.poll_final_stdio_task_control(ctx, &mut request))?
+            {
+                ctx.ensure_live()?;
+                return serde_json::from_value(result).map(Some).map_err(|_| {
+                    McpError::internal_error(
+                        "Admitted stdio Tasks result has the wrong operation type",
+                    )
+                });
+            }
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    #[cfg(feature = "tasks")]
     async fn get_final_task(
         &self,
         ctx: &McpContext,
@@ -9024,7 +9134,20 @@ impl ProxyClient {
                     )),
                 }
             }
-            None => self.with_backend(|backend| backend.get_final_task_with_context(ctx, task_id)),
+            None => match self
+                .try_final_stdio_task_control(
+                    ctx,
+                    ProxyFinalTaskOperation::Get {
+                        task_id: task_id.clone(),
+                    },
+                )
+                .await?
+            {
+                Some(result) => Ok(result),
+                None => {
+                    self.with_backend(|backend| backend.get_final_task_with_context(ctx, task_id))
+                }
+            },
         }
     }
 
@@ -9051,9 +9174,21 @@ impl ProxyClient {
                     )),
                 }
             }
-            None => self.with_backend(|backend| {
-                backend.update_final_task_with_context(ctx, task, input_responses)
-            }),
+            None => match self
+                .try_final_stdio_task_control(
+                    ctx,
+                    ProxyFinalTaskOperation::Update {
+                        task: task.clone(),
+                        input_responses: input_responses.clone(),
+                    },
+                )
+                .await?
+            {
+                Some(result) => Ok(result),
+                None => self.with_backend(|backend| {
+                    backend.update_final_task_with_context(ctx, task, input_responses)
+                }),
+            },
         }
     }
 
@@ -9078,9 +9213,19 @@ impl ProxyClient {
                     )),
                 }
             }
-            None => {
-                self.with_backend(|backend| backend.cancel_final_task_with_context(ctx, task_id))
-            }
+            None => match self
+                .try_final_stdio_task_control(
+                    ctx,
+                    ProxyFinalTaskOperation::Cancel {
+                        task_id: task_id.clone(),
+                    },
+                )
+                .await?
+            {
+                Some(result) => Ok(result),
+                None => self
+                    .with_backend(|backend| backend.cancel_final_task_with_context(ctx, task_id)),
+            },
         }
     }
 
@@ -10712,6 +10857,8 @@ mod tests {
         set_task_subscription_ids,
     };
 
+    #[cfg(all(unix, feature = "tasks"))]
+    use super::{FinalTask, ProxyFinalTaskRelay};
     use super::{
         ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog,
         ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
@@ -11032,6 +11179,253 @@ mod tests {
     #[test]
     fn proxy_task_controls_caller_runtime_planted_negative() {
         proxy_task_controls_caller_runtime_probe(true);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn invoke_stdio_task_control(
+        relay: &ProxyFinalTaskRelay,
+        ctx: &McpContext,
+        method: &str,
+        task_id: &str,
+    ) -> fastmcp_core::McpResult<serde_json::Value> {
+        let mut parameters = serde_json::json!({
+            "taskId": task_id,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}
+                }
+            }
+        });
+        match method {
+            "tasks/get" => relay.dispatch_get(ctx, parameters).await,
+            "tasks/cancel" => relay.dispatch_cancel(ctx, parameters).await,
+            "tasks/update" => {
+                parameters["inputResponses"] = serde_json::json!({
+                    "roots": {"roots": [{"uri": format!("file:///{task_id}")}]}
+                });
+                relay.dispatch_update(ctx, parameters).await
+            }
+            _ => panic!("probe only dispatches real Tasks controls"),
+        }
+    }
+
+    /// The native child waits for both requests and replies in reverse order.
+    /// Both relay futures must run on one worker and share one connection.
+    #[cfg(all(unix, feature = "tasks"))]
+    fn proxy_stdio_task_controls_probe(cancel: bool, context_deadline: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let subject = format!(
+                "stdio-control-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let first_id = format!("{subject}-first");
+            let second_id = format!("{subject}-second");
+            let first_task = final_task_relay_result_with_ttl(&first_id, None).task;
+            let second_task = final_task_relay_result_with_ttl(&second_id, None).task;
+            let result_for = |task: &FinalTask| {
+                let mut value = serde_json::to_value(task).unwrap();
+                value["resultType"] = serde_json::json!("complete");
+                value
+            };
+            let first_result = if method == "tasks/get" {
+                result_for(&first_task)
+            } else {
+                serde_json::json!({"resultType": "complete"})
+            };
+            let second_result = if method == "tasks/get" {
+                result_for(&second_task)
+            } else {
+                serde_json::json!({"resultType": "complete"})
+            };
+            let first_response =
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": first_result});
+            let second_response =
+                serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": second_result});
+            let recovery = result_for(&second_task).to_string();
+            let recovery_members = &recovery[1..recovery.len() - 1];
+            let mut discovery: serde_json::Value =
+                serde_json::from_str(&modern_discovery_response_line(&subject, &["2026-07-28"]))
+                    .unwrap();
+            discovery["result"]["capabilities"]["extensions"] =
+                serde_json::json!({fastmcp_protocol::TASKS_EXTENSION: {}});
+            let script = format!(
+                r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r first || exit 91
+IFS= read -r second || exit 92
+control=null
+if [ '{cancel}' = true ]; then IFS= read -r control || exit 93; fi
+printf '%s\n' '{second_response}' '{first_response}'
+IFS= read -r recovery || exit 94
+printf '{{"jsonrpc":"2.0","id":4,"result":{{{recovery_members},"_meta":{{"wires":[%s,%s],"control":%s,"recovery":%s}}}}}}\n' "$first" "$second" "$control" "$recovery"
+IFS= read -r end
+"#
+            );
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let mut client = Client::stdio_with_protocol_plan_with_cx(
+                "sh",
+                &["-c", &script],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                cx.clone(),
+            )
+            .unwrap();
+            client
+                .set_request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+                        .unwrap(),
+                )
+                .unwrap();
+            let proxy = ProxyClient::from_client(client).unwrap();
+            let relay = proxy.final_tasks_relay().unwrap().unwrap();
+            if method != "tasks/get" {
+                for task in [&first_task, &second_task] {
+                    let mut value = serde_json::to_value(task).unwrap();
+                    value["inputRequests"] = serde_json::json!({"roots": {"method": "roots/list"}});
+                    relay
+                        .record_task(serde_json::from_value(value).unwrap())
+                        .unwrap();
+                }
+            }
+            let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            runtime.block_on(async {
+                let make_ctx = |id| McpContext::new(cx.clone(), id)
+                    .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks().with_roots(false))
+                    .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "19"));
+                let first_ctx = make_ctx(895).with_request_cancellation(cancellation.clone());
+                let second_ctx = make_ctx(896);
+                let started = Arc::new(AtomicBool::new(false));
+                let pending = Arc::new(AtomicBool::new(false));
+                let worker = Arc::new(Mutex::new(None));
+                let observer_started = Arc::clone(&started);
+                let observer_cancel = cancellation.clone();
+                let mut observer = cx.spawn(move |observer_cx| async move {
+                    let deadline = observer_cx.now().saturating_add_nanos(3_000_000_000);
+                    while !observer_started.load(Ordering::Acquire) {
+                        assert!(observer_cx.now() < deadline);
+                        asupersync::runtime::yield_now().await;
+                    }
+                    if cancel && !context_deadline {
+                        asupersync::time::sleep(observer_cx.now(), Duration::from_millis(20)).await;
+                        assert!(observer_cancel.cancel());
+                    }
+                }).unwrap();
+                let first_relay = relay.clone();
+                let first_target = first_id.clone();
+                let first_worker = Arc::clone(&worker);
+                let first_pending = Arc::clone(&pending);
+                let mut first = cx.spawn(move |first_cx| async move {
+                    *first_worker.lock().unwrap() = Some(thread::current().id());
+                    let ctx = if context_deadline {
+                        first_ctx.with_operation_deadline(Some(first_cx.now().saturating_add_nanos(
+                            if cancel { 100_000_000 } else { 5_000_000_000 })))
+                    } else { first_ctx };
+                    let deadline = ctx.budget().deadline;
+                    let mut future = Box::pin(invoke_stdio_task_control(&first_relay, &ctx, method, &first_target));
+                    let result = std::future::poll_fn(|task_cx| {
+                        let poll = future.as_mut().poll(task_cx);
+                        if poll.is_pending() { first_pending.store(true, Ordering::Release); }
+                        if let std::task::Poll::Ready(Err(error)) = &poll {
+                            assert!(first_pending.load(Ordering::Acquire), "control failed before yielding: {error}");
+                        }
+                        poll
+                    }).await;
+                    (result, deadline)
+                }).unwrap();
+                let second_relay = relay.clone();
+                let second_target = second_id.clone();
+                let second_proxy = proxy.clone();
+                let mut second = cx.spawn(move |second_cx| async move {
+                    let deadline = second_cx.now().saturating_add_nanos(3_000_000_000);
+                    while !pending.load(Ordering::Acquire) {
+                        assert!(second_cx.now() < deadline, "first control must yield");
+                        asupersync::runtime::yield_now().await;
+                    }
+                    assert_eq!(*worker.lock().unwrap(), Some(thread::current().id()));
+                    assert!(second_proxy.inner.try_lock().is_ok());
+                    started.store(true, Ordering::Release);
+                    invoke_stdio_task_control(&second_relay, &second_ctx, method, &second_target).await
+                }).unwrap();
+                let (first, deadline) = first.join(&cx).await.unwrap();
+                let second = second.join(&cx).await.unwrap().unwrap();
+                observer.join(&cx).await.unwrap();
+                assert_eq!(second, second_result);
+                if cancel {
+                    assert_eq!(first.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    if context_deadline {
+                        assert!(!cancellation.is_cancel_requested());
+                        assert!(cx.now() >= deadline.unwrap());
+                    }
+                } else { assert_eq!(first.unwrap(), first_result); }
+                assert!(!cx.is_cancel_requested());
+                let after = proxy.final_task_registry_snapshot_for_test().unwrap();
+                assert_eq!(after["pendingCreations"], 0);
+                if method == "tasks/get" {
+                    if cancel {
+                        assert!(after["tasks"].get(&first_id).is_none());
+                    } else {
+                        assert_eq!(after["tasks"][&first_id], serde_json::to_value(&first_task).unwrap());
+                    }
+                    assert_eq!(after["tasks"][&second_id], serde_json::to_value(&second_task).unwrap());
+                } else { assert_eq!(after, before); }
+                let recovery = invoke_stdio_task_control(&relay, &make_ctx(897), "tasks/get", &second_id).await.unwrap();
+                let meta = &recovery["_meta"];
+                assert_eq!(meta["wires"].as_array().unwrap().len(), 2);
+                for (index, wire) in meta["wires"].as_array().unwrap().iter().enumerate() {
+                    assert_eq!(wire["id"], index + 2);
+                    assert_eq!(wire["method"], method);
+                    assert_eq!(wire["params"]["taskId"], if index == 0 { first_id.as_str() } else { second_id.as_str() });
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], subject);
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], serde_json::json!({}));
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"], serde_json::json!({}));
+                    if method == "tasks/update" {
+                        assert_eq!(wire["params"]["inputResponses"], serde_json::json!({"roots": {"roots": [{"uri": format!("file:///{}", if index == 0 { &first_id } else { &second_id })}]}}));
+                    }
+                }
+                if cancel {
+                    assert_eq!(meta["control"]["method"], "notifications/cancelled");
+                    assert_eq!(meta["control"]["params"]["requestId"], 2);
+                    assert_eq!(proxy.final_task_registry_snapshot_for_test().unwrap()["tasks"].get(&first_id), before["tasks"].get(&first_id));
+                } else { assert!(meta["control"].is_null()); }
+                assert_eq!(meta["recovery"]["id"], 4);
+                assert_eq!(recovery["taskId"], second_id);
+                eprintln!("{}", serde_json::json!({"proof": "proxy_stdio_task_controls", "method": method,
+                    "cancelled": cancel, "context_deadline": context_deadline, "subject": subject,
+                    "before": before, "after": after, "peer": meta}));
+            });
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_controls_caller_runtime_positive() {
+        proxy_stdio_task_controls_probe(false, false);
+    }
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_controls_caller_runtime_planted_negative() {
+        proxy_stdio_task_controls_probe(true, false);
+    }
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_controls_mcp_deadline_positive() {
+        proxy_stdio_task_controls_probe(false, true);
+    }
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_task_controls_mcp_deadline_planted_negative() {
+        proxy_stdio_task_controls_probe(true, true);
     }
 
     /// Native HTTP plus the shipped handler; the peer supplies protocol

@@ -3353,6 +3353,12 @@ impl<T> RequestExecution<T> {
         self.generation
     }
 
+    /// Distinguishes a consumed handle from a newly observed peer failure.
+    #[cfg(feature = "tasks")]
+    pub(crate) const fn is_completed(&self) -> bool {
+        self.completed
+    }
+
     /// Removes request-owned streaming notifications in peer arrival order.
     ///
     /// Only structurally valid progress with this execution's exact token can
