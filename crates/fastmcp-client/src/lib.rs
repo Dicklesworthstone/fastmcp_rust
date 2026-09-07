@@ -34778,13 +34778,13 @@ IFS= read -r end
                     format!(r#"{{"jsonrpc":"2.0","id":2,"result":{source}}}"#)
                 };
                 let script = format!(
-                    r#"
+                    r"
 IFS= read -r discovery || exit 90
 printf '%s\n' '{discovery}'
 IFS= read -r control || exit 91
 printf '%s\n' '{response}'
 IFS= read -r end
-"#
+"
                 );
                 let cx = Cx::for_request();
                 let mut client = Client::stdio_with_protocol_plan_with_cx(
