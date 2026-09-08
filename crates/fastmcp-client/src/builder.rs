@@ -64,8 +64,9 @@ use crate::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
-    combine_operation_and_cleanup, combine_operation_with_cleanup, is_cleanup_unverified,
-    resolve_stdio_command, validate_protocol_plan_feature,
+    combine_operation_and_cleanup, combine_operation_with_cleanup,
+    combine_operation_with_cleanup_async, is_cleanup_unverified, resolve_stdio_command,
+    validate_protocol_plan_feature,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -894,20 +895,23 @@ impl ClientBuilder {
             }
 
             match self.try_connect(command, args, cx, retry_deadline) {
-                Ok(mut client) => {
-                    if cx.checkpoint().is_err() {
-                        let cleanup = client.close_with_cx(cx).await;
-                        return combine_operation_with_cleanup(
-                            Err(McpError::request_cancelled()),
-                            || cleanup,
-                        );
-                    }
-                    if Instant::now() >= retry_deadline {
-                        let cleanup = client.close_with_cx(cx).await;
-                        return combine_operation_with_cleanup(
-                            Err(Self::connection_retry_elapsed_error()),
-                            || cleanup,
-                        );
+                Ok(client) => {
+                    let operation_error = if cx.checkpoint().is_err() {
+                        Some(McpError::request_cancelled())
+                    } else if Instant::now() >= retry_deadline {
+                        Some(Self::connection_retry_elapsed_error())
+                    } else {
+                        None
+                    };
+                    if let Some(error) = operation_error {
+                        // Only failed construction retains a client across an
+                        // await. Keep that state off every caller's future.
+                        let mut client = Box::new(client);
+                        return combine_operation_with_cleanup_async(
+                            Err(error),
+                            client.close_with_cx(cx),
+                        )
+                        .await;
                     }
                     return Ok(client);
                 }

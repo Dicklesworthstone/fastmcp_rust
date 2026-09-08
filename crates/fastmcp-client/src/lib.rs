@@ -2485,7 +2485,23 @@ where
     F: FnOnce() -> McpResult<()>,
 {
     let started = Instant::now();
-    let mut result = combine_operation_and_cleanup(operation, cleanup());
+    let result = combine_operation_and_cleanup(operation, cleanup());
+    record_cleanup_duration(result, started.elapsed())
+}
+
+pub(crate) async fn combine_operation_with_cleanup_async<T, F>(
+    operation: McpResult<T>,
+    cleanup: F,
+) -> McpResult<T>
+where
+    F: Future<Output = McpResult<()>>,
+{
+    let started = Instant::now();
+    let result = combine_operation_and_cleanup(operation, cleanup.await);
+    record_cleanup_duration(result, started.elapsed())
+}
+
+fn record_cleanup_duration<T>(mut result: McpResult<T>, elapsed: Duration) -> McpResult<T> {
     if let Err(error) = &mut result
         && is_cleanup_unverified(error)
         && let Some(data) = error
@@ -2495,7 +2511,7 @@ where
     {
         data.insert(
             CLEANUP_DURATION_MS_DATA_KEY.to_owned(),
-            serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+            serde_json::json!(elapsed.as_secs_f64() * 1000.0),
         );
     }
     result
@@ -30075,7 +30091,16 @@ mod tests {
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    fn client_close_caller_runtime_probe(cancel: bool, interrupt: bool) {
+    #[derive(Clone, Copy)]
+    enum ClientCloseInterruption {
+        None,
+        Cancel,
+        Drop,
+        Timeout,
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn client_close_caller_runtime_probe(interruption: ClientCloseInterruption) {
         use std::task::Poll;
 
         struct ReleaseOnDrop(Arc<AtomicBool>);
@@ -30111,10 +30136,15 @@ mod tests {
                             started.store(true, Ordering::Release);
                             // Deliberately retain an unfinished callback after
                             // cancellation, without blocking the runtime worker.
+                            let release_deadline = Instant::now() + Duration::from_secs(2);
                             while !release.load(Ordering::Acquire) {
-                                asupersync::time::sleep(callback_cx.now(), Duration::from_millis(1)).await;
+                                assert!(Instant::now() < release_deadline, "retained callback must be released");
+                                // Sleep completes immediately under cancellation;
+                                // an explicit yield still suspends this callback.
+                                asupersync::runtime::yield_now().await;
                             }
                             assert!(cancellation.is_cancel_requested());
+                            assert!(callback_cx.is_cancel_requested());
                             settled.store(true, Ordering::Release);
                             Ok(ListRootsResult::new(Vec::new()))
                         })
@@ -30146,19 +30176,27 @@ exit 0
                     assert!(Instant::now() < start_deadline, "native reverse callback must start");
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
+                let close_started = Instant::now();
                 let mut closing = Box::pin(client.close_with_cx(&close_cx));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(closing.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "callback settlement must yield to its caller runtime");
-                if cancel {
-                    close_cx.set_cancel_requested(true);
-                    assert_eq!(closing.await.unwrap_err().code, McpErrorCode::RequestCancelled);
-                } else if interrupt {
-                    drop(closing);
-                } else {
-                    release.store(true, Ordering::Release);
-                    closing.await.unwrap();
+                match interruption {
+                    ClientCloseInterruption::None => {
+                        release.store(true, Ordering::Release);
+                        closing.await.unwrap();
+                    }
+                    ClientCloseInterruption::Cancel => {
+                        close_cx.set_cancel_requested(true);
+                        assert_eq!(closing.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    }
+                    ClientCloseInterruption::Drop => drop(closing),
+                    ClientCloseInterruption::Timeout => {
+                        assert_eq!(closing.await.unwrap_err().message, REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR);
+                        assert!(close_started.elapsed() >= REVERSE_CALLBACK_SHUTDOWN_TIMEOUT);
+                        assert!(close_started.elapsed() < Duration::from_secs(1));
+                    }
                 }
-                if cancel || interrupt {
+                if !matches!(interruption, ClientCloseInterruption::None) {
                     assert!(!settled.load(Ordering::Acquire));
                     assert!(!client.transport_is_closed());
                     assert!(client.child.is_some());
@@ -30186,19 +30224,40 @@ exit 0
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn client_close_caller_runtime_positive() {
-        client_close_caller_runtime_probe(false, false);
+        client_close_caller_runtime_probe(ClientCloseInterruption::None);
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn client_close_caller_runtime_planted_negative() {
-        client_close_caller_runtime_probe(true, false);
+        client_close_caller_runtime_probe(ClientCloseInterruption::Cancel);
+        client_close_caller_runtime_probe(ClientCloseInterruption::Timeout);
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn client_close_interrupted_future_retains_callbacks() {
-        client_close_caller_runtime_probe(false, true);
+        client_close_caller_runtime_probe(ClientCloseInterruption::Drop);
+    }
+
+    #[test]
+    fn async_cleanup_duration_includes_await() {
+        let error = block_on(combine_operation_with_cleanup_async::<(), _>(
+            Err(McpError::invalid_params("operation sentinel")),
+            async {
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_millis(10) {
+                    asupersync::runtime::yield_now().await;
+                }
+                Err(McpError::internal_error("cleanup sentinel"))
+            },
+        ))
+        .unwrap_err();
+        assert!(is_cleanup_unverified(&error));
+        let data = error.data.unwrap();
+        assert_eq!(data["operation"]["message"], "operation sentinel");
+        assert_eq!(data["cleanup"]["message"], "cleanup sentinel");
+        assert!(data[CLEANUP_DURATION_MS_DATA_KEY].as_f64().unwrap() >= 10.0);
     }
 
     #[cfg(unix)]

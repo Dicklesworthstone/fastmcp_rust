@@ -12376,6 +12376,7 @@ mod tests {
             .local_addr()
             .expect("read final subscriptions/listen cancellation address");
         let modern_target = format!("http://{address}/mcp");
+        let (sent, received) = mpsc::sync_channel(1);
         let server = thread::spawn(move || {
             let (mut probe, _) = listener.accept().expect("accept modern probe");
             let probe_request = read_request(&mut probe);
@@ -12401,6 +12402,8 @@ mod tests {
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n\n",
             );
             finish_chunked_sse(&mut stream);
+            sent.send(())
+                .expect("report complete cancellation response");
         });
 
         let cx = Cx::for_request();
@@ -12423,6 +12426,11 @@ mod tests {
             SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
         ))
         .expect("open the request-owned subscription response stream");
+        // Rejection deliberately closes the body. Finish the peer's trailer
+        // first so that the required close cannot race an unrelated peer write.
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation response and trailer must finish before rejection");
         let error = runtime_block_on(subscription.next_event(&cx))
             .expect_err("server cancellation notifications are invalid on final HTTP SSE");
         assert!(matches!(

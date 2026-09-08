@@ -1209,14 +1209,14 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             protocol_policy,
         } => match server.as_deref() {
             Some(server) => {
-                cmd_inspect(
+                Box::pin(cmd_inspect(
                     cx,
                     server,
                     &args,
                     format,
                     output.as_deref(),
                     protocol_policy,
-                )
+                ))
                 .await
             }
             None if http_url.is_some()
@@ -1274,7 +1274,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             verbose,
             json,
         } => {
-            cmd_test(
+            Box::pin(cmd_test(
                 cx,
                 &server,
                 &args,
@@ -1283,7 +1283,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 absolute_timeout,
                 verbose,
                 json,
-            )
+            ))
             .await
         }
         Commands::Dev {
@@ -6065,8 +6065,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
         {
             let outcome =
                 run_yielding_stdio_task(cx, &mut client, connection, action, task_id, inputs).await;
-            let cleanup = client.close_with_cx(cx).await;
-            finish_inspect_acquisition(outcome, || cleanup)
+            finish_inspect_acquisition_async(outcome, client.close_with_cx(cx)).await
         }
         #[cfg(not(unix))]
         {
@@ -6146,8 +6145,7 @@ fn run_stdio_task(
             client.open_final_task_subscription_listener(filter)?;
             let outcome =
                 watch_stdio_task(cx, client, connection, &task_id, *max_events, &cancellation);
-            let cleanup = client.cancel_live_final_task_subscription(cx);
-            finish_inspect_acquisition(outcome, || cleanup)
+            finish_inspect_acquisition(outcome, || client.cancel_live_final_task_subscription(cx))
         }
         TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
     }
@@ -6220,8 +6218,7 @@ async fn run_yielding_stdio_task(
             };
             // A cancelled event poll has already retired its listener using
             // the connection context. Other exits still need explicit cleanup.
-            let cleanup = client.cancel_live_final_task_subscription(cx);
-            finish_inspect_acquisition(outcome, || cleanup)
+            finish_inspect_acquisition(outcome, || client.cancel_live_final_task_subscription(cx))
         }
         TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
     }
@@ -6484,7 +6481,6 @@ async fn cmd_inspect(
         ))
     }
     .await;
-    let cleanup = client.close_with_cx(cx).await;
     let (
         server_info,
         capabilities,
@@ -6493,7 +6489,7 @@ async fn cmd_inspect(
         resource_templates,
         prompts,
         acquisition_truncated,
-    ) = finish_inspect_acquisition(inspection, || cleanup)?;
+    ) = finish_inspect_acquisition_async(inspection, client.close_with_cx(cx)).await?;
     let protocol_status =
         InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
@@ -6542,12 +6538,34 @@ async fn stdio_inspect_core_request(
 /// `Client::drop` is only a best-effort backstop: a command must surface an
 /// unverified cleanup rather than silently replacing a bounded lifecycle
 /// outcome with destructor behavior.
+#[cfg(any(test, feature = "tasks"))]
 fn finish_inspect_acquisition<T, F>(acquisition: McpResult<T>, cleanup: F) -> McpResult<T>
 where
     F: FnOnce() -> McpResult<()>,
 {
     let cleanup_started = std::time::Instant::now();
-    match (acquisition, cleanup()) {
+    let cleanup = cleanup();
+    finish_inspect_cleanup(acquisition, cleanup, cleanup_started.elapsed())
+}
+
+async fn finish_inspect_acquisition_async<T, F>(
+    acquisition: McpResult<T>,
+    cleanup: F,
+) -> McpResult<T>
+where
+    F: std::future::Future<Output = McpResult<()>>,
+{
+    let cleanup_started = std::time::Instant::now();
+    let cleanup = cleanup.await;
+    finish_inspect_cleanup(acquisition, cleanup, cleanup_started.elapsed())
+}
+
+fn finish_inspect_cleanup<T>(
+    acquisition: McpResult<T>,
+    cleanup: McpResult<()>,
+    cleanup_duration: std::time::Duration,
+) -> McpResult<T> {
+    match (acquisition, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(acquisition_error), Ok(())) => Err(acquisition_error),
         (Ok(_), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
@@ -6557,7 +6575,7 @@ where
                 CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
                 "cleanup": cleanup_error,
                 CLIENT_CLEANUP_DURATION_MS_DATA_KEY:
-                    cleanup_started.elapsed().as_secs_f64() * 1_000.0,
+                    cleanup_duration.as_secs_f64() * 1_000.0,
             }),
         )),
         (Err(acquisition_error), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
@@ -6568,7 +6586,7 @@ where
                 "operation": acquisition_error,
                 "cleanup": cleanup_error,
                 CLIENT_CLEANUP_DURATION_MS_DATA_KEY:
-                    cleanup_started.elapsed().as_secs_f64() * 1_000.0,
+                    cleanup_duration.as_secs_f64() * 1_000.0,
             }),
         )),
     }
@@ -11993,9 +12011,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         }).unwrap();
                         let args = vec!["-c".to_owned(), script];
                         let outcome = if inspect {
-                            cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy).await
+                            Box::pin(cmd_inspect(&cx, "sh", &args, InspectFormat::Json, None, policy)).await
                         } else {
-                            cmd_test(&cx, "sh", &args, policy, 5, 5, false, true).await
+                            Box::pin(cmd_test(&cx, "sh", &args, policy, 5, 5, false, true)).await
                         };
                         if cancel {
                             let error = outcome.unwrap_err();
@@ -15850,6 +15868,34 @@ IFS= read -r end
                 .expect_err("failed output must be returned after verified cleanup");
             assert_eq!(error.message, "output sentinel");
             assert_eq!(cleanup_calls.get(), 1);
+        }
+
+        #[test]
+        fn async_cleanup_duration_includes_await() {
+            for test_output in [false, true] {
+                let cleanup = async {
+                    let started = std::time::Instant::now();
+                    while started.elapsed() < std::time::Duration::from_millis(10) {
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Err(fastmcp_core::McpError::internal_error("cleanup sentinel"))
+                };
+                let operation =
+                    Err::<(), _>(fastmcp_core::McpError::invalid_params("operation sentinel"));
+                let error = fastmcp_core::block_on(async {
+                    if test_output {
+                        finish_test_output(operation, cleanup).await
+                    } else {
+                        finish_inspect_acquisition_async(operation, cleanup).await
+                    }
+                })
+                .unwrap_err();
+                assert!(fastmcp_client::is_cleanup_unverified(&error));
+                let data = error.data.unwrap();
+                assert_eq!(data["operation"]["message"], "operation sentinel");
+                assert_eq!(data["cleanup"]["message"], "cleanup sentinel");
+                assert!(data[CLIENT_CLEANUP_DURATION_MS_DATA_KEY].as_f64().unwrap() >= 10.0);
+            }
         }
 
         #[test]
