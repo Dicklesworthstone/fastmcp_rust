@@ -9501,6 +9501,25 @@ impl TransportSendHalf for SharedStdioSend {
 }
 
 impl NegotiatedClientIo<SharedStdioRecv, SharedStdioSend> {
+    #[cfg(unix)]
+    fn recv_slice_with_source(
+        &mut self,
+        cx: &Cx,
+        slice_deadline: Instant,
+        frame_deadline: Option<Instant>,
+    ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
+        let mut receiver = self.receiver.0.lock().map_err(|_| TransportError::Closed)?;
+        if receiver
+            .recv_slice_or_closed(cx, slice_deadline, frame_deadline)?
+            .is_none()
+        {
+            return Err(TransportError::ReceiveDeadlineExceeded);
+        }
+        let received_at = Instant::now();
+        let frame = admitted_stdio_frame(&receiver)?;
+        Ok((frame, received_at))
+    }
+
     fn recv_until_with_source(
         &mut self,
         cx: &Cx,
@@ -15131,6 +15150,9 @@ impl Client {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<StdioRequestExecution> {
+        if let Some(error) = self.responses.terminal_error() {
+            return Err(error);
+        }
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(cx)?;
         let params = match params {
@@ -15502,6 +15524,8 @@ impl Client {
 
     /// Drives one bounded stdio ingress turn so reverse callbacks can be
     /// admitted, then returns so the caller can yield the inbound runtime.
+    /// On Unix, partial frames survive a polling slice; the executor's real
+    /// request deadlines still bound incomplete-frame reads.
     pub fn drive_yielding_stdio_slice(&mut self) -> McpResult<()> {
         let connection_cx = self.cx.clone();
         let receive_deadline = Instant::now()
@@ -15710,17 +15734,36 @@ impl Client {
             return Err(self.terminate_connection(error));
         }
         let executor = self.multiplexed_stdio_executor()?;
+        // Keep an expiring request's read boundary even when service retires
+        // its handle before this turn reads the remaining frame prefix.
+        let request_deadline = executor.next_pending_deadline();
         executor
             .service(cx)
             .map_err(|error| self.terminate_connection(error))?;
-        let deadline = match (executor.next_pending_deadline(), receive_deadline) {
+        let deadline = match (request_deadline, receive_deadline) {
             (Some(request_deadline), Some(receive_deadline)) => {
                 Some(request_deadline.min(receive_deadline))
             }
             (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
             (None, None) => None,
         };
-        let (frame, received_at) = match self.recv_next_child_frame(cx, deadline) {
+        // Scheduling slices must not become frame deadlines. Retain a prefix
+        // only when the slice is strictly earlier than every request deadline;
+        // ties and actual request expiry keep the strict terminal read path.
+        #[cfg(unix)]
+        let received = if let Some(slice) =
+            receive_deadline.filter(|slice| request_deadline.is_none_or(|request| *slice < request))
+        {
+            self.selected_io
+                .as_mut()
+                .ok_or(TransportError::Closed)
+                .and_then(|io| io.recv_slice_with_source(cx, slice, request_deadline))
+        } else {
+            self.recv_next_child_frame(cx, deadline)
+        };
+        #[cfg(not(unix))]
+        let received = self.recv_next_child_frame(cx, deadline);
+        let (frame, received_at) = match received {
             Ok(frame) => frame,
             Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
                 executor
@@ -30332,6 +30375,93 @@ mod tests {
             client.transport_is_closed(),
             "transport teardown follows the cooperative callback join"
         );
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn client_yielding_split_frame_probe(request_expires: bool) {
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let mut work = root.spawn(move |cx| async move {
+                let script = r#"
+IFS= read -r initialize || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"split-frame-peer","version":"1"}}}'
+IFS= read -r initialized || exit 91
+IFS= read -r request || exit 92
+printf '%s' '{"jsonrpc":"2.0","id":2,"result":{"n":1.'
+sleep 0.12
+printf '%s' '25e+2,"ok":true}'
+sleep 0.12
+printf '}\n'
+IFS= read -r ping || exit 93
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+exec sleep 2
+"#;
+                let timeout = if request_expires {
+                    Duration::from_millis(80)
+                } else {
+                    Duration::from_secs(2)
+                };
+                let mut client = Box::pin(ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                    .request_timeout_policy(RequestTimeoutPolicy::new(timeout, timeout).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script], &cx))
+                    .await.unwrap();
+                let worker = std::thread::current().id();
+                let mut request = Box::pin(client.request_with_cx(&cx, "ping", None));
+                std::future::poll_fn(|task_cx| {
+                    assert!(request.as_mut().poll(task_cx).is_pending(), "a split response must yield before it is complete");
+                    Poll::Ready(())
+                }).await;
+                let mut sibling = cx.spawn(move |sibling_cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    sibling_cx.checkpoint().unwrap();
+                    7
+                }).unwrap();
+                assert_eq!(sibling.join(&cx).await.unwrap(), 7);
+                let result = request.await;
+                if request_expires {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert!(error.message.to_ascii_lowercase().contains("timed out") || error.message.to_ascii_lowercase().contains("deadline"), "{error}");
+                    // If the executor observed its deadline before another
+                    // read turn, the retained prefix must still enforce it.
+                    if !client.transport_is_closed() {
+                        assert!(client.drive_yielding_stdio_slice().is_err());
+                    }
+                    assert!(client.transport_is_closed());
+                    let next_id = client.next_id.load(Ordering::SeqCst);
+                    assert!(client.request_with_cx(&cx, "ping", None).await.is_err());
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+                } else {
+                    assert_eq!(result.unwrap().result, Some(serde_json::from_str::<serde_json::Value>(r#"{"n":1.25e+2,"ok":true}"#).unwrap()));
+                    assert!(!client.transport_is_closed());
+                    client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.unwrap();
+                }
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(client.child.is_none());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_yielding_split_frame_positive() {
+        client_yielding_split_frame_probe(false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_yielding_split_frame_request_deadline() {
+        client_yielding_split_frame_probe(true);
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
