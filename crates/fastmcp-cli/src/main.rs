@@ -4367,7 +4367,11 @@ async fn cmd_test(
         total_duration_ms,
     };
 
-    finish_test_output(write_test_report(&report, json_output), client.close_with_cx(cx)).await?;
+    finish_test_output(
+        write_test_report(&report, json_output),
+        client.close_with_cx(cx),
+    )
+    .await?;
 
     if all_passed {
         Ok(())
@@ -15838,11 +15842,12 @@ IFS= read -r end
             assert_eq!(cleanup_calls.get(), 0);
 
             let output_error = fastmcp_core::McpError::internal_error("output sentinel");
-            let error = fastmcp_core::block_on(finish_test_output::<(), _>(Err(output_error), async {
-                cleanup_calls.set(cleanup_calls.get() + 1);
-                Ok(())
-            }))
-            .expect_err("failed output must be returned after verified cleanup");
+            let error =
+                fastmcp_core::block_on(finish_test_output::<(), _>(Err(output_error), async {
+                    cleanup_calls.set(cleanup_calls.get() + 1);
+                    Ok(())
+                }))
+                .expect_err("failed output must be returned after verified cleanup");
             assert_eq!(error.message, "output sentinel");
             assert_eq!(cleanup_calls.get(), 1);
         }
