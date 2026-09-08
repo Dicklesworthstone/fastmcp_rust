@@ -7218,7 +7218,11 @@ async fn await_proxy_operation_with_cancellation_priority<T>(
                     cx.now(),
                     PROXY_OPERATION_CANCEL_POLL,
                 ));
-                let _ = cancel_poll.as_mut().poll(task_cx);
+                // Poll the replacement on the next turn. It may already be
+                // ready; discarding that result would leave a completed Sleep
+                // to be polled again. The wake prevents parking before the new
+                // timer has registered its waker.
+                task_cx.waker().wake_by_ref();
                 if cancelled() {
                     return Poll::Ready(Err(McpError::request_cancelled()));
                 }
@@ -13267,6 +13271,89 @@ IFS= read -r end
             baseline,
             "the rejected frame cannot alter the admitted raw-parameter baseline"
         );
+    }
+
+    fn proxy_cancel_timer_rearm_probe(cancel: bool) {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // An unrelated cancelled ambient context makes a real Sleep immediately
+        // ready on every rearm, deterministically exercising the same lifecycle
+        // as a scheduler delay spanning the replacement timer's deadline.
+        let ambient = Cx::for_testing();
+        ambient.set_cancel_requested(true);
+        let _ambient = Cx::set_current(Some(ambient));
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let polls = AtomicUsize::new(0);
+        let operation = std::future::poll_fn(|_| {
+            if polls.fetch_add(1, Ordering::SeqCst) < 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(73))
+            }
+        });
+        let mut wait = Box::pin(super::await_proxy_operation_with_cancellation_priority(
+            &cx,
+            &cancellation,
+            operation,
+            None,
+            None,
+        ));
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task_cx = Context::from_waker(&waker);
+        for turn in 1..=3 {
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(polls.load(Ordering::SeqCst), turn);
+        }
+        assert!(
+            wakes.0.load(Ordering::SeqCst) >= 3,
+            "an immediately-ready replacement timer cannot leave the request parked"
+        );
+        if cancel {
+            assert!(cancellation.cancel());
+        }
+        let Poll::Ready(result) = wait.as_mut().poll(&mut task_cx) else {
+            panic!("upstream completion or request cancellation must finish the wait");
+        };
+        if cancel {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                3,
+                "late upstream result untouched"
+            );
+        } else {
+            assert_eq!(result.unwrap(), 73);
+            assert_eq!(polls.load(Ordering::SeqCst), 4);
+        }
+        assert!(
+            !cx.is_cancel_requested(),
+            "the explicit caller Cx remains live"
+        );
+    }
+
+    #[test]
+    fn proxy_cancel_timer_rearm_positive() {
+        proxy_cancel_timer_rearm_probe(false);
+    }
+
+    #[test]
+    fn proxy_cancel_timer_rearm_planted_negative() {
+        proxy_cancel_timer_rearm_probe(true);
     }
 
     #[cfg(feature = "tasks")]

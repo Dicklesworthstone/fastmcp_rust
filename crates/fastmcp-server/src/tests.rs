@@ -6488,6 +6488,89 @@ mod handler_direct_tests {
 
     // ── ProgressNotificationSender ───────────────────────────────────
 
+    fn final_progress_timer_rearm_probe(cancel: bool) {
+        use fastmcp_core::NotificationSender;
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Force every real Sleep, including each replacement, to become ready
+        // immediately. This needs no wall-clock delay or scheduler lottery.
+        let ambient = Cx::for_testing();
+        ambient.set_cancel_requested(true);
+        let _ambient = Cx::set_current(Some(ambient));
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let sent = Mutex::new(Vec::new());
+        let runtime = crate::handler::FinalProgressRuntime::new(
+            fastmcp_protocol::ProgressMarker::from("rearm"),
+            |request| sent.lock().unwrap().push(request),
+        );
+        let mut polls = 0;
+        let handler = std::future::poll_fn(|_| {
+            polls += 1;
+            if polls <= 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(73)
+            }
+        });
+        let mut wait = Box::pin(crate::await_final_progress_rate_tick(
+            &cx,
+            &cancellation,
+            &runtime,
+            handler,
+        ));
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task_cx = Context::from_waker(&waker);
+        for step in 1..=3 {
+            if cancel && step == 3 {
+                assert!(cancellation.cancel());
+            }
+            runtime.send_progress_exact(serde_json::Number::from(step), None, None);
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+        }
+        let expected_frames = if cancel { 2 } else { 3 };
+        assert!(
+            wakes.0.load(Ordering::SeqCst) >= expected_frames,
+            "successive rate ticks must arrange another handler poll"
+        );
+        let notifications = sent.lock().unwrap();
+        assert_eq!(notifications.len(), expected_frames);
+        for (index, notification) in notifications.iter().enumerate() {
+            assert_eq!(notification.method, "notifications/progress");
+            let params = notification.params.as_ref().unwrap();
+            assert_eq!(params["progressToken"], "rearm");
+            assert_eq!(params["progress"], index + 1);
+        }
+        drop(notifications);
+        assert_eq!(wait.as_mut().poll(&mut task_cx), Poll::Ready(73));
+        assert_eq!(sent.lock().unwrap().len(), expected_frames);
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn final_progress_timer_rearm_positive() {
+        final_progress_timer_rearm_probe(false);
+    }
+
+    #[test]
+    fn final_progress_timer_rearm_planted_negative() {
+        final_progress_timer_rearm_probe(true);
+    }
+
     #[test]
     fn progress_notification_sender_sends_notification() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -4384,10 +4384,10 @@ where
                 cx.now(),
                 FINAL_PROGRESS_FLUSH_INTERVAL,
             ));
-            // Register the replacement timer before returning `Pending`.
-            // Without this poll, a handler that remains parked after the
-            // first flush would have no timer waker for later updates.
-            let _ = std::future::Future::poll(tick.as_mut(), task_cx);
+            // Poll the replacement on the next turn instead of discarding an
+            // immediately-ready result and later repolling a completed Sleep.
+            // Arrange that turn even when the handler has no wake of its own.
+            task_cx.waker().wake_by_ref();
         }
 
         std::task::Poll::Pending

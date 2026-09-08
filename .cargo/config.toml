@@ -1,3 +1,9 @@
 # Parallel rustc front-end (nightly). Added by build-settings sweep.
 [build]
 rustflags = ["-Z", "threads=4"]
+# Source overlays can preserve timestamps older than pooled build outputs.
+# Compare Rust source contents so a different overlay cannot reuse stale code.
+fingerprint = "content"
+
+[unstable]
+checksum-freshness = true
