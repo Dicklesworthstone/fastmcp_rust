@@ -1450,6 +1450,8 @@ const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(15);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
+    "Subprocess cleanup exceeded the caller deadline";
 const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1904,25 +1906,27 @@ fn direct_child_stop_decision(
     }
 }
 
+fn try_reap_signalled_child(child: &mut Child) -> McpResult<bool> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => {
+            // After signalling, another reaper consuming this exact child is
+            // equivalent to a successful reap. Never use this for signal authority.
+            Ok(true)
+        }
+        Err(error) => Err(McpError::internal_error(format!(
+            "Failed to reap the owned subprocess: {error}"
+        ))),
+    }
+}
+
 fn reap_signalled_child(child: &mut Child) -> McpResult<()> {
     let reap_deadline = Instant::now() + DIRECT_CHILD_REAP_TIMEOUT;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            #[cfg(unix)]
-            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => {
-                // Once group shutdown has been requested, a process-wide
-                // reaper consuming this exact child is equivalent to a
-                // successful reap. This helper is never used to establish
-                // pre-signal identity.
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(McpError::internal_error(format!(
-                    "Failed to reap the owned subprocess: {error}"
-                )));
-            }
+        if try_reap_signalled_child(child)? {
+            return Ok(());
         }
 
         let now = Instant::now();
@@ -1939,6 +1943,53 @@ fn reap_signalled_child(child: &mut Child) -> McpResult<()> {
     }
 }
 
+fn process_cleanup_remaining(cx: &Cx, maximum: Duration) -> McpResult<Duration> {
+    let Some(deadline) = cx.budget().deadline else {
+        return Ok(maximum);
+    };
+    let remaining = Duration::from_nanos(deadline.duration_since(cx.now()));
+    if remaining.is_zero() {
+        return Err(McpError::internal_error(
+            PROCESS_CLEANUP_CALLER_DEADLINE_ERROR,
+        ));
+    }
+    Ok(remaining.min(maximum))
+}
+
+async fn wait_for_process_cleanup(cx: &Cx, maximum: Duration) -> McpResult<()> {
+    let delay = process_cleanup_remaining(cx, maximum)?;
+    let mut sleep = std::pin::pin!(asupersync::time::sleep(cx.now(), delay));
+    std::future::poll_fn(|task_cx| {
+        // A cancelled command still owns its killed children. Mask only this
+        // timer poll so cancellation cannot turn cleanup into a busy loop.
+        // No mask or lock survives Pending; the caller's deadline still bounds us.
+        if let Some(current) = Cx::current() {
+            current.masked(|| sleep.as_mut().poll(task_cx))
+        } else {
+            sleep.as_mut().poll(task_cx)
+        }
+    })
+    .await;
+    process_cleanup_remaining(cx, Duration::ZERO)?;
+    Ok(())
+}
+
+async fn reap_signalled_child_with_cx(cx: &Cx, child: &mut Child) -> McpResult<()> {
+    let deadline = Instant::now() + DIRECT_CHILD_REAP_TIMEOUT;
+    loop {
+        if try_reap_signalled_child(child)? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(McpError::internal_error(
+                "Owned subprocess did not exit within the cleanup deadline",
+            ));
+        }
+        wait_for_process_cleanup(cx, remaining.min(DIRECT_CHILD_REAP_POLL_INTERVAL)).await?;
+    }
+}
+
 /// Terminates and boundedly reaps the retained direct child process when its
 /// identity is still proven by a successful live-status probe.
 ///
@@ -1946,9 +1997,17 @@ fn reap_signalled_child(child: &mut Child) -> McpResult<()> {
 /// that safely and portably requires runtime support (including Windows Job
 /// Objects), not a PATH-resolved helper and a reusable PID.
 fn stop_direct_child(child: &mut Child) -> McpResult<()> {
+    if request_direct_child_shutdown(child)? {
+        reap_signalled_child(child)?;
+    }
+    Ok(())
+}
+
+/// Returns whether an accepted kill still needs its retained child reaped.
+fn request_direct_child_shutdown(child: &mut Child) -> McpResult<bool> {
     let probe = child.try_wait();
     match (&probe, direct_child_stop_decision(&probe)) {
-        (Ok(Some(_)), DirectChildStopDecision::DoNotSignal) => return Ok(()),
+        (Ok(Some(_)), DirectChildStopDecision::DoNotSignal) => return Ok(false),
         (Err(error), DirectChildStopDecision::DoNotSignal) => {
             return Err(McpError::internal_error(format!(
                 "Failed to establish owned subprocess state: {error}"
@@ -1964,7 +2023,7 @@ fn stop_direct_child(child: &mut Child) -> McpResult<()> {
     // recycled PID, and a blocking `wait` would defeat request deadlines.
     if let Err(signal_error) = child.kill() {
         return match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(_)) => Ok(false),
             Ok(None) => Err(McpError::internal_error(format!(
                 "Failed to terminate the owned subprocess: {signal_error}"
             ))),
@@ -1973,7 +2032,7 @@ fn stop_direct_child(child: &mut Child) -> McpResult<()> {
             ))),
         };
     }
-    reap_signalled_child(child)
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -2387,6 +2446,42 @@ fn wait_for_owned_process_group_quiescence(process_group: rustix::process::Pid) 
                 .saturating_duration_since(now)
                 .min(DIRECT_CHILD_REAP_POLL_INTERVAL),
         );
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_owned_process_group_quiescence_with_cx(
+    cx: &Cx,
+    process_group: rustix::process::Pid,
+) -> McpResult<()> {
+    let deadline = Instant::now() + OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT;
+    loop {
+        if owned_process_group_is_absent(process_group)? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            #[cfg(target_os = "linux")]
+            {
+                // Preserve the same two-snapshot zombie proof as sync close,
+                // yielding between snapshots and capping each by the caller.
+                let process_group_id = process_group.as_raw_nonzero().get();
+                let first_deadline = Instant::now()
+                    + process_cleanup_remaining(cx, OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT)?;
+                if !linux_process_group_has_live_member(process_group_id, first_deadline)? {
+                    wait_for_process_cleanup(cx, DIRECT_CHILD_REAP_POLL_INTERVAL).await?;
+                    let second_deadline = Instant::now()
+                        + process_cleanup_remaining(cx, OWNED_PROCESS_GROUP_INSPECTION_TIMEOUT)?;
+                    if !linux_process_group_has_live_member(process_group_id, second_deadline)? {
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(McpError::internal_error(
+                "Owned subprocess group remained present after the cleanup deadline",
+            ));
+        }
+        wait_for_process_cleanup(cx, remaining.min(DIRECT_CHILD_REAP_POLL_INTERVAL)).await?;
     }
 }
 
@@ -13833,6 +13928,135 @@ impl Client {
         }
     }
 
+    async fn stop_direct_peer_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let result = async {
+            process_cleanup_remaining(cx, DIRECT_CHILD_REAP_TIMEOUT)?;
+            if request_direct_child_shutdown(child)? {
+                // Give sibling work a turn after signalling, even if the OS
+                // has already finished terminating the child by our next probe.
+                asupersync::runtime::yield_now().await;
+                reap_signalled_child_with_cx(cx, child).await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.child = None;
+                Ok(())
+            }
+            Err(error) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child = None;
+                    Ok(())
+                }
+                Ok(None) | Err(_) => Err(error),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    async fn stop_owned_child_group_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        loop {
+            process_cleanup_remaining(cx, OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT)?;
+            match self.child_cleanup_phase {
+                ClientChildCleanupPhase::Active => {
+                    let Some(anchor) = self.group_anchor.as_mut() else {
+                        let missing_anchor =
+                            McpError::internal_error("Owned process-group cleanup lost its anchor");
+                        let peer_result = self.stop_direct_peer_with_cx(cx).await;
+                        if peer_result.is_ok() {
+                            self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                        }
+                        return combine_cleanup_results(Err(missing_anchor), peer_result);
+                    };
+                    self.child_cleanup_phase = match request_anchored_group_shutdown(anchor)? {
+                        AnchoredGroupShutdown::KillAccepted(group) => {
+                            ClientChildCleanupPhase::GroupKillAccepted(group)
+                        }
+                        AnchoredGroupShutdown::IdentityLost(group) => {
+                            ClientChildCleanupPhase::GroupIdentityLost(group)
+                        }
+                    };
+                    // Persist signal authority before yielding. Dropping close
+                    // here must never make a later retry signal this group again.
+                    asupersync::runtime::yield_now().await;
+                }
+                ClientChildCleanupPhase::GroupKillAccepted(process_group) => {
+                    let peer_result = if let Some(child) = self.child.as_mut() {
+                        reap_signalled_child_with_cx(cx, child).await
+                    } else {
+                        Ok(())
+                    };
+                    if peer_result.is_ok() {
+                        self.child = None;
+                    }
+                    let anchor_result = if let Some(anchor) = self.group_anchor.as_mut() {
+                        if let Some(child) = anchor.child.as_mut() {
+                            let result = reap_signalled_child_with_cx(cx, child).await;
+                            if result.is_ok() {
+                                anchor.child = None;
+                            }
+                            result
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Err(McpError::internal_error(
+                            "Owned process-group cleanup lost its anchor",
+                        ))
+                    };
+                    combine_cleanup_results(peer_result, anchor_result)?;
+                    self.child_cleanup_phase =
+                        ClientChildCleanupPhase::GroupChildrenReaped(process_group);
+                }
+                ClientChildCleanupPhase::GroupChildrenReaped(process_group) => {
+                    wait_for_owned_process_group_quiescence_with_cx(cx, process_group).await?;
+                    self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                    return Ok(());
+                }
+                ClientChildCleanupPhase::GroupIdentityLost(process_group) => {
+                    let peer_result = self.stop_direct_peer_with_cx(cx).await;
+                    let group_result = require_owned_process_group_absent(process_group);
+                    let result = combine_cleanup_results(peer_result, group_result);
+                    if result.is_ok() {
+                        self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                    }
+                    return result;
+                }
+                ClientChildCleanupPhase::Complete => return Ok(()),
+            }
+        }
+    }
+
+    async fn stop_retained_child_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        if self.child_cleanup_phase == ClientChildCleanupPhase::Complete {
+            return self.stop_direct_peer_with_cx(cx).await;
+        }
+        match self.child_ownership {
+            ChildOwnership::DirectChild => {
+                self.stop_direct_peer_with_cx(cx).await?;
+                self.child_cleanup_phase = ClientChildCleanupPhase::Complete;
+                Ok(())
+            }
+            ChildOwnership::OwnedProcessGroup => {
+                #[cfg(unix)]
+                {
+                    self.stop_owned_child_group_with_cx(cx).await
+                }
+                #[cfg(not(unix))]
+                {
+                    Err(McpError::internal_error(
+                        "Owned subprocess groups are unavailable on this platform",
+                    ))
+                }
+            }
+        }
+    }
+
     /// Creates a stdio client with the caller's cancellation context.
     ///
     /// ```compile_fail
@@ -21055,13 +21279,21 @@ impl Client {
     /// the transport owned by this client for a later close attempt. New
     /// requests remain refused once shutdown begins.
     ///
-    /// Only callback settlement is asynchronous here. After every callback
-    /// has stopped, transport and subprocess teardown use the same synchronous
-    /// cleanup phases and platform limits documented on [`Self::close`].
+    /// Callback settlement and subprocess exit/quiescence waits yield to the
+    /// caller's runtime. Process cleanup honors the caller's deadline and
+    /// retains unfinished phases for retry. Once callbacks have stopped,
+    /// cancellation does not abandon owned subprocesses: cleanup continues
+    /// under that deadline, including when the command was already cancelled.
+    ///
+    /// Transport flush, OS status/signalling calls and bounded Linux procfs
+    /// snapshots remain synchronous. Platform limits from [`Self::close`]
+    /// still apply; this does not make arbitrary custom transports nonblocking.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
         let deferred_retirement_result = self.begin_close(cx);
         self.reverse_callback_pool.join_bounded_with_cx(cx).await?;
-        self.finish_close(deferred_retirement_result)
+        self.close_transport_retaining_error();
+        let process_result = self.stop_retained_child_with_cx(cx).await;
+        self.finish_close_result(deferred_retirement_result, process_result)
     }
 
     fn begin_close(&self, cx: &Cx) -> McpResult<()> {
@@ -21083,6 +21315,12 @@ impl Client {
     }
 
     fn finish_close(&mut self, deferred_retirement_result: McpResult<()>) -> McpResult<()> {
+        self.close_transport_retaining_error();
+        let process_result = self.stop_retained_child();
+        self.finish_close_result(deferred_retirement_result, process_result)
+    }
+
+    fn close_transport_retaining_error(&mut self) {
         // Transport teardown is one-shot. Preserve any failure because a
         // consumed writer cannot make a later close prove that the earlier
         // flush/close succeeded.
@@ -21090,10 +21328,16 @@ impl Client {
         if let Err(error) = transport_result {
             self.retain_cleanup_error(error);
         }
+    }
+
+    fn finish_close_result(
+        &mut self,
+        deferred_retirement_result: McpResult<()>,
+        process_result: McpResult<()>,
+    ) -> McpResult<()> {
         // Process teardown is phaseful and retryable. Only an error from a
         // terminal phase becomes sticky; a later successful quiescence proof
         // clears the prior attempt's transient failure.
-        let process_result = self.stop_retained_child();
         let retryable_process_result = match process_result {
             Ok(()) => {
                 self.pending_process_cleanup_error = None;
@@ -30238,6 +30482,169 @@ exit 0
     #[test]
     fn client_close_interrupted_future_retains_callbacks() {
         client_close_caller_runtime_probe(ClientCloseInterruption::Drop);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn client_process_close_probe(mode: ClientCloseInterruption) {
+        use std::task::Poll;
+
+        for owned_group in [false, true] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let expired = runtime.request_cx_with_budget(
+                asupersync::Budget::default().with_deadline(asupersync::Time::ZERO),
+            );
+            let completed = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&completed);
+            runtime.block_on(async move {
+                let root = Cx::current().unwrap();
+                let sibling_root = root.clone();
+                let mut work = root.spawn(move |cx| async move {
+                    let worker = std::thread::current().id();
+                    let script = r#"
+IFS= read -r initialize || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"process-close-peer","version":"1"}}}'
+IFS= read -r initialized || exit 91
+IFS= read -r ping || exit 92
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+exec sleep 30
+"#;
+                    let mut client = Box::pin(ClientBuilder::new()
+                        .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                        .owned_process_group(owned_group)
+                        .max_retries(0)
+                        .connect_stdio_with_cx("sh", &["-c", script], &cx))
+                        .await.unwrap();
+                    client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.unwrap();
+                    let peer_id = client.child.as_ref().unwrap().id();
+                    let group_id = client.group_anchor.as_ref().map(ProcessGroupAnchor::raw_process_group);
+
+                    if matches!(mode, ClientCloseInterruption::Timeout) {
+                        let error = client.close_with_cx(&expired).await.unwrap_err();
+                        assert_eq!(error.message, PROCESS_CLEANUP_CALLER_DEADLINE_ERROR);
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Active);
+                        assert_eq!(client.child.as_ref().unwrap().id(), peer_id);
+                        assert!(client.child.as_mut().unwrap().try_wait().unwrap().is_none());
+                        assert!(client.pending_process_cleanup_error.is_some());
+                        assert!(client.transport_is_closed());
+                        if let Some(anchor) = client.group_anchor.as_mut() {
+                            anchor.verify_live().unwrap();
+                        }
+                    } else {
+                        if matches!(mode, ClientCloseInterruption::Cancel) {
+                            cx.set_cancel_requested(true);
+                            // Exercise the actual cleanup timer under ambient
+                            // cancellation; a normal Sleep would finish early.
+                            let started = Instant::now();
+                            let mut waiting = Box::pin(wait_for_process_cleanup(&cx, Duration::from_millis(15)));
+                            let first = std::future::poll_fn(|task_cx| {
+                                Poll::Ready(waiting.as_mut().poll(task_cx))
+                            }).await;
+                            assert!(first.is_pending(), "the cleanup timer must yield under cancellation");
+                            let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                                assert_eq!(std::thread::current().id(), worker);
+                                sibling_cx.checkpoint().unwrap();
+                                1_u8
+                            }).unwrap();
+                            assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                            waiting.await.unwrap();
+                            assert!(started.elapsed() >= Duration::from_millis(15));
+                            assert!(cx.checkpoint().is_err(), "the timer must unwind its poll mask");
+                        }
+                        let mut closing = Box::pin(client.close_with_cx(&cx));
+                        let first = std::future::poll_fn(|task_cx| {
+                            Poll::Ready(closing.as_mut().poll(task_cx))
+                        }).await;
+                        assert!(first.is_pending(), "process shutdown must yield after signalling");
+                        let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                            assert_eq!(std::thread::current().id(), worker);
+                            sibling_cx.checkpoint().unwrap();
+                            1_u8
+                        }).unwrap();
+                        assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                        if matches!(mode, ClientCloseInterruption::Drop) {
+                            drop(closing);
+                            assert_eq!(client.child.as_ref().unwrap().id(), peer_id);
+                            assert!(client.transport_is_closed());
+                            assert!(!client.is_initialized());
+                            if let Some(group_id) = group_id {
+                                assert_eq!(client.group_anchor.as_ref().unwrap().raw_process_group(), group_id);
+                                assert!(client.group_anchor.as_ref().unwrap().child.is_some());
+                                assert!(matches!(client.child_cleanup_phase, ClientChildCleanupPhase::GroupKillAccepted(_)));
+                            }
+                        } else {
+                            closing.await.unwrap();
+                        }
+                    }
+                    client.close_with_cx(&sibling_root).await.unwrap();
+                    assert!(client.child.is_none());
+                    assert!(client.transport_is_closed());
+                    assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                    assert!(client.pending_process_cleanup_error.is_none());
+                    if let Some(anchor) = client.group_anchor.as_ref() {
+                        assert!(anchor.child.is_none());
+                        assert!(owned_process_group_is_absent(anchor.process_group).unwrap());
+                    }
+                    sibling_root.checkpoint().unwrap();
+                    client.close_with_cx(&sibling_root).await.unwrap();
+                    observed.store(true, Ordering::Release);
+                }).unwrap();
+                let joined = work.join(&root).await;
+                if matches!(mode, ClientCloseInterruption::Cancel) {
+                    assert!(matches!(joined, Err(asupersync::runtime::JoinError::Cancelled(_))));
+                } else {
+                    joined.unwrap();
+                }
+                root.checkpoint().unwrap();
+            });
+            assert!(completed.load(Ordering::Acquire));
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_process_close_caller_runtime_positive() {
+        client_process_close_probe(ClientCloseInterruption::None);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_process_close_cancelled_caller_still_retires_children() {
+        client_process_close_probe(ClientCloseInterruption::Cancel);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_process_close_interrupted_future_retains_ownership() {
+        client_process_close_probe(ClientCloseInterruption::Drop);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_process_close_caller_deadline_preserves_retry() {
+        client_process_close_probe(ClientCloseInterruption::Timeout);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let limited = runtime.request_cx_with_budget(
+                asupersync::Budget::default().with_deadline(root.now() + Duration::from_millis(20)),
+            );
+            let started = Instant::now();
+            let error = wait_for_process_cleanup(&limited, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(error.message, PROCESS_CLEANUP_CALLER_DEADLINE_ERROR);
+            assert!(started.elapsed() < Duration::from_millis(500));
+            root.checkpoint().unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[test]
