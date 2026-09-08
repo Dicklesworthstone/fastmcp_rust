@@ -8438,6 +8438,32 @@ impl ProxyClient {
         self.with_backend(|backend| backend.set_log_level(level))
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn forward_inbound_log_level_async(&self, ctx: &McpContext) -> McpResult<()> {
+        ctx.checkpoint()?;
+        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+        let Some(level) = inbound_logging_level(ctx) else {
+            return Ok(());
+        };
+        if let Some(result) = self
+            .request_legacy_yielding_with_context(
+                ctx,
+                fastmcp_protocol::methods::LOGGING_SET_LEVEL,
+                serde_json::json!({"level": level}),
+            )
+            .await?
+        {
+            ctx.checkpoint()?;
+            return match self.admit_upstream_result("logging/setLevel", result)? {
+                CoreResult::Legacy(LegacyCoreResult::SetLogLevel(_)) => Ok(()),
+                _ => Err(unexpected_proxy_result("logging/setLevel")),
+            };
+        }
+        self.with_backend(|backend| backend.set_log_level(level))
+    }
+
     fn relay_resource_updated_notifications(&self, ctx: &McpContext) -> McpResult<()> {
         let drained = self.with_backend(|backend| backend.take_legacy_peer_notifications())?;
         let rewrites = self
@@ -8494,6 +8520,14 @@ impl ProxyClient {
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("completion/complete", result);
         }
+        self.complete_backend_typed(ctx, params)
+    }
+
+    fn complete_backend_typed(
+        &self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
         let mut progress_error = None;
         let mut forward_progress = |progress: FinalProgressNotificationParams| {
             if let Err(error) = forward_final_progress_to_context(ctx, progress) {
@@ -8513,6 +8547,48 @@ impl ProxyClient {
         ctx.checkpoint()?;
         self.relay_resource_updated_notifications(ctx)?;
         self.admit_upstream_result("completion/complete", result)
+    }
+
+    /// Completes an argument while yielding native I/O to the caller runtime.
+    pub async fn complete_typed_async(
+        &self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        let parameters = serde_json::to_value(&params).map_err(McpError::from)?;
+        if let Some(result) = self
+            .try_final_mrtr_request(
+                ctx,
+                fastmcp_protocol::methods::COMPLETION_COMPLETE,
+                parameters.clone(),
+            )
+            .await?
+        {
+            self.relay_resource_updated_notifications(ctx)?;
+            return Ok(result);
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            self.start_legacy_receive_pump()?;
+            self.forward_inbound_log_level_async(ctx).await?;
+            let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+            if let Some(result) = self
+                .request_legacy_yielding_with_context(
+                    ctx,
+                    fastmcp_protocol::methods::COMPLETION_COMPLETE,
+                    parameters,
+                )
+                .await?
+            {
+                ctx.checkpoint()?;
+                self.relay_resource_updated_notifications(ctx)?;
+                return self.admit_upstream_result("completion/complete", result);
+            }
+            self.complete_backend_typed(ctx, params)
+        }
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        self.complete_typed(ctx, params)
     }
 
     pub fn call_tool(
@@ -8788,6 +8864,9 @@ impl ProxyClient {
         ctx.checkpoint()?;
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        self.forward_inbound_log_level_async(ctx).await?;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         #[cfg(feature = "legacy-2024-11-05")]
@@ -9479,6 +9558,9 @@ impl ProxyClient {
         }
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        self.forward_inbound_log_level_async(ctx).await?;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         #[cfg(feature = "legacy-2024-11-05")]
@@ -9583,6 +9665,9 @@ impl ProxyClient {
         }
         #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        self.forward_inbound_log_level_async(ctx).await?;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         #[cfg(feature = "legacy-2024-11-05")]
@@ -10084,6 +10169,56 @@ impl CompletionHandler for ProxyCompletionHandler {
             )),
             _ => Err(unexpected_proxy_result("completion/complete")),
         }
+    }
+
+    fn complete_legacy_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        Box::pin(async move {
+            let params = match self.rewrite_legacy(params) {
+                Ok(params) => params,
+                Err(error) => return Outcome::Err(error),
+            };
+            match self.client.complete_typed_async(ctx, params).await {
+                Ok(CoreResult::Legacy(LegacyCoreResult::Completion(result))) => {
+                    Outcome::Ok(result.completion)
+                }
+                Ok(CoreResult::Final(FinalCoreResult::Completion { .. })) => {
+                    Outcome::Err(McpError::invalid_request(
+                        "Proxy cannot use an exact final completion result for a legacy handler path",
+                    ))
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("completion/complete")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    fn complete_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
+        Box::pin(async move {
+            let params = match self.rewrite_final(params) {
+                Ok(params) => params,
+                Err(error) => return Outcome::Err(error),
+            };
+            match self.client.complete_typed_async(ctx, params).await {
+                Ok(CoreResult::Final(FinalCoreResult::Completion { result, .. })) => {
+                    Outcome::Ok(result.payload.completion)
+                }
+                Ok(CoreResult::Legacy(LegacyCoreResult::Completion(_))) => {
+                    Outcome::Err(McpError::invalid_request(
+                        "Proxy cannot use an exact legacy completion result for a final handler path",
+                    ))
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("completion/complete")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 
@@ -12460,6 +12595,628 @@ IFS= read -r end
         proxy_resource_prompt_caller_runtime_probe(true, true);
     }
 
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn proxy_logging_caller_runtime_probe(cancel: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        let initialize = legacy_initialize_response_line();
+        let script = format!(
+            r#"
+IFS= read -r initialize || exit 90
+printf '%s\n' '{initialize}'
+IFS= read -r initialized || exit 91
+IFS= read -r first || exit 92
+IFS= read -r second || exit 93
+for wire in "$first" "$second"; do
+  case "$wire" in *'"method":"logging/setLevel"'*'"level":"info"'*) ;; *) exit 94;; esac
+done
+if [ '{cancel}' = true ]; then
+  IFS= read -r control || exit 95
+  case "$control" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 96;; esac
+fi
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{}}}}' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+IFS= read -r recovery || exit 97
+case "$recovery" in *'"method":"logging/setLevel"'*'"level":"info"'*) ;; *) exit 98;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{}}}}'
+IFS= read -r end
+"#
+        );
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", &script],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            cx.clone(),
+        )
+        .unwrap();
+        client
+            .set_request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4)).unwrap(),
+            )
+            .unwrap();
+        let proxy = ProxyClient::from_client(client).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let first_ctx = McpContext::new(cx.clone(), 899)
+            .with_request_cancellation(cancellation.clone())
+            .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+        let second_ctx = McpContext::new(cx.clone(), 900)
+            .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+        runtime.block_on(async {
+            let mut first = std::pin::pin!(proxy.forward_inbound_log_level_async(&first_ctx));
+            let mut second = std::pin::pin!(proxy.forward_inbound_log_level_async(&second_ctx));
+            let mut first_result = None;
+            let mut second_result = None;
+            let mut first_pending = false;
+            let mut second_pending = false;
+            std::future::poll_fn(|task_cx| {
+                if first_result.is_none() {
+                    match first.as_mut().poll(task_cx) {
+                        Poll::Ready(result) => first_result = Some(result),
+                        Poll::Pending => first_pending = true,
+                    }
+                }
+                if second_result.is_none() {
+                    match second.as_mut().poll(task_cx) {
+                        Poll::Ready(result) => second_result = Some(result),
+                        Poll::Pending => second_pending = true,
+                    }
+                }
+                if cancel && first_pending && second_pending {
+                    cancellation.cancel();
+                }
+                if first_result.is_some() && second_result.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert!(first_pending, "logging controls yield for sibling work");
+            // The peer withholds replies until both controls arrive. Once the
+            // second is sent, it may already be ready on its first poll.
+            if cancel {
+                assert!(second_pending, "the cancelled pair awaits its control");
+                assert_eq!(
+                    first_result.unwrap().unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+            } else {
+                first_result.unwrap().unwrap();
+            }
+            second_result.unwrap().unwrap();
+            assert!(second_ctx.checkpoint().is_ok());
+            proxy
+                .forward_inbound_log_level_async(&second_ctx)
+                .await
+                .unwrap();
+        });
+        drop(proxy);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_logging_caller_runtime_positive() {
+        proxy_logging_caller_runtime_probe(false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_logging_caller_runtime_planted_negative() {
+        proxy_logging_caller_runtime_probe(true);
+    }
+
+    #[test]
+    fn proxy_completion_custom_backend_forwards_logging_once() {
+        for cancelled in [false, true] {
+            let backend = TestBackend::default();
+            let state = Arc::clone(&backend.state);
+            let proxy = ProxyClient::from_backend(backend);
+            let cancellation = McpRequestCancellation::new();
+            let ctx = McpContext::new(Cx::for_testing(), 901)
+                .with_request_cancellation(cancellation.clone())
+                .with_min_log_level(Some(fastmcp_core::McpLogLevel::Info));
+            if cancelled {
+                assert!(cancellation.cancel());
+            }
+            let error = block_on(
+                proxy.complete_typed_async(
+                    &ctx,
+                    serde_json::from_value(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "custom"},
+                        "argument": {"name": "subject", "value": "custom"}
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap_err();
+            let state = state.lock().unwrap();
+            if cancelled {
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert!(state.log_levels.is_empty());
+            } else {
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    "Proxy upstream does not provide completion/complete"
+                );
+                assert_eq!(state.log_levels, [fastmcp_client::LoggingLevel::Info]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn invoke_proxy_completion(
+        handler: &super::ProxyCompletionHandler,
+        ctx: &McpContext,
+        modern: bool,
+        resource: bool,
+        target: &str,
+    ) -> fastmcp_core::McpResult<serde_json::Value> {
+        use crate::handler::CompletionHandler;
+        use fastmcp_core::Outcome;
+        let reference = if resource {
+            serde_json::json!({"type": "ref/resource", "uri": format!("gateway/{target}")})
+        } else {
+            serde_json::json!({"type": "ref/prompt", "name": format!("gateway/{target}")})
+        };
+        let mut params =
+            serde_json::json!({"ref": reference, "argument": {"name": "subject", "value": target}});
+        if modern {
+            params["_meta"] = serde_json::json!({});
+            params["context"] = serde_json::json!({"arguments": {"language": "rust"}});
+            if !resource {
+                params["ref"]["title"] = serde_json::json!("Completion title");
+            }
+            match handler
+                .complete_final_async_in_request(
+                    ctx,
+                    ctx.cx(),
+                    serde_json::from_value(params).unwrap(),
+                )
+                .await
+            {
+                Outcome::Ok(values) => Ok(serde_json::to_value(values).unwrap()),
+                Outcome::Err(error) => Err(error),
+                _ => panic!("completion has a typed outcome"),
+            }
+        } else {
+            match handler
+                .complete_legacy_async_in_request(
+                    ctx,
+                    ctx.cx(),
+                    serde_json::from_value(params).unwrap(),
+                )
+                .await
+            {
+                Outcome::Ok(values) => Ok(serde_json::to_value(values).unwrap()),
+                Outcome::Err(error) => Err(error),
+                _ => panic!("completion has a typed outcome"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_completion_caller_runtime_probe(cancel: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        for modern in [true, false] {
+            if !modern && !cfg!(feature = "legacy-2024-11-05") {
+                continue;
+            }
+            for resource in [false, true] {
+                let subject = format!(
+                    "completion-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                let target = if resource {
+                    format!("db://{subject}/{{subject}}")
+                } else {
+                    subject.clone()
+                };
+                let discovery = if modern {
+                    modern_discovery_response_line(&subject, &["2026-07-28"])
+                } else {
+                    legacy_initialize_response_line()
+                };
+                let result_type = if modern {
+                    "\"resultType\":\"complete\","
+                } else {
+                    ""
+                };
+                // Withhold both results until both requests arrive. A nested
+                // executor in the first completion cannot send the second.
+                let script = format!(
+                    r#"
+IFS= read -r discover || exit 90
+printf '%s\n' '{discovery}'
+if [ '{modern}' = false ]; then IFS= read -r initialized || exit 91; fi
+IFS= read -r first || exit 92
+IFS= read -r second || exit 93
+for wire in "$first" "$second"; do
+  case "$wire" in *'"method":"completion/complete"'*) ;; *) exit 94;; esac
+  case "$wire" in *'gateway/'*) exit 95;; esac
+  case "$wire" in *'{target}'*) ;; *) exit 96;; esac
+  if [ '{modern}' = true ]; then
+    case "$wire" in *'"language":"rust"'*) ;; *) exit 97;; esac
+    case "$wire" in *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;; *) exit 98;; esac
+  else
+    case "$wire" in *'"context"'*) exit 99;; esac
+  fi
+done
+if [ '{cancel}' = true ]; then
+  IFS= read -r control || exit 100
+  case "$control" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 101;; esac
+fi
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{{result_type}"completion":{{"values":["{subject}-second"],"total":1,"hasMore":false}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{{result_type}"completion":{{"values":["{subject}-first"],"total":1,"hasMore":false}}}}}}'
+IFS= read -r recovery || exit 102
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{{result_type}"completion":{{"values":["{subject}-recovery"],"total":1,"hasMore":false}}}}}}'
+IFS= read -r end
+"#
+                );
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    "sh",
+                    &["-c", &script],
+                    ClientProtocolPlan::stdio(if modern {
+                        ProtocolPolicy::ModernOnly
+                    } else {
+                        ProtocolPolicy::LegacyOnly
+                    }),
+                    cx.clone(),
+                )
+                .unwrap();
+                client
+                    .set_request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let proxy = ProxyClient::from_client(client).unwrap();
+                let handler = if resource {
+                    super::ProxyCompletionHandler::for_resource_template(
+                        proxy,
+                        format!("gateway/{target}"),
+                        &target,
+                    )
+                } else {
+                    super::ProxyCompletionHandler::for_prompt(
+                        proxy,
+                        format!("gateway/{target}"),
+                        &target,
+                    )
+                };
+                let cancellation = McpRequestCancellation::new();
+                let first_ctx = McpContext::new(cx.clone(), 895)
+                    .with_request_cancellation(cancellation.clone());
+                let second_ctx = McpContext::new(cx.clone(), 896);
+                runtime.block_on(async {
+                    let mut first = std::pin::pin!(invoke_proxy_completion(&handler, &first_ctx, modern, resource, &target));
+                    let mut second = std::pin::pin!(invoke_proxy_completion(&handler, &second_ctx, modern, resource, &target));
+                    let mut first_result = None;
+                    let mut second_result = None;
+                    let mut first_pending = false;
+                    let mut second_pending = false;
+                    std::future::poll_fn(|task_cx| {
+                        if first_result.is_none() {
+                            match first.as_mut().poll(task_cx) {
+                                Poll::Ready(result) => first_result = Some(result),
+                                Poll::Pending => first_pending = true,
+                            }
+                        }
+                        if second_result.is_none() {
+                            match second.as_mut().poll(task_cx) {
+                                Poll::Ready(result) => second_result = Some(result),
+                                Poll::Pending => second_pending = true,
+                            }
+                        }
+                        if cancel && first_pending && second_pending {
+                            cancellation.cancel();
+                        }
+                        if first_result.is_some() && second_result.is_some() { Poll::Ready(()) } else { Poll::Pending }
+                    }).await;
+                    assert!(first_pending, "first completion yields before sibling dispatch");
+                    // The peer has both requests before replying; the second
+                    // result may be ready immediately after its send.
+                    if cancel {
+                        assert!(second_pending, "the cancelled pair awaits its control");
+                        assert_eq!(first_result.unwrap().unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        assert_eq!(first_result.unwrap().unwrap(), serde_json::json!({"values": [format!("{subject}-first")], "total": 1, "hasMore": false}));
+                    }
+                    assert_eq!(second_result.unwrap().unwrap(), serde_json::json!({"values": [format!("{subject}-second")], "total": 1, "hasMore": false}));
+                    assert!(second_ctx.checkpoint().is_ok());
+                    assert_eq!(invoke_proxy_completion(&handler, &second_ctx, modern, resource, &target).await.unwrap(), serde_json::json!({"values": [format!("{subject}-recovery")], "total": 1, "hasMore": false}));
+                });
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"proof": "proxy_completion_caller_runtime", "modern": modern, "resource": resource, "cancelled": cancel, "subject": subject, "completion_results": if cancel { 2 } else { 3 }})
+                );
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_completion_caller_runtime_positive() {
+        proxy_completion_caller_runtime_probe(false);
+        proxy_completion_http_caller_runtime_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_completion_caller_runtime_planted_negative() {
+        proxy_completion_caller_runtime_probe(true);
+        proxy_completion_http_caller_runtime_probe(true);
+    }
+
+    #[cfg(unix)]
+    fn proxy_completion_http_caller_runtime_probe(cancel: bool) {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        for resource in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let target = format!("http-completion-{}", address.port());
+            let peer_target = target.clone();
+            let received = Arc::new(AtomicBool::new(false));
+            let peer_received = Arc::clone(&received);
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let peer = thread::spawn(move || {
+                let accept = || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(10)))
+                                    .unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(10)))
+                                    .unwrap();
+                                return stream;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "completion peer accept is bounded"
+                                );
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("completion peer accept: {error}"),
+                        }
+                    }
+                };
+                let mut discovery = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+                assert_eq!(request["method"], "server/discover");
+                write_http_discovery_response(&mut discovery, &serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": {
+                        "supportedVersions": ["2026-07-28"], "capabilities": {"completions": {}},
+                        "ttlMs": 0, "cacheScope": "private"
+                    }
+                })).unwrap());
+                drop(discovery);
+                let read = |stream: &mut TcpStream| {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_http_request(stream).body).unwrap();
+                    assert_eq!(request["method"], "completion/complete");
+                    let params = &request["params"];
+                    assert_eq!(
+                        params["ref"][if resource { "uri" } else { "name" }],
+                        peer_target
+                    );
+                    if !resource {
+                        assert_eq!(params["ref"]["title"], "Completion title");
+                    }
+                    assert_eq!(
+                        params["argument"],
+                        serde_json::json!({"name": "subject", "value": peer_target})
+                    );
+                    assert_eq!(
+                        params["context"],
+                        serde_json::json!({"arguments": {"language": "rust"}})
+                    );
+                    assert_eq!(
+                        params["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                        "2026-07-28"
+                    );
+                    request
+                };
+                let mut first = accept();
+                let mut first_wire = read(&mut first);
+                let mut second = accept();
+                let mut second_wire = read(&mut second);
+                // IDs are reserved in poll order; connections may arrive in
+                // either order. Reply to the second operation first in both cases.
+                if first_wire["id"].as_i64().unwrap() > second_wire["id"].as_i64().unwrap() {
+                    std::mem::swap(&mut first, &mut second);
+                    std::mem::swap(&mut first_wire, &mut second_wire);
+                }
+                peer_received.store(true, Ordering::Release);
+                released
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller releases completion results");
+                let write = |stream: &mut TcpStream, request: &serde_json::Value, suffix: &str| {
+                    let body = serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                        "resultType": "complete", "completion": {"values": [format!("{peer_target}-{suffix}")], "total": 1, "hasMore": false}
+                    }})).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(head.as_bytes())
+                        .and_then(|()| stream.write_all(&body))
+                };
+                write(&mut second, &second_wire, "second").unwrap();
+                let first_written = write(&mut first, &first_wire, "first").is_ok();
+                if !cancel {
+                    assert!(first_written);
+                }
+                drop(first);
+                drop(second);
+                let mut recovery = accept();
+                let recovery_wire = read(&mut recovery);
+                write(&mut recovery, &recovery_wire, "recovery").unwrap();
+                vec![first_wire, second_wire, recovery_wire]
+            });
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                None,
+                None,
+                "completion-credential".to_owned(),
+                "completion-owner".to_owned(),
+                "native-completion".to_owned(),
+                1,
+                1,
+                0,
+            )
+            .unwrap();
+            let capabilities = ClientCapabilities::default();
+            let connection = runtime
+                .block_on(ClientHttpConnection::connect(
+                    &cx,
+                    plan,
+                    proxy_http_client_info(),
+                    capabilities.clone(),
+                ))
+                .unwrap();
+            let binding = ProxyUpstreamBinding {
+                adapter: ProxyUpstreamAdapter::ModernHttp,
+                ..proxy_binding(ProtocolEra::Modern2026)
+            };
+            let proxy = ProxyClient::from_backend_with_upstream_binding(
+                ProxyHttpClient::new(
+                    binding,
+                    connection,
+                    cx.clone(),
+                    proxy_http_client_info(),
+                    capabilities,
+                ),
+                binding,
+                "2026-07-28",
+            )
+            .unwrap();
+            let handler = if resource {
+                super::ProxyCompletionHandler::for_resource_template(
+                    proxy,
+                    format!("gateway/{target}"),
+                    &target,
+                )
+            } else {
+                super::ProxyCompletionHandler::for_prompt(
+                    proxy,
+                    format!("gateway/{target}"),
+                    &target,
+                )
+            };
+            let cancellation = McpRequestCancellation::new();
+            let first_ctx =
+                McpContext::new(cx.clone(), 897).with_request_cancellation(cancellation.clone());
+            let second_ctx = McpContext::new(cx.clone(), 898);
+            runtime.block_on(async {
+                let mut first = std::pin::pin!(invoke_proxy_completion(
+                    &handler, &first_ctx, true, resource, &target
+                ));
+                let mut second = std::pin::pin!(invoke_proxy_completion(
+                    &handler,
+                    &second_ctx,
+                    true,
+                    resource,
+                    &target
+                ));
+                let mut first_result = None;
+                let mut second_result = None;
+                let mut released = false;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                std::future::poll_fn(|task_cx| {
+                    assert!(
+                        Instant::now() < deadline,
+                        "completion operations are bounded"
+                    );
+                    if first_result.is_none()
+                        && let Poll::Ready(result) = first.as_mut().poll(task_cx)
+                    {
+                        first_result = Some(result);
+                    }
+                    if second_result.is_none()
+                        && let Poll::Ready(result) = second.as_mut().poll(task_cx)
+                    {
+                        second_result = Some(result);
+                    }
+                    if !released && received.load(Ordering::Acquire) {
+                        if cancel {
+                            assert!(cancellation.cancel());
+                        }
+                        release.send(()).unwrap();
+                        released = true;
+                    }
+                    if first_result.is_some() && second_result.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        task_cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert!(released);
+                if cancel {
+                    assert_eq!(
+                        first_result.unwrap().unwrap_err().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                } else {
+                    assert_eq!(
+                        first_result.unwrap().unwrap()["values"],
+                        serde_json::json!([format!("{target}-first")])
+                    );
+                }
+                assert_eq!(
+                    second_result.unwrap().unwrap()["values"],
+                    serde_json::json!([format!("{target}-second")])
+                );
+                assert!(second_ctx.checkpoint().is_ok());
+                assert_eq!(
+                    invoke_proxy_completion(&handler, &second_ctx, true, resource, &target)
+                        .await
+                        .unwrap()["values"],
+                    serde_json::json!([format!("{target}-recovery")])
+                );
+            });
+            let wires = peer.join().expect("completion peer quiesced");
+            assert_eq!(wires.len(), 3);
+            assert_ne!(wires[0]["id"], wires[1]["id"]);
+            eprintln!(
+                "{}",
+                serde_json::json!({"proof": "proxy_completion_http_caller_runtime", "cancelled": cancel, "resource": resource, "requests": wires})
+            );
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
     #[cfg(unix)]
     async fn invoke_modern_stdio_handler(
         ctx: &McpContext,
@@ -12600,10 +13357,17 @@ IFS= read -r end
         };
         use fastmcp_protocol::{FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY};
         use std::sync::atomic::{AtomicBool, Ordering};
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
-            .build()
-            .unwrap();
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let builder = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap());
+        let builder = if context_deadline {
+            builder.with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+        } else {
+            builder
+        };
+        let runtime = builder.build().unwrap();
         let methods: &[&str] = if task_result.is_some() {
             &["tools/call"]
         } else {
@@ -12744,11 +13508,18 @@ IFS= read -r end
                         let started = Arc::new(AtomicBool::new(false));
                         let observer_started = Arc::clone(&started);
                         let observer_cancellation = cancellation.clone();
+                        let observer_clock = Arc::clone(&clock);
                         let mut observer = cx.spawn(move |observer_cx| async move {
-                            let deadline = observer_cx.now().saturating_add_nanos(3_000_000_000);
+                            let deadline = Instant::now() + Duration::from_secs(3);
                             while !observer_started.load(Ordering::Acquire) {
-                                assert!(observer_cx.now() < deadline, "second request starts within its bound");
+                                assert!(Instant::now() < deadline, "second request starts within its bound");
                                 asupersync::runtime::yield_now().await;
+                            }
+                            if context_deadline {
+                                // Expire the same 100ms MCP deadline only after
+                                // both real requests committed and yielded.
+                                // Scheduler delays cannot erase that witness.
+                                observer_clock.advance(100_000_000);
                             }
                             if cancelling_pair && !context_deadline {
                                 asupersync::time::sleep(observer_cx.now(), Duration::from_millis(20)).await;
@@ -12784,16 +13555,22 @@ IFS= read -r end
                         let second_proxy = proxy.clone();
                         let second_target = target.clone();
                         let second_resume = resumes.get(1).cloned();
-                        let mut sibling = cx.spawn(move |sibling_cx| async move {
-                            let deadline = sibling_cx.now().saturating_add_nanos(3_000_000_000);
+                        let mut sibling = cx.spawn(move |_sibling_cx| async move {
+                            let deadline = Instant::now() + Duration::from_secs(3);
                             while !first_pending.load(Ordering::Acquire) {
-                                assert!(sibling_cx.now() < deadline, "first request yields within its bound");
+                                assert!(Instant::now() < deadline, "first request yields within its bound");
                                 asupersync::runtime::yield_now().await;
                             }
                             assert_eq!(*worker_thread.lock().unwrap(), Some(thread::current().id()), "both operations run on the same caller worker");
                             assert!(second_proxy.inner.try_lock().is_ok(), "first request released backend lock");
-                            started.store(true, Ordering::Release);
-                            invoke_modern_stdio_handler(&second_ctx, second_proxy, method, &second_target, second_resume.as_ref()).await
+                            let mut request = Box::pin(invoke_modern_stdio_handler(&second_ctx, second_proxy, method, &second_target, second_resume.as_ref()));
+                            std::future::poll_fn(|task_cx| {
+                                let poll = request.as_mut().poll(task_cx);
+                                // Ready also releases the bounded observer on
+                                // the positive fast-response path.
+                                started.store(true, Ordering::Release);
+                                poll
+                            }).await
                         }).unwrap();
                         let (first, first_deadline) = first_request.join(&cx).await.unwrap();
                         let second = sibling.join(&cx).await.unwrap().unwrap();
@@ -15318,6 +16095,7 @@ IFS= read -r end
     #[allow(clippy::struct_field_names)] // Each field records the last observed backend call.
     struct TestState {
         last_tool: Option<(String, serde_json::Value)>,
+        log_levels: Vec<fastmcp_client::LoggingLevel>,
         last_resource: Option<String>,
         last_subscribe: Option<String>,
         last_unsubscribe: Option<String>,
@@ -15350,6 +16128,14 @@ IFS= read -r end
     }
 
     impl ProxyBackend for TestBackend {
+        fn set_log_level(
+            &mut self,
+            level: fastmcp_client::LoggingLevel,
+        ) -> fastmcp_core::McpResult<()> {
+            self.state.lock().unwrap().log_levels.push(level);
+            Ok(())
+        }
+
         fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
             Ok(self.tools.clone())
         }

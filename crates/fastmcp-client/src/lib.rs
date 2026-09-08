@@ -14901,8 +14901,9 @@ impl Client {
         self.start_multiplexed_request(&connection_cx, method, params)
     }
 
-    /// Starts a final tools/call, resources/read or prompts/get,
-    /// including a continuation, without waiting for the upstream response.
+    /// Starts a final tools/call, resources/read, prompts/get or completion/complete
+    /// without waiting for the upstream response. Only the first three methods
+    /// admit continuations; completion retains its complete-only decoder.
     /// Tasks require explicit admission for this tools/call request.
     #[doc(hidden)]
     pub fn start_yielding_final_mrtr_request(
@@ -14917,7 +14918,10 @@ impl Client {
         }
         self.ensure_initialized()?;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026)
-            || !matches!(method, "tools/call" | "resources/read" | "prompts/get")
+            || !matches!(
+                method,
+                "tools/call" | "resources/read" | "prompts/get" | "completion/complete"
+            )
         {
             return Err(McpError::invalid_params(
                 "Yielding final MRTR requires a modern core method",

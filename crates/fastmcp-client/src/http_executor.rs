@@ -5529,8 +5529,9 @@ impl ModernHttpClient {
             .await
     }
 
-    /// Starts a tool call, resource read, or prompt request, including
-    /// caller-managed MRTR retries.
+    /// Starts a tool call, resource read, prompt request, or argument completion.
+    /// The first three support caller-managed MRTR retries; completion retains
+    /// its complete-only decoder.
     ///
     /// `allow_tasks` is valid only for tools/call and controls this request
     /// alone. Enabling it requires bilateral
@@ -5546,7 +5547,10 @@ impl ModernHttpClient {
         parameters: serde_json::Value,
         allow_tasks: bool,
     ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
-        if !matches!(method, TOOLS_CALL | RESOURCES_READ | PROMPTS_GET) {
+        if !matches!(
+            method,
+            TOOLS_CALL | RESOURCES_READ | PROMPTS_GET | "completion/complete"
+        ) {
             return Err(ModernHttpClientError::UnsupportedFinalMethod {
                 method: method.to_owned(),
             });

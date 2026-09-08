@@ -187,12 +187,19 @@ impl<L> PartitionStore<L> {
     where
         F: FnOnce(&L) -> T,
     {
+        self.use_existing_at(key, Instant::now(), operation)
+    }
+
+    fn use_existing_at<T, F>(&mut self, key: Sha256Digest, now: Instant, operation: F) -> Option<T>
+    where
+        F: FnOnce(&L) -> T,
+    {
         let key_bytes = key.into_bytes();
         let (old_last_seen, new_last_seen, result) = {
             let entry = self.entries.get_mut(&key)?;
             let old_last_seen = entry.last_seen;
             let result = operation(&entry.limiter);
-            let new_last_seen = Instant::now();
+            let new_last_seen = now.max(old_last_seen);
             entry.last_seen = new_last_seen;
             (old_last_seen, new_last_seen, result)
         };
@@ -205,8 +212,11 @@ impl<L> PartitionStore<L> {
     }
 
     fn insert(&mut self, key: Sha256Digest, limiter: L) {
+        self.insert_at(key, limiter, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: Sha256Digest, limiter: L, last_seen: Instant) {
         let key_bytes = key.into_bytes();
-        let last_seen = Instant::now();
         let previous = self
             .entries
             .insert(key, ClientPartition { limiter, last_seen });
@@ -309,6 +319,10 @@ impl TokenBucketRateLimiter {
     /// * `refill_rate` - Tokens added per second (sustained rate)
     #[must_use]
     pub fn new(capacity: usize, refill_rate: f64) -> Self {
+        Self::new_at(capacity, refill_rate, Instant::now())
+    }
+
+    fn new_at(capacity: usize, refill_rate: f64, now: Instant) -> Self {
         let refill_rate = sanitized_rate(refill_rate);
         let capacity = if refill_rate > 0.0 && capacity <= MAX_EXACT_TOKEN_CAPACITY {
             capacity
@@ -319,7 +333,7 @@ impl TokenBucketRateLimiter {
             capacity,
             refill_rate,
             tokens: Mutex::new(capacity as f64),
-            last_refill: Mutex::new(Instant::now()),
+            last_refill: Mutex::new(now),
         }
     }
 
@@ -331,6 +345,10 @@ impl TokenBucketRateLimiter {
     }
 
     fn try_consume_with_retry(&self, tokens: usize) -> RateLimitAdmission {
+        self.try_consume_with_retry_at(tokens, Instant::now())
+    }
+
+    fn try_consume_with_retry_at(&self, tokens: usize, now: Instant) -> RateLimitAdmission {
         let mut current_tokens = self
             .tokens
             .lock()
@@ -340,7 +358,9 @@ impl TokenBucketRateLimiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let now = Instant::now();
+        // Requests can sample time before contending for the limiter lock.
+        // Never rewind refill state when a later observation acquired it first.
+        let now = now.max(*last_refill);
         let elapsed = now.duration_since(*last_refill).as_secs_f64();
 
         // Add tokens based on elapsed time
@@ -364,6 +384,10 @@ impl TokenBucketRateLimiter {
     /// Returns the current number of available tokens.
     #[must_use]
     pub fn available_tokens(&self) -> f64 {
+        self.available_tokens_at(Instant::now())
+    }
+
+    fn available_tokens_at(&self, now: Instant) -> f64 {
         let mut current_tokens = self
             .tokens
             .lock()
@@ -373,7 +397,7 @@ impl TokenBucketRateLimiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let now = Instant::now();
+        let now = now.max(*last_refill);
         let elapsed = now.duration_since(*last_refill).as_secs_f64();
 
         // Update tokens without consuming
@@ -383,6 +407,7 @@ impl TokenBucketRateLimiter {
         *current_tokens
     }
 
+    #[cfg(test)]
     fn is_fully_refilled(&self) -> bool {
         self.available_tokens() >= self.capacity as f64
     }
@@ -656,46 +681,50 @@ impl RateLimitingMiddleware {
         rate_limit_method_partition(self.client_partition_key(ctx, request)?, &request.method)
     }
 
-    fn get_or_create_limiter_with_retry(&self, partition: Sha256Digest) -> RateLimitAdmission {
+    fn get_or_create_limiter_with_retry_at(
+        &self,
+        partition: Sha256Digest,
+        now: Instant,
+    ) -> RateLimitAdmission {
         let mut limiters = self
             .limiters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if let Some(admission) =
-            limiters.use_existing(partition, |limiter| limiter.try_consume_with_retry(1))
-        {
+        if let Some(admission) = limiters.use_existing_at(partition, now, |limiter| {
+            limiter.try_consume_with_retry_at(1, now)
+        }) {
             return admission;
         }
 
         if limiters.len() >= MAX_NAMED_CLIENT_PARTITIONS
-            && !limiters.reclaim_oldest_if(
-                Instant::now(),
-                self.partition_idle_ttl,
-                TokenBucketRateLimiter::is_fully_refilled,
-            )
+            && !limiters.reclaim_oldest_if(now, self.partition_idle_ttl, |limiter| {
+                limiter.available_tokens_at(now) >= limiter.capacity as f64
+            })
         {
-            return self.overflow_limiter.try_consume_with_retry(1);
+            return self.overflow_limiter.try_consume_with_retry_at(1, now);
         }
 
         let limiter =
-            TokenBucketRateLimiter::new(self.burst_capacity, self.max_requests_per_second);
-        let admission = limiter.try_consume_with_retry(1);
-        limiters.insert(partition, limiter);
+            TokenBucketRateLimiter::new_at(self.burst_capacity, self.max_requests_per_second, now);
+        let admission = limiter.try_consume_with_retry_at(1, now);
+        limiters.insert_at(partition, limiter, now);
         admission
     }
 
+    #[cfg(test)]
     fn get_or_create_limiter(&self, partition: Sha256Digest) -> bool {
-        self.get_or_create_limiter_with_retry(partition)
+        self.get_or_create_limiter_with_retry_at(partition, Instant::now())
             .is_allowed()
     }
 }
 
-impl Middleware for RateLimitingMiddleware {
-    fn on_request(
+impl RateLimitingMiddleware {
+    fn on_request_at(
         &self,
         ctx: &McpContext,
         request: &JsonRpcRequest,
+        now: Instant,
     ) -> McpResult<MiddlewareDecision> {
         ctx.ensure_live().map_err(McpError::from)?;
         if self.max_requests_per_second <= 0.0 || self.burst_capacity == 0 {
@@ -705,7 +734,7 @@ impl Middleware for RateLimitingMiddleware {
         let admission = if self.global_limit {
             // Global rate limiting
             if let Some(ref limiter) = self.global_limiter {
-                limiter.try_consume_with_retry(1)
+                limiter.try_consume_with_retry_at(1, now)
             } else {
                 RateLimitAdmission::Rejected {
                     retry_after_ms: u64::MAX,
@@ -716,7 +745,7 @@ impl Middleware for RateLimitingMiddleware {
             // bucket key would let a retry with a fresh JSON-RPC ID evade the
             // method's configured admission budget.
             let partition = self.request_partition_key(ctx, request)?;
-            self.get_or_create_limiter_with_retry(partition)
+            self.get_or_create_limiter_with_retry_at(partition, now)
         };
 
         ctx.ensure_live().map_err(McpError::from)?;
@@ -726,6 +755,16 @@ impl Middleware for RateLimitingMiddleware {
                 Err(rate_limit_retry_error(request, retry_after_ms))
             }
         }
+    }
+}
+
+impl Middleware for RateLimitingMiddleware {
+    fn on_request(
+        &self,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        self.on_request_at(ctx, request, Instant::now())
     }
 }
 
@@ -1040,19 +1079,65 @@ mod tests {
     fn test_rate_limiting_middleware_per_client() {
         let middleware = RateLimitingMiddleware::new(10.0)
             .burst_capacity(1)
-            .client_id_extractor(|_ctx, req| Some(req.method.clone()));
+            .client_id_extractor(|_ctx, req| {
+                req.params
+                    .as_ref()?
+                    .get("client")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
         let ctx = test_context();
+        let mut request1 = test_request("tools/call");
+        request1.params = Some(serde_json::json!({"client": "first"}));
+        let mut request2 = test_request("tools/call");
+        request2.params = Some(serde_json::json!({"client": "second"}));
+        let now = Instant::now();
 
-        let request1 = test_request("method_a");
-        let request2 = test_request("method_b");
+        // Same method, different clients: method partitioning alone cannot
+        // satisfy this assertion. No scheduler speed assumption controls refill.
+        assert!(middleware.on_request_at(&ctx, &request1, now).is_ok());
+        assert!(middleware.on_request_at(&ctx, &request2, now).is_ok());
+        assert!(middleware.on_request_at(&ctx, &request1, now).is_err());
+        assert!(middleware.on_request_at(&ctx, &request2, now).is_err());
+    }
 
-        // Each "client" (method) gets their own bucket
-        assert!(middleware.on_request(&ctx, &request1).is_ok());
-        assert!(middleware.on_request(&ctx, &request2).is_ok());
+    fn rate_limit_clock_boundary_probe(refilled: bool) {
+        let middleware = RateLimitingMiddleware::new(10.0).burst_capacity(1);
+        let ctx = test_context();
+        let request = test_request("tools/call");
+        let now = Instant::now();
+        assert!(middleware.on_request_at(&ctx, &request, now).is_ok());
+        let observed = now + Duration::from_millis(if refilled { 100 } else { 99 });
+        let result = middleware.on_request_at(&ctx, &request, observed);
+        if refilled {
+            assert!(matches!(result, Ok(MiddlewareDecision::Continue)));
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(i32::from(error.code), RATE_LIMIT_ERROR_CODE);
+            assert_eq!(error.message, RATE_LIMIT_EXCEEDED_MESSAGE);
+            // Millisecond rounding may conservatively add one millisecond.
+            let retry = error.data.unwrap()["retryAfterMs"].as_u64().unwrap();
+            assert!((1..=2).contains(&retry));
+        }
+        // An observation taken before the previous request acquired the lock
+        // cannot rewind refill state and mint another token at the same time.
+        assert!(middleware.on_request_at(&ctx, &request, now).is_err());
+        assert!(middleware.on_request_at(&ctx, &request, observed).is_err());
+        let partition = middleware.request_partition_key(&ctx, &request).unwrap();
+        let limiters = middleware.limiters.lock().unwrap();
+        let entry = &limiters.entries[&partition];
+        assert_eq!(entry.last_seen, observed);
+        assert_eq!(*entry.limiter.last_refill.lock().unwrap(), observed);
+    }
 
-        // Now both are exhausted
-        assert!(middleware.on_request(&ctx, &request1).is_err());
-        assert!(middleware.on_request(&ctx, &request2).is_err());
+    #[test]
+    fn rate_limit_clock_boundary_positive() {
+        rate_limit_clock_boundary_probe(true);
+    }
+
+    #[test]
+    fn rate_limit_clock_boundary_planted_negative() {
+        rate_limit_clock_boundary_probe(false);
     }
 
     // ========================================
