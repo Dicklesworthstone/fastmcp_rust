@@ -30074,6 +30074,133 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn client_close_caller_runtime_probe(cancel: bool, interrupt: bool) {
+        use std::task::Poll;
+
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let close_cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let mut work = root.spawn(move |cx| async move {
+                let worker_thread = std::thread::current().id();
+                let started = Arc::new(AtomicBool::new(false));
+                let release = Arc::new(AtomicBool::new(false));
+                let settled = Arc::new(AtomicBool::new(false));
+                let _release_on_failure = ReleaseOnDrop(Arc::clone(&release));
+                let handlers = ReverseRequestHandlers::new().with_roots_list({
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    let settled = Arc::clone(&settled);
+                    move |callback_cx, cancellation, _params| {
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        let settled = Arc::clone(&settled);
+                        Box::pin(async move {
+                            assert_eq!(std::thread::current().id(), worker_thread);
+                            started.store(true, Ordering::Release);
+                            // Deliberately retain an unfinished callback after
+                            // cancellation, without blocking the runtime worker.
+                            while !release.load(Ordering::Acquire) {
+                                asupersync::time::sleep(callback_cx.now(), Duration::from_millis(1)).await;
+                            }
+                            assert!(cancellation.is_cancel_requested());
+                            settled.store(true, Ordering::Release);
+                            Ok(ListRootsResult::new(Vec::new()))
+                        })
+                    }
+                });
+                let script = r#"
+IFS= read -r initialize || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"close-peer","version":"1"}}}'
+IFS= read -r initialized || exit 91
+IFS= read -r request || exit 92
+case "$request" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 93;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":77,"method":"roots/list","params":{}}' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+IFS= read -r unexpected && exit 94
+exit 0
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                    .reverse_request_handlers(handlers)
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                    .await
+                    .unwrap();
+                let result = client.request_core_with_cx(
+                    &cx, &McpRequestCancellation::new(), "tools/list", serde_json::json!({}),
+                ).await.unwrap();
+                assert!(matches!(result, CoreResult::Legacy(LegacyCoreResult::ToolsList(_))));
+                let start_deadline = Instant::now() + Duration::from_secs(2);
+                while !started.load(Ordering::Acquire) {
+                    assert!(Instant::now() < start_deadline, "native reverse callback must start");
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                let mut closing = Box::pin(client.close_with_cx(&close_cx));
+                let first = std::future::poll_fn(|task_cx| Poll::Ready(closing.as_mut().poll(task_cx))).await;
+                assert!(first.is_pending(), "callback settlement must yield to its caller runtime");
+                if cancel {
+                    close_cx.set_cancel_requested(true);
+                    assert_eq!(closing.await.unwrap_err().code, McpErrorCode::RequestCancelled);
+                } else if interrupt {
+                    drop(closing);
+                } else {
+                    release.store(true, Ordering::Release);
+                    closing.await.unwrap();
+                }
+                if cancel || interrupt {
+                    assert!(!settled.load(Ordering::Acquire));
+                    assert!(!client.transport_is_closed());
+                    assert!(client.child.is_some());
+                    assert_eq!(client.reverse_callback_pool.tasks.lock().unwrap().len(), 1);
+                    assert!(client.reverse_callback_pool.state.admit(&RequestId::Number(78)).is_err());
+                    assert!(!client.is_initialized());
+                    let next_id = client.next_id.load(Ordering::Acquire);
+                    assert!(client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.is_err());
+                    assert_eq!(client.next_id.load(Ordering::Acquire), next_id);
+                    release.store(true, Ordering::Release);
+                    client.close_with_cx(&cx).await.unwrap();
+                }
+                assert!(settled.load(Ordering::Acquire));
+                assert!(client.reverse_callback_pool.tasks.lock().unwrap().is_empty());
+                assert!(client.transport_is_closed());
+                assert!(client.child.is_none());
+                assert!(cx.checkpoint().is_ok(), "closing context must not cancel its sibling");
+                client.close_with_cx(&cx).await.unwrap();
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_close_caller_runtime_positive() {
+        client_close_caller_runtime_probe(false, false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_close_caller_runtime_planted_negative() {
+        client_close_caller_runtime_probe(true, false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_close_interrupted_future_retains_callbacks() {
+        client_close_caller_runtime_probe(false, true);
+    }
+
     #[cfg(unix)]
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
