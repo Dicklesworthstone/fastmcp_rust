@@ -3135,6 +3135,28 @@ impl ReverseCallbackPool {
         }
     }
 
+    async fn join_bounded_with_cx(&self, cx: &Cx) -> McpResult<()> {
+        self.cancel_all();
+        let deadline = Instant::now()
+            .checked_add(REVERSE_CALLBACK_SHUTDOWN_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        loop {
+            // Keep ownership in the pool across every await. Cancellation or
+            // dropping this close future must leave unfinished tasks retryable.
+            if self.reap_finished_tasks()? == 0 {
+                return Ok(());
+            }
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(McpError::internal_error(
+                    REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR,
+                ));
+            }
+            asupersync::time::sleep(cx.now(), remaining.min(REVERSE_CALLBACK_POLL_SLICE)).await;
+        }
+    }
+
     /// Drop cannot report a join result. It requests cancellation, then lets
     /// the task owner region perform structural settlement.
     fn abort_for_drop(&self) {
@@ -21003,13 +21025,37 @@ impl Client {
     /// cannot be established, signalling fails, or the subprocess cannot be
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
+        let cx = self.cx.clone();
+        let deferred_retirement_result = self.begin_close(&cx);
+        self.join_reverse_callback_pool()?;
+        self.finish_close(deferred_retirement_result)
+    }
+
+    /// Cancels and joins callbacks while yielding to the caller's runtime.
+    ///
+    /// Use this entry point from asynchronous code: [`Self::close`] waits
+    /// synchronously and can starve callbacks on a single-thread runtime.
+    /// A cancelled, timed-out, or dropped join leaves unfinished callbacks and
+    /// the transport owned by this client for a later close attempt. New
+    /// requests remain refused once shutdown begins.
+    ///
+    /// Only callback settlement is asynchronous here. After every callback
+    /// has stopped, transport and subprocess teardown use the same synchronous
+    /// cleanup phases and platform limits documented on [`Self::close`].
+    pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        let deferred_retirement_result = self.begin_close(cx);
+        self.reverse_callback_pool.join_bounded_with_cx(cx).await?;
+        self.finish_close(deferred_retirement_result)
+    }
+
+    fn begin_close(&self, cx: &Cx) -> McpResult<()> {
         // A dropped request-owned handle has no later ingress turn to flush
         // its cancellation. Service the shared executor before closing child
         // stdin so the selected-era control receives one bounded attempt.
         let deferred_retirement_result = self
             .multiplexed_executor
             .as_ref()
-            .map_or(Ok(()), |executor| executor.service(&self.cx));
+            .map_or(Ok(()), |executor| executor.service(cx));
         self.initialized.store(false, Ordering::SeqCst);
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
@@ -21017,8 +21063,10 @@ impl Client {
             executor.fail_connection(McpError::internal_error("Client connection closed"));
         }
         self.cancel_reverse_callback_pool();
-        self.join_reverse_callback_pool()?;
+        deferred_retirement_result
+    }
 
+    fn finish_close(&mut self, deferred_retirement_result: McpResult<()>) -> McpResult<()> {
         // Transport teardown is one-shot. Preserve any failure because a
         // consumed writer cannot make a later close prove that the earlier
         // flush/close succeeded.

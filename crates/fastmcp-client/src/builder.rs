@@ -896,14 +896,14 @@ impl ClientBuilder {
             match self.try_connect(command, args, cx, retry_deadline) {
                 Ok(mut client) => {
                     if cx.checkpoint().is_err() {
-                        let cleanup = client.close();
+                        let cleanup = client.close_with_cx(cx).await;
                         return combine_operation_with_cleanup(
                             Err(McpError::request_cancelled()),
                             || cleanup,
                         );
                     }
                     if Instant::now() >= retry_deadline {
-                        let cleanup = client.close();
+                        let cleanup = client.close_with_cx(cx).await;
                         return combine_operation_with_cleanup(
                             Err(Self::connection_retry_elapsed_error()),
                             || cleanup,
