@@ -4045,15 +4045,15 @@ fn split_client_cleanup_failure(
 /// Once output fails, however, the command cannot continue safely and must not
 /// rely on `Client::drop` to stop the owned subprocess group. Preserve both
 /// failures as structured data when cleanup cannot be verified.
-fn finish_test_output<T, F>(output: McpResult<T>, cleanup: F) -> McpResult<T>
+async fn finish_test_output<T, F>(output: McpResult<T>, cleanup: F) -> McpResult<T>
 where
-    F: FnOnce() -> McpResult<()>,
+    F: std::future::Future<Output = McpResult<()>>,
 {
     match output {
         Ok(value) => Ok(value),
         Err(output_error) => {
             let cleanup_started = std::time::Instant::now();
-            match cleanup() {
+            match cleanup.await {
                 Ok(()) => Err(output_error),
                 Err(cleanup_error) => Err(fastmcp_core::McpError::with_data(
                     fastmcp_core::McpErrorCode::InternalError,
@@ -4217,7 +4217,11 @@ async fn cmd_test(
         mutation: OutputMutationMetadata::default(),
     };
     if !json_output {
-        finish_test_output(print_test_result(&init_result, verbose), || client.close())?;
+        finish_test_output(
+            print_test_result(&init_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(init_result);
 
@@ -4242,7 +4246,11 @@ async fn cmd_test(
     })
     .await;
     if !json_output {
-        finish_test_output(print_test_result(&ping_result, verbose), || client.close())?;
+        finish_test_output(
+            print_test_result(&ping_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(ping_result);
 
@@ -4264,7 +4272,11 @@ async fn cmd_test(
         skipped_test("list_tools", "server did not advertise tools")
     };
     if !json_output {
-        finish_test_output(print_test_result(&tools_result, verbose), || client.close())?;
+        finish_test_output(
+            print_test_result(&tools_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(tools_result);
 
@@ -4285,9 +4297,11 @@ async fn cmd_test(
         skipped_test("list_resources", "server did not advertise resources")
     };
     if !json_output {
-        finish_test_output(print_test_result(&resources_result, verbose), || {
-            client.close()
-        })?;
+        finish_test_output(
+            print_test_result(&resources_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(resources_result);
 
@@ -4308,9 +4322,11 @@ async fn cmd_test(
         skipped_test("list_prompts", "server did not advertise prompts")
     };
     if !json_output {
-        finish_test_output(print_test_result(&prompts_result, verbose), || {
-            client.close()
-        })?;
+        finish_test_output(
+            print_test_result(&prompts_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(prompts_result);
 
@@ -4318,7 +4334,7 @@ async fn cmd_test(
     // process-group anchor pins group identity while the requested MCP peer
     // runs directly as its sibling; unsupported platforms fail during connect.
     let cleanup_start = Instant::now();
-    let cleanup_result = match client.close() {
+    let cleanup_result = match client.close_with_cx(cx).await {
         Ok(()) => TestResult {
             name: "cleanup".to_owned(),
             success: true,
@@ -4332,9 +4348,11 @@ async fn cmd_test(
         Err(error) => failed_test_result("cleanup", cleanup_start.elapsed(), &error),
     };
     if !json_output {
-        finish_test_output(print_test_result(&cleanup_result, verbose), || {
-            client.close()
-        })?;
+        finish_test_output(
+            print_test_result(&cleanup_result, verbose),
+            client.close_with_cx(cx),
+        )
+        .await?;
     }
     results.push(cleanup_result);
 
@@ -4349,7 +4367,7 @@ async fn cmd_test(
         total_duration_ms,
     };
 
-    finish_test_output(write_test_report(&report, json_output), || client.close())?;
+    finish_test_output(write_test_report(&report, json_output), client.close_with_cx(cx)).await?;
 
     if all_passed {
         Ok(())
@@ -6043,7 +6061,8 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
         {
             let outcome =
                 run_yielding_stdio_task(cx, &mut client, connection, action, task_id, inputs).await;
-            finish_inspect_acquisition(outcome, || client.close())
+            let cleanup = client.close_with_cx(cx).await;
+            finish_inspect_acquisition(outcome, || cleanup)
         }
         #[cfg(not(unix))]
         {
@@ -6461,6 +6480,7 @@ async fn cmd_inspect(
         ))
     }
     .await;
+    let cleanup = client.close_with_cx(cx).await;
     let (
         server_info,
         capabilities,
@@ -6469,7 +6489,7 @@ async fn cmd_inspect(
         resource_templates,
         prompts,
         acquisition_truncated,
-    ) = finish_inspect_acquisition(inspection, || client.close())?;
+    ) = finish_inspect_acquisition(inspection, || cleanup)?;
     let protocol_status =
         InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
@@ -15807,21 +15827,21 @@ IFS= read -r end
         #[test]
         fn reality_check_regression_test_output_guard_closes_after_output_failure() {
             let cleanup_calls = std::cell::Cell::new(0_u8);
-            let value = finish_test_output(Ok(17_u8), || {
+            let value = fastmcp_core::block_on(finish_test_output(Ok(17_u8), async {
                 cleanup_calls.set(cleanup_calls.get() + 1);
                 Err(fastmcp_core::McpError::internal_error(
                     "cleanup must not run",
                 ))
-            })
+            }))
             .expect("successful incremental output keeps the client live");
             assert_eq!(value, 17);
             assert_eq!(cleanup_calls.get(), 0);
 
             let output_error = fastmcp_core::McpError::internal_error("output sentinel");
-            let error = finish_test_output::<(), _>(Err(output_error), || {
+            let error = fastmcp_core::block_on(finish_test_output::<(), _>(Err(output_error), async {
                 cleanup_calls.set(cleanup_calls.get() + 1);
                 Ok(())
-            })
+            }))
             .expect_err("failed output must be returned after verified cleanup");
             assert_eq!(error.message, "output sentinel");
             assert_eq!(cleanup_calls.get(), 1);
@@ -15877,16 +15897,16 @@ IFS= read -r end
 
         #[test]
         fn reality_check_regression_output_guard_preserves_output_and_cleanup_failures() {
-            let error = finish_test_output::<(), _>(
+            let error = fastmcp_core::block_on(finish_test_output::<(), _>(
                 Err(fastmcp_core::McpError::internal_error(
                     "output failure sentinel",
                 )),
-                || {
+                async {
                     Err(fastmcp_core::McpError::internal_error(
                         "cleanup failure sentinel",
                     ))
                 },
-            )
+            ))
             .expect_err("unverified cleanup must remain visible");
 
             assert!(fastmcp_client::is_cleanup_unverified(&error));
