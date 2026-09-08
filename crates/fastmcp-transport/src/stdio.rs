@@ -108,6 +108,7 @@ pub struct StdioTransport<R, W> {
     writer: Option<W>,
     codec: Codec,
     line_buffer: Vec<u8>,
+    line_in_progress: bool,
     closed: bool,
 }
 
@@ -122,6 +123,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             writer: Some(writer),
             codec: Codec::new(),
             line_buffer: Vec::with_capacity(4096),
+            line_in_progress: false,
             closed: false,
         }
     }
@@ -140,6 +142,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             writer,
             codec,
             line_buffer,
+            line_in_progress,
             closed,
         } = self;
         let mut send_codec = Codec::new();
@@ -153,9 +156,11 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
                     writer: Some(std::io::sink()),
                     codec,
                     line_buffer,
+                    line_in_progress,
                     closed,
                 },
                 terminal: Arc::clone(&terminal),
+                partial_frame_deadline: None,
             },
             StdioSendHalf {
                 writer,
@@ -190,7 +195,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
     #[must_use]
     pub fn last_received_frame(&self) -> Option<&[u8]> {
         let frame_len = self.frame_len();
-        (frame_len != 0).then(|| &self.line_buffer[..frame_len])
+        (!self.line_in_progress && frame_len != 0).then(|| &self.line_buffer[..frame_len])
     }
 
     /// Receives one blocking frame and reports its decode-completion instant.
@@ -208,7 +213,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         &mut self,
         cx: &Cx,
     ) -> Result<(JsonRpcMessage, Instant), TransportError> {
-        self.recv_with_readiness(cx, |_, _| Ok(()))
+        self.recv_with_readiness(cx, false, |_, _| Ok(()))
     }
 
     /// Receives one complete NDJSON frame and dispatches it by JSON-RPC
@@ -333,6 +338,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             self.closed = true;
         }
         self.line_buffer.clear();
+        self.line_in_progress = false;
         error
     }
 
@@ -342,6 +348,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         // must not retry and silently skip that frame.
         self.closed = true;
         self.line_buffer.clear();
+        self.line_in_progress = false;
         error
     }
 
@@ -350,12 +357,16 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
     fn read_line_with_readiness<F>(
         &mut self,
         cx: &Cx,
+        retain_on_slice_expiry: bool,
         wait_for_readiness: &mut F,
     ) -> Result<usize, TransportError>
     where
         F: FnMut(&BufReader<R>, &Cx) -> Result<(), TransportError>,
     {
-        self.line_buffer.clear();
+        if !self.line_in_progress {
+            self.line_buffer.clear();
+        }
+        self.line_in_progress = true;
         let max_frame_size = self.codec.max_message_size();
         let wire_limit = max_frame_size.saturating_add(2);
 
@@ -365,6 +376,13 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             }
 
             if let Err(error) = wait_for_readiness(&self.reader, cx) {
+                if retain_on_slice_expiry
+                    && matches!(error, TransportError::ReceiveDeadlineExceeded)
+                {
+                    // This is a scheduling boundary, not a frame deadline.
+                    // Keep the sole copy of the prefix for the next turn.
+                    return Err(error);
+                }
                 return Err(self.abort_pending_read(error));
             }
 
@@ -395,6 +413,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
                         frame_len,
                     )));
                 }
+                self.line_in_progress = false;
                 return Ok(frame_len);
             }
 
@@ -422,6 +441,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
                         frame_len,
                     )));
                 }
+                self.line_in_progress = false;
                 return Ok(frame_len);
             }
         }
@@ -430,6 +450,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
     fn recv_with_readiness<F>(
         &mut self,
         cx: &Cx,
+        retain_on_slice_expiry: bool,
         mut wait_for_readiness: F,
     ) -> Result<(JsonRpcMessage, Instant), TransportError>
     where
@@ -440,7 +461,11 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
         }
 
         loop {
-            let frame_len = match self.read_line_with_readiness(cx, &mut wait_for_readiness) {
+            let frame_len = match self.read_line_with_readiness(
+                cx,
+                retain_on_slice_expiry,
+                &mut wait_for_readiness,
+            ) {
                 Ok(frame_len) => frame_len,
                 Err(
                     error @ (TransportError::Closed
@@ -562,7 +587,7 @@ impl<R: Read + AsFd, W: Write> StdioTransport<R, W> {
         deadline: Option<Instant>,
     ) -> Result<(JsonRpcMessage, Instant), TransportError> {
         let mut never_stop = || false;
-        self.recv_with_readiness(cx, |reader, cx| {
+        self.recv_with_readiness(cx, false, |reader, cx| {
             wait_for_unix_readiness(reader, cx, deadline, &mut never_stop)
         })
     }
@@ -650,12 +675,25 @@ impl<R: Read + AsFd, W: Write> StdioTransport<R, W> {
         &mut self,
         cx: &Cx,
         deadline: Option<Instant>,
+        should_stop: F,
+    ) -> Result<(JsonRpcMessage, Instant), TransportError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.recv_until_or_stopped_with_policy(cx, deadline, false, should_stop)
+    }
+
+    fn recv_until_or_stopped_with_policy<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+        retain_on_slice_expiry: bool,
         mut should_stop: F,
     ) -> Result<(JsonRpcMessage, Instant), TransportError>
     where
         F: FnMut() -> bool,
     {
-        let result = self.recv_with_readiness(cx, |reader, cx| {
+        let result = self.recv_with_readiness(cx, retain_on_slice_expiry, |reader, cx| {
             wait_for_unix_readiness(reader, cx, deadline, &mut should_stop)
         });
         let completed = match result {
@@ -861,6 +899,9 @@ pub struct StdioRecvHalf<R> {
     // remain identical to `StdioTransport::recv`.
     transport: StdioTransport<R, std::io::Sink>,
     terminal: Arc<AtomicBool>,
+    // Retain the hard bound with the prefix even if the request owner times
+    // out or is dropped before the next ingress turn.
+    partial_frame_deadline: Option<Instant>,
 }
 
 impl<R> StdioRecvHalf<R> {
@@ -896,6 +937,9 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
         }
 
         let result = self.transport.recv(cx);
+        if !self.transport.line_in_progress || self.transport.is_closed() {
+            self.partial_frame_deadline = None;
+        }
         let sibling_closed = self.terminal.load(Ordering::Acquire);
         let receiver_closed = self.transport.is_closed();
         let clean_eof =
@@ -911,6 +955,7 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
 
     fn close(&mut self) -> Result<(), TransportError> {
         self.terminal.store(true, Ordering::Release);
+        self.partial_frame_deadline = None;
         self.transport.close()
     }
 }
@@ -948,17 +993,72 @@ impl<R: Read + AsFd> StdioRecvHalf<R> {
         cx: &Cx,
         deadline: Option<Instant>,
     ) -> Result<JsonRpcMessage, TransportError> {
+        self.recv_until_or_closed_with_policy(cx, deadline, false)
+    }
+
+    /// Receives for one cooperative polling turn, retaining a bounded prefix.
+    ///
+    /// `Ok(None)` means the slice expired before a complete frame arrived.
+    /// A later receive resumes that frame, including when switching back to
+    /// [`Self::recv_until_or_closed`] for a real request deadline. Partial
+    /// input is never exposed as an admitted source frame. Cancellation,
+    /// shared terminal state, I/O failures and size limits keep their ordinary
+    /// terminal behavior. This bounds readiness waits on ordinary Unix pipes;
+    /// it cannot preempt an arbitrary blocking `Read` implementation.
+    /// `frame_deadline` is a hard request bound, retained with any prefix even
+    /// if later turns omit it or supply a later deadline. Complete frames
+    /// retain the completion semantics of [`Self::recv_until_or_closed`].
+    pub fn recv_slice_or_closed(
+        &mut self,
+        cx: &Cx,
+        slice_deadline: Instant,
+        frame_deadline: Option<Instant>,
+    ) -> Result<Option<JsonRpcMessage>, TransportError> {
+        let hard_deadline = match (self.partial_frame_deadline, frame_deadline) {
+            (Some(retained), Some(current)) => Some(retained.min(current)),
+            (retained, current) => retained.or(current),
+        };
+        let soft_expiry = hard_deadline.is_none_or(|hard| slice_deadline < hard);
+        let deadline = hard_deadline.map_or(slice_deadline, |hard| slice_deadline.min(hard));
+        match self.recv_until_or_closed_with_policy(cx, Some(deadline), soft_expiry) {
+            Err(TransportError::ReceiveDeadlineExceeded) if soft_expiry && !self.is_closed() => {
+                if !self.transport.line_buffer.is_empty() {
+                    self.partial_frame_deadline = hard_deadline;
+                }
+                Ok(None)
+            }
+            result => result.map(Some),
+        }
+    }
+
+    fn recv_until_or_closed_with_policy(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+        retain_on_slice_expiry: bool,
+    ) -> Result<JsonRpcMessage, TransportError> {
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
 
+        let deadline = match (self.partial_frame_deadline, deadline) {
+            (Some(retained), Some(current)) => Some(retained.min(current)),
+            (retained, current) => retained.or(current),
+        };
+        let retain_on_slice_expiry = retain_on_slice_expiry
+            && self
+                .partial_frame_deadline
+                .is_none_or(|hard| deadline.is_some_and(|deadline| deadline < hard));
         let terminal = Arc::clone(&self.terminal);
         let result = self
             .transport
-            .recv_until_or_stopped_with_completion(cx, deadline, || {
+            .recv_until_or_stopped_with_policy(cx, deadline, retain_on_slice_expiry, || {
                 terminal.load(Ordering::Acquire)
             })
             .map(|(message, _completed_at)| message);
+        if !self.transport.line_in_progress || self.transport.is_closed() {
+            self.partial_frame_deadline = None;
+        }
         let sibling_closed = self.terminal.load(Ordering::Acquire);
         let receiver_closed = self.transport.is_closed();
         let clean_eof =
@@ -1991,6 +2091,172 @@ mod tests {
         assert!(matches!(result, Err(TransportError::Cancelled)));
         assert!(checks.get() >= 3);
         assert!(transport.closed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_slice_retains_partial_frame_and_exact_source() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        let (mut receiver, _sender) = StdioTransport::new(reader, Vec::new()).into_split();
+        let cx = Cx::for_testing();
+        let hard = Instant::now() + Duration::from_secs(2);
+        let prefix = br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#;
+        peer.write_all(prefix).unwrap();
+        for _ in 0..3 {
+            assert!(
+                receiver
+                    .recv_slice_or_closed(
+                        &cx,
+                        Instant::now() + Duration::from_millis(2),
+                        Some(hard)
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!receiver.is_closed());
+            assert_eq!(receiver.transport.line_buffer, prefix);
+            assert!(receiver.last_received_frame().is_none());
+        }
+        // An exponent and CRLF straddle turns. Empty lines and a second frame
+        // must not duplicate or overwrite the retained first frame.
+        peer.write_all(b"25e+2}}\r").unwrap();
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), Some(hard))
+                .unwrap()
+                .is_none()
+        );
+        peer.write_all(b"\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":2}\n")
+            .unwrap();
+        let message = receiver
+            .recv_slice_or_closed(&cx, hard, Some(hard))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(message, JsonRpcMessage::Response(_)));
+        assert_eq!(
+            receiver.last_received_frame(),
+            Some(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1.25e+2}}"#.as_slice())
+        );
+        assert!(receiver.partial_frame_deadline.is_none());
+        let second = receiver.recv_until_or_closed(&cx, Some(hard)).unwrap();
+        assert!(
+            matches!(second, JsonRpcMessage::Request(request) if request.id == Some(2_i64.into()))
+        );
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_slice_hard_deadline_closes_retained_prefix() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        let (mut receiver, mut sender) = StdioTransport::new(reader, Vec::new()).into_split();
+        let cx = Cx::for_testing();
+        let hard = Instant::now() + Duration::from_millis(30);
+        peer.write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#)
+            .unwrap();
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), Some(hard))
+                .unwrap()
+                .is_none()
+        );
+        // Removing the request owner must not remove its retained frame bound.
+        assert!(matches!(
+            receiver.recv_slice_or_closed(&cx, hard + Duration::from_secs(1), None),
+            Err(TransportError::ReceiveDeadlineExceeded)
+        ));
+        assert!(receiver.is_closed());
+        assert!(receiver.transport.line_buffer.is_empty());
+        assert!(receiver.last_received_frame().is_none());
+        assert!(matches!(
+            sender.send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2))
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert!(sender.writer.as_ref().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_slice_cancelled_context_closes_retained_prefix() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        let (mut receiver, sender) = StdioTransport::new(reader, Vec::new()).into_split();
+        let cx = Cx::for_testing();
+        peer.write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#)
+            .unwrap();
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), None)
+                .unwrap()
+                .is_none()
+        );
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            receiver.recv_slice_or_closed(&cx, Instant::now() + Duration::from_secs(1), None),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(receiver.is_closed());
+        assert!(sender.is_closed());
+        assert!(receiver.transport.line_buffer.is_empty());
+        assert!(receiver.last_received_frame().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_slice_enforces_size_limit_across_turns() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        let mut transport = StdioTransport::new(reader, Vec::new());
+        transport.codec.set_max_message_size(40);
+        let (mut receiver, sender) = transport.into_split();
+        let cx = Cx::for_testing();
+        peer.write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#)
+            .unwrap();
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.transport.line_buffer.len() <= 42);
+        peer.write_all(b"25e+2}}\n").unwrap();
+        assert!(matches!(
+            receiver.recv_slice_or_closed(&cx, Instant::now() + Duration::from_secs(1), None),
+            Err(TransportError::Codec(CodecError::MessageTooLarge(_)))
+        ));
+        assert!(receiver.is_closed());
+        assert!(sender.is_closed());
+        assert!(receiver.transport.line_buffer.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_slice_preserves_split_close() {
+        let (mut peer, reader) = UnixStream::pair().unwrap();
+        let (mut receiver, mut sender) = StdioTransport::new(reader, Vec::new()).into_split();
+        let cx = Cx::for_testing();
+        peer.write_all(br#"{"jsonrpc":"2.0","id":1,"result":{"n":1."#)
+            .unwrap();
+        assert!(
+            receiver
+                .recv_slice_or_closed(&cx, Instant::now() + Duration::from_millis(2), None)
+                .unwrap()
+                .is_none()
+        );
+        sender.close().unwrap();
+        peer.write_all(b"25e+2}}\n").unwrap();
+        assert!(matches!(
+            receiver.recv_slice_or_closed(&cx, Instant::now() + Duration::from_secs(1), None),
+            Err(TransportError::Closed)
+        ));
+        assert!(receiver.is_closed());
+        assert!(receiver.last_received_frame().is_none());
     }
 
     #[cfg(unix)]
