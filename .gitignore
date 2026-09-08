@@ -78,3 +78,17 @@ beads_compliance_audit/
 
 # Isolated worktree-verify clones; never product source.
 .wm-verify*/
+
+# Isolated cargo target trees named after agents/worktrees (not `/target`).
+# `**/target/` only matches a directory literally named `target`.
+/target-*/
+
+# Agent polish dumps and timestamped beads/jsonl sync backups.
+.beads_polish_tmp/
+.fastmcp_temp_sync_backup/
+
+# One-off FND-01 provision wrapper (run scratch; `.fnd01-run/` already ignored).
+.fnd01-provision-and-run.sh
+
+# Accidental empty sibling-repo placeholder dropped at the repo root.
+/rich_rust
