@@ -617,6 +617,10 @@ impl ClientBuilder {
     /// modern probe during connection so a recognized refusal can be followed
     /// only by a fresh exact-legacy subprocess. Fixed modern and legacy plans
     /// retain deferred initialization.
+    /// On Unix, async request methods and `Client::ensure_initialized_with_cx`
+    /// yield during this first handshake. Dropping the first-use future retains
+    /// its request and deadline for the next call; synchronous methods resume
+    /// the same handshake with their usual blocking behavior.
     ///
     /// Default is `false` (initialize immediately on connect).
     ///
@@ -1162,7 +1166,7 @@ impl ClientBuilder {
                 match builder.initialize_timeout_policy_for_retry_deadline(retry_deadline) {
                     Ok(policy) => {
                         client.timeout_policy = policy;
-                        client.initialize_yielding(cx, probing).await
+                        client.initialize_yielding(cx, probing, None).await
                     }
                     Err(error) => Err(error),
                 };
@@ -2048,6 +2052,297 @@ exec sleep 5
     #[test]
     fn client_connect_yielding_auto_rejects_wrong_id() {
         yielding_connect_probe(ProtocolPolicy::Auto, "wrong-id", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    async fn deferred_probe_request(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &crate::McpRequestCancellation,
+        api: &str,
+    ) -> McpResult<()> {
+        match api {
+            "raw" => {
+                let response = client.request_with_cx(cx, "ping", None).await?;
+                assert_eq!(response.result, Some(serde_json::json!({})));
+                assert!(response.error.is_none());
+            }
+            "core" => {
+                let result = client
+                    .request_core_with_cx(cx, cancellation, "tools/list", serde_json::json!({}))
+                    .await?;
+                match result {
+                    crate::CoreResult::Legacy(crate::LegacyCoreResult::ToolsList(result)) => {
+                        assert!(result.tools.is_empty());
+                    }
+                    crate::CoreResult::Final(crate::FinalCoreResult::ToolsList {
+                        result, ..
+                    }) => {
+                        assert!(result.payload.tools.is_empty());
+                    }
+                    other => panic!("unexpected deferred catalog result: {other:?}"),
+                }
+            }
+            "legacy" => {
+                let result = client
+                    .request_legacy_core_with_cx(cx, crate::LegacyCoreRequest::Ping)
+                    .await?;
+                assert!(matches!(result, crate::LegacyCoreResult::Ping(_)));
+            }
+            "initialize" => {
+                client.ensure_initialized_with_cx(cx).await?;
+                client.ping_with_cx(cx, cancellation).await?;
+            }
+            #[cfg(feature = "tasks")]
+            "tasks" => {
+                let task = client
+                    .get_task_final_with_cx(
+                        cx,
+                        cancellation,
+                        crate::FinalTaskId::parse("task-1").unwrap(),
+                    )
+                    .await?;
+                assert_eq!(task.task.base().task_id.as_str(), "task-1");
+                assert!(matches!(task.task, crate::FinalTask::Working { .. }));
+            }
+            _ => client.ping_with_cx(cx, cancellation).await?,
+        }
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn deferred_initialization_probe(
+        policy: ProtocolPolicy,
+        mode: &'static str,
+        api: &'static str,
+    ) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let events = StdioRetryAttemptLog::new(mode);
+                let script = r#"
+printf 'spawn:%s\n' "$$" >> "$1"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+case "$first" in *server/discover*) era=modern;; *initialize*2024-11-05*) era=legacy;; *) exit 92;; esac
+printf 'handshake:%s\n' "$era" >> "$1"
+case "$2" in silent|close) exec sleep 5;; esac
+printf '%s' '{"jsonrpc":"2.0",'
+if [ "$2" = partial ]; then exec sleep 5; fi
+sleep 0.4
+if [ "$2" = invalid ]; then
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{},"serverInfo":{"name":"invalid-peer","version":"1"}}}'
+    exec sleep 5
+fi
+if [ "$era" = modern ]; then
+    printf '%s\n' '"id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"deferred-peer","version":"1"}}}}'
+else
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"deferred-peer","version":"1"}}}'
+    IFS= read -r initialized || exit 93
+    case "$initialized" in *notifications/initialized*) ;; *) exit 94;; esac
+fi
+IFS= read -r request || exit 95
+printf 'request:%s\n' "$request" >> "$1"
+case "$request" in *'"id":2'*) ;; *) exit 96;; esac
+case "$request" in
+    *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}';;
+    *'"method":"tasks/get"'*)
+        case "$request" in *'"taskId":"task-1"'*'"id":2'*) ;; *) exit 98;; esac
+        case "$request" in *'"extensions":{"io.modelcontextprotocol/tasks":{}}'*) ;; *) exit 99;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"working","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null}}';;
+    *'"method":"tools/list"'*)
+        if [ "$era" = modern ]; then
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
+        else
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+        fi;;
+    *) exit 97;;
+esac
+exec sleep 5
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .auto_initialize(true)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(
+                        Duration::from_millis(900), Duration::from_millis(900),
+                    ).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode], &cx)
+                    .await.unwrap();
+                assert!(!client.is_initialized());
+                let mut cancellation = crate::McpRequestCancellation::new();
+                if mode.starts_with("pre-") {
+                    if mode == "pre-token" { cancellation.cancel(); } else { cx.set_cancel_requested(true); }
+                    let error = deferred_probe_request(&mut client, &cx, &cancellation, api).await.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert!(client.pending_initialization.is_none());
+                    assert!(!client.is_initialized());
+                    assert!(!events.lines().iter().any(|line| line.starts_with("handshake:")));
+                    cx.set_cancel_requested(false);
+                    cancellation = crate::McpRequestCancellation::new();
+                }
+                let worker = std::thread::current().id();
+                let started = Instant::now();
+                let mut first_use = Box::pin(deferred_probe_request(&mut client, &cx, &cancellation, api));
+                let first = std::future::poll_fn(|task_cx| Poll::Ready(first_use.as_mut().poll(task_cx))).await;
+                assert!(first.is_pending(), "deferred first use must yield before initialization completes");
+                assert!(started.elapsed() < Duration::from_millis(250), "deferred initialization occupied the caller worker");
+                let path = events.path.clone();
+                let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 { return 1_u8; }
+                        assert!(Instant::now() < deadline, "child never received initialization");
+                        asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
+                    }
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                let result = if matches!(mode, "drop-async" | "drop-sync" | "partial" | "silent" | "close") {
+                    drop(first_use);
+                    assert!(!client.is_initialized());
+                    assert!(client.pending_initialization.is_some());
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    if mode == "close" {
+                        client.close_with_cx(&cx).await.unwrap();
+                        Err(client.ensure_initialized_with_cx(&cx).await.unwrap_err())
+                    } else {
+                        if matches!(mode, "partial" | "silent") {
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(1000)).await;
+                        }
+                        let resumed = Instant::now();
+                        if mode == "drop-sync" { client.ensure_initialized().unwrap(); }
+                        let result = deferred_probe_request(&mut client, &cx, &cancellation, api).await;
+                        if matches!(mode, "partial" | "silent") {
+                            assert!(resumed.elapsed() < Duration::from_millis(250), "resumption restarted the handshake deadline");
+                        }
+                        result
+                    }
+                } else {
+                    if mode == "cancel-token" { cancellation.cancel(); }
+                    if mode == "cancel-cx" { cx.set_cancel_requested(true); }
+                    let result = first_use.await;
+                    cx.set_cancel_requested(false);
+                    result
+                };
+                if matches!(mode, "partial" | "silent" | "invalid" | "close" | "cancel-token" | "cancel-cx") {
+                    let error = result.expect_err("interrupted or invalid initialization cannot expose a selected client");
+                    if mode.starts_with("cancel-") { assert_eq!(error.code, McpErrorCode::RequestCancelled); }
+                    if matches!(mode, "partial" | "silent") {
+                        assert_eq!(error.data, Some(serde_json::json!({"timeoutSource":"absolute"})));
+                    }
+                    assert!(!client.is_initialized());
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    assert!(client.ensure_initialized_with_cx(&cx).await.is_err());
+                    assert!(client.ensure_initialized().is_err());
+                    assert!(!events.lines().iter().any(|line| line.starts_with("request:")));
+                } else {
+                    result.unwrap();
+                    assert!(client.is_initialized());
+                    assert!(client.pending_initialization.is_none());
+                    assert_eq!(client.session.server_info().name, "deferred-peer");
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 3);
+                    assert_eq!(events.lines().iter().filter(|line| line.starts_with("request:")).count(), 1);
+                }
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(client.child.is_none());
+                let lines = events.lines();
+                assert_eq!(lines.iter().filter(|line| line.starts_with("handshake:")).count(), 1);
+                let pids = lines.iter().filter_map(|line| line.strip_prefix("spawn:")).collect::<Vec<_>>();
+                assert_eq!(pids.len(), 1);
+                #[cfg(target_os = "linux")]
+                assert!(!PathBuf::from(format!("/proc/{}", pids[0])).exists());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_yielding_legacy_positive() {
+        for api in ["ping", "raw", "core", "legacy", "initialize"] {
+            deferred_initialization_probe(ProtocolPolicy::LegacyOnly, "positive", api);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_yielding_modern_positive() {
+        for api in ["ping", "raw", "core", "initialize"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, "positive", api);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_drop_resume_async() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "drop-async", "core");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_drop_resume_sync() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "drop-sync", "core");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_deadline_not_restarted() {
+        for mode in ["partial", "silent"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_cancel_stays_terminal() {
+        for mode in ["cancel-token", "cancel-cx"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_pre_cancel_leaves_handshake_unsent() {
+        for mode in ["pre-token", "pre-cx"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_rejects_invalid_initialization() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "invalid", "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_close_pending_handshake() {
+        deferred_initialization_probe(ProtocolPolicy::ModernOnly, "close", "ping");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05", feature = "tasks"))]
+    #[test]
+    fn client_deferred_tasks_yielding_positive() {
+        for mode in ["positive", "drop-async", "cancel-token", "pre-token"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "tasks");
+        }
     }
 
     #[cfg(unix)]

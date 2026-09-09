@@ -13879,6 +13879,9 @@ pub struct Client {
     /// Terminal auto-initialization failure, preventing lifecycle retries on
     /// the same subprocess connection.
     initialization_error: Option<McpError>,
+    /// The client, rather than a first-use future, owns a committed handshake.
+    /// Dropping that future cannot abandon its response or restart its budget.
+    pending_initialization: Option<PendingClientInitialization>,
     /// Final logging configuration included in metadata of later modern
     /// requests. Exact legacy sessions send the historical RPC instead.
     final_log_level: Option<LoggingLevel>,
@@ -13897,6 +13900,13 @@ enum ClientInitialization {
         server_info: ServerInfo,
         discovery: ServerDiscoverResult,
     },
+}
+
+struct PendingClientInitialization {
+    waiter: ResponseWaiter,
+    deadlines: RequestDeadlines,
+    admitted_ingress: bool,
+    modern: bool,
 }
 
 impl ClientInitialization {
@@ -14321,6 +14331,7 @@ impl Client {
             auto_initialize: false,
             initialized: AtomicBool::new(false),
             initialization_error: None,
+            pending_initialization: None,
             final_log_level: None,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         };
@@ -14518,6 +14529,7 @@ impl Client {
             auto_initialize: false,
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
+            pending_initialization: None,
             final_log_level: None,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         };
@@ -14591,6 +14603,7 @@ impl Client {
             auto_initialize: true,
             initialized: AtomicBool::new(false),
             initialization_error: None,
+            pending_initialization: None,
             final_log_level: None,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         }
@@ -14622,6 +14635,21 @@ impl Client {
             return Err(error.clone());
         }
 
+        // An async first-use future may have been dropped after committing
+        // the handshake. Synchronous callers resume its original waiter and
+        // deadline, rather than issuing a second initialize/discover request.
+        if self.pending_initialization.is_some() {
+            let cx = self.cx.clone();
+            loop {
+                match self.poll_pending_initialization(&cx, false, false) {
+                    Ok(std::task::Poll::Ready(None)) => return Ok(()),
+                    Ok(std::task::Poll::Pending) => {}
+                    Ok(std::task::Poll::Ready(Some(_))) => unreachable!("fallback is disabled"),
+                    Err(error) => return Err(self.record_initialization_failure(error)),
+                }
+            }
+        }
+
         // Perform initialization
         let client_info = self.session.client_info().clone();
         let capabilities = self.session.client_capabilities().clone();
@@ -14634,23 +14662,98 @@ impl Client {
             .map_err(|error| self.record_initialization_failure(error))
     }
 
-    /// The async builder owns this provisional client across every await.
-    /// Dropping construction therefore drops the client and its child owner;
-    /// an interrupted handshake is never returned for a second initialization.
+    /// Initializes a deferred Unix stdio client in bounded receive turns.
+    ///
+    /// Dropping this future preserves the committed handshake in the client.
+    /// A later initialization or request resumes the same response and original
+    /// deadline. Explicit cancellation after commitment fails the connection;
+    /// cancellation before starting leaves it untouched. Reads yield on the
+    /// caller runtime; writes and subprocess operations remain bounded
+    /// synchronous operations.
+    #[cfg(unix)]
+    pub async fn ensure_initialized_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        self.ensure_initialized_with_cancellation(cx, None).await
+    }
+
+    #[cfg(unix)]
+    async fn ensure_initialized_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> McpResult<()> {
+        if let Some(error) = self.responses.terminal_error() {
+            return Err(error);
+        }
+        if let Some(error) = &self.initialization_error {
+            return Err(error.clone());
+        }
+        let cancelled = cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested);
+        if cancelled && self.pending_initialization.is_none() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.initialized.load(Ordering::SeqCst) {
+            return self.ensure_initialized();
+        }
+        // Keep the cold handshake/cleanup future out of every ordinary RPC's
+        // concrete type. Deep proxy/CLI consumers otherwise exceed the Send
+        // trait solver's recursion bound. Initialized requests allocate nothing.
+        let initialization: Pin<Box<dyn Future<Output = McpResult<()>> + Send + '_>> =
+            Box::pin(async move {
+                match self.initialize_yielding(cx, false, cancellation).await {
+                    Ok(None) => Ok(()),
+                    Ok(Some(_)) => unreachable!("retained clients cannot select a fallback child"),
+                    Err(error) => {
+                        // Publish terminal state before cleanup's first await.
+                        // A dropped cleanup cannot permit reinitialization.
+                        self.responses.fail_all(error.clone());
+                        self.initialization_error = Some(error.clone());
+                        self.pending_initialization = None;
+                        let cleanup = self.close_with_cx(cx).await;
+                        combine_operation_and_cleanup(Err(error), cleanup)
+                    }
+                }
+            });
+        initialization.await
+    }
+
+    /// Eager construction and retained first-use share one receive policy.
+    /// All handshake state survives in `self` before every suspension point.
     #[cfg(unix)]
     async fn initialize_yielding(
         &mut self,
         cx: &Cx,
         auto_probe: bool,
+        cancellation: Option<&McpRequestCancellation>,
     ) -> McpResult<Option<AutoStdioFallbackSignal>> {
-        self.timeout_policy.validate()?;
-        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-        let modern = self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly;
-        if auto_probe && !modern {
+        if auto_probe && self.session.protocol_plan().policy() != ProtocolPolicy::ModernOnly {
             return Err(McpError::internal_error(
                 "Auto stdio probe requires a modern-only client session",
             ));
         }
+        loop {
+            if cx.checkpoint().is_err()
+                || self.cx.checkpoint().is_err()
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            {
+                return Err(McpError::request_cancelled());
+            }
+            if self.pending_initialization.is_none() {
+                self.pending_initialization = Some(self.start_initialization(cx)?);
+            }
+            if let std::task::Poll::Ready(result) =
+                self.poll_pending_initialization(cx, auto_probe, true)?
+            {
+                return Ok(result);
+            }
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn start_initialization(&mut self, cx: &Cx) -> McpResult<PendingClientInitialization> {
+        self.timeout_policy.validate()?;
+        let modern = self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly;
         let (method, params) = if modern {
             let params =
                 serde_json::to_value(ServerDiscoverRequest::default()).map_err(|error| {
@@ -14679,36 +14782,52 @@ impl Client {
         let request_id = RequestId::Number(
             i64::try_from(id).expect("request ID allocator enforces the i64 bound"),
         );
-        let mut waiter = self.responses.register(request_id.clone())?;
+        let waiter = self.responses.register(request_id.clone())?;
         let request = JsonRpcRequest::new(method, Some(params), request_id.clone());
         if let Err(error) = self.send_to_server_with_cx(cx, &JsonRpcMessage::Request(request)) {
             return Err(self.record_send_failure(Some(&request_id), error));
         }
         let deadlines = RequestDeadlines::start_at(self.timeout_policy, Instant::now())
             .map_err(|error| self.finish_committed_request_locally(&request_id, error))?;
-        let mut admitted_ingress = false;
-        let received = loop {
-            if let Some(result) = self.poll_initialization_response(
-                cx,
-                &mut waiter,
-                deadlines,
-                &mut admitted_ingress,
-                auto_probe,
-                true,
-            )? {
-                match result {
-                    Ok(response) => break response,
-                    Err(signal) => return Ok(Some(signal)),
-                }
+        Ok(PendingClientInitialization {
+            waiter,
+            deadlines,
+            admitted_ingress: false,
+            modern,
+        })
+    }
+
+    fn poll_pending_initialization(
+        &mut self,
+        cx: &Cx,
+        auto_probe: bool,
+        cooperative: bool,
+    ) -> McpResult<std::task::Poll<Option<AutoStdioFallbackSignal>>> {
+        let mut pending = self
+            .pending_initialization
+            .take()
+            .expect("the initialization request was committed before receiving");
+        let received = match self.poll_initialization_response(
+            cx,
+            &mut pending.waiter,
+            pending.deadlines,
+            &mut pending.admitted_ingress,
+            auto_probe,
+            cooperative,
+        )? {
+            Some(Ok(response)) => response,
+            Some(Err(signal)) => return Ok(std::task::Poll::Ready(Some(signal))),
+            None => {
+                self.pending_initialization = Some(pending);
+                return Ok(std::task::Poll::Pending);
             }
-            asupersync::runtime::yield_now().await;
         };
         let mut response = received.response;
         if let Some(error) = response.error.take() {
             if auto_probe && error.code.as_i32() == Some(-32_601) {
-                return Ok(Some(
+                return Ok(std::task::Poll::Ready(Some(
                     AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
-                ));
+                )));
             }
             return Err(json_rpc_error_to_mcp(error));
         }
@@ -14716,7 +14835,7 @@ impl Client {
             .result
             .take()
             .ok_or_else(|| McpError::internal_error("No result in response"))?;
-        let initialization = if modern {
+        let initialization = if pending.modern {
             self.decode_modern_discovery_initialization(ReceivedPreparedResult {
                 result,
                 raw_result: received.raw_result,
@@ -14729,7 +14848,7 @@ impl Client {
         };
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         self.complete_initialization(initialization)?;
-        Ok(None)
+        Ok(std::task::Poll::Ready(None))
     }
 
     /// Completes a disposable modern Auto probe without flattening its sole
@@ -15788,6 +15907,7 @@ impl Client {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<(JsonRpcResponse, Option<String>)> {
+        self.ensure_initialized_with_cx(cx).await?;
         let executor = self.multiplexed_stdio_executor()?;
         let connection_cx = self.cx.clone();
         if cx.checkpoint().is_err() {
@@ -15848,6 +15968,7 @@ impl Client {
         cx: &Cx,
         request: LegacyCoreRequest,
     ) -> McpResult<LegacyCoreResult> {
+        self.ensure_initialized_with_cx(cx).await?;
         self.require_legacy_exact_result_session(request.method())?;
         let request = CoreRequest::Legacy(request);
         let method = request.method();
@@ -21676,7 +21797,9 @@ impl Client {
         method: &str,
         parameters: serde_json::Value,
     ) -> McpResult<CoreResult> {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        if (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
+            && self.pending_initialization.is_none()
+        {
             return Err(McpError::request_cancelled());
         }
         if !matches!(
@@ -21694,7 +21817,8 @@ impl Client {
                 "Method is not an ordinary core catalog, content or completion request",
             ));
         }
-        self.ensure_initialized()?;
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
         let parameters = self.prepare_request_parameters(parameters)?;
         #[cfg(feature = "tasks")]
         let parameters = {
@@ -21732,10 +21856,8 @@ impl Client {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
     ) -> McpResult<()> {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            return Err(McpError::request_cancelled());
-        }
-        self.ensure_initialized()?;
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
         let parameters = self.prepare_request_parameters(serde_json::json!({}))?;
         self.send_yielding_prepared_request(cx, cancellation, "ping", Some(parameters))
             .await?;
@@ -21879,9 +22001,8 @@ impl Client {
         parameters: serde_json::Value,
         task: Option<&FinalTask>,
     ) -> McpResult<R> {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            return Err(McpError::request_cancelled());
-        }
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
         let mut request = self.start_yielding_final_task_request(cx, method, parameters, task)?;
         loop {
             let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();

@@ -401,9 +401,13 @@ notification on a request that actually supplied a progress token can reset idle
 On Unix, eager `ClientBuilder::connect_stdio_with_cx` initialization also
 yields between bounded receive turns, including partial responses and Auto
 negotiation. A fallback child starts only after the disposable modern child
-has been cleaned up. Synchronous constructors and deferred initialization
-on a synchronous first use retain their blocking boundaries; subprocess
-creation and write commits remain synchronous.
+has been cleaned up. With `auto_initialize(true)`, async requests and
+`Client::ensure_initialized_with_cx` also yield during the first handshake.
+Dropping that future preserves the handshake, partial response and original
+deadline; the next async or synchronous call resumes it without another send.
+Explicit cancellation after the handshake starts fails the connection.
+Synchronous constructors and synchronous first use retain their blocking
+boundaries; subprocess creation and write commits remain synchronous.
 
 ```rust
 use std::time::Duration;
