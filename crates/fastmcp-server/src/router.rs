@@ -27,6 +27,7 @@ use crate::handler::{
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use crate::proxy::ProxyFinalTaskRelay;
 use crate::session::SessionPrincipalBinding;
+use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(test)]
 use asupersync::time::wall_now;
 use asupersync::types::Time;
@@ -1793,6 +1794,41 @@ fn handler_budget_error(ctx: &McpContext, budget: Budget) -> Option<McpError> {
 /// requests (including a valid zero poll balance).
 fn request_cx_cancellation_is_visible(request_cx: &Cx) -> bool {
     request_cx.is_cancel_requested() && request_cx.checkpoint().is_err()
+}
+
+/// Keeps custody of an admission result even if dispatch is dropped while
+/// the scheduler is opening the region. `ChildRegionOpening` itself has no
+/// drop cleanup in the pinned runtime. The short, parent-owned task consumes
+/// that result and drops the region (requesting close) if its receiver left.
+async fn open_modern_request_region(ctx: &McpContext) -> McpResult<Option<ChildRegion>> {
+    let budget = ctx.budget();
+    let admission = ctx.cx().spawn(move |admission_cx| async move {
+        admission_cx
+            .open_child_region(ChildRegionSpec::inherit().with_budget(budget))
+            .await
+    });
+    let mut admission = match admission {
+        // Direct callers without a runtime retain the existing inline path.
+        // A live runtime's closed region or exhausted quota must not fall back.
+        Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => return Ok(None),
+        Err(_) => {
+            return Err(McpError::internal_error(
+                "modern request region admission could not be scheduled",
+            ));
+        }
+        Ok(admission) => admission,
+    };
+    // poll_join does not charge/checkpoint the ambient context, unlike a
+    // cancellable channel receive. Dropping this handle only detaches its
+    // observation; publication drops a returned ChildRegion if the receiver
+    // left. Do not create/drop a cancelling JoinFuture during admission.
+    match std::future::poll_fn(|task_cx| admission.poll_join(task_cx)).await {
+        Ok(Ok(region)) => Ok(Some(region)),
+        Err(asupersync::runtime::JoinError::Cancelled(_)) => Err(McpError::request_cancelled()),
+        Ok(Err(_)) | Err(_) => Err(McpError::internal_error(
+            "modern request child region could not be opened",
+        )),
+    }
 }
 
 fn sanitized_handler_panic(_request_lifetime: &Cx, handler_class: &'static str) -> McpError {
@@ -4048,12 +4084,12 @@ impl Router {
 
     /// Dispatches one modern request in a request-owned structured child task.
     ///
-    /// The caller owns the returned future. It owns exactly one child task,
-    /// waits for that task to finish, and cancellation of that wait aborts the
-    /// child through `TaskHandle::join` before control returns. No task is
-    /// detached: a result is produced only after the handler task has reached a
-    /// terminal state. The child Cx is propagated to the modern handler hooks
-    /// so their nested work remains in the same request lifetime.
+    /// With a runtime-backed context, the caller owns a child region containing
+    /// the handler task and descendants spawned through the explicit in-request
+    /// Cx. Returning awaits their quiescent close; dropping the future requests
+    /// close without claiming that cleanup has already finished. Request-local
+    /// cancellation affects this subtree, never sibling requests. Direct callers
+    /// without a runtime gateway retain the inline dispatch path.
     pub(crate) async fn dispatch_stateless_owned(
         self: Arc<Self>,
         request_ctx: McpContext,
@@ -4101,48 +4137,80 @@ impl Router {
             return Err(error);
         }
 
+        let Some(region) = open_modern_request_region(&request_ctx).await? else {
+            return self
+                .dispatch_stateless_in_request(
+                    &request_ctx,
+                    request_ctx.cx(),
+                    &request,
+                    raw_params.as_deref(),
+                    &continuation_cancellation,
+                )
+                .await;
+        };
         let join_cx = request_ctx.cx().clone();
         let dispatch_ctx = request_ctx.clone();
-        let spawn_self = Arc::clone(&self);
-        let spawn_request = request.clone();
-        let spawn_raw_params = raw_params.clone();
-        let spawn_continuation_cancellation = continuation_cancellation.clone();
-        let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
-            spawn_self
-                .dispatch_stateless_in_request(
-                    &dispatch_ctx,
-                    &child_cx,
-                    &spawn_request,
-                    spawn_raw_params.as_deref(),
-                    &spawn_continuation_cancellation,
-                )
-                .await
-        }) {
+        let task = region.cx().spawn(move |child_cx| async move {
+            self.dispatch_stateless_in_request(
+                &dispatch_ctx,
+                &child_cx,
+                &request,
+                raw_params.as_deref(),
+                &continuation_cancellation,
+            )
+            .await
+        });
+        let mut task = match task {
             Ok(task) => task,
-            // A context without a spawn gateway (lab/test contexts, plain
-            // synchronous callers) cannot host the request-owned child; the
-            // in-request dispatch on the caller's own Cx preserves the same
-            // cancellation observations without child isolation. Every other
-            // spawn failure (region closed, quota) stays a scheduling error.
-            Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
-                return self
-                    .dispatch_stateless_in_request(
-                        &request_ctx,
-                        request_ctx.cx(),
-                        &request,
-                        raw_params.as_deref(),
-                        &continuation_cancellation,
-                    )
-                    .await;
-            }
-            Err(_error) => {
+            Err(_) => {
+                region.close().await.map_err(|_| {
+                    McpError::internal_error("modern request child region could not be closed")
+                })?;
                 return Err(McpError::internal_error(
                     "request-owned modern dispatch could not be scheduled",
                 ));
             }
         };
 
-        match task.join(&join_cx).await {
+        let cancellation = request_ctx.request_cancellation();
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        let mut join = std::pin::pin!(task.join(&join_cx));
+        let mut token_cancelled = false;
+        let mut cancel_forwarded = false;
+        let wait = std::future::poll_fn(|task_cx| {
+            // Joining alone does not observe caller cancellation in the pinned
+            // runtime. Arm the request token as well so even a parked handler
+            // receives subtree cancellation without a polling loop.
+            // A shared framework mask may defer visibility after the token
+            // future completes. Latch completion rather than polling that
+            // completed async future again while cancellation is deferred.
+            if !token_cancelled {
+                token_cancelled = cancelled.as_mut().poll(task_cx).is_ready();
+            }
+            if !cancel_forwarded
+                && (token_cancelled || request_cx_cancellation_is_visible(&join_cx))
+                && budget_error(&request_ctx).is_some()
+            {
+                let _ = region.cancel(asupersync::CancelReason::user("modern request cancelled"));
+                cancel_forwarded = true;
+            }
+            join.as_mut().poll(task_cx)
+        });
+        let joined = match request_ctx.budget().deadline {
+            Some(deadline) => asupersync::time::timeout_at(deadline, wait)
+                .await
+                .map_err(|_| {
+                    McpError::new(McpErrorCode::RequestCancelled, "Request timeout exceeded")
+                }),
+            None => Ok(wait.await),
+        };
+        // Close cancels and drains remaining descendants on success, error,
+        // panic, and deadline expiry. Keeping this wait inside dispatch also
+        // lets the HTTP shutdown owner retain nonquiescent work as debt.
+        region.close().await.map_err(|_| {
+            McpError::internal_error("modern request child region could not be closed")
+        })?;
+        match joined? {
             Ok(result) => result,
             Err(asupersync::runtime::JoinError::Panicked(_payload)) => {
                 Err(sanitized_handler_panic(&join_cx, "modern_dispatch"))
@@ -23706,6 +23774,260 @@ mod router_tests {
             .clone();
         completed.sort();
         assert_eq!(completed, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    struct RegionOwnedTool {
+        started: Mutex<Option<oneshot::Sender<Cx>>>,
+        descendant_dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolHandler for RegionOwnedTool {
+        fn definition(&self) -> Tool {
+            NamedTool::new("region-owned-tool").definition()
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            panic!("the modern request must use the async handler hook")
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            arguments: serde_json::Value,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                struct DescendantGuard(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for DescendantGuard {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Release);
+                    }
+                }
+                let dropped = Arc::clone(&self.descendant_dropped);
+                let (ready_sender, mut ready) = oneshot::channel();
+                let _descendant = request_cx
+                    .spawn(move |descendant_cx| async move {
+                        let _guard = DescendantGuard(dropped);
+                        ready_sender
+                            .send_blocking(())
+                            .expect("handler waits for admission");
+                        while descendant_cx.checkpoint().is_ok() {
+                            yield_once().await;
+                        }
+                    })
+                    .expect("the public handler Cx admits nested work");
+                ready
+                    .recv(request_cx)
+                    .await
+                    .expect("descendant actually started");
+                self.started
+                    .lock()
+                    .expect("start sender lock")
+                    .take()
+                    .expect("handler invoked once")
+                    .send_blocking(request_cx.clone())
+                    .expect("test observes handler admission");
+                if arguments["park"] == true {
+                    // Keep the sender alive so only cancellation wakes this
+                    // real runtime channel receive; no handler-side polling.
+                    let (_sender, mut receiver) = oneshot::channel::<()>();
+                    assert_eq!(
+                        receiver.recv(request_cx).await,
+                        Err(oneshot::RecvError::Cancelled)
+                    );
+                    return Outcome::Cancelled(asupersync::CancelReason::user(
+                        "request child observed cancellation",
+                    ));
+                }
+                Outcome::Ok(FinalToolOutcome::Complete(
+                    crate::handler::promote_legacy_tool_content(vec![Content::text("completed")])
+                        .expect("text result is valid"),
+                ))
+            })
+        }
+    }
+
+    async fn check_modern_request_region(parent: Cx, action: &str) {
+        let descendant_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_sender, mut started) = oneshot::channel();
+        let mut router = Router::new();
+        router
+            .add_tool(RegionOwnedTool {
+                started: Mutex::new(Some(started_sender)),
+                descendant_dropped: Arc::clone(&descendant_dropped),
+            })
+            .expect("region-owned tool registers");
+        let request_ctx = McpContext::with_state(parent.clone(), 405, SessionState::new());
+        let mask_ctx = request_ctx.clone();
+        let cancellation = request_ctx.request_cancellation();
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "region-owned-tool",
+                "arguments": {"park": action != "complete"},
+            })),
+            "region-request",
+        );
+        let (release, mut released) = oneshot::channel();
+        let mut sibling = parent
+            .spawn(move |sibling_cx| async move {
+                released
+                    .recv(&sibling_cx)
+                    .await
+                    .expect("sibling was not cancelled");
+                sibling_cx.checkpoint().expect("parent region remains live");
+                42
+            })
+            .expect("parent admits sibling");
+        let mut dispatch =
+            Box::pin(Arc::new(router).dispatch_stateless_owned(request_ctx, request));
+        let handler_cx = if action == "complete" {
+            let result = dispatch.as_mut().await.expect("request completes");
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(result["content"][0]["text"], "completed");
+            assert!(
+                descendant_dropped.load(Ordering::Acquire),
+                "response cannot precede descendant cleanup"
+            );
+            started
+                .recv(&parent)
+                .await
+                .expect("handler reported its Cx")
+        } else {
+            let mut admission = std::pin::pin!(started.recv(&parent));
+            let handler_cx = std::future::poll_fn(|task_cx| {
+                assert!(
+                    dispatch.as_mut().poll(task_cx).is_pending(),
+                    "parked request cannot finish before the selected action"
+                );
+                admission.as_mut().poll(task_cx)
+            })
+            .await
+            .expect("handler and descendant started");
+            assert!(!descendant_dropped.load(Ordering::Acquire));
+            if matches!(action, "cancel" | "masked-cancel") {
+                if action == "cancel" {
+                    struct DispatchWake(AtomicUsize);
+                    impl std::task::Wake for DispatchWake {
+                        fn wake(self: Arc<Self>) {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    let wake = Arc::new(DispatchWake(AtomicUsize::new(0)));
+                    let waker = std::task::Waker::from(Arc::clone(&wake));
+                    let mut task_cx = std::task::Context::from_waker(&waker);
+                    assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+                    let before_cancel = wake.0.load(Ordering::SeqCst);
+                    let mut canceller = parent
+                        .spawn(move |_| async move {
+                            assert!(cancellation.cancel());
+                        })
+                        .expect("runtime admits cancellation controller");
+                    canceller
+                        .join(&parent)
+                        .await
+                        .expect("cancellation controller joins");
+                    assert!(
+                        wake.0.load(Ordering::SeqCst) > before_cancel,
+                        "cancellation must wake the parked dispatch before it is polled again"
+                    );
+                } else {
+                    assert!(cancellation.cancel());
+                    mask_ctx
+                        .masked(|| {
+                            let mut task_cx =
+                                std::task::Context::from_waker(std::task::Waker::noop());
+                            for _ in 0..2 {
+                                assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+                            }
+                        })
+                        .expect("request may mask cancellation");
+                    assert!(!descendant_dropped.load(Ordering::Acquire));
+                }
+                let error = dispatch
+                    .as_mut()
+                    .await
+                    .expect_err("selected request is cancelled");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert!(
+                    descendant_dropped.load(Ordering::Acquire),
+                    "cancellation result cannot precede descendant cleanup"
+                );
+            }
+            handler_cx
+        };
+        assert_ne!(
+            handler_cx.region_id(),
+            parent.region_id(),
+            "a task in the ambient region is not a request child region"
+        );
+        drop(dispatch);
+        // Drop requests cleanup, but is not itself a quiescent close. Drive
+        // the runtime until the independently observed descendant is gone.
+        while !descendant_dropped.load(Ordering::Acquire) {
+            yield_once().await;
+        }
+        assert!(
+            !parent.is_cancel_requested(),
+            "request cleanup cannot cancel parent"
+        );
+        release
+            .send_blocking(())
+            .expect("sibling still owns its receive");
+        assert_eq!(sibling.join(&parent).await.expect("sibling joins"), 42);
+
+        // Retaining the handler Cx cannot resurrect work after region close.
+        let resurrected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let effect = Arc::clone(&resurrected);
+        if let Ok(mut task) = handler_cx.spawn(move |_| async move {
+            effect.store(true, Ordering::Release);
+        }) {
+            assert!(
+                task.join(&parent).await.is_err(),
+                "closed region rejects late work"
+            );
+        }
+        assert!(!resurrected.load(Ordering::Acquire));
+    }
+
+    fn run_modern_request_region_check(action: &'static str) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime builds");
+        runtime.block_on(async move {
+            let parent = Cx::current().expect("public runtime entry installs its context");
+            asupersync::time::timeout(
+                parent.now(),
+                Duration::from_secs(5),
+                check_modern_request_region(parent, action),
+            )
+            .await
+            .expect("request and descendants settle within five seconds");
+        });
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_drains_descendants_before_completion() {
+        run_modern_request_region_check("complete");
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_cancellation_isolates_sibling() {
+        run_modern_request_region_check("cancel");
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_drop_closes_descendants() {
+        run_modern_request_region_check("drop");
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_mask_defers_cancellation_without_repolling_completion() {
+        run_modern_request_region_check("masked-cancel");
     }
 
     #[test]

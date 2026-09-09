@@ -2277,10 +2277,11 @@ impl McpContext {
 
     /// Returns the underlying region ID from asupersync.
     ///
-    /// This is the region of the caller-supplied [`Cx`]. FastMCP does not
-    /// currently create a request-owned child region, so this identifier must
-    /// not be interpreted as proof that spawned work is scoped to, cancelled
-    /// with, or drained before completion of this MCP request.
+    /// This is the region of the caller-supplied [`Cx`]. Owned modern stateless
+    /// dispatch separately supplies a child region through the handler's
+    /// explicit in-request Cx. This ambient identifier does not prove that work
+    /// spawned through [`Self::cx`] is cancelled with, or drained before
+    /// completion of, this MCP request.
     #[must_use]
     pub fn region_id(&self) -> RegionId {
         self.cx.region_id()
