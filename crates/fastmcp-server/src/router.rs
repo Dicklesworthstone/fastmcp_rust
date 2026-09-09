@@ -1802,9 +1802,22 @@ async fn open_modern_request_region(ctx: &McpContext) -> McpResult<Option<ChildR
             .await
     });
     let mut admission = match admission {
-        // Direct callers without a runtime retain the existing inline path.
-        // A live runtime's closed region or exhausted quota must not fall back.
-        Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => return Ok(None),
+        Err(asupersync::runtime::state::SpawnError::RuntimeUnavailable) => {
+            // Spawn conflates detached contexts with runtime teardown. Region
+            // admission distinguishes them. After this spawn error both cases
+            // resolve immediately, without an outstanding admission to abandon.
+            return match ctx
+                .cx()
+                .open_child_region(ChildRegionSpec::inherit().with_budget(budget))
+                .await
+            {
+                Err(asupersync::cx::ChildRegionError::NoRuntimeGateway) => Ok(None),
+                Ok(region) => Ok(Some(region)),
+                Err(_) => Err(McpError::internal_error(
+                    "modern request runtime is no longer available",
+                )),
+            };
+        }
         Err(_) => {
             return Err(McpError::internal_error(
                 "modern request region admission could not be scheduled",
@@ -4181,6 +4194,7 @@ impl Router {
                     registration.execution_mode == crate::ToolExecutionMode::Blocking
                 });
         let task = region.cx().spawn(move |child_cx| async move {
+            let dispatch_ctx = dispatch_ctx.with_request_cx(child_cx.clone());
             if blocking {
                 let blocking_cx = child_cx.clone();
                 return run_modern_blocking_dispatch(&child_cx, move || {
@@ -23838,11 +23852,18 @@ mod router_tests {
 
         fn call_final_outcome_async_in_request<'a>(
             &'a self,
-            _ctx: &'a McpContext,
+            ctx: &'a McpContext,
             request_cx: &'a Cx,
             arguments: serde_json::Value,
         ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
+                let request_cx = if arguments["ordinaryContext"] == true {
+                    assert_eq!(ctx.region_id(), request_cx.region_id());
+                    assert_eq!(ctx.task_id(), request_cx.task_id());
+                    ctx.cx()
+                } else {
+                    request_cx
+                };
                 struct DescendantGuard(Arc<std::sync::atomic::AtomicBool>);
                 impl Drop for DescendantGuard {
                     fn drop(&mut self) {
@@ -23893,7 +23914,7 @@ mod router_tests {
         }
     }
 
-    async fn check_modern_request_region(parent: Cx, action: &str) {
+    async fn check_modern_request_region(parent: Cx, action: &str, ordinary_context: bool) {
         let descendant_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (started_sender, mut started) = oneshot::channel();
         let mut router = Router::new();
@@ -23918,7 +23939,7 @@ mod router_tests {
                     "io.modelcontextprotocol/clientCapabilities": {},
                 },
                 "name": "region-owned-tool",
-                "arguments": {"park": action != "complete"},
+                "arguments": {"park": action != "complete", "ordinaryContext": ordinary_context},
             })),
             "region-request",
         );
@@ -24069,7 +24090,7 @@ mod router_tests {
         assert!(!resurrected.load(Ordering::Acquire));
     }
 
-    fn run_modern_request_region_check(action: &'static str) {
+    fn run_modern_request_region_check(action: &'static str, ordinary_context: bool) {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("native runtime builds");
@@ -24078,7 +24099,7 @@ mod router_tests {
             asupersync::time::timeout(
                 parent.now(),
                 Duration::from_secs(5),
-                check_modern_request_region(parent, action),
+                check_modern_request_region(parent, action, ordinary_context),
             )
             .await
             .expect("request and descendants settle within five seconds");
@@ -24087,27 +24108,114 @@ mod router_tests {
 
     #[test]
     fn fnd_04_modern_request_region_drains_descendants_before_completion() {
-        run_modern_request_region_check("complete");
+        run_modern_request_region_check("complete", false);
     }
 
     #[test]
     fn fnd_04_modern_request_region_cancellation_isolates_sibling() {
-        run_modern_request_region_check("cancel");
+        run_modern_request_region_check("cancel", false);
     }
 
     #[test]
     fn fnd_04_modern_request_region_drop_closes_descendants() {
-        run_modern_request_region_check("drop");
+        run_modern_request_region_check("drop", false);
     }
 
     #[test]
     fn fnd_04_modern_request_region_mask_defers_cancellation_without_repolling_completion() {
-        run_modern_request_region_check("masked-cancel");
+        run_modern_request_region_check("masked-cancel", false);
     }
 
     #[test]
     fn fnd_04_modern_request_region_mask_unwind_wakes_deferred_cancellation() {
-        run_modern_request_region_check("masked-panic-cancel");
+        run_modern_request_region_check("masked-panic-cancel", false);
+    }
+
+    #[test]
+    fn fnd_04_modern_request_context_drains_descendants_before_completion() {
+        run_modern_request_region_check("complete", true);
+    }
+
+    #[test]
+    fn fnd_04_modern_request_context_cancellation_isolates_sibling() {
+        run_modern_request_region_check("cancel", true);
+    }
+
+    #[test]
+    fn fnd_04_modern_request_context_drop_closes_descendants() {
+        run_modern_request_region_check("drop", true);
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_unavailable_runtime_never_dispatches() {
+        struct ObservedTool(Arc<AtomicUsize>);
+        impl ToolHandler for ObservedTool {
+            fn definition(&self) -> Tool {
+                NamedTool::new("observed-runtime").definition()
+            }
+
+            fn execution_mode(&self) -> crate::ToolExecutionMode {
+                crate::ToolExecutionMode::Async
+            }
+
+            fn call(&self, ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ctx.set_state("called", true);
+                Ok(vec![Content::text("runtime admitted")])
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_tool(ObservedTool(Arc::clone(&calls))).unwrap();
+        let router = Arc::new(router);
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "observed-runtime",
+                "arguments": {},
+            })),
+            "runtime-admission",
+        );
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let state = SessionState::new();
+        let retained = runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let ctx = McpContext::with_state(cx.clone(), 406, state.clone());
+            let result = Arc::clone(&router)
+                .dispatch_stateless_owned(ctx, request.clone())
+                .await
+                .expect("live runtime dispatches");
+            assert_eq!(result["content"][0]["text"], "runtime admitted");
+            cx
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.get::<bool>("called"), Some(true));
+        drop(runtime);
+        let untouched = SessionState::new();
+        let error = fastmcp_core::block_on(Arc::clone(&router).dispatch_stateless_owned(
+            McpContext::with_state(retained, 406, untouched.clone()),
+            request.clone(),
+        ))
+        .expect_err("dead runtime must not select direct dispatch");
+        assert_eq!(error.message, "modern request runtime is no longer available");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(untouched.get::<bool>("called"), None);
+
+        // A detached test context has never held runtime authority. Preserve
+        // the existing direct-call surface, rather than conflating it with a
+        // retained handle whose runtime was destroyed.
+        let result = fastmcp_core::block_on(router.dispatch_stateless_owned(
+            McpContext::with_state(Cx::for_testing(), 406, untouched.clone()),
+            request,
+        ))
+        .expect("detached direct caller still dispatches");
+        assert_eq!(result["content"][0]["text"], "runtime admitted");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(untouched.get::<bool>("called"), Some(true));
     }
 
     #[test]
