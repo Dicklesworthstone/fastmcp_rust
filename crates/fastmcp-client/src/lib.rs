@@ -9473,19 +9473,10 @@ impl SharedStdioRecv {
         deadline: Option<Instant>,
     ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
         let mut receiver = self.0.lock().map_err(|_| TransportError::Closed)?;
-        if let Err(error) = receiver.recv_until_or_closed(cx, deadline) {
-            // A partial-frame deadline closes the split receiver before its
-            // wrapper returns.  The wrapper consequently reports `Closed`
-            // even though the request-local deadline was the event that won.
-            // Preserve that elected outcome for the client while an EOF that
-            // arrives strictly before the deadline remains ordinary closure.
-            if matches!(error, TransportError::Closed)
-                && deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                return Err(TransportError::ReceiveDeadlineExceeded);
-            }
-            return Err(error);
-        }
+        // The transport preserves the elected read outcome, including partial
+        // frame deadlines. A polling slice expiring after EOF cannot relabel
+        // that closure as a request timeout.
+        receiver.recv_until_or_closed(cx, deadline)?;
         let received_at = Instant::now();
         let frame = admitted_stdio_frame(&receiver)?;
         Ok((frame, received_at))
@@ -39486,6 +39477,12 @@ exec sleep 5
             "Subscription listener reached EOF before terminal complete result"
         );
         assert!(!client.is_initialized());
+        let mut receiver = SharedStdioRecv(Arc::clone(&client.transport));
+        let expired_poll_deadline = Instant::now();
+        assert!(matches!(
+            receiver.recv_until_with_source(&client.cx, Some(expired_poll_deadline)),
+            Err(TransportError::Closed)
+        ));
     }
 
     #[cfg(unix)]

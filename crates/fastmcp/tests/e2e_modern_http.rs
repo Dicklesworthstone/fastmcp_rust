@@ -41705,8 +41705,16 @@ mod live_websocket_bind {
                 },
             )
             .await;
+            websocket_client_bounded(
+                &cx,
+                "WebSocket timeout gateway client close",
+                client.close(&cx),
+            )
+            .await
+            .expect("WebSocket timeout client settles its transport before listener shutdown");
             drop(client);
-            cx.set_cancel_requested(true);
+            // Keep the cleanup context live: cancelling it also completes
+            // the timeout's Sleep immediately in the caller runtime.
             listener.abort();
             let shutdown = asupersync::time::timeout(
                 cx.now(),
@@ -41729,6 +41737,7 @@ mod live_websocket_bind {
                 panic!("WebSocket timeout gateway unexpectedly stopped nonquiescently");
             }
             hold_upstream.shutdown();
+            cx.set_cancel_requested(true);
         });
     }
 

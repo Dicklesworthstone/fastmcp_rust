@@ -32075,6 +32075,34 @@ mod lib_unit_tests {
             request_cx: &'a Cx,
             _arguments: serde_json::Value,
         ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            // Cancellation may drop the pending future before another body poll.
+            struct ActiveCallGuard<'ctx> {
+                control: &'ctx LiveModernControl,
+                ctx: &'ctx McpContext,
+                request_cx: &'ctx Cx,
+                request_id: u64,
+                cancellation_observed: bool,
+            }
+
+            impl Drop for ActiveCallGuard<'_> {
+                fn drop(&mut self) {
+                    let mut state = self
+                        .control
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.active = state.active.saturating_sub(1);
+                    if self.cancellation_observed
+                        || self.ctx.request_cancellation().is_cancel_requested()
+                        || self.request_cx.is_cancel_requested()
+                        || self.control.shutdown_requested.load(Ordering::Acquire)
+                    {
+                        state.cancelled.insert(self.request_id);
+                    }
+                    self.control.changed.notify_all();
+                }
+            }
+
             Box::pin(async move {
                 report_final_progress_probe_updates(ctx);
                 let request_id = ctx.request_id();
@@ -32089,43 +32117,33 @@ mod lib_unit_tests {
                     state.started.insert(request_id);
                     self.control.changed.notify_all();
                 }
+                let mut active_call = ActiveCallGuard {
+                    control: &self.control,
+                    ctx,
+                    request_cx,
+                    request_id,
+                    cancellation_observed: false,
+                };
                 loop {
                     if self.control.shutdown_requested.load(Ordering::Acquire) {
                         self.control.apply_shutdown();
-                        let mut state = self
-                            .control
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state.active = state.active.saturating_sub(1);
-                        state.cancelled.insert(request_id);
-                        self.control.changed.notify_all();
                         return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
                             "controlled modern tool released for server shutdown",
                         ));
                     }
                     if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
-                        let mut state = self
-                            .control
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state.active = state.active.saturating_sub(1);
-                        state.cancelled.insert(request_id);
-                        self.control.changed.notify_all();
+                        active_call.cancellation_observed = true;
                         return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
                             "request cancellation observed by controlled modern tool",
                         ));
                     }
                     {
-                        let mut state = self
+                        let state = self
                             .control
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if state.release_all || state.released.contains(&request_id) {
-                            state.active = state.active.saturating_sub(1);
-                            self.control.changed.notify_all();
                             drop(state);
                             return match crate::handler::promote_legacy_tool_content(vec![
                                 Content::text(format!("modern request {request_id}")),
@@ -44483,9 +44501,31 @@ mod lib_unit_tests {
             Arc::clone(&responses),
         );
 
-        assert_eq!(exit_code, 0);
+        assert_eq!(
+            exit_code,
+            0,
+            "modern cancellation pump failed: phase={}, started200={}, started201={}, \
+             cancelled200={}, cancelled201={}, max_active={}, response200={:?}, response201={:?}",
+            phase.load(Ordering::Acquire),
+            control.has_started(200),
+            control.has_started(201),
+            control.was_cancelled(200),
+            control.was_cancelled(201),
+            control.max_active(),
+            responses.response(200),
+            responses.response(201),
+        );
         assert!(control.was_cancelled(200));
         assert!(!control.was_cancelled(201));
+        assert_eq!(
+            control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active,
+            0,
+            "all controlled calls must finish cleanup before the pump returns"
+        );
         assert_eq!(responses.response_count(200), 1);
         assert_eq!(responses.response_count(201), 1);
         assert_eq!(

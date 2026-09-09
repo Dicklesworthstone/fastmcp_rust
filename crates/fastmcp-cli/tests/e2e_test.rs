@@ -695,26 +695,35 @@ impl ProcessGroupGuard {
                 self.process_group_id
             ));
         }
-        let exit_status = match if child_exited {
-            // `/proc` (or `ps`) has already proved that the exact child is in
-            // a terminal state. `wait` cannot block on that state and avoids
-            // a kernel-observation race where an immediate `try_wait` still
-            // reports `None` for the just-observed zombie.
-            self.child_mut().wait().map(Some)
-        } else {
-            self.child_mut().try_wait()
-        } {
-            Ok(status) => status,
-            Err(error) => {
-                errors.push(format!(
-                    "failed to reap exact child after all signaling completed: {error}"
-                ));
-                None
-            }
-        };
-        self.child = None;
+        // Reaping may release the PID, so permanently end numeric signaling
+        // before polling for the real exit status. A zombie is not yet waitable
+        // while other threads in its group are still exiting.
         self.owns_process_group = false;
         self.armed = false;
+        let exit_status = loop {
+            match self.child_mut().try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        errors.push(format!(
+                            "exact child exit status was not available within {PROCESS_CLEANUP_DEADLINE:?}"
+                        ));
+                        break None;
+                    }
+                    std::thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "failed to reap exact child after all signaling completed: {error}"
+                    ));
+                    break None;
+                }
+            }
+        };
+        if exit_status.is_some() {
+            self.child = None;
+        }
 
         if errors.is_empty() {
             Ok(exit_status)
@@ -882,6 +891,12 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if let Err(error) = self.kill_and_reap() {
             eprintln!("fastmcp test-command harness cleanup failed: {error}");
+        }
+        if self.child.is_some() {
+            eprintln!(
+                "fastmcp test-command harness retained an unreaped child; aborting after cleanup failure"
+            );
+            std::process::abort();
         }
     }
 }
