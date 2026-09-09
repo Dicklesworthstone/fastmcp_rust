@@ -398,6 +398,13 @@ acquisition and the native pipe commit. These commits remain synchronous;
 non-Unix sends retain blocking-I/O limits. Only a valid matching progress
 notification on a request that actually supplied a progress token can reset idle.
 
+On Unix, eager `ClientBuilder::connect_stdio_with_cx` initialization also
+yields between bounded receive turns, including partial responses and Auto
+negotiation. A fallback child starts only after the disposable modern child
+has been cleaned up. Synchronous constructors and deferred initialization
+on a synchronous first use retain their blocking boundaries; subprocess
+creation and write commits remain synchronous.
+
 ```rust
 use std::time::Duration;
 
