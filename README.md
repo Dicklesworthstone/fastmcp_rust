@@ -452,6 +452,15 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
 event stream and POST message endpoints are already known.
 
+On Unix, `Client::call_tool_with_cx`, `read_resource_with_cx`, and
+`get_prompt_with_cx` follow installed async reverse handlers when a modern
+peer requests input. After initialization, all rounds and handler waits share
+one absolute deadline; cancellation drops pending handler work and preserves
+the connection. Deferred discovery keeps its separate initialization deadline
+and connection-ending cancellation rules. Each
+retry carries the original arguments and only the latest continuation state.
+Without installed handlers, the input-required result is returned to the caller.
+
 With the `tasks` feature on Unix, `Client::call_tool_final_outcome_with_cx`
 creates tasks without blocking the runtime while waiting for the peer. It
 returns the typed complete, task, or input-required outcome. A returned task ID
