@@ -1430,6 +1430,9 @@ pub struct McpContext {
     /// Mask depth for framework-owned ceilings. The underlying Cx tracks its
     /// own cancellation mask, but it cannot see a ceiling held only here.
     framework_mask_depth: Arc<AtomicU32>,
+    /// Wakes deferred cancellation observers across all mask-sharing clones,
+    /// including clones whose request cancellation token was replaced.
+    framework_mask_released: Arc<Notify>,
     /// Serializes transitions between the Cx mask and the framework mask.
     ///
     /// Checkpoint and cost-accounting operations take this lock while they
@@ -1690,6 +1693,7 @@ impl McpContext {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
             operation_deadline: None,
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
@@ -1733,6 +1737,7 @@ impl McpContext {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
             operation_deadline: None,
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
@@ -1777,6 +1782,7 @@ impl McpContext {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
             operation_deadline: None,
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
@@ -1825,6 +1831,7 @@ impl McpContext {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
+            framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
             operation_deadline: None,
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
@@ -2340,6 +2347,17 @@ impl McpContext {
         self.request_cancellation.clone()
     }
 
+    /// Waits for request-local cancellation to become visible outside a
+    /// framework mask. Completion is the visibility observation; callers
+    /// must act on it rather than rechecking a possibly newly entered mask.
+    #[doc(hidden)]
+    pub async fn request_cancelled(&self) {
+        self.request_cancellation.cancelled().await;
+        self.framework_mask_released
+            .wait_until(|| self.ensure_live().is_err())
+            .await;
+    }
+
     /// Checks terminal request liveness without charging a poll or cost unit.
     ///
     /// A finite quota that was exactly depleted is not itself a failed
@@ -2611,15 +2629,28 @@ impl McpContext {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 drop(framework_mask);
                 drop(exit_transition);
+                self.notify_framework_mask_released();
                 return Err(CancelledError);
             }
         };
         drop(framework_mask);
         drop(exit_transition);
+        self.notify_framework_mask_released();
 
         match outcome {
             Ok(result) => Ok(result),
             Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn notify_framework_mask_released(&self) {
+        if self.framework_mask_depth.load(Ordering::SeqCst) == 0 {
+            // No transition lock may be held while arbitrary task wakers run.
+            // A panicking waker cannot suppress mask restoration or replace
+            // the original critical-section panic.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.framework_mask_released.notify_waiters();
+            }));
         }
     }
 

@@ -4172,24 +4172,20 @@ impl Router {
             }
         };
 
-        let cancellation = request_ctx.request_cancellation();
-        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        let mut cancelled = std::pin::pin!(request_ctx.request_cancelled());
         let mut join = std::pin::pin!(task.join(&join_cx));
-        let mut token_cancelled = false;
         let mut cancel_forwarded = false;
         let wait = std::future::poll_fn(|task_cx| {
             // Joining alone does not observe caller cancellation in the pinned
             // runtime. Arm the request token as well so even a parked handler
             // receives subtree cancellation without a polling loop.
-            // A shared framework mask may defer visibility after the token
-            // future completes. Latch completion rather than polling that
-            // completed async future again while cancellation is deferred.
-            if !token_cancelled {
-                token_cancelled = cancelled.as_mut().poll(task_cx).is_ready();
-            }
+            // The context wait also wakes when a shared framework mask exits.
+            // Its completion linearizes visibility: rechecking a later mask
+            // here would lose that observation and leave no waiter to wake.
             if !cancel_forwarded
-                && (token_cancelled || request_cx_cancellation_is_visible(&join_cx))
-                && budget_error(&request_ctx).is_some()
+                && (cancelled.as_mut().poll(task_cx).is_ready()
+                    || (request_cx_cancellation_is_visible(&join_cx)
+                        && budget_error(&request_ctx).is_some()))
             {
                 let _ = region.cancel(asupersync::CancelReason::user("modern request cancelled"));
                 cancel_forwarded = true;
@@ -23858,7 +23854,11 @@ mod router_tests {
             })
             .expect("region-owned tool registers");
         let request_ctx = McpContext::with_state(parent.clone(), 405, SessionState::new());
-        let mask_ctx = request_ctx.clone();
+        // A derived pre-admission context can replace its token while still
+        // sharing the mask. Mask release must wake the dispatch's token too.
+        let mask_ctx = request_ctx
+            .clone()
+            .with_request_cancellation(fastmcp_core::McpRequestCancellation::new());
         let cancellation = request_ctx.request_cancellation();
         let request = JsonRpcRequest::new(
             "tools/call",
@@ -23909,16 +23909,16 @@ mod router_tests {
             .await
             .expect("handler and descendant started");
             assert!(!descendant_dropped.load(Ordering::Acquire));
-            if matches!(action, "cancel" | "masked-cancel") {
-                if action == "cancel" {
-                    struct DispatchWake(AtomicUsize);
-                    impl std::task::Wake for DispatchWake {
-                        fn wake(self: Arc<Self>) {
-                            self.0.fetch_add(1, Ordering::SeqCst);
-                        }
+            if matches!(action, "cancel" | "masked-cancel" | "masked-panic-cancel") {
+                struct DispatchWake(AtomicUsize);
+                impl std::task::Wake for DispatchWake {
+                    fn wake(self: Arc<Self>) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
                     }
-                    let wake = Arc::new(DispatchWake(AtomicUsize::new(0)));
-                    let waker = std::task::Waker::from(Arc::clone(&wake));
+                }
+                let wake = Arc::new(DispatchWake(AtomicUsize::new(0)));
+                let waker = std::task::Waker::from(Arc::clone(&wake));
+                if action == "cancel" {
                     let mut task_cx = std::task::Context::from_waker(&waker);
                     assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
                     let before_cancel = wake.0.load(Ordering::SeqCst);
@@ -23937,15 +23937,40 @@ mod router_tests {
                     );
                 } else {
                     assert!(cancellation.cancel());
-                    mask_ctx
-                        .masked(|| {
-                            let mut task_cx =
-                                std::task::Context::from_waker(std::task::Waker::noop());
-                            for _ in 0..2 {
-                                assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
-                            }
-                        })
-                        .expect("request may mask cancellation");
+                    let mut before_release = 0;
+                    let masked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        mask_ctx
+                            .masked(|| {
+                                mask_ctx
+                                    .masked(|| {
+                                        let mut task_cx = std::task::Context::from_waker(&waker);
+                                        for _ in 0..2 {
+                                            assert!(
+                                                dispatch.as_mut().poll(&mut task_cx).is_pending()
+                                            );
+                                        }
+                                        before_release = wake.0.load(Ordering::SeqCst);
+                                    })
+                                    .expect("nested request mask enters");
+                                assert_eq!(wake.0.load(Ordering::SeqCst), before_release);
+                                if action == "masked-panic-cancel" {
+                                    panic!("planted synchronous masked-section panic");
+                                }
+                            })
+                            .expect("request may mask cancellation");
+                    }));
+                    assert_eq!(masked.is_err(), action == "masked-panic-cancel");
+                    if let Err(payload) = masked {
+                        assert_eq!(
+                            payload.downcast_ref::<&str>(),
+                            Some(&"planted synchronous masked-section panic"),
+                            "a failed mask assertion must not count as the planted unwind"
+                        );
+                    }
+                    assert!(
+                        wake.0.load(Ordering::SeqCst) > before_release,
+                        "outer mask exit must wake dispatch before it is polled again"
+                    );
                     assert!(!descendant_dropped.load(Ordering::Acquire));
                 }
                 let error = dispatch
@@ -24028,6 +24053,11 @@ mod router_tests {
     #[test]
     fn fnd_04_modern_request_region_mask_defers_cancellation_without_repolling_completion() {
         run_modern_request_region_check("masked-cancel");
+    }
+
+    #[test]
+    fn fnd_04_modern_request_region_mask_unwind_wakes_deferred_cancellation() {
+        run_modern_request_region_check("masked-panic-cancel");
     }
 
     #[test]
