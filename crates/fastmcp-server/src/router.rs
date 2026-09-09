@@ -909,18 +909,12 @@ fn admit_final_tool_schemas<H: ToolHandler + ?Sized>(
 
 /// One immutable catalog snapshot committed together with its dispatch target.
 /// No list or validation path re-invokes the handler's definition hooks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LegacyToolDispatch {
-    Blocking,
-    CallerOwnedAsync,
-}
-
 struct AdmittedToolRegistration {
     handler: BoxedToolHandler,
     definition: Tool,
     final_registration: Option<AdmittedFinalToolRegistration>,
     legacy_enabled: bool,
-    legacy_dispatch: LegacyToolDispatch,
+    execution_mode: crate::ToolExecutionMode,
 }
 
 struct AdmittedFinalToolRegistration {
@@ -950,7 +944,7 @@ impl AdmittedToolRegistration {
         handler: H,
         definition: Tool,
         legacy_enabled: bool,
-        legacy_dispatch: LegacyToolDispatch,
+        execution_mode: crate::ToolExecutionMode,
     ) -> McpResult<Self> {
         let (exact_final_definition, declares_final_tasks, upstream_schema_registered) =
             crate::catch_extension_unwind(|| {
@@ -1011,21 +1005,21 @@ impl AdmittedToolRegistration {
                 declares_final_tasks,
             }),
             legacy_enabled,
-            legacy_dispatch,
+            execution_mode,
         })
     }
 
     fn legacy_only<H: ToolHandler + 'static>(
         handler: H,
         definition: Tool,
-        legacy_dispatch: LegacyToolDispatch,
+        execution_mode: crate::ToolExecutionMode,
     ) -> Self {
         Self {
             handler: Box::new(handler),
             definition,
             final_registration: None,
             legacy_enabled: true,
-            legacy_dispatch,
+            execution_mode,
         }
     }
 
@@ -1037,7 +1031,7 @@ impl AdmittedToolRegistration {
             mut definition,
             mut final_registration,
             legacy_enabled,
-            legacy_dispatch,
+            execution_mode,
         } = self;
         definition.name.clone_from(&mounted_name);
         if let Some(final_registration) = final_registration.as_mut() {
@@ -1051,7 +1045,7 @@ impl AdmittedToolRegistration {
             definition,
             final_registration,
             legacy_enabled,
-            legacy_dispatch,
+            execution_mode,
         }
     }
 }
@@ -1831,6 +1825,36 @@ async fn open_modern_request_region(ctx: &McpContext) -> McpResult<Option<ChildR
     }
 }
 
+/// Runs declared blocking work without occupying the caller's async worker.
+/// The enclosing region task retains the pool handle until actual completion,
+/// including when cancellation arrives after the closure has started.
+async fn run_modern_blocking_dispatch(
+    request_cx: &Cx,
+    dispatch: impl FnOnce() -> McpResult<serde_json::Value> + Send + 'static,
+) -> McpResult<serde_json::Value> {
+    let permit = crate::try_reserve_blocking_dispatch()
+        .ok_or_else(|| McpError::internal_error("blocking dispatch capacity exhausted"))?;
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+    let task = crate::blocking_dispatch_pool().spawn(move || {
+        let _permit = permit;
+        let result = crate::catch_extension_unwind(dispatch);
+        let _ = sender.send_blocking(result);
+    });
+    let task = crate::BlockingTaskGuard(task);
+    // A running synchronous closure cannot be preempted. Cancellation must
+    // not turn its still-live effects into a completed request-region close.
+    while !task.0.is_done() {
+        asupersync::time::sleep(request_cx.now(), Duration::from_millis(1)).await;
+    }
+    match receiver.try_recv() {
+        Ok(Ok(result)) => result,
+        Ok(Err(_payload)) => Err(sanitized_handler_panic(request_cx, "modern_dispatch")),
+        Err(_) => Err(McpError::internal_error(
+            "blocking dispatch ended without a result",
+        )),
+    }
+}
+
 fn sanitized_handler_panic(_request_lifetime: &Cx, handler_class: &'static str) -> McpError {
     let incident_id = NEXT_HANDLER_INCIDENT_ID.fetch_add(1, Ordering::Relaxed);
     log::error!(
@@ -2440,15 +2464,11 @@ impl Router {
             crate::catch_extension_unwind(|| handler.execution_mode()).map_err(|_payload| {
                 McpError::internal_error("tool execution-mode hook panicked during admission")
             })?;
-        let legacy_dispatch = match execution_mode {
-            crate::ToolExecutionMode::Blocking => LegacyToolDispatch::Blocking,
-            crate::ToolExecutionMode::Async => LegacyToolDispatch::CallerOwnedAsync,
-        };
         let name = def.name.clone();
         let admitted = if admit_final {
-            AdmittedToolRegistration::admit(handler, def, legacy_enabled, legacy_dispatch)?
+            AdmittedToolRegistration::admit(handler, def, legacy_enabled, execution_mode)?
         } else {
-            AdmittedToolRegistration::legacy_only(handler, def, legacy_dispatch)
+            AdmittedToolRegistration::legacy_only(handler, def, execution_mode)
         };
         if let Some(final_registration) = admitted.final_registration.as_ref() {
             self.validate_mcp_apps_tool_admission(
@@ -3542,7 +3562,7 @@ impl Router {
         };
         self.tools.get(&params.name).is_some_and(|registration| {
             registration.legacy_enabled
-                && registration.legacy_dispatch == LegacyToolDispatch::CallerOwnedAsync
+                && registration.execution_mode == crate::ToolExecutionMode::Async
         })
     }
 
@@ -4150,7 +4170,33 @@ impl Router {
         };
         let join_cx = request_ctx.cx().clone();
         let dispatch_ctx = request_ctx.clone();
+        let blocking = request.method == "tools/call"
+            && request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|name| self.tools.get(name))
+                .is_some_and(|registration| {
+                    registration.execution_mode == crate::ToolExecutionMode::Blocking
+                });
         let task = region.cx().spawn(move |child_cx| async move {
+            if blocking {
+                let blocking_cx = child_cx.clone();
+                return run_modern_blocking_dispatch(&child_cx, move || {
+                    crate::poll_on_cx(
+                        &blocking_cx,
+                        self.dispatch_stateless_in_request(
+                            &dispatch_ctx,
+                            &blocking_cx,
+                            &request,
+                            raw_params.as_deref(),
+                            &continuation_cancellation,
+                        ),
+                    )
+                })
+                .await;
+            }
             self.dispatch_stateless_in_request(
                 &dispatch_ctx,
                 &child_cx,
@@ -23780,6 +23826,10 @@ mod router_tests {
     impl ToolHandler for RegionOwnedTool {
         fn definition(&self) -> Tool {
             NamedTool::new("region-owned-tool").definition()
+        }
+
+        fn execution_mode(&self) -> crate::ToolExecutionMode {
+            crate::ToolExecutionMode::Async
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {

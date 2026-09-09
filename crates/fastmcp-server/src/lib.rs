@@ -6087,58 +6087,47 @@ type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>
 const MODERN_HTTP_RESPONSE_BODY_TTL: Duration = Duration::from_mins(15);
 const MODERN_HTTP_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Process-wide bounds for synchronous exact-2024 HTTP dispatch bridges.
+/// Process-wide bounds for synchronous handler dispatch bridges.
 ///
 /// `Cx::spawn_blocking` deliberately runs inline when an embedding runtime has
 /// no blocking pool. That deterministic fallback is useful in the lab, but a
-/// live listener must not let one synchronous handler occupy the reactor that
-/// accepts its cancellation or reverse-response POST. This lazy Asupersync
+/// request must not let one synchronous handler occupy the reactor that
+/// accepts its cancellation or reverse response. This lazy Asupersync
 /// pool supplies only that missing blocking authority; it does not own an
 /// async runtime or any transport task.
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-const MAX_LEGACY_HTTP_BLOCKING_DISPATCH_THREADS: usize = 64;
+const MAX_BLOCKING_DISPATCH_THREADS: usize = 64;
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-const MAX_LEGACY_HTTP_BLOCKING_DISPATCHES: usize = 256;
+const MAX_BLOCKING_DISPATCHES: usize = 256;
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-static LEGACY_HTTP_BLOCKING_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+static BLOCKING_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-struct LegacyHttpBlockingDispatchPermit;
+struct BlockingDispatchPermit;
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-impl Drop for LegacyHttpBlockingDispatchPermit {
+impl Drop for BlockingDispatchPermit {
     fn drop(&mut self) {
-        LEGACY_HTTP_BLOCKING_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+        BLOCKING_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-fn try_reserve_legacy_http_blocking_dispatch() -> Option<LegacyHttpBlockingDispatchPermit> {
-    LEGACY_HTTP_BLOCKING_DISPATCHES
+fn try_reserve_blocking_dispatch() -> Option<BlockingDispatchPermit> {
+    BLOCKING_DISPATCHES
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < MAX_LEGACY_HTTP_BLOCKING_DISPATCHES).then_some(current + 1)
+            (current < MAX_BLOCKING_DISPATCHES).then_some(current + 1)
         })
         .ok()
-        .map(|_| LegacyHttpBlockingDispatchPermit)
+        .map(|_| BlockingDispatchPermit)
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-fn legacy_http_blocking_dispatch_pool() -> asupersync::runtime::BlockingPoolHandle {
+fn blocking_dispatch_pool() -> asupersync::runtime::BlockingPoolHandle {
     static POOL: std::sync::OnceLock<asupersync::runtime::BlockingPool> =
         std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        asupersync::runtime::BlockingPool::new(0, MAX_LEGACY_HTTP_BLOCKING_DISPATCH_THREADS)
-    })
-    .handle()
+    POOL.get_or_init(|| asupersync::runtime::BlockingPool::new(0, MAX_BLOCKING_DISPATCH_THREADS))
+        .handle()
 }
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-struct LegacyHttpBlockingTaskGuard(asupersync::runtime::BlockingTaskHandle);
+struct BlockingTaskGuard(asupersync::runtime::BlockingTaskHandle);
 
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-impl Drop for LegacyHttpBlockingTaskGuard {
+impl Drop for BlockingTaskGuard {
     fn drop(&mut self) {
         self.0.cancel();
     }
@@ -6181,7 +6170,7 @@ async fn run_live_http_legacy_blocking_dispatch<F>(
     cx: &Cx,
     sessions: &LiveHttpSessionRegistry,
     panic_session_id: Option<String>,
-    blocking_dispatch_permit: LegacyHttpBlockingDispatchPermit,
+    blocking_dispatch_permit: BlockingDispatchPermit,
     dispatch: F,
 ) -> Result<HttpResponse, ()>
 where
@@ -6192,7 +6181,7 @@ where
         .spawn(move |dispatch_cx| async move {
             let blocking_cx = dispatch_cx.clone();
             let (dispatch_sender, mut dispatch_receiver) = asupersync::channel::oneshot::channel();
-            let blocking_dispatch = legacy_http_blocking_dispatch_pool().spawn(move || {
+            let blocking_dispatch = blocking_dispatch_pool().spawn(move || {
                 let _blocking_dispatch_permit = blocking_dispatch_permit;
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     dispatch(blocking_cx)
@@ -6203,7 +6192,7 @@ where
                 );
                 let _ = dispatch_sender.send_blocking(outcome);
             });
-            let blocking_dispatch_guard = LegacyHttpBlockingTaskGuard(blocking_dispatch);
+            let blocking_dispatch_guard = BlockingTaskGuard(blocking_dispatch);
             // A claimed blocking task cannot be force-stopped. Keep this
             // region child alive until the pool records terminal completion,
             // even after its Cx has been cancelled. The worker sends before
@@ -11738,7 +11727,7 @@ async fn serve_http_connection(
             let dispatch_endpoint = Arc::clone(&endpoint);
             let dispatch_legacy_sessions = Arc::clone(&legacy_sessions);
             let dispatch_modern_sessions = Arc::clone(&modern_sessions);
-            let Some(blocking_dispatch_permit) = try_reserve_legacy_http_blocking_dispatch() else {
+            let Some(blocking_dispatch_permit) = try_reserve_blocking_dispatch() else {
                 let _ = send_h1_response(
                     cx,
                     &listener_shutdown,
@@ -23270,7 +23259,12 @@ mod lib_unit_tests {
             .expect("live modern pump must complete")
     }
 
-    fn run_live_split_transport<R, S>(server: Server, recv: R, send: S) -> Result<(), String>
+    fn run_live_split_transport<R, S>(
+        completion_timeout: Duration,
+        server: Server,
+        recv: R,
+        send: S,
+    ) -> Result<(), String>
     where
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
@@ -23296,9 +23290,32 @@ mod lib_unit_tests {
             }) {
                 // Read the value from the completed blocking closure itself;
                 // the wrapper join is cancellation-dominant during shutdown.
-                Ok(_pump) => wait_for_live_http_test_result(receiver)
-                    .await
-                    .and_then(|result| result.map_err(|error| error.to_string())),
+                Ok(_pump) => {
+                    let deadline = cx.now().saturating_add_nanos(
+                        u64::try_from(completion_timeout.as_nanos())
+                            .expect("split transport completion timeout must fit in nanoseconds"),
+                    );
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(result) => break result.map_err(|error| error.to_string()),
+                            Err(TryRecvError::Disconnected) => {
+                                panic!(
+                                    "live split transport task exited without reporting its result"
+                                );
+                            }
+                            Err(TryRecvError::Empty) => {
+                                asupersync::time::timeout_at(
+                                    deadline,
+                                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                                )
+                                .await
+                                .map_err(|_| {
+                                    live_http_test_timeout("live split transport result")
+                                })?;
+                            }
+                        }
+                    }
+                }
                 Err(error) => Err(format!("live split transport admission failed: {error}")),
             }
         })
@@ -30155,6 +30172,7 @@ mod lib_unit_tests {
         });
         let started = Instant::now();
         let run_result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("returning-legacy-worker-shutdown-test", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -30203,7 +30221,15 @@ mod lib_unit_tests {
             started
         });
         let started = Instant::now();
+        // The handler deliberately outlives both five-second product drain
+        // windows. Include its two-second start bound and two seconds for
+        // joined cleanup instead of expiring the harness before release.
+        let completion_timeout = DISPATCH_WORKER_SHUTDOWN_TIMEOUT * 2
+            + Duration::from_millis(500)
+            + Duration::from_secs(2)
+            + Duration::from_secs(2);
         let run_result = run_live_split_transport(
+            completion_timeout,
             Server::new("returning-modern-worker-shutdown-test", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -30229,6 +30255,11 @@ mod lib_unit_tests {
         assert!(
             run_result.is_err(),
             "modern worker timeout must remain a failure"
+        );
+        assert_eq!(
+            run_result.as_ref().map_err(String::as_str),
+            Err("[-32603] Server transport loop failed"),
+            "the product must report its drain failure after cleanup; a harness timeout is not that failure"
         );
     }
 
@@ -32754,6 +32785,7 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("live-legacy-runtime-connection", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -32779,6 +32811,7 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(16);
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("legacy-roots-context", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -33329,6 +33362,7 @@ mod lib_unit_tests {
         }
         inbound.push_back(modern_subscriptions_listen_request(SUBSCRIPTION_ID));
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             server,
             PublicStdioSubscriptionRecv {
                 inbound,
@@ -33465,6 +33499,7 @@ mod lib_unit_tests {
 
         let _ = receive_calls;
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             server,
             WaitForAckThenMutate {
                 phase: 0,
@@ -33723,6 +33758,7 @@ mod lib_unit_tests {
     ) -> Result<Vec<JsonRpcMessage>, String> {
         let sent = Arc::new(Mutex::new(Vec::new()));
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("public-split-stdio-final-subscription", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
@@ -34884,6 +34920,7 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
         let result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("legacy-cancel-late", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -34928,6 +34965,7 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
         let result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("legacy-cancel-numeric-alias", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -34971,6 +35009,7 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let (outbound, inbound) = sync_channel(32);
         let result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("legacy-cancel-next-negative", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -41642,7 +41681,7 @@ mod lib_unit_tests {
             session_id.clone(),
             Arc::clone(&shell),
         )])));
-        let permit = try_reserve_legacy_http_blocking_dispatch()
+        let permit = try_reserve_blocking_dispatch()
             .ok_or_else(|| "legacy blocking bridge test could not reserve capacity".to_owned())?;
 
         let response = run_live_http_legacy_blocking_dispatch(
@@ -44323,6 +44362,7 @@ mod lib_unit_tests {
         let responses = Arc::new(LiveModernResponses::default());
 
         let run_result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("live-modern-split-overlap", "1.0.0")
                 .protocol_policy(ProtocolPolicy::Auto)
                 .expect("Auto must be available to this test build")
@@ -44367,6 +44407,7 @@ mod lib_unit_tests {
 
         // This differs from the overlap-positive setup only in protocol policy.
         run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
             Server::new("live-modern-split-overlap", "1.0.0")
                 .protocol_policy(ProtocolPolicy::LegacyOnly)
                 .expect("LegacyOnly must be available to this test build")
