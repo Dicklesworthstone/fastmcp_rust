@@ -1516,7 +1516,12 @@ where
             let mut read_buf = ReadBuf::new(&mut temporary[..limit]);
             match Pin::new(&mut self.io).poll_read(task_cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                Poll::Ready(Err(error)) => Poll::Ready(Err(TransportError::Io(error))),
+                // Native I/O can observe cancellation after our checkpoint.
+                // Preserve actual I/O failures, but classify its Interrupted
+                // cancellation exactly as the client transport does.
+                Poll::Ready(Err(error)) => {
+                    Poll::Ready(Err(native_websocket_error(cx, WsError::Io(error))))
+                }
                 Poll::Pending => Poll::Pending,
             }
         })
@@ -3685,11 +3690,17 @@ mod tests {
 
     struct ReadFailingIo {
         write_attempted: Arc<AtomicBool>,
+        error_kind: io::ErrorKind,
+        cancel_on_read: Option<Cx>,
     }
 
     impl ReadFailingIo {
         fn new(write_attempted: Arc<AtomicBool>) -> Self {
-            Self { write_attempted }
+            Self {
+                write_attempted,
+                error_kind: io::ErrorKind::ConnectionReset,
+                cancel_on_read: None,
+            }
         }
     }
 
@@ -3699,8 +3710,11 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            if let Some(cx) = &self.cancel_on_read {
+                cx.set_cancel_requested(true);
+            }
             Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
+                self.error_kind,
                 "peer reset during WebSocket receive",
             )))
         }
@@ -5070,6 +5084,41 @@ mod tests {
                 .join(&cx)
                 .await
                 .expect("join source-preserving client response writer");
+        });
+    }
+
+    #[test]
+    fn async_server_read_boundary_preserves_cancellation_and_real_errors() {
+        run_test(|| async {
+            for (cancel, kind) in [
+                (true, io::ErrorKind::Interrupted),
+                (false, io::ErrorKind::Interrupted),
+                (true, io::ErrorKind::InvalidData),
+            ] {
+                let cx = Cx::for_testing();
+                let write_attempted = Arc::new(AtomicBool::new(false));
+                let mut io = ReadFailingIo::new(Arc::clone(&write_attempted));
+                io.error_kind = kind;
+                io.cancel_on_read = cancel.then(|| cx.clone());
+                let mut transport = AsyncWsServerTransport::from_upgraded(io);
+                assert!(!cx.is_cancel_requested());
+                let error = transport.recv(&cx).await.expect_err("read must fail");
+                if cancel && kind == io::ErrorKind::Interrupted {
+                    assert!(matches!(error, TransportError::Cancelled));
+                } else {
+                    assert!(matches!(
+                        error,
+                        TransportError::Io(ref source) if source.kind() == kind
+                    ));
+                }
+                assert_eq!(cx.is_cancel_requested(), cancel);
+                assert!(!write_attempted.load(Ordering::Acquire));
+                assert!(transport.read_buf.is_empty());
+                assert!(matches!(
+                    transport.recv(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+            }
         });
     }
 
