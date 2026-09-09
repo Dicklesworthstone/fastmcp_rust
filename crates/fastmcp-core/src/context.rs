@@ -2018,7 +2018,18 @@ impl McpContext {
                 .budget_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.ceiling = Some(state.effective(self.cx.budget(), self.budget_debit_origin));
+            let mut remaining = state.effective(self.cx.budget(), self.budget_debit_origin);
+            if let Some(deadline) = remaining.deadline {
+                self.operation_deadline = Some(
+                    self.operation_deadline
+                        .map_or(deadline, |current| current.min(deadline)),
+                );
+            }
+            // A prior child Cx can already include an operation-local
+            // deadline. Retain it on this derivation, never copy it into the
+            // request-wide ceiling where it would shorten parent clones.
+            remaining.deadline = state.ceiling.and_then(|ceiling| ceiling.deadline);
+            state.ceiling = Some(remaining);
             self.budget_debit_origin = (state.ambient_poll_debits, state.ambient_cost_debits);
         }
         self.cx = cx;
@@ -4641,10 +4652,12 @@ mod tests {
     fn test_request_cx_rebinding_preserves_local_deadline_and_pending_cancellation() {
         let parent = McpContext::new(Cx::for_testing(), 18);
         let deadline = wall_now().saturating_add_nanos(5_000_000_000);
-        let local = parent
-            .clone()
-            .with_operation_deadline(Some(deadline))
-            .with_request_cx(Cx::for_testing());
+        let local = parent.clone().with_operation_deadline(Some(deadline));
+        let inherited = Cx::for_testing_with_budget(local.budget());
+        let local = local.with_request_cx(inherited);
+        assert_eq!(local.budget().deadline, Some(deadline));
+        assert_eq!(parent.budget().deadline, None);
+        let local = local.with_request_cx(Cx::for_testing());
         assert_eq!(local.budget().deadline, Some(deadline));
         assert_eq!(parent.budget().deadline, None);
 
