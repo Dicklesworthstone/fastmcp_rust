@@ -431,6 +431,14 @@ A live modern `subscriptions/listen` can stay open on the same stdio
 `Client::open_subscriptions_listener` and then
 `Client::next_subscription_event` to drain acknowledgement, catalog, and
 resource-update events without collecting the stream to terminal.
+On Unix, `open_subscriptions_listener_with_cx` and
+`next_subscription_event_with_cx` yield during initialization and between
+bounded receive turns. Tasks offer the corresponding
+`open_final_task_subscription_listener_with_cx` and
+`next_final_task_subscription_event_with_cx` APIs. Dropping an event future
+preserves the stream and partial frame for resumption; explicit cancellation
+retires only that listener, leaving sibling requests usable. Cancellation
+write failures retain the listener and its error. Writes remain synchronous.
 `listen_subscriptions_typed` remains the collect-to-terminal adapter.
 The same incremental pattern exists on HTTP (`HttpClient::start_subscriptions_listener`),
 modern WebSocket (`WebSocketClient::open_subscriptions_listener`), and

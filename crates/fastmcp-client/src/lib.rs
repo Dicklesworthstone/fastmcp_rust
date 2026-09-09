@@ -20923,6 +20923,27 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a catalog listener, yielding during deferred Unix initialization.
+    ///
+    /// Cancellation before commitment leaves no listener installed. Once this
+    /// returns, the client owns the listener until its terminal event, explicit
+    /// cancellation, or connection close. Request writes remain bounded and
+    /// synchronous, as with [`Self::open_subscriptions_listener`].
+    #[cfg(unix)]
+    pub async fn open_subscriptions_listener_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()> {
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.open_subscriptions_listener(notifications)
+    }
+
     /// Commits upstream cancellation before retiring the live catalog listener.
     ///
     /// A missing listener is a no-op so Drop / next-async cancel paths can
@@ -21048,27 +21069,30 @@ impl Client {
         cx: &Cx,
         cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<StdioSubscriptionEvent> {
-        if let Some(error) = self
-            .live_catalog_subscription
-            .as_ref()
-            .and_then(|subscription| subscription.cancellation_failure.clone())
-        {
-            return Err(error);
-        }
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_catalog_subscription(cx)?;
-            return Err(McpError::request_cancelled());
-        }
         loop {
-            self.harvest_live_catalog_subscription_notifications()?;
-            if let Some(event) = self.take_ready_catalog_subscription_event()? {
+            if let Some(event) = self.try_next_subscription_event(cx, cancellation)? {
                 return Ok(event);
             }
-            self.drive_multiplexed_stdio(cx)?;
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_catalog_subscription(cx)?;
-                return Err(McpError::request_cancelled());
+        }
+    }
+
+    /// Waits for one catalog event while yielding the caller's Unix runtime.
+    ///
+    /// Dropping this future keeps the listener, queued events and partial
+    /// ingress frame on the client; a later call resumes the same stream.
+    /// Explicit cancellation retires only this listener, preserving sibling
+    /// requests. A failed cancellation write retains the listener and error.
+    #[cfg(unix)]
+    pub async fn next_subscription_event_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<StdioSubscriptionEvent> {
+        loop {
+            if let Some(event) = self.try_next_subscription_event(cx, cancellation)? {
+                return Ok(event);
             }
+            asupersync::runtime::yield_now().await;
         }
     }
 
@@ -21184,6 +21208,9 @@ impl Client {
     /// Takes a ready catalog listener event, or drives one bounded stdio
     /// receive turn. `None` means the bound elapsed without an event so a
     /// proxy route can drop its mutex.
+    /// The supplied context cancels only the listener; connection I/O uses
+    /// the retained connection context so cancellation cannot strand this
+    /// listener or terminate sibling requests.
     pub fn try_next_subscription_event(
         &mut self,
         cx: &Cx,
@@ -21198,7 +21225,7 @@ impl Client {
             return Err(error);
         }
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_catalog_subscription(cx)?;
+            self.cancel_live_catalog_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
         self.harvest_live_catalog_subscription_notifications()?;
@@ -21206,11 +21233,11 @@ impl Client {
             return Ok(Some(event));
         }
         self.drive_multiplexed_stdio_until(
-            cx,
+            &self.cx.clone(),
             Some(Instant::now() + STDIO_CATALOG_LISTEN_RECEIVE_BOUND),
         )?;
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            self.cancel_live_catalog_subscription(cx)?;
+            self.cancel_live_catalog_subscription(&self.cx.clone())?;
             return Err(McpError::request_cancelled());
         }
         self.harvest_live_catalog_subscription_notifications()?;
@@ -21318,6 +21345,25 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a Tasks listener, yielding during deferred Unix initialization.
+    ///
+    /// Uses the same ownership and cancellation rules as
+    /// [`Self::open_subscriptions_listener_with_cx`].
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn open_final_task_subscription_listener_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()> {
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.open_final_task_subscription_listener(notifications)
+    }
+
     /// Commits upstream cancellation before retiring the live listener owner.
     ///
     /// The listener remains installed when the cancellation control cannot be
@@ -21366,6 +21412,25 @@ impl Client {
             if let Some(event) = self.try_next_final_task_subscription_event(cx, cancellation)? {
                 return Ok(event);
             }
+        }
+    }
+
+    /// Waits for one Tasks event while yielding the caller's Unix runtime.
+    ///
+    /// Dropping this future preserves the live listener and partial ingress
+    /// for the next call. Explicit cancellation retires only this listener;
+    /// a failed cancellation write retains its owner and original error.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn next_final_task_subscription_event_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        loop {
+            if let Some(event) = self.try_next_final_task_subscription_event(cx, cancellation)? {
+                return Ok(event);
+            }
+            asupersync::runtime::yield_now().await;
         }
     }
 
@@ -37636,6 +37701,282 @@ IFS= read -r end
         client
             .close()
             .expect("incremental catalog listener cleanup");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn subscription_probe_open(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        tasks: bool,
+    ) -> McpResult<()> {
+        let mut filter = SubscriptionFilter::default();
+        if tasks {
+            fastmcp_protocol::set_task_subscription_ids(
+                &mut filter,
+                vec![FinalTaskId::parse("task-live-73").unwrap()],
+            )
+            .unwrap();
+            client
+                .open_final_task_subscription_listener_with_cx(cx, cancellation, filter)
+                .await
+        } else {
+            filter.tools_list_changed = Some(true);
+            client
+                .open_subscriptions_listener_with_cx(cx, cancellation, filter)
+                .await
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn subscription_probe_next(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        tasks: bool,
+    ) -> McpResult<u8> {
+        if tasks {
+            match client
+                .next_final_task_subscription_event_with_cx(cx, cancellation)
+                .await?
+            {
+                StdioTaskSubscriptionEvent::Acknowledged(filter) => {
+                    assert_eq!(
+                        task_subscription_ids(&filter).unwrap().unwrap(),
+                        vec![FinalTaskId::parse("task-live-73").unwrap()]
+                    );
+                    Ok(0)
+                }
+                StdioTaskSubscriptionEvent::Notification(notification) => {
+                    assert_eq!(
+                        notification.params.task.base().task_id.as_str(),
+                        "task-live-73"
+                    );
+                    Ok(1)
+                }
+                StdioTaskSubscriptionEvent::Terminal => Ok(2),
+            }
+        } else {
+            match client
+                .next_subscription_event_with_cx(cx, cancellation)
+                .await?
+            {
+                StdioSubscriptionEvent::Acknowledged(filter) => {
+                    assert_eq!(filter.tools_list_changed, Some(true));
+                    Ok(0)
+                }
+                StdioSubscriptionEvent::Notification(notification) => {
+                    assert!(matches!(
+                        notification,
+                        ServerNotification::ToolsListChanged(None)
+                    ));
+                    Ok(1)
+                }
+                StdioSubscriptionEvent::Terminal => Ok(2),
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn client_subscription_probe(tasks: bool, mode: &'static str) {
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |connection_cx| async move {
+                let discovery = modern_tasks_discovery_response("yielding-listener", serde_json::json!({}));
+                let filter = if tasks { r#"{"taskIds":["task-live-73"]}"# } else { r#"{"toolsListChanged":true}"# };
+                let notification = if tasks {
+                    let task_id = if mode == "bad-filter" { "task-live-74" } else { "task-live-73" };
+                    format!(r#""method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"{task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#)
+                } else {
+                    let catalog = if mode == "bad-filter" { "resources" } else { "tools" };
+                    format!(r#""method":"notifications/{catalog}/list_changed"}}"#)
+                };
+                // The cancellation neighbor sends the same delayed event as
+                // the positive peer; only caller cancellation differs before
+                // the peer checks the resulting wire control.
+                let script = r#"
+IFS= read -r first || exit 90
+case "$first" in *server/discover*'"id":1'*) ;; *) exit 91;; esac
+sleep 0.2
+printf '%s\n' "$1"
+IFS= read -r listen || exit 92
+case "$listen" in *subscriptions/listen*'"id":2'*) ;; *) exit 93;; esac
+printf '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":%s}}\n' "$2"
+IFS= read -r ping || exit 94
+case "$ping" in *'"method":"ping"'*'"id":3'*) ;; *) exit 95;; esac
+printf '%s' '{"jsonrpc":"2.0",'
+sleep 0.4
+printf '%s\n' "$3"
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}'
+case "$4" in cancel-*)
+    IFS= read -r cancel || exit 96
+    case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 97;; esac;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+exec sleep 5
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .auto_initialize(true)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script, "yielding-listener", &discovery, filter, &notification, mode], &connection_cx)
+                    .await.unwrap();
+                let caller_cx = Cx::for_request();
+                let mut cancellation = McpRequestCancellation::new();
+                if mode.starts_with("pre-") {
+                    if mode == "pre-token" { cancellation.cancel(); } else { caller_cx.set_cancel_requested(true); }
+                    let error = subscription_probe_open(&mut client, &caller_cx, &cancellation, tasks).await.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 1);
+                    assert!(client.pending_initialization.is_none());
+                    assert!(client.live_catalog_subscription.is_none());
+                    assert!(client.live_task_subscription.is_none());
+                    caller_cx.set_cancel_requested(false);
+                    cancellation = McpRequestCancellation::new();
+                }
+                let mut open = Box::pin(subscription_probe_open(&mut client, &caller_cx, &cancellation, tasks));
+                let started = Instant::now();
+                assert!(std::future::poll_fn(|task_cx| Poll::Ready(open.as_mut().poll(task_cx))).await.is_pending());
+                assert!(started.elapsed() < Duration::from_millis(150), "deferred listener open must yield");
+                open.await.unwrap();
+                assert_eq!(subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks).await.unwrap(), 0);
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let mut ping = executor.execute(&connection_cx, "ping", None).unwrap();
+                assert_eq!(ping.request_id(), &RequestId::Number(3));
+                let worker = std::thread::current().id();
+                let mut next = Box::pin(subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks));
+                let started = Instant::now();
+                assert!(std::future::poll_fn(|task_cx| Poll::Ready(next.as_mut().poll(task_cx))).await.is_pending());
+                assert!(started.elapsed() < Duration::from_millis(250), "event receive must yield before delayed frame completion");
+                let mut sibling = sibling_root.spawn(move |cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(40)).await;
+                    1_u8
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                assert!(std::future::poll_fn(|task_cx| Poll::Ready(next.as_mut().poll(task_cx))).await.is_pending());
+                if mode == "cancel-cx" { caller_cx.set_cancel_requested(true); }
+                if mode == "cancel-token" { cancellation.cancel(); }
+                let result = if matches!(mode, "drop" | "write-failure") {
+                    drop(next);
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+                    assert_eq!(client.live_task_subscription.is_some(), tasks);
+                    assert_eq!(client.live_catalog_subscription.is_some(), !tasks);
+                    if mode == "write-failure" {
+                        client.close_transport().unwrap();
+                        cancellation.cancel();
+                    }
+                    subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks).await
+                } else { next.await };
+                if mode == "write-failure" {
+                    let error = result.unwrap_err();
+                    assert_ne!(error.code, McpErrorCode::RequestCancelled);
+                    assert_eq!(client.live_task_subscription.is_some(), tasks);
+                    assert_eq!(client.live_catalog_subscription.is_some(), !tasks);
+                    let again = subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks).await.unwrap_err();
+                    assert_eq!(again.code, error.code);
+                    assert_eq!(again.message, error.message);
+                } else if mode == "bad-filter" {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                    assert!(!client.is_initialized());
+                    assert!(executor.try_take_response(&mut ping).is_err());
+                } else {
+                    if mode.starts_with("cancel-") {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        assert_eq!(result.unwrap(), 1);
+                        assert_eq!(subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks).await.unwrap(), 2);
+                    }
+                    assert!(client.live_catalog_subscription.is_none());
+                    assert!(client.live_task_subscription.is_none());
+                    assert!(!client.transport_is_closed());
+                    assert!(client.is_initialized());
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let response = loop {
+                        if let Some(response) = executor.try_take_response(&mut ping).unwrap() { break response; }
+                        assert!(Instant::now() < deadline, "listener cancellation stranded sibling ping");
+                        client.drive_yielding_stdio_slice().unwrap();
+                        asupersync::runtime::yield_now().await;
+                    };
+                    assert_eq!(response.id, Some(RequestId::Number(3)));
+                    assert_eq!(response.result, Some(serde_json::json!({})));
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+                }
+                drop(ping);
+                client.close_with_cx(&connection_cx).await.unwrap();
+                assert!(client.child.is_none());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_yielding_catalog_positive() {
+        client_subscription_probe(false, "positive");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_yielding_tasks_positive() {
+        client_subscription_probe(true, "positive");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_drop_preserves_catalog_prefix() {
+        client_subscription_probe(false, "drop");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_drop_preserves_tasks_prefix() {
+        client_subscription_probe(true, "drop");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_cancel_keeps_sibling() {
+        for tasks in [false, true] {
+            for mode in ["cancel-cx", "cancel-token"] {
+                client_subscription_probe(tasks, mode);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_pre_cancel_keeps_state() {
+        for tasks in [false, true] {
+            for mode in ["pre-cx", "pre-token"] {
+                client_subscription_probe(tasks, mode);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_rejects_unacknowledged_events() {
+        for tasks in [false, true] {
+            client_subscription_probe(tasks, "bad-filter");
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn client_subscription_cancel_write_failure() {
+        for tasks in [false, true] {
+            client_subscription_probe(tasks, "write-failure");
+        }
     }
 
     #[cfg(unix)]
