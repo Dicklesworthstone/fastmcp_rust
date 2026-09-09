@@ -894,7 +894,13 @@ impl ClientBuilder {
                     .await?;
             }
 
-            match self.try_connect(command, args, cx, retry_deadline) {
+            #[cfg(unix)]
+            let attempt_result = self
+                .try_connect_yielding(command, args, cx, retry_deadline)
+                .await;
+            #[cfg(not(unix))]
+            let attempt_result = self.try_connect(command, args, cx, retry_deadline);
+            match attempt_result {
                 Ok(client) => {
                     let operation_error = if cx.checkpoint().is_err() {
                         Some(McpError::request_cancelled())
@@ -1112,7 +1118,92 @@ impl ClientBuilder {
         }
     }
 
-    /// Attempts a single connection.
+    /// Runs startup reads and post-startup cleanup on the caller's runtime.
+    /// The existing spawn/admission path returns an owned provisional Client;
+    /// no transport lock or unowned child crosses an await here.
+    #[cfg(unix)]
+    async fn try_connect_yielding(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: Instant,
+    ) -> McpResult<Client> {
+        let auto_probe = self.protocol_plan.policy() == ProtocolPolicy::Auto;
+        let mut builder = match self.protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self.legacy_builder_with_reverse_handlers(),
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => self.clone(),
+        };
+        let mut plan = self.protocol_plan.clone();
+        if auto_probe {
+            builder.reverse_request_handlers = ReverseRequestHandlers::new();
+            plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+        }
+        let mut probing = auto_probe;
+        loop {
+            let mut client = match builder.try_connect_with_protocol_plan(
+                command,
+                args,
+                cx,
+                plan.clone(),
+                true,
+                false,
+                retry_deadline,
+            )? {
+                StdioConnectionAttempt::Connected(client) => client,
+                StdioConnectionAttempt::Fallback(_) => {
+                    unreachable!("spawning without initialization cannot select fallback")
+                }
+            };
+            if !auto_probe && self.auto_initialize {
+                return Ok(*client);
+            }
+            let operation =
+                match builder.initialize_timeout_policy_for_retry_deadline(retry_deadline) {
+                    Ok(policy) => {
+                        client.timeout_policy = policy;
+                        client.initialize_yielding(cx, probing).await
+                    }
+                    Err(error) => Err(error),
+                };
+            match operation {
+                Ok(Some(_signal)) => {
+                    // Cleanup must finish before fallback admission. It is
+                    // awaited even after cancellation and can veto the spawn.
+                    client.close_with_cx(cx).await?;
+                    crate::admit_auto_legacy_fallback(cx)?;
+                    if Instant::now() >= retry_deadline {
+                        return Err(Self::connection_retry_elapsed_error());
+                    }
+                    builder = self.legacy_builder_with_reverse_handlers();
+                    plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+                    probing = false;
+                }
+                Ok(None) => {
+                    if Instant::now() >= retry_deadline {
+                        return combine_operation_with_cleanup_async(
+                            Err(Self::connection_retry_elapsed_error()),
+                            client.close_with_cx(cx),
+                        )
+                        .await;
+                    }
+                    if auto_probe {
+                        client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                    }
+                    return Ok(*client);
+                }
+                Err(error) => {
+                    return combine_operation_with_cleanup_async(
+                        Err(error),
+                        client.close_with_cx(cx),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Attempts a single connection for synchronous constructors.
     fn try_connect(
         &self,
         command: &str,
@@ -1781,6 +1872,182 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn yielding_connect_probe(policy: ProtocolPolicy, mode: &'static str, owned_group: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let events = StdioRetryAttemptLog::new(mode);
+                let script = r#"
+printf 'spawn:%s\n' "$$" >> "$1"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+case "$first" in
+    *server/discover*) era=modern;;
+    *initialize*2024-11-05*) era=legacy;;
+    *) exit 92;;
+esac
+printf '%s\n' "$era" >> "$1"
+case "$2" in cancel|drop) exec sleep 5;; esac
+if [ "$era" = modern ]; then
+    case "$2" in
+        auto-silent) exec sleep 5;;
+        auto-refusal) sleep 0.1; printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+        wrong-id) sleep 0.1; printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+    esac
+fi
+printf '%s' '{"jsonrpc":"2.0",'
+if [ "$2" = partial ]; then exec sleep 5; fi
+sleep 0.1
+if [ "$era" = modern ]; then
+    printf '%s\n' '"id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"yielding-startup-peer","version":"1"}}}}'
+else
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"yielding-startup-peer","version":"1"}}}'
+    IFS= read -r initialized || exit 93
+    case "$initialized" in *notifications/initialized*) ;; *) exit 94;; esac
+fi
+IFS= read -r ping || exit 95
+case "$ping" in *'"id":2'*) ;; *) exit 96;; esac
+case "$ping" in *'"method":"ping"'*) ;; *) exit 97;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+exec sleep 5
+"#;
+                let builder = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .owned_process_group(owned_group)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(
+                        Duration::from_millis(400), Duration::from_millis(400),
+                    ).unwrap())
+                    .max_retries(0);
+                let args = ["-c", script, "yielding-startup-peer", events.path.to_str().unwrap(), mode];
+                let worker = std::thread::current().id();
+                let started = Instant::now();
+                let mut connecting = Box::pin(builder.connect_stdio_with_cx("sh", &args, &cx));
+                let first = std::future::poll_fn(|task_cx| Poll::Ready(connecting.as_mut().poll(task_cx))).await;
+                assert!(first.is_pending(), "eager initialization must yield before the peer completes");
+                assert!(started.elapsed() < Duration::from_millis(250), "one startup poll occupied the caller worker");
+                let path = events.path.clone();
+                let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        sibling_cx.checkpoint().unwrap();
+                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 {
+                            return 1_u8;
+                        }
+                        assert!(Instant::now() < deadline, "the actual child never received initialization");
+                        asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
+                    }
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                if mode == "drop" {
+                    drop(connecting);
+                } else {
+                    if mode == "cancel" {
+                        cx.set_cancel_requested(true);
+                    }
+                    let result = connecting.await;
+                    cx.set_cancel_requested(false);
+                    if matches!(mode, "partial" | "wrong-id" | "cancel") {
+                        let error = match result {
+                            Err(error) => error,
+                            Ok(_) => panic!("invalid startup must not expose a client"),
+                        };
+                        if mode == "cancel" {
+                            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        } else {
+                            assert_eq!(error.data, Some(serde_json::json!({"timeoutSource":"absolute"})));
+                        }
+                    } else {
+                        let mut client = result.unwrap();
+                        assert!(client.is_initialized());
+                        assert_eq!(client.session.server_info().name, "yielding-startup-peer");
+                        assert_eq!(client.protocol_policy(), policy);
+                        let legacy = policy == ProtocolPolicy::LegacyOnly || mode.starts_with("auto-");
+                        assert_eq!(client.selected_protocol_era(), Some(if legacy {
+                            fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+                        } else {
+                            fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+                        }));
+                        client.ping_with_cx(&cx, &crate::McpRequestCancellation::new()).await.unwrap();
+                        client.close_with_cx(&cx).await.unwrap();
+                        assert!(client.child.is_none());
+                    }
+                }
+                assert!(started.elapsed() < Duration::from_secs(3));
+                let lines = events.lines();
+                let pids = lines.iter().filter_map(|line| line.strip_prefix("spawn:")).collect::<Vec<_>>();
+                let fallback = mode.starts_with("auto-");
+                assert_eq!(pids.len(), if fallback { 2 } else { 1 });
+                if fallback {
+                    assert_ne!(pids[0], pids[1]);
+                    assert_eq!(lines[1], "modern");
+                    assert_eq!(lines[3], "legacy");
+                }
+                #[cfg(target_os = "linux")]
+                for pid in pids {
+                    assert!(!PathBuf::from(format!("/proc/{pid}")).exists(), "startup retained unreaped child {pid}");
+                }
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_legacy_positive() {
+        yielding_connect_probe(ProtocolPolicy::LegacyOnly, "positive", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_modern_positive() {
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "positive", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "positive", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_auto_fallback_positive() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "auto-refusal", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "auto-silent", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_partial_deadline() {
+        yielding_connect_probe(ProtocolPolicy::LegacyOnly, "partial", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "partial", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_cancel_no_fallback() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "cancel", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_drop_reaps_child() {
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "drop", false);
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "drop", true);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_auto_rejects_wrong_id() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "wrong-id", false);
     }
 
     #[cfg(unix)]
