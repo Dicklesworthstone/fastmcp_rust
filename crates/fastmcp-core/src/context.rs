@@ -1427,6 +1427,9 @@ pub struct McpContext {
     /// This is composed with `cx.budget()` on every read so an inner operation
     /// can tighten, but never relax, the caller's current budget.
     budget_state: Arc<Mutex<FrameworkBudgetState>>,
+    /// Debits already included in this Cx's initial budget when request
+    /// execution moved into a child region. Later debits remain clone-shared.
+    budget_debit_origin: (u32, u64),
     /// Mask depth for framework-owned ceilings. The underlying Cx tracks its
     /// own cancellation mask, but it cannot see a ceiling held only here.
     framework_mask_depth: Arc<AtomicU32>,
@@ -1626,18 +1629,20 @@ struct FrameworkBudgetState {
 }
 
 impl FrameworkBudgetState {
-    fn adjusted_ambient(self, mut ambient: Budget) -> Budget {
+    fn adjusted_ambient(self, mut ambient: Budget, origin: (u32, u64)) -> Budget {
         if ambient.poll_quota != u32::MAX {
-            ambient.poll_quota = ambient.poll_quota.saturating_sub(self.ambient_poll_debits);
+            ambient.poll_quota = ambient
+                .poll_quota
+                .saturating_sub(self.ambient_poll_debits.saturating_sub(origin.0));
         }
         if let Some(remaining) = ambient.cost_quota.as_mut() {
-            *remaining = remaining.saturating_sub(self.ambient_cost_debits);
+            *remaining = remaining.saturating_sub(self.ambient_cost_debits.saturating_sub(origin.1));
         }
         ambient
     }
 
-    fn effective(self, ambient: Budget) -> Budget {
-        let ambient = self.adjusted_ambient(ambient);
+    fn effective(self, ambient: Budget, origin: (u32, u64)) -> Budget {
+        let ambient = self.adjusted_ambient(ambient, origin);
         self.ceiling
             .map_or(ambient, |ceiling| ambient.meet(ceiling))
     }
@@ -1692,6 +1697,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
@@ -1736,6 +1742,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
@@ -1781,6 +1788,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
@@ -1830,6 +1838,7 @@ impl McpContext {
         Self {
             cx,
             budget_state: Arc::new(Mutex::new(FrameworkBudgetState::default())),
+            budget_debit_origin: (0, 0),
             framework_mask_depth: Arc::new(AtomicU32::new(0)),
             framework_mask_released: Arc::new(Notify::new()),
             mask_transition: Arc::new(Mutex::new(())),
@@ -1986,6 +1995,31 @@ impl McpContext {
                     .map_or(deadline, |current| current.min(deadline)),
             );
         }
+        self
+    }
+
+    /// Binds this request to the runtime task admitted in its owned region.
+    ///
+    /// The server must supply the Cx obtained from that task's spawn closure.
+    /// All request authority and accounting remain shared with existing clones;
+    /// this does not reopen a closed lease or replace cancellation. The child
+    /// budget already includes earlier request debits, so those debits are not
+    /// charged twice. A shared remaining-budget ceiling prevents rebinding to
+    /// a more generous Cx from restoring spent quota.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_request_cx(mut self, cx: Cx) -> Self {
+        {
+            let mut state = self
+                .budget_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.ceiling = Some(self.apply_operation_deadline(
+                state.effective(self.cx.budget(), self.budget_debit_origin),
+            ));
+            self.budget_debit_origin = (state.ambient_poll_debits, state.ambient_cost_debits);
+        }
+        self.cx = cx;
         self
     }
 
@@ -2284,11 +2318,10 @@ impl McpContext {
 
     /// Returns the underlying region ID from asupersync.
     ///
-    /// This is the region of the caller-supplied [`Cx`]. Owned modern stateless
-    /// dispatch separately supplies a child region through the handler's
-    /// explicit in-request Cx. This ambient identifier does not prove that work
-    /// spawned through [`Self::cx`] is cancelled with, or drained before
-    /// completion of, this MCP request.
+    /// Owned modern stateless dispatch binds this context to its request child
+    /// region, matching the handler's explicit in-request Cx. Other entry
+    /// points retain their caller-supplied context; this identifier alone does
+    /// not establish an owned request lifecycle for those entry points.
     #[must_use]
     pub fn region_id(&self) -> RegionId {
         self.cx.region_id()
@@ -2324,7 +2357,7 @@ impl McpContext {
             .budget_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.apply_operation_deadline(state.effective(ambient))
+        self.apply_operation_deadline(state.effective(ambient, self.budget_debit_origin))
     }
 
     /// Checks if cancellation has been requested.
@@ -2390,7 +2423,8 @@ impl McpContext {
             .budget_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let effective = self.apply_operation_deadline(state.effective(ambient));
+        let effective =
+            self.apply_operation_deadline(state.effective(ambient, self.budget_debit_origin));
         if self.request_cancellation.is_cancel_requested()
             || self.cx.is_cancel_requested()
             || effective.is_past_deadline(now)
@@ -2447,7 +2481,7 @@ impl McpContext {
             .budget_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let adjusted_ambient = state.adjusted_ambient(ambient);
+        let adjusted_ambient = state.adjusted_ambient(ambient, self.budget_debit_origin);
         let effective = self.apply_operation_deadline(
             state
                 .ceiling
@@ -2529,7 +2563,8 @@ impl McpContext {
             .budget_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let effective = self.apply_operation_deadline(state.effective(ambient));
+        let effective =
+            self.apply_operation_deadline(state.effective(ambient, self.budget_debit_origin));
         let enough_cost = effective
             .cost_quota
             .is_none_or(|remaining| remaining >= cost);
@@ -4553,6 +4588,54 @@ mod tests {
 
         assert_eq!(ctx.budget().deadline, Some(tighter_deadline));
         assert!(ctx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn test_request_cx_rebinding_preserves_budget_and_request_state() {
+        let budget = Budget::new().with_poll_quota(5).with_cost_quota(20);
+        let parent = McpContext::with_state(
+            Cx::for_testing_with_budget(budget),
+            17,
+            SessionState::new(),
+        )
+        .with_auth(AuthContext::with_subject("admitted"));
+        parent.set_state("value", 42);
+        assert!(parent.checkpoint().is_ok());
+        assert!(parent.consume_cost(7).is_ok());
+        let child_cx = Cx::for_testing_with_budget(parent.budget());
+        let child = parent.clone().with_request_cx(child_cx);
+        assert_eq!(child.budget().poll_quota, 4);
+        assert_eq!(child.budget().cost_quota, Some(13));
+        assert_eq!(child.get_state::<u32>("value"), Some(42));
+        assert_eq!(child.auth().unwrap().subject, Some("admitted".to_owned()));
+        assert_eq!(child.request_id(), 17);
+
+        // Clones before and after rebinding debit the same remaining balance.
+        assert!(child.checkpoint().is_ok());
+        assert!(parent.consume_cost(3).is_ok());
+        assert_eq!(child.budget().poll_quota, 3);
+        assert_eq!(parent.budget().poll_quota, 3);
+        assert_eq!(child.budget().cost_quota, Some(10));
+        assert_eq!(parent.budget().cost_quota, Some(10));
+        let wider = child.clone().with_request_cx(Cx::for_testing());
+        assert_eq!(wider.budget().poll_quota, 3);
+        assert_eq!(wider.budget().cost_quota, Some(10));
+        assert!(wider.consume_cost(10).is_ok());
+        assert!(child.consume_cost(1).is_err());
+        assert_eq!(parent.budget().cost_quota, Some(0));
+        assert_eq!(child.budget().cost_quota, Some(0));
+        assert_eq!(wider.budget().cost_quota, Some(0));
+
+        let (scoped, guard) = child.begin_request_scope().unwrap();
+        let rebound = scoped.with_request_cx(Cx::for_testing());
+        assert!(parent.request_cancellation().cancel());
+        assert!(rebound.ensure_live().is_err());
+        drop(guard);
+        let expired = rebound.with_request_cx(Cx::for_testing());
+        assert!(expired.ensure_live().is_err());
+        assert!(expired.clone().begin_request_scope().is_none());
+        assert_eq!(expired.get_state::<u32>("value"), None);
+        assert_eq!(parent.budget().cost_quota, Some(0));
     }
 
     #[test]
