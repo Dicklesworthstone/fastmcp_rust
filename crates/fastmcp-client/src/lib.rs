@@ -31177,10 +31177,12 @@ exec sleep 2
                 };
                 let mut client = Box::pin(ClientBuilder::new()
                     .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
-                    .request_timeout_policy(RequestTimeoutPolicy::new(timeout, timeout).unwrap())
                     .max_retries(0)
                     .connect_stdio_with_cx("sh", &["-c", script], &cx))
                     .await.unwrap();
+                // The short deadline belongs to the split-frame request;
+                // process startup is setup and must complete before it begins.
+                client.set_request_timeout_policy(RequestTimeoutPolicy::new(timeout, timeout).unwrap()).unwrap();
                 let worker = std::thread::current().id();
                 let request_started = Instant::now();
                 let mut request = Box::pin(client.request_with_cx(&cx, "ping", None));

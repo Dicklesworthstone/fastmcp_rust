@@ -1973,7 +1973,9 @@ exec sleep 5
                             assert_eq!(error.data, Some(serde_json::json!({"timeoutSource":"absolute"})));
                         }
                     } else {
-                        let mut client = result.unwrap();
+                        let mut client = result.unwrap_or_else(|error| {
+                            panic!("startup {policy:?}/{mode} failed after {:?}: {error}; child events: {:?}", started.elapsed(), events.lines())
+                        });
                         assert!(client.is_initialized());
                         assert_eq!(client.session.server_info().name, "yielding-startup-peer");
                         assert_eq!(client.protocol_policy(), policy);
