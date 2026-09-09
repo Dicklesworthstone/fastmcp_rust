@@ -24201,7 +24201,10 @@ mod router_tests {
             request.clone(),
         ))
         .expect_err("dead runtime must not select direct dispatch");
-        assert_eq!(error.message, "modern request runtime is no longer available");
+        assert_eq!(
+            error.message,
+            "modern request runtime is no longer available"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(untouched.get::<bool>("called"), None);
 

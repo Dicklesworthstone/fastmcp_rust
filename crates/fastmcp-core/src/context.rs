@@ -1636,7 +1636,8 @@ impl FrameworkBudgetState {
                 .saturating_sub(self.ambient_poll_debits.saturating_sub(origin.0));
         }
         if let Some(remaining) = ambient.cost_quota.as_mut() {
-            *remaining = remaining.saturating_sub(self.ambient_cost_debits.saturating_sub(origin.1));
+            *remaining =
+                remaining.saturating_sub(self.ambient_cost_debits.saturating_sub(origin.1));
         }
         ambient
     }
@@ -2009,14 +2010,15 @@ impl McpContext {
     #[doc(hidden)]
     #[must_use]
     pub fn with_request_cx(mut self, cx: Cx) -> Self {
+        if self.cx.is_cancel_requested() {
+            self.request_cancellation.cancel();
+        }
         {
             let mut state = self
                 .budget_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.ceiling = Some(self.apply_operation_deadline(
-                state.effective(self.cx.budget(), self.budget_debit_origin),
-            ));
+            state.ceiling = Some(state.effective(self.cx.budget(), self.budget_debit_origin));
             self.budget_debit_origin = (state.ambient_poll_debits, state.ambient_cost_debits);
         }
         self.cx = cx;
@@ -4593,12 +4595,9 @@ mod tests {
     #[test]
     fn test_request_cx_rebinding_preserves_budget_and_request_state() {
         let budget = Budget::new().with_poll_quota(5).with_cost_quota(20);
-        let parent = McpContext::with_state(
-            Cx::for_testing_with_budget(budget),
-            17,
-            SessionState::new(),
-        )
-        .with_auth(AuthContext::with_subject("admitted"));
+        let parent =
+            McpContext::with_state(Cx::for_testing_with_budget(budget), 17, SessionState::new())
+                .with_auth(AuthContext::with_subject("admitted"));
         parent.set_state("value", 42);
         assert!(parent.checkpoint().is_ok());
         assert!(parent.consume_cost(7).is_ok());
@@ -4636,6 +4635,27 @@ mod tests {
         assert!(expired.clone().begin_request_scope().is_none());
         assert_eq!(expired.get_state::<u32>("value"), None);
         assert_eq!(parent.budget().cost_quota, Some(0));
+    }
+
+    #[test]
+    fn test_request_cx_rebinding_preserves_local_deadline_and_pending_cancellation() {
+        let parent = McpContext::new(Cx::for_testing(), 18);
+        let deadline = wall_now().saturating_add_nanos(5_000_000_000);
+        let local = parent
+            .clone()
+            .with_operation_deadline(Some(deadline))
+            .with_request_cx(Cx::for_testing());
+        assert_eq!(local.budget().deadline, Some(deadline));
+        assert_eq!(parent.budget().deadline, None);
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let original = McpContext::new(cancelled, 19);
+        let rebound = original.clone().with_request_cx(Cx::for_testing());
+        assert!(original.ensure_live().is_err());
+        assert!(rebound.ensure_live().is_err());
+        assert!(rebound.request_cancellation().is_cancel_requested());
+        assert!(rebound.checkpoint().is_err());
     }
 
     #[test]
