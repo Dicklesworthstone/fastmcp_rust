@@ -2402,6 +2402,12 @@ where
             .fail_all(error, ExecutionTerminalReason::ConnectionLost);
     }
 
+    /// Lets the owning client publish an executor-selected failure before
+    /// admitting another request or allocating its next correlation ID.
+    pub(crate) fn terminal_error(&self) -> Option<McpError> {
+        self.state.borrow().terminal_error.clone()
+    }
+
     /// Cancels live owners, releases their waiters, and closes the transport.
     pub fn shutdown(&self, cx: &Cx) -> McpResult<()> {
         let mut state = self.state.borrow_mut();

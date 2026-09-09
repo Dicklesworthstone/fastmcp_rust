@@ -135,6 +135,71 @@ fn lock_stdout_until(deadline: Instant) -> io::Result<std::sync::MutexGuard<'sta
     }
 }
 
+/// Commits bytes to an exclusively owned, unbuffered Unix descriptor.
+/// Callers serialize access and treat every error as connection-fatal.
+#[cfg(unix)]
+pub(crate) fn write_all_fd_until(
+    writer: &impl std::os::fd::AsFd,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(writer).map_err(io::Error::from)?;
+    let restore_flags = !flags.contains(rustix::fs::OFlags::NONBLOCK);
+    if restore_flags {
+        rustix::fs::fcntl_setfl(writer, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(io::Error::from)?;
+    }
+
+    let write_result = (|| {
+        while !bytes.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "stdio write exceeded the commit deadline",
+                ));
+            }
+            let poll_timeout =
+                rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "timeout out of range")
+                    })?;
+            let mut poll_fds = [rustix::event::PollFd::new(
+                writer,
+                rustix::event::PollFlags::OUT,
+            )];
+            match rustix::event::poll(&mut poll_fds, Some(&poll_timeout)) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stdio writability exceeded the commit deadline",
+                    ));
+                }
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(io::Error::from(error)),
+            }
+
+            match rustix::io::write(writer, bytes) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(written) => bytes = &bytes[written..],
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                Err(error) => return Err(io::Error::from(error)),
+            }
+        }
+        Ok(())
+    })();
+    let restore_result = if restore_flags {
+        rustix::fs::fcntl_setfl(writer, flags).map_err(io::Error::from)
+    } else {
+        Ok(())
+    };
+    match (write_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
 impl AsyncStdout {
     /// Creates a new `AsyncStdout` wrapping the standard output.
     #[must_use]
@@ -237,7 +302,7 @@ impl AsyncStdout {
     /// lock acquisition or writability exceeds the bound, or the underlying
     /// descriptor/poll/write error.
     #[cfg(unix)]
-    pub fn write_all_bounded(&mut self, mut bytes: &[u8], timeout: Duration) -> io::Result<()> {
+    pub fn write_all_bounded(&mut self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
         if timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -248,61 +313,7 @@ impl AsyncStdout {
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout overflow"))?;
         let _guard = lock_stdout_until(deadline)?;
-        let flags = rustix::fs::fcntl_getfl(&self.inner).map_err(io::Error::from)?;
-        let restore_flags = !flags.contains(rustix::fs::OFlags::NONBLOCK);
-        if restore_flags {
-            rustix::fs::fcntl_setfl(&self.inner, flags | rustix::fs::OFlags::NONBLOCK)
-                .map_err(io::Error::from)?;
-        }
-
-        let write_result = (|| {
-            while !bytes.is_empty() {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "stdout write exceeded the commit deadline",
-                    ));
-                }
-                let poll_timeout =
-                    rustix::event::Timespec::try_from(deadline.saturating_duration_since(now))
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "timeout out of range")
-                        })?;
-                let mut poll_fds = [rustix::event::PollFd::new(
-                    &self.inner,
-                    rustix::event::PollFlags::OUT,
-                )];
-                match rustix::event::poll(&mut poll_fds, Some(&poll_timeout)) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "stdout writability exceeded the commit deadline",
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(rustix::io::Errno::INTR) => continue,
-                    Err(error) => return Err(io::Error::from(error)),
-                }
-
-                match rustix::io::write(&self.inner, bytes) {
-                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                    Ok(written) => bytes = &bytes[written..],
-                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
-                    Err(error) => return Err(io::Error::from(error)),
-                }
-            }
-            Ok(())
-        })();
-        let restore_result = if restore_flags {
-            rustix::fs::fcntl_setfl(&self.inner, flags).map_err(io::Error::from)
-        } else {
-            Ok(())
-        };
-        match (write_result, restore_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-        }
+        write_all_fd_until(&self.inner, bytes, deadline)
     }
 }
 

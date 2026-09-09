@@ -824,6 +824,46 @@ impl<R, W: AsFd> StdioTransport<R, W> {
 }
 
 #[cfg(unix)]
+impl<R: Read, W: Write + AsFd> StdioTransport<R, W> {
+    /// Commits a frame to an exclusively owned, unbuffered Unix descriptor.
+    ///
+    /// The deadline bounds native pipe/socket writes after encoding. This
+    /// bypasses `Write` buffering and flushes, so the writer must have no
+    /// pending buffered bytes or independently used descriptor duplicates.
+    /// Cancellation is checked before encoding; an admitted commit finishes
+    /// without another checkpoint. A write or flag-restoration error closes
+    /// the transport. The synchronous commit does not yield the runtime.
+    pub fn send_until(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        stdio_checkpoint(cx)?;
+        if Instant::now() >= deadline {
+            return Err(TransportError::Timeout);
+        }
+        let bytes = match message {
+            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+        };
+        let writer = self.writer.as_ref().ok_or(TransportError::Closed)?;
+        if let Err(error) = crate::async_io::write_all_fd_until(writer, &bytes, deadline) {
+            self.closed = true;
+            return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                TransportError::Timeout
+            } else {
+                TransportError::Io(error)
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl<R> StdioTransport<R, std::process::ChildStdin> {
     /// Attempts one small connection-control write without blocking.
     ///
@@ -1160,7 +1200,63 @@ impl<W: Write> StdioSendPermit<'_, W> {
 }
 
 #[cfg(unix)]
+impl<W: Write + AsFd> StdioSendPermit<'_, W> {
+    /// Commits through the unbuffered descriptor with a hard write deadline.
+    /// See [`StdioSendHalf::send_until`] for ownership and buffering rules.
+    /// No cancellation checkpoint occurs after the reservation.
+    pub fn send_until(
+        self,
+        message: &JsonRpcMessage,
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        if self.send_half.is_closed() {
+            return Err(TransportError::Closed);
+        }
+        if Instant::now() >= deadline {
+            return Err(TransportError::Timeout);
+        }
+        let bytes = match message {
+            JsonRpcMessage::Request(request) => self.send_half.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.send_half.codec.encode_response(response)?,
+        };
+        let writer = self
+            .send_half
+            .writer
+            .as_ref()
+            .ok_or(TransportError::Closed)?;
+        if let Err(error) = crate::async_io::write_all_fd_until(writer, &bytes, deadline) {
+            self.send_half.mark_closed();
+            return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                TransportError::Timeout
+            } else {
+                TransportError::Io(error)
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl<W: Write + AsFd> StdioSendHalf<W> {
+    /// Sends one bounded frame to an exclusively owned, unbuffered descriptor.
+    ///
+    /// The native pipe/socket commit is synchronous, with no cancellation
+    /// checkpoint after reservation. It bypasses `Write` adapters and flushes;
+    /// do not supply a writer with pending buffered bytes or independently
+    /// used descriptor duplicates. Every commit I/O error closes both halves.
+    /// Preflight cancellation, expired deadlines and encoding errors emit
+    /// nothing. Regular files/devices may ignore `O_NONBLOCK` and are not a
+    /// bounded-I/O guarantee. Original flags are restored before returning;
+    /// restoration failure is terminal and can leave the flags changed.
+    pub fn send_until(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        self.reserve_send(cx)?.send_until(message, deadline)
+    }
+
     fn try_write_atomic_control(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         if self.is_closed() {
             return Err(TransportError::Closed);
@@ -2091,6 +2187,172 @@ mod tests {
         assert!(matches!(result, Err(TransportError::Cancelled)));
         assert!(checks.get() >= 3);
         assert!(transport.closed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_split_send_commits_large_frame_and_restores_flags() {
+        for initially_nonblocking in [false, true] {
+            let (writer, peer) = UnixStream::pair().unwrap();
+            writer.set_nonblocking(initially_nonblocking).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let flags = fcntl_getfl(&writer).unwrap();
+            let (receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
+            let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+                1_i64.into(),
+                serde_json::json!({"text": "x".repeat(4 * 1024 * 1024)}),
+            ));
+            let expected = format!("{}\n", serde_json::to_string(&message).unwrap());
+            let follow_up = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2));
+            let next = format!("{}\n", serde_json::to_string(&follow_up).unwrap());
+            let reader = std::thread::spawn(move || {
+                let mut reader = BufReader::new(peer);
+                let mut first = String::new();
+                let mut second = String::new();
+                reader.read_line(&mut first).unwrap();
+                reader.read_line(&mut second).unwrap();
+                assert_eq!(first, expected);
+                assert_eq!(second, next);
+            });
+            let cx = Cx::for_testing();
+            sender
+                .send_until(&cx, &message, Instant::now() + Duration::from_secs(3))
+                .unwrap();
+            sender
+                .send_until(&cx, &follow_up, Instant::now() + Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(fcntl_getfl(sender.writer.as_ref().unwrap()).unwrap(), flags);
+            assert!(!sender.is_closed());
+            assert!(!receiver.is_closed());
+            reader.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_split_send_times_out_and_closes_both_halves() {
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let flags = fcntl_getfl(&writer).unwrap();
+        let (receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            1_i64.into(),
+            serde_json::json!({"text": "x".repeat(4 * 1024 * 1024)}),
+        ));
+        let expected = format!("{}\n", serde_json::to_string(&message).unwrap());
+        let cx = Cx::for_testing();
+        let started = Instant::now();
+        assert!(matches!(
+            sender.send_until(&cx, &message, started + Duration::from_millis(500)),
+            Err(TransportError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(sender.is_closed());
+        assert!(receiver.is_closed());
+        assert_eq!(fcntl_getfl(sender.writer.as_ref().unwrap()).unwrap(), flags);
+        assert!(matches!(
+            sender.send_until(&cx, &message, Instant::now() + Duration::from_secs(1)),
+            Err(TransportError::Closed)
+        ));
+        sender.close().unwrap();
+        let mut emitted = Vec::new();
+        peer.read_to_end(&mut emitted).unwrap();
+        assert!(!emitted.is_empty());
+        assert!(emitted.len() < expected.len());
+        assert_eq!(emitted, expected.as_bytes()[..emitted.len()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_split_send_preflight_failure_preserves_stream() {
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let flags = fcntl_getfl(&writer).unwrap();
+        let (receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2));
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            sender.send_until(&cx, &message, Instant::now() + Duration::from_secs(1)),
+            Err(TransportError::Cancelled)
+        ));
+        cx.set_cancel_requested(false);
+        assert!(matches!(
+            sender.send_until(&cx, &message, Instant::now()),
+            Err(TransportError::Timeout)
+        ));
+        let maximum = sender.codec.max_message_size();
+        sender.codec.set_max_message_size(1);
+        assert!(matches!(
+            sender.send_until(&cx, &message, Instant::now() + Duration::from_secs(1)),
+            Err(TransportError::Codec(_))
+        ));
+        sender.codec.set_max_message_size(maximum);
+        assert!(!sender.is_closed());
+        assert!(!receiver.is_closed());
+        assert_eq!(fcntl_getfl(sender.writer.as_ref().unwrap()).unwrap(), flags);
+        assert_eq!(
+            peer.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        sender
+            .send_until(&cx, &message, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut line = String::new();
+        BufReader::new(peer).read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            format!("{}\n", serde_json::to_string(&message).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_split_send_respects_shared_close() {
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let (mut receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
+        receiver.close().unwrap();
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2));
+        assert!(matches!(
+            sender.send_until(
+                &Cx::for_testing(),
+                &message,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert_eq!(
+            peer.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_split_send_cancel_after_reservation_finishes_frame() {
+        let (writer, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (_receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
+        let cx = Cx::for_testing();
+        let permit = sender.reserve_send(&cx).unwrap();
+        cx.set_cancel_requested(true);
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2));
+        permit
+            .send_until(&message, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(peer).read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            format!("{}\n", serde_json::to_string(&message).unwrap())
+        );
+        assert!(!sender.is_closed());
     }
 
     #[cfg(unix)]

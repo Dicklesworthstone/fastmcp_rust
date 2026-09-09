@@ -3079,11 +3079,11 @@ fn commit_reverse_callback_response(
     cancellation: &ReverseRequestCancellation,
     response: &JsonRpcMessage,
 ) -> Result<bool, TransportError> {
-    let mut sender = response_sender.lock().map_err(|_| TransportError::Closed)?;
+    let (mut sender, deadline) = lock_child_sender(response_sender)?;
     if !state.claim_response_if_open(request_id, cancellation) {
         return Ok(false);
     }
-    sender.send(cx, response)?;
+    send_child_frame(&mut sender, cx, response, deadline)?;
     Ok(true)
 }
 
@@ -9487,12 +9487,66 @@ impl SharedStdioRecv {
 #[derive(Clone)]
 struct SharedStdioSend(Arc<Mutex<StdioSendHalf<ChildStdin>>>);
 
+const CHILD_STDIO_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+type ChildStdioSenderGuard<'a> = std::sync::MutexGuard<'a, StdioSendHalf<ChildStdin>>;
+
+/// The queue wait and native commit share one bound. This remains a
+/// synchronous boundary; it never creates a runtime, task, or worker thread.
+fn lock_child_sender(
+    sender: &Mutex<StdioSendHalf<ChildStdin>>,
+) -> Result<(ChildStdioSenderGuard<'_>, Instant), TransportError> {
+    let deadline = Instant::now()
+        .checked_add(CHILD_STDIO_COMMIT_TIMEOUT)
+        .ok_or(TransportError::Timeout)?;
+    #[cfg(unix)]
+    {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(TransportError::Timeout);
+            }
+            match sender.try_lock() {
+                Ok(guard) => return Ok((guard, deadline)),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(TransportError::Closed),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::park_timeout(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        sender
+            .lock()
+            .map(|guard| (guard, deadline))
+            .map_err(|_| TransportError::Closed)
+    }
+}
+
+fn send_child_frame(
+    sender: &mut StdioSendHalf<ChildStdin>,
+    cx: &Cx,
+    message: &JsonRpcMessage,
+    deadline: Instant,
+) -> Result<(), TransportError> {
+    #[cfg(unix)]
+    {
+        sender.send_until(cx, message, deadline)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = deadline;
+        sender.send(cx, message)
+    }
+}
+
 impl TransportSendHalf for SharedStdioSend {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        self.0
-            .lock()
-            .map_err(|_| TransportError::Closed)?
-            .send(cx, message)
+        let (mut sender, deadline) = lock_child_sender(&self.0)?;
+        send_child_frame(&mut sender, cx, message, deadline)
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -9670,9 +9724,9 @@ fn send_child_server_response_during_receive(
     _cx: &Cx,
     message: &JsonRpcMessage,
 ) -> McpResult<()> {
-    transport
-        .lock()
-        .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
+    lock_child_sender(transport)
+        .map_err(transport_error_to_mcp)?
+        .0
         .try_send_control_message(message)
         .map_err(transport_error_to_mcp)
 }
@@ -9761,13 +9815,19 @@ fn initialize_child_transport(
         McpError::internal_error(format!("Failed to serialize params: {error}"))
     })?;
     let request = JsonRpcRequest::new("initialize", Some(params), INITIALIZE_REQUEST_ID);
+    let message = JsonRpcMessage::Request(request);
+    #[cfg(unix)]
     transport
-        .send(cx, &JsonRpcMessage::Request(request))
+        .send_until(cx, &message, Instant::now() + CHILD_STDIO_COMMIT_TIMEOUT)
+        .map_err(transport_error_to_mcp)?;
+    #[cfg(not(unix))]
+    transport
+        .send(cx, &message)
         .map_err(transport_error_to_mcp)?;
     // Both timers start at the observed successful commit boundary. The
     // initialization exchange has no request-owned progress token, so its idle
-    // timer is never reset. Synchronous writes remain governed by the caller's
-    // `Cx` checkpoints before this commit.
+    // timer is never reset. Unix commits have their own bounded native write;
+    // cancellation remains a preflight checkpoint before that commit.
     let committed_at = Instant::now();
     let deadlines = RequestDeadlines::start_at(timeout_policy, committed_at)?;
 
@@ -13444,6 +13504,9 @@ impl StdioRequestExecutor {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<StdioRequestExecution> {
+        if let Some(error) = self.executor.terminal_error() {
+            return Err(error);
+        }
         let method = method.into();
         if self
             .client_extension_runtime
@@ -13527,6 +13590,9 @@ impl StdioRequestExecutor {
         cx: &Cx,
         parameters: serde_json::Value,
     ) -> McpResult<StdioRequestExecution> {
+        if let Some(error) = self.executor.terminal_error() {
+            return Err(error);
+        }
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         self.execute_tasks_subscription(
@@ -15067,10 +15133,8 @@ impl Client {
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), TransportError> {
-        self.response_sender
-            .lock()
-            .map_err(|_| TransportError::Closed)?
-            .send(cx, message)
+        let (mut sender, deadline) = lock_child_sender(&self.response_sender)?;
+        send_child_frame(&mut sender, cx, message, deadline)
     }
 
     fn activate_selected_io(&mut self) {
@@ -15154,7 +15218,9 @@ impl Client {
             return Err(error);
         }
         let executor = self.multiplexed_stdio_executor()?;
-        executor.service(cx)?;
+        executor
+            .service(cx)
+            .map_err(|error| self.terminate_connection(error))?;
         let params = match params {
             Some(params) => Some(self.prepare_request_parameters(params)?),
             None if self.session.selected_era() == Some(ProtocolEra::Modern2026) => {
@@ -15162,7 +15228,12 @@ impl Client {
             }
             None => None,
         };
-        executor.execute(cx, method, params)
+        match executor.execute(cx, method, params) {
+            Err(error) if executor.executor.terminal_error().is_some() => {
+                Err(self.terminate_connection(error))
+            }
+            result => result,
+        }
     }
 
     /// Starts one exact-2024 stdio request without waiting so the caller can
@@ -17547,9 +17618,9 @@ impl Client {
     fn send_bounded_control_message(&mut self, message: JsonRpcMessage) -> McpResult<()> {
         #[cfg(unix)]
         {
-            self.response_sender
-                .lock()
-                .map_err(|_| McpError::internal_error("Client stdio response writer failed"))?
+            lock_child_sender(&self.response_sender)
+                .map_err(transport_error_to_mcp)?
+                .0
                 .try_send_control_message(&message)
                 .map_err(transport_error_to_mcp)
         }
@@ -30375,6 +30446,157 @@ mod tests {
             client.transport_is_closed(),
             "transport teardown follows the cooperative callback join"
         );
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn client_bounded_send_probe(callback: bool, drains: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let mut work = root.spawn(move |cx| async move {
+                let script = r#"
+IFS= read -r initialize || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"bounded-send-peer","version":"1"}}}'
+IFS= read -r initialized || exit 91
+if [ "$2" = 1 ]; then
+    IFS= read -r request || exit 92
+    printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"sampling/createMessage","params":{"messages":[],"maxTokens":9}}'
+fi
+if [ "$1" = 0 ]; then exec sleep 6; fi
+IFS= read -r frame || exit 93
+[ "${#frame}" -gt 2097152 ] || exit 94
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"largeFrame":true}}'
+IFS= read -r follow_up || exit 95
+case "$follow_up" in *'"id":3'*) ;; *) exit 96;; esac
+case "$follow_up" in *'"method":"ping"'*) ;; *) exit 97;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+exec sleep 6
+"#;
+                let calls = Arc::new(AtomicUsize::new(0));
+                let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+                    let calls = Arc::clone(&calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(CreateMessageResult::text("x".repeat(2 * 1024 * 1024), "large-model")) })
+                    }
+                });
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                    .reverse_request_handlers(handlers)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(4)).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script, "bounded-send-peer", if drains { "1" } else { "0" }, if callback { "1" } else { "0" }], &cx)
+                    .await.unwrap();
+                let params = if callback { serde_json::json!({}) } else { serde_json::json!({"payload": "x".repeat(2 * 1024 * 1024)}) };
+                let started = Instant::now();
+                let result = client.request_with_cx(&cx, "test/large", Some(params)).await;
+                assert!(started.elapsed() < Duration::from_secs(4), "commit must finish before the nonreading peer exits");
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(callback));
+                if drains {
+                    assert_eq!(result.unwrap().result, Some(serde_json::json!({"largeFrame": true})));
+                    assert!(!client.transport_is_closed());
+                    client.ping_with_cx(&cx, &McpRequestCancellation::new()).await.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert!(error.message.contains("timed out"), "{error}");
+                    assert!(client.transport_is_closed());
+                    assert!(client.responses.terminal_error().is_some());
+                    assert!(!client.is_initialized());
+                    let next_id = client.next_id.load(Ordering::SeqCst);
+                    assert!(client.request_with_cx(&cx, "ping", None).await.is_err());
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+                    let detached = client.multiplexed_stdio_executor().unwrap();
+                    assert!(detached.execute(&cx, "ping", None).is_err());
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+                    #[cfg(feature = "tasks")]
+                    {
+                        assert!(detached.execute_final_tasks_subscription(&cx, serde_json::json!({})).is_err());
+                        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+                    }
+                }
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(client.child.is_none());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_bounded_request_send_positive() {
+        client_bounded_send_probe(false, true);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_bounded_request_send_backpressure() {
+        client_bounded_send_probe(false, false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_bounded_callback_send_positive() {
+        client_bounded_send_probe(true, true);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_bounded_callback_send_backpressure() {
+        client_bounded_send_probe(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_bounded_writer_lock_contention() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 6"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (receiver, sender) =
+            StdioTransport::new(std::io::empty(), child.stdin.take().unwrap()).into_split();
+        let sender = Arc::new(Mutex::new(sender));
+        let held = sender.lock().unwrap();
+        let waiting = Arc::clone(&sender);
+        let started = Instant::now();
+        let timeout = std::thread::spawn(move || {
+            matches!(lock_child_sender(&waiting), Err(TransportError::Timeout))
+        });
+        assert!(timeout.join().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!held.is_closed());
+        assert!(!receiver.is_closed());
+        drop(held);
+        let (guard, deadline) = lock_child_sender(&sender).unwrap();
+        assert!(Instant::now() < deadline);
+        drop(guard);
+
+        let held = sender.lock().unwrap();
+        let waiting = Arc::clone(&sender);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let child_ready = Arc::clone(&ready);
+        let acquired = Arc::new(AtomicBool::new(false));
+        let child_acquired = Arc::clone(&acquired);
+        let success = std::thread::spawn(move || {
+            child_ready.wait();
+            let (_guard, deadline) = lock_child_sender(&waiting).unwrap();
+            assert!(Instant::now() < deadline);
+            child_acquired.store(true, Ordering::SeqCst);
+        });
+        ready.wait();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!acquired.load(Ordering::SeqCst));
+        drop(held);
+        success.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+        sender.lock().unwrap().close().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
