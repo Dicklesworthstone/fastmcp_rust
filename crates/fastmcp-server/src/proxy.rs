@@ -17,8 +17,6 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 #[cfg(feature = "tasks")]
-use asupersync::channel::oneshot;
-#[cfg(feature = "tasks")]
 use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(feature = "tasks")]
 use fastmcp_client::FinalToolCallOutcome;
@@ -3798,26 +3796,20 @@ struct ProxyIncrementalStdioCatalogListener {
 /// [`ChildRegion`] until its result is polled. A request future dropped after
 /// enqueueing the create command could therefore leave a late scheduler
 /// admission with no handle to close it. This short structured task always
-/// consumes that result. The oneshot receiver either takes ownership or, when
-/// its request has gone away, makes `send_blocking` return the result so the
-/// task drops the child handle and triggers its close backstop.
+/// consumes that result. Its task-result receiver either takes ownership or,
+/// when its request has gone away, drops the returned child handle and triggers
+/// its close backstop. Admission observation must not checkpoint or charge the
+/// caller's shared context.
 #[cfg(feature = "tasks")]
 async fn open_owned_proxy_listener_region(
     cx: &Cx,
     listener_kind: &'static str,
 ) -> McpResult<ChildRegion> {
-    let (sender, mut receiver) = oneshot::channel();
-    let _opening_task = cx
+    let mut opening_task = cx
         .spawn(move |task_cx| async move {
-            let result = task_cx
+            task_cx
                 .open_child_region(ChildRegionSpec::inherit())
-                .await;
-            if let Err(error) = sender.send_blocking(result) {
-                match error {
-                    oneshot::SendError::Disconnected(abandoned)
-                    | oneshot::SendError::Cancelled(abandoned) => drop(abandoned),
-                }
-            }
+                .await
         })
         .map_err(|error| {
             McpError::internal_error(format!(
@@ -3825,18 +3817,23 @@ async fn open_owned_proxy_listener_region(
             ))
         })?;
 
-    match receiver.recv(cx).await {
+    // poll_join leaves the admission task region-owned when this future is
+    // dropped; unlike join(), abandoning observation does not abort it while
+    // its ChildRegionOpening still lacks the drop cleanup handle.
+    match std::future::poll_fn(|task_cx| opening_task.poll_join(task_cx)).await {
         Ok(Ok(child_region)) => Ok(child_region),
         Ok(Err(error)) => Err(McpError::internal_error(format!(
             "Proxy {listener_kind} stdio listener could not create its owned child region: {error}"
         ))),
-        Err(oneshot::RecvError::Cancelled) => Err(McpError::request_cancelled()),
-        Err(oneshot::RecvError::Closed) => Err(McpError::internal_error(format!(
+        Err(asupersync::runtime::JoinError::Cancelled(_)) => Err(McpError::request_cancelled()),
+        Err(asupersync::runtime::JoinError::Panicked(_)) => Err(McpError::internal_error(format!(
             "Proxy {listener_kind} stdio listener child-region admission guard ended without a result"
         ))),
-        Err(oneshot::RecvError::PolledAfterCompletion) => Err(McpError::internal_error(format!(
-            "Proxy {listener_kind} stdio listener child-region admission result was consumed twice"
-        ))),
+        Err(asupersync::runtime::JoinError::PolledAfterCompletion) => {
+            Err(McpError::internal_error(format!(
+                "Proxy {listener_kind} stdio listener child-region admission result was consumed twice"
+            )))
+        }
     }
 }
 
@@ -13792,6 +13789,63 @@ IFS= read -r end
             .expect_err("polling without a reserved incremental listener must fail closed");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(error.message.contains("incremental catalog listener"));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn fnd_04_proxy_listener_region_admission_preserves_parent_budget() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime builds");
+        let parent =
+            runtime.request_cx_with_budget(asupersync::Budget::INFINITE.with_poll_quota(64));
+        let before = parent.budget();
+        runtime.block_on(async {
+            asupersync::time::timeout(parent.now(), Duration::from_secs(5), async {
+                for kind in ["catalog", "final Tasks"] {
+                    let region = super::open_owned_proxy_listener_region(&parent, kind)
+                        .await
+                        .expect("live parent admits listener region");
+                    assert_eq!(
+                        parent.budget(),
+                        before,
+                        "admission cannot charge ambient budget"
+                    );
+                    assert_ne!(region.region_id(), parent.region_id());
+                    let retained = region.cx().clone();
+                    let retained_before = retained.budget();
+                    let nested = super::open_owned_proxy_listener_region(&retained, kind)
+                        .await
+                        .expect("the retained parent admits a region while live");
+                    assert_eq!(retained.budget(), retained_before);
+                    let mut body = nested
+                        .cx()
+                        .spawn(|_| async { 42 })
+                        .expect("listener region can execute work");
+                    assert_eq!(body.join(&parent).await.expect("body joins"), 42);
+                    nested
+                        .close()
+                        .await
+                        .expect("nested listener region quiesces");
+                    region.close().await.expect("listener region quiesces");
+                    assert!(
+                        super::open_owned_proxy_listener_region(&retained, kind)
+                            .await
+                            .is_err(),
+                        "changing only parent liveness refuses a new listener region"
+                    );
+                    assert_eq!(retained.budget(), retained_before);
+                    assert_eq!(
+                        parent.budget(),
+                        before,
+                        "rejected admission leaves parent unchanged"
+                    );
+                    assert!(!parent.is_cancel_requested());
+                }
+            })
+            .await
+            .expect("native admission and close settle within five seconds");
+        });
     }
 
     #[cfg(feature = "tasks")]
