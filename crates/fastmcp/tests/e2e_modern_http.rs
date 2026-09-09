@@ -21204,7 +21204,7 @@ fn e2e_public_http_legacy_as_proxy_resource_composes_nested_prompt() {
 #[test]
 fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
     let cx = Cx::for_request();
-    let upstream = spawn_modern_as_proxy_hold_upstream();
+    let (upstream, hold_completed) = spawn_modern_as_proxy_hold_upstream();
     let gateway = spawn_modern_http_identity_proxy_gateway_configured(
         upstream.address(),
         None,
@@ -21266,6 +21266,11 @@ fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout
         "as_proxy must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
     );
 
+    runtime_block_on_bounded_named(&cx, "HTTP hold handler completion before teardown", async {
+        while !hold_completed.load(Ordering::Acquire) {
+            asupersync::runtime::yield_now().await;
+        }
+    });
     drop(client);
     gateway.shutdown();
     upstream.shutdown();
@@ -23856,7 +23861,9 @@ impl ToolHandler for PublicHttpFastTool {
 const PUBLIC_HTTP_HOLD_TOOL_NAME: &str = "public-http-e2e-hold";
 
 /// Sleeps longer than a 1s gateway `request_timeout` and has no handler `timeout()`.
-struct PublicHttpHoldTool;
+struct PublicHttpHoldTool {
+    completed: Option<Arc<AtomicBool>>,
+}
 
 impl ToolHandler for PublicHttpHoldTool {
     fn definition(&self) -> Tool {
@@ -23876,6 +23883,9 @@ impl ToolHandler for PublicHttpHoldTool {
 
     fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         thread::sleep(Duration::from_millis(1500));
+        if let Some(completed) = &self.completed {
+            completed.store(true, Ordering::Release);
+        }
         Ok(vec![Content::text("held")])
     }
 }
@@ -26816,18 +26826,23 @@ fn spawn_legacy_as_proxy_timeout_upstream() -> HttpServerFixture {
     })
 }
 
-fn spawn_modern_as_proxy_hold_upstream() -> HttpServerFixture {
-    spawn_legacy_http_server("modern as_proxy hold upstream", || {
+fn spawn_modern_as_proxy_hold_upstream() -> (HttpServerFixture, Arc<AtomicBool>) {
+    let completed = Arc::new(AtomicBool::new(false));
+    let handler_completed = Arc::clone(&completed);
+    let fixture = spawn_legacy_http_server("modern as_proxy hold upstream", move || {
         ServerBuilder::new("facade-http-modern-as-proxy-hold-upstream", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly is available")
             .tool(PublicHttpValue)
-            .tool(PublicHttpHoldTool)
+            .tool(PublicHttpHoldTool {
+                completed: Some(handler_completed),
+            })
             .tool(PublicHttpFastTool)
             .prompt(PublicHttpInstructionPrompt)
             .resource(PublicHttpSnapshotResource)
             .build()
-    })
+    });
+    (fixture, completed)
 }
 
 fn spawn_legacy_as_proxy_hold_upstream() -> HttpServerFixture {
@@ -26836,7 +26851,7 @@ fn spawn_legacy_as_proxy_hold_upstream() -> HttpServerFixture {
             .protocol_policy(ProtocolPolicy::LegacyOnly)
             .expect("LegacyOnly is available")
             .tool(PublicHttpValue)
-            .tool(PublicHttpHoldTool)
+            .tool(PublicHttpHoldTool { completed: None })
             .tool(PublicHttpFastTool)
             .prompt(PublicHttpInstructionPrompt)
             .resource(PublicHttpSnapshotResource)
@@ -41552,7 +41567,7 @@ mod live_websocket_bind {
             let cx = Cx::current().expect(
                 "owned modern WebSocket as_proxy request_timeout runtime installs an ambient context",
             );
-            let hold_upstream = spawn_modern_as_proxy_hold_upstream();
+            let (hold_upstream, hold_completed) = spawn_modern_as_proxy_hold_upstream();
             let plan = ClientProtocolPlan::http(
                 ProtocolPolicy::ModernOnly,
                 Some(public_http_target(hold_upstream.address(), "/mcp")),
@@ -41602,7 +41617,7 @@ mod live_websocket_bind {
                 "public ModernOnly bind_websocket as_proxy request_timeout publishes its address",
             );
             let scope = cx.scope();
-            let listener = cx
+            let mut listener = cx
                 .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
                 .expect(
                     "public ModernOnly bind_websocket as_proxy request_timeout serve must be admitted",
@@ -41680,9 +41695,39 @@ mod live_websocket_bind {
                 "as_proxy WebSocket must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
             );
 
+            websocket_client_bounded(
+                &cx,
+                "WebSocket hold handler completion before teardown",
+                async {
+                    while !hold_completed.load(Ordering::Acquire) {
+                        asupersync::runtime::yield_now().await;
+                    }
+                },
+            )
+            .await;
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
+            let shutdown = asupersync::time::timeout(
+                cx.now(),
+                WS_SERVER_TEARDOWN_BOUND,
+                std::future::poll_fn(|task_cx| listener.poll_join(task_cx)),
+            )
+            .await
+            .expect("WebSocket timeout gateway joins before upstream shutdown")
+            .expect("WebSocket timeout gateway child completes without a join failure")
+            .expect("WebSocket timeout gateway shuts down without a server error");
+            if let WebSocketServerShutdown::Nonquiescent(mut shutdown) = shutdown {
+                let settled = shutdown
+                    .settle_for(WS_SERVER_TEARDOWN_BOUND)
+                    .await
+                    .expect("nonquiescent WebSocket timeout gateway cleanup has no terminal error");
+                assert!(
+                    settled,
+                    "WebSocket timeout gateway retains live children after cleanup"
+                );
+                panic!("WebSocket timeout gateway unexpectedly stopped nonquiescently");
+            }
             hold_upstream.shutdown();
         });
     }
