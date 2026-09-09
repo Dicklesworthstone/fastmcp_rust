@@ -450,7 +450,7 @@ fn quarantine_identity() -> WorkflowIdentity {
         },
         ActionIdentity {
             name: "taiki-e/install-action",
-            commit_sha: "ba47c86ac325773530516bb756137ac718732518",
+            commit_sha: "5bf6ce016fd2e72eefc647cbca1e4213f65955b8",
         },
         ActionIdentity {
             name: "actions/upload-artifact",
@@ -462,8 +462,8 @@ fn quarantine_identity() -> WorkflowIdentity {
         role: WorkflowRole::QuarantineVerification,
         workflow_name: "Release Quarantine Verification",
         path: WORKFLOW_PATH,
-        revision: "3332da3e036fb4c0a778aaec24cb17720b37c08c",
-        definition_sha256_hex: "23ea1534d4ee97a60506d2efc48c27e67dc4acbcd98c1818fb46f23e744b5684",
+        revision: "6ee74786da85badd12fdd4828703dcaaf2afe9dd",
+        definition_sha256_hex: "7bb8cc73e7bf674c99e3ffc7bf586efd0b37c1858b88941a8772c7e0cd1f81ce",
         events: &["workflow_dispatch"],
         jobs: &["preflight", "build"],
         declared_permissions: &[
