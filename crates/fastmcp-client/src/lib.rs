@@ -9439,6 +9439,25 @@ impl ClientTransportRecvHalf for SharedStdioRecv {
 
 impl SharedStdioRecv {
     #[cfg(unix)]
+    fn recv_slice_with_source(
+        &mut self,
+        cx: &Cx,
+        slice_deadline: Instant,
+        frame_deadline: Option<Instant>,
+    ) -> Result<Option<(ReceivedTransportFrame, Instant)>, TransportError> {
+        let mut receiver = self.0.lock().map_err(|_| TransportError::Closed)?;
+        if receiver
+            .recv_slice_or_closed(cx, slice_deadline, frame_deadline)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let received_at = Instant::now();
+        let frame = admitted_stdio_frame(&receiver)?;
+        Ok(Some((frame, received_at)))
+    }
+
+    #[cfg(unix)]
     fn recv_until_with_source(
         &mut self,
         cx: &Cx,
@@ -9562,16 +9581,9 @@ impl NegotiatedClientIo<SharedStdioRecv, SharedStdioSend> {
         slice_deadline: Instant,
         frame_deadline: Option<Instant>,
     ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
-        let mut receiver = self.receiver.0.lock().map_err(|_| TransportError::Closed)?;
-        if receiver
-            .recv_slice_or_closed(cx, slice_deadline, frame_deadline)?
-            .is_none()
-        {
-            return Err(TransportError::ReceiveDeadlineExceeded);
-        }
-        let received_at = Instant::now();
-        let frame = admitted_stdio_frame(&receiver)?;
-        Ok((frame, received_at))
+        self.receiver
+            .recv_slice_with_source(cx, slice_deadline, frame_deadline)?
+            .ok_or(TransportError::ReceiveDeadlineExceeded)
     }
 
     fn recv_until_with_source(
@@ -14622,6 +14634,104 @@ impl Client {
             .map_err(|error| self.record_initialization_failure(error))
     }
 
+    /// The async builder owns this provisional client across every await.
+    /// Dropping construction therefore drops the client and its child owner;
+    /// an interrupted handshake is never returned for a second initialization.
+    #[cfg(unix)]
+    async fn initialize_yielding(
+        &mut self,
+        cx: &Cx,
+        auto_probe: bool,
+    ) -> McpResult<Option<AutoStdioFallbackSignal>> {
+        self.timeout_policy.validate()?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let modern = self.session.protocol_plan().policy() == ProtocolPolicy::ModernOnly;
+        if auto_probe && !modern {
+            return Err(McpError::internal_error(
+                "Auto stdio probe requires a modern-only client session",
+            ));
+        }
+        let (method, params) = if modern {
+            let params =
+                serde_json::to_value(ServerDiscoverRequest::default()).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Failed to serialize discovery parameters: {error}"
+                    ))
+                })?;
+            (
+                SERVER_DISCOVER_METHOD,
+                self.with_modern_request_metadata(params)?,
+            )
+        } else {
+            let params = InitializeParams {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                capabilities: self.session.client_capabilities().clone(),
+                client_info: self.session.client_info().clone(),
+            };
+            let params = serde_json::to_value(params).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Failed to serialize initialize parameters: {error}"
+                ))
+            })?;
+            ("initialize", self.prepare_request_parameters(params)?)
+        };
+        let id = self.next_request_id()?;
+        let request_id = RequestId::Number(
+            i64::try_from(id).expect("request ID allocator enforces the i64 bound"),
+        );
+        let mut waiter = self.responses.register(request_id.clone())?;
+        let request = JsonRpcRequest::new(method, Some(params), request_id.clone());
+        if let Err(error) = self.send_to_server_with_cx(cx, &JsonRpcMessage::Request(request)) {
+            return Err(self.record_send_failure(Some(&request_id), error));
+        }
+        let deadlines = RequestDeadlines::start_at(self.timeout_policy, Instant::now())
+            .map_err(|error| self.finish_committed_request_locally(&request_id, error))?;
+        let mut admitted_ingress = false;
+        let received = loop {
+            if let Some(result) = self.poll_initialization_response(
+                cx,
+                &mut waiter,
+                deadlines,
+                &mut admitted_ingress,
+                auto_probe,
+                true,
+            )? {
+                match result {
+                    Ok(response) => break response,
+                    Err(signal) => return Ok(Some(signal)),
+                }
+            }
+            asupersync::runtime::yield_now().await;
+        };
+        let mut response = received.response;
+        if let Some(error) = response.error.take() {
+            if auto_probe && error.code.as_i32() == Some(-32_601) {
+                return Ok(Some(
+                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                ));
+            }
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let result = response
+            .result
+            .take()
+            .ok_or_else(|| McpError::internal_error("No result in response"))?;
+        let initialization = if modern {
+            self.decode_modern_discovery_initialization(ReceivedPreparedResult {
+                result,
+                raw_result: received.raw_result,
+                receipt: Instant::now(),
+            })?
+        } else {
+            let result = decode_response_payload(result)?;
+            validate_initialize_result(&result)?;
+            ClientInitialization::Legacy(result)
+        };
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        self.complete_initialization(initialization)?;
+        Ok(None)
+    }
+
     /// Completes a disposable modern Auto probe without flattening its sole
     /// eligible fallback signal into an [`McpError`]. The caller owns this
     /// client until it either becomes selected or is closed before a fresh
@@ -16840,134 +16950,163 @@ impl Client {
         mut waiter: ResponseWaiter,
         deadlines: RequestDeadlines,
     ) -> McpResult<Result<ReceivedJsonRpcResponse, AutoStdioFallbackSignal>> {
-        let expected_id = waiter.id.clone();
-        #[cfg(unix)]
         let mut admitted_ingress = false;
-
         loop {
-            if let Some(response) = waiter.try_response()? {
-                debug_assert!(
-                    response
-                        .id
-                        .as_ref()
-                        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
-                );
-                return Ok(Ok(response));
+            if let Some(result) = self.poll_initialization_response(
+                cx,
+                &mut waiter,
+                deadlines,
+                &mut admitted_ingress,
+                true,
+                false,
+            )? {
+                return Ok(result);
             }
-            if cx.checkpoint().is_err() {
-                return Err(self.finish_open_context_interruption(
-                    &expected_id,
-                    McpError::request_cancelled(),
-                ));
-            }
-            if let Some(source) = deadlines.expired_at(Instant::now()) {
-                // Only Unix child pipes expose the readiness boundary that
-                // distinguishes silence from a consumed partial frame. Other
-                // targets retain the ordinary terminal timeout rather than
-                // claiming a clean fallback signal from a blocking read.
-                #[cfg(unix)]
-                if !admitted_ingress {
-                    return Ok(Err(AutoStdioFallbackSignal::CleanFirstProbeTimeout {
-                        source,
-                    }));
-                }
-                return Err(self.timeout_committed_request(&expected_id, source));
-            }
+        }
+    }
 
-            let (frame, received_at) = match self.recv_next_child_frame(cx, Some(deadlines.next()))
-            {
-                Ok(received) => received,
-                Err(TransportError::ReceiveDeadlineExceeded) => {
-                    let source = deadlines
-                        .expired_at(Instant::now())
-                        .unwrap_or_else(|| deadlines.next_kind());
-                    if cx.checkpoint().is_err() {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::request_cancelled(),
-                        ));
-                    }
-                    if self.transport_is_closed() {
-                        return Err(self.finish_partial_frame_timeout(&expected_id, source));
-                    }
-                    #[cfg(unix)]
-                    if !admitted_ingress {
-                        return Ok(Err(AutoStdioFallbackSignal::CleanFirstProbeTimeout {
-                            source,
-                        }));
-                    }
-                    return Err(self.timeout_committed_request(&expected_id, source));
-                }
-                Err(TransportError::Timeout) if !self.transport_is_closed() => {
-                    return Err(self.finish_open_context_interruption(
-                        &expected_id,
-                        McpError::internal_error("Request timed out"),
-                    ));
-                }
-                Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+    /// Drives one initialization receive turn. Both synchronous Auto probes
+    /// and the async builder use this policy, so yielding cannot broaden the
+    /// set of failures that authorizes a fresh exact-2024 child.
+    fn poll_initialization_response(
+        &mut self,
+        cx: &Cx,
+        waiter: &mut ResponseWaiter,
+        deadlines: RequestDeadlines,
+        admitted_ingress: &mut bool,
+        allow_fallback: bool,
+        cooperative: bool,
+    ) -> McpResult<Option<Result<ReceivedJsonRpcResponse, AutoStdioFallbackSignal>>> {
+        let expected_id = waiter.id.clone();
+        if let Some(response) = waiter.try_response()? {
+            debug_assert!(
+                response
+                    .id
+                    .as_ref()
+                    .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+            );
+            return Ok(Some(Ok(response)));
+        }
+        if cx.checkpoint().is_err() {
+            return Err(
+                self.finish_open_context_interruption(&expected_id, McpError::request_cancelled())
+            );
+        }
+
+        // Always visit the receiver at a hard deadline. It distinguishes a
+        // clean silent stream from a prefix retained by earlier soft slices;
+        // checking only the clock here would wrongly authorize Auto fallback
+        // after consuming a partial discovery response.
+        #[cfg(unix)]
+        let received = if cooperative {
+            match SharedStdioRecv(Arc::clone(&self.transport)).recv_slice_with_source(
+                cx,
+                Instant::now() + REVERSE_CALLBACK_POLL_SLICE,
+                Some(deadlines.next()),
+            ) {
+                Ok(Some(received)) => Ok(received),
+                // The clock can cross the hard deadline after a soft slice
+                // returns. Keep that outcome distinct: only a subsequent
+                // hard receive can classify retained bytes as terminal.
+                Ok(None) => return Ok(None),
+                Err(error) => Err(error),
+            }
+        } else {
+            self.recv_next_child_frame(cx, Some(deadlines.next()))
+        };
+        #[cfg(not(unix))]
+        let received = {
+            let _ = (cooperative, allow_fallback);
+            self.recv_next_child_frame(cx, Some(deadlines.next()))
+        };
+        let (frame, received_at) = match received {
+            Ok(received) => received,
+            Err(TransportError::ReceiveDeadlineExceeded) => {
+                if cx.checkpoint().is_err() {
                     return Err(self.finish_open_context_interruption(
                         &expected_id,
                         McpError::request_cancelled(),
                     ));
                 }
-                Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
-            };
-            #[cfg(unix)]
-            {
-                admitted_ingress = true;
+                let Some(source) = deadlines.expired_at(Instant::now()) else {
+                    return Ok(None);
+                };
+                if self.transport_is_closed() {
+                    return Err(self.finish_partial_frame_timeout(&expected_id, source));
+                }
+                #[cfg(unix)]
+                if allow_fallback && !*admitted_ingress {
+                    return Ok(Some(Err(AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                        source,
+                    })));
+                }
+                return Err(self.timeout_committed_request(&expected_id, source));
             }
-            if let Some(source) = deadlines.expired_at(received_at) {
-                return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, source));
+            Err(TransportError::Timeout) if !self.transport_is_closed() => {
+                return Err(self.finish_open_context_interruption(
+                    &expected_id,
+                    McpError::internal_error("Request timed out"),
+                ));
             }
-            if let Err(error) = validate_inbound_typed_message(frame.message()) {
+            Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                return Err(self.finish_open_context_interruption(
+                    &expected_id,
+                    McpError::request_cancelled(),
+                ));
+            }
+            Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
+        };
+        *admitted_ingress = true;
+        if let Some(source) = deadlines.expired_at(received_at) {
+            return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, source));
+        }
+        if let Err(error) = validate_inbound_typed_message(frame.message()) {
+            return Err(self.terminate_connection(error));
+        }
+
+        if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+            let route = self
+                .route_received_response(frame)
+                .map_err(|error| self.terminate_connection(error))?;
+            if matches!(
+                route,
+                ResponseRoute::InvalidEnvelope
+                    | ResponseRoute::MissingId
+                    | ResponseRoute::ConnectionClosed
+            ) {
+                let error = self.responses.terminal_error().unwrap_or_else(|| {
+                    McpError::internal_error("Client response correlation failed")
+                });
                 return Err(self.terminate_connection(error));
             }
-
-            if matches!(frame.message(), JsonRpcMessage::Response(_)) {
-                let route = self
-                    .route_received_response(frame)
-                    .map_err(|error| self.terminate_connection(error))?;
-                if matches!(
-                    route,
-                    ResponseRoute::InvalidEnvelope
-                        | ResponseRoute::MissingId
-                        | ResponseRoute::ConnectionClosed
-                ) {
-                    let error = self.responses.terminal_error().unwrap_or_else(|| {
-                        McpError::internal_error("Client response correlation failed")
-                    });
-                    return Err(self.terminate_connection(error));
-                }
-                continue;
-            }
-
-            let JsonRpcMessage::Request(request) = frame.message() else {
-                unreachable!("a JSON-RPC message is either a request or response")
-            };
-            if self.cancel_legacy_reverse_callback(request) {
-                continue;
-            }
-            match self.retain_modern_server_notification(&frame) {
-                Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(error) => return Err(self.terminate_connection(error)),
-            }
-            if let JsonRpcMessage::Request(request) = frame.message() {
-                match self.retain_legacy_server_notification(request) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => return Err(self.terminate_connection(error)),
-                }
-            }
-            let JsonRpcMessage::Request(request) = frame.into_message() else {
-                unreachable!("the frame was checked as a JSON-RPC request")
-            };
-            if let Some(response) = self.server_request_response(&request) {
-                if let Err(error) = self.send_server_response_during_receive(response) {
-                    return Err(self.terminate_connection(error));
-                }
-            }
+            return Ok(None);
         }
+
+        let JsonRpcMessage::Request(request) = frame.message() else {
+            unreachable!("a JSON-RPC message is either a request or response")
+        };
+        if self.cancel_legacy_reverse_callback(request) {
+            return Ok(None);
+        }
+        match self.retain_modern_server_notification(&frame) {
+            Ok(Some(_)) => return Ok(None),
+            Ok(None) => {}
+            Err(error) => return Err(self.terminate_connection(error)),
+        }
+        match self.retain_legacy_server_notification(request) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(error) => return Err(self.terminate_connection(error)),
+        }
+        let JsonRpcMessage::Request(request) = frame.into_message() else {
+            unreachable!("the frame was checked as a JSON-RPC request")
+        };
+        if let Some(response) = self.server_request_response(&request)
+            && let Err(error) = self.send_server_response_during_receive(response)
+        {
+            return Err(self.terminate_connection(error));
+        }
+        Ok(None)
     }
 
     /// Sends one supported core request and retains its selected-era result.
