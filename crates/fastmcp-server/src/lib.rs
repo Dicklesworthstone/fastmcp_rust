@@ -8254,6 +8254,9 @@ impl ServerHttpSession {
     }
 
     /// Routes and dispatches one modern or exact-2024 HTTP request.
+    ///
+    /// This synchronous entry blocks the calling thread. On a runtime worker,
+    /// use [`Self::handle_async`] so request-owned tasks can make progress.
     pub fn handle(
         &mut self,
         cx: &Cx,
@@ -8564,14 +8567,16 @@ impl ServerHttpSession {
             self.selected_era.get_or_insert(ProtocolEra::Legacy2024);
         }
         if is_modern {
-            return self.handle_modern(
-                cx,
-                endpoint_response,
-                transport_authorization,
-                raw_params,
-                auth_receipt,
-                modern_request_cancellation,
-            );
+            return self
+                .handle_modern(
+                    cx,
+                    endpoint_response,
+                    transport_authorization,
+                    raw_params,
+                    auth_receipt,
+                    modern_request_cancellation,
+                )
+                .await;
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         return self.handle_legacy(cx, endpoint_response).await;
@@ -8864,7 +8869,7 @@ impl ServerHttpSession {
         ServerHttpEndpointResponse::Immediate(HttpResponse::new(HttpStatus::ACCEPTED))
     }
 
-    fn handle_modern(
+    async fn handle_modern(
         &mut self,
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
@@ -8949,8 +8954,8 @@ impl ServerHttpSession {
                 // handler contract. Use the same owned dispatcher as SSE so
                 // async extensions (including proxy Tasks controls) can yield
                 // on the caller's runtime and core handlers own their region.
-                let response = block_on(
-                    Arc::clone(&self.server).dispatch_with_protocol_policy_owned(
+                let response = Arc::clone(&self.server)
+                    .dispatch_with_protocol_policy_owned(
                         self.server.protocol_policy,
                         &inbound,
                         request,
@@ -8961,8 +8966,8 @@ impl ServerHttpSession {
                         modern_request_cancellation.unwrap_or_default(),
                         None,
                         Arc::new(|_| {}),
-                    ),
-                );
+                    )
+                    .await;
                 if let Some(response) = response {
                     if let Some(rejection) =
                         canonical_missing_required_client_capability_http_response(&response)
@@ -9059,8 +9064,8 @@ impl ServerHttpSession {
                             .push(notification);
                     })
                 };
-                let response = block_on(
-                    Arc::clone(&self.server).dispatch_with_protocol_policy_owned(
+                let response = Arc::clone(&self.server)
+                    .dispatch_with_protocol_policy_owned(
                         self.server.protocol_policy,
                         &inbound,
                         request,
@@ -9071,8 +9076,8 @@ impl ServerHttpSession {
                         request_cancellation.clone(),
                         None,
                         notification_sender,
-                    ),
-                );
+                    )
+                    .await;
                 if let Some(rejection) = response
                     .as_ref()
                     .and_then(canonical_missing_required_client_capability_http_response)
@@ -9136,7 +9141,7 @@ impl ServerHttpSession {
     /// Long-lived subscriptions can stream after pre-admission, while ordinary
     /// request-scoped SSE defers its wire representation until the final
     /// outcome has elected it.
-    fn begin_modern_sse(
+    async fn begin_modern_sse(
         &mut self,
         cx: &Cx,
         request: HttpRequest,
@@ -9202,6 +9207,7 @@ impl ServerHttpSession {
                     Some(auth_receipt),
                     None,
                 )
+                .await
                 .map(Err);
         };
         let request = self
@@ -11131,7 +11137,7 @@ fn http_endpoint_error_response(
     }
 }
 
-fn dispatch_modern_http_request(
+async fn dispatch_modern_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
@@ -11149,9 +11155,10 @@ fn dispatch_modern_http_request(
         transport_authorization,
         None,
     )
+    .await
 }
 
-fn dispatch_modern_http_request_with_cancellation(
+async fn dispatch_modern_http_request_with_cancellation(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
@@ -11170,9 +11177,10 @@ fn dispatch_modern_http_request_with_cancellation(
         transport_authorization,
         request_cancellation,
     )
+    .await
 }
 
-fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
+async fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
@@ -11190,12 +11198,15 @@ fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
         Err(_) => return HttpResponse::internal_error(),
     };
     session
-        .handle_with_modern_request_cancellation_and_transport_authorization(
+        .handle_with_modern_request_cancellation_and_transport_authorization_async(
             cx,
             request,
             transport_authorization,
             request_cancellation,
+            false,
+            None,
         )
+        .await
         .map_err(ServerHttpEndpointError::from_internal)
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| {
@@ -11243,10 +11254,13 @@ async fn serve_modern_json_http_connection(
         Err(_) => return,
     };
 
+    // Keep the dispatch under a joined connection child, but let it yield.
+    // spawn_blocking can run inline without a caller-owned blocking pool;
+    // blocking there would prevent the owned handler's children from running.
     let request_endpoint = Arc::clone(&endpoint);
     let request_modern_sessions = Arc::clone(&modern_sessions);
     let dispatch_cancellation = request_cancellation.clone();
-    let mut dispatch = match cx.spawn_blocking(move |request_cx| {
+    let mut dispatch = match cx.spawn(move |request_cx| async move {
         dispatch_modern_http_request_with_cancellation_and_transport_authorization(
             &request_cx,
             &request_endpoint,
@@ -11255,6 +11269,7 @@ async fn serve_modern_json_http_connection(
             transport_authorization,
             Some(dispatch_cancellation),
         )
+        .await
     }) {
         Ok(dispatch) => dispatch,
         Err(_) => {
@@ -11445,7 +11460,7 @@ async fn dispatch_http_request_async(
     if request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
     {
-        return dispatch_modern_http_request(cx, endpoint, modern_sessions, request);
+        return dispatch_modern_http_request(cx, endpoint, modern_sessions, request).await;
     }
 
     let mut session = match endpoint.open_session(cx) {
@@ -11558,8 +11573,8 @@ async fn serve_http_connection(
             .await;
             return;
         }
-        let live_session = match endpoint.open_session(cx) {
-            Ok(session) => Arc::new(LiveModernHttpSession::new(session)),
+        let mut session = match endpoint.open_session(cx) {
+            Ok(session) => session,
             Err(_) => {
                 let _ = send_h1_response(
                     cx,
@@ -11572,11 +11587,10 @@ async fn serve_http_connection(
             }
         };
         let response = {
-            let mut session = live_session
-                .session
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
+            match session
+                .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
+                .await
+            {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
@@ -11594,6 +11608,7 @@ async fn serve_http_connection(
                 Err(error) => Err(ServerHttpEndpointError::from_internal(error)),
             }
         };
+        let live_session = Arc::new(LiveModernHttpSession::new(session));
         match response {
             Ok(Ok((inbound, request, raw_params, auth_receipt, response))) => {
                 let response_body_generation = next_live_modern_http_response_body_generation();
@@ -11942,8 +11957,8 @@ async fn serve_modern_http_connection(
             .await;
             return;
         }
-        let live_session = match endpoint.open_session(cx) {
-            Ok(session) => Arc::new(LiveModernHttpSession::new(session)),
+        let mut session = match endpoint.open_session(cx) {
+            Ok(session) => session,
             Err(_) => {
                 let _ = send_h1_response(
                     cx,
@@ -11956,11 +11971,10 @@ async fn serve_modern_http_connection(
             }
         };
         let response = {
-            let mut session = live_session
-                .session
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
+            match session
+                .begin_modern_sse(cx, request.clone(), transport_authorization.clone())
+                .await
+            {
                 Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
@@ -11978,6 +11992,7 @@ async fn serve_modern_http_connection(
                 Err(error) => Err(ServerHttpEndpointError::from_internal(error)),
             }
         };
+        let live_session = Arc::new(LiveModernHttpSession::new(session));
         match response {
             Ok(Ok((inbound, request, raw_params, auth_receipt, response))) => {
                 let response_body_generation = next_live_modern_http_response_body_generation();
@@ -12063,7 +12078,7 @@ async fn serve_modern_http_connection(
     let response = if request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
     {
-        dispatch_modern_http_request(cx, &endpoint, &modern_sessions, request)
+        dispatch_modern_http_request(cx, &endpoint, &modern_sessions, request).await
     } else {
         let mut session = match endpoint.open_session(cx) {
             Ok(session) => session,
@@ -38812,7 +38827,8 @@ mod lib_unit_tests {
                 &endpoint,
                 &modern_sessions,
                 retry,
-            );
+            )
+            .await;
             let retry: JsonRpcResponse = serde_json::from_slice(&retry.body)
                 .map_err(|error| format!("MRTR shutdown retry was not valid JSON-RPC: {error}"))?;
             if retry.id != Some(933_i64.into())
@@ -50033,6 +50049,7 @@ mod lib_unit_tests {
                         ),
                     TransportAuthorization::default(),
                 )
+                .await
                 .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?;
             let Err(ServerHttpEndpointResponse::Immediate(streaming_rejected)) = streaming_rejected
             else {
