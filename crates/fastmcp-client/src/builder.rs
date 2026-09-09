@@ -1001,7 +1001,9 @@ impl ClientBuilder {
         self.validate_feature_configuration()?;
         self.validate_websocket_configuration()?;
         let client_implementation = self.client_implementation_for_session();
-        WebSocketClient::connect_with_builder_configuration_with_cx(
+        // Negotiation owns several protocol states. Pin it separately so
+        // wrapping this connection in a caller deadline keeps a small future.
+        Box::pin(WebSocketClient::connect_with_builder_configuration_with_cx(
             cx,
             self.protocol_plan,
             self.client_info,
@@ -1011,7 +1013,7 @@ impl ClientBuilder {
             self.mcp_apps_settings,
             self.client_extension_runtime,
             transport,
-        )
+        ))
         .await
     }
 

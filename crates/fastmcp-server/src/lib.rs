@@ -4361,7 +4361,7 @@ where
     F: std::future::Future<Output = T>,
     SendFn: Fn(JsonRpcRequest) + Send + Sync,
 {
-    let mut future = Box::pin(future);
+    let mut future = std::pin::pin!(future);
     let mut tick = Box::pin(asupersync::time::sleep(
         cx.now(),
         FINAL_PROGRESS_FLUSH_INTERVAL,
@@ -13272,7 +13272,12 @@ impl Server {
                 }
             }
         }
-        let dispatch = async {
+        // Bound the dispatch state and its Send proof before the progress
+        // timer and transport futures wrap it. The same owner still polls
+        // and drops the request; no extra task or cancellation scope is added.
+        let dispatch: std::pin::Pin<
+            Box<dyn Future<Output = McpResult<serde_json::Value>> + Send + '_>,
+        > = Box::pin(async {
             match middleware_result {
                 Some(result) => result,
                 None if request.method == SERVER_DISCOVER_METHOD => {
@@ -13316,7 +13321,7 @@ impl Server {
                     result => result,
                 },
             }
-        };
+        });
         let result = match final_progress_runtime.as_ref() {
             Some(runtime) => {
                 await_final_progress_rate_tick(
