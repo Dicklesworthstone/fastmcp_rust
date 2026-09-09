@@ -21996,6 +21996,61 @@ impl Client {
         }
     }
 
+    /// Calls a Tasks-capable tool while yielding the caller's Unix runtime.
+    ///
+    /// Returns the typed complete, durable task, or input-required outcome.
+    /// Input-required results are returned to the caller without automatically
+    /// invoking reverse handlers or replaying the call. Tasks must be admitted
+    /// by the retained modern discovery before any tool request is committed.
+    ///
+    /// An already-admitted, validated task result survives caller cancellation
+    /// so its durable identifier is not lost. Other outcomes remain
+    /// cancellation-first. Cancelling or dropping a pending call retires its
+    /// request owner; the connection remains usable by sibling requests.
+    /// Dropped owners commit cancellation when the client next drives ingress,
+    /// sends a request, or closes. Writes remain bounded and synchronous.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn call_tool_final_outcome_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let mut execution = self.start_yielding_final_mrtr_request(
+            cx,
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            true,
+        )?;
+        loop {
+            let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
+            if let Some(result) =
+                self.try_take_yielding_final_mrtr_response(&mut execution, cancelled)?
+            {
+                return match result {
+                    CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                        Ok(FinalToolCallOutcome::Complete(result))
+                    }
+                    CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                        Ok(FinalToolCallOutcome::Task(result))
+                    }
+                    CoreResult::Final(FinalCoreResult::ToolsCallInputRequired {
+                        result, ..
+                    }) => Ok(FinalToolCallOutcome::InputRequired(result)),
+                    _ => Err(unexpected_convenience_result("tools/call")),
+                };
+            }
+            self.drive_yielding_stdio_slice()?;
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
     /// Reads one final task while yielding the caller's Unix stdio runtime.
     ///
     /// Each ingress turn has a bounded readiness wait; this is cooperative
@@ -30961,6 +31016,7 @@ exec sleep 2
                     .connect_stdio_with_cx("sh", &["-c", script], &cx))
                     .await.unwrap();
                 let worker = std::thread::current().id();
+                let request_started = Instant::now();
                 let mut request = Box::pin(client.request_with_cx(&cx, "ping", None));
                 std::future::poll_fn(|task_cx| {
                     assert!(request.as_mut().poll(task_cx).is_pending(), "a split response must yield before it is complete");
@@ -30975,8 +31031,22 @@ exec sleep 2
                 let result = request.await;
                 if request_expires {
                     let error = result.unwrap_err();
-                    assert_eq!(error.code, McpErrorCode::InternalError);
-                    assert!(error.message.to_ascii_lowercase().contains("timed out") || error.message.to_ascii_lowercase().contains("deadline"), "{error}");
+                    assert!(request_started.elapsed() >= timeout);
+                    assert!(cx.checkpoint().is_ok(), "request expiry must not cancel its caller");
+                    // A soft slice can service the request's absolute expiry
+                    // before the next read; a hard frame read can expire first.
+                    // Admit only those exact diagnostics, not caller cancellation.
+                    match error.code {
+                        McpErrorCode::InternalError => {
+                            assert_eq!(error.message, "Request timed out");
+                            assert_eq!(error.data, None);
+                        }
+                        McpErrorCode::RequestCancelled => {
+                            assert_eq!(error.message, "Request timed out at the absolute deadline");
+                            assert_eq!(error.data, Some(serde_json::json!({"timeoutSource": "absolute"})));
+                        }
+                        _ => panic!("unexpected split-frame failure: {error}"),
+                    }
                     // If the executor observed its deadline before another
                     // read turn, the retained prefix must still enforce it.
                     if !client.transport_is_closed() {
@@ -36904,6 +36974,261 @@ IFS= read -r end
         assert_eq!(result.task.base().task_id.as_str(), "task-73");
         assert!(matches!(result.task, FinalTask::Working(_)));
         client.close().expect("final tool task client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    fn async_task_creation_probe(branch: &'static str, mode: &'static str) {
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |connection_cx| async move {
+                let subject = format!("created-task-{}", std::process::id());
+                let task = serde_json::json!({"resultType": "task", "taskId": subject,
+                    "status": "working", "createdAt": "2026-07-28T12:00:00.000Z",
+                    "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": null});
+                let payload = match branch {
+                    "task" => task.clone(),
+                    "complete" => serde_json::json!({"resultType": "complete", "content": [{"type": "text", "text": subject}], "isError": false}),
+                    "input" => serde_json::json!({"resultType": "input_required", "inputRequests": {"roots": {"method": "roots/list"}}, "requestState": subject}),
+                    "malformed" => {
+                        let mut malformed = task.clone();
+                        malformed["serverInfo"] = serde_json::json!({"name": "injected", "version": "1"});
+                        malformed
+                    }
+                    "error" => serde_json::Value::Null,
+                    _ => unreachable!(),
+                };
+                let response_tail = if branch == "error" {
+                    r#""id":2,"error":{"code":-32000,"message":"creation failed"}}"#.to_owned()
+                } else {
+                    format!(r#""id":2,"result":{payload}}}"#)
+                };
+                let mut snapshot = task.clone();
+                snapshot["resultType"] = serde_json::json!("complete");
+                let discovery = match mode {
+                    "legacy" => serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"creation-peer","version":"1"}}}).to_string(),
+                    "missing-extension" => modern_discovery_response("creation-peer", &[MODERN_PROTOCOL_VERSION]),
+                    _ => modern_tasks_discovery_response("creation-peer", serde_json::json!({})),
+                };
+                let script = r#"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+printf '%s\n' "$1"
+if [ "$5" = legacy ]; then
+    IFS= read -r initialized || exit 92
+    case "$initialized" in *notifications/initialized*) ;; *) exit 93;; esac
+fi
+IFS= read -r call || exit 94
+case "$5" in pre-*|missing-extension|legacy)
+    case "$call" in *'"method":"ping"'*'"id":2'*) ;; *) exit 95;; esac
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+    exec sleep 5;;
+esac
+case "$call" in *'"method":"tools/call"'*'"id":2'*) ;; *) exit 96;; esac
+case "$call" in *'"extensions":{"io.modelcontextprotocol/tasks":{}}'*) ;; *) exit 97;; esac
+case "$call" in *"$4"*) ;; *) exit 98;; esac
+if [ "$5" != deferred ]; then
+    IFS= read -r ping || exit 99
+    case "$ping" in *'"method":"ping"'*'"id":3'*) ;; *) exit 100;; esac
+fi
+printf '%s' '{"jsonrpc":"2.0",'
+sleep 0.25
+printf '%s\n' "$2"
+case "$5" in pending-*|drop)
+    IFS= read -r cancel || exit 101
+    case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 102;; esac;;
+esac
+if [ "$5" != deferred ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+    next=4
+else
+    next=3
+fi
+IFS= read -r get || exit 0
+case "$get" in *'"method":"tasks/get"'*'"taskId":"'"$4"'"'*'"id":'"$next"*) ;; *) exit 103;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$next" "$3"
+next=$((next + 1))
+IFS= read -r cancel_task || exit 104
+case "$cancel_task" in *'"method":"tasks/cancel"'*'"taskId":"'"$4"'"'*'"id":'"$next"*) ;; *) exit 105;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete"}}\n' "$next"
+exec sleep 5
+"#;
+                let policy = if mode == "legacy" { ProtocolPolicy::LegacyOnly } else { ProtocolPolicy::ModernOnly };
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .auto_initialize(mode == "deferred")
+                    .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx("sh", &["-c", script, "creation-peer", &discovery, &response_tail, &snapshot.to_string(), &subject, mode], &connection_cx)
+                    .await.unwrap();
+                let caller_cx = Cx::for_request();
+                let cancellation = McpRequestCancellation::new();
+                if mode == "pre-token" { cancellation.cancel(); }
+                if mode == "pre-cx" { caller_cx.set_cancel_requested(true); }
+                if matches!(mode, "pre-token" | "pre-cx" | "legacy" | "missing-extension") {
+                    let error = client.call_tool_final_outcome_with_cx(&caller_cx, &cancellation, "durable-tool", serde_json::json!({"subject": subject})).await.unwrap_err();
+                    assert_eq!(error.code, if mode.starts_with("pre-") { McpErrorCode::RequestCancelled } else { McpErrorCode::InvalidParams });
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+                    assert!(client.is_initialized());
+                    client.ping_with_cx(&connection_cx, &McpRequestCancellation::new()).await.unwrap();
+                    client.close_with_cx(&connection_cx).await.unwrap();
+                    assert!(client.child.is_none());
+                    return;
+                }
+                let executor = if mode == "deferred" {
+                    assert!(!client.is_initialized());
+                    None
+                } else { Some(client.multiplexed_stdio_executor().unwrap()) };
+                let worker = std::thread::current().id();
+                let started = Instant::now();
+                let mut call = Box::pin(client.call_tool_final_outcome_with_cx(&caller_cx, &cancellation, "durable-tool", serde_json::json!({"subject": subject})));
+                assert!(std::future::poll_fn(|task_cx| Poll::Ready(call.as_mut().poll(task_cx))).await.is_pending());
+                assert!(started.elapsed() < Duration::from_millis(150), "task creation must yield before the peer completes");
+                let mut ping = executor.as_ref().map(|executor| executor.execute(&connection_cx, "ping", None).unwrap());
+                let mut sibling = sibling_root.spawn(move |cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                    1_u8
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                if mode.starts_with("ready-") {
+                    // Observe actual sole-ingress admission, not a fabricated
+                    // response: the future yields after reading each frame,
+                    // before it consumes the resulting request-owned reply.
+                    let executor = executor.as_ref().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while executor.executor.pending_records().iter().any(|record| record.request_id == RequestId::Number(2)) {
+                        assert!(Instant::now() < deadline, "peer result was never admitted");
+                        assert!(std::future::poll_fn(|task_cx| Poll::Ready(call.as_mut().poll(task_cx))).await.is_pending());
+                        asupersync::runtime::yield_now().await;
+                    }
+                }
+                if matches!(mode, "ready-token" | "pending-token") { cancellation.cancel(); }
+                if matches!(mode, "ready-cx" | "pending-cx") { caller_cx.set_cancel_requested(true); }
+                let outcome = if mode == "drop" {
+                    drop(call);
+                    None
+                } else {
+                    let result = call.await;
+                    if mode.starts_with("pending-") || (mode.starts_with("ready-") && branch != "task") {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        None
+                    } else if branch == "malformed" {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                        assert!(!client.is_initialized());
+                        assert!(executor.as_ref().unwrap().try_take_response(ping.as_mut().unwrap()).is_err());
+                        client.close_with_cx(&connection_cx).await.unwrap();
+                        assert!(client.child.is_none());
+                        return;
+                    } else { Some(result.unwrap()) }
+                };
+                assert!(client.is_initialized());
+                assert!(!connection_cx.is_cancel_requested());
+                if let (Some(executor), Some(ping)) = (executor.as_ref(), ping.as_mut()) {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let response = loop {
+                        if let Some(response) = executor.try_take_response(ping).unwrap() { break response; }
+                        assert!(Instant::now() < deadline, "task creation cancellation stranded sibling ping");
+                        client.drive_yielding_stdio_slice().unwrap();
+                        asupersync::runtime::yield_now().await;
+                    };
+                    assert_eq!(response.id, Some(RequestId::Number(3)));
+                    assert_eq!(response.result, Some(serde_json::json!({})));
+                }
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        FinalToolCallOutcome::Task(created) => {
+                            assert_eq!(serde_json::to_value(&created).unwrap(), payload);
+                            let task_id = created.task.base().task_id.clone();
+                            assert_eq!(task_id.as_str(), subject);
+                            let observed = client.get_task_final_with_cx(&connection_cx, &McpRequestCancellation::new(), task_id.clone()).await.unwrap();
+                            assert_eq!(observed.task.base().task_id, task_id);
+                            client.cancel_task_final_with_cx(&connection_cx, &McpRequestCancellation::new(), task_id).await.unwrap();
+                        }
+                        FinalToolCallOutcome::Complete(complete) => {
+                            let is_error = complete.payload.is_error;
+                            assert!(!is_error);
+                            let encoded = CoreResult::Final(FinalCoreResult::ToolsCall { result: complete, diagnostic: None }).encode().unwrap();
+                            let mut observed = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+                            // The established payload codec omits the false
+                            // default; verify it before restoring that field
+                            // for comparison with the peer's explicit value.
+                            assert!(observed.get("isError").is_none());
+                            observed["isError"] = serde_json::json!(is_error);
+                            assert_eq!(observed, payload);
+                        }
+                        FinalToolCallOutcome::InputRequired(input) => {
+                            let encoded = CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result: input, diagnostic: None }).encode().unwrap();
+                            assert_eq!(serde_json::from_str::<serde_json::Value>(&encoded).unwrap(), payload);
+                        }
+                    }
+                }
+                client.close_with_cx(&connection_cx).await.unwrap();
+                assert!(client.child.is_none());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_outcomes() {
+        for branch in ["task", "complete", "input"] {
+            async_task_creation_probe(branch, "positive");
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_deferred() {
+        async_task_creation_probe("task", "deferred");
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_admitted_task_wins_cancel() {
+        for mode in ["ready-token", "ready-cx"] {
+            async_task_creation_probe("task", mode);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_other_reply_loses_cancel() {
+        for branch in ["complete", "input", "malformed", "error"] {
+            for mode in ["ready-token", "ready-cx"] {
+                async_task_creation_probe(branch, mode);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_pending_cancel_and_drop() {
+        for mode in ["pending-token", "pending-cx", "drop"] {
+            async_task_creation_probe("task", mode);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_refuses_without_commit() {
+        for mode in ["pre-token", "pre-cx", "legacy", "missing-extension"] {
+            async_task_creation_probe("task", mode);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_async_task_creation_rejects_malformed_reply() {
+        async_task_creation_probe("malformed", "positive");
     }
 
     #[cfg(unix)]

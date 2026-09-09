@@ -452,6 +452,14 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
 event stream and POST message endpoints are already known.
 
+With the `tasks` feature on Unix, `Client::call_tool_final_outcome_with_cx`
+creates tasks without blocking the runtime while waiting for the peer. It
+returns the typed complete, task, or input-required outcome. A returned task ID
+can be used with `get_task_final_with_cx` and `cancel_task_final_with_cx` on the
+same client. An already-admitted valid task result survives caller cancellation;
+other results remain cancellation-first. Input-required results are returned
+without automatic continuation. Pipe writes remain synchronous.
+
 The published 0.8.1 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 

@@ -2366,11 +2366,15 @@ exec sleep 5
             .path
             .to_str()
             .expect("temporary retry attempt path must be valid UTF-8");
-        let script = r#"printf '%s\n' spawn >> "$1";
+        // Cleanup may kill the peer as soon as its error is parsed. Keep the
+        // outer closing brace unpublished until the response log is committed;
+        // even EOF cannot turn the incomplete prefix into a valid response.
+        let script = r#"printf '%s\n' spawn >> "$1" || exit 90;
             IFS= read -r request || exit 91;
             case "$request" in *server/discover*) ;; *) exit 92 ;; esac;
-            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"planned retry probe failure"}}';
-            printf '%s\n' response >> "$1";
+            printf '%s' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"planned retry probe failure"}' || exit 93;
+            printf '%s\n' response >> "$1" || exit 94;
+            printf '}\n' || exit 95;
             exit 73"#;
         let cx = Cx::for_request();
         let canceller = cancel_during_delay.then(|| {
@@ -3257,6 +3261,9 @@ exec sleep 5
             McpErrorCode::RequestCancelled,
             "an active caller context must not turn a failed retry sequence into cancellation"
         );
+        assert_eq!(probe.error.code, McpErrorCode::InternalError);
+        assert_eq!(probe.error.message, "planned retry probe failure");
+        assert_eq!(probe.error.data, None);
         assert_eq!(
             probe.attempt_events,
             ["spawn", "response", "spawn", "response"],
