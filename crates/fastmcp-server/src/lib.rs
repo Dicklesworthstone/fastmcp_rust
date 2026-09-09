@@ -8945,14 +8945,23 @@ impl ServerHttpSession {
                         HttpStatus::NOT_ACCEPTABLE,
                     )));
                 }
-                let response = self.server.dispatch_with_protocol_policy_and_cancellation(
-                    self.server.protocol_policy,
-                    &inbound,
-                    &request,
-                    modern_request_cancellation,
-                    raw_params.as_deref(),
-                    auth_receipt.as_ref(),
-                    None,
+                // JSON selects the response representation, not a synchronous
+                // handler contract. Use the same owned dispatcher as SSE so
+                // async extensions (including proxy Tasks controls) can yield
+                // on the caller's runtime and core handlers own their region.
+                let response = block_on(
+                    Arc::clone(&self.server).dispatch_with_protocol_policy_owned(
+                        self.server.protocol_policy,
+                        &inbound,
+                        request,
+                        raw_params,
+                        auth_receipt,
+                        None,
+                        None,
+                        modern_request_cancellation.unwrap_or_default(),
+                        None,
+                        Arc::new(|_| {}),
+                    ),
                 );
                 if let Some(response) = response {
                     if let Some(rejection) =
