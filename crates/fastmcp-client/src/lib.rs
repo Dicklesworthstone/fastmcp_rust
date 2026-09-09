@@ -37163,6 +37163,8 @@ IFS= read -r end
                 let subject = format!("file:///mrtr-{}-{method}", std::process::id());
                 let calls = Arc::new(AtomicUsize::new(0));
                 let dropped = Arc::new(AtomicBool::new(false));
+                let probe_clock = Instant::now();
+                let last_callback_ns = Arc::new(AtomicU64::new(0));
                 let worker = std::thread::current().id();
                 let caller = Cx::for_request();
                 let cancellation = McpRequestCancellation::new();
@@ -37177,15 +37179,17 @@ IFS= read -r end
                 } else {
                     let calls = Arc::clone(&calls);
                     let dropped = Arc::clone(&dropped);
+                    let last_callback_ns = Arc::clone(&last_callback_ns);
                     let cancellation = cancellation.clone();
                     ReverseRequestHandlers::new().with_modern_roots_list(move |cx, _, _| {
                         let calls = Arc::clone(&calls);
                         let dropped = Arc::clone(&dropped);
+                        let last_callback_ns = Arc::clone(&last_callback_ns);
                         let cancellation = cancellation.clone();
                         Box::pin(async move {
                             assert_eq!(std::thread::current().id(), worker);
                             let _drop = HandlerDrop(dropped);
-                            calls.fetch_add(1, Ordering::AcqRel);
+                            let call = calls.fetch_add(1, Ordering::AcqRel) + 1;
                             if mode.starts_with("callback-") || mode == "deadline-callback" {
                                 std::future::pending::<()>().await;
                             }
@@ -37201,6 +37205,14 @@ IFS= read -r end
                             }
                             if matches!(mode, "warm" | "deferred") {
                                 asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                            }
+                            if mode == "deadline-rounds" {
+                                if call == 1 {
+                                    // Spend part of the single operation budget
+                                    // before the final request is committed.
+                                    asupersync::time::sleep(cx.now(), Duration::from_millis(100)).await;
+                                }
+                                last_callback_ns.store(u64::try_from(probe_clock.elapsed().as_nanos()).unwrap(), Ordering::Release);
                             }
                             serde_json::from_value(serde_json::json!({"roots": []}))
                                 .map_err(|_| McpError::internal_error("invalid roots test value"))
@@ -37266,7 +37278,6 @@ if [ "$4" != pre-cancel ]; then
         malformed|legacy)
             printf '{"jsonrpc":"2.0","id":2,"result":%s}\n' "$5";;
         *)
-            if [ "$4" = deadline-rounds ]; then sleep 0.1; fi
             printf '{"jsonrpc":"2.0","id":2,"result":%s}\n' "$6";;
     esac
     case "$4" in warm|deferred|deadline-rounds|total-bound)
@@ -37276,7 +37287,6 @@ if [ "$4" != pre-cancel ]; then
         case "$second" in *'"requestState":"first-state"'*) ;; *) exit 102;; esac
         case "$second" in *'"r0":{"roots":[]}'*) ;; *) exit 103;; esac
         case "$second" in *io.modelcontextprotocol/tasks*) exit 104;; esac
-        if [ "$4" = deadline-rounds ]; then sleep 0.1; fi
         printf '{"jsonrpc":"2.0","id":3,"result":%s}\n' "$7"
         next=4
         if [ "$4" != total-bound ]; then
@@ -37285,13 +37295,14 @@ if [ "$4" != pre-cancel ]; then
             check_original "$third" "$2" "$3" || exit 107
             case "$third" in *'"latest":{"roots":[]}'*) ;; *) exit 108;; esac
             case "$third" in *requestState*|*'"r0"'*|*io.modelcontextprotocol/tasks*) exit 109;; esac
-            if [ "$4" = deadline-rounds ]; then sleep 0.1; fi
-            printf '{"jsonrpc":"2.0","id":4,"result":%s}\n' "$5"
-            next=5
             if [ "$4" = deadline-rounds ]; then
+                # Keep request4 pending until its actual cancellation. A timed
+                # reply can race admission and obscure which budget expired.
                 IFS= read -r cancel || exit 110
                 case "$cancel" in *notifications/cancelled*'"requestId":4'*) ;; *) exit 111;; esac
             fi
+            printf '{"jsonrpc":"2.0","id":4,"result":%s}\n' "$5"
+            next=5
         fi;;
     round-bound)
         while [ "$next" -le 6 ]; do
@@ -37380,6 +37391,8 @@ exec sleep 5
                     if let Some(canceller) = canceller.as_mut() { canceller.join(&sibling_root).await.unwrap(); }
                     result
                 };
+                let result_elapsed = probe_clock.elapsed();
+                let operation_elapsed = started.elapsed();
                 drop(operation);
                 let observed_calls = calls.load(Ordering::Acquire);
                 let expected_calls = match mode {
@@ -37415,8 +37428,13 @@ exec sleep 5
                             let error = result.unwrap_err();
                             assert_eq!(error.code, McpErrorCode::InternalError);
                             assert_eq!(error.message, "MRTR operation absolute deadline elapsed");
-                            assert!(started.elapsed() >= timeout);
-                            assert!(started.elapsed() < Duration::from_secs(1));
+                            assert!(operation_elapsed >= timeout);
+                            assert!(operation_elapsed < Duration::from_secs(1));
+                            if mode == "deadline-rounds" {
+                                let last_callback = Duration::from_nanos(last_callback_ns.load(Ordering::Acquire));
+                                assert!(!last_callback.is_zero());
+                                assert!(result_elapsed - last_callback < timeout, "a continuation must not receive a fresh absolute budget");
+                            }
                         }
                         "missing-handler" => assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidParams),
                         "handler-error" => assert_eq!(result.unwrap_err().message, "input handler failed"),
@@ -37443,7 +37461,7 @@ exec sleep 5
                 client.ping_with_cx(&connection_cx, &McpRequestCancellation::new()).await.unwrap();
                 assert_eq!(client.next_id.load(Ordering::SeqCst), next + 1);
                 assert!(client.multiplexed_stdio_executor().unwrap().executor.pending_records().is_empty());
-                eprintln!("ASYNC_MRTR_PROOF {}", serde_json::json!({"method":method,"mode":mode,"subject":subject,"handlerCalls":observed_calls,"nextId":next+1,"sibling":sibling_completed,"recovery":true}));
+                eprintln!("ASYNC_MRTR_PROOF {}", serde_json::json!({"method":method,"mode":mode,"subject":subject,"handlerCalls":observed_calls,"nextId":next+1,"sibling":sibling_completed,"recovery":true,"operationElapsedNs":operation_elapsed.as_nanos(),"resultElapsedNs":result_elapsed.as_nanos(),"lastCallbackElapsedNs":last_callback_ns.load(Ordering::Acquire),"absoluteTimeoutNs":timeout.as_nanos()}));
                 client.close_with_cx(&connection_cx).await.unwrap();
                 assert!(client.child.is_none());
             }).unwrap();

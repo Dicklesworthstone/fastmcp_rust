@@ -17916,24 +17916,63 @@ exec sleep 2
 
             let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
             let sse_request = read_http_request(&mut sse);
-            let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
-            body.push_str(concat!(
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resources\":[]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resourceTemplates\":[]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"prompts\":[]}}\n\n",
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"forwarded\"}]}}\n\n"
-            ));
-            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+            write!(sse, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .expect("write legacy SSE headers");
+            write_chunked_sse_event(
+                &mut sse,
+                format!("event: endpoint\ndata: {expected_message_target}\n\n").as_bytes(),
+            );
 
             let mut posts = Vec::new();
-            for _ in 0..7 {
+            let replies = [
+                (
+                    "initialize",
+                    Some(
+                        serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"legacy-proxy-peer","version":"1.0.0"}}),
+                    ),
+                ),
+                ("notifications/initialized", None),
+                (
+                    "tools/list",
+                    Some(serde_json::json!({"tools":[{"name":"echo","inputSchema":{}}]})),
+                ),
+                ("resources/list", Some(serde_json::json!({"resources":[]}))),
+                (
+                    "resources/templates/list",
+                    Some(serde_json::json!({"resourceTemplates":[]})),
+                ),
+                ("prompts/list", Some(serde_json::json!({"prompts":[]}))),
+                (
+                    "tools/call",
+                    Some(serde_json::json!({"content":[{"type":"text","text":"forwarded"}]})),
+                ),
+            ];
+            let mut response_id = 1;
+            for (method, result) in replies {
                 let (mut post, _) = listener.accept().expect("accept advertised legacy POST");
                 let request = read_http_request(&mut post);
+                let message: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("decode actual legacy request");
+                assert_eq!(message["method"], method);
                 write_http_response(&mut post, 202, "application/json", b"");
+                // Future IDs are invalid ingress. Reply only after the real
+                // request has registered its waiter and arrived on the wire.
+                if let Some(result) = result {
+                    assert_eq!(message["id"], response_id);
+                    let response =
+                        serde_json::json!({"jsonrpc":"2.0","id":response_id,"result":result});
+                    write_chunked_sse_event(
+                        &mut sse,
+                        format!("event: message\ndata: {response}\n\n").as_bytes(),
+                    );
+                    response_id += 1;
+                } else {
+                    assert!(message.get("id").is_none());
+                }
                 posts.push(request);
             }
+            sse.write_all(b"0\r\n\r\n")
+                .expect("finish legacy SSE stream");
             (probe_request, sse_request, posts)
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
