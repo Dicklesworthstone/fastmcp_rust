@@ -497,9 +497,17 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         .expect("caller HTTP runtime initializes");
     runtime.block_on(async {
     let cx = Cx::current().expect("caller runtime supplies the HTTP session context");
-    let endpoint = Server::new("feature-off-modern-http", "1.0.0")
-        .protocol_policy(ProtocolPolicy::Auto)
-        .expect("Auto is available in every server feature set")
+    let mut builder = Server::new("feature-off-modern-http", "1.0.0")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .expect("ModernOnly is available in every server feature set");
+    assert_eq!(
+        builder.try_set_protocol_policy(ProtocolPolicy::Auto),
+        Err(fastmcp_server::ServerLaunchPolicyError::FeatureUnavailable),
+        "Auto requires the unavailable legacy adapter"
+    );
+    assert_eq!(builder.configured_protocol_policy(), ProtocolPolicy::ModernOnly);
+    // The same builder must still serve modern HTTP after refusing Auto.
+    let endpoint = builder
         .build_http_endpoint()
         .expect("feature-off server must construct its modern HTTP endpoint");
     let mut session = endpoint
@@ -555,8 +563,8 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
     let (modern_transport, modern_transport_state) =
         FeatureOffTransport::single_request(discovery.clone());
     let modern_stdio_result = Server::new("feature-off-modern-stdio", "1.0.0")
-        .protocol_policy(ProtocolPolicy::Auto)
-        .expect("Auto is available in every server feature set")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .expect("ModernOnly is available in every server feature set")
         .build()
         .run_transport_returning_with_cx(&cx, modern_transport);
     assert!(
