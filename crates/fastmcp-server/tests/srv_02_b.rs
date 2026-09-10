@@ -4,7 +4,7 @@
 //! discovers and starts each one through the shipped server surface.
 
 use asupersync::Cx;
-use fastmcp_core::{McpContext, McpResult};
+use fastmcp_core::{McpContext, McpOutcome, McpResult};
 use fastmcp_derive::tool;
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::JsonRpcMessage;
@@ -14,21 +14,23 @@ use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, SERVER_DISCOVER_METHOD,
 };
 use fastmcp_protocol::{JsonRpcRequest, MAX_SERVER_INSTRUCTIONS_BYTES};
-#[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_server::ServerHttpEndpointResponse;
+use fastmcp_server::{
+    FinalToolOutcome, InboundRequestContext, InboundRequestTransport, Server, ToolHandler,
+};
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_server::{HttpServerConfig, ServerHttpEndpointError};
-use fastmcp_server::{InboundRequestContext, InboundRequestTransport, Server};
 use fastmcp_transport::http::HttpStatus;
-#[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_transport::http::{HttpMethod, HttpRequest};
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_transport::{Transport, TransportError};
 use serde_json::json;
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use std::collections::VecDeque;
+use std::sync::Arc;
 #[cfg(not(feature = "legacy-2024-11-05"))]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(not(feature = "legacy-2024-11-05"))]
 #[derive(Default)]
@@ -95,6 +97,88 @@ impl Transport for FeatureOffTransport {
 fn discoverable(ctx: &McpContext) -> McpResult<String> {
     ctx.checkpoint()?;
     Ok("available".to_owned())
+}
+
+#[tool(
+    name = "runtime-child",
+    description = "Returns caller-owned child output"
+)]
+fn caller_child_echo(ctx: &McpContext, value: String) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok(value)
+}
+
+struct CallerRuntimeTool {
+    caller_thread: std::thread::ThreadId,
+    entered: Arc<AtomicUsize>,
+    children_completed: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for CallerRuntimeTool {
+    fn definition(&self) -> fastmcp_protocol::Tool {
+        CallerChildEcho.definition()
+    }
+
+    fn execution_mode(&self) -> fastmcp_server::ToolExecutionMode {
+        fastmcp_server::ToolExecutionMode::Async
+    }
+
+    fn call(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<fastmcp_protocol::Content>> {
+        CallerChildEcho.call(ctx, arguments)
+    }
+
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            assert_eq!(std::thread::current().id(), self.caller_thread);
+            let ambient = Cx::current().expect("the caller runtime supplies the handler context");
+            assert_eq!(ambient.task_id(), ctx.cx().task_id());
+            assert_eq!(ambient.region_id(), ctx.cx().region_id());
+            ctx.checkpoint().expect("positive handler is live");
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            asupersync::runtime::yield_now().await;
+
+            let value = arguments["value"]
+                .as_str()
+                .expect("the real tool schema validates the string argument")
+                .to_owned();
+            let caller_thread = self.caller_thread;
+            let handler_task = ctx.cx().task_id();
+            let handler_region = ctx.cx().region_id();
+            let completed = Arc::clone(&self.children_completed);
+            let mut child = ctx
+                .cx()
+                .spawn(move |child_cx| async move {
+                    assert_eq!(std::thread::current().id(), caller_thread);
+                    assert_ne!(child_cx.task_id(), handler_task);
+                    assert_eq!(child_cx.region_id(), handler_region);
+                    child_cx.checkpoint().expect("the owned child is live");
+                    asupersync::runtime::yield_now().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    format!("owned:{value}")
+                })
+                .expect("the provided handler context admits its owned child");
+            let value = child
+                .join(ctx.cx())
+                .await
+                .expect("the caller runtime drives and joins the owned child");
+            assert_eq!(std::thread::current().id(), self.caller_thread);
+            McpOutcome::Ok(FinalToolOutcome::Complete(
+                CallerChildEcho
+                    .call_final(ctx, json!({"value": value}))
+                    .expect("the joined child output is a valid final result"),
+            ))
+        })
+    }
 }
 
 fn public_catalog_snapshot(server: &Server) -> Vec<u8> {
@@ -383,7 +467,16 @@ fn srv_02_i_planted_negative() {
 #[cfg(not(feature = "legacy-2024-11-05"))]
 #[test]
 fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
-    let cx = Cx::for_testing();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor()
+                .expect("caller HTTP runtime reactor initializes"),
+        )
+        .blocking_threads(0, 16)
+        .build()
+        .expect("caller HTTP runtime initializes");
+    runtime.block_on(async {
+    let cx = Cx::current().expect("caller runtime supplies the HTTP session context");
     let endpoint = Server::new("feature-off-modern-http", "1.0.0")
         .protocol_policy(ProtocolPolicy::Auto)
         .expect("Auto is available in every server feature set")
@@ -412,7 +505,8 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         );
 
     let modern_response = session
-        .handle(&cx, modern_request.clone())
+        .handle_async(&cx, modern_request.clone())
+        .await
         .expect("feature-off modern request must reach modern_http_only");
     let ServerHttpEndpointResponse::Immediate(modern_response) = modern_response else {
         panic!("ordinary modern discovery must retain its JSON response representation");
@@ -437,6 +531,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
     // This reaches the same final-era capability through the public stdio
     // entry point. Unlike a lib unit test, the server linked by this
     // integration target is the shipped no-default-features dependency.
+    {
     let (modern_transport, modern_transport_state) =
         FeatureOffTransport::single_request(discovery.clone());
     let modern_stdio_result = Server::new("feature-off-modern-stdio", "1.0.0")
@@ -471,6 +566,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
             .and_then(serde_json::Value::as_str),
         Some(MODERN_PROTOCOL_VERSION),
     );
+    }
 
     // This is deliberately the same fully admitted modern request except for
     // the path. `/messages` is the historical exact-2024 ingress, which must
@@ -479,7 +575,8 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
     let mut legacy_route_request = modern_request.clone();
     legacy_route_request.path = "/messages".to_owned();
     let legacy_refusal = session
-        .handle(&cx, legacy_route_request)
+        .handle_async(&cx, legacy_route_request)
+        .await
         .expect("a disabled legacy route must be a normal HTTP response");
     assert!(matches!(
         legacy_refusal,
@@ -488,7 +585,8 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
 
     // The refusal must not disturb the previously selected modern HTTP era.
     let modern_after_refusal = session
-        .handle(&cx, modern_request)
+        .handle_async(&cx, modern_request)
+        .await
         .expect("legacy-route refusal must not poison the selected modern session");
     assert!(matches!(
         modern_after_refusal,
@@ -518,6 +616,113 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         legacy_stdio,
         Err(fastmcp_server::ServerLaunchPolicyError::FeatureUnavailable)
     ));
+    });
+}
+
+#[test]
+fn srv_02_b_http_session_caller_runtime_and_cancelled_negative() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor()
+                .expect("caller HTTP runtime reactor initializes"),
+        )
+        .build()
+        .expect("caller HTTP runtime initializes");
+    let caller_thread = std::thread::current().id();
+    let entered = Arc::new(AtomicUsize::new(0));
+    let children_completed = Arc::new(AtomicUsize::new(0));
+    let server = Server::new("caller-runtime-http", "1.0.0")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .expect("ModernOnly is available in every profile")
+        .tool(CallerRuntimeTool {
+            caller_thread,
+            entered: Arc::clone(&entered),
+            children_completed: Arc::clone(&children_completed),
+        })
+        .build();
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    let endpoint = server.into_http_endpoint();
+    #[cfg(feature = "legacy-2024-11-05")]
+    let endpoint = server.into_http_endpoint("http://127.0.0.1");
+    let endpoint = endpoint.expect("the real server constructs its public HTTP endpoint");
+
+    runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime supplies the session context");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("the real public HTTP session opens");
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "name": "runtime-child",
+                "arguments": {"value": "from-request"},
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            4_102_i64,
+        );
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json")
+            .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+            .with_header("mcp-method", "tools/call")
+            .with_header("mcp-name", "runtime-child")
+            .with_body(serde_json::to_vec(&request).expect("the tool request serializes"));
+        let request_body_before = request.body.clone();
+        let positive = session
+            .handle_async(&cx, request.clone())
+            .await
+            .expect("the async HTTP session completes on the caller runtime");
+        let ServerHttpEndpointResponse::Immediate(positive) = positive else {
+            panic!("the ordinary tool call must return its selected JSON representation");
+        };
+        assert_eq!(positive.status, HttpStatus::OK);
+        let positive: fastmcp_protocol::JsonRpcResponse =
+            serde_json::from_slice(&positive.body).expect("the real result is JSON-RPC");
+        assert_eq!(positive.id, Some(4_102_i64.into()));
+        assert!(positive.error.is_none());
+        let result = positive
+            .result
+            .expect("the child output reaches the caller");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["content"][0]["text"], "owned:from-request");
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert_eq!(children_completed.load(Ordering::SeqCst), 1);
+
+        // Keep the endpoint, session, request, and runtime unchanged. Native
+        // HTTP currently maps failed cancellation/budget admission to its
+        // fixed authentication rejection before it invokes the handler.
+        cx.cancel_with(
+            asupersync::CancelKind::User,
+            Some("caller cancelled HTTP admission"),
+        );
+        let negative = session
+            .handle_async(&cx, request.clone())
+            .await
+            .expect("caller cancellation remains an ordinary admission refusal");
+        let ServerHttpEndpointResponse::Immediate(negative) = negative else {
+            panic!("cancelled admission must not allocate a response stream");
+        };
+        assert_eq!(negative.status, HttpStatus::UNAUTHORIZED);
+        assert_eq!(
+            negative.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer")
+        );
+        assert!(negative.body.is_empty());
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "cancellation invoked the handler"
+        );
+        assert_eq!(
+            children_completed.load(Ordering::SeqCst),
+            1,
+            "cancellation admitted another child"
+        );
+        assert_eq!(request.body, request_body_before);
+    });
 }
 
 #[cfg(not(feature = "legacy-2024-11-05"))]

@@ -279,6 +279,66 @@ pub fn probe() {
         absent_feature_diagnostic: None,
     },
     DownstreamFeatureSymbolProbe {
+        name: "http-session-caller-owned-async-present",
+        features: &[],
+        source: r"
+pub async fn probe(
+    cx: &asupersync::Cx,
+    session: &mut mcp::ServerHttpSession,
+    request: mcp::HttpRequest,
+) -> Result<mcp::ServerHttpEndpointResponse, mcp::ServerHttpEndpointError> {
+    session.handle_async(cx, request).await
+}
+",
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "http-session-hidden-runtime-handle-absent",
+        features: &[],
+        source: r"
+pub async fn probe(
+    cx: &asupersync::Cx,
+    session: &mut mcp::ServerHttpSession,
+    request: mcp::HttpRequest,
+) -> Result<mcp::ServerHttpEndpointResponse, mcp::ServerHttpEndpointError> {
+    session.handle(cx, request)
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("handle"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "legacy-http-session-caller-owned-async-present",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(
+    cx: &asupersync::Cx,
+    session: &mut mcp::ServerHttpSession,
+    request: mcp::HttpRequest,
+) -> Result<mcp::ServerHttpEndpointResponse, mcp::ServerHttpEndpointError> {
+    session.handle_async(cx, request).await
+}
+",
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "legacy-http-session-hidden-runtime-handle-absent",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(
+    cx: &asupersync::Cx,
+    session: &mut mcp::ServerHttpSession,
+    request: mcp::HttpRequest,
+) -> Result<mcp::ServerHttpEndpointResponse, mcp::ServerHttpEndpointError> {
+    session.handle(cx, request)
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("handle"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "modern-server-caller-owned-stdio-present",
         features: &[],
         source: r"
