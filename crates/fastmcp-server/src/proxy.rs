@@ -610,22 +610,76 @@ pub struct PreparedIncrementalHttpListen {
     request_id: RequestId,
     notifications: SubscriptionFilter,
     limits: SseLimits,
-    cx: Cx,
 }
 
 impl PreparedIncrementalHttpListen {
-    fn open(self) -> McpResult<ModernHttpSubscriptionListener> {
-        block_on(self.client.open_subscriptions_listener(
-            &self.cx,
-            self.request_id,
-            self.notifications,
-            self.limits,
-        ))
-        .map_err(|error| {
-            McpError::invalid_request(format!(
-                "Proxy HTTP incremental subscriptions/listen failed: {error}"
-            ))
-        })
+    async fn open(self, cx: &Cx) -> McpResult<ModernHttpSubscriptionListener> {
+        // Native HTTP header reads may remain parked after this caller Cx is
+        // cancelled. Use the same bounded cancellation wake as response reads
+        // so dropping the opening releases both its socket and route admission.
+        await_proxy_operation_with_cancellation_priority(
+            cx,
+            &fastmcp_core::McpRequestCancellation::new(),
+            async {
+                self.client
+                    .open_subscriptions_listener(
+                        cx,
+                        self.request_id,
+                        self.notifications,
+                        self.limits,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if matches!(
+                            error,
+                            ModernHttpSubscriptionListenError::CallerCancelled { .. }
+                        ) || cx.checkpoint().is_err()
+                        {
+                            return McpError::request_cancelled();
+                        }
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP incremental subscriptions/listen failed: {error}"
+                        ))
+                    })
+            },
+            None,
+            None,
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IncrementalListenerKind {
+    Catalog,
+    #[cfg(feature = "tasks")]
+    Tasks,
+}
+
+/// Owns the route's opening reservation while its HTTP handshake is suspended.
+/// Dropping that future releases admission for a later attempt on the route.
+struct IncrementalListenerOpening<'a> {
+    client: &'a ProxyClient,
+    kind: IncrementalListenerKind,
+    armed: bool,
+}
+
+impl Drop for IncrementalListenerOpening<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let result = self.client.with_backend(|backend| match self.kind {
+                IncrementalListenerKind::Catalog => {
+                    backend.abort_incremental_catalog_listener_opening()
+                }
+                #[cfg(feature = "tasks")]
+                IncrementalListenerKind::Tasks => {
+                    backend.abort_incremental_final_task_listener_opening()
+                }
+            });
+            if let Err(error) = result {
+                log::warn!("Failed to release proxy listener opening reservation: {error}");
+            }
+        }
     }
 }
 
@@ -6439,7 +6493,6 @@ impl ProxyBackend for ProxyHttpClient {
             request_id,
             notifications,
             limits: Self::sse_limits(),
-            cx: self.cx.clone(),
         }))
     }
 
@@ -6499,6 +6552,10 @@ impl ProxyBackend for ProxyHttpClient {
         })?;
         let event = match listener.try_next_event(cx) {
             Ok(event) => event,
+            Err(ModernHttpSubscriptionListenError::CallerCancelled { .. }) => {
+                self.live_catalog_listener = None;
+                return Err(McpError::request_cancelled());
+            }
             Err(error) => {
                 self.live_catalog_listener = None;
                 return Err(McpError::invalid_request(format!(
@@ -6574,7 +6631,6 @@ impl ProxyBackend for ProxyHttpClient {
             request_id,
             notifications,
             limits: Self::sse_limits(),
-            cx: self.cx.clone(),
         }))
     }
 
@@ -9390,21 +9446,29 @@ impl ProxyClient {
     /// does not own sequential ingress returns `false` instead of collecting
     /// the stream to terminal. Modern HTTP routes store the listener on this
     /// proxy client so the same route can keep issuing ordinary requests.
-    pub fn start_catalog_listener(&self, notifications: SubscriptionFilter) -> McpResult<bool> {
+    ///
+    /// HTTP handshakes use the caller's runtime. Dropping an opening future
+    /// releases its reservation; cancellation before polling changes no state.
+    pub async fn start_catalog_listener(
+        &self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         if let Some(prepared) = self.with_backend(|backend| {
             backend.prepare_incremental_catalog_listener(notifications.clone())
         })? {
-            let listener = match prepared.open() {
-                Ok(listener) => listener,
-                Err(error) => {
-                    let _ = self.with_backend(|backend| {
-                        backend.abort_incremental_catalog_listener_opening()
-                    });
-                    return Err(error);
-                }
+            let mut opening = IncrementalListenerOpening {
+                client: self,
+                kind: IncrementalListenerKind::Catalog,
+                armed: true,
             };
-            return self
-                .with_backend(|backend| backend.install_incremental_catalog_listener(listener));
+            let listener = prepared.open(cx).await?;
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let installed = self
+                .with_backend(|backend| backend.install_incremental_catalog_listener(listener))?;
+            opening.armed = !installed;
+            return Ok(installed);
         }
         self.with_backend(|backend| backend.start_incremental_catalog_listener(notifications))
     }
@@ -9414,7 +9478,9 @@ impl ProxyClient {
     /// The route mutex is held only to poll or bound-receive. Waiting for the
     /// next SSE or stdio frame happens after the lock is released so the same
     /// route can still issue ordinary requests.
-    pub fn next_catalog_listener_event(
+    /// Dropping this future preserves the installed listener and any retained
+    /// frame prefix. Explicit cancellation retires it through the backend.
+    pub async fn next_catalog_listener_event(
         &self,
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -9426,12 +9492,14 @@ impl ProxyClient {
                 return Ok(event);
             }
             if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                // Let the backend retire its listener before returning the
+                // cancellation that arrived during the preceding poll.
+                let _ = self.with_backend(|backend| {
+                    backend.try_next_incremental_catalog_listener(cx, request_cancellation)
+                });
                 return Err(McpError::request_cancelled());
             }
-            block_on(asupersync::time::sleep(
-                cx.now(),
-                std::time::Duration::from_millis(20),
-            ));
+            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
         }
     }
 
@@ -9442,21 +9510,27 @@ impl ProxyClient {
     /// `true` when this route now owns a live listener that
     /// [`Self::next_final_task_listener_event`] can poll.
     #[cfg(feature = "tasks")]
-    pub fn start_final_task_listener(&self, notifications: SubscriptionFilter) -> McpResult<bool> {
+    pub async fn start_final_task_listener(
+        &self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         if let Some(prepared) = self.with_backend(|backend| {
             backend.prepare_incremental_final_task_listener(notifications.clone())
         })? {
-            let listener = match prepared.open() {
-                Ok(listener) => listener,
-                Err(error) => {
-                    let _ = self.with_backend(|backend| {
-                        backend.abort_incremental_final_task_listener_opening()
-                    });
-                    return Err(error);
-                }
+            let mut opening = IncrementalListenerOpening {
+                client: self,
+                kind: IncrementalListenerKind::Tasks,
+                armed: true,
             };
-            return self
-                .with_backend(|backend| backend.install_incremental_final_task_listener(listener));
+            let listener = prepared.open(cx).await?;
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let installed = self.with_backend(|backend| {
+                backend.install_incremental_final_task_listener(listener)
+            })?;
+            opening.armed = !installed;
+            return Ok(installed);
         }
         self.with_backend(|backend| backend.start_incremental_final_task_listener(notifications))
     }
@@ -9464,7 +9538,7 @@ impl ProxyClient {
     /// Drives one incremental official Tasks listener event on this proxy
     /// route.
     #[cfg(feature = "tasks")]
-    pub fn next_final_task_listener_event(
+    pub async fn next_final_task_listener_event(
         &self,
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -9476,12 +9550,13 @@ impl ProxyClient {
                 break event;
             }
             if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                // The next backend poll owns cancellation cleanup.
+                let _ = self.with_backend(|backend| {
+                    backend.try_next_incremental_final_task_listener(cx, request_cancellation)
+                });
                 return Err(McpError::request_cancelled());
             }
-            block_on(asupersync::time::sleep(
-                cx.now(),
-                std::time::Duration::from_millis(20),
-            ));
+            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
         };
         match event {
             ProxyFinalTaskListenerEvent::Acknowledged(filter) => {
@@ -13774,21 +13849,356 @@ IFS= read -r end
 
     #[test]
     fn custom_backend_does_not_pretend_to_own_an_incremental_catalog_listener() {
-        let proxy = ProxyClient::from_backend(TestBackend::default());
-        assert!(
-            !proxy
-                .start_catalog_listener(SubscriptionFilter {
-                    tools_list_changed: Some(true),
-                    ..SubscriptionFilter::default()
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller runtime builds");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime supplies a context");
+            let proxy = ProxyClient::from_backend(TestBackend::default());
+            assert!(
+                !proxy
+                    .start_catalog_listener(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        }
+                    )
+                    .await
+                    .expect("a custom backend must answer the incremental catalog reservation"),
+                "only a sequential stdio backend can own the live catalog listener"
+            );
+            let error = proxy
+                .next_catalog_listener_event(&cx, &McpRequestCancellation::new())
+                .await
+                .expect_err("polling without a reserved incremental listener must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(error.message.contains("incremental catalog listener"));
+        });
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn open_incremental_listener_probe(
+        proxy: &ProxyClient,
+        cx: &Cx,
+        filter: SubscriptionFilter,
+        tasks: bool,
+    ) -> fastmcp_core::McpResult<bool> {
+        if tasks {
+            proxy.start_final_task_listener(cx, filter).await
+        } else {
+            proxy.start_catalog_listener(cx, filter).await
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn next_incremental_listener_probe(
+        proxy: &ProxyClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        tasks: bool,
+    ) -> fastmcp_core::McpResult<bool> {
+        if tasks {
+            match proxy
+                .next_final_task_listener_event(cx, cancellation)
+                .await?
+            {
+                fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(_) => Ok(false),
+                fastmcp_client::StdioTaskSubscriptionEvent::Terminal => Ok(true),
+                event => panic!("unexpected Tasks listener event: {event:?}"),
+            }
+        } else {
+            match proxy.next_catalog_listener_event(cx, cancellation).await? {
+                fastmcp_client::StdioSubscriptionEvent::Acknowledged(_) => Ok(false),
+                fastmcp_client::StdioSubscriptionEvent::Terminal => Ok(true),
+                event => panic!("unexpected catalog listener event: {event:?}"),
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn proxy_incremental_listener_caller_runtime_probe(tasks: bool, interrupt: Option<bool>) {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let subject = format!("listener-{}", address.port());
+        let mut filter = SubscriptionFilter::default();
+        if tasks {
+            set_task_subscription_ids(
+                &mut filter,
+                vec![fastmcp_protocol::FinalTaskId::parse(subject.clone()).unwrap()],
+            )
+            .unwrap();
+        } else {
+            filter.tools_list_changed = Some(true);
+        }
+        let expected_filter = serde_json::to_value(&filter).unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let peer_received = Arc::clone(&received);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(10)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(10)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "listener peer accept is bounded");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("listener peer accept: {error}"),
+                    }
+                }
+            };
+            let mut discovery = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_http_request(&mut discovery).body).unwrap();
+            assert_eq!(request["method"], "server/discover");
+            write_http_discovery_response(&mut discovery, &serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": {
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}, "extensions": {"io.modelcontextprotocol/tasks": {}}},
+                    "ttlMs": 0, "cacheScope": "private"
+                }
+            })).unwrap());
+            drop(discovery);
+            let attempts = if interrupt.is_some() { 2 } else { 1 };
+            let mut requests = Vec::new();
+            for attempt in 0..attempts {
+                let mut stream = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_http_request(&mut stream).body).unwrap();
+                assert_eq!(request["method"], "subscriptions/listen");
+                assert_eq!(request["params"]["notifications"], expected_filter);
+                assert_eq!(request["id"], 2 + attempt);
+                requests.push(request.clone());
+                peer_received.store(attempt + 1, Ordering::Release);
+                let abort = released
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller runtime releases the delayed HTTP handshake");
+                if abort {
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        other => panic!("dropped opening must close its native socket: {other:?}"),
+                    }
+                    continue;
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                let ack = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": request["id"]},
+                    "notifications": expected_filter
+                }});
+                write_chunked_sse_event(&mut stream, format!("data: {ack}\n\n").as_bytes());
+                stream.flush().unwrap();
+                assert!(
+                    !released
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("caller releases terminal event")
+                );
+                let terminal = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": request["id"]}
+                }});
+                write_chunked_sse_event(&mut stream, format!("data: {terminal}\n\n").as_bytes());
+                stream.write_all(b"0\r\n\r\n").unwrap();
+            }
+            requests
+        });
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+            None,
+            None,
+            subject.clone(),
+            subject.clone(),
+            subject,
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let capabilities = ClientCapabilities::default();
+        let connection = runtime
+            .block_on(ClientHttpConnection::connect(
+                &cx,
+                plan,
+                proxy_http_client_info(),
+                capabilities.clone(),
+            ))
+            .unwrap();
+        let binding = ProxyUpstreamBinding {
+            adapter: ProxyUpstreamAdapter::ModernHttp,
+            ..proxy_binding(ProtocolEra::Modern2026)
+        };
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            ProxyHttpClient::new(
+                binding,
+                connection,
+                cx.clone(),
+                proxy_http_client_info(),
+                capabilities,
+            ),
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let proxy = proxy.clone();
+            let cx = cx.clone();
+            let mut work = root
+                .spawn(move |_| async move {
+                    let root = sibling_root;
+                    let worker = thread::current().id();
+                    if interrupt.is_some() {
+                        cx.set_cancel_requested(true);
+                        let error =
+                            open_incremental_listener_probe(&proxy, &cx, filter.clone(), tasks)
+                                .await
+                                .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        assert_eq!(received.load(Ordering::Acquire), 0);
+                        cx.set_cancel_requested(false);
+                    }
+                    let attempts = if interrupt.is_some() { 2 } else { 1 };
+                    for attempt in 0..attempts {
+                        let mut opening = Box::pin(open_incremental_listener_probe(
+                            &proxy,
+                            &cx,
+                            filter.clone(),
+                            tasks,
+                        ));
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        loop {
+                            assert!(
+                                std::future::poll_fn(|task_cx| Poll::Ready(
+                                    opening.as_mut().poll(task_cx)
+                                ))
+                                .await
+                                .is_pending(),
+                                "handshake must yield while peer withholds HTTP headers"
+                            );
+                            if received.load(Ordering::Acquire) > attempt {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "listen request reaches peer");
+                            asupersync::time::sleep(root.now(), Duration::from_millis(1)).await;
+                        }
+                        // Reservation refuses a second opening without a second POST.
+                        let error =
+                            open_incremental_listener_probe(&proxy, &cx, filter.clone(), tasks)
+                                .await
+                                .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        if attempt == 0
+                            && let Some(cancel) = interrupt
+                        {
+                            if cancel {
+                                cx.set_cancel_requested(true);
+                                assert_eq!(
+                                    opening.await.unwrap_err().code,
+                                    McpErrorCode::RequestCancelled
+                                );
+                                cx.set_cancel_requested(false);
+                            } else {
+                                drop(opening);
+                            }
+                            release.send(true).unwrap();
+                            continue;
+                        }
+                        let release_headers = release.clone();
+                        let mut sibling = root
+                            .spawn(move |_| async move {
+                                assert_eq!(thread::current().id(), worker);
+                                release_headers.send(false).unwrap();
+                                1_u8
+                            })
+                            .unwrap();
+                        assert_eq!(sibling.join(&root).await.unwrap(), 1);
+                        assert!(opening.await.unwrap());
+                    }
+                    let cancellation = McpRequestCancellation::new();
+                    assert!(
+                        !next_incremental_listener_probe(&proxy, &cx, &cancellation, tasks)
+                            .await
+                            .unwrap()
+                    );
+                    let mut next = Box::pin(next_incremental_listener_probe(
+                        &proxy,
+                        &cx,
+                        &cancellation,
+                        tasks,
+                    ));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(next.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending(),
+                        "event read yields before peer terminal"
+                    );
+                    drop(next);
+                    let mut sibling = root
+                        .spawn(move |_| async move {
+                            assert_eq!(thread::current().id(), worker);
+                            release.send(false).unwrap();
+                            2_u8
+                        })
+                        .unwrap();
+                    assert_eq!(sibling.join(&root).await.unwrap(), 2);
+                    assert!(
+                        next_incremental_listener_probe(&proxy, &cx, &cancellation, tasks)
+                            .await
+                            .unwrap()
+                    );
                 })
-                .expect("a custom backend must answer the incremental catalog reservation"),
-            "only a sequential stdio backend can own the live catalog listener"
-        );
-        let error = proxy
-            .next_catalog_listener_event(&Cx::for_testing(), &McpRequestCancellation::new())
-            .expect_err("polling without a reserved incremental listener must fail closed");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(error.message.contains("incremental catalog listener"));
+                .unwrap();
+            work.join(&root).await.unwrap();
+        });
+        drop(proxy);
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), if interrupt.is_some() { 2 } else { 1 });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_incremental_listener_caller_runtime_positive() {
+        for tasks in [false, true] {
+            proxy_incremental_listener_caller_runtime_probe(tasks, None);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_incremental_listener_caller_runtime_planted_negative() {
+        for tasks in [false, true] {
+            for cancel in [false, true] {
+                proxy_incremental_listener_caller_runtime_probe(tasks, Some(cancel));
+            }
+        }
     }
 
     #[cfg(feature = "tasks")]

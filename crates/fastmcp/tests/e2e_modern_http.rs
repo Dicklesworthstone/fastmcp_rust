@@ -10578,10 +10578,11 @@ fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
             )
             .map_err(|error| format!("live HTTP ProxyClient connect failed: {error}"))?;
         let started = proxy
-            .start_catalog_listener(modern::SubscriptionFilter {
+            .start_catalog_listener(&cx, modern::SubscriptionFilter {
                 tools_list_changed: Some(true),
                 ..modern::SubscriptionFilter::default()
             })
+            .await
             .map_err(|error| format!("ProxyClient catalog listen start failed: {error}"))?;
         if !started {
             return Err(
@@ -10591,6 +10592,7 @@ fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
         }
         let acknowledgement = proxy
             .next_catalog_listener_event(&cx, &McpRequestCancellation::new())
+            .await
             .map_err(|error| format!("ProxyClient catalog listen ack failed: {error}"))?;
         if !matches!(
             acknowledgement,
@@ -10646,6 +10648,7 @@ fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
 
         let changed = proxy
             .next_catalog_listener_event(&cx, &McpRequestCancellation::new())
+            .await
             .map_err(|error| {
                 format!("ProxyClient catalog listen must retain tools/list_changed: {error}")
             })?;
@@ -10734,7 +10737,8 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
         modern::set_task_subscription_ids(&mut catalog_with_tasks, vec![task_id.clone()])
             .map_err(|error| format!("the public Tasks filter must compose: {error}"))?;
         let catalog_refusal = proxy
-            .start_catalog_listener(catalog_with_tasks)
+            .start_catalog_listener(&cx, catalog_with_tasks)
+            .await
             .expect_err("catalog listen must refuse taskIds");
         if !(catalog_refusal
             .to_string()
@@ -10750,7 +10754,8 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
         modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
             .map_err(|error| format!("the public Tasks filter is invalid: {error}"))?;
         let started = proxy
-            .start_final_task_listener(filter)
+            .start_final_task_listener(&cx, filter)
+            .await
             .map_err(|error| format!("ProxyClient official Tasks listen start failed: {error}"))?;
         if !started {
             return Err(
@@ -10761,6 +10766,7 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
 
         let acknowledgement = proxy
             .next_final_task_listener_event(&cx, &McpRequestCancellation::new())
+            .await
             .map_err(|error| format!("ProxyClient official Tasks listen ack failed: {error}"))?;
         if !matches!(
             acknowledgement,
@@ -10784,6 +10790,7 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
         loop {
             let event = proxy
                 .next_final_task_listener_event(&cx, &McpRequestCancellation::new())
+                .await
                 .map_err(|error| {
                     format!("official Tasks listen must retain later status updates: {error}")
                 })?;
