@@ -3902,6 +3902,7 @@ fn spawn_modern_http_proxy_gateway_with_prefix(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-live-upstream",
                     "native-h1:e2e-live-upstream",
                     1,
@@ -3911,11 +3912,12 @@ fn spawn_modern_http_proxy_gateway_with_prefix(
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| format!("live HTTP proxy upstream connect failed: {error}"))?;
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .map_err(|error| format!("live HTTP proxy catalog failed: {error}"))?;
             let tool_names = catalog
                 .final_tools()
@@ -4491,6 +4493,7 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-live-task-upstream",
                     "native-h1:e2e-live-task-upstream",
                     1,
@@ -4500,11 +4503,12 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| format!("live HTTP task proxy upstream connect failed: {error}"))?;
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .map_err(|error| format!("live HTTP task proxy catalog failed: {error}"))?;
             let tool_names = catalog
                 .final_tools()
@@ -5783,6 +5787,7 @@ fn spawn_modern_http_template_proxy_gateway(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-live-template-upstream",
                     "native-h1:e2e-live-template-upstream",
                     1,
@@ -5792,13 +5797,14 @@ fn spawn_modern_http_template_proxy_gateway(
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| {
                     format!("live HTTP template proxy upstream connect failed: {error}")
                 })?;
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .map_err(|error| format!("live HTTP template proxy catalog failed: {error}"))?;
             let templates = catalog
                 .final_resource_templates()
@@ -10565,6 +10571,7 @@ fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
         let mut registry = ProxyClient::upstream_binding_registry();
         let proxy = registry
             .connect_http_with_protocol_plan(
+                &cx,
                 "e2e-listen-upstream",
                 "native-h1:e2e-listen-upstream",
                 1,
@@ -10574,8 +10581,8 @@ fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
                     version: "1.0.0".to_owned(),
                 },
                 ClientCapabilities::default(),
-                cx.clone(),
             )
+            .await
             .map_err(|error| format!("live HTTP ProxyClient connect failed: {error}"))?;
         let started = proxy
             .start_catalog_listener(&cx, modern::SubscriptionFilter {
@@ -10695,6 +10702,7 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
         let mut registry = ProxyClient::upstream_binding_registry();
         let proxy = registry
             .connect_http_with_protocol_plan(
+                &cx,
                 "e2e-tasks-listen-upstream",
                 "native-h1:e2e-tasks-listen-upstream",
                 1,
@@ -10704,8 +10712,8 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
                     version: "1.0.0".to_owned(),
                 },
                 ClientCapabilities::default(),
-                cx.clone(),
             )
+            .await
             .map_err(|error| format!("live HTTP ProxyClient Tasks listen connect failed: {error}"))?;
 
         let mut creator = modern::ClientBuilder::new()
@@ -12801,6 +12809,7 @@ fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-live-identity-upstream",
                     "native-h1:e2e-live-identity-upstream",
                     1,
@@ -12810,13 +12819,14 @@ fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| {
                     format!("live HTTP identity proxy upstream connect failed: {error}")
                 })?;
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .map_err(|error| format!("live HTTP identity proxy catalog failed: {error}"))?;
             let mut builder = modern::ServerBuilder::new("e2e-http-identity-gateway", "1.0.0")
                 .mask_error_details(mask_error_details);
@@ -18791,6 +18801,7 @@ fn spawn_modern_http_as_proxy_duplicate_gateway(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-live-duplicate-upstream",
                     "native-h1:e2e-live-duplicate-upstream",
                     1,
@@ -18800,12 +18811,12 @@ fn spawn_modern_http_as_proxy_duplicate_gateway(
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| {
                     format!("live HTTP as_proxy on_duplicate upstream connect failed: {error}")
                 })?;
-            let catalog = proxy.catalog_typed().map_err(|error| {
+            let catalog = proxy.catalog_typed_with_cx(&cx).await.map_err(|error| {
                 format!("live HTTP as_proxy on_duplicate catalog failed: {error}")
             })?;
             let server = modern::ServerBuilder::new("e2e-http-as-proxy-duplicate", "1.0.0")
@@ -19033,6 +19044,7 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-duplicate-upstream",
                     "native-h1:e2e-legacy-duplicate-upstream",
                     1,
@@ -19048,14 +19060,14 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
                             list_changed: false,
                         }),
                     },
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| {
                     format!(
                         "live exact-2024 as_proxy on_duplicate upstream connect failed: {error}"
                     )
                 })?;
-            let catalog = proxy.catalog_typed().map_err(|error| {
+            let catalog = proxy.catalog_typed_with_cx(&cx).await.map_err(|error| {
                 format!("live exact-2024 as_proxy on_duplicate catalog failed: {error}")
             })?;
             let server = ServerBuilder::new("e2e-legacy-http-as-proxy-duplicate", "1.0.0")
@@ -34805,6 +34817,7 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-instructions-upstream",
                     "native-h1:e2e-legacy-instructions-upstream",
                     1,
@@ -34814,12 +34827,12 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .map_err(|error| {
                     format!("live exact-2024 instructions proxy connect failed: {error}")
                 })?;
-            let catalog = proxy.catalog_typed().map_err(|error| {
+            let catalog = proxy.catalog_typed_with_cx(&cx).await.map_err(|error| {
                 format!("live exact-2024 instructions proxy catalog failed: {error}")
             })?;
             let mut builder = ServerBuilder::new("e2e-legacy-http-instructions-gateway", "1.0.0")
@@ -39241,6 +39254,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-tasks-upstream",
                     "native-h1:e2e-ws-as-proxy-tasks-upstream",
                     1,
@@ -39250,11 +39264,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -39427,6 +39442,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-resource-updated-upstream",
                     "native-h1:e2e-ws-as-proxy-resource-updated-upstream",
                     1,
@@ -39436,11 +39452,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP catalog proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP catalog proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-resource-updated-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -39599,6 +39616,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-dual-listen-upstream",
                     "native-h1:e2e-ws-as-proxy-dual-listen-upstream",
                     1,
@@ -39608,11 +39626,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP dual-listen proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP dual-listen proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-dual-listen-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -39849,6 +39868,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-tasks-create-upstream",
                     "native-h1:e2e-ws-as-proxy-tasks-create-upstream",
                     1,
@@ -39858,11 +39878,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-create-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40003,6 +40024,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-identity-upstream",
                     "native-h1:e2e-ws-as-proxy-identity-upstream",
                     1,
@@ -40012,11 +40034,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP identity proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP identity proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-identity-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40175,6 +40198,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-server-identity-upstream",
                     "native-h1:e2e-ws-as-proxy-server-identity-upstream",
                     1,
@@ -40184,11 +40208,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP identity proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP identity proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-identity-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40286,6 +40311,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-bare-identity-upstream",
                     "native-h1:e2e-ws-as-proxy-bare-identity-upstream",
                     1,
@@ -40295,11 +40321,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP bare-identity proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP bare-identity proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-identity-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40385,6 +40412,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-instructions-upstream",
                     "native-h1:e2e-ws-as-proxy-instructions-upstream",
                     1,
@@ -40394,11 +40422,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP instructions proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP instructions proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-instructions-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40473,6 +40502,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-bare-instructions-upstream",
                     "native-h1:e2e-ws-as-proxy-bare-instructions-upstream",
                     1,
@@ -40482,11 +40512,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP bare-instructions proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP bare-instructions proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-instructions-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40560,6 +40591,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-hide-upstream",
                     "native-h1:e2e-ws-as-proxy-hide-upstream",
                     1,
@@ -40569,11 +40601,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP hide proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP hide proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-hide-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40743,6 +40776,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-compose-upstream",
                     "native-h1:e2e-ws-as-proxy-compose-upstream",
                     1,
@@ -40752,13 +40786,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP compose proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-compose-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -40882,6 +40917,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-compose-prompt-upstream",
                     "native-h1:e2e-ws-as-proxy-compose-prompt-upstream",
                     1,
@@ -40891,13 +40927,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP compose-prompt proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-compose-prompt-gateway", "1.0.0")
@@ -41029,6 +41066,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-resource-compose-upstream",
                     "native-h1:e2e-ws-as-proxy-resource-compose-upstream",
                     1,
@@ -41038,13 +41076,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP compose proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-resource-compose-gateway", "1.0.0")
@@ -41160,6 +41199,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-prompt-compose-upstream",
                     "native-h1:e2e-ws-as-proxy-prompt-compose-upstream",
                     1,
@@ -41169,13 +41209,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP compose proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-prompt-compose-gateway", "1.0.0")
@@ -41310,6 +41351,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-resource-compose-prompt-upstream",
                     "native-h1:e2e-ws-as-proxy-resource-compose-prompt-upstream",
                     1,
@@ -41319,13 +41361,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP compose-prompt proxy catalog is typed");
             let server = modern::ServerBuilder::new(
                 "e2e-ws-as-proxy-resource-compose-prompt-gateway",
@@ -41446,6 +41489,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-from-prompt-upstream",
                     "native-h1:e2e-ws-as-proxy-from-prompt-upstream",
                     1,
@@ -41455,13 +41499,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP from-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP from-prompt proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-from-prompt-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -41591,6 +41636,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-request-timeout-upstream",
                     "native-h1:e2e-ws-as-proxy-request-timeout-upstream",
                     1,
@@ -41600,13 +41646,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP hold proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP hold proxy catalog is typed");
             let server = modern::ServerBuilder::new(
                 "e2e-ws-as-proxy-request-timeout-gateway",
@@ -41773,6 +41820,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-mask-upstream",
                     "native-h1:e2e-ws-as-proxy-mask-upstream",
                     1,
@@ -41782,11 +41830,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP leak proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP leak proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-mask-gateway", "1.0.0")
                 .mask_error_details(true)
@@ -41880,6 +41929,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-timeout-upstream",
                     "native-h1:e2e-ws-as-proxy-timeout-upstream",
                     1,
@@ -41889,13 +41939,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP timeout proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP timeout proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-timeout-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -42012,6 +42063,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-panic-upstream",
                     "native-h1:e2e-ws-as-proxy-panic-upstream",
                     1,
@@ -42021,13 +42073,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP panic proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP panic proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-panic-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -42142,6 +42195,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-catalog-panic-upstream",
                     "native-h1:e2e-ws-as-proxy-catalog-panic-upstream",
                     1,
@@ -42151,13 +42205,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP catalog-panic proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP catalog-panic proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-catalog-panic-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -42396,6 +42451,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-cache-upstream",
                     "native-h1:e2e-ws-as-proxy-cache-upstream",
                     1,
@@ -42405,13 +42461,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-cache-gateway", "1.0.0")
                 .middleware(
@@ -42550,6 +42607,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-rate-limit-upstream",
                     "native-h1:e2e-ws-as-proxy-rate-limit-upstream",
                     1,
@@ -42559,13 +42617,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-rate-limit-gateway", "1.0.0")
                 .middleware(
@@ -42680,6 +42739,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-sliding-upstream",
                     "native-h1:e2e-ws-as-proxy-sliding-upstream",
                     1,
@@ -42689,13 +42749,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-sliding-gateway", "1.0.0")
                 .middleware(rate_limiting::SlidingWindowRateLimitingMiddleware::new(
@@ -42810,6 +42871,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-auth-upstream",
                     "native-h1:e2e-ws-as-proxy-auth-upstream",
                     1,
@@ -42819,13 +42881,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let verifier = StaticTokenVerifier::new([(
                 "alpha",
@@ -42953,6 +43016,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-custom-auth-upstream",
                     "native-h1:e2e-ws-as-proxy-custom-auth-upstream",
                     1,
@@ -42962,13 +43026,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect for the custom verifier",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-custom-auth-gateway", "1.0.0")
                 .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
@@ -43095,6 +43160,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-state-upstream",
                     "native-h1:e2e-ws-as-proxy-state-upstream",
                     1,
@@ -43104,13 +43170,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP state proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP state proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-state-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -43216,6 +43283,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-strict-upstream",
                     "native-h1:e2e-ws-as-proxy-strict-upstream",
                     1,
@@ -43225,13 +43293,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let strict_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-strict-gateway", "1.0.0")
@@ -43255,6 +43324,7 @@ mod live_websocket_bind {
             .expect("modern as_proxy WebSocket lenient gateway HTTP plan is valid");
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-lenient-upstream",
                     "native-h1:e2e-ws-as-proxy-lenient-upstream",
                     1,
@@ -43264,13 +43334,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let lenient_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-lenient-gateway", "1.0.0")
@@ -43425,6 +43496,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-page-upstream",
                     "native-h1:e2e-ws-as-proxy-page-upstream",
                     1,
@@ -43434,13 +43506,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let paged_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-page-gateway", "1.0.0")
@@ -43464,6 +43537,7 @@ mod live_websocket_bind {
             .expect("modern as_proxy WebSocket default-list gateway HTTP plan is valid");
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-unpaged-upstream",
                     "native-h1:e2e-ws-as-proxy-unpaged-upstream",
                     1,
@@ -43473,13 +43547,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let unpaged_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-unpaged-gateway", "1.0.0")
@@ -43642,6 +43717,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-duplicate-error-upstream",
                     "native-h1:e2e-ws-as-proxy-duplicate-error-upstream",
                     1,
@@ -43651,13 +43727,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let error_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-duplicate-error", "1.0.0")
@@ -43698,6 +43775,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-duplicate-replace-upstream",
                     "native-h1:e2e-ws-as-proxy-duplicate-replace-upstream",
                     1,
@@ -43707,13 +43785,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect for the Replace gateway",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed for Replace");
             let replace_server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-duplicate-replace", "1.0.0")
@@ -43848,6 +43927,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-transform-upstream",
                     "native-h1:e2e-ws-as-proxy-transform-upstream",
                     1,
@@ -43857,13 +43937,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP transform proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP transform proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-transform-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -43996,6 +44077,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-log-upstream",
                     "native-h1:e2e-ws-as-proxy-log-upstream",
                     1,
@@ -44005,11 +44087,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP log proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP log proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-log-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -44165,6 +44248,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-sampling-upstream",
                     "native-h1:e2e-ws-as-proxy-sampling-upstream",
                     1,
@@ -44174,11 +44258,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP sampling proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP sampling proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-sampling-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -44751,6 +44836,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-progress-upstream",
                     "native-h1:e2e-ws-as-proxy-progress-upstream",
                     1,
@@ -44760,11 +44846,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP progress proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP progress proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-progress-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -44950,6 +45037,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-complete-progress-upstream",
                     "native-h1:e2e-ws-as-proxy-complete-progress-upstream",
                     1,
@@ -44959,11 +45047,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP completion proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP completion proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-complete-progress-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -45106,6 +45195,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-template-complete-upstream",
                     "native-h1:e2e-ws-as-proxy-template-complete-upstream",
                     1,
@@ -45115,11 +45205,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP template-completion proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP template-completion proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-template-complete-gateway", "1.0.0")
@@ -45224,6 +45315,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-complete-advertise-upstream",
                     "native-h1:e2e-ws-as-proxy-complete-advertise-upstream",
                     1,
@@ -45233,13 +45325,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP template-completion proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP template-completion proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-complete-advertise-gateway", "1.0.0")
@@ -45343,6 +45436,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-complete-omit-upstream",
                     "native-h1:e2e-ws-as-proxy-complete-omit-upstream",
                     1,
@@ -45352,13 +45446,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP counting proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-complete-omit-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -45470,6 +45565,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-filesystem-upstream",
                     "native-h1:e2e-ws-as-proxy-filesystem-upstream",
                     1,
@@ -45479,13 +45575,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live modern HTTP filesystem proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP filesystem proxy catalog is typed");
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-filesystem-gateway", "1.0.0")
                 .as_proxy_typed("ext", proxy, catalog)
@@ -45615,6 +45712,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-as-proxy-tasks-progress-upstream",
                     "native-h1:e2e-ws-as-proxy-tasks-progress-upstream",
                     1,
@@ -45624,11 +45722,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP Tasks proxy catalog is typed");
             let server =
                 modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-progress-gateway", "1.0.0")
@@ -49194,6 +49293,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-live-upstream",
                     "native-h1:e2e-legacy-ws-live-upstream",
                     1,
@@ -49203,11 +49303,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live exact-2024 HTTP proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP proxy catalog is typed");
             let ProxyToolCatalog::Legacy(tools) = &catalog.tools else {
                 panic!("exact-2024 WebSocket as_proxy catalog must stay on the 2024 tool model");
@@ -49388,6 +49489,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-template-complete-upstream",
                     "native-h1:e2e-legacy-ws-template-complete-upstream",
                     1,
@@ -49397,11 +49499,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live exact-2024 HTTP template-completion proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP template-completion proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-template-complete-gateway", "1.0.0")
@@ -49526,6 +49629,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-complete-advertise-upstream",
                     "native-h1:e2e-legacy-ws-complete-advertise-upstream",
                     1,
@@ -49535,13 +49639,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP template-completion proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP template-completion proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-complete-advertise-gateway",
@@ -49661,6 +49766,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-complete-omit-upstream",
                     "native-h1:e2e-legacy-ws-complete-omit-upstream",
                     1,
@@ -49670,13 +49776,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-complete-omit-gateway", "1.0.0")
@@ -49786,6 +49893,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-filesystem-upstream",
                     "native-h1:e2e-legacy-ws-filesystem-upstream",
                     1,
@@ -49795,13 +49903,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP filesystem proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP filesystem proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-filesystem-gateway", "1.0.0")
@@ -49942,6 +50051,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-subscribe-upstream",
                     "native-h1:e2e-legacy-ws-subscribe-upstream",
                     1,
@@ -49951,13 +50061,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP subscribe proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP subscribe proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-subscribe-gateway", "1.0.0")
@@ -50130,6 +50241,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-log-upstream",
                     "native-h1:e2e-legacy-ws-log-upstream",
                     1,
@@ -50139,13 +50251,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP log proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP log proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-log-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -50290,6 +50403,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-progress-upstream",
                     "native-h1:e2e-legacy-ws-progress-upstream",
                     1,
@@ -50299,13 +50413,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP progress proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP progress proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-progress-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -50524,6 +50639,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-sample-upstream",
                     "native-h1:e2e-legacy-ws-sample-upstream",
                     1,
@@ -50539,13 +50655,14 @@ mod live_websocket_bind {
                             list_changed: false,
                         }),
                     },
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP sampling proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP sampling proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-sample-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -50701,6 +50818,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-instructions-upstream",
                     "native-h1:e2e-legacy-ws-instructions-upstream",
                     1,
@@ -50710,13 +50828,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP instructions proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP instructions proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-instructions-gateway", "1.0.0")
@@ -50792,6 +50911,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-bare-instructions-upstream",
                     "native-h1:e2e-legacy-ws-bare-instructions-upstream",
                     1,
@@ -50801,13 +50921,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP bare-instructions proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP bare-instructions proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-instructions-gateway", "1.0.0")
@@ -50885,6 +51006,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-hide-upstream",
                     "native-h1:e2e-legacy-ws-hide-upstream",
                     1,
@@ -50894,13 +51016,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP hide proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP hide proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-hide-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -51090,6 +51213,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-compose-upstream",
                     "native-h1:e2e-legacy-ws-compose-upstream",
                     1,
@@ -51099,13 +51223,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP compose proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-compose-gateway", "1.0.0")
@@ -51226,6 +51351,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-compose-prompt-upstream",
                     "native-h1:e2e-legacy-ws-compose-prompt-upstream",
                     1,
@@ -51235,13 +51361,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP compose-prompt proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-compose-prompt-gateway",
@@ -51373,6 +51500,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-resource-compose-upstream",
                     "native-h1:e2e-legacy-ws-resource-compose-upstream",
                     1,
@@ -51382,13 +51510,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP compose proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-resource-compose-gateway",
@@ -51508,6 +51637,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-prompt-compose-upstream",
                     "native-h1:e2e-legacy-ws-prompt-compose-upstream",
                     1,
@@ -51517,13 +51647,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP compose proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-prompt-compose-gateway",
@@ -51655,6 +51786,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-resource-compose-prompt-upstream",
                     "native-h1:e2e-legacy-ws-resource-compose-prompt-upstream",
                     1,
@@ -51664,13 +51796,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP compose-prompt proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-resource-compose-prompt-gateway",
@@ -51792,6 +51925,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-from-prompt-upstream",
                     "native-h1:e2e-legacy-ws-from-prompt-upstream",
                     1,
@@ -51801,13 +51935,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP from-prompt proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP from-prompt proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-from-prompt-gateway",
@@ -51939,6 +52074,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-complete-progress-upstream",
                     "native-h1:e2e-legacy-ws-complete-progress-upstream",
                     1,
@@ -51948,13 +52084,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP completion-progress proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP completion-progress proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-complete-progress-gateway",
@@ -52101,6 +52238,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-request-timeout-upstream",
                     "native-h1:e2e-legacy-ws-request-timeout-upstream",
                     1,
@@ -52110,13 +52248,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP hold proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP hold proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new(
                 "e2e-legacy-ws-request-timeout-gateway",
@@ -52243,6 +52382,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-hide-catalog-upstream",
                     "native-h1:e2e-legacy-ws-hide-catalog-upstream",
                     1,
@@ -52252,13 +52392,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP hide-catalog proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP hide-catalog proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-hide-catalog-gateway", "1.0.0")
@@ -52472,6 +52613,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-mask-upstream",
                     "native-h1:e2e-legacy-ws-mask-upstream",
                     1,
@@ -52481,13 +52623,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP leak proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP leak proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-mask-gateway", "1.0.0")
                 .mask_error_details(true)
@@ -52584,6 +52727,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-timeout-upstream",
                     "native-h1:e2e-legacy-ws-timeout-upstream",
                     1,
@@ -52593,13 +52737,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP timeout proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP timeout proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-timeout-gateway", "1.0.0")
@@ -52716,6 +52861,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-panic-upstream",
                     "native-h1:e2e-legacy-ws-panic-upstream",
                     1,
@@ -52725,13 +52871,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP panic proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP panic proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-panic-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -52843,6 +52990,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-catalog-panic-upstream",
                     "native-h1:e2e-legacy-ws-catalog-panic-upstream",
                     1,
@@ -52852,13 +53000,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP catalog-panic proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP catalog-panic proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-catalog-panic-gateway", "1.0.0")
@@ -53095,6 +53244,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-cache-upstream",
                     "native-h1:e2e-legacy-ws-cache-upstream",
                     1,
@@ -53104,13 +53254,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-cache-gateway", "1.0.0")
                 .middleware(
@@ -53245,6 +53396,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-rate-limit-upstream",
                     "native-h1:e2e-legacy-ws-rate-limit-upstream",
                     1,
@@ -53254,13 +53406,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-rate-limit-gateway", "1.0.0")
@@ -53376,6 +53529,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-sliding-upstream",
                     "native-h1:e2e-legacy-ws-sliding-upstream",
                     1,
@@ -53385,13 +53539,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-sliding-gateway", "1.0.0")
@@ -53507,6 +53662,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-auth-upstream",
                     "native-h1:e2e-legacy-ws-auth-upstream",
                     1,
@@ -53516,13 +53672,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let verifier = StaticTokenVerifier::new([(
                 "alpha",
@@ -53649,6 +53806,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-custom-auth-upstream",
                     "native-h1:e2e-legacy-ws-custom-auth-upstream",
                     1,
@@ -53658,13 +53816,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect for the custom verifier",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-custom-auth-gateway", "1.0.0")
                 .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
@@ -53789,6 +53948,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-state-upstream",
                     "native-h1:e2e-legacy-ws-state-upstream",
                     1,
@@ -53798,13 +53958,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP state proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP state proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-state-gateway", "1.0.0")
@@ -53937,6 +54098,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-strict-upstream",
                     "native-h1:e2e-legacy-ws-strict-upstream",
                     1,
@@ -53946,13 +54108,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let strict_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-strict-gateway", "1.0.0")
@@ -53976,6 +54139,7 @@ mod live_websocket_bind {
             .expect("legacy as_proxy WebSocket lenient gateway HTTP plan is valid");
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-lenient-upstream",
                     "native-h1:e2e-legacy-ws-lenient-upstream",
                     1,
@@ -53985,13 +54149,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let lenient_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-lenient-gateway", "1.0.0")
@@ -54141,6 +54306,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-page-upstream",
                     "native-h1:e2e-legacy-ws-page-upstream",
                     1,
@@ -54150,13 +54316,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let paged_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-page-gateway", "1.0.0")
@@ -54180,6 +54347,7 @@ mod live_websocket_bind {
             .expect("legacy as_proxy WebSocket default-list gateway HTTP plan is valid");
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-unpaged-upstream",
                     "native-h1:e2e-legacy-ws-unpaged-upstream",
                     1,
@@ -54189,13 +54357,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let unpaged_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-unpaged-gateway", "1.0.0")
@@ -54366,6 +54535,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-as-proxy-duplicate-error-upstream",
                     "native-h1:e2e-legacy-ws-as-proxy-duplicate-error-upstream",
                     1,
@@ -54381,13 +54551,14 @@ mod live_websocket_bind {
                             list_changed: false,
                         }),
                     },
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed");
             let error_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-as-proxy-duplicate-error", "1.0.0")
@@ -54428,6 +54599,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-as-proxy-duplicate-replace-upstream",
                     "native-h1:e2e-legacy-ws-as-proxy-duplicate-replace-upstream",
                     1,
@@ -54443,13 +54615,14 @@ mod live_websocket_bind {
                             list_changed: false,
                         }),
                     },
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP counting proxy upstream must connect for the Replace gateway",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP counting proxy catalog is typed for Replace");
             let replace_server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-as-proxy-duplicate-replace", "1.0.0")
@@ -54580,6 +54753,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-transform-upstream",
                     "native-h1:e2e-legacy-ws-transform-upstream",
                     1,
@@ -54589,13 +54763,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP transform proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP transform proxy catalog is typed");
             let server =
                 legacy_2024::ServerBuilder::new("e2e-legacy-ws-transform-gateway", "1.0.0")
@@ -54725,6 +54900,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-legacy-ws-tags-upstream",
                     "native-h1:e2e-legacy-ws-tags-upstream",
                     1,
@@ -54734,13 +54910,14 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect(
                     "live exact-2024 HTTP tags proxy upstream must connect from the WebSocket runtime",
                 );
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live exact-2024 HTTP tags proxy catalog is typed");
             let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-tags-gateway", "1.0.0")
                 .as_proxy_typed("child", proxy, catalog)
@@ -57020,6 +57197,7 @@ mod live_websocket_bind {
             let mut registry = ProxyClient::upstream_binding_registry();
             let proxy = registry
                 .connect_http_with_protocol_plan(
+                    &cx,
                     "e2e-ws-live-upstream",
                     "native-h1:e2e-ws-live-upstream",
                     1,
@@ -57029,11 +57207,12 @@ mod live_websocket_bind {
                         version: "1.0.0".to_owned(),
                     },
                     ClientCapabilities::default(),
-                    cx.clone(),
                 )
+                .await
                 .expect("live modern HTTP proxy upstream must connect from the WebSocket runtime");
             let catalog = proxy
-                .catalog_typed()
+                .catalog_typed_with_cx(&cx)
+                .await
                 .expect("live modern HTTP proxy catalog is typed");
             let tool_names = catalog
                 .final_tools()

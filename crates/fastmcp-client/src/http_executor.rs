@@ -5529,6 +5529,40 @@ impl ModernHttpClient {
             .await
     }
 
+    /// Starts one catalog page and returns the decoder for the exact stamped
+    /// request sent on the wire. The caller owns response streaming and
+    /// cancellation. Catalog methods retain their complete-only result algebra.
+    pub async fn request_catalog(
+        &self,
+        cx: &Cx,
+        method: &str,
+        request_id: RequestId,
+        parameters: serde_json::Value,
+    ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
+        if !matches!(
+            method,
+            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        ) {
+            return Err(ModernHttpClientError::UnsupportedFinalMethod {
+                method: method.to_owned(),
+            });
+        }
+        let request = self.build_post_discovery_request(
+            cx,
+            method,
+            parameters,
+            Some(request_id),
+            None,
+            false,
+        )?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
+            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+        let decoder = CoreRequest::decode(ProtocolEra::Modern2026, method, wire.params.as_ref())
+            .map_err(ModernHttpClientError::TypedResult)?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
+        Ok((decoder, response))
+    }
+
     /// Starts a tool call, resource read, prompt request, or argument completion.
     /// The first three support caller-managed MRTR retries; completion retains
     /// its complete-only decoder.
@@ -6686,6 +6720,29 @@ struct LegacyPersistentResponseWaiter {
     sender: oneshot::Sender<LegacyPersistentResponse>,
 }
 
+/// Owns waiter retirement while POST acknowledgement is still pending. A
+/// dropped send may already have reached the peer, but grants no authority
+/// to send a cancellation control or create a committed request receipt.
+struct LegacyPendingPost<'a> {
+    state: &'a std::sync::Mutex<LegacySsePersistentState>,
+    key: &'a CorrelationKey,
+    request_id: &'a RequestId,
+    armed: bool,
+}
+
+impl Drop for LegacyPendingPost<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ =
+                retire_abandoned_persistent_waiter(&mut state, self.key, self.request_id.clone());
+        }
+    }
+}
+
 enum LegacyPersistentResponse {
     Response(JsonRpcResponse),
     IdMismatch { actual: RequestId },
@@ -7281,6 +7338,12 @@ impl LegacySsePersistentReceiver {
                 .pending
                 .insert(key.clone(), LegacyPersistentResponseWaiter { sender });
         }
+        let mut pending_post = LegacyPendingPost {
+            state: &self.state,
+            key: &key,
+            request_id: &request_id,
+            armed: true,
+        };
         let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
         if let Err(error) = self
             .outbound
@@ -7291,6 +7354,8 @@ impl LegacySsePersistentReceiver {
                 error,
                 request_may_have_reached_peer,
             } = error;
+            pending_post.armed = false;
+            drop(pending_post);
             let mut state = self
                 .state
                 .lock()
@@ -7302,6 +7367,8 @@ impl LegacySsePersistentReceiver {
             }
             return Err(ClientHttpConnectionError::Legacy(error));
         }
+        pending_post.armed = false;
+        drop(pending_post);
         Ok(LegacyHttpRequest {
             commit: LegacyHttpRequestCommit { request_id },
             key,
@@ -14859,6 +14926,7 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     fn assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(
         use_ready_receive_pump: bool,
+        drop_pending_post: bool,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("bind ready legacy accepted-POST cancellation listener");
@@ -14910,6 +14978,11 @@ mod tests {
             release_late_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("wait until cancelled caller has installed its tombstone");
+            cancelled_post
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut byte = [0];
+            assert!(matches!(cancelled_post.read(&mut byte), Ok(0)));
             drop(cancelled_post);
             write_chunked_sse_event(
                 &mut sse,
@@ -14968,36 +15041,71 @@ mod tests {
             Ok::<_, ClientHttpConnectionError>(connection)
         })
         .expect("ready legacy accepted-POST connection opens");
-        let cancelled_cx = Cx::for_request();
-        let cancellation_controller = {
-            let cancelled_cx = cancelled_cx.clone();
-            thread::spawn(move || {
-                post_accepted_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .expect("server must observe the POST before cancellation");
-                cancelled_cx.cancel_with(
-                    CancelKind::User,
-                    Some("cancel accepted legacy POST before its HTTP acknowledgement"),
-                );
-            })
-        };
-        let cancelled = runtime_block_on(connection.request_json(
-            &cancelled_cx,
-            "ping",
-            serde_json::json!({}),
-            RequestId::Number(91),
-            4_096,
-        ));
-        cancellation_controller
-            .join()
-            .expect("accepted-POST cancellation controller joins");
-        assert!(matches!(
-            cancelled,
-            Err(ClientHttpConnectionError::Legacy(
-                LegacySseHttpClientError::Cancelled
-                    | LegacySseHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
-            ))
-        ));
+        if drop_pending_post {
+            assert!(use_ready_receive_pump);
+            runtime_block_on(async {
+                let mut opening = Box::pin(connection.start_legacy_request(
+                    &cx,
+                    "ping",
+                    serde_json::json!({}),
+                    RequestId::Number(91),
+                ));
+                let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+                std::future::poll_fn(|task_cx| {
+                    assert!(opening.as_mut().poll(task_cx).is_pending());
+                    if post_accepted_rx.try_recv().is_ok() {
+                        Poll::Ready(())
+                    } else {
+                        assert!(Instant::now() < deadline, "pending POST reaches peer");
+                        task_cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                drop(opening);
+            });
+        } else {
+            let cancelled_cx = Cx::for_request();
+            let cancellation_controller = {
+                let cancelled_cx = cancelled_cx.clone();
+                thread::spawn(move || {
+                    post_accepted_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("server must observe the POST before cancellation");
+                    cancelled_cx.cancel_with(
+                        CancelKind::User,
+                        Some("cancel accepted legacy POST before its HTTP acknowledgement"),
+                    );
+                })
+            };
+            let cancelled = runtime_block_on(connection.request_json(
+                &cancelled_cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(91),
+                4_096,
+            ));
+            cancellation_controller
+                .join()
+                .expect("accepted-POST cancellation controller joins");
+            assert!(matches!(
+                cancelled,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::Cancelled
+                        | LegacySseHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
+                ))
+            ));
+        }
+        if use_ready_receive_pump {
+            let receiver = connection.legacy_persistent_receiver().unwrap();
+            let state = receiver.state.lock().unwrap();
+            assert!(
+                state.pending.is_empty(),
+                "abandoned POST releases its waiter"
+            );
+            assert_eq!(state.cancelled_response_ids, [RequestId::Number(91)]);
+            assert!(!state.stopped);
+        }
         release_late_tx
             .send(())
             .expect("release the late accepted-POST terminal response");
@@ -15018,6 +15126,12 @@ mod tests {
                 .id,
             Some(RequestId::Number(92))
         );
+        if use_ready_receive_pump {
+            let receiver = connection.legacy_persistent_receiver().unwrap();
+            let state = receiver.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.cancelled_response_ids.is_empty());
+        }
         server
             .join()
             .expect("ready legacy accepted-POST cancellation peer joins");
@@ -15026,13 +15140,19 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_cancelled_post_tombstones_late_response_before_follow_up() {
-        assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(false);
+        assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(false, false);
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn ready_legacy_cancelled_post_tombstones_late_response_before_follow_up() {
-        assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(true);
+        assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(true, false);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn ready_legacy_dropped_post_tombstones_late_response_before_follow_up() {
+        assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(true, true);
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

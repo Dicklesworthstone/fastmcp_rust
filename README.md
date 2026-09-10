@@ -449,6 +449,17 @@ cancelling or dropping that opening closes its socket and releases the
 route for another attempt. Dropping an event future preserves the installed
 listener for resumption. Stdio startup and bounded receive turns retain
 their synchronous I/O limits.
+`ProxyUpstreamBindingRegistry::connect_http_with_protocol_plan` and
+`connect_stdio_with_protocol_plan` are async and take the caller's `&Cx`
+first. HTTP negotiation and exact-2024 initialization await that runtime;
+Unix stdio initialization uses the client's yielding receive path. Interrupted
+openings leave the registry cache unchanged, allowing a fresh attempt. Keep
+the caller runtime alive while using a cached legacy HTTP/SSE connection.
+Use `ProxyClient::catalog_typed_with_cx` or `catalog_with_cx` to fetch HTTP
+catalogs on that runtime, including every page and its modern cache hints.
+These methods release the route lock while awaiting network I/O and reject
+cursor cycles without returning a partial catalog. Custom and stdio catalog
+backends retain their synchronous implementation.
 HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
 `read_resource`/`get_prompt` verbs so callers do not have to decode a raw
 core result for ordinary catalog and invocation traffic. HTTP and WebSocket

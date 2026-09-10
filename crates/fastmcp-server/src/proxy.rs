@@ -30,9 +30,9 @@ use fastmcp_client::http_executor::{
 };
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
-    Client, ClientHttpConnection, ClientHttpConnectionError, ClientProtocolPlan, CompletionParams,
-    CompletionReference, ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
-    StdioFinalMrtrExecution, StdioSubscriptionEvent,
+    Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError, ClientProtocolPlan,
+    CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, StdioFinalMrtrExecution, StdioSubscriptionEvent,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::{
@@ -144,20 +144,27 @@ impl ProxyFinalCoreRequest {
         let (request, response) = await_proxy_request_or_cancellation(
             ctx,
             Box::pin(async {
-                client
-                    .request_mrtr(
-                        ctx.cx(),
-                        method,
-                        request_id.clone(),
-                        parameters,
-                        allow_tasks,
-                    )
-                    .await
-                    .map_err(|error| {
-                        McpError::invalid_request(format!(
-                            "Proxy HTTP final {method} failed: {error}"
-                        ))
-                    })
+                let response = if matches!(
+                    method,
+                    "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+                ) {
+                    client
+                        .request_catalog(ctx.cx(), method, request_id.clone(), parameters)
+                        .await
+                } else {
+                    client
+                        .request_mrtr(
+                            ctx.cx(),
+                            method,
+                            request_id.clone(),
+                            parameters,
+                            allow_tasks,
+                        )
+                        .await
+                };
+                response.map_err(|error| {
+                    McpError::invalid_request(format!("Proxy HTTP final {method} failed: {error}"))
+                })
             }),
         )
         .await?;
@@ -7695,17 +7702,21 @@ impl ProxyUpstreamBindingRegistry {
     /// establishments for the same immutable upstream reuse that live client,
     /// rather than allowing a caller-provided classification or a fresh
     /// negotiation to alter the pinned era.
+    /// On Unix, initialization yields between bounded receive turns on the
+    /// caller's runtime. Process creation, writes, and cleanup remain synchronous.
     #[allow(clippy::too_many_arguments)]
-    pub fn connect_stdio_with_protocol_plan(
+    pub async fn connect_stdio_with_protocol_plan(
         &mut self,
+        cx: &Cx,
         route_identity: &str,
         transport_identity: &str,
         configuration_generation: u64,
         command: &str,
         args: &[&str],
         protocol_plan: ClientProtocolPlan,
-        cx: Cx,
     ) -> McpResult<ProxyClient> {
+        let context = McpContext::new(cx.clone(), 0);
+        context.ensure_live()?;
         if route_identity.is_empty() || transport_identity.is_empty() {
             return Err(McpError::invalid_params(
                 "Upstream route and transport identities must be non-empty",
@@ -7727,7 +7738,11 @@ impl ProxyUpstreamBindingRegistry {
             return Ok(existing.clone());
         }
 
-        let client = Client::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)?;
+        let client = ClientBuilder::new()
+            .protocol_plan(protocol_plan)
+            .connect_stdio_with_cx(command, args, cx)
+            .await?;
+        context.ensure_live()?;
         let binding = binding_from_live_stdio_client(&client, configuration_generation)?;
 
         let upstream_protocol_version = client.protocol_version().to_owned();
@@ -7748,17 +7763,22 @@ impl ProxyUpstreamBindingRegistry {
     /// exact configured legacy SSE GET plus advertised-POST route. The live
     /// selected client is cached per complete backend identity, so another
     /// request for that same backend cannot re-probe or switch eras.
+    /// Establishment and exact-2024 initialization run on the caller's runtime.
+    /// Cancellation or dropping the opening future leaves the cache unchanged.
+    /// Keep that runtime alive while using a cached legacy SSE connection.
     #[allow(clippy::too_many_arguments)]
-    pub fn connect_http_with_protocol_plan(
+    pub async fn connect_http_with_protocol_plan(
         &mut self,
+        cx: &Cx,
         route_identity: &str,
         transport_identity: &str,
         configuration_generation: u64,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
-        cx: Cx,
     ) -> McpResult<ProxyClient> {
+        let context = McpContext::new(cx.clone(), 0);
+        context.ensure_live()?;
         if route_identity.is_empty() || transport_identity.is_empty() {
             return Err(McpError::invalid_params(
                 "Upstream route and transport identities must be non-empty",
@@ -7782,30 +7802,47 @@ impl ProxyUpstreamBindingRegistry {
             return Ok(existing.clone());
         }
 
-        let connection = block_on(ClientHttpConnection::connect(
-            &cx,
-            protocol_plan.clone(),
-            client_info.clone(),
-            client_capabilities.clone(),
-        ))
-        .map_err(|error| {
-            McpError::internal_error(format!("HTTP proxy upstream connect failed: {error}"))
-        })?;
+        let connection = Box::pin(await_proxy_request_or_cancellation(&context, async {
+            ClientHttpConnection::connect(
+                cx,
+                protocol_plan.clone(),
+                client_info.clone(),
+                client_capabilities.clone(),
+            )
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("HTTP proxy upstream connect failed: {error}"))
+            })
+        }))
+        .await?;
         let binding = binding_from_live_http_connection(
             &connection,
             protocol_plan.policy(),
             configuration_generation,
         )?;
-        let mut backend =
-            ProxyHttpClient::new(binding, connection, cx, client_info, client_capabilities);
+        let mut backend = Box::new(ProxyHttpClient::new(
+            binding,
+            connection,
+            cx.clone(),
+            client_info,
+            client_capabilities,
+        ));
         // Selecting the legacy SSE adapter only authorizes the exact-2024
         // lifecycle. Do not expose or cache an era binding until that
         // lifecycle has validated the peer's exact initialize version.
         if binding.era() == ProtocolEra::Legacy2024 {
+            #[cfg(feature = "legacy-2024-11-05")]
+            await_proxy_request_or_cancellation(
+                &context,
+                backend.ensure_legacy_initialized_async(),
+            )
+            .await?;
+            #[cfg(not(feature = "legacy-2024-11-05"))]
             backend.ensure_legacy_initialized()?;
         }
+        context.ensure_live()?;
         let proxy = ProxyClient::from_backend_with_upstream_binding(
-            backend,
+            *backend,
             binding,
             binding.era().version().as_str(),
         )?;
@@ -8229,6 +8266,230 @@ impl ProxyClient {
         Ok(catalog)
     }
 
+    /// Fetches a typed HTTP catalog on the caller's runtime, releasing the
+    /// route lock before every network wait. All pages must succeed before a
+    /// catalog is returned. Custom and stdio backends retain their synchronous
+    /// catalog implementation; their connection initialization is separate.
+    pub async fn catalog_typed_with_cx(&self, cx: &Cx) -> McpResult<ProxyTypedCatalog> {
+        let ctx = McpContext::new(cx.clone(), 0);
+        ctx.checkpoint()?;
+        let Some(binding) = self.upstream_binding.filter(|binding| {
+            matches!(
+                binding.adapter(),
+                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::LegacyHttpSse
+            )
+        }) else {
+            return self.catalog_typed();
+        };
+        let catalog = match binding.era() {
+            ProtocolEra::Modern2026 => ProxyTypedCatalog {
+                tools: ProxyToolCatalog::Final(
+                    self.collect_http_catalog_pages(&ctx, "tools/list", |result| {
+                        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result
+                        else {
+                            return Err(unexpected_proxy_result("tools/list"));
+                        };
+                        let p = result.payload;
+                        Ok((
+                            p.tools,
+                            p.next_cursor,
+                            Some(ProxyCatalogCacheHint::new(p.ttl_ms, p.cache_scope)),
+                        ))
+                    })
+                    .await?,
+                ),
+                resources: ProxyResourceCatalog::Final(
+                    self.collect_http_catalog_pages(&ctx, "resources/list", |result| {
+                        let CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) =
+                            result
+                        else {
+                            return Err(unexpected_proxy_result("resources/list"));
+                        };
+                        let p = result.payload;
+                        Ok((
+                            p.resources,
+                            p.next_cursor,
+                            Some(ProxyCatalogCacheHint::new(p.ttl_ms, p.cache_scope)),
+                        ))
+                    })
+                    .await?,
+                ),
+                resource_templates: ProxyResourceTemplateCatalog::Final(
+                    self.collect_http_catalog_pages(&ctx, "resources/templates/list", |result| {
+                        let CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
+                            result,
+                            ..
+                        }) = result
+                        else {
+                            return Err(unexpected_proxy_result("resources/templates/list"));
+                        };
+                        let p = result.payload;
+                        Ok((
+                            p.resource_templates,
+                            p.next_cursor,
+                            Some(ProxyCatalogCacheHint::new(p.ttl_ms, p.cache_scope)),
+                        ))
+                    })
+                    .await?,
+                ),
+                prompts: ProxyPromptCatalog::Final(
+                    self.collect_http_catalog_pages(&ctx, "prompts/list", |result| {
+                        let CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) = result
+                        else {
+                            return Err(unexpected_proxy_result("prompts/list"));
+                        };
+                        let p = result.payload;
+                        Ok((
+                            p.prompts,
+                            p.next_cursor,
+                            Some(ProxyCatalogCacheHint::new(p.ttl_ms, p.cache_scope)),
+                        ))
+                    })
+                    .await?,
+                ),
+            },
+            #[cfg(feature = "legacy-2024-11-05")]
+            ProtocolEra::Legacy2024 => {
+                self.start_legacy_receive_pump()?;
+                ProxyTypedCatalog {
+                    tools: ProxyToolCatalog::Legacy(
+                        self.collect_http_catalog_pages(&ctx, "tools/list", |result| {
+                            let CoreResult::Legacy(LegacyCoreResult::ToolsList(p)) = result else {
+                                return Err(unexpected_proxy_result("tools/list"));
+                            };
+                            Ok((p.tools, p.next_cursor, None))
+                        })
+                        .await?
+                        .entries,
+                    ),
+                    resources: ProxyResourceCatalog::Legacy(
+                        self.collect_http_catalog_pages(&ctx, "resources/list", |result| {
+                            let CoreResult::Legacy(LegacyCoreResult::ResourcesList(p)) = result
+                            else {
+                                return Err(unexpected_proxy_result("resources/list"));
+                            };
+                            Ok((p.resources, p.next_cursor, None))
+                        })
+                        .await?
+                        .entries,
+                    ),
+                    resource_templates: ProxyResourceTemplateCatalog::Legacy(
+                        self.collect_http_catalog_pages(
+                            &ctx,
+                            "resources/templates/list",
+                            |result| {
+                                let CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(p)) =
+                                    result
+                                else {
+                                    return Err(unexpected_proxy_result(
+                                        "resources/templates/list",
+                                    ));
+                                };
+                                Ok((p.resource_templates, p.next_cursor, None))
+                            },
+                        )
+                        .await?
+                        .entries,
+                    ),
+                    prompts: ProxyPromptCatalog::Legacy(
+                        self.collect_http_catalog_pages(&ctx, "prompts/list", |result| {
+                            let CoreResult::Legacy(LegacyCoreResult::PromptsList(p)) = result
+                            else {
+                                return Err(unexpected_proxy_result("prompts/list"));
+                            };
+                            Ok((p.prompts, p.next_cursor, None))
+                        })
+                        .await?
+                        .entries,
+                    ),
+                }
+            }
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            ProtocolEra::Legacy2024 => {
+                return Err(McpError::invalid_request(
+                    "Exact-2024 catalog requires feature `legacy-2024-11-05`",
+                ));
+            }
+        };
+        ctx.ensure_live()?;
+        self.admit_observed_era(catalog.era()?, "typed HTTP catalog")?;
+        Ok(catalog)
+    }
+
+    /// Fetches an HTTP catalog asynchronously and projects its admitted era
+    /// into the composition catalog used by the server builder.
+    pub async fn catalog_with_cx(&self, cx: &Cx) -> McpResult<ProxyCatalog> {
+        ProxyCatalog::from_typed_catalog(self.catalog_typed_with_cx(cx).await?)
+    }
+
+    async fn collect_http_catalog_pages<T>(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        mut decode: impl FnMut(
+            CoreResult,
+        )
+            -> McpResult<(Vec<T>, Option<String>, Option<ProxyCatalogCacheHint>)>,
+    ) -> McpResult<ProxyFinalCatalog<T>> {
+        let mut catalog = ProxyFinalCatalog::new(Vec::new());
+        let mut cursor = None;
+        let mut observed_cursors = HashSet::new();
+        let era = if self.upstream_binding.map(|binding| binding.era())
+            == Some(ProtocolEra::Legacy2024)
+        {
+            "legacy"
+        } else {
+            "modern"
+        };
+        for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
+            ctx.checkpoint()?;
+            let parameters = ProxyHttpClient::modern_catalog_parameters(cursor.as_deref());
+            let prepared = self.with_backend(|backend| backend.prepare_final_core_request())?;
+            let result = if let Some(request) = prepared {
+                request
+                    .execute(ctx, method, parameters, false, &mut |_| {})
+                    .await?
+            } else {
+                #[cfg(feature = "legacy-2024-11-05")]
+                {
+                    self.request_legacy_yielding_with_context(ctx, method, parameters)
+                        .await?
+                        .ok_or_else(|| {
+                            McpError::invalid_request(
+                                "HTTP backend does not support asynchronous catalog requests",
+                            )
+                        })?
+                }
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                {
+                    return Err(McpError::invalid_request(
+                        "HTTP backend does not support asynchronous catalog requests",
+                    ));
+                }
+            };
+            let (entries, next_cursor, hint) = decode(result)?;
+            catalog.entries.extend(entries);
+            catalog.cache_hints.extend(hint);
+            let Some(next_cursor) = next_cursor else {
+                return Ok(catalog);
+            };
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(McpError::invalid_request(format!(
+                    "Proxy {era} {method} catalog returned a non-advancing cursor"
+                )));
+            }
+            if !observed_cursors.insert(next_cursor.clone()) {
+                return Err(McpError::invalid_request(format!(
+                    "Proxy {era} {method} catalog returned a repeated cursor"
+                )));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(McpError::invalid_request(format!(
+            "Proxy {era} {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+        )))
+    }
+
     /// Returns the upstream initialize/discover instructions when the peer
     /// advertised a nonempty string.
     pub fn upstream_instructions(&self) -> McpResult<Option<String>> {
@@ -8400,16 +8661,19 @@ impl ProxyClient {
         if let Some(prepared) = self.with_backend(|backend| {
             backend.prepare_legacy_http_start(ctx, method, parameters.clone())
         })? {
-            let handle = prepared
-                .receiver
-                .start_request(
-                    ctx.cx(),
-                    &prepared.method,
-                    prepared.parameters,
-                    prepared.request_id,
-                )
-                .await
-                .map_err(proxy_http_connection_error)?;
+            let handle = await_proxy_request_or_cancellation(ctx, async {
+                prepared
+                    .receiver
+                    .start_request(
+                        ctx.cx(),
+                        &prepared.method,
+                        prepared.parameters,
+                        prepared.request_id,
+                    )
+                    .await
+                    .map_err(proxy_http_connection_error)
+            })
+            .await?;
             let request = ProxyLegacyHttpRequest::new(prepared.request, handle);
             return self
                 .await_legacy_request_with_context_async(ctx, request, method)
@@ -14210,6 +14474,661 @@ IFS= read -r end
     }
 
     #[cfg(unix)]
+    fn proxy_http_registry_caller_runtime_probe(legacy: bool, interrupt: u8) {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let builder = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(0, 0);
+        let builder = if matches!(interrupt, 3 | 5) {
+            builder.with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+        } else {
+            builder
+        };
+        let runtime = builder.build().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let subject = format!("registry-{}", address.port());
+        let endpoint = format!("http://{address}/message?owner={subject}");
+        let plan = if legacy {
+            legacy_only_http_proxy_plan(&format!("http://{address}/sse"), &endpoint)
+        } else {
+            ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                None,
+                None,
+                subject.clone(),
+                subject.clone(),
+                subject.clone(),
+                1,
+                1,
+                0,
+            )
+            .unwrap()
+        };
+        let received = Arc::new(AtomicUsize::new(0));
+        let peer_received = Arc::clone(&received);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let interrupted_opening = matches!(interrupt, 1..=3);
+        let attempts = if interrupted_opening { 2 } else { 1 };
+        let peer = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(10)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(10)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "registry peer accept is bounded");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("registry peer accept: {error}"),
+                    }
+                }
+            };
+            for attempt in 0..attempts {
+                let mut stream = accept();
+                let opening = read_http_request(&mut stream);
+                let request: serde_json::Value = if legacy {
+                    assert!(opening.head.starts_with("GET /sse HTTP/1.1\r\n"));
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                    write_chunked_sse_event(
+                        &mut stream,
+                        format!("event: endpoint\ndata: {endpoint}\n\n").as_bytes(),
+                    );
+                    stream.flush().unwrap();
+                    let mut post = accept();
+                    let initialization = read_http_request(&mut post);
+                    assert!(
+                        initialization
+                            .head
+                            .starts_with("POST /message?owner=registry-")
+                    );
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&initialization.body).unwrap();
+                    assert_eq!(request["method"], "initialize");
+                    assert_eq!(request["params"]["protocolVersion"], "2024-11-05");
+                    write_http_response(&mut post, 202, "application/json", b"");
+                    request
+                } else {
+                    assert!(opening.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+                    let request: serde_json::Value = serde_json::from_slice(&opening.body).unwrap();
+                    assert_eq!(request["method"], "server/discover");
+                    request
+                };
+                assert_eq!(request["id"], 1, "retry uses a fresh connection");
+                peer_received.store(attempt + 1, Ordering::Release);
+                if released.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        other => {
+                            panic!("abandoned connection must close its native socket: {other:?}")
+                        }
+                    }
+                    continue;
+                }
+                let result = if legacy {
+                    serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{}, "serverInfo":{"name":"registry-peer","version":"1"}})
+                } else {
+                    serde_json::json!({"supportedVersions":["2026-07-28"], "capabilities":{"tools":{}}, "ttlMs":0,"cacheScope":"private"})
+                };
+                let response =
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+                if legacy {
+                    write_chunked_sse_event(
+                        &mut stream,
+                        format!("event: message\ndata: {response}\n\n").as_bytes(),
+                    );
+                    stream.flush().unwrap();
+                    let mut post = accept();
+                    let initialized: serde_json::Value =
+                        serde_json::from_slice(&read_http_request(&mut post).body).unwrap();
+                    assert_eq!(initialized["method"], "notifications/initialized");
+                    assert!(initialized.get("id").is_none());
+                    write_http_response(&mut post, 202, "application/json", b"");
+                } else {
+                    write_http_discovery_response(
+                        &mut stream,
+                        &serde_json::to_vec(&response).unwrap(),
+                    );
+                }
+                let methods: &[&str] = if interrupt == 4 {
+                    &["tools/list", "tools/list"]
+                } else {
+                    &[
+                        "tools/list",
+                        "tools/list",
+                        "resources/list",
+                        "resources/templates/list",
+                        "prompts/list",
+                    ]
+                };
+                for (index, method) in methods.iter().enumerate() {
+                    let mut post = accept();
+                    let message: serde_json::Value =
+                        serde_json::from_slice(&read_http_request(&mut post).body).unwrap();
+                    assert_eq!(message["method"], *method);
+                    assert_eq!(message["id"], index + 2);
+                    if index == 0 {
+                        peer_received.store(attempts + 1, Ordering::Release);
+                        if released.recv_timeout(Duration::from_secs(10)).unwrap() {
+                            let mut byte = [0];
+                            assert!(matches!(post.read(&mut byte), Ok(0)));
+                            break;
+                        }
+                    }
+                    let mut result = match *method {
+                        "tools/list" => {
+                            serde_json::json!({"tools":[{"name":format!("registry-{}-{index}", address.port()), "inputSchema":{"type":"object"}}]})
+                        }
+                        "resources/list" => serde_json::json!({"resources":[]}),
+                        "resources/templates/list" => serde_json::json!({"resourceTemplates":[]}),
+                        "prompts/list" => serde_json::json!({"prompts":[]}),
+                        _ => unreachable!(),
+                    };
+                    if index == 0 || (index == 1 && interrupt == 4) {
+                        result["nextCursor"] = serde_json::json!("page-two");
+                    }
+                    if index == 1 {
+                        assert_eq!(message["params"]["cursor"], "page-two");
+                    }
+                    if !legacy {
+                        result["resultType"] = serde_json::json!("complete");
+                        result["ttlMs"] = serde_json::json!(index + 17);
+                        result["cacheScope"] = serde_json::json!("private");
+                    }
+                    let response =
+                        serde_json::json!({"jsonrpc":"2.0", "id":message["id"], "result":result});
+                    if legacy {
+                        write_http_response(&mut post, 202, "application/json", b"");
+                        write_chunked_sse_event(
+                            &mut stream,
+                            format!("event: message\ndata: {response}\n\n").as_bytes(),
+                        );
+                        stream.flush().unwrap();
+                    } else {
+                        write_http_response(
+                            &mut post,
+                            200,
+                            "application/json",
+                            &serde_json::to_vec(&response).unwrap(),
+                        );
+                    }
+                }
+                if legacy {
+                    assert!(!released.recv_timeout(Duration::from_secs(10)).unwrap());
+                }
+            }
+        });
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let opening_cx = runtime.request_cx_with_budget(if interrupt == 3 {
+            asupersync::Budget::INFINITE.with_deadline(cx.now().saturating_add_nanos(100_000_000))
+        } else {
+            asupersync::Budget::INFINITE
+        });
+        let catalog_cx = runtime.request_cx_with_budget(if interrupt == 5 {
+            asupersync::Budget::INFINITE.with_deadline(cx.now().saturating_add_nanos(100_000_000))
+        } else {
+            asupersync::Budget::INFINITE
+        });
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let siblings = root.clone();
+            let mut work = root
+                .spawn(move |_| async move {
+                    let worker = thread::current().id();
+                    let mut registry = ProxyClient::upstream_binding_registry();
+                    if interrupt != 0 {
+                        cx.set_cancel_requested(true);
+                        assert_eq!(
+                            registry
+                                .connect_http_with_protocol_plan(
+                                    &cx,
+                                    &subject,
+                                    "native",
+                                    1,
+                                    plan.clone(),
+                                    proxy_http_client_info(),
+                                    ClientCapabilities::default()
+                                )
+                                .await
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::RequestCancelled
+                        );
+                        assert_eq!(received.load(Ordering::Acquire), 0);
+                        assert!(registry.live_http.is_empty());
+                        cx.set_cancel_requested(false);
+                    }
+                    for attempt in 0..attempts {
+                        let request_cx = if attempt == 0 { &opening_cx } else { &cx };
+                        let mut opening = Box::pin(registry.connect_http_with_protocol_plan(
+                            request_cx,
+                            &subject,
+                            "native",
+                            1,
+                            plan.clone(),
+                            proxy_http_client_info(),
+                            ClientCapabilities::default(),
+                        ));
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        loop {
+                            assert!(
+                                std::future::poll_fn(|task_cx| Poll::Ready(
+                                    opening.as_mut().poll(task_cx)
+                                ))
+                                .await
+                                .is_pending(),
+                                "connection must yield while peer withholds its reply"
+                            );
+                            if received.load(Ordering::Acquire) > attempt {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "connection reaches peer");
+                            asupersync::runtime::yield_now().await;
+                        }
+                        if attempt == 0 && interrupted_opening {
+                            if interrupt == 2 {
+                                drop(opening);
+                            } else {
+                                let cancelling_cx = opening_cx.clone();
+                                let clock = Arc::clone(&clock);
+                                let mut sibling = siblings
+                                    .spawn(move |_| async move {
+                                        assert_eq!(thread::current().id(), worker);
+                                        if interrupt == 3 {
+                                            clock.advance(100_000_000);
+                                        } else {
+                                            cancelling_cx.set_cancel_requested(true);
+                                        }
+                                    })
+                                    .unwrap();
+                                assert_eq!(
+                                    opening.await.unwrap_err().code,
+                                    McpErrorCode::RequestCancelled
+                                );
+                                sibling.join(&siblings).await.unwrap();
+                            }
+                            assert!(
+                                registry.live_http.is_empty(),
+                                "interrupted establishment cannot publish a cache entry"
+                            );
+                            release.send(true).unwrap();
+                            continue;
+                        }
+                        let release_reply = release.clone();
+                        let mut sibling = siblings
+                            .spawn(move |_| async move {
+                                assert_eq!(thread::current().id(), worker);
+                                release_reply.send(false).unwrap();
+                            })
+                            .unwrap();
+                        let proxy = opening.await.unwrap();
+                        sibling.join(&siblings).await.unwrap();
+                        assert_eq!(
+                            proxy.upstream_binding().unwrap().era(),
+                            if legacy {
+                                ProtocolEra::Legacy2024
+                            } else {
+                                ProtocolEra::Modern2026
+                            }
+                        );
+                        assert_eq!(registry.live_http.len(), 1);
+                        let cached = registry
+                            .connect_http_with_protocol_plan(
+                                &cx,
+                                &subject,
+                                "native",
+                                1,
+                                plan.clone(),
+                                proxy_http_client_info(),
+                                ClientCapabilities::default(),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(
+                            Arc::ptr_eq(&proxy.inner, &cached.inner),
+                            "same identity reuses the admitted backend"
+                        );
+                        cx.set_cancel_requested(true);
+                        assert_eq!(
+                            registry
+                                .connect_http_with_protocol_plan(
+                                    &cx,
+                                    &subject,
+                                    "native",
+                                    1,
+                                    plan.clone(),
+                                    proxy_http_client_info(),
+                                    ClientCapabilities::default()
+                                )
+                                .await
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::RequestCancelled
+                        );
+                        assert_eq!(
+                            registry.live_http.len(),
+                            1,
+                            "cancelled cache lookup preserves existing state"
+                        );
+                        assert_eq!(received.load(Ordering::Acquire), attempts);
+                        cx.set_cancel_requested(false);
+                        let mut catalog = Box::pin(proxy.catalog_typed_with_cx(&catalog_cx));
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        loop {
+                            let polled = std::future::poll_fn(|task_cx| {
+                                Poll::Ready(catalog.as_mut().poll(task_cx))
+                            })
+                            .await;
+                            assert!(
+                                polled.is_pending(),
+                                "catalog must yield before the peer reply: {polled:?}"
+                            );
+                            if received.load(Ordering::Acquire) > attempts {
+                                break;
+                            }
+                            assert!(Instant::now() < deadline, "catalog request reaches peer");
+                            asupersync::runtime::yield_now().await;
+                        }
+                        if interrupt >= 5 {
+                            if interrupt == 6 {
+                                drop(catalog);
+                            } else {
+                                let cancelling_cx = catalog_cx.clone();
+                                let clock = Arc::clone(&clock);
+                                let mut sibling = siblings
+                                    .spawn(move |_| async move {
+                                        assert_eq!(thread::current().id(), worker);
+                                        if interrupt == 5 {
+                                            clock.advance(100_000_000);
+                                        } else {
+                                            cancelling_cx.set_cancel_requested(true);
+                                        }
+                                    })
+                                    .unwrap();
+                                assert_eq!(
+                                    catalog.await.unwrap_err().code,
+                                    McpErrorCode::RequestCancelled
+                                );
+                                sibling.join(&siblings).await.unwrap();
+                            }
+                            assert_eq!(registry.live_http.len(), 1);
+                            release.send(true).unwrap();
+                            if legacy {
+                                release.send(false).unwrap();
+                            }
+                            continue;
+                        }
+                        let release_catalog = release.clone();
+                        let sibling_proxy = proxy.clone();
+                        let mut sibling = siblings
+                            .spawn(move |_| async move {
+                                assert_eq!(thread::current().id(), worker);
+                                assert!(
+                                    sibling_proxy.inner.try_lock().is_ok(),
+                                    "catalog does not hold route mutex across I/O"
+                                );
+                                release_catalog.send(false).unwrap();
+                            })
+                            .unwrap();
+                        let catalog = catalog.await;
+                        sibling.join(&siblings).await.unwrap();
+                        if interrupt == 4 {
+                            let error = catalog.unwrap_err();
+                            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                            assert!(error.message.contains("non-advancing cursor"));
+                        } else {
+                            let catalog = catalog.unwrap();
+                            let names: Vec<_> = match &catalog.tools {
+                                ProxyToolCatalog::Legacy(tools) => {
+                                    tools.iter().map(|tool| tool.name.clone()).collect()
+                                }
+                                ProxyToolCatalog::Final(tools) => {
+                                    assert_eq!(tools.cache_hints.len(), 2);
+                                    assert_eq!(
+                                        serde_json::to_value(&tools.cache_hints[1].ttl_ms).unwrap(),
+                                        18
+                                    );
+                                    tools.iter().map(|tool| tool.name.clone()).collect()
+                                }
+                            };
+                            assert_eq!(names, [format!("{subject}-0"), format!("{subject}-1")]);
+                            assert_eq!(
+                                catalog.era().unwrap(),
+                                proxy.upstream_binding().unwrap().era()
+                            );
+                        }
+                        assert_eq!(
+                            registry.live_http.len(),
+                            1,
+                            "catalog refusal preserves the bound connection"
+                        );
+                        if legacy {
+                            release.send(false).unwrap();
+                        }
+                    }
+                })
+                .unwrap();
+            work.join(&root).await.unwrap();
+        });
+        peer.join().unwrap();
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_http_registry_caller_runtime_positive() {
+        proxy_http_registry_caller_runtime_probe(false, 0);
+        #[cfg(feature = "legacy-2024-11-05")]
+        proxy_http_registry_caller_runtime_probe(true, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_http_registry_caller_runtime_planted_negative() {
+        for interrupt in 1..=7 {
+            proxy_http_registry_caller_runtime_probe(false, interrupt);
+            #[cfg(feature = "legacy-2024-11-05")]
+            proxy_http_registry_caller_runtime_probe(true, interrupt);
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_stdio_registry_caller_runtime_probe(policy: ProtocolPolicy, interrupt: u8) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let legacy = policy == ProtocolPolicy::LegacyOnly;
+        let response = if legacy {
+            scripted_response_line(
+                1,
+                serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{}, "serverInfo":{"name":"registry-stdio","version":"1"}}),
+            )
+        } else {
+            modern_discovery_response_line("registry-stdio", &["2026-07-28"])
+        };
+        let control = std::env::temp_dir().join(format!(
+            "fastmcp-stdio-registry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&control).unwrap();
+        // The child cannot reply until a sibling on the same runtime worker
+        // writes its permit. This tests scheduling without a timing race
+        // against a fixed child sleep. Retain the tiny permits as test evidence.
+        let script = format!(
+            "IFS= read -r opening || exit 91\nwhile ! [ -f \"$1/$2\" ]; do sleep 0.01; done\nprintf '%s\\n' '{response}'\nIFS= read -r next\nIFS= read -r end\n"
+        );
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let siblings = root.clone();
+            let mut work = root
+                .spawn(move |cx| async move {
+                    let worker = thread::current().id();
+                    let mut registry = ProxyClient::upstream_binding_registry();
+                    let plan = ClientProtocolPlan::stdio(policy);
+                    let attempts = if interrupt == 0 { 1 } else { 2 };
+                    for attempt in 0..attempts {
+                        let attempt_name = attempt.to_string();
+                        let args = [
+                            "-c",
+                            script.as_str(),
+                            "registry-peer",
+                            control.to_str().unwrap(),
+                            &attempt_name,
+                        ];
+                        let mut opening = Box::pin(registry.connect_stdio_with_protocol_plan(
+                            &cx,
+                            "stdio-route",
+                            "stdio-child",
+                            1,
+                            "sh",
+                            &args,
+                            plan.clone(),
+                        ));
+                        assert!(
+                            std::future::poll_fn(|task_cx| Poll::Ready(
+                                opening.as_mut().poll(task_cx)
+                            ))
+                            .await
+                            .is_pending(),
+                            "stdio initialization must yield before the delayed child response"
+                        );
+                        if attempt == 0 && interrupt != 0 {
+                            if interrupt == 2 {
+                                drop(opening);
+                            } else {
+                                let cancelling_cx = cx.clone();
+                                let mut sibling = siblings
+                                    .spawn(move |_| async move {
+                                        assert_eq!(thread::current().id(), worker);
+                                        cancelling_cx.set_cancel_requested(true);
+                                    })
+                                    .unwrap();
+                                assert_eq!(
+                                    opening.await.unwrap_err().code,
+                                    McpErrorCode::RequestCancelled
+                                );
+                                sibling.join(&siblings).await.unwrap();
+                                cx.set_cancel_requested(false);
+                            }
+                            assert!(
+                                registry.live_stdio.is_empty(),
+                                "interrupted initialization leaves no cached client"
+                            );
+                            continue;
+                        }
+                        let permit = control.join(&attempt_name);
+                        let mut sibling = siblings
+                            .spawn(move |_| async move {
+                                assert_eq!(thread::current().id(), worker);
+                                std::fs::write(permit, b"release initialization\n").unwrap();
+                                19
+                            })
+                            .unwrap();
+                        assert_eq!(sibling.join(&siblings).await.unwrap(), 19);
+                        let proxy = opening.await.unwrap();
+                        assert_eq!(
+                            proxy.upstream_binding().unwrap().era(),
+                            if legacy {
+                                ProtocolEra::Legacy2024
+                            } else {
+                                ProtocolEra::Modern2026
+                            }
+                        );
+                        assert_eq!(registry.live_stdio.len(), 1);
+                        let cached = registry
+                            .connect_stdio_with_protocol_plan(
+                                &cx,
+                                "stdio-route",
+                                "stdio-child",
+                                1,
+                                "sh",
+                                &args,
+                                plan.clone(),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(Arc::ptr_eq(&proxy.inner, &cached.inner));
+                        cx.set_cancel_requested(true);
+                        assert_eq!(
+                            registry
+                                .connect_stdio_with_protocol_plan(
+                                    &cx,
+                                    "stdio-route",
+                                    "stdio-child",
+                                    1,
+                                    "sh",
+                                    &args,
+                                    plan.clone()
+                                )
+                                .await
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::RequestCancelled
+                        );
+                        assert_eq!(registry.live_stdio.len(), 1);
+                        cx.set_cancel_requested(false);
+                    }
+                })
+                .unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_registry_caller_runtime_positive() {
+        proxy_stdio_registry_caller_runtime_probe(ProtocolPolicy::ModernOnly, 0);
+        #[cfg(feature = "legacy-2024-11-05")]
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
+            proxy_stdio_registry_caller_runtime_probe(policy, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_registry_caller_runtime_planted_negative() {
+        for interrupt in 1..=2 {
+            proxy_stdio_registry_caller_runtime_probe(ProtocolPolicy::ModernOnly, interrupt);
+            #[cfg(feature = "legacy-2024-11-05")]
+            for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
+                proxy_stdio_registry_caller_runtime_probe(policy, interrupt);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn proxy_incremental_listener_caller_runtime_planted_negative() {
         for cancel in [false, true] {
@@ -18222,17 +19141,16 @@ exec sleep 2
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let proxy = bindings
-            .connect_http_with_protocol_plan(
-                "modern-http-backend",
-                "native-h1:modern-http-backend",
-                9,
-                plan.clone(),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("recognized modern discovery must select the native modern proxy client");
+        let proxy = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "modern-http-backend",
+            "native-h1:modern-http-backend",
+            9,
+            plan.clone(),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("recognized modern discovery must select the native modern proxy client");
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Modern2026);
         assert_eq!(binding.adapter(), super::ProxyUpstreamAdapter::ModernHttp);
@@ -18306,17 +19224,16 @@ exec sleep 2
                 .expect("the final proxy handler preserves the modern HTTP result"),
         );
 
-        let cached = bindings
-            .connect_http_with_protocol_plan(
-                "modern-http-backend",
-                "native-h1:modern-http-backend",
-                9,
-                plan,
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("the exact backend returns its cached selected client");
+        let cached = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "modern-http-backend",
+            "native-h1:modern-http-backend",
+            9,
+            plan,
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("the exact backend returns its cached selected client");
         assert_eq!(cached.upstream_binding(), Some(binding));
         assert_eq!(bindings.live_http.len(), 1);
 
@@ -18460,17 +19377,16 @@ exec sleep 2
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let proxy = bindings
-            .connect_http_with_protocol_plan(
-                "legacy-http-backend",
-                "native-h1:legacy-http-backend",
-                10,
-                plan.clone(),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("only the authorized disposable refusal may select legacy SSE");
+        let proxy = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "legacy-http-backend",
+            "native-h1:legacy-http-backend",
+            10,
+            plan.clone(),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("only the authorized disposable refusal may select legacy SSE");
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Legacy2024);
         assert_eq!(
@@ -18503,17 +19419,16 @@ exec sleep 2
                 .expect("public proxy handler forwards over legacy SSE"),
         );
 
-        let cached = bindings
-            .connect_http_with_protocol_plan(
-                "legacy-http-backend",
-                "native-h1:legacy-http-backend",
-                10,
-                plan,
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("the exact legacy backend returns its cached selected client");
+        let cached = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "legacy-http-backend",
+            "native-h1:legacy-http-backend",
+            10,
+            plan,
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("the exact legacy backend returns its cached selected client");
         assert_eq!(cached.upstream_binding(), Some(binding));
         assert_eq!(bindings.live_http.len(), 1);
 
@@ -18582,17 +19497,16 @@ exec sleep 2
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let error = bindings
-            .connect_http_with_protocol_plan(
-                "invalid-legacy-http-backend",
-                "native-h1:invalid-legacy-http-backend",
-                101,
-                plan,
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect_err("changing only initialize.protocolVersion rejects the legacy binding");
+        let error = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "invalid-legacy-http-backend",
+            "native-h1:invalid-legacy-http-backend",
+            101,
+            plan,
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect_err("changing only initialize.protocolVersion rejects the legacy binding");
 
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(
@@ -19082,17 +19996,16 @@ exec sleep 2
         });
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let error = bindings
-            .connect_http_with_protocol_plan(
-                "legacy-endpoint-mismatch",
-                "native-h1:legacy-endpoint-mismatch",
-                16,
-                http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect_err("changing only the advertised session value must fail closed");
+        let error = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "legacy-endpoint-mismatch",
+            "native-h1:legacy-endpoint-mismatch",
+            16,
+            http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect_err("changing only the advertised session value must fail closed");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert!(
@@ -19131,31 +20044,29 @@ exec sleep 2
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
-        let first = bindings
-            .connect_http_with_protocol_plan(
-                "identity-cache-backend",
-                "native-h1:identity-cache-backend",
-                12,
-                plan.clone(),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("first identity opens the modern upstream");
-        let second = bindings
-            .connect_http_with_protocol_plan(
-                "identity-cache-backend",
-                "native-h1:identity-cache-backend",
-                12,
-                plan,
-                ClientInfo {
-                    name: "proxy-http-test-client".to_owned(),
-                    version: "1.0.1".to_owned(),
-                },
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("one clientInfo field change opens a separate modern upstream");
+        let first = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "identity-cache-backend",
+            "native-h1:identity-cache-backend",
+            12,
+            plan.clone(),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("first identity opens the modern upstream");
+        let second = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "identity-cache-backend",
+            "native-h1:identity-cache-backend",
+            12,
+            plan,
+            ClientInfo {
+                name: "proxy-http-test-client".to_owned(),
+                version: "1.0.1".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("one clientInfo field change opens a separate modern upstream");
 
         assert_eq!(bindings.live_http.len(), 2);
         assert_eq!(first.upstream_binding(), second.upstream_binding());
@@ -19197,31 +20108,29 @@ exec sleep 2
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
-        bindings
-            .connect_http_with_protocol_plan(
-                "capability-cache-backend",
-                "native-h1:capability-cache-backend",
-                13,
-                plan.clone(),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("first capability set opens the modern upstream");
-        bindings
-            .connect_http_with_protocol_plan(
-                "capability-cache-backend",
-                "native-h1:capability-cache-backend",
-                13,
-                plan,
-                proxy_http_client_info(),
-                ClientCapabilities {
-                    roots: Some(fastmcp_protocol::RootsCapability { list_changed: true }),
-                    ..ClientCapabilities::default()
-                },
-                Cx::for_request(),
-            )
-            .expect("one clientCapabilities field change opens a separate modern upstream");
+        block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "capability-cache-backend",
+            "native-h1:capability-cache-backend",
+            13,
+            plan.clone(),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("first capability set opens the modern upstream");
+        block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "capability-cache-backend",
+            "native-h1:capability-cache-backend",
+            13,
+            plan,
+            proxy_http_client_info(),
+            ClientCapabilities {
+                roots: Some(fastmcp_protocol::RootsCapability { list_changed: true }),
+                ..ClientCapabilities::default()
+            },
+        ))
+        .expect("one clientCapabilities field change opens a separate modern upstream");
 
         assert_eq!(bindings.live_http.len(), 2);
         let probes = server.join().expect("capability cache server must join");
@@ -19270,17 +20179,16 @@ exec sleep 2
         });
         let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
         let mut bindings = ProxyClient::upstream_binding_registry();
-        let proxy = bindings
-            .connect_http_with_protocol_plan(
-                "modern-empty-acknowledgement-backend",
-                "native-h1:modern-empty-acknowledgement-backend",
-                14,
-                plan,
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect("modern discovery opens the proxy backend");
+        let proxy = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "modern-empty-acknowledgement-backend",
+            "native-h1:modern-empty-acknowledgement-backend",
+            14,
+            plan,
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery opens the proxy backend");
 
         let error = proxy.catalog().expect_err(
             "a notification acknowledgement cannot satisfy a correlated catalog request",
@@ -19365,17 +20273,16 @@ exec sleep 2
             let mut bindings = ProxyClient::upstream_binding_registry();
             let route = format!("modern-result-source-{transport_name}");
             let transport = format!("native-h1:{route}");
-            let proxy = bindings
-                .connect_http_with_protocol_plan(
-                    &route,
-                    &transport,
-                    31,
-                    plan,
-                    proxy_http_client_info(),
-                    ClientCapabilities::default(),
-                    Cx::for_request(),
-                )
-                .expect("modern discovery opens the public proxy backend");
+            let proxy = block_on(bindings.connect_http_with_protocol_plan(
+                &Cx::for_request(),
+                &route,
+                &transport,
+                31,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ))
+            .expect("modern discovery opens the public proxy backend");
             let handler = ProxyToolHandler::from_final(final_catalog_tool(), proxy)
                 .expect("a negotiated modern proxy builds the public final handler");
 
@@ -19502,17 +20409,16 @@ exec sleep 2
             let mut bindings = ProxyClient::upstream_binding_registry();
             let route = format!("modern-id-mismatch-{}", path.name());
             let transport = format!("native-h1:{route}");
-            let proxy = bindings
-                .connect_http_with_protocol_plan(
-                    &route,
-                    &transport,
-                    14,
-                    plan.clone(),
-                    proxy_http_client_info(),
-                    ClientCapabilities::default(),
-                    Cx::for_request(),
-                )
-                .expect("modern discovery opens the public proxy backend");
+            let proxy = block_on(bindings.connect_http_with_protocol_plan(
+                &Cx::for_request(),
+                &route,
+                &transport,
+                14,
+                plan.clone(),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ))
+            .expect("modern discovery opens the public proxy backend");
             let binding = proxy.upstream_binding().expect("live binding is retained");
 
             let error = match path {
@@ -19536,17 +20442,16 @@ exec sleep 2
 
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(bindings.live_http.len(), 1);
-            let cached = bindings
-                .connect_http_with_protocol_plan(
-                    &route,
-                    &transport,
-                    14,
-                    plan,
-                    proxy_http_client_info(),
-                    ClientCapabilities::default(),
-                    Cx::for_request(),
-                )
-                .expect("a response-ID refusal must not alter the selected cache binding");
+            let cached = block_on(bindings.connect_http_with_protocol_plan(
+                &Cx::for_request(),
+                &route,
+                &transport,
+                14,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ))
+            .expect("a response-ID refusal must not alter the selected cache binding");
             assert_eq!(cached.upstream_binding(), Some(binding));
             assert_eq!(bindings.live_http.len(), 1);
 
@@ -19678,17 +20583,16 @@ exec sleep 2
             let mut bindings = ProxyClient::upstream_binding_registry();
             let route = format!("legacy-id-mismatch-{}", path.name());
             let transport = format!("native-h1:{route}");
-            let proxy = bindings
-                .connect_http_with_protocol_plan(
-                    &route,
-                    &transport,
-                    15,
-                    plan.clone(),
-                    proxy_http_client_info(),
-                    ClientCapabilities::default(),
-                    Cx::for_request(),
-                )
-                .expect("authorized modern refusal opens the public legacy proxy backend");
+            let proxy = block_on(bindings.connect_http_with_protocol_plan(
+                &Cx::for_request(),
+                &route,
+                &transport,
+                15,
+                plan.clone(),
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ))
+            .expect("authorized modern refusal opens the public legacy proxy backend");
             let binding = proxy.upstream_binding().expect("live binding is retained");
 
             let error = match path {
@@ -19723,17 +20627,16 @@ exec sleep 2
                 error.message
             );
             assert_eq!(bindings.live_http.len(), 1);
-            let cached = bindings
-                .connect_http_with_protocol_plan(
-                    &route,
-                    &transport,
-                    15,
-                    plan,
-                    proxy_http_client_info(),
-                    ClientCapabilities::default(),
-                    Cx::for_request(),
-                )
-                .expect("a legacy response-ID refusal must not alter the selected cache binding");
+            let cached = block_on(bindings.connect_http_with_protocol_plan(
+                &Cx::for_request(),
+                &route,
+                &transport,
+                15,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+            ))
+            .expect("a legacy response-ID refusal must not alter the selected cache binding");
             assert_eq!(cached.upstream_binding(), Some(binding));
             assert_eq!(bindings.live_http.len(), 1);
             release_sse
@@ -19802,17 +20705,16 @@ exec sleep 2
             request
         });
         let mut bindings = ProxyClient::upstream_binding_registry();
-        let error = bindings
-            .connect_http_with_protocol_plan(
-                "contradictory-http-backend",
-                "native-h1:contradictory-http-backend",
-                11,
-                http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target),
-                proxy_http_client_info(),
-                ClientCapabilities::default(),
-                Cx::for_request(),
-            )
-            .expect_err("a contradictory modern discovery response must not downgrade to legacy");
+        let error = block_on(bindings.connect_http_with_protocol_plan(
+            &Cx::for_request(),
+            "contradictory-http-backend",
+            "native-h1:contradictory-http-backend",
+            11,
+            http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target),
+            proxy_http_client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect_err("a contradictory modern discovery response must not downgrade to legacy");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert!(bindings.live_http.is_empty());
@@ -19833,17 +20735,16 @@ exec sleep 2
         let script = modern_proxy_peer_script(&discovery, &tool_result);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let proxy = bindings
-            .connect_stdio_with_protocol_plan(
-                "modern-route",
-                "stdio:modern-peer",
-                1,
-                "sh",
-                &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-                Cx::for_testing(),
-            )
-            .expect("ModernOnly connects a live modern client");
+        let proxy = block_on(bindings.connect_stdio_with_protocol_plan(
+            &Cx::for_testing(),
+            "modern-route",
+            "stdio:modern-peer",
+            1,
+            "sh",
+            &["-c", script.as_str()],
+            fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+        ))
+        .expect("ModernOnly connects a live modern client");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Modern2026);
@@ -19921,31 +20822,29 @@ exec sleep 2
 "#
         );
         let mut bindings = ProxyClient::upstream_binding_registry();
-        let first = bindings
-            .connect_stdio_with_protocol_plan(
-                "pinned-auto-route",
-                "stdio:pinned-auto-peer",
-                22,
-                "sh",
-                &["-c", script.as_str()],
-                ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-                Cx::for_testing(),
-            )
-            .expect("the real Auto discovery selects the modern upstream");
+        let first = block_on(bindings.connect_stdio_with_protocol_plan(
+            &Cx::for_testing(),
+            "pinned-auto-route",
+            "stdio:pinned-auto-peer",
+            22,
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+        ))
+        .expect("the real Auto discovery selects the modern upstream");
         let selected = first
             .upstream_binding()
             .expect("the selected era is retained");
-        let second = bindings
-            .connect_stdio_with_protocol_plan(
-                "pinned-auto-route",
-                "stdio:pinned-auto-peer",
-                22,
-                "sh",
-                &["-c", script.as_str()],
-                ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-                Cx::for_testing(),
-            )
-            .expect("the same immutable upstream reuses its pinned selection");
+        let second = block_on(bindings.connect_stdio_with_protocol_plan(
+            &Cx::for_testing(),
+            "pinned-auto-route",
+            "stdio:pinned-auto-peer",
+            22,
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+        ))
+        .expect("the same immutable upstream reuses its pinned selection");
 
         assert_eq!(selected.era(), ProtocolEra::Modern2026);
         assert_eq!(selected.policy(), ProtocolPolicy::Auto);
@@ -20025,17 +20924,16 @@ exec sleep 2
         let script = legacy_proxy_peer_script(&initialize, &tool_result);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let proxy = bindings
-            .connect_stdio_with_protocol_plan(
-                "legacy-route",
-                "stdio:legacy-peer",
-                4,
-                "sh",
-                &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
-                Cx::for_testing(),
-            )
-            .expect("LegacyOnly connects a live exact-2024 client");
+        let proxy = block_on(bindings.connect_stdio_with_protocol_plan(
+            &Cx::for_testing(),
+            "legacy-route",
+            "stdio:legacy-peer",
+            4,
+            "sh",
+            &["-c", script.as_str()],
+            fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+        ))
+        .expect("LegacyOnly connects a live exact-2024 client");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Legacy2024);
@@ -20066,17 +20964,16 @@ exec sleep 2
             malformed_modern_or_legacy_peer_script(&contradictory_discovery, &legacy_initialize);
         let mut bindings = ProxyClient::upstream_binding_registry();
 
-        let error = bindings
-            .connect_stdio_with_protocol_plan(
-                "auto-malformed-route",
-                "stdio:auto-malformed-peer",
-                5,
-                "sh",
-                &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-                Cx::for_testing(),
-            )
-            .expect_err("a contradictory modern success must not start the available legacy peer");
+        let error = block_on(bindings.connect_stdio_with_protocol_plan(
+            &Cx::for_testing(),
+            "auto-malformed-route",
+            "stdio:auto-malformed-peer",
+            5,
+            "sh",
+            &["-c", script.as_str()],
+            fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+        ))
+        .expect_err("a contradictory modern success must not start the available legacy peer");
 
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
         assert!(
