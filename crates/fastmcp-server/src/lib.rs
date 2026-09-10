@@ -2973,6 +2973,13 @@ impl Drop for DispatchWorkerCompletionSignal {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PumpIoMode {
+    Split,
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    Unsplit,
+}
+
 /// Owns every admission-side resource for one modern stdio request until its
 /// caller-owned child task has finished. The reservation is deliberately held
 /// by the task closure itself: a runtime that rejects or cancels a task before
@@ -3026,6 +3033,49 @@ impl ModernDispatchReservation {
 
     fn cancellation(&self) -> McpRequestCancellation {
         self.cancellation.clone()
+    }
+}
+
+#[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+impl DispatchQueueState {
+    fn admit_modern_request(
+        self: &Arc<Self>,
+        request: &JsonRpcRequest,
+        failed: Arc<AtomicBool>,
+    ) -> Result<ModernDispatchReservation, JsonRpcError> {
+        if let Some(id) = request.id.as_ref()
+            && !self.admit(id, request.method != "initialize")
+        {
+            return Err(JsonRpcError {
+                code: McpErrorCode::InvalidRequest.into(),
+                message: "Request id is already active".to_owned(),
+                data: None,
+            });
+        }
+        let slot = self.reserve_modern_slot();
+        let bytes = measure_dispatch_request(request);
+        if slot
+            && let Some(bytes) = bytes
+            && self.reserve_queued_bytes(bytes)
+        {
+            return Ok(ModernDispatchReservation::new(
+                Arc::clone(self),
+                request.id.clone(),
+                bytes,
+                failed,
+            ));
+        }
+        if slot {
+            self.release_modern_slot();
+        }
+        if let Some(id) = request.id.as_ref() {
+            self.discard(id);
+        }
+        Err(JsonRpcError {
+            code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
+            message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_owned(),
+            data: None,
+        })
     }
 }
 
@@ -14890,18 +14940,27 @@ impl Server {
             "custom",
         );
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
-        let run_result = match self.run_loop_pump(
+        let run_result = match Arc::new(self).run_loop_pump_with_policy(
+            cx,
             cx,
             move |cx, _worker_failed| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
             notification_sender,
             "custom",
+            false,
+            Some(notification_failure),
+            true,
+            true,
+            None,
+            None,
+            None,
+            PumpIoMode::Unsplit,
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
                 "transport",
-                "feature_off_pump_failure",
-                "Feature-off modern transport loop failed",
+                "pump_failure",
+                "Server transport loop failed",
             )),
         };
         let close_result = shared
@@ -15649,6 +15708,7 @@ impl Server {
             None,
             None,
             None,
+            PumpIoMode::Split,
         )
     }
 
@@ -15715,6 +15775,7 @@ impl Server {
             None,
             None,
             None,
+            PumpIoMode::Split,
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -15757,6 +15818,7 @@ impl Server {
             Some(transport_authorization),
             Some(auth_receipt),
             Some(websocket_connection_generation),
+            PumpIoMode::Split,
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -15794,14 +15856,16 @@ impl Server {
             None,
             None,
             None,
+            PumpIoMode::Unsplit,
         )
     }
 
     /// Feature-off stdio runner: only final-era envelopes can reach dispatch.
     ///
-    /// This deliberately owns no legacy adapter, session state, reverse
-    /// request registry, or worker branch. The dual-era implementation below
-    /// remains compiled only with the dated feature (or crate unit tests).
+    /// Uses the shared bounded request admission and retains each child until
+    /// it settles, without compiling a legacy adapter or reverse registry.
+    /// The dual-era implementation below remains compiled only with the dated
+    /// feature (or crate unit tests).
     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
     #[allow(clippy::too_many_arguments)]
     fn run_loop_pump_with_policy<R, S>(
@@ -15810,15 +15874,16 @@ impl Server {
         dispatch_cx: &Cx,
         mut recv: R,
         send: S,
-        notification_sender: NotificationSender,
+        _notification_sender: NotificationSender,
         transport_label: &'static str,
-        _detach_on_worker_timeout: bool,
+        detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
         enforce_runtime_era: bool,
         owns_server_lifecycle: bool,
         transport_authorization: Option<TransportAuthorization>,
         auth_receipt: Option<AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
+        io_mode: PumpIoMode,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -15840,11 +15905,34 @@ impl Server {
         let modern_connection = ModernConnection::new();
         let send = Arc::new(Mutex::new(send));
         let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
-        let worker_failed = AtomicBool::new(false);
+        let worker_failed = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(DispatchQueueState::default());
+        let mut children: Vec<asupersync::runtime::TaskHandle<()>> = Vec::new();
+        let mut blocking_children: Vec<BlockingTaskGuard> = Vec::new();
+        // A synchronous embedding can call this loop on the runtime's only
+        // async worker. It cannot join a task scheduled on that same worker.
+        // Use the existing bounded blocking bridge in that arrangement; the
+        // split/stdio pump supplies a distinct dispatch Cx and uses async
+        // children instead. Both paths retain the same admission ownership.
+        let synchronous_dispatch =
+            io_mode == PumpIoMode::Split && cx.task_id() == dispatch_cx.task_id();
         let mut negotiated_era = None;
         let mut exit_code = 0;
+        let mut drain_responses = false;
         loop {
+            blocking_children.retain(|child| !child.0.is_done());
+            // Retain ownership until completion, but do not accumulate handles
+            // over the lifetime of a long-running connection.
+            for index in (0..children.len()).rev() {
+                if children[index].is_finished() {
+                    let mut child = children.swap_remove(index);
+                    if poll_on_cx(cx, child.join(cx)).is_err() {
+                        worker_failed.store(true, Ordering::Release);
+                    }
+                }
+            }
             if cx.checkpoint().is_err()
+                || worker_failed.load(Ordering::Acquire)
                 || connection_failure
                     .as_ref()
                     .is_some_and(|failed| failed.load(Ordering::Acquire))
@@ -15853,7 +15941,11 @@ impl Server {
             }
             let message = match recv(cx, &worker_failed) {
                 Ok(message) => message,
-                Err(TransportError::Closed | TransportError::Cancelled) => break,
+                Err(TransportError::Closed) => {
+                    drain_responses = true;
+                    break;
+                }
+                Err(TransportError::Cancelled) => break,
                 Err(_) => {
                     exit_code = 1;
                     break;
@@ -15882,6 +15974,7 @@ impl Server {
                             );
                         }
                         exit_code = i32::from(owns_server_lifecycle);
+                        drain_responses = true;
                         break;
                     }
                 }
@@ -15898,7 +15991,11 @@ impl Server {
                     );
                 }
                 exit_code = i32::from(owns_server_lifecycle);
+                drain_responses = true;
                 break;
+            }
+            if admit_final_client_notification_ingress(&request).is_err() {
+                continue;
             }
             // The request context is the DISPATCH runtime's, not the receive
             // pump's: under the stdio arrangement the pump is a blocking child
@@ -15910,26 +16007,201 @@ impl Server {
                 &modern_connection,
                 transport_authorization.clone().unwrap_or_default(),
             );
-            let response = Self::dispatch_or_detach_stdio_modern_request(
-                Arc::clone(&server),
-                cx,
-                dispatch_cx,
-                inbound,
-                request,
-                auth_receipt.clone(),
+            if request.id.is_none() && request.method == "notifications/cancelled" {
+                let mut request = request;
+                if let Ok(cancellation) = server.authenticate_modern_cancelled_control(
+                    &inbound,
+                    &mut request,
+                    auth_receipt.as_ref(),
+                    auth_custody_generation,
+                ) {
+                    // Cancellation and final output elect their winner under
+                    // the same writer fence. An unrelated ID changes nothing.
+                    let _writer = send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    queue.cancel_reserved(Self::cancellation_wire_request_id(&cancellation));
+                }
+                continue;
+            }
+            let admission = queue.admit_modern_request(&request, Arc::clone(&worker_failed));
+            let mut reservation = match admission {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(id) = request.id {
+                        let response = JsonRpcResponse::error(Some(id), error);
+                        if send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                            cx,
+                            &JsonRpcMessage::Response(response),
+                        )
+                        .is_err()
+                        {
+                            exit_code = 1;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let blocking_permit = synchronous_dispatch.then(try_reserve_blocking_dispatch);
+            if matches!(blocking_permit, Some(None)) {
+                if let Some(id) = request.id {
+                    let response = JsonRpcResponse::error(
+                        Some(id),
+                        JsonRpcError {
+                            code: RESOURCE_EXHAUSTED_ERROR_CODE.into(),
+                            message: DISPATCH_QUEUE_CAPACITY_MESSAGE.to_owned(),
+                            data: None,
+                        },
+                    );
+                    if send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                        cx,
+                        &JsonRpcMessage::Response(response),
+                    )
+                    .is_err()
+                    {
+                        exit_code = 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Establish ordinary-request ownership before reading the next
+            // frame. A following cancellation must not depend on whether the
+            // runtime has polled this child yet. Dispatch consumes the exact
+            // private receipt, so the provider is evaluated only once.
+            let task_auth_receipt = match server.admit_modern_pump_authentication(
+                &inbound,
+                &request,
+                auth_receipt.as_ref(),
                 auth_custody_generation,
-                Arc::clone(&notification_sender),
-                Arc::clone(&send),
-            );
-            if let Some(response) = response {
-                let send_err = send
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
-                    cx,
-                    &JsonRpcMessage::Response(response),
-                )
-                .is_err();
-                if send_err {
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if let Some(id) = request.id {
+                        let response = JsonRpcResponse::error(
+                            Some(id),
+                            JsonRpcError {
+                                code: error.code.into(),
+                                message: error.message,
+                                data: error.data,
+                            },
+                        );
+                        if send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                            cx,
+                            &JsonRpcMessage::Response(response),
+                        )
+                        .is_err()
+                        {
+                            exit_code = 1;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            reservation.begin();
+            let request_server = Arc::clone(&server);
+            let request_send = Arc::clone(&send);
+            let dispatch = move |request_cx: Cx| async move {
+                let mut reservation = reservation;
+                let cancellation = reservation.cancellation();
+                let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
+                let inbound = inbound.with_cx(request_cx.clone());
+                let notification_send = Arc::clone(&request_send);
+                let notification_cx = request_cx.clone();
+                let notification_cancellation = cancellation.clone();
+                let notification_failed = Arc::clone(&reservation.failed);
+                let committed_notifications: NotificationSender = Arc::new(move |notification| {
+                    let mut writer = notification_send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !notification_cancellation.is_cancel_requested()
+                        && writer(&notification_cx, &JsonRpcMessage::Request(notification)).is_err()
+                    {
+                        notification_failed.store(true, Ordering::Release);
+                        notification_cancellation.cancel();
+                    }
+                });
+                let response = match reservation.queue.begin_modern_dispatch(request.id.as_ref()) {
+                    ModernDispatchStart::Stopping => None,
+                    ModernDispatchStart::Cancelled => request.id.clone().map(|id| {
+                        JsonRpcResponse::error(
+                            Some(id),
+                            JsonRpcError {
+                                code: McpErrorCode::RequestCancelled.into(),
+                                message: "Request cancelled before dispatch".to_owned(),
+                                data: None,
+                            },
+                        )
+                    }),
+                    ModernDispatchStart::Ready => {
+                        Arc::clone(&request_server)
+                            .dispatch_with_protocol_policy_owned(
+                                request_server.protocol_policy,
+                                &inbound,
+                                request,
+                                None,
+                                Some(task_auth_receipt),
+                                auth_custody_generation,
+                                None,
+                                cancellation.clone(),
+                                None,
+                                committed_notifications,
+                            )
+                            .await
+                    }
+                };
+                if let Some(mut response) = response {
+                    let mut writer = request_send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !(subscription_request && final_subscription_completion_response(&response)
+                        || cancellation.begin_finalization())
+                    {
+                        response = JsonRpcResponse::error(
+                            response.id,
+                            JsonRpcError {
+                                code: McpErrorCode::RequestCancelled.into(),
+                                message: "Request cancelled before response finalization"
+                                    .to_owned(),
+                                data: None,
+                            },
+                        );
+                    }
+                    if writer(&request_cx, &JsonRpcMessage::Response(response)).is_err() {
+                        return;
+                    }
+                }
+                reservation.disarm_failure();
+            };
+            if io_mode == PumpIoMode::Unsplit {
+                // An unsplit Transport holds one mutex during recv. Finish
+                // its response before receiving again, otherwise that read
+                // can lock out the response the peer is waiting for.
+                poll_on_cx(dispatch_cx, dispatch(dispatch_cx.clone()));
+                continue;
+            }
+            if let Some(Some(permit)) = blocking_permit {
+                let request_cx = dispatch_cx.clone();
+                blocking_children.push(BlockingTaskGuard(blocking_dispatch_pool().spawn(
+                    move || {
+                        let _permit = permit;
+                        poll_on_cx(&request_cx, dispatch(request_cx.clone()));
+                    },
+                )));
+                continue;
+            }
+            let submitted = dispatch_cx.spawn(dispatch);
+            match submitted {
+                Ok(child) => children.push(child),
+                Err(_) => {
                     exit_code = 1;
                     break;
                 }
@@ -15937,8 +16209,45 @@ impl Server {
         }
         if owns_server_lifecycle {
             let _ = server.terminate_subscription_streams();
+        }
+        queue.cancel_uncorrelated_modern_children();
+        if drain_responses
+            && !queue.wait_for_correlated_response_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
+        {
+            exit_code = 1;
+        }
+        queue.stop();
+        modern_connection.disconnect();
+        if owns_server_lifecycle {
             server.cancel_active_requests(CancelKind::Shutdown, false);
-            server.run_shutdown_hook();
+        }
+        let mut quiescent = queue.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT);
+        if !quiescent {
+            exit_code = 1;
+            if !detach_on_worker_timeout {
+                queue.wait_for_modern_drain_unbounded();
+                quiescent = true;
+            }
+        }
+        if quiescent {
+            for child in blocking_children {
+                child.0.wait();
+            }
+            for mut child in children {
+                if poll_on_cx(cx, child.join(cx)).is_err() {
+                    exit_code = 1;
+                }
+            }
+            if owns_server_lifecycle {
+                server.run_shutdown_hook();
+            }
+        }
+        if worker_failed.load(Ordering::Acquire)
+            || connection_failure
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Acquire))
+        {
+            exit_code = 1;
         }
         if let Some(stats) = &server.stats {
             stats.connection_closed();
@@ -15974,6 +16283,7 @@ impl Server {
             None,
             None,
             None,
+            PumpIoMode::Split,
         )
     }
 
@@ -15994,6 +16304,7 @@ impl Server {
         transport_authorization: Option<TransportAuthorization>,
         auth_receipt: Option<AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
+        _io_mode: PumpIoMode,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -19775,6 +20086,100 @@ impl Server {
         Self::enforce_request_context(ctx)
     }
 
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    fn admit_modern_pump_authentication(
+        &self,
+        inbound: &InboundRequestContext,
+        request: &JsonRpcRequest,
+        auth_receipt: Option<&AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
+    ) -> McpResult<AuthDispatchCustody> {
+        let context = inbound.request_context();
+        let budget = self.create_request_budget(context.cx());
+        let (context, _lease) = context
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+            .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
+        Self::enforce_request_context(&context)?;
+        let mut sanitized = request.clone();
+        let (fingerprint, authenticated) = match auth_receipt {
+            Some(receipt) => (
+                receipt.commit(
+                    &context,
+                    inbound,
+                    &mut sanitized,
+                    websocket_connection_generation,
+                )?,
+                context.auth(),
+            ),
+            None => self.authenticate_request_without_commit(
+                &context,
+                inbound.auth_request(&request.method, request.params.as_ref()),
+            )?,
+        };
+        Self::enforce_request_context(&context)?;
+        auth::strip_recognized_access_credentials(&mut sanitized.params);
+        if !inbound.bind_or_verify_principal(fingerprint) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authenticated principal does not own an admitted connection",
+            ));
+        }
+        Ok(AuthDispatchCustody::Http(AuthAdmissionReceipt {
+            method: sanitized.method,
+            request_id: sanitized.id,
+            sanitized_params: sanitized.params,
+            fingerprint,
+            authenticated,
+        }))
+    }
+
+    /// A control message may cancel an existing principal's request, but may
+    /// never establish that principal's connection ownership itself.
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    fn authenticate_modern_cancelled_control(
+        &self,
+        inbound: &InboundRequestContext,
+        request: &mut JsonRpcRequest,
+        auth_receipt: Option<&AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
+    ) -> McpResult<CancellationWireMessage> {
+        let context = inbound.request_context();
+        let budget = self.create_request_budget(context.cx());
+        let (context, _lease) = context
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+            .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
+        Self::enforce_request_context(&context)?;
+        let fingerprint = match auth_receipt {
+            Some(receipt) => {
+                receipt.commit(&context, inbound, request, websocket_connection_generation)?
+            }
+            None => {
+                let fingerprint = self.authenticate_request(
+                    &context,
+                    inbound.auth_request(&request.method, request.params.as_ref()),
+                )?;
+                auth::strip_recognized_access_credentials(&mut request.params);
+                fingerprint
+            }
+        };
+        let cancellation = CancellationWireMessage::decode(
+            ProtocolEra::Modern2026,
+            CancellationSender::Client,
+            request,
+        )
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        if !inbound.verify_existing_principal(fingerprint) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authenticated principal does not own an admitted connection",
+            ));
+        }
+        Self::enforce_request_context(&context)?;
+        Ok(cancellation)
+    }
+
     fn authenticate_request(
         &self,
         ctx: &McpContext,
@@ -23245,6 +23650,7 @@ mod lib_unit_tests {
                         None,
                         None,
                         None,
+                        PumpIoMode::Split,
                     );
                     let _ = sender.send(result);
                 }) {
@@ -30334,6 +30740,7 @@ mod lib_unit_tests {
                         None,
                         None,
                         None,
+                        PumpIoMode::Split,
                     );
                     let _ = pump_sender.send(Ok(code));
                 }) {
@@ -30416,6 +30823,7 @@ mod lib_unit_tests {
                 None,
                 None,
                 None,
+                PumpIoMode::Split,
             );
 
         assert!(notification_failure.load(Ordering::Acquire));

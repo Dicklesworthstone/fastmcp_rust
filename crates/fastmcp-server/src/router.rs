@@ -265,6 +265,16 @@ impl InboundRequestContext {
             .is_none_or(|binding| binding.bind_or_verify(fingerprint))
     }
 
+    #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
+    pub(crate) fn verify_existing_principal(
+        &self,
+        fingerprint: fastmcp_core::Sha256Digest,
+    ) -> bool {
+        self.principal_binding
+            .as_ref()
+            .is_some_and(|binding| binding.verify_existing(fingerprint))
+    }
+
     pub(crate) fn with_cx(mut self, cx: Cx) -> Self {
         self.cx = cx;
         self

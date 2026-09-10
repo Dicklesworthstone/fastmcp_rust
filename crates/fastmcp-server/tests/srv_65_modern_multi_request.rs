@@ -18,16 +18,19 @@
 //! thread: a regression fails the test instead of hanging CI.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asupersync::Cx;
-use fastmcp_core::{McpContext, McpResult, block_on};
+use fastmcp_core::{McpContext, McpOutcome, McpResult, block_on};
 use fastmcp_derive::tool;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
-use fastmcp_server::Server;
-use fastmcp_transport::{Transport, TransportError, TransportRecvHalf, TransportSendHalf};
+use fastmcp_protocol::{Content, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, Tool};
+use fastmcp_server::{FinalToolOutcome, Server, ToolHandler};
+use fastmcp_transport::{Codec, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
 
 /// A regression must fail, not hang. Generous next to the milliseconds a
 /// scripted in-memory transport needs (a healthy run finishes in well under a
@@ -548,4 +551,471 @@ fn srv_65_stdio_shaped_pump_answers_a_modern_request_sequence() {
         outcome.closed,
         "the stdio-shaped runtime must close the receive half it owned"
     );
+}
+
+#[derive(Default)]
+struct PendingControl {
+    entered: AtomicUsize,
+    active: AtomicUsize,
+    released: AtomicBool,
+}
+
+struct PendingTool(Arc<PendingControl>);
+
+struct ActiveInvocation(Arc<PendingControl>);
+
+impl Drop for ActiveInvocation {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ToolHandler for PendingTool {
+    fn execution_mode(&self) -> fastmcp_server::ToolExecutionMode {
+        fastmcp_server::ToolExecutionMode::Async
+    }
+
+    fn definition(&self) -> Tool {
+        let mut definition = Echo.definition();
+        definition.name = "pending".to_owned();
+        definition
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Echo.call(ctx, arguments)
+    }
+
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.0.active.fetch_add(1, Ordering::AcqRel);
+            let _active = ActiveInvocation(Arc::clone(&self.0));
+            self.0.entered.fetch_add(1, Ordering::AcqRel);
+            while !self.0.released.load(Ordering::Acquire) {
+                if let Err(error) = ctx.checkpoint() {
+                    return McpOutcome::Err(error.into());
+                }
+                asupersync::time::sleep(ctx.cx().now(), Duration::from_millis(5)).await;
+            }
+            match Echo.call_final(ctx, arguments) {
+                Ok(result) => McpOutcome::Ok(FinalToolOutcome::Complete(result)),
+                Err(error) => McpOutcome::Err(error),
+            }
+        })
+    }
+}
+
+struct WireRecv(BufReader<TcpStream>, Arc<AtomicUsize>);
+struct WireSend(TcpStream);
+
+fn read_wire(reader: &mut BufReader<TcpStream>) -> Result<JsonRpcMessage, TransportError> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(TransportError::Closed);
+    }
+    Codec::new()
+        .decode_complete_message(line.as_bytes())
+        .map_err(TransportError::Codec)
+}
+
+fn write_wire(stream: &mut TcpStream, message: &JsonRpcMessage) -> Result<(), TransportError> {
+    let codec = Codec::new();
+    let bytes = match message {
+        JsonRpcMessage::Request(request) => codec.encode_request(request),
+        JsonRpcMessage::Response(response) => codec.encode_response(response),
+    }
+    .map_err(TransportError::Codec)?;
+    stream.write_all(&bytes)?;
+    Ok(())
+}
+
+impl TransportRecvHalf for WireRecv {
+    fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        let message = read_wire(&mut self.0)?;
+        self.1.fetch_add(1, Ordering::Release);
+        Ok(message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.0.get_ref().shutdown(Shutdown::Read)?;
+        Ok(())
+    }
+}
+
+impl TransportSendHalf for WireSend {
+    fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        eprintln!(
+            "modern-pump outbound={}",
+            serde_json::to_string(message).unwrap()
+        );
+        write_wire(&mut self.0, message)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.0.shutdown(Shutdown::Write)?;
+        Ok(())
+    }
+}
+
+/// Real socket bytes and the public split runner. A single async worker owns
+/// the request children while the receive pump occupies a blocking worker.
+/// Cleanup releases even a regressed sequential handler before joining it.
+struct WireScenario {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+    control: Arc<PendingControl>,
+    shutdown: Arc<AtomicBool>,
+    shutdown_active: Arc<AtomicUsize>,
+    outcome: mpsc::Receiver<McpResult<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    subject: String,
+    input_closed: bool,
+}
+
+impl WireScenario {
+    fn start() -> Self {
+        Self::start_with_dispatch(true)
+    }
+
+    fn start_with_dispatch(separate_dispatch: bool) -> Self {
+        Self::start_with_options(separate_dispatch, false)
+    }
+
+    fn start_with_options(separate_dispatch: bool, hold_first_poll: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_socket, peer) = listener.accept().unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        server_socket
+            .set_read_timeout(Some(SCENARIO_DEADLINE))
+            .unwrap();
+        server_socket
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let reader = BufReader::new(writer.try_clone().unwrap());
+        let control = Arc::new(PendingControl::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_active = Arc::new(AtomicUsize::new(usize::MAX));
+        let shutdown_probe = Arc::clone(&shutdown);
+        let shutdown_active_probe = Arc::clone(&shutdown_active);
+        let shutdown_control = Arc::clone(&control);
+        let server = Server::new("modern-owned-pump", "1.0.0")
+            .tool(Echo)
+            .tool(PendingTool(Arc::clone(&control)))
+            .on_shutdown(move || {
+                shutdown_active_probe.store(
+                    shutdown_control.active.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                shutdown_probe.store(true, Ordering::Release);
+            })
+            .build();
+        let ingress_count = Arc::new(AtomicUsize::new(0));
+        let recv = WireRecv(
+            BufReader::new(server_socket.try_clone().unwrap()),
+            Arc::clone(&ingress_count),
+        );
+        let send = WireSend(server_socket);
+        let (tx, outcome) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 4)
+                .build()
+                .unwrap();
+            let result = runtime.block_on(async move {
+                let root = Cx::current().unwrap();
+                if !separate_dispatch {
+                    return server.run_split_transport_returning_with_cx(&root, recv, send);
+                }
+                let dispatch_cx = root.clone();
+                let mut pump = root
+                    .spawn_blocking(move |pump_cx| {
+                        server.run_split_transport_returning_with_dispatch_cx(
+                            &pump_cx,
+                            &dispatch_cx,
+                            recv,
+                            send,
+                        )
+                    })
+                    .unwrap();
+                if hold_first_poll {
+                    // Deliberately occupy the only async worker until the
+                    // blocking pump has read beyond the cancellation frame.
+                    // Request children cannot get their first poll before it.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while ingress_count.load(Ordering::Acquire) < 3
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(ingress_count.load(Ordering::Acquire), 3);
+                }
+                pump.join(&root).await.expect("pump child must join")
+            });
+            let _ = tx.send(result);
+        });
+        Self {
+            reader,
+            writer,
+            control,
+            shutdown,
+            shutdown_active,
+            outcome,
+            worker: Some(worker),
+            subject: format!("socket-{peer}"),
+            input_closed: false,
+        }
+    }
+
+    fn send(&mut self, request: JsonRpcRequest) {
+        write_wire(&mut self.writer, &JsonRpcMessage::Request(request)).unwrap();
+    }
+
+    fn response(&mut self, id: i64) -> JsonRpcResponse {
+        let message = read_wire(&mut self.reader)
+            .expect("request must receive a response within the wire deadline");
+        let JsonRpcMessage::Response(response) = message else {
+            panic!("expected response, got {message:?}");
+        };
+        assert_eq!(response.id, Some(id.into()), "wrong correlated response");
+        response
+    }
+
+    fn pending(&mut self, id: i64) {
+        self.send(modern_request(
+            "tools/call",
+            id,
+            Some(serde_json::json!({
+                "name": "pending", "arguments": {"value": self.subject},
+            })),
+        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while self.control.entered.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            self.control.entered.load(Ordering::Acquire),
+            1,
+            "pending handler must actually start; shutdown={}",
+            self.shutdown.load(Ordering::Acquire)
+        );
+    }
+
+    fn cancel(&mut self, id: i64) {
+        let mut request = modern_request(
+            "notifications/cancelled",
+            0,
+            Some(serde_json::json!({"requestId": id})),
+        );
+        request.id = None;
+        self.send(request);
+    }
+
+    fn close_input(&mut self) {
+        assert!(!self.input_closed, "input EOF is emitted exactly once");
+        self.writer.shutdown(Shutdown::Write).unwrap();
+        self.input_closed = true;
+    }
+
+    fn finish(&mut self) {
+        self.control.released.store(true, Ordering::Release);
+        if !self.input_closed {
+            self.close_input();
+        }
+        let result = self
+            .outcome
+            .recv_timeout(SCENARIO_DEADLINE)
+            .expect("pump must settle before cleanup");
+        self.worker.take().unwrap().join().unwrap();
+        assert!(result.is_ok(), "returning pump failed: {result:?}");
+        assert!(self.shutdown.load(Ordering::Acquire));
+        assert_eq!(
+            self.shutdown_active.load(Ordering::Acquire),
+            0,
+            "shutdown must follow handler cleanup"
+        );
+    }
+}
+
+impl Drop for WireScenario {
+    fn drop(&mut self) {
+        self.control.released.store(true, Ordering::Release);
+        let _ = self.writer.shutdown(Shutdown::Write);
+        if self.worker.is_some() && self.outcome.recv_timeout(SCENARIO_DEADLINE).is_ok() {
+            let _ = self.worker.take().unwrap().join();
+        }
+    }
+}
+
+#[test]
+fn srv_65_modern_pending_request_allows_other_requests() {
+    // The no-legacy synchronous split entry point must also make progress
+    // when its caller occupies the only async worker, using the bounded
+    // bridge. The unchanged dual-era pump requires a separate dispatch Cx.
+    let dispatch_modes: &[bool] = if cfg!(feature = "legacy-2024-11-05") {
+        &[true]
+    } else {
+        &[true, false]
+    };
+    for &separate_dispatch in dispatch_modes {
+        let mut wire = WireScenario::start_with_dispatch(separate_dispatch);
+        wire.pending(10);
+        wire.send(modern_request("tools/list", 11, None));
+        assert_ok_response(&wire.response(11), "catalog while handler pending");
+        assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+        wire.control.released.store(true, Ordering::Release);
+        let response = wire.response(10);
+        assert_ok_response(&response, "released handler");
+        assert_eq!(response.result.unwrap()["content"][0]["text"], wire.subject);
+        wire.finish();
+    }
+}
+
+#[test]
+fn srv_65_modern_cancellation_preserves_unrelated_request() {
+    if !cfg!(feature = "legacy-2024-11-05") {
+        for cancellation_id in [50, 999] {
+            let mut queued = WireScenario::start_with_options(true, true);
+            queued.control.released.store(true, Ordering::Release);
+            queued.send(modern_request(
+                "tools/call",
+                50,
+                Some(serde_json::json!({
+                    "name": "pending", "arguments": {"value": queued.subject},
+                })),
+            ));
+            queued.cancel(cancellation_id);
+            queued.send(modern_request("tools/list", 51, None));
+            let responses = (0..2)
+                .map(|_| match read_wire(&mut queued.reader).unwrap() {
+                    JsonRpcMessage::Response(response) => response,
+                    message => panic!("expected correlated response, got {message:?}"),
+                })
+                .collect::<Vec<_>>();
+            let original = response_for(&responses, 50, "pre-poll cancellation");
+            if cancellation_id == 50 {
+                assert_eq!(
+                    original.error.as_ref().unwrap().code,
+                    fastmcp_core::McpErrorCode::RequestCancelled.into()
+                );
+                assert_eq!(queued.control.entered.load(Ordering::Acquire), 0);
+            } else {
+                assert_ok_response(original, "unknown target preserves queued request");
+                assert_eq!(
+                    original.result.as_ref().unwrap()["content"][0]["text"],
+                    queued.subject
+                );
+                assert_eq!(queued.control.entered.load(Ordering::Acquire), 1);
+            }
+            assert_ok_response(
+                response_for(&responses, 51, "pre-poll cancellation"),
+                "catalog survives pre-poll cancellation",
+            );
+            queued.finish();
+        }
+    }
+    let mut wire = WireScenario::start();
+    wire.pending(20);
+    let mut unauthenticated = modern_request(
+        "notifications/cancelled",
+        0,
+        Some(serde_json::json!({"requestId": 20, "token": "unadmitted-peer"})),
+    );
+    unauthenticated.id = None;
+    wire.send(unauthenticated);
+    wire.send(modern_request("tools/list", 23, None));
+    assert_ok_response(&wire.response(23), "catalog after rejected credentials");
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        1,
+        "unauthenticated cancellation must leave the handler running"
+    );
+    wire.cancel(999);
+    wire.send(modern_request("tools/list", 21, None));
+    assert_ok_response(&wire.response(21), "catalog after unrelated cancellation");
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        1,
+        "unknown ID must not cancel the active request"
+    );
+    wire.cancel(20);
+    let response = wire.response(20);
+    assert_eq!(
+        response.error.unwrap().code,
+        fastmcp_core::McpErrorCode::RequestCancelled.into()
+    );
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 0);
+    wire.send(modern_request("tools/list", 22, None));
+    assert_ok_response(&wire.response(22), "catalog after target cancellation");
+    wire.finish();
+}
+
+#[test]
+fn srv_65_modern_duplicate_id_does_not_enter_handler() {
+    let mut wire = WireScenario::start();
+    wire.pending(30);
+    wire.send(modern_request(
+        "tools/call",
+        30,
+        Some(serde_json::json!({
+            "name": "pending", "arguments": {"value": wire.subject},
+        })),
+    ));
+    let duplicate = wire.response(30);
+    assert_eq!(
+        duplicate.error.unwrap().code,
+        fastmcp_core::McpErrorCode::InvalidRequest.into()
+    );
+    assert_eq!(wire.control.entered.load(Ordering::Acquire), 1);
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+    wire.control.released.store(true, Ordering::Release);
+    assert_ok_response(
+        &wire.response(30),
+        "original request survives duplicate refusal",
+    );
+    wire.finish();
+}
+
+#[test]
+fn srv_65_modern_subscription_drains_before_shutdown() {
+    let mut wire = WireScenario::start();
+    wire.send(modern_request(
+        "subscriptions/listen",
+        40,
+        Some(serde_json::json!({
+            "notifications": {"toolsListChanged": true},
+        })),
+    ));
+    let acknowledgement = read_wire(&mut wire.reader).unwrap();
+    assert!(
+        matches!(acknowledgement, JsonRpcMessage::Request(request) if request.method == "notifications/subscriptions/acknowledged")
+    );
+    wire.send(modern_request("tools/list", 41, None));
+    assert_ok_response(&wire.response(41), "catalog while subscription pending");
+    wire.close_input();
+    let cancellation = read_wire(&mut wire.reader).unwrap();
+    assert!(
+        matches!(cancellation, JsonRpcMessage::Request(request) if request.method == "notifications/cancelled" && request.params.as_ref().unwrap()["requestId"] == 40)
+    );
+    let completion = wire.response(40);
+    assert_ok_response(&completion, "graceful subscription completion");
+    let result = completion.result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        40
+    );
+    wire.finish();
 }
