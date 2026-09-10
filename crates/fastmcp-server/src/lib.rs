@@ -513,11 +513,13 @@ use fastmcp_console::RequestResponseRenderer;
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+use fastmcp_core::block_on;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
     AuthContext, ClientCapabilityInfo, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
     McpLogLevel, McpRequestCancellation, McpResult, ServerCapabilityInfo, SessionState,
-    Sha256Digest, block_on, sha256_bounded,
+    Sha256Digest, sha256_bounded,
 };
 #[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
@@ -2187,15 +2189,6 @@ fn bind_connection_principal(
             "Authenticated principal does not own this session",
         ))
     }
-}
-
-#[cfg(any(feature = "legacy-2024-11-05", test))]
-fn legacy_adapter_response<H: Legacy2024Handler>(
-    adapter: &mut Legacy2024ServerAdapter<H>,
-    binding: LegacyPeerBinding,
-    request: &JsonRpcRequest,
-) -> Result<Option<JsonRpcResponse>, Legacy2024AdapterError> {
-    block_on(legacy_adapter_response_async(adapter, binding, request))
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -8305,19 +8298,11 @@ impl ServerHttpSession {
         &self.legacy_session_id
     }
 
-    /// Routes and dispatches one modern or exact-2024 HTTP request.
+    /// Routes and dispatches one modern or exact-2024 HTTP request on the caller's `Cx`.
     ///
-    /// This synchronous entry blocks the calling thread. On a runtime worker,
-    /// use [`Self::handle_async`] so request-owned tasks can make progress.
-    pub fn handle(
-        &mut self,
-        cx: &Cx,
-        request: HttpRequest,
-    ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
-        block_on(self.handle_async(cx, request))
-    }
-
-    /// Routes one HTTP request on the caller's `Cx` instead of `block_on`.
+    /// The caller drives this future on its runtime. This entry does not
+    /// construct or re-enter a runtime, so request-owned children can progress
+    /// while the handler awaits them.
     pub async fn handle_async(
         &mut self,
         cx: &Cx,
@@ -8338,23 +8323,6 @@ impl ServerHttpSession {
         self.handle_with_modern_request_cancellation_async(cx, request, None, true, None)
             .await
             .map_err(ServerHttpEndpointError::from_internal)
-    }
-
-    /// Routes one request while retaining a cancellation authority owned by
-    /// an ordinary modern JSON response body.
-    fn handle_with_modern_request_cancellation(
-        &mut self,
-        cx: &Cx,
-        request: HttpRequest,
-        modern_request_cancellation: Option<McpRequestCancellation>,
-    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        block_on(self.handle_with_modern_request_cancellation_async(
-            cx,
-            request,
-            modern_request_cancellation,
-            false,
-            None,
-        ))
     }
 
     async fn handle_with_modern_request_cancellation_async(
@@ -8378,25 +8346,6 @@ impl ServerHttpSession {
             legacy_auth_receipt,
         )
         .await
-    }
-
-    fn handle_with_modern_request_cancellation_and_transport_authorization(
-        &mut self,
-        cx: &Cx,
-        request: HttpRequest,
-        transport_authorization: TransportAuthorization,
-        modern_request_cancellation: Option<McpRequestCancellation>,
-    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        block_on(
-            self.handle_with_modern_request_cancellation_and_transport_authorization_async(
-                cx,
-                request,
-                transport_authorization,
-                modern_request_cancellation,
-                false,
-                None,
-            ),
-        )
     }
 
     #[cfg_attr(
@@ -11858,7 +11807,7 @@ async fn serve_http_connection(
         }
     };
     let session_id = session.legacy_session_id().to_owned();
-    let response = match session.handle(cx, request) {
+    let response = match session.handle_async(cx, request).await {
         Ok(ServerHttpEndpointResponse::LegacySse(response)) => response,
         Ok(response) => {
             let _ = send_h1_response(
@@ -12147,7 +12096,8 @@ async fn serve_modern_http_connection(
         };
         let error_request = request.clone();
         session
-            .handle(cx, request)
+            .handle_async(cx, request)
+            .await
             .map(|response| http_endpoint_response_to_static(cx, response))
             .unwrap_or_else(|error| {
                 http_endpoint_error_response(&error_request, error, http_config.max_body_size)
@@ -26693,8 +26643,8 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("modern endpoint session must open");
         let request = final_http_task_outcome_request(create_task, accept == "text/event-stream");
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -26706,8 +26656,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&request)
                             .expect("missing-capability request must serialize"),
                     ),
-            )
-            .expect("missing-capability request must be handled");
+            ),
+        )
+        .expect("missing-capability request must be handled");
         let ServerHttpEndpointResponse::Immediate(response) = response else {
             panic!("missing capability must reject before committing a response stream");
         };
@@ -26948,8 +26899,8 @@ mod lib_unit_tests {
             })),
             84_i64,
         );
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -26960,8 +26911,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&request)
                             .expect("middleware capability request must serialize"),
                     ),
-            )
-            .expect("middleware capability request must be handled");
+            ),
+        )
+        .expect("middleware capability request must be handled");
         let ServerHttpEndpointResponse::Immediate(response) = response else {
             panic!("canonical middleware error must commit neither an SSE event nor stream");
         };
@@ -34408,8 +34360,7 @@ mod lib_unit_tests {
             HttpRequest::new(HttpMethod::Get, "/sse"),
             HttpRequest::new(HttpMethod::Post, "/messages"),
         ] {
-            let response = session
-                .handle(&cx, request)
+            let response = block_on(session.handle_async(&cx, request))
                 .expect("a disabled legacy route is an ordinary zero-route response");
             assert!(matches!(
                 response,
@@ -35763,8 +35714,8 @@ mod lib_unit_tests {
             201_i64,
         );
 
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -35775,8 +35726,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&request)
                             .expect("modern discovery request must serialize"),
                     ),
-            )
-            .expect("modern request must be admitted and dispatched");
+            ),
+        )
+        .expect("modern request must be admitted and dispatched");
         let ServerHttpEndpointResponse::Immediate(response) = response else {
             panic!("modern JSON negotiation must produce an immediate HTTP response");
         };
@@ -35811,21 +35763,21 @@ mod lib_unit_tests {
         let mut legacy_session = endpoint
             .open_session(&cx)
             .expect("legacy session opens before shared-target GET");
-        let rejected = legacy_session
-            .handle(
-                &cx,
-                HttpRequest::new(HttpMethod::Get, "/bridge").with_body(b"{}".to_vec()),
-            )
-            .expect("nonempty shared-target GET becomes an HTTP rejection");
+        let rejected = block_on(legacy_session.handle_async(
+            &cx,
+            HttpRequest::new(HttpMethod::Get, "/bridge").with_body(b"{}".to_vec()),
+        ))
+        .expect("nonempty shared-target GET becomes an HTTP rejection");
         assert!(matches!(
             rejected,
             ServerHttpEndpointResponse::Immediate(response)
                 if response.status == HttpStatus::BAD_REQUEST
         ));
         assert_eq!(legacy_session.selected_era, None);
-        let legacy = legacy_session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/bridge"))
-            .expect("shared GET target selects legacy SSE");
+        let legacy = block_on(
+            legacy_session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/bridge")),
+        )
+        .expect("shared GET target selects legacy SSE");
         assert!(matches!(legacy, ServerHttpEndpointResponse::LegacySse(_)));
         assert_eq!(legacy_session.selected_era, Some(ProtocolEra::Legacy2024));
 
@@ -35834,8 +35786,7 @@ mod lib_unit_tests {
             .expect("modern session opens before shared-target POST");
         let mut modern = modern_http_json_tool_request("missing", 2_020);
         modern.path = "/bridge".to_owned();
-        let modern = modern_session
-            .handle(&cx, modern)
+        let modern = block_on(modern_session.handle_async(&cx, modern))
             .expect("shared POST target selects final modern admission");
         assert!(matches!(modern, ServerHttpEndpointResponse::Immediate(_)));
         assert_eq!(modern_session.selected_era, Some(ProtocolEra::Modern2026));
@@ -35851,23 +35802,23 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("legacy session must open");
-        let ServerHttpEndpointResponse::LegacySse(first) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("first legacy GET must open")
+        let ServerHttpEndpointResponse::LegacySse(first) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("first legacy GET must open")
         else {
             panic!("first legacy GET must return an SSE body");
         };
         let first_session_id = session.legacy_session_id().to_owned();
         drop(first);
 
-        let ServerHttpEndpointResponse::LegacySse(mut second) = session
-            .handle(
+        let ServerHttpEndpointResponse::LegacySse(mut second) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Get, "/sse")
                     .with_header("last-event-id", "non-replayable"),
-            )
-            .expect("reconnect must open a fresh legacy body")
-        else {
+            ),
+        )
+        .expect("reconnect must open a fresh legacy body") else {
             panic!("reconnect must return an SSE body");
         };
         assert_ne!(session.legacy_session_id(), first_session_id);
@@ -35895,8 +35846,8 @@ mod lib_unit_tests {
             })),
             2_024_i64,
         );
-        let old_capability = session
-            .handle(
+        let old_capability = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/messages")
                     .with_header("content-type", "application/json")
@@ -35904,8 +35855,9 @@ mod lib_unit_tests {
                     .with_body(
                         serde_json::to_vec(&initialize).expect("legacy initialize must serialize"),
                     ),
-            )
-            .expect("old POST capability must become an HTTP rejection");
+            ),
+        )
+        .expect("old POST capability must become an HTTP rejection");
         assert!(matches!(
             old_capability,
             ServerHttpEndpointResponse::Immediate(response)
@@ -35913,8 +35865,8 @@ mod lib_unit_tests {
         ));
 
         let current_session_id = session.legacy_session_id().to_owned();
-        let current_capability = session
-            .handle(
+        let current_capability = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/messages")
                     .with_header("content-type", "application/json")
@@ -35922,8 +35874,9 @@ mod lib_unit_tests {
                     .with_body(
                         serde_json::to_vec(&initialize).expect("legacy initialize must serialize"),
                     ),
-            )
-            .expect("fresh POST capability must remain usable");
+            ),
+        )
+        .expect("fresh POST capability must remain usable");
         assert!(matches!(
             current_capability,
             ServerHttpEndpointResponse::Immediate(response)
@@ -35941,9 +35894,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("legacy session must open");
-        let ServerHttpEndpointResponse::LegacySse(mut first_stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("first legacy GET must open")
+        let ServerHttpEndpointResponse::LegacySse(mut first_stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("first legacy GET must open")
         else {
             panic!("first legacy GET must return an SSE body");
         };
@@ -35973,7 +35926,7 @@ mod lib_unit_tests {
             )),
         ] {
             assert!(matches!(
-                session.handle(&cx, first_post(message)),
+                block_on(session.handle_async(&cx, first_post(message))),
                 Ok(ServerHttpEndpointResponse::Immediate(response))
                     if response.status == HttpStatus::ACCEPTED
             ));
@@ -36005,14 +35958,14 @@ mod lib_unit_tests {
         assert_eq!(stale_pending.in_flight_len(), 1);
         drop(first_stream);
 
-        let ServerHttpEndpointResponse::LegacySse(mut fresh_stream) = session
-            .handle(
+        let ServerHttpEndpointResponse::LegacySse(mut fresh_stream) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Get, "/sse")
                     .with_header("last-event-id", "old-generation"),
-            )
-            .expect("reconnect opens a fresh generation")
-        else {
+            ),
+        )
+        .expect("reconnect opens a fresh generation") else {
             panic!("reconnect must return an SSE body");
         };
         let _fresh_endpoint = fresh_stream
@@ -36065,7 +36018,7 @@ mod lib_unit_tests {
             )),
         ] {
             assert!(matches!(
-                session.handle(&cx, fresh_post(message)),
+                block_on(session.handle_async(&cx, fresh_post(message))),
                 Ok(ServerHttpEndpointResponse::Immediate(response))
                     if response.status == HttpStatus::ACCEPTED
             ));
@@ -36109,10 +36062,10 @@ mod lib_unit_tests {
             serde_json::json!({"roots": [{"uri": "file:///fresh", "name": "fresh"}]}),
         );
         assert!(matches!(
-            session.handle(
+            block_on(session.handle_async(
                 &cx,
                 fresh_post(JsonRpcMessage::Response(fresh_completion))
-            ),
+            )),
             Ok(ServerHttpEndpointResponse::Immediate(response))
                 if response.status == HttpStatus::ACCEPTED
         ));
@@ -36135,9 +36088,9 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("session must open before first-era admission");
 
-        let modern = session
-            .handle(&cx, modern_http_json_tool_request("missing", 2_021))
-            .expect("an admitted modern request may return a JSON-RPC handler error");
+        let modern =
+            block_on(session.handle_async(&cx, modern_http_json_tool_request("missing", 2_021)))
+                .expect("an admitted modern request may return a JSON-RPC handler error");
         assert!(matches!(modern, ServerHttpEndpointResponse::Immediate(_)));
         let before_era = session.selected_era;
         let before_dispatches = session
@@ -36148,9 +36101,9 @@ mod lib_unit_tests {
         assert_eq!(before_era, Some(ProtocolEra::Modern2026));
         assert!(session.legacy_adapter.is_none());
 
-        let rejected = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("cross-era request must become an HTTP rejection");
+        let rejected =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("cross-era request must become an HTTP rejection");
         assert!(matches!(
             rejected,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::BAD_REQUEST
@@ -36179,8 +36132,7 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("session must open before first-era admission");
 
-        let legacy = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+        let legacy = block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
             .expect("legacy SSE opening request must be admitted");
         assert!(matches!(legacy, ServerHttpEndpointResponse::LegacySse(_)));
         let before_era = session.selected_era;
@@ -36192,9 +36144,9 @@ mod lib_unit_tests {
             .len();
         assert_eq!(before_era, Some(ProtocolEra::Legacy2024));
 
-        let rejected = session
-            .handle(&cx, modern_http_json_tool_request("missing", 2_022))
-            .expect("cross-era request must become an HTTP rejection");
+        let rejected =
+            block_on(session.handle_async(&cx, modern_http_json_tool_request("missing", 2_022)))
+                .expect("cross-era request must become an HTTP rejection");
         assert!(matches!(
             rejected,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::BAD_REQUEST
@@ -36224,12 +36176,11 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
 
-        let response = session
-            .handle(
-                &cx,
-                extension_tasks_get_http_request(MODERN_PROTOCOL_VERSION),
-            )
-            .expect("exact modern extension request must be admitted and dispatched");
+        let response = block_on(session.handle_async(
+            &cx,
+            extension_tasks_get_http_request(MODERN_PROTOCOL_VERSION),
+        ))
+        .expect("exact modern extension request must be admitted and dispatched");
         let ServerHttpEndpointResponse::Immediate(response) = response else {
             panic!("modern JSON extension dispatch must produce an immediate HTTP response");
         };
@@ -38147,14 +38098,15 @@ mod lib_unit_tests {
             modern_http_json_tool_request("http_header_auth_probe", 945),
             HttpRequest::new(HttpMethod::Get, "/sse"),
         ] {
-            let response = session
-                .handle(
+            let response = block_on(
+                session.handle_async(
                     &cx,
                     request
                         .with_header("Authorization", format!("Bearer {}", probe.token))
                         .with_query("%61ccess_token", &probe.token),
-                )
-                .expect("credential refusal must be an HTTP response");
+                ),
+            )
+            .expect("credential refusal must be an HTTP response");
             assert!(
                 matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
             );
@@ -38162,13 +38114,14 @@ mod lib_unit_tests {
             assert_eq!(probe.effects(), (0, 0, 0));
         }
         cx.cancel_with(CancelKind::User, Some("cancel before HTTP authentication"));
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 modern_http_json_tool_request("http_header_auth_probe", 945)
                     .with_header("Authorization", format!("Bearer {}", probe.token)),
-            )
-            .expect("cancelled authentication must return an HTTP refusal");
+            ),
+        )
+        .expect("cancelled authentication must return an HTTP refusal");
         assert!(
             matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
         );
@@ -38179,13 +38132,14 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&Cx::for_testing())
             .expect("deadline probe must start with a fresh live session");
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &expired,
                 modern_http_json_tool_request("http_header_auth_probe", 945)
                     .with_header("Authorization", format!("Bearer {}", probe.token)),
-            )
-            .expect("expired authentication must return an HTTP refusal");
+            ),
+        )
+        .expect("expired authentication must return an HTTP refusal");
         assert!(
             matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
         );
@@ -42091,7 +42045,8 @@ mod lib_unit_tests {
             .open_session(cx)
             .map_err(|error| format!("legacy HTTP session did not open: {error}"))?;
         let ServerHttpEndpointResponse::LegacySse(mut stream) = owned
-            .handle(cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .handle_async(cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .await
             .map_err(|error| format!("legacy SSE admission failed: {error}"))?
         else {
             return Err("legacy GET did not return an SSE response body".to_owned());
@@ -43622,8 +43577,7 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let stream = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+        let stream = block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
             .expect("legacy SSE route must open");
         let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
             panic!("legacy GET must open an exact SSE stream");
@@ -43666,8 +43620,7 @@ mod lib_unit_tests {
         );
 
         for request in [initialize, initialized, call] {
-            let response = session
-                .handle(&cx, post(request))
+            let response = block_on(session.handle_async(&cx, post(request)))
                 .expect("advertised legacy POST must be dispatched");
             let ServerHttpEndpointResponse::Immediate(response) = response else {
                 panic!("legacy POST acknowledgement must be immediate");
@@ -43730,8 +43683,7 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
 
-        let denied = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+        let denied = block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
             .expect("unauthenticated GET must be answered");
         assert!(
             matches!(
@@ -43742,13 +43694,11 @@ mod lib_unit_tests {
             "GET /sse without a token must fail closed when a verifier is installed"
         );
 
-        let stream = session
-            .handle(
-                &cx,
-                HttpRequest::new(HttpMethod::Get, "/sse")
-                    .with_header("Authorization", "Bearer alpha"),
-            )
-            .expect("authenticated GET must open");
+        let stream = block_on(session.handle_async(
+            &cx,
+            HttpRequest::new(HttpMethod::Get, "/sse").with_header("Authorization", "Bearer alpha"),
+        ))
+        .expect("authenticated GET must open");
         let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
             panic!("authenticated GET must open an exact SSE stream");
         };
@@ -43806,8 +43756,7 @@ mod lib_unit_tests {
         );
 
         for request in [initialize, initialized] {
-            let response = session
-                .handle(&cx, post(request, "alpha"))
+            let response = block_on(session.handle_async(&cx, post(request, "alpha")))
                 .expect("opener POST must be dispatched");
             let ServerHttpEndpointResponse::Immediate(response) = response else {
                 panic!("legacy POST acknowledgement must be immediate");
@@ -43826,8 +43775,7 @@ mod lib_unit_tests {
                 if response.id == Some(311_i64.into()) && response.error.is_none()
         ));
 
-        let foreign = session
-            .handle(&cx, post(foreign_call, "beta"))
+        let foreign = block_on(session.handle_async(&cx, post(foreign_call, "beta")))
             .expect("foreign POST must be answered");
         let ServerHttpEndpointResponse::Immediate(foreign) = foreign else {
             panic!("foreign legacy POST acknowledgement must be immediate");
@@ -43844,8 +43792,7 @@ mod lib_unit_tests {
                 if response.id == Some(312_i64.into()) && response.error.is_some()
         ));
 
-        let owned = session
-            .handle(&cx, post(owned_call, "alpha"))
+        let owned = block_on(session.handle_async(&cx, post(owned_call, "alpha")))
             .expect("opener tool call must be dispatched");
         let ServerHttpEndpointResponse::Immediate(owned) = owned else {
             panic!("opener tool call acknowledgement must be immediate");
@@ -43879,9 +43826,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("legacy SSE route must open")
+        let ServerHttpEndpointResponse::LegacySse(mut stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
         else {
             panic!("legacy GET must open an exact SSE stream");
         };
@@ -43914,7 +43861,7 @@ mod lib_unit_tests {
             ),
         ] {
             assert!(matches!(
-                session.handle(&cx, post(request)),
+                block_on(session.handle_async(&cx, post(request))),
                 Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
             ));
         }
@@ -43937,7 +43884,7 @@ mod lib_unit_tests {
                 id,
             );
             assert!(matches!(
-                session.handle(&cx, post(call)),
+                block_on(session.handle_async(&cx, post(call))),
                 Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
             ));
         }
@@ -44026,9 +43973,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("legacy SSE route must open")
+        let ServerHttpEndpointResponse::LegacySse(mut stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
         else {
             panic!("legacy GET must open an exact SSE stream");
         };
@@ -44058,7 +44005,7 @@ mod lib_unit_tests {
             ),
         ] {
             assert!(matches!(
-                session.handle(&cx, post(request)),
+                block_on(session.handle_async(&cx, post(request))),
                 Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
             ));
         }
@@ -44113,9 +44060,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("legacy SSE route must open")
+        let ServerHttpEndpointResponse::LegacySse(mut stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
         else {
             panic!("legacy GET must open an exact SSE stream");
         };
@@ -44140,7 +44087,7 @@ mod lib_unit_tests {
             JsonRpcRequest::notification("notifications/initialized", None),
         ] {
             assert!(matches!(
-                session.handle(&cx, post(request)),
+                block_on(session.handle_async(&cx, post(request))),
                 Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
             ));
         }
@@ -44169,7 +44116,7 @@ mod lib_unit_tests {
             .with_query("session_id", session.legacy_session_id())
             .with_body(serde_json::to_vec(&response).expect("response must serialize"));
         assert!(matches!(
-            session.handle(&cx, response_post),
+            block_on(session.handle_async(&cx, response_post)),
             Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
         ));
         let roots = roots_task
@@ -44189,9 +44136,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let ServerHttpEndpointResponse::LegacySse(mut stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("legacy SSE route must open")
+        let ServerHttpEndpointResponse::LegacySse(mut stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
         else {
             panic!("legacy GET must open an exact SSE stream");
         };
@@ -44216,7 +44163,7 @@ mod lib_unit_tests {
             JsonRpcRequest::notification("notifications/initialized", None),
         ] {
             assert!(matches!(
-                session.handle(&cx, post(request)),
+                block_on(session.handle_async(&cx, post(request))),
                 Ok(ServerHttpEndpointResponse::Immediate(response)) if response.status == HttpStatus::ACCEPTED
             ));
         }
@@ -44243,8 +44190,7 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded live session");
-        let stream = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+        let stream = block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
             .expect("legacy SSE route must open");
         let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
             panic!("legacy GET must open an exact SSE stream");
@@ -44262,8 +44208,8 @@ mod lib_unit_tests {
             })),
             221_i64,
         );
-        let initialize_response = session
-            .handle(
+        let initialize_response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/messages")
                     .with_header("content-type", "application/json")
@@ -44272,8 +44218,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&initialize)
                             .expect("legacy initialize request must serialize"),
                     ),
-            )
-            .expect("correct-session initialize must dispatch");
+            ),
+        )
+        .expect("correct-session initialize must dispatch");
         assert!(matches!(
             initialize_response,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
@@ -44282,8 +44229,8 @@ mod lib_unit_tests {
             .recv_event(&cx)
             .expect("initialize response must be streamed before lifecycle advance");
         let initialized = JsonRpcRequest::notification("notifications/initialized", None);
-        let initialized_response = session
-            .handle(
+        let initialized_response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/messages")
                     .with_header("content-type", "application/json")
@@ -44292,8 +44239,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&initialized)
                             .expect("legacy initialized notification must serialize"),
                     ),
-            )
-            .expect("correct-session initialized notification must dispatch");
+            ),
+        )
+        .expect("correct-session initialized notification must dispatch");
         assert!(matches!(
             initialized_response,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
@@ -44319,8 +44267,7 @@ mod lib_unit_tests {
             .as_ref()
             .expect("initialize installs the exact legacy adapter")
             .snapshot();
-        let rejected = session
-            .handle(&cx, wrong_session)
+        let rejected = block_on(session.handle_async(&cx, wrong_session))
             .expect("wrong session must become an HTTP rejection");
         assert!(matches!(
             rejected,
@@ -44336,8 +44283,8 @@ mod lib_unit_tests {
             "changing only the session ID must not mutate the live exact lifecycle"
         );
 
-        let accepted = session
-            .handle(
+        let accepted = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/messages")
                     .with_header("content-type", "application/json")
@@ -44345,8 +44292,9 @@ mod lib_unit_tests {
                     .with_body(
                         serde_json::to_vec(&valid).expect("legacy tool request must serialize"),
                     ),
-            )
-            .expect("the otherwise identical correct-session request must dispatch");
+            ),
+        )
+        .expect("the otherwise identical correct-session request must dispatch");
         assert!(matches!(
             accepted,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED
@@ -44371,9 +44319,9 @@ mod lib_unit_tests {
         let mut session = endpoint
             .open_session(&cx)
             .expect("endpoint must open a bounded session");
-        let ServerHttpEndpointResponse::LegacySse(stream) = session
-            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
-            .expect("legacy SSE route must open")
+        let ServerHttpEndpointResponse::LegacySse(stream) =
+            block_on(session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")))
+                .expect("legacy SSE route must open")
         else {
             panic!("legacy GET must return a live body");
         };
@@ -48410,8 +48358,7 @@ mod lib_unit_tests {
 
         let request = modern_http_json_tool_request("http_session_disabling_tool", 901);
         for session in [&mut first_client, &mut second_client] {
-            let response = session
-                .handle(&cx, request.clone())
+            let response = block_on(session.handle_async(&cx, request.clone()))
                 .expect("each independently admitted modern session must dispatch its first call");
             let ServerHttpEndpointResponse::Immediate(response) = response else {
                 panic!("ordinary modern tool calls must return JSON responses");
@@ -48448,12 +48395,11 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("second modern HTTP session must open");
 
-        let first = first_client
-            .handle(
-                &cx,
-                modern_http_json_tool_request("http_session_disabling_tool", 903),
-            )
-            .expect("first session must dispatch the disabling call");
+        let first = block_on(first_client.handle_async(
+            &cx,
+            modern_http_json_tool_request("http_session_disabling_tool", 903),
+        ))
+        .expect("first session must dispatch the disabling call");
         assert!(matches!(
             first,
             ServerHttpEndpointResponse::Immediate(response)
@@ -48462,8 +48408,7 @@ mod lib_unit_tests {
         ));
 
         let comparison = modern_http_json_tool_request("http_session_disabling_tool", 904);
-        let rejected = first_client
-            .handle(&cx, comparison.clone())
+        let rejected = block_on(first_client.handle_async(&cx, comparison.clone()))
             .expect("same-session disablement must be represented as JSON-RPC");
         assert!(matches!(
             rejected,
@@ -48474,8 +48419,7 @@ mod lib_unit_tests {
                 })
         ));
 
-        let independent = second_client
-            .handle(&cx, comparison)
+        let independent = block_on(second_client.handle_async(&cx, comparison))
             .expect("changing only the client session must restore its independent state");
         assert!(matches!(
             independent,
@@ -48515,8 +48459,8 @@ mod lib_unit_tests {
             "notifications/progress",
             Some(serde_json::json!({"progressToken": "server-only", "progress": 1})),
         );
-        let rejected = session
-            .handle(
+        let rejected = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -48527,8 +48471,9 @@ mod lib_unit_tests {
                         serde_json::to_vec(&server_notification)
                             .expect("wrong-direction notification must encode"),
                     ),
-            )
-            .expect("native HTTP must reject the wrong-direction notification");
+            ),
+        )
+        .expect("native HTTP must reject the wrong-direction notification");
         assert!(matches!(
             rejected,
             ServerHttpEndpointResponse::Immediate(HttpResponse {
@@ -48551,13 +48496,14 @@ mod lib_unit_tests {
             "rejected native HTTP notification must not allocate a request session"
         );
 
-        let accepted = session
-            .handle(
+        let accepted = block_on(
+            session.handle_async(
                 &cx,
                 modern_http_json_tool_request("modern_http_auth_counter", 947)
                     .with_header("authorization", "Bearer alpha"),
-            )
-            .expect("the same HTTP session must remain usable after rejection");
+            ),
+        )
+        .expect("the same HTTP session must remain usable after rejection");
         assert!(matches!(
             accepted,
             ServerHttpEndpointResponse::Immediate(response)
@@ -48593,13 +48539,14 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("modern endpoint session must open");
 
-        let allowed = session
-            .handle(
+        let allowed = block_on(
+            session.handle_async(
                 &cx,
                 modern_http_json_tool_request("modern_http_auth_counter", 931)
                     .with_header("authorization", "Bearer alpha"),
-            )
-            .expect("allowed bearer must dispatch");
+            ),
+        )
+        .expect("allowed bearer must dispatch");
         let ServerHttpEndpointResponse::Immediate(allowed) = allowed else {
             panic!("ordinary authenticated modern HTTP must return JSON");
         };
@@ -48611,13 +48558,14 @@ mod lib_unit_tests {
         assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
         assert!(!saw_credential.load(Ordering::Acquire));
 
-        let rejected = session
-            .handle(
+        let rejected = block_on(
+            session.handle_async(
                 &cx,
                 modern_http_json_tool_request("modern_http_auth_counter", 932)
                     .with_header("authorization", "Bearer beta"),
-            )
-            .expect("a principal mismatch must be represented as JSON-RPC");
+            ),
+        )
+        .expect("a principal mismatch must be represented as JSON-RPC");
         let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
             panic!("principal mismatch must not admit an SSE body");
         };
@@ -48672,9 +48620,9 @@ mod lib_unit_tests {
                 .with_header("authorization", format!("Bearer {bearer}"))
         };
 
-        let ServerHttpEndpointResponse::ModernSse(allowed) = session
-            .handle(&cx, request(933, "alpha"))
-            .expect("allowed bearer must admit an owned SSE dispatch")
+        let ServerHttpEndpointResponse::ModernSse(allowed) =
+            block_on(session.handle_async(&cx, request(933, "alpha")))
+                .expect("allowed bearer must admit an owned SSE dispatch")
         else {
             panic!("SSE request must retain its owned response body");
         };
@@ -48694,9 +48642,9 @@ mod lib_unit_tests {
         assert_eq!(handler_calls.load(Ordering::Acquire), 1);
         assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
 
-        let ServerHttpEndpointResponse::ModernSse(rejected) = session
-            .handle(&cx, request(934, "beta"))
-            .expect("principal mismatch must retain the protocol-selected SSE body")
+        let ServerHttpEndpointResponse::ModernSse(rejected) =
+            block_on(session.handle_async(&cx, request(934, "beta")))
+                .expect("principal mismatch must retain the protocol-selected SSE body")
         else {
             panic!("SSE admission must preserve its owned response path");
         };
@@ -49041,13 +48989,14 @@ mod lib_unit_tests {
             .open_session(&cx)
             .expect("valid retry modern HTTP session must open");
 
-        let initial = issuing_client
-            .handle(
+        let initial = block_on(
+            issuing_client.handle_async(
                 &cx,
                 modern_http_json_tool_request("live_http_mrtr", 906)
                     .with_header("authorization", "Bearer alpha"),
-            )
-            .expect("the issuing session must receive an input-required response");
+            ),
+        )
+        .expect("the issuing session must receive an input-required response");
         let ServerHttpEndpointResponse::Immediate(initial) = initial else {
             panic!("ordinary MRTR requests must return JSON responses");
         };
@@ -49094,18 +49043,17 @@ mod lib_unit_tests {
             };
 
         let forged_state = format!("{request_state}-foreign");
-        let forged = issuing_client
-            .handle(
-                &cx,
-                retry(
-                    &forged_state,
-                    "live_http_mrtr",
-                    serde_json::json!({}),
-                    907,
-                    "alpha",
-                ),
-            )
-            .expect("forged MRTR state must receive a JSON-RPC rejection");
+        let forged = block_on(issuing_client.handle_async(
+            &cx,
+            retry(
+                &forged_state,
+                "live_http_mrtr",
+                serde_json::json!({}),
+                907,
+                "alpha",
+            ),
+        ))
+        .expect("forged MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
             forged,
             ServerHttpEndpointResponse::Immediate(response)
@@ -49120,18 +49068,17 @@ mod lib_unit_tests {
         );
         assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
 
-        let target_mismatch = other_client
-            .handle(
-                &cx,
-                retry(
-                    &request_state,
-                    "other_live_http_mrtr",
-                    serde_json::json!({}),
-                    908,
-                    "alpha",
-                ),
-            )
-            .expect("a target-mismatched MRTR retry must receive a JSON-RPC rejection");
+        let target_mismatch = block_on(other_client.handle_async(
+            &cx,
+            retry(
+                &request_state,
+                "other_live_http_mrtr",
+                serde_json::json!({}),
+                908,
+                "alpha",
+            ),
+        ))
+        .expect("a target-mismatched MRTR retry must receive a JSON-RPC rejection");
         assert!(matches!(
             target_mismatch,
             ServerHttpEndpointResponse::Immediate(response)
@@ -49150,18 +49097,17 @@ mod lib_unit_tests {
             "a target-binding rejection must leave the issued state available",
         );
 
-        let argument_mismatch = argument_client
-            .handle(
-                &cx,
-                retry(
-                    &request_state,
-                    "live_http_mrtr",
-                    serde_json::json!({"city": "Cambridge"}),
-                    909,
-                    "alpha",
-                ),
-            )
-            .expect("an argument-mismatched MRTR retry must receive a JSON-RPC rejection");
+        let argument_mismatch = block_on(argument_client.handle_async(
+            &cx,
+            retry(
+                &request_state,
+                "live_http_mrtr",
+                serde_json::json!({"city": "Cambridge"}),
+                909,
+                "alpha",
+            ),
+        ))
+        .expect("an argument-mismatched MRTR retry must receive a JSON-RPC rejection");
         assert!(matches!(
             argument_mismatch,
             ServerHttpEndpointResponse::Immediate(response)
@@ -49180,18 +49126,17 @@ mod lib_unit_tests {
             "an argument-binding rejection must leave the issued state available",
         );
 
-        let principal_mismatch = principal_client
-            .handle(
-                &cx,
-                retry(
-                    &request_state,
-                    "live_http_mrtr",
-                    serde_json::json!({}),
-                    910,
-                    "beta",
-                ),
-            )
-            .expect("a principal-mismatched MRTR retry must receive a JSON-RPC rejection");
+        let principal_mismatch = block_on(principal_client.handle_async(
+            &cx,
+            retry(
+                &request_state,
+                "live_http_mrtr",
+                serde_json::json!({}),
+                910,
+                "beta",
+            ),
+        ))
+        .expect("a principal-mismatched MRTR retry must receive a JSON-RPC rejection");
         assert!(matches!(
             principal_mismatch,
             ServerHttpEndpointResponse::Immediate(response)
@@ -49217,8 +49162,7 @@ mod lib_unit_tests {
             911,
             "alpha",
         );
-        let resumed = valid_client
-            .handle(&cx, valid_retry.clone())
+        let resumed = block_on(valid_client.handle_async(&cx, valid_retry.clone()))
             .expect("a later stateless session with the bound request must resume");
         assert!(matches!(
             resumed,
@@ -49232,8 +49176,7 @@ mod lib_unit_tests {
         ));
         assert_eq!(calls.load(Ordering::Acquire), 2);
 
-        let replay = issuing_client
-            .handle(&cx, valid_retry)
+        let replay = block_on(issuing_client.handle_async(&cx, valid_retry))
             .expect("a consumed MRTR state must receive a JSON-RPC rejection");
         assert!(matches!(
             replay,
@@ -49295,8 +49238,7 @@ mod lib_unit_tests {
                 .with_body(serde_json::to_vec(&request).expect("elicitation request must encode"))
         };
 
-        let initial = issuing_client
-            .handle(&cx, request(None, 912))
+        let initial = block_on(issuing_client.handle_async(&cx, request(None, 912)))
             .expect("stateless elicitation must return input_required");
         let ServerHttpEndpointResponse::Immediate(initial) = initial else {
             panic!("ordinary stateless elicitation must use the JSON response lane");
@@ -49321,9 +49263,9 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
 
-        let rejected = retrying_client
-            .handle(&cx, request(Some(request_state), 913))
-            .expect("stateless elicitation retry must receive a JSON-RPC rejection");
+        let rejected =
+            block_on(retrying_client.handle_async(&cx, request(Some(request_state), 913)))
+                .expect("stateless elicitation retry must receive a JSON-RPC rejection");
         let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
             panic!("stateless elicitation retry rejection must use the JSON response lane");
         };
@@ -49380,8 +49322,8 @@ mod lib_unit_tests {
             })),
             811_i64,
         );
-        let ServerHttpEndpointResponse::ModernSse(sse) = session
-            .handle(
+        let ServerHttpEndpointResponse::ModernSse(sse) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49390,9 +49332,9 @@ mod lib_unit_tests {
                     .with_header("mcp-method", "tools/call")
                     .with_header("mcp-name", "http_request_scoped_progress")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("notification-capable modern request must dispatch over SSE")
-        else {
+            ),
+        )
+        .expect("notification-capable modern request must dispatch over SSE") else {
             panic!("notification-capable modern request must select SSE");
         };
 
@@ -49550,15 +49492,17 @@ mod lib_unit_tests {
         );
 
         set_forced_http_sse_would_block_commits(MAX_HTTP_SSE_COMMIT_RETRIES + 1);
-        let result = session.handle(
-            &cx,
-            HttpRequest::new(HttpMethod::Post, "/mcp")
-                .with_header("content-type", "application/json")
-                .with_header("accept", "text/event-stream")
-                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-                .with_header("mcp-method", "tools/call")
-                .with_header("mcp-name", "http_request_scoped_progress")
-                .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+        let result = block_on(
+            session.handle_async(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "text/event-stream")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", "http_request_scoped_progress")
+                    .with_body(serde_json::to_vec(&request).expect("final request must encode")),
+            ),
         );
         let remaining = forced_http_sse_would_block_commits_remaining();
         set_forced_http_sse_would_block_commits(0);
@@ -49600,8 +49544,8 @@ mod lib_unit_tests {
             })),
             812_i64,
         );
-        let ServerHttpEndpointResponse::ModernSse(sse) = session
-            .handle(
+        let ServerHttpEndpointResponse::ModernSse(sse) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49610,9 +49554,9 @@ mod lib_unit_tests {
                     .with_header("mcp-method", "tools/call")
                     .with_header("mcp-name", "http_final_progress_cancellation")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("cancelled modern request must retain its owned SSE body")
-        else {
+            ),
+        )
+        .expect("cancelled modern request must retain its owned SSE body") else {
             panic!("cancelled modern request must select SSE");
         };
 
@@ -49664,8 +49608,8 @@ mod lib_unit_tests {
             })),
             811_i64,
         );
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49674,8 +49618,9 @@ mod lib_unit_tests {
                     .with_header("mcp-method", "tools/call")
                     .with_header("mcp-name", "http_request_scoped_progress")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("zero-quality SSE request must be rejected before dispatch");
+            ),
+        )
+        .expect("zero-quality SSE request must be rejected before dispatch");
         assert!(matches!(
             response,
             ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::NOT_ACCEPTABLE
@@ -49714,8 +49659,8 @@ mod lib_unit_tests {
             })),
             812_i64,
         );
-        let response = session
-            .handle(
+        let response = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49724,8 +49669,9 @@ mod lib_unit_tests {
                     .with_header("mcp-method", "tools/call")
                     .with_header("mcp-name", "http_request_scoped_progress")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("ordinary JSON-only request must dispatch");
+            ),
+        )
+        .expect("ordinary JSON-only request must dispatch");
         let ServerHttpEndpointResponse::Immediate(response) = response else {
             panic!("ordinary JSON-only request must retain its one-response representation");
         };
@@ -49762,8 +49708,8 @@ mod lib_unit_tests {
             })),
             91_i64,
         );
-        let ServerHttpEndpointResponse::ModernSse(sse) = session
-            .handle(
+        let ServerHttpEndpointResponse::ModernSse(sse) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49771,9 +49717,9 @@ mod lib_unit_tests {
                     .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                     .with_header("mcp-method", "tools/list")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("public modern request must dispatch")
-        else {
+            ),
+        )
+        .expect("public modern request must dispatch") else {
             panic!("public modern request must return an SSE body");
         };
         let log = sse
@@ -49838,8 +49784,8 @@ mod lib_unit_tests {
             })),
             91_i64,
         );
-        let ServerHttpEndpointResponse::ModernSse(sse) = session
-            .handle(
+        let ServerHttpEndpointResponse::ModernSse(sse) = block_on(
+            session.handle_async(
                 &cx,
                 HttpRequest::new(HttpMethod::Post, "/mcp")
                     .with_header("content-type", "application/json")
@@ -49847,9 +49793,9 @@ mod lib_unit_tests {
                     .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                     .with_header("mcp-method", "tools/list")
                     .with_body(serde_json::to_vec(&request).expect("final request must encode")),
-            )
-            .expect("public modern request must dispatch")
-        else {
+            ),
+        )
+        .expect("public modern request must dispatch") else {
             panic!("public modern request must return an SSE body");
         };
         assert!(
@@ -50460,10 +50406,12 @@ mod lib_unit_tests {
                     )
             };
             let first = first_session
-                .handle(&cx, listen_request())
+                .handle_async(&cx, listen_request())
+                .await
                 .map_err(|error| format!("first public listen failed: {error}"))?;
             let second = second_session
-                .handle(&cx, listen_request())
+                .handle_async(&cx, listen_request())
+                .await
                 .map_err(|error| format!("second public listen failed: {error}"))?;
             let ServerHttpEndpointResponse::ModernSse(first_sse) = first else {
                 return Err("first public listen did not return SSE".to_owned());
@@ -50505,7 +50453,7 @@ mod lib_unit_tests {
                 })),
             );
             let rejected = rejected_session
-                .handle(
+                .handle_async(
                     &cx,
                     HttpRequest::new(HttpMethod::Post, "/mcp")
                         .with_header("content-type", "application/json")
@@ -50517,6 +50465,7 @@ mod lib_unit_tests {
                                 .expect("typed cancellation notification must serialize"),
                         ),
                 )
+                .await
                 .map_err(|error| format!("cancellation rejection failed: {error}"))?;
             let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
                 return Err(
@@ -50681,7 +50630,7 @@ mod lib_unit_tests {
                 RequestId::Number(889),
             );
             let response = session
-                .handle(
+                .handle_async(
                     &cx,
                     HttpRequest::new(HttpMethod::Post, "/mcp")
                         .with_header("content-type", "application/json")
@@ -50693,6 +50642,7 @@ mod lib_unit_tests {
                                 .expect("typed listen request must serialize"),
                         ),
                 )
+                .await
                 .map_err(|error| format!("public listen failed: {error}"))?;
             let ServerHttpEndpointResponse::ModernSse(sse) = response else {
                 return Err("public listen did not return SSE".to_owned());
