@@ -516,10 +516,46 @@ impl ReverseRequestHandlers {
                         member.name
                     ))
                 })?;
-            let value = self
-                .invoke_embedded_input_request_async(cx, &member.name, request)
-                .await?;
+            let cancellation = ReverseRequestCancellation::new();
+            let mut callback = Box::pin(self.invoke_embedded_input_request_async(
+                cx,
+                &member.name,
+                request,
+                cancellation.clone(),
+            ));
+            // Declared after the callback so cancellation is recorded before
+            // dropping its future on every abandonment path.
+            let owner = MrtrCallbackOwner(cancellation);
+            let mut wake = Box::pin(asupersync::time::sleep(
+                cx.now(),
+                REVERSE_CALLBACK_POLL_SLICE,
+            ));
+            let value = std::future::poll_fn(|task_cx| {
+                if let Err(error) = checkpoint() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                let polled = catch_client_callback_unwind(|| callback.as_mut().poll(task_cx))
+                    .unwrap_or_else(|_| {
+                        std::task::Poll::Ready(Err(McpError::internal_error(
+                            "Client reverse request handler failed",
+                        )))
+                    });
+                // Cancellation can win inside the callback's completing poll.
+                if let Err(error) = checkpoint() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                if polled.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
+                    wake.set(asupersync::time::sleep(
+                        cx.now(),
+                        REVERSE_CALLBACK_POLL_SLICE,
+                    ));
+                    task_cx.waker().wake_by_ref();
+                }
+                polled
+            })
+            .await?;
             checkpoint()?;
+            owner.0.record_response_sent();
             responses.insert(member.name.clone(), value);
         }
         Ok(responses)
@@ -594,6 +630,7 @@ impl ReverseRequestHandlers {
         cx: &Cx,
         input_key: &str,
         request: FinalEmbeddedInputRequest,
+        cancellation: ReverseRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         match request {
             FinalEmbeddedInputRequest::Sampling(params) => {
@@ -604,7 +641,7 @@ impl ReverseRequestHandlers {
                 };
                 let result = handler(
                     cx,
-                    ReverseRequestCancellation::new(),
+                    cancellation,
                     final_create_message_params_from_embedded(params),
                 )
                 .await?;
@@ -620,7 +657,7 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed roots/list reverse handler"
                     )));
                 };
-                let result = handler(cx, ReverseRequestCancellation::new(), params).await?;
+                let result = handler(cx, cancellation, params).await?;
                 serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR roots input response could not serialize: {error}"
@@ -635,7 +672,7 @@ impl ReverseRequestHandlers {
                 };
                 let result = handler(
                     cx,
-                    ReverseRequestCancellation::new(),
+                    cancellation,
                     elicit_request_params_from_embedded(input_key, params),
                 )
                 .await?;
@@ -2918,6 +2955,16 @@ const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const REVERSE_CALLBACK_SHUTDOWN_POLLS: usize = 25;
 const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR: &str =
     "Client reverse callback workers did not stop within the shutdown bound";
+
+/// Owns one local MRTR callback until its value is accepted. Cancelling this
+/// token does not cancel the caller's Cx or any sibling request.
+struct MrtrCallbackOwner(ReverseRequestCancellation);
+
+impl Drop for MrtrCallbackOwner {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 struct ActiveReverseCallback {
     request_id: RequestId,
@@ -27788,6 +27835,364 @@ mod tests {
             CoreResult::Final(FinalCoreResult::ToolsCall { .. })
         ));
         server.join().expect("public call_tool MRTR peer must join");
+    }
+
+    #[cfg(unix)]
+    struct MrtrCallbackProbeState {
+        mode: AtomicUsize,
+        entered: AtomicBool,
+        permit: AtomicBool,
+        dropped: AtomicUsize,
+        cancelled_at_drop: AtomicBool,
+        token: Mutex<Option<ReverseRequestCancellation>>,
+        wake: Mutex<Option<std::task::Waker>>,
+        request_cancellation: McpRequestCancellation,
+    }
+
+    #[cfg(unix)]
+    fn mrtr_callback_probe_wait<T: Send + 'static>(
+        state: Arc<MrtrCallbackProbeState>,
+        cancellation: ReverseRequestCancellation,
+        value: T,
+    ) -> ReverseRequestFuture<'static, T> {
+        let mode = state.mode.load(Ordering::Acquire);
+        *state.token.lock().unwrap() = Some(cancellation.clone());
+        state.entered.store(true, Ordering::Release);
+        if mode == 4 {
+            panic!("private callback creation payload");
+        }
+        Box::pin(async move {
+            struct OnDrop(Arc<MrtrCallbackProbeState>, ReverseRequestCancellation);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0
+                        .cancelled_at_drop
+                        .store(self.1.is_cancel_requested(), Ordering::Release);
+                    self.0.dropped.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            let _drop = OnDrop(Arc::clone(&state), cancellation);
+            std::future::poll_fn(|cx| {
+                if state.permit.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(())
+                } else {
+                    // The cancellation/deadline negatives deliberately never
+                    // arrange a callback wake. The framework must observe them.
+                    if mode != 1 && mode != 2 {
+                        *state.wake.lock().unwrap() = Some(cx.waker().clone());
+                    }
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if mode == 5 {
+                panic!("private callback resumed payload");
+            }
+            if mode == 6 {
+                state.request_cancellation.cancel();
+            }
+            Ok(value)
+        })
+    }
+
+    #[cfg(unix)]
+    async fn invoke_http_mrtr_callback_probe(
+        client: &mut HttpClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        verb: usize,
+        target: &str,
+    ) -> Result<CoreResult, HttpClientError> {
+        match verb {
+            0 => {
+                client
+                    .call_tool_with_cancellation(
+                        cx,
+                        cancellation,
+                        target,
+                        serde_json::json!({"subject":target}),
+                    )
+                    .await
+            }
+            1 => {
+                client
+                    .read_resource_with_cancellation(cx, cancellation, target)
+                    .await
+            }
+            2 => {
+                client
+                    .get_prompt_with_cancellation(
+                        cx,
+                        cancellation,
+                        target,
+                        std::collections::HashMap::from([(
+                            "subject".to_owned(),
+                            target.to_owned(),
+                        )]),
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn public_http_mrtr_callback_caller_runtime_probe(verb: usize, mode: usize) {
+        use std::task::Poll;
+
+        // 0=success, 1=cancel, 2=deadline, 3=drop, 4=creation panic,
+        // 5=panic after await, 6=cancel in the completing callback poll.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let root_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let limited = runtime.request_cx_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(root_cx.now() + Duration::from_secs(2)),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let subject = format!("callback-{}-{verb}-{mode}", address.port());
+        let target = if verb == 1 {
+            format!("file:///{subject}")
+        } else {
+            subject.clone()
+        };
+        let method = ["tools/call", "resources/read", "prompts/get"][verb];
+        let complete = match verb {
+            0 => {
+                serde_json::json!({"resultType":"complete","content":[{"type":"text","text":subject}]})
+            }
+            1 => {
+                serde_json::json!({"resultType":"complete","contents":[{"uri":target,"text":subject}],"ttlMs":0,"cacheScope":"private"})
+            }
+            2 => {
+                serde_json::json!({"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":subject}}]})
+            }
+            _ => unreachable!(),
+        };
+        let descriptor = match verb {
+            0 => {
+                serde_json::json!({"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":subject}}],"maxTokens":8}})
+            }
+            1 => serde_json::json!({"method":"roots/list"}),
+            2 => {
+                serde_json::json!({"method":"elicitation/create","params":{"mode":"form","message":subject,"requestedSchema":{"type":"object","properties":{"subject":{"type":"string"}},"required":["subject"]}}})
+            }
+            _ => unreachable!(),
+        };
+        let peer_subject = subject.clone();
+        let peer_target = target.clone();
+        let peer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let accept = || loop {
+                assert!(Instant::now() < deadline, "native MRTR peer is bounded");
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        break stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("native MRTR accept: {error}"),
+                }
+            };
+            let mut stream = accept();
+            let discovery = read_http_cache_test_request(&mut stream);
+            assert_eq!(discovery["method"], "server/discover");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                modern_discovery_response(&peer_subject, &[MODERN_PROTOCOL_VERSION]).as_bytes(),
+            );
+            let mut initial_parameters = None;
+            let requests = if mode == 0 { 2 } else { 3 };
+            for index in 0..requests {
+                let mut stream = accept();
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], index + 2);
+                assert_eq!(request["method"], method);
+                assert_eq!(
+                    request["params"][if verb == 1 { "uri" } else { "name" }],
+                    peer_target
+                );
+                let continuation = index == requests - 1;
+                let mut parameters = request["params"].clone();
+                let object = parameters.as_object_mut().unwrap();
+                object.remove("_meta");
+                object.remove("requestState");
+                object.remove("inputResponses");
+                if let Some(initial) = &initial_parameters {
+                    assert_eq!(&parameters, initial);
+                } else {
+                    initial_parameters = Some(parameters);
+                }
+                let result = if continuation {
+                    assert_eq!(
+                        request["params"]["requestState"],
+                        format!("{peer_subject}-{}", index + 1)
+                    );
+                    let responses = request["params"]["inputResponses"].as_object().unwrap();
+                    assert_eq!(responses.len(), 1);
+                    match verb {
+                        0 => {
+                            assert_eq!(responses["input"]["model"], peer_subject);
+                            assert_eq!(responses["input"]["content"]["text"], peer_subject);
+                        }
+                        1 => assert_eq!(responses["input"]["roots"][0]["uri"], peer_target),
+                        2 => {
+                            assert_eq!(responses["input"]["action"], "accept");
+                            assert_eq!(responses["input"]["content"]["subject"], peer_subject);
+                        }
+                        _ => unreachable!(),
+                    }
+                    complete.clone()
+                } else {
+                    assert!(
+                        request["params"].get("inputResponses").is_none(),
+                        "abandoned callback must not send a continuation"
+                    );
+                    assert!(request["params"].get("requestState").is_none());
+                    serde_json::json!({"resultType":"input_required","inputRequests":{"input":descriptor},"requestState":format!("{peer_subject}-{}",index+2)})
+                };
+                let response = serde_json::json!({"jsonrpc":"2.0","id":index+2,"result":result});
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
+            }
+        });
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let siblings = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let worker = std::thread::current().id();
+                let state = Arc::new(MrtrCallbackProbeState {
+                    mode: AtomicUsize::new(mode), entered: AtomicBool::new(false), permit: AtomicBool::new(false),
+                    dropped: AtomicUsize::new(0), cancelled_at_drop: AtomicBool::new(false), token: Mutex::new(None),
+                    wake: Mutex::new(None), request_cancellation: McpRequestCancellation::new(),
+                });
+                let handlers = match verb {
+                    0 => {
+                        let state = Arc::clone(&state); let subject = subject.clone();
+                        ReverseRequestHandlers::new().with_modern_sampling_create_message(move |_cx, token, _params| {
+                            mrtr_callback_probe_wait(Arc::clone(&state), token, FinalCreateMessageResult {
+                                content: fastmcp_protocol::FinalSamplingMessageContent::Block(fastmcp_protocol::common_types::SamplingContentBlock::Text { text: subject.clone(), annotations: None, meta: None, additional: BTreeMap::new() }),
+                                model: subject.clone(), role: fastmcp_protocol::Role::Assistant, stop_reason: None, meta: None,
+                            })
+                        })
+                    }
+                    1 => {
+                        let state = Arc::clone(&state); let target = target.clone();
+                        ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, token, _params| {
+                            mrtr_callback_probe_wait(Arc::clone(&state), token, FinalEmbeddedRootsListResult { roots: vec![fastmcp_protocol::Root::new(&target)] })
+                        })
+                    }
+                    2 => {
+                        let state = Arc::clone(&state); let subject = subject.clone();
+                        ReverseRequestHandlers::new().with_modern_elicitation_create(move |_cx, token, _params| {
+                            mrtr_callback_probe_wait(Arc::clone(&state), token, ElicitResult::accept(std::collections::HashMap::from([("subject".to_owned(),fastmcp_protocol::ElicitContentValue::String(subject.clone()))])))
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(http_cache_test_plan(&format!("http://{address}/mcp")))
+                    .reverse_request_handlers(handlers).connect_http_client_with_cx(&cx).await.unwrap();
+                for attempt in 0..if mode == 0 { 1 } else { 2 } {
+                    let current = if attempt == 0 { mode } else { 0 };
+                    state.mode.store(current, Ordering::Release);
+                    state.entered.store(false, Ordering::Release);
+                    state.permit.store(false, Ordering::Release);
+                    let cancellation = if attempt == 0 { state.request_cancellation.clone() } else { McpRequestCancellation::new() };
+                    let operation_cx = if current == 2 { &limited } else { &cx };
+                    let mut operation = Box::pin(invoke_http_mrtr_callback_probe(&mut client, operation_cx, &cancellation, verb, &target));
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut early = None;
+                    loop {
+                        let polled = std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx))).await;
+                        if let Poll::Ready(result) = polled {
+                            assert_eq!(current, 4, "only creation panic may finish before sibling release: {result:?}");
+                            early = Some(result); break;
+                        }
+                        if state.entered.load(Ordering::Acquire) { break; }
+                        assert!(Instant::now() < deadline, "native response reaches installed callback");
+                        asupersync::runtime::yield_now().await;
+                    }
+                    let retained = state.token.lock().unwrap().as_ref().unwrap().clone();
+                    let dropped_before = state.dropped.load(Ordering::Acquire);
+                    let observed = if current == 3 {
+                        drop(operation); None
+                    } else if let Some(result) = early {
+                        drop(operation); Some(result)
+                    } else {
+                        let sibling_state = Arc::clone(&state);
+                        let mut sibling = siblings.spawn(move |_| async move {
+                            assert_eq!(std::thread::current().id(), worker);
+                            match current {
+                                1 => { sibling_state.request_cancellation.cancel(); }
+                                2 => {}
+                                _ => {
+                                    sibling_state.permit.store(true, Ordering::Release);
+                                    if let Some(wake) = sibling_state.wake.lock().unwrap().take() { wake.wake(); }
+                                }
+                            }
+                        }).unwrap();
+                        let result = asupersync::time::timeout(cx.now(), Duration::from_secs(5), operation).await.expect("callback wait settles within its bound");
+                        sibling.join(&siblings).await.unwrap();
+                        Some(result)
+                    };
+                    if current == 0 {
+                        let result = observed.unwrap().unwrap();
+                        assert_eq!(result.method(), method);
+                        assert!(mrtr_input_required_for_method(method, &result).is_none());
+                        assert!(!retained.is_cancel_requested());
+                    } else {
+                        if let Some(result) = observed {
+                            let HttpClientError::CoreResult(error) = result.unwrap_err() else { panic!("local callback errors retain their typed class"); };
+                            assert_eq!(error.code, if current == 4 || current == 5 { McpErrorCode::InternalError } else { McpErrorCode::RequestCancelled });
+                            if current == 4 || current == 5 { assert_eq!(error.message, "Client reverse request handler failed"); }
+                        }
+                        assert!(retained.is_cancel_requested(), "abandoned callback token is cancelled");
+                        if (1..=3).contains(&current) {
+                            assert_eq!(state.dropped.load(Ordering::Acquire), dropped_before + 1);
+                            assert!(state.cancelled_at_drop.load(Ordering::Acquire), "token is cancelled before dropping callback state");
+                        }
+                    }
+                    assert!(!cx.is_cancel_requested(), "callback interruption cannot cancel the ambient sibling domain");
+                }
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        peer.join().unwrap();
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_callback_caller_runtime_positive() {
+        for verb in 0..3 {
+            public_http_mrtr_callback_caller_runtime_probe(verb, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_callback_caller_runtime_planted_negative() {
+        for verb in 0..3 {
+            for mode in 1..=6 {
+                public_http_mrtr_callback_caller_runtime_probe(verb, mode);
+            }
+        }
     }
 
     #[cfg(unix)]

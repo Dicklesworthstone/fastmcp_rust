@@ -490,6 +490,12 @@ and connection-ending cancellation rules. Each
 retry carries the original arguments and only the latest continuation state.
 Without installed handlers, the input-required result is returned to the caller.
 
+Installed modern MRTR callbacks also remain cancellable while pending in HTTP
+and WebSocket clients, including callbacks that never wake themselves. Dropping
+or interrupting a callback cancels its local token and prevents a continuation;
+callback panics become redacted errors. These checks run between callback polls
+and cannot preempt synchronous work or undo external effects inside user code.
+
 With the `tasks` feature on Unix, `Client::call_tool_final_outcome_with_cx`
 creates tasks without blocking the runtime while waiting for the peer. It
 returns the typed complete, task, or input-required outcome. A returned task ID
