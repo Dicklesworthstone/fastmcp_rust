@@ -1446,7 +1446,7 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
-    /// Starts a modern stdio MRTR request on the shared ingress.
+    /// Starts a modern stdio core request on the shared ingress.
     #[doc(hidden)]
     fn start_final_stdio_request(
         &mut self,
@@ -2658,8 +2658,21 @@ impl ProxyBackend for Client {
             inbound_logging_level(ctx),
             inbound_client_capabilities(ctx),
         );
-        self.start_yielding_final_mrtr_request(ctx.cx(), method, parameters, allow_tasks)
-            .map(Some)
+        if matches!(
+            method,
+            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        ) {
+            if allow_tasks {
+                return Err(McpError::invalid_params(
+                    "Catalog requests cannot admit Tasks",
+                ));
+            }
+            self.start_yielding_final_catalog_request(ctx.cx(), method, parameters)
+                .map(Some)
+        } else {
+            self.start_yielding_final_mrtr_request(ctx.cx(), method, parameters, allow_tasks)
+                .map(Some)
+        }
     }
 
     fn poll_final_stdio_request(
@@ -8266,25 +8279,20 @@ impl ProxyClient {
         Ok(catalog)
     }
 
-    /// Fetches a typed HTTP catalog on the caller's runtime, releasing the
-    /// route lock before every network wait. All pages must succeed before a
-    /// catalog is returned. Custom and stdio backends retain their synchronous
-    /// catalog implementation; their connection initialization is separate.
+    /// Fetches a typed native HTTP or stdio catalog on the caller's runtime.
+    /// Releases the route lock before HTTP waits and between bounded stdio
+    /// ingress turns. All pages must succeed before a catalog is returned.
+    /// Backends without an upstream binding retain their synchronous catalog.
     pub async fn catalog_typed_with_cx(&self, cx: &Cx) -> McpResult<ProxyTypedCatalog> {
         let ctx = McpContext::new(cx.clone(), 0);
         ctx.checkpoint()?;
-        let Some(binding) = self.upstream_binding.filter(|binding| {
-            matches!(
-                binding.adapter(),
-                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::LegacyHttpSse
-            )
-        }) else {
+        let Some(binding) = self.upstream_binding else {
             return self.catalog_typed();
         };
         let catalog = match binding.era() {
             ProtocolEra::Modern2026 => ProxyTypedCatalog {
                 tools: ProxyToolCatalog::Final(
-                    self.collect_http_catalog_pages(&ctx, "tools/list", |result| {
+                    self.collect_catalog_pages(&ctx, "tools/list", |result| {
                         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result
                         else {
                             return Err(unexpected_proxy_result("tools/list"));
@@ -8299,7 +8307,7 @@ impl ProxyClient {
                     .await?,
                 ),
                 resources: ProxyResourceCatalog::Final(
-                    self.collect_http_catalog_pages(&ctx, "resources/list", |result| {
+                    self.collect_catalog_pages(&ctx, "resources/list", |result| {
                         let CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) =
                             result
                         else {
@@ -8315,7 +8323,7 @@ impl ProxyClient {
                     .await?,
                 ),
                 resource_templates: ProxyResourceTemplateCatalog::Final(
-                    self.collect_http_catalog_pages(&ctx, "resources/templates/list", |result| {
+                    self.collect_catalog_pages(&ctx, "resources/templates/list", |result| {
                         let CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                             result,
                             ..
@@ -8333,7 +8341,7 @@ impl ProxyClient {
                     .await?,
                 ),
                 prompts: ProxyPromptCatalog::Final(
-                    self.collect_http_catalog_pages(&ctx, "prompts/list", |result| {
+                    self.collect_catalog_pages(&ctx, "prompts/list", |result| {
                         let CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) = result
                         else {
                             return Err(unexpected_proxy_result("prompts/list"));
@@ -8353,7 +8361,7 @@ impl ProxyClient {
                 self.start_legacy_receive_pump()?;
                 ProxyTypedCatalog {
                     tools: ProxyToolCatalog::Legacy(
-                        self.collect_http_catalog_pages(&ctx, "tools/list", |result| {
+                        self.collect_catalog_pages(&ctx, "tools/list", |result| {
                             let CoreResult::Legacy(LegacyCoreResult::ToolsList(p)) = result else {
                                 return Err(unexpected_proxy_result("tools/list"));
                             };
@@ -8363,7 +8371,7 @@ impl ProxyClient {
                         .entries,
                     ),
                     resources: ProxyResourceCatalog::Legacy(
-                        self.collect_http_catalog_pages(&ctx, "resources/list", |result| {
+                        self.collect_catalog_pages(&ctx, "resources/list", |result| {
                             let CoreResult::Legacy(LegacyCoreResult::ResourcesList(p)) = result
                             else {
                                 return Err(unexpected_proxy_result("resources/list"));
@@ -8374,25 +8382,19 @@ impl ProxyClient {
                         .entries,
                     ),
                     resource_templates: ProxyResourceTemplateCatalog::Legacy(
-                        self.collect_http_catalog_pages(
-                            &ctx,
-                            "resources/templates/list",
-                            |result| {
-                                let CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(p)) =
-                                    result
-                                else {
-                                    return Err(unexpected_proxy_result(
-                                        "resources/templates/list",
-                                    ));
-                                };
-                                Ok((p.resource_templates, p.next_cursor, None))
-                            },
-                        )
+                        self.collect_catalog_pages(&ctx, "resources/templates/list", |result| {
+                            let CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(p)) =
+                                result
+                            else {
+                                return Err(unexpected_proxy_result("resources/templates/list"));
+                            };
+                            Ok((p.resource_templates, p.next_cursor, None))
+                        })
                         .await?
                         .entries,
                     ),
                     prompts: ProxyPromptCatalog::Legacy(
-                        self.collect_http_catalog_pages(&ctx, "prompts/list", |result| {
+                        self.collect_catalog_pages(&ctx, "prompts/list", |result| {
                             let CoreResult::Legacy(LegacyCoreResult::PromptsList(p)) = result
                             else {
                                 return Err(unexpected_proxy_result("prompts/list"));
@@ -8412,17 +8414,17 @@ impl ProxyClient {
             }
         };
         ctx.ensure_live()?;
-        self.admit_observed_era(catalog.era()?, "typed HTTP catalog")?;
+        self.admit_observed_era(catalog.era()?, "typed catalog")?;
         Ok(catalog)
     }
 
-    /// Fetches an HTTP catalog asynchronously and projects its admitted era
+    /// Fetches a native catalog asynchronously and projects its admitted era
     /// into the composition catalog used by the server builder.
     pub async fn catalog_with_cx(&self, cx: &Cx) -> McpResult<ProxyCatalog> {
         ProxyCatalog::from_typed_catalog(self.catalog_typed_with_cx(cx).await?)
     }
 
-    async fn collect_http_catalog_pages<T>(
+    async fn collect_catalog_pages<T>(
         &self,
         ctx: &McpContext,
         method: &str,
@@ -8449,6 +8451,11 @@ impl ProxyClient {
                 request
                     .execute(ctx, method, parameters, false, &mut |_| {})
                     .await?
+            } else if let Some(result) = self
+                .try_final_stdio_request(ctx, method, parameters.clone(), false)
+                .await?
+            {
+                result
             } else {
                 #[cfg(feature = "legacy-2024-11-05")]
                 {
@@ -8456,14 +8463,14 @@ impl ProxyClient {
                         .await?
                         .ok_or_else(|| {
                             McpError::invalid_request(
-                                "HTTP backend does not support asynchronous catalog requests",
+                                "Backend does not support asynchronous catalog requests",
                             )
                         })?
                 }
                 #[cfg(not(feature = "legacy-2024-11-05"))]
                 {
                     return Err(McpError::invalid_request(
-                        "HTTP backend does not support asynchronous catalog requests",
+                        "Backend does not support asynchronous catalog requests",
                     ));
                 }
             };
@@ -15113,6 +15120,285 @@ IFS= read -r end
         #[cfg(feature = "legacy-2024-11-05")]
         for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
             proxy_stdio_registry_caller_runtime_probe(policy, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_stdio_catalog_caller_runtime_probe(policy: ProtocolPolicy, interrupt: u8) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        // 0: complete, 1: cursor cycle, 2: cancellation, 3: deadline, 4: drop.
+        let legacy = policy == ProtocolPolicy::LegacyOnly;
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+            .build()
+            .unwrap();
+        let control = std::env::temp_dir().join(format!(
+            "fastmcp-stdio-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&control).unwrap();
+        let subject = control.file_name().unwrap().to_str().unwrap().to_owned();
+        let opening = if legacy {
+            scripted_response_line(
+                1,
+                serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{}, "serverInfo":{"name":subject,"version":"1"}}),
+            )
+        } else {
+            modern_discovery_response_line(&subject, &["2026-07-28"])
+        };
+        // Capture actual requests. Notifications consume no response ID and
+        // may include the cancellation of an abandoned catalog page.
+        let mut script = format!(
+            "read_request() {{\nwhile IFS= read -r request; do\nprintf '%s\\n' \"$request\" >> \"$1/requests\"\ncase \"$request\" in *'\"id\":'*) return 0;; esac\ndone\nreturn 1\n}}\nread_request \"$1\" || exit 91\nprintf '%s\\n' '{opening}'\n"
+        );
+        let mut pages = Vec::new();
+        if interrupt == 1 {
+            pages.extend([(0, true), (1, true)]);
+        } else if interrupt >= 2 {
+            pages.push((0, true));
+        }
+        pages.extend([(0, true), (1, false), (2, false), (3, false), (4, false)]);
+        for (index, &(page, has_next)) in pages.iter().enumerate() {
+            let mut payload = match page {
+                0 | 1 => {
+                    serde_json::json!({"tools":[{"name":format!("{subject}-{page}"), "inputSchema":{"type":"object"}}]})
+                }
+                2 => serde_json::json!({"resources":[{"name":subject,"uri":"test://catalog"}]}),
+                3 => {
+                    serde_json::json!({"resourceTemplates":[{"name":subject,"uriTemplate":"test://catalog/{id}"}]})
+                }
+                4 => serde_json::json!({"prompts":[{"name":subject}]}),
+                _ => unreachable!(),
+            };
+            if has_next {
+                payload["nextCursor"] = serde_json::json!("page-two");
+            }
+            if !legacy {
+                payload["resultType"] = serde_json::json!("complete");
+                payload["ttlMs"] = serde_json::json!(17 + page);
+                payload["cacheScope"] = serde_json::json!("private");
+            }
+            let response = scripted_response_line((index + 2) as i64, payload);
+            script.push_str("read_request \"$1\" || exit 92\n");
+            if index == 0 {
+                // A sibling on the sole worker must release this wait. Keep
+                // it bounded so a regression fails rather than hanging Cargo.
+                script.push_str("printf ready > \"$1/received\"\nturn=0\nwhile ! [ -f \"$1/permit\" ]; do\nturn=$((turn + 1))\n[ \"$turn\" -lt 1000 ] || exit 93\nsleep 0.01\ndone\n");
+            }
+            script.push_str(&format!("printf '%s\\n' '{response}'\n"));
+        }
+        script.push_str("while IFS= read -r remaining; do :; done\n");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let catalog_cx = runtime.request_cx_with_budget(if interrupt == 3 {
+            asupersync::Budget::INFINITE.with_deadline(cx.now().saturating_add_nanos(100_000_000))
+        } else {
+            asupersync::Budget::INFINITE
+        });
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let siblings = root.clone();
+            let mut work = root
+                .spawn(move |_| async move {
+                    let worker = thread::current().id();
+                    let mut registry = ProxyClient::upstream_binding_registry();
+                    let args = ["-c", &script, "catalog-peer", control.to_str().unwrap()];
+                    let plan = ClientProtocolPlan::stdio(policy);
+                    let proxy = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx,
+                            &subject,
+                            "stdio",
+                            1,
+                            "sh",
+                            &args,
+                            plan.clone(),
+                        )
+                        .await
+                        .unwrap();
+                    let binding = proxy.upstream_binding();
+                    if !legacy {
+                        assert_eq!(
+                            proxy
+                                .with_backend(|backend| backend.start_final_stdio_request(
+                                    &McpContext::new(cx.clone(), 0),
+                                    "tools/list",
+                                    serde_json::json!({}),
+                                    true,
+                                ))
+                                .unwrap_err()
+                                .code,
+                            McpErrorCode::InvalidParams,
+                            "catalog cannot advertise Tasks or consume an ID on refusal"
+                        );
+                    }
+                    let mut catalog = Box::pin(proxy.catalog_typed_with_cx(&catalog_cx));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let polled = std::future::poll_fn(|task_cx| {
+                            Poll::Ready(catalog.as_mut().poll(task_cx))
+                        })
+                        .await;
+                        assert!(polled.is_pending(), "catalog must yield: {polled:?}");
+                        assert!(proxy.inner.try_lock().is_ok(), "route lock is released");
+                        if control.join("received").exists() {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "catalog request reaches child");
+                        asupersync::runtime::yield_now().await;
+                    }
+                    if interrupt >= 2 {
+                        if interrupt == 4 {
+                            drop(catalog);
+                        } else {
+                            let cancelling_cx = catalog_cx.clone();
+                            let mut sibling = siblings
+                                .spawn(move |_| async move {
+                                    assert_eq!(thread::current().id(), worker);
+                                    if interrupt == 3 {
+                                        clock.advance(100_000_000);
+                                    } else {
+                                        cancelling_cx.set_cancel_requested(true);
+                                    }
+                                })
+                                .unwrap();
+                            assert_eq!(
+                                catalog.await.unwrap_err().code,
+                                McpErrorCode::RequestCancelled
+                            );
+                            sibling.join(&siblings).await.unwrap();
+                        }
+                        catalog = Box::pin(proxy.catalog_typed_with_cx(&cx));
+                    }
+                    let permit = control.join("permit");
+                    let mut sibling = siblings
+                        .spawn(move |_| async move {
+                            assert_eq!(thread::current().id(), worker);
+                            std::fs::write(permit, b"release catalog\n").unwrap();
+                            29
+                        })
+                        .unwrap();
+                    let observed = catalog.await;
+                    assert_eq!(sibling.join(&siblings).await.unwrap(), 29);
+                    let catalog = if interrupt == 1 {
+                        let error = observed.unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(error.message.contains("non-advancing cursor"));
+                        proxy.catalog_typed_with_cx(&cx).await.unwrap()
+                    } else {
+                        observed.unwrap()
+                    };
+                    assert_eq!(catalog.era().unwrap(), binding.unwrap().era());
+                    if let super::ProxyToolCatalog::Final(tools) = &catalog.tools {
+                        assert_eq!(tools.cache_hints.len(), 2);
+                        assert_eq!(
+                            serde_json::to_value(&tools.cache_hints[1].ttl_ms).unwrap(),
+                            18
+                        );
+                    }
+                    let projected = ProxyCatalog::from_typed_catalog(catalog).unwrap();
+                    if legacy {
+                        assert_eq!(projected.tools.len(), 2);
+                        assert_eq!(projected.tools[0].name, format!("{subject}-0"));
+                        assert_eq!(projected.tools[1].name, format!("{subject}-1"));
+                        assert_eq!(projected.resources.len(), 1);
+                        assert_eq!(projected.resource_templates.len(), 1);
+                        assert_eq!(projected.prompts.len(), 1);
+                        assert!(projected.final_tools.is_empty());
+                    } else {
+                        assert_eq!(projected.final_tools.len(), 2);
+                        assert_eq!(projected.final_tools[0].name, format!("{subject}-0"));
+                        assert_eq!(projected.final_tools[1].name, format!("{subject}-1"));
+                        assert_eq!(projected.final_resources.len(), 1);
+                        assert_eq!(projected.final_resource_templates.len(), 1);
+                        assert_eq!(projected.final_prompts.len(), 1);
+                        assert!(projected.tools.is_empty());
+                        assert_eq!(projected.final_resource_cache_hints.len(), 1);
+                        assert_eq!(projected.final_resource_template_cache_hints.len(), 1);
+                        assert_eq!(projected.final_prompt_cache_hints.len(), 1);
+                    }
+                    let cached = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx, &subject, "stdio", 1, "sh", &args, plan,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&proxy.inner, &cached.inner));
+                    assert_eq!(proxy.upstream_binding(), binding);
+                    assert_eq!(registry.live_stdio.len(), 1);
+                    assert!(
+                        !cx.is_cancel_requested(),
+                        "catalog cancellation is request-local"
+                    );
+                    let requests: Vec<serde_json::Value> =
+                        std::fs::read_to_string(control.join("requests"))
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .filter(|request: &serde_json::Value| request.get("id").is_some())
+                            .collect();
+                    assert_eq!(requests.len(), pages.len() + 1);
+                    for (index, &(page, _)) in pages.iter().enumerate() {
+                        let request = &requests[index + 1];
+                        assert_eq!(
+                            request["id"],
+                            index + 2,
+                            "refusal never consumes a request ID"
+                        );
+                        assert_eq!(
+                            request["method"],
+                            match page {
+                                0 | 1 => "tools/list",
+                                2 => "resources/list",
+                                3 => "resources/templates/list",
+                                4 => "prompts/list",
+                                _ => unreachable!(),
+                            }
+                        );
+                        assert_eq!(
+                            request["params"]["cursor"],
+                            if page == 1 {
+                                serde_json::json!("page-two")
+                            } else {
+                                serde_json::Value::Null
+                            }
+                        );
+                    }
+                })
+                .unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_caller_runtime_positive() {
+        proxy_stdio_catalog_caller_runtime_probe(ProtocolPolicy::ModernOnly, 0);
+        #[cfg(feature = "legacy-2024-11-05")]
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
+            proxy_stdio_catalog_caller_runtime_probe(policy, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_caller_runtime_planted_negative() {
+        for interrupt in 1..=4 {
+            proxy_stdio_catalog_caller_runtime_probe(ProtocolPolicy::ModernOnly, interrupt);
+            #[cfg(feature = "legacy-2024-11-05")]
+            for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
+                proxy_stdio_catalog_caller_runtime_probe(policy, interrupt);
+            }
         }
     }
 

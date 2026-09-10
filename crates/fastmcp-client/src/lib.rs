@@ -13370,7 +13370,7 @@ pub struct StdioRequestExecution {
     execution: RequestExecution<SelectedStdioTransport>,
 }
 
-/// One source-preserving MRTR request on the shared stdio ingress.
+/// One source-preserving final core request on the shared stdio ingress.
 /// The retained decoder is bound to the exact parameters committed upstream.
 #[derive(Debug)]
 pub struct StdioFinalMrtrExecution {
@@ -15516,6 +15516,39 @@ impl Client {
                 "Yielding final MRTR requires a modern core method",
             ));
         }
+        self.start_prepared_yielding_final_request(method, parameters, allow_tasks)
+    }
+
+    /// Starts one final catalog page without waiting for its response.
+    /// Uses the shared ingress and exact final decoder, with Tasks disabled.
+    #[doc(hidden)]
+    pub fn start_yielding_final_catalog_request(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<StdioFinalMrtrExecution> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        self.ensure_initialized()?;
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026)
+            || !matches!(
+                method,
+                "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+            )
+        {
+            return Err(McpError::invalid_params(
+                "Yielding final catalog requires a modern list method",
+            ));
+        }
+        self.start_prepared_yielding_final_request(method, parameters, false)
+    }
+
+    fn start_prepared_yielding_final_request(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+        allow_tasks: bool,
+    ) -> McpResult<StdioFinalMrtrExecution> {
         if allow_tasks && (method != "tools/call" || !cfg!(feature = "tasks")) {
             return Err(McpError::invalid_params(
                 "Yielding Tasks require a Tasks-enabled tools/call",
@@ -15541,9 +15574,9 @@ impl Client {
         };
         let request = self
             .prepared_core_request(method, &parameters)?
-            .ok_or_else(|| McpError::invalid_params("Unsupported final MRTR request"))?;
+            .ok_or_else(|| McpError::invalid_params("Unsupported final core request"))?;
         let parameters = request.encode_params().map_err(|error| {
-            McpError::invalid_params(format!("Invalid final MRTR parameters: {error}"))
+            McpError::invalid_params(format!("Invalid final core parameters: {error}"))
         })?;
         let executor = self.multiplexed_stdio_executor()?;
         // Do not prepare the parameters again: that would re-advertise Tasks.
