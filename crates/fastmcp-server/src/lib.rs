@@ -3894,7 +3894,7 @@ fn http_request_accepts_sse(request: &HttpRequest) -> bool {
 /// dispatched and neither emit nor accept `MCP-Session-Id`. A final
 /// `subscriptions/listen` SSE body retains its request-owned dispatch only for
 /// that response body. A retained [`ServerHttpSession`] is an embedding
-/// lifecycle handle whose repeated [`ServerHttpSession::handle`] calls share
+/// lifecycle handle whose repeated [`ServerHttpSession::handle_async`] calls share
 /// modern mutable component state; it does not own a private MRTR namespace.
 /// Turnkey live ingress opens a fresh embedding session per stateless POST.
 /// Eligible stateless MRTR continuations are owned by the router; listener
@@ -4515,7 +4515,7 @@ fn final_subscription_acknowledgement_notification(notification: &JsonRpcRequest
     )
 }
 
-/// A response emitted by [`ServerHttpSession::handle`].
+/// A response emitted by [`ServerHttpSession::handle_async`].
 pub enum ServerHttpEndpointResponse {
     /// A complete response, including modern JSON and legacy POST acknowledgement.
     Immediate(HttpResponse),
@@ -6041,7 +6041,7 @@ struct LiveHttpSession {
     /// POST owns the serialized session mutex. The matching response POST must
     /// therefore route through this independently synchronized registry before
     /// attempting session mutation. Every nonmatching response continues
-    /// through `ServerHttpSession::handle`, preserving serialized adapter and
+    /// through `ServerHttpSession::handle_async`, preserving serialized adapter and
     /// session-state mutation.
     legacy_pending_requests: Arc<PendingRequests>,
 }
@@ -11872,7 +11872,7 @@ async fn serve_http_connection(
 ///
 /// This is intentionally separate from the dual-era listener: the only
 /// request route admitted here is final Streamable HTTP. Historical `/sse`
-/// and `/messages` traffic reaches `ServerHttpSession::handle` as a 404 and
+/// and `/messages` traffic reaches `ServerHttpSession::handle_async` as a 404 and
 /// can neither allocate a legacy session nor pin a legacy era.
 #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
 async fn serve_modern_http_connection(

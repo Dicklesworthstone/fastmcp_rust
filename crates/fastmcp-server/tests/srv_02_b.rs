@@ -139,8 +139,20 @@ impl ToolHandler for CallerRuntimeTool {
         Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
     > {
         Box::pin(async move {
+            eprintln!(
+                "HTTP handler thread: {:?}; caller: {:?}",
+                std::thread::current().id(),
+                self.caller_thread
+            );
             assert_eq!(std::thread::current().id(), self.caller_thread);
             let ambient = Cx::current().expect("the caller runtime supplies the handler context");
+            eprintln!(
+                "HTTP handler ambient: {:?}/{:?}; explicit: {:?}/{:?}",
+                ambient.task_id(),
+                ambient.region_id(),
+                ctx.cx().task_id(),
+                ctx.cx().region_id()
+            );
             assert_eq!(ambient.task_id(), ctx.cx().task_id());
             assert_eq!(ambient.region_id(), ctx.cx().region_id());
             ctx.checkpoint().expect("positive handler is live");
@@ -158,6 +170,14 @@ impl ToolHandler for CallerRuntimeTool {
             let mut child = ctx
                 .cx()
                 .spawn(move |child_cx| async move {
+                    eprintln!(
+                        "HTTP child thread: {:?}; task/region: {:?}/{:?}; handler: {:?}/{:?}",
+                        std::thread::current().id(),
+                        child_cx.task_id(),
+                        child_cx.region_id(),
+                        handler_task,
+                        handler_region
+                    );
                     assert_eq!(std::thread::current().id(), caller_thread);
                     assert_ne!(child_cx.task_id(), handler_task);
                     assert_eq!(child_cx.region_id(), handler_region);
@@ -628,100 +648,121 @@ fn srv_02_b_http_session_caller_runtime_and_cancelled_negative() {
         )
         .build()
         .expect("caller HTTP runtime initializes");
-    let caller_thread = std::thread::current().id();
-    let entered = Arc::new(AtomicUsize::new(0));
-    let children_completed = Arc::new(AtomicUsize::new(0));
-    let server = Server::new("caller-runtime-http", "1.0.0")
-        .protocol_policy(ProtocolPolicy::ModernOnly)
-        .expect("ModernOnly is available in every profile")
-        .tool(CallerRuntimeTool {
-            caller_thread,
-            entered: Arc::clone(&entered),
-            children_completed: Arc::clone(&children_completed),
-        })
-        .build();
-    #[cfg(not(feature = "legacy-2024-11-05"))]
-    let endpoint = server.into_http_endpoint();
-    #[cfg(feature = "legacy-2024-11-05")]
-    let endpoint = server.into_http_endpoint("http://127.0.0.1");
-    let endpoint = endpoint.expect("the real server constructs its public HTTP endpoint");
-
     runtime.block_on(async {
-        let cx = Cx::current().expect("the caller runtime supplies the session context");
-        let mut session = endpoint
-            .open_session(&cx)
-            .expect("the real public HTTP session opens");
-        let request = JsonRpcRequest::new(
-            "tools/call",
-            Some(json!({
-                "name": "runtime-child",
-                "arguments": {"value": "from-request"},
-                "_meta": {
-                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
-                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                },
-            })),
-            4_102_i64,
-        );
-        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
-            .with_header("content-type", "application/json")
-            .with_header("accept", "application/json")
-            .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
-            .with_header("mcp-method", "tools/call")
-            .with_header("mcp-name", "runtime-child")
-            .with_body(serde_json::to_vec(&request).expect("the tool request serializes"));
-        let request_body_before = request.body.clone();
-        let positive = session
-            .handle_async(&cx, request.clone())
-            .await
-            .expect("the async HTTP session completes on the caller runtime");
-        let ServerHttpEndpointResponse::Immediate(positive) = positive else {
-            panic!("the ordinary tool call must return its selected JSON representation");
-        };
-        assert_eq!(positive.status, HttpStatus::OK);
-        let positive: fastmcp_protocol::JsonRpcResponse =
-            serde_json::from_slice(&positive.body).expect("the real result is JSON-RPC");
-        assert_eq!(positive.id, Some(4_102_i64.into()));
-        assert!(positive.error.is_none());
-        let result = positive
-            .result
-            .expect("the child output reaches the caller");
-        assert_eq!(result["resultType"], "complete");
-        assert_eq!(result["content"][0]["text"], "owned:from-request");
-        assert_eq!(entered.load(Ordering::SeqCst), 1);
-        assert_eq!(children_completed.load(Ordering::SeqCst), 1);
+        let parent_cx = Cx::current().expect("the caller runtime supplies the parent context");
+        // `current_thread` has one scheduler worker; `block_on` polls its
+        // outer future on the invoking thread. Start the embedding scenario
+        // on that worker so its children must progress on the same thread.
+        let mut scenario = parent_cx
+            .spawn(|cx| async move {
+                let caller_thread = std::thread::current().id();
+                let entered = Arc::new(AtomicUsize::new(0));
+                let children_completed = Arc::new(AtomicUsize::new(0));
+                let server = Server::new("caller-runtime-http", "1.0.0")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .expect("ModernOnly is available in every profile")
+                    .tool(CallerRuntimeTool {
+                        caller_thread,
+                        entered: Arc::clone(&entered),
+                        children_completed: Arc::clone(&children_completed),
+                    })
+                    .build();
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                let endpoint = server.into_http_endpoint();
+                #[cfg(feature = "legacy-2024-11-05")]
+                let endpoint = server.into_http_endpoint("http://127.0.0.1");
+                let endpoint =
+                    endpoint.expect("the real server constructs its public HTTP endpoint");
 
-        // Keep the endpoint, session, request, and runtime unchanged. Native
-        // HTTP currently maps failed cancellation/budget admission to its
-        // fixed authentication rejection before it invokes the handler.
-        cx.cancel_with(
-            asupersync::CancelKind::User,
-            Some("caller cancelled HTTP admission"),
-        );
-        let negative = session
-            .handle_async(&cx, request.clone())
+                let mut session = endpoint
+                    .open_session(&cx)
+                    .expect("the real public HTTP session opens");
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(json!({
+                        "name": "runtime-child",
+                        "arguments": {"value": "from-request"},
+                        "_meta": {
+                            FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                    })),
+                    4_102_i64,
+                );
+                let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "tools/call")
+                    .with_header("mcp-name", "runtime-child")
+                    .with_body(serde_json::to_vec(&request).expect("the tool request serializes"));
+                let request_body_before = request.body.clone();
+                let positive = session
+                    .handle_async(&cx, request.clone())
+                    .await
+                    .expect("the async HTTP session completes on the caller runtime");
+                let ServerHttpEndpointResponse::Immediate(positive) = positive else {
+                    panic!("the ordinary tool call must return its selected JSON representation");
+                };
+                assert_eq!(positive.status, HttpStatus::OK);
+                let positive: fastmcp_protocol::JsonRpcResponse =
+                    serde_json::from_slice(&positive.body).expect("the real result is JSON-RPC");
+                assert_eq!(positive.id, Some(4_102_i64.into()));
+                assert!(
+                    positive.error.is_none(),
+                    "HTTP result: {:?}; entered: {}; children completed: {}",
+                    positive.error,
+                    entered.load(Ordering::SeqCst),
+                    children_completed.load(Ordering::SeqCst)
+                );
+                let result = positive
+                    .result
+                    .expect("the child output reaches the caller");
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["content"][0]["text"], "owned:from-request");
+                assert_eq!(entered.load(Ordering::SeqCst), 1);
+                assert_eq!(children_completed.load(Ordering::SeqCst), 1);
+
+                // Keep the endpoint, session, request, and runtime unchanged. Native
+                // HTTP currently maps failed cancellation/budget admission to its
+                // fixed authentication rejection before it invokes the handler.
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("caller cancelled HTTP admission"),
+                );
+                let negative = session
+                    .handle_async(&cx, request.clone())
+                    .await
+                    .expect("caller cancellation remains an ordinary admission refusal");
+                let ServerHttpEndpointResponse::Immediate(negative) = negative else {
+                    panic!("cancelled admission must not allocate a response stream");
+                };
+                assert_eq!(negative.status, HttpStatus::UNAUTHORIZED);
+                assert_eq!(
+                    negative.headers.get("www-authenticate").map(String::as_str),
+                    Some("Bearer")
+                );
+                assert!(negative.body.is_empty());
+                assert_eq!(
+                    entered.load(Ordering::SeqCst),
+                    1,
+                    "cancellation invoked the handler"
+                );
+                assert_eq!(
+                    children_completed.load(Ordering::SeqCst),
+                    1,
+                    "cancellation admitted another child"
+                );
+                assert_eq!(request.body, request_body_before);
+                // Acknowledge the scenario's deliberate cancellation only after all
+                // refusal/effect assertions ran, so joining requires actual completion.
+                assert!(cx.checkpoint().is_err());
+            })
+            .expect("the caller runtime admits the HTTP embedding task");
+        scenario
+            .join(&parent_cx)
             .await
-            .expect("caller cancellation remains an ordinary admission refusal");
-        let ServerHttpEndpointResponse::Immediate(negative) = negative else {
-            panic!("cancelled admission must not allocate a response stream");
-        };
-        assert_eq!(negative.status, HttpStatus::UNAUTHORIZED);
-        assert_eq!(
-            negative.headers.get("www-authenticate").map(String::as_str),
-            Some("Bearer")
-        );
-        assert!(negative.body.is_empty());
-        assert_eq!(
-            entered.load(Ordering::SeqCst),
-            1,
-            "cancellation invoked the handler"
-        );
-        assert_eq!(
-            children_completed.load(Ordering::SeqCst),
-            1,
-            "cancellation admitted another child"
-        );
-        assert_eq!(request.body, request_body_before);
+            .expect("the caller runtime joins the complete HTTP scenario");
     });
 }
 
