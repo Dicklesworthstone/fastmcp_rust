@@ -3654,7 +3654,6 @@ impl ProxyBackend for Client {
         Client::next_subscription_event(self, cx, request_cancellation)
     }
 
-    #[cfg(feature = "tasks")]
     fn try_next_incremental_catalog_listener(
         &mut self,
         cx: &Cx,
@@ -13877,46 +13876,48 @@ IFS= read -r end
         });
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(unix)]
     async fn open_incremental_listener_probe(
         proxy: &ProxyClient,
         cx: &Cx,
         filter: SubscriptionFilter,
         tasks: bool,
     ) -> fastmcp_core::McpResult<bool> {
+        #[cfg(feature = "tasks")]
         if tasks {
-            proxy.start_final_task_listener(cx, filter).await
-        } else {
-            proxy.start_catalog_listener(cx, filter).await
+            return proxy.start_final_task_listener(cx, filter).await;
         }
+        assert!(!tasks, "Tasks probes require the Tasks feature");
+        proxy.start_catalog_listener(cx, filter).await
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(unix)]
     async fn next_incremental_listener_probe(
         proxy: &ProxyClient,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         tasks: bool,
     ) -> fastmcp_core::McpResult<bool> {
+        #[cfg(feature = "tasks")]
         if tasks {
-            match proxy
+            return match proxy
                 .next_final_task_listener_event(cx, cancellation)
                 .await?
             {
                 fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(_) => Ok(false),
                 fastmcp_client::StdioTaskSubscriptionEvent::Terminal => Ok(true),
                 event => panic!("unexpected Tasks listener event: {event:?}"),
-            }
-        } else {
-            match proxy.next_catalog_listener_event(cx, cancellation).await? {
-                fastmcp_client::StdioSubscriptionEvent::Acknowledged(_) => Ok(false),
-                fastmcp_client::StdioSubscriptionEvent::Terminal => Ok(true),
-                event => panic!("unexpected catalog listener event: {event:?}"),
-            }
+            };
+        }
+        assert!(!tasks, "Tasks probes require the Tasks feature");
+        match proxy.next_catalog_listener_event(cx, cancellation).await? {
+            fastmcp_client::StdioSubscriptionEvent::Acknowledged(_) => Ok(false),
+            fastmcp_client::StdioSubscriptionEvent::Terminal => Ok(true),
+            event => panic!("unexpected catalog listener event: {event:?}"),
         }
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(unix)]
     fn proxy_incremental_listener_caller_runtime_probe(tasks: bool, interrupt: Option<bool>) {
         use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13932,11 +13933,14 @@ IFS= read -r end
         let subject = format!("listener-{}", address.port());
         let mut filter = SubscriptionFilter::default();
         if tasks {
+            #[cfg(feature = "tasks")]
             set_task_subscription_ids(
                 &mut filter,
                 vec![fastmcp_protocol::FinalTaskId::parse(subject.clone()).unwrap()],
             )
             .unwrap();
+            #[cfg(not(feature = "tasks"))]
+            panic!("Tasks probes require the Tasks feature");
         } else {
             filter.tools_list_changed = Some(true);
         }
@@ -14118,11 +14122,23 @@ IFS= read -r end
                             && let Some(cancel) = interrupt
                         {
                             if cancel {
-                                cx.set_cancel_requested(true);
+                                let cancelling_cx = cx.clone();
+                                let mut cancelling = root
+                                    .spawn(move |sibling_cx| async move {
+                                        assert_eq!(thread::current().id(), worker);
+                                        asupersync::time::sleep(
+                                            sibling_cx.now(),
+                                            Duration::from_millis(10),
+                                        )
+                                        .await;
+                                        cancelling_cx.set_cancel_requested(true);
+                                    })
+                                    .unwrap();
                                 assert_eq!(
                                     opening.await.unwrap_err().code,
                                     McpErrorCode::RequestCancelled
                                 );
+                                cancelling.join(&root).await.unwrap();
                                 cx.set_cancel_requested(false);
                             } else {
                                 drop(opening);
@@ -14183,21 +14199,21 @@ IFS= read -r end
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(unix)]
     #[test]
     fn proxy_incremental_listener_caller_runtime_positive() {
-        for tasks in [false, true] {
-            proxy_incremental_listener_caller_runtime_probe(tasks, None);
-        }
+        proxy_incremental_listener_caller_runtime_probe(false, None);
+        #[cfg(feature = "tasks")]
+        proxy_incremental_listener_caller_runtime_probe(true, None);
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(unix)]
     #[test]
     fn proxy_incremental_listener_caller_runtime_planted_negative() {
-        for tasks in [false, true] {
-            for cancel in [false, true] {
-                proxy_incremental_listener_caller_runtime_probe(tasks, Some(cancel));
-            }
+        for cancel in [false, true] {
+            proxy_incremental_listener_caller_runtime_probe(false, Some(cancel));
+            #[cfg(feature = "tasks")]
+            proxy_incremental_listener_caller_runtime_probe(true, Some(cancel));
         }
     }
 
