@@ -443,6 +443,12 @@ write failures retain the listener and its error. Writes remain synchronous.
 The same incremental pattern exists on HTTP (`HttpClient::start_subscriptions_listener`),
 modern WebSocket (`WebSocketClient::open_subscriptions_listener`), and
 `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams.
+Proxy catalog and Tasks listener startup and event methods are async and
+take the caller's `&Cx`. HTTP opening yields while awaiting headers;
+cancelling or dropping that opening closes its socket and releases the
+route for another attempt. Dropping an event future preserves the installed
+listener for resumption. Stdio startup and bounded receive turns retain
+their synchronous I/O limits.
 HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
 `read_resource`/`get_prompt` verbs so callers do not have to decode a raw
 core result for ordinary catalog and invocation traffic. HTTP and WebSocket

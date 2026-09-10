@@ -22,11 +22,12 @@ use asupersync::cx::{ChildRegion, ChildRegionSpec};
 use fastmcp_client::FinalToolCallOutcome;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::StdioRequestExecution;
+#[cfg(feature = "tasks")]
+use fastmcp_client::http_executor::ModernHttpFinalCoreEvent;
 use fastmcp_client::http_executor::{
     ModernHttpClient, ModernHttpResponseKind, ModernHttpResponseStream,
+    ModernHttpSubscriptionListenError,
 };
-#[cfg(feature = "tasks")]
-use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientProtocolPlan, CompletionParams,
@@ -9493,9 +9494,9 @@ impl ProxyClient {
             if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 // Let the backend retire its listener before returning the
                 // cancellation that arrived during the preceding poll.
-                let _ = self.with_backend(|backend| {
+                self.with_backend(|backend| {
                     backend.try_next_incremental_catalog_listener(cx, request_cancellation)
-                });
+                })?;
                 return Err(McpError::request_cancelled());
             }
             asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
@@ -9550,9 +9551,9 @@ impl ProxyClient {
             }
             if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 // The next backend poll owns cancellation cleanup.
-                let _ = self.with_backend(|backend| {
+                self.with_backend(|backend| {
                     backend.try_next_incremental_final_task_listener(cx, request_cancellation)
-                });
+                })?;
                 return Err(McpError::request_cancelled());
             }
             asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
@@ -13921,6 +13922,7 @@ IFS= read -r end
     fn proxy_incremental_listener_caller_runtime_probe(tasks: bool, interrupt: Option<bool>) {
         use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
 
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
