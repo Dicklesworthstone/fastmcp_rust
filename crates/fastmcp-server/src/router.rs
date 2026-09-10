@@ -3619,6 +3619,34 @@ impl Router {
         Ok(())
     }
 
+    /// Awaits the resolved handler's subscription hook on the request runtime.
+    pub(crate) async fn notify_resource_subscribed_async(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<()> {
+        ctx.ensure_live()?;
+        if let Some(resolved) = self.resolve_resource(uri) {
+            resolved.handler.on_subscribe_async(ctx, uri).await?;
+        }
+        ctx.ensure_live()?;
+        Ok(())
+    }
+
+    /// Awaits the resolved handler's unsubscription hook on the request runtime.
+    pub(crate) async fn notify_resource_unsubscribed_async(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<()> {
+        ctx.ensure_live()?;
+        if let Some(resolved) = self.resolve_resource(uri) {
+            resolved.handler.on_unsubscribe_async(ctx, uri).await?;
+        }
+        ctx.ensure_live()?;
+        Ok(())
+    }
+
     fn resolve_resource(&self, uri: &str) -> Option<ResolvedResource<'_>> {
         self.resolve_resource_for_era(uri, None)
     }

@@ -2219,6 +2219,118 @@ mod router_tests {
     }
 
     #[test]
+    fn subscription_hook_errors_preserve_session_state() {
+        use std::sync::atomic::AtomicU8;
+
+        const URI: &str = "resource://subscription/hook-rollback";
+        struct HookResource(Arc<AtomicU8>);
+        impl HookResource {
+            fn hook(&self, ctx: &McpContext) -> McpResult<()> {
+                match self.0.load(Ordering::Acquire) {
+                    0 => Ok(()),
+                    1 => Err(McpError::invalid_request("upstream rejected subscription")),
+                    2 => {
+                        ctx.cx().set_cancel_requested(true);
+                        Err(McpError::request_cancelled())
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        impl ResourceHandler for HookResource {
+            fn definition(&self) -> Resource {
+                StaticResource {
+                    uri: URI.to_owned(),
+                    content: "ready".to_owned(),
+                }
+                .definition()
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(Vec::new())
+            }
+            fn on_subscribe(&self, ctx: &McpContext, _uri: &str) -> McpResult<()> {
+                self.hook(ctx)
+            }
+            fn on_unsubscribe(&self, ctx: &McpContext, _uri: &str) -> McpResult<()> {
+                self.hook(ctx)
+            }
+        }
+        for mode in 0..=2 {
+            for (method, initially_subscribed) in [
+                ("resources/subscribe", false),
+                ("resources/subscribe", true),
+                ("resources/unsubscribe", true),
+            ] {
+                let server = Server::new("subscription-hook-rollback", "1")
+                    .resource(HookResource(Arc::new(AtomicU8::new(mode))))
+                    .build();
+                let cx = Cx::for_testing();
+                let mut session = create_test_session();
+                session.initialize(
+                    ClientInfo {
+                        name: "hook-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    "2024-11-05".to_owned(),
+                );
+                if initially_subscribed {
+                    session
+                        .subscribe_resource(&McpContext::new(cx.clone(), 1), URI.to_owned())
+                        .unwrap();
+                }
+                let before: Vec<String> = session
+                    .subscribed_resource_uris()
+                    .map(str::to_owned)
+                    .collect();
+                let sender: NotificationSender = Arc::new(|_| {});
+                let response = server
+                    .handle_request(
+                        &cx,
+                        &mut session,
+                        JsonRpcRequest::new(method, Some(serde_json::json!({"uri":URI})), 91_i64),
+                        &sender,
+                        &create_test_request_sender(),
+                    )
+                    .unwrap();
+                if mode == 0 {
+                    assert!(
+                        response.error.is_none(),
+                        "successful hook completes: {response:?}"
+                    );
+                    assert_eq!(
+                        session.is_resource_subscribed(URI),
+                        method == "resources/subscribe"
+                    );
+                } else {
+                    assert_eq!(
+                        response.error.unwrap().code,
+                        i32::from(if mode == 2 {
+                            McpErrorCode::RequestCancelled
+                        } else {
+                            McpErrorCode::InvalidRequest
+                        })
+                        .into()
+                    );
+                    let after: Vec<String> = session
+                        .subscribed_resource_uris()
+                        .map(str::to_owned)
+                        .collect();
+                    assert_eq!(
+                        after, before,
+                        "hook failure preserves exact prior membership"
+                    );
+                    cx.set_cancel_requested(false);
+                    assert_eq!(
+                        session.notify_resource_updated(URI, &sender),
+                        initially_subscribed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn middleware_cannot_forge_subscription_mutation_success() {
         const URI: &str = "resource://subscription/short-circuit-guard";
 

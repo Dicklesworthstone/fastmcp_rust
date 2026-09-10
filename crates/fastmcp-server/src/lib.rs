@@ -14264,13 +14264,16 @@ impl Server {
                         if !self.router.resource_exists(&uri) {
                             return Err(McpError::resource_not_found(&uri));
                         }
-                        self.router.notify_resource_subscribed(&request_ctx, &uri)?;
+                        self.router
+                            .notify_resource_subscribed_async(&request_ctx, &uri)
+                            .await?;
                         Ok(serde_json::json!({}))
                     }
                     "resources/unsubscribe" => {
                         let params: UnsubscribeResourceParams = parse_params(params)?;
                         self.router
-                            .notify_resource_unsubscribed(&request_ctx, &params.uri)?;
+                            .notify_resource_unsubscribed_async(&request_ctx, &params.uri)
+                            .await?;
                         Ok(serde_json::json!({}))
                     }
                     _ => Err(McpError::method_not_found(&request.method)),
@@ -19115,14 +19118,10 @@ impl Server {
                     }
                     match session.subscribe_resource(&mw_ctx, uri.clone()) {
                         Ok(SubscriptionAdmission::Accepted) => {
-                            if let Err(error) =
-                                self.router.notify_resource_subscribed(&mw_ctx, &uri)
-                            {
-                                let _ = session.unsubscribe_resource(&mw_ctx, &uri);
-                                return Err(error);
-                            }
-                            *session_mutation_rollback =
-                                Some(SessionMutationRollback::RemoveResourceSubscription(uri));
+                            *session_mutation_rollback = Some(
+                                SessionMutationRollback::RemoveResourceSubscription(uri.clone()),
+                            );
+                            self.router.notify_resource_subscribed(&mw_ctx, &uri)?;
                             Ok(serde_json::json!({}))
                         }
                         Ok(SubscriptionAdmission::Duplicate) => {
@@ -19142,9 +19141,10 @@ impl Server {
                     let uri = params.uri;
                     match session.unsubscribe_resource(&mw_ctx, &uri) {
                         Ok(SubscriptionRemoval::Removed) => {
+                            *session_mutation_rollback = Some(
+                                SessionMutationRollback::RestoreResourceSubscription(uri.clone()),
+                            );
                             self.router.notify_resource_unsubscribed(&mw_ctx, &uri)?;
-                            *session_mutation_rollback =
-                                Some(SessionMutationRollback::RestoreResourceSubscription(uri));
                             Ok(serde_json::json!({}))
                         }
                         Ok(SubscriptionRemoval::NotSubscribed) => Ok(serde_json::json!({})),

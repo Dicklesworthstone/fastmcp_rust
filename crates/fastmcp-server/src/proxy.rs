@@ -8751,6 +8751,89 @@ impl ProxyClient {
         Ok(())
     }
 
+    /// Subscribes through the native upstream on the caller runtime.
+    /// Commits the notification URI rewrite only after a live, typed response.
+    pub async fn subscribe_resource_async(
+        &self,
+        ctx: &McpContext,
+        inbound_uri: &str,
+    ) -> McpResult<()> {
+        self.change_resource_subscription_async(ctx, inbound_uri, true)
+            .await
+    }
+
+    /// Unsubscribes through the native upstream on the caller runtime.
+    /// A failed or interrupted request retains the existing URI rewrite.
+    pub async fn unsubscribe_resource_async(
+        &self,
+        ctx: &McpContext,
+        inbound_uri: &str,
+    ) -> McpResult<()> {
+        self.change_resource_subscription_async(ctx, inbound_uri, false)
+            .await
+    }
+
+    async fn change_resource_subscription_async(
+        &self,
+        ctx: &McpContext,
+        inbound_uri: &str,
+        subscribe: bool,
+    ) -> McpResult<()> {
+        ctx.ensure_live()?;
+        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
+        #[cfg(feature = "legacy-2024-11-05")]
+        let completed = {
+            self.start_legacy_receive_pump()?;
+            let method = if subscribe {
+                fastmcp_protocol::methods::RESOURCES_SUBSCRIBE
+            } else {
+                fastmcp_protocol::methods::RESOURCES_UNSUBSCRIBE
+            };
+            if let Some(result) = self
+                .request_legacy_yielding_with_context(
+                    ctx,
+                    method,
+                    serde_json::json!({"uri": upstream_uri}),
+                )
+                .await?
+            {
+                match (subscribe, self.admit_upstream_result(method, result)?) {
+                    (true, CoreResult::Legacy(LegacyCoreResult::ResourcesSubscribe(_)))
+                    | (false, CoreResult::Legacy(LegacyCoreResult::ResourcesUnsubscribe(_))) => {}
+                    _ => return Err(unexpected_proxy_result(method)),
+                }
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let completed = false;
+        if !completed {
+            self.with_backend(|backend| {
+                if subscribe {
+                    backend.subscribe_resource(upstream_uri)
+                } else {
+                    backend.unsubscribe_resource(upstream_uri)
+                }
+            })?;
+        }
+        ctx.ensure_live()?;
+        let mut rewrites = self
+            .subscription_rewrites
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?;
+        if subscribe {
+            rewrites.insert(upstream_uri.to_owned(), inbound_uri.to_owned());
+        } else {
+            rewrites.remove(upstream_uri);
+        }
+        Ok(())
+    }
+
     fn forward_inbound_log_level(&self, ctx: &McpContext) -> McpResult<()> {
         ctx.checkpoint()?;
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
@@ -11007,6 +11090,22 @@ impl ResourceHandler for ProxyResourceHandler {
 
     fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
         self.client.unsubscribe_resource(ctx, uri)
+    }
+
+    fn on_subscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(self.client.subscribe_resource_async(ctx, uri))
+    }
+
+    fn on_unsubscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(self.client.unsubscribe_resource_async(ctx, uri))
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
@@ -15398,6 +15497,326 @@ IFS= read -r end
             #[cfg(feature = "legacy-2024-11-05")]
             for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::Auto] {
                 proxy_stdio_catalog_caller_runtime_probe(policy, interrupt);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn proxy_resource_hooks_caller_runtime_probe(http: bool, unsubscribe: bool, interrupt: u8) {
+        use fastmcp_protocol::JsonRpcRequest;
+        use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        // Same peer and operation: 0=success, 1=upstream error, 2=cancel,
+        // 3=deadline, 4=drop. Every negative retries on the same connection.
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let control = std::env::temp_dir().join(format!(
+            "fastmcp-resource-hooks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&control).unwrap();
+        let subject = control.file_name().unwrap().to_str().unwrap().to_owned();
+        let uri = format!("file:///{subject}");
+        let method = if unsubscribe {
+            "resources/unsubscribe"
+        } else {
+            "resources/subscribe"
+        };
+        let target = usize::from(unsubscribe);
+        let mut methods = Vec::new();
+        if unsubscribe {
+            methods.push("resources/subscribe");
+        }
+        methods.push(method);
+        if interrupt != 0 {
+            methods.push(method);
+        }
+        let initialization = serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{"resources":{"subscribe":true}}, "serverInfo":{"name":subject,"version":"1"}});
+        let responses: Vec<_> = methods.iter().enumerate().map(|(i, _)| {
+            if interrupt == 1 && i == target {
+                serde_json::json!({"jsonrpc":"2.0","id":i+2,"error":{"code":-32602,"message":"upstream rejected subscription"}})
+            } else {
+                serde_json::json!({"jsonrpc":"2.0","id":i+2,"result":{}})
+            }
+        }).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (peer, plan) = if http {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let endpoint = format!("http://{address}/messages");
+            let plan = legacy_only_http_proxy_plan(&format!("http://{address}/sse"), &endpoint);
+            let peer_control = control.clone();
+            let peer_stop = Arc::clone(&stop);
+            let peer_responses = responses.clone();
+            let peer_initialization = initialization.clone();
+            let peer = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut sse = None;
+                let mut delayed = None;
+                let mut index = 0;
+                while !peer_stop.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "native subscription peer is bounded"
+                    );
+                    if peer_control.join("permit").exists()
+                        && let Some(response) = delayed.take()
+                    {
+                        let stream = sse.as_mut().unwrap();
+                        write_chunked_sse_event(
+                            stream,
+                            format!("event: message\ndata: {response}\n\n").as_bytes(),
+                        );
+                        stream.flush().unwrap();
+                    }
+                    let mut post = match listener.accept() {
+                        Ok((post, _)) => post,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("native subscription accept: {error}"),
+                    };
+                    post.set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    post.set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let incoming = read_http_request(&mut post);
+                    if incoming.head.starts_with("GET /sse ") {
+                        post.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                        write_chunked_sse_event(
+                            &mut post,
+                            format!("event: endpoint\ndata: {endpoint}\n\n").as_bytes(),
+                        );
+                        post.flush().unwrap();
+                        assert!(sse.replace(post).is_none());
+                        continue;
+                    }
+                    assert!(incoming.head.starts_with("POST /messages "));
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&incoming.body).unwrap();
+                    use std::fs::OpenOptions;
+                    writeln!(
+                        OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(peer_control.join("requests"))
+                            .unwrap(),
+                        "{request}"
+                    )
+                    .unwrap();
+                    write_http_response(&mut post, 202, "application/json", b"");
+                    if request.get("id").is_none() {
+                        continue;
+                    }
+                    let response = if request["method"] == "initialize" {
+                        serde_json::json!({"jsonrpc":"2.0","id":1,"result":peer_initialization})
+                    } else {
+                        let response = peer_responses[index].clone();
+                        assert_eq!(request["id"], index + 2);
+                        let hold = index == target;
+                        index += 1;
+                        if hold {
+                            delayed = Some(response);
+                            std::fs::write(peer_control.join("received"), b"ready").unwrap();
+                            continue;
+                        }
+                        response
+                    };
+                    let stream = sse.as_mut().unwrap();
+                    write_chunked_sse_event(
+                        stream,
+                        format!("event: message\ndata: {response}\n\n").as_bytes(),
+                    );
+                    stream.flush().unwrap();
+                }
+                assert_eq!(index, peer_responses.len());
+                assert!(delayed.is_none());
+            });
+            (Some(peer), plan)
+        } else {
+            (None, ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+        };
+        let opening = scripted_response_line(1, initialization.clone());
+        let mut script = format!(
+            "read_request() {{\nwhile IFS= read -r request; do\nprintf '%s\\n' \"$request\" >> \"$1/requests\"\ncase \"$request\" in *'\"id\":'*) return 0;; esac\ndone\nreturn 1\n}}\nread_request \"$1\" || exit 91\nprintf '%s\\n' '{opening}'\n"
+        );
+        for (i, response) in responses.iter().enumerate() {
+            script.push_str("read_request \"$1\" || exit 92\n");
+            if i == target {
+                script.push_str("printf ready > \"$1/received\"\nturn=0\nwhile ! [ -f \"$1/permit\" ]; do\nturn=$((turn + 1))\n[ \"$turn\" -lt 1000 ] || exit 93\nsleep 0.01\ndone\n");
+            }
+            script.push_str(&format!("printf '%s\\n' '{response}'\n"));
+        }
+        script.push_str("while IFS= read -r remaining; do :; done\n");
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let siblings = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let worker = thread::current().id();
+                let mut registry = ProxyClient::upstream_binding_registry();
+                let proxy = if http {
+                    registry.connect_http_with_protocol_plan(&cx, &subject, "native", 1, plan, proxy_http_client_info(), ClientCapabilities::default()).await.unwrap()
+                } else {
+                    registry.connect_stdio_with_protocol_plan(&cx, &subject, "native", 1, "sh", &["-c", &script, "subscription-peer", control.to_str().unwrap()], plan).await.unwrap()
+                };
+                let handler = super::ProxyResourceHandler::with_prefix(Resource {
+                    uri: uri.clone(), name: subject.clone(), description: None, mime_type: None,
+                    icon: None, version: None, tags: Vec::new(),
+                }, "remote/ns", proxy.clone());
+                let child = crate::Server::new("upstream-resource", "1").legacy_resource(handler).build();
+                let endpoint = crate::Server::new("resource-gateway", "1")
+                    .mount(child, Some("gateway"))
+                    .request_timeout(1)
+                    .build_http_endpoint("http://gateway.test").unwrap();
+                let mut session = endpoint.open_session(&cx).unwrap();
+                let crate::ServerHttpEndpointResponse::LegacySse(mut stream) = session.handle_async(&cx, HttpRequest::new(HttpMethod::Get, "/sse")).await.unwrap() else { panic!("legacy SSE opens"); };
+                assert!(stream.try_recv_event(&cx).unwrap().is_some());
+                let session_id = session.legacy_session_id().to_owned();
+                let inbound_uri = format!("gateway/remote/ns/{uri}");
+                let post = |request: JsonRpcRequest| HttpRequest::new(HttpMethod::Post, "/messages")
+                    .with_header("content-type", "application/json")
+                    .with_query("session_id", session_id.clone())
+                    .with_body(serde_json::to_vec(&request).unwrap());
+                let initialized = JsonRpcRequest::new("initialize", Some(serde_json::json!({"protocolVersion":"2024-11-05","clientInfo":{"name":"hook-client","version":"1"},"capabilities":{}})), 1_i64);
+                for request in [initialized, JsonRpcRequest::notification("notifications/initialized", None)] {
+                    assert!(matches!(session.handle_async(&cx, post(request)).await.unwrap(), crate::ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED));
+                }
+                let initialized_event = stream.try_recv_event(&cx).unwrap().unwrap();
+                let initialized_response: serde_json::Value = serde_json::from_str(&initialized_event.data).unwrap();
+                assert_eq!(initialized_response["result"]["capabilities"]["resources"]["subscribe"], true);
+                if unsubscribe {
+                    let request = JsonRpcRequest::new("resources/subscribe", Some(serde_json::json!({"uri":inbound_uri})), 2_i64);
+                    assert!(matches!(session.handle_async(&cx, post(request)).await.unwrap(), crate::ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED));
+                    let event = stream.try_recv_event(&cx).unwrap().unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                    assert_eq!(response["result"], serde_json::json!({}));
+                }
+                let snapshot = session.legacy_adapter.as_ref().unwrap().snapshot();
+                let rewrites = proxy.subscription_rewrites.lock().unwrap().clone();
+                let active_requests = Arc::clone(&session.server.active_requests);
+                let request_id = (target + 2) as i64;
+                let request = JsonRpcRequest::new(method, Some(serde_json::json!({"uri":inbound_uri})), request_id);
+                let mut operation = Box::pin(session.handle_async(&cx, post(request)));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let polled = std::future::poll_fn(|task_cx| Poll::Ready(operation.as_mut().poll(task_cx))).await;
+                    assert!(polled.is_pending(), "subscription hook must yield until peer response; http={http}, unsubscribe={unsubscribe}, interrupt={interrupt}, event={:?}", stream.try_recv_event(&cx));
+                    assert!(proxy.inner.try_lock().is_ok(), "proxy mutex is released while awaiting upstream");
+                    if control.join("received").exists() { break; }
+                    assert!(Instant::now() < deadline, "request reaches native upstream");
+                    asupersync::runtime::yield_now().await;
+                }
+                if interrupt == 4 {
+                    drop(operation);
+                } else {
+                    let permit = control.join("permit");
+                    let mut sibling = siblings.spawn(move |_| async move {
+                        assert_eq!(thread::current().id(), worker);
+                        match interrupt {
+                            2 => {
+                                let active = active_requests.lock().unwrap();
+                                assert_eq!(active.len(), 1);
+                                assert!(active.values().next().unwrap().cancellation.cancel());
+                            }
+                                    3 => {
+                                        clock.advance(1_000_000_000);
+                                    }
+                            _ => std::fs::write(permit, b"release subscription").unwrap(),
+                        }
+                    }).unwrap();
+                    assert!(matches!(operation.await.unwrap(), crate::ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED));
+                    sibling.join(&siblings).await.unwrap();
+                    let event = stream.try_recv_event(&cx).unwrap();
+                    if interrupt == 2 {
+                        // Exact-2024 explicit cancellation suppresses the
+                        // terminal response at HandledRequest::send_with.
+                        assert!(event.is_none(), "explicit cancellation cannot publish a response");
+                    } else {
+                        let event = event.expect("non-cancelled request publishes its terminal response");
+                        let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                        assert_eq!(response["id"], request_id);
+                        if interrupt == 0 {
+                            assert_eq!(response["result"], serde_json::json!({}));
+                            assert!(response.get("error").is_none());
+                        } else {
+                            assert_eq!(response["error"]["code"], i32::from(if interrupt == 1 { McpErrorCode::InvalidParams } else { McpErrorCode::RequestCancelled }));
+                            assert!(response.get("result").is_none());
+                        }
+                    }
+                }
+                if interrupt != 0 {
+                    assert_eq!(session.legacy_adapter.as_ref().unwrap().snapshot(), snapshot, "interrupted hook does not commit downstream state");
+                    assert_eq!(*proxy.subscription_rewrites.lock().unwrap(), rewrites, "interrupted hook preserves URI rewrites");
+                    std::fs::write(control.join("permit"), b"release late response").unwrap();
+                    let request = JsonRpcRequest::new(method, Some(serde_json::json!({"uri":inbound_uri})), request_id + 1);
+                    assert!(matches!(session.handle_async(&cx, post(request)).await.unwrap(), crate::ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::ACCEPTED));
+                    let event = stream.try_recv_event(&cx).unwrap().unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                    assert_eq!(response["id"], request_id + 1);
+                    assert_eq!(response["result"], serde_json::json!({}));
+                    assert!(response.get("error").is_none());
+                }
+                assert_eq!(session.legacy_adapter.as_ref().unwrap().snapshot().subscriptions.contains(&inbound_uri), !unsubscribe);
+                let final_rewrites = proxy.subscription_rewrites.lock().unwrap().clone();
+                if unsubscribe { assert!(final_rewrites.is_empty()); } else {
+                    assert_eq!(final_rewrites.get(&uri), Some(&format!("remote/ns/{uri}")));
+                }
+                assert_eq!(registry.live_stdio.len() + registry.live_http.len(), 1);
+                assert!(!cx.is_cancel_requested());
+                let requests: Vec<serde_json::Value> = std::fs::read_to_string(control.join("requests")).unwrap().lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .filter(|request: &serde_json::Value| request.get("id").is_some()).collect();
+                assert_eq!(requests.len(), methods.len() + 1);
+                for (index, method) in methods.iter().enumerate() {
+                    assert_eq!(requests[index+1]["id"], index+2);
+                    assert_eq!(requests[index+1]["method"], *method);
+                    assert_eq!(requests[index+1]["params"]["uri"], uri);
+                }
+                session.close(&cx).await;
+                stop.store(true, Ordering::Release);
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        if let Some(peer) = peer {
+            peer.join().unwrap();
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_resource_hooks_caller_runtime_positive() {
+        for http in [false, true] {
+            for unsubscribe in [false, true] {
+                proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, 0);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_resource_hooks_caller_runtime_planted_negative() {
+        for http in [false, true] {
+            for unsubscribe in [false, true] {
+                for interrupt in 1..=4 {
+                    proxy_resource_hooks_caller_runtime_probe(http, unsubscribe, interrupt);
+                }
             }
         }
     }

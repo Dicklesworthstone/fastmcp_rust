@@ -1913,6 +1913,25 @@ pub trait ResourceHandler: Send + Sync {
         Ok(())
     }
 
+    /// Subscribes on the caller runtime. Override when the hook waits for I/O.
+    /// The default invokes the synchronous hook for local handlers.
+    fn on_subscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(async move { self.on_subscribe(ctx, uri) })
+    }
+
+    /// Unsubscribes on the caller runtime, with the same default as subscribe.
+    fn on_unsubscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(async move { self.on_unsubscribe(ctx, uri) })
+    }
+
     /// Returns an exact final resource catalog definition, when this handler
     /// owns one. This bypasses lossy projection through [`Resource`], retaining
     /// final-only fields such as `size`, full icons, annotations, and `_meta`.
@@ -3361,6 +3380,28 @@ impl ResourceHandler for MountedResourceHandler {
     fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
         let source_uri = self.translate_incoming_uri(uri)?;
         self.inner.on_unsubscribe(ctx, &source_uri)
+    }
+
+    fn on_subscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(async move {
+            let source_uri = self.translate_incoming_uri(uri)?;
+            self.inner.on_subscribe_async(ctx, &source_uri).await
+        })
+    }
+
+    fn on_unsubscribe_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(async move {
+            let source_uri = self.translate_incoming_uri(uri)?;
+            self.inner.on_unsubscribe_async(ctx, &source_uri).await
+        })
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {

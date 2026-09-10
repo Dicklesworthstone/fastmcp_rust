@@ -462,6 +462,16 @@ stdio receive turns and reject cursor cycles without returning a partial
 catalog. Stdio writes and individual receive turns retain their synchronous
 I/O limits. Backends without an upstream binding retain their synchronous
 catalog implementation.
+
+Exact-2024 resource subscribe/unsubscribe hooks also have awaited variants:
+`ResourceHandler::on_subscribe_async` and `on_unsubscribe_async`. The live
+dispatcher and mounted resources forward these hooks on the caller runtime.
+Native proxies release the route lock during HTTP/SSE waits and between bounded
+stdio receive turns.
+Failed or interrupted proxy requests preserve local URI rewrites, and failed
+synchronous hooks roll back the session's subscription membership. Remote
+effects already acknowledged upstream cannot be rolled back by these guarantees.
+
 HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
 `read_resource`/`get_prompt` verbs so callers do not have to decode a raw
 core result for ordinary catalog and invocation traffic. HTTP and WebSocket
