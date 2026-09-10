@@ -1894,7 +1894,13 @@ mod tests {
             let sibling_root = root.clone();
             let mut work = root.spawn(move |cx| async move {
                 let events = StdioRetryAttemptLog::new(mode);
+                // Completion requires progress on the caller's sole worker;
+                // a fixed peer sleep cannot establish that ordering.
+                let release = StdioRetryAttemptLog::new("yielding-peer-release");
                 let script = r#"
+wait_for_sibling() {
+    while [ ! -s "$1" ]; do sleep 0.001; done
+}
 printf 'spawn:%s\n' "$$" >> "$1"
 IFS= read -r first || exit 90
 case "$first" in *'"id":1'*) ;; *) exit 91;; esac
@@ -1908,13 +1914,13 @@ case "$2" in cancel|drop) exec sleep 5;; esac
 if [ "$era" = modern ]; then
     case "$2" in
         auto-silent) exec sleep 5;;
-        auto-refusal) sleep 0.1; printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
-        wrong-id) sleep 0.1; printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+        auto-refusal) wait_for_sibling "$3"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+        wrong-id) wait_for_sibling "$3"; printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
     esac
 fi
 printf '%s' '{"jsonrpc":"2.0",'
 if [ "$2" = partial ]; then exec sleep 5; fi
-sleep 0.1
+wait_for_sibling "$3"
 if [ "$era" = modern ]; then
     printf '%s\n' '"id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"yielding-startup-peer","version":"1"}}}}'
 else
@@ -1935,20 +1941,22 @@ exec sleep 5
                         Duration::from_millis(400), Duration::from_millis(400),
                     ).unwrap())
                     .max_retries(0);
-                let args = ["-c", script, "yielding-startup-peer", events.path.to_str().unwrap(), mode];
+                let args = ["-c", script, "yielding-startup-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()];
                 let worker = std::thread::current().id();
                 let started = Instant::now();
                 let mut connecting = Box::pin(builder.connect_stdio_with_cx("sh", &args, &cx));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(connecting.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "eager initialization must yield before the peer completes");
-                assert!(started.elapsed() < Duration::from_millis(250), "one startup poll occupied the caller worker");
+                assert!(started.elapsed() < Duration::from_millis(250), "one startup poll occupied the caller worker; elapsed: {:?}", started.elapsed());
                 let path = events.path.clone();
+                let release_path = release.path.clone();
                 let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
                     assert_eq!(std::thread::current().id(), worker);
                     let deadline = Instant::now() + Duration::from_secs(2);
                     loop {
                         sibling_cx.checkpoint().unwrap();
                         if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 {
+                            std::fs::write(&release_path, b"continue\n").unwrap();
                             return 1_u8;
                         }
                         assert!(Instant::now() < deadline, "the actual child never received initialization");
@@ -2132,6 +2140,9 @@ exec sleep 5
             let sibling_root = root.clone();
             let mut work = root.spawn(move |cx| async move {
                 let events = StdioRetryAttemptLog::new(mode);
+                // Keep first use pending until the same-worker sibling has
+                // observed the handshake and explicitly releases its peer.
+                let release = StdioRetryAttemptLog::new("deferred-peer-release");
                 let script = r#"
 printf 'spawn:%s\n' "$$" >> "$1"
 IFS= read -r first || exit 90
@@ -2141,7 +2152,7 @@ printf 'handshake:%s\n' "$era" >> "$1"
 case "$2" in silent|close) exec sleep 5;; esac
 printf '%s' '{"jsonrpc":"2.0",'
 if [ "$2" = partial ]; then exec sleep 5; fi
-sleep 0.4
+while [ ! -s "$3" ]; do sleep 0.001; done
 if [ "$2" = invalid ]; then
     printf '%s\n' '"id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{},"serverInfo":{"name":"invalid-peer","version":"1"}}}'
     exec sleep 5
@@ -2179,7 +2190,7 @@ exec sleep 5
                         Duration::from_millis(900), Duration::from_millis(900),
                     ).unwrap())
                     .max_retries(0)
-                    .connect_stdio_with_cx("sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode], &cx)
+                    .connect_stdio_with_cx("sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()], &cx)
                     .await.unwrap();
                 assert!(!client.is_initialized());
                 let mut cancellation = crate::McpRequestCancellation::new();
@@ -2199,13 +2210,17 @@ exec sleep 5
                 let mut first_use = Box::pin(deferred_probe_request(&mut client, &cx, &cancellation, api));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(first_use.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "deferred first use must yield before initialization completes");
-                assert!(started.elapsed() < Duration::from_millis(250), "deferred initialization occupied the caller worker");
+                assert!(started.elapsed() < Duration::from_millis(250), "deferred initialization occupied the caller worker; elapsed: {:?}", started.elapsed());
                 let path = events.path.clone();
+                let release_path = release.path.clone();
                 let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
                     assert_eq!(std::thread::current().id(), worker);
                     let deadline = Instant::now() + Duration::from_secs(2);
                     loop {
-                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 { return 1_u8; }
+                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 {
+                            std::fs::write(&release_path, b"continue\n").unwrap();
+                            return 1_u8;
+                        }
                         assert!(Instant::now() < deadline, "child never received initialization");
                         asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
                     }
