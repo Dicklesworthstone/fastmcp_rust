@@ -38720,9 +38720,17 @@ exec sleep 5
                     cancellation = McpRequestCancellation::new();
                 }
                 let mut open = Box::pin(subscription_probe_open(&mut client, &caller_cx, &cancellation, tasks));
+                // Keep scheduler evidence outside the timed poll. A delayed
+                // executor thread and a blocking poll otherwise produce the
+                // same wall-clock assertion with no way to tell them apart.
+                let scheduler_before = std::fs::read_to_string("/proc/thread-self/schedstat").ok();
                 let started = Instant::now();
-                assert!(std::future::poll_fn(|task_cx| Poll::Ready(open.as_mut().poll(task_cx))).await.is_pending());
-                assert!(started.elapsed() < Duration::from_millis(150), "deferred listener open must yield");
+                let first_poll = std::future::poll_fn(|task_cx| Poll::Ready(open.as_mut().poll(task_cx))).await;
+                let elapsed = started.elapsed();
+                let scheduler_after = std::fs::read_to_string("/proc/thread-self/schedstat").ok();
+                eprintln!("subscription-open tasks={tasks} mode={mode} elapsed={elapsed:?} scheduler_before={scheduler_before:?} scheduler_after={scheduler_after:?}");
+                assert!(first_poll.is_pending(), "deferred listener open completed in its first poll: {first_poll:?}");
+                assert!(elapsed < Duration::from_millis(150), "deferred listener open must yield; elapsed={elapsed:?}, tasks={tasks}, mode={mode}, scheduler_before={scheduler_before:?}, scheduler_after={scheduler_after:?}");
                 open.await.unwrap();
                 assert_eq!(subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks).await.unwrap(), 0);
                 let executor = client.multiplexed_stdio_executor().unwrap();
@@ -38732,7 +38740,8 @@ exec sleep 5
                 let mut next = Box::pin(subscription_probe_next(&mut client, &caller_cx, &cancellation, tasks));
                 let started = Instant::now();
                 assert!(std::future::poll_fn(|task_cx| Poll::Ready(next.as_mut().poll(task_cx))).await.is_pending());
-                assert!(started.elapsed() < Duration::from_millis(250), "event receive must yield before delayed frame completion");
+                let elapsed = started.elapsed();
+                assert!(elapsed < Duration::from_millis(250), "event receive must yield before delayed frame completion; elapsed={elapsed:?}, tasks={tasks}, mode={mode}");
                 let mut sibling = sibling_root.spawn(move |cx| async move {
                     assert_eq!(std::thread::current().id(), worker);
                     asupersync::time::sleep(cx.now(), Duration::from_millis(40)).await;
