@@ -122,6 +122,7 @@ MCP server implementations need to solve several recurring problems:
 **FastMCP Rust** is an MCP framework with asupersync capability contexts, attribute macros, and explicit cancellation/budget surfaces:
 
 ```rust
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 #[tool]
@@ -131,13 +132,26 @@ async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
 }
 
 fn main() {
-    ServerBuilder::new("my-server", "1.0.0")
-        // Attribute macros generate PascalCase handler values.
-        .tool(Greet)
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("my-server", "1.0.0")
+            // Attribute macros generate PascalCase handler values.
+            .tool(Greet)
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
+
+The application creates the runtime once and supplies its context. Stdio needs
+a blocking pool for its receive pump; FastMCP does not create a runtime at this
+entry point. See Quick Start below for the dependency declarations.
 
 ### Why FastMCP Rust?
 
@@ -169,6 +183,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 ## Quick Example
 
 ```rust
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 // Define a tool with automatic JSON schema generation
@@ -197,13 +212,22 @@ async fn greeting(ctx: &McpContext, name: String) -> McpResult<Vec<PromptMessage
 }
 
 fn main() {
-    ServerBuilder::new("example-server", "1.0.0")
-        .tool(Add)
-        .resource(ConfigResource)
-        .prompt(GreetingPrompt)
-        .request_timeout(30)  // 30-second budget per request
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("example-server", "1.0.0")
+            .tool(Add)
+            .resource(ConfigResource)
+            .prompt(GreetingPrompt)
+            .request_timeout(30)  // 30-second budget per request
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
 
@@ -242,12 +266,15 @@ async fn process_items(
 Timeouts are "we gave up." Budgets are "you have X resources." The `Budget` type represents deadline, poll-quota, and cost-quota dimensions:
 
 ```rust
-// Configure a 30-second server-owned request ceiling
-ServerBuilder::new("server", "1.0.0")
-    .request_timeout(30)
-    .tool(MyTool)
-    .build()
-    .run_stdio();
+// Called from the application's runtime with its context.
+async fn serve(cx: &Cx) -> ! {
+    ServerBuilder::new("server", "1.0.0")
+        .request_timeout(30) // 30-second server-owned request ceiling
+        .tool(MyTool)
+        .build()
+        .run_stdio_with_cx(cx)
+        .await
+}
 
 // Handler can check remaining budget
 #[tool]
@@ -350,6 +377,7 @@ fastmcp-rust = "0.8.1"
 ```toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+asupersync = "=0.4.10"
 ```
 
 ### From Source
@@ -614,12 +642,14 @@ cd my-mcp-server
 # Cargo.toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+asupersync = "=0.4.10"
 ```
 
 ### 3. Write Your Server
 
 ```rust
 // src/main.rs
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 
 #[tool(description = "Echo the input message")]
@@ -629,11 +659,20 @@ async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
 }
 
 fn main() {
-    ServerBuilder::new("echo-server", "1.0.0")
-        .tool(Echo)
-        .instructions("A simple echo server for testing")
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("echo-server", "1.0.0")
+            .tool(Echo)
+            .instructions("A simple echo server for testing")
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
 

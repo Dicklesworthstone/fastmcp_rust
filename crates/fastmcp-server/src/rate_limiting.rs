@@ -8,17 +8,19 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_rust::prelude::*;
+//! use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 //! use fastmcp_rust::rate_limiting::RateLimitingMiddleware;
 //!
 //! // Allow 10 requests per second with bursts up to 20
 //! let rate_limiter = RateLimitingMiddleware::new(10.0)
 //!     .burst_capacity(20);
 //!
-//! Server::new("my-server", "1.0.0")
+//! // Inside the application's async entry point, with its supplied `cx`.
+//! ServerBuilder::new("my-server", "1.0.0")
 //!     .middleware(rate_limiter)
 //!     .build()
-//!     .run_stdio();
+//!     .run_stdio_with_cx(cx)
+//!     .await;
 //! ```
 
 use std::collections::{BTreeSet, HashMap, VecDeque};

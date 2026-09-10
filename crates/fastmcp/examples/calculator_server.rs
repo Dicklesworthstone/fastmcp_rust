@@ -313,7 +313,7 @@ fn solve_problem(_ctx: &McpContext, problem: String) -> Vec<PromptMessage> {
 // ============================================================================
 
 fn main() {
-    ServerBuilder::new("calculator-server", "1.0.0")
+    let server = ServerBuilder::new("calculator-server", "1.0.0")
         // Basic arithmetic
         .tool(Add)
         .tool(Subtract)
@@ -345,6 +345,14 @@ fn main() {
              for number theory. Use 'average', 'std_dev' for statistics. \
              Access 'math://constants' for mathematical constants.",
         )
+        .build();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("stdio reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("application-owned runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::current().expect("application caller context");
+        server.run_stdio_with_cx(&cx).await;
+    });
 }

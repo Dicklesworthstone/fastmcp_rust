@@ -449,7 +449,7 @@ fn packing_list(
 // ============================================================================
 
 fn main() {
-    ServerBuilder::new("weather-server", "1.0.0")
+    let server = ServerBuilder::new("weather-server", "1.0.0")
         // Weather tools
         .tool(GetWeather)
         .tool(GetForecast)
@@ -471,6 +471,14 @@ fn main() {
              Available cities: New York, London, Tokyo, Sydney, Paris. \
              Check 'weather://docs' for full API documentation.",
         )
+        .build();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("stdio reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("application-owned runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::current().expect("application caller context");
+        server.run_stdio_with_cx(&cx).await;
+    });
 }

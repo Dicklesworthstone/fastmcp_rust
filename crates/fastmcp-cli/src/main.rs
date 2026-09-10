@@ -6580,7 +6580,13 @@ fn finish_inspect_cleanup<T>(
         )),
         (Err(acquisition_error), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
             fastmcp_core::McpErrorCode::InternalError,
-            format!("client cleanup failed after an operation failure: {cleanup_error}"),
+            // The trusted separator bounds header-value redaction when the
+            // terminal writer sanitizes again; it then escapes the newline.
+            format!(
+                "operation failed: {}\nclient cleanup also failed: {}",
+                sanitize_peer_text(&acquisition_error.to_string(), PEER_FIELD_LIMIT),
+                sanitize_peer_text(&cleanup_error.to_string(), PEER_FIELD_LIMIT),
+            ),
             serde_json::json!({
                 CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
                 "operation": acquisition_error,
@@ -15937,6 +15943,11 @@ IFS= read -r end
 
             assert_eq!(cleanup_calls.get(), 1);
             assert!(fastmcp_client::is_cleanup_unverified(&error));
+            assert!(
+                error.message.contains("list sentinel"),
+                "the visible CLI error must preserve the operation failure"
+            );
+            assert!(error.message.contains("cleanup sentinel"));
             let data = error
                 .data
                 .as_ref()
@@ -15944,6 +15955,42 @@ IFS= read -r end
                 .expect("unverified cleanup must retain structured inspect evidence");
             assert_eq!(data["operation"]["message"], "list sentinel");
             assert_eq!(data["cleanup"]["message"], "cleanup sentinel");
+
+            let long_operation = fastmcp_core::McpError::invalid_params(format!(
+                "list sentinel\u{1b}[2J{}",
+                "x".repeat(PEER_DETAIL_LIMIT)
+            ));
+            let error = finish_inspect_acquisition::<(), _>(Err(long_operation.clone()), || {
+                Err(cleanup_error)
+            })
+            .unwrap_err();
+            let visible = sanitize_peer_text(&error.to_string(), PEER_DETAIL_LIMIT);
+            assert!(visible.contains("list sentinel"));
+            assert!(visible.contains("cleanup sentinel"));
+            assert!(!visible.contains('\u{1b}'));
+            assert!(visible.len() <= PEER_DETAIL_LIMIT);
+            assert_eq!(
+                error.data.as_ref().unwrap()["operation"]["message"],
+                long_operation.message,
+                "bounded display must not discard the structured operation failure"
+            );
+
+            for header in ["Authorization: Bearer", "Cookie:"] {
+                let operation = fastmcp_core::McpError::invalid_params(format!(
+                    "list sentinel {header} diagnostic-secret-canary"
+                ));
+                let error = finish_inspect_acquisition::<(), _>(Err(operation), || {
+                    Err(fastmcp_core::McpError::internal_error("cleanup sentinel"))
+                })
+                .unwrap_err();
+                let visible = sanitize_peer_text(&error.to_string(), PEER_DETAIL_LIMIT);
+                assert!(visible.contains("list sentinel"));
+                assert!(!visible.contains("diagnostic-secret-canary"));
+                assert!(
+                    visible.contains("cleanup sentinel"),
+                    "redacting an operation credential must not hide cleanup: {visible}"
+                );
+            }
         }
 
         #[test]

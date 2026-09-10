@@ -195,11 +195,15 @@ const MEMORY_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
 /// the client transports before this bounded settlement runs. A server that
 /// does not stop within the bound aborts the test process rather than silently
 /// detaching a live server thread.
-struct ThreadJoins(Vec<JoinHandle<()>>);
+struct ThreadJoins(Vec<JoinHandle<()>>, Option<WorkerProgress>);
 
 impl ThreadJoins {
     fn new(handles: Vec<JoinHandle<()>>) -> Self {
-        Self(handles)
+        Self(handles, None)
+    }
+
+    fn with_worker_progress(progress: WorkerProgress) -> Self {
+        Self(Vec::new(), Some(progress))
     }
 
     fn push(&mut self, handle: JoinHandle<()>) {
@@ -209,11 +213,18 @@ impl ThreadJoins {
 
 impl Drop for ThreadJoins {
     fn drop(&mut self) {
-        let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
+        let started = self
+            .1
+            .as_ref()
+            .map_or_else(Instant::now, |progress| progress.advance("server teardown"));
+        let deadline = started + MEMORY_SERVER_TEARDOWN_BOUND;
         while self.0.iter().any(|handle| !handle.is_finished()) {
             if Instant::now() >= deadline {
-                eprintln!(
-                    "memory-transport server teardown exceeded its bounded settlement window"
+                // Bypass libtest capture: abort cannot flush a test's captured diagnostics.
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "memory-transport server teardown exceeded its bounded settlement window in {:?}",
+                    thread::current().name()
                 );
                 std::process::abort();
             }
@@ -221,9 +232,16 @@ impl Drop for ThreadJoins {
         }
         for handle in self.0.drain(..) {
             if handle.join().is_err() {
-                eprintln!("memory-transport server thread panicked during settlement");
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "memory-transport server thread panicked during settlement in {:?}",
+                    thread::current().name()
+                );
                 std::process::abort();
             }
+        }
+        if let Some(progress) = &self.1 {
+            progress.advance("worker return");
         }
     }
 }
@@ -235,37 +253,115 @@ where
     std::thread::spawn(f)
 }
 
-fn join_thread_with_bound<T>(handle: JoinHandle<T>, owner: &str) -> std::thread::Result<T> {
-    let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            eprintln!("{owner} exceeded its bounded settlement window");
-            std::process::abort();
+struct WorkerStage {
+    started: Instant,
+    name: &'static str,
+    expired: Option<&'static str>,
+}
+
+impl WorkerStage {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            name: "client initialization",
+            expired: None,
         }
-        thread::sleep(Duration::from_millis(1));
     }
-    handle.join()
+
+    fn check(&mut self, now: Instant) -> Option<&'static str> {
+        if now.saturating_duration_since(self.started) >= MEMORY_SERVER_TEARDOWN_BOUND {
+            self.expired.get_or_insert(self.name);
+        }
+        self.expired
+    }
+
+    fn advance(&mut self, now: Instant, name: &'static str) {
+        // A late return must not erase an overrun between supervisor polls.
+        self.check(now);
+        self.started = now;
+        self.name = name;
+    }
+}
+
+#[derive(Clone)]
+struct WorkerProgress(Arc<std::sync::Mutex<WorkerStage>>);
+
+impl WorkerProgress {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(WorkerStage::new(
+            Instant::now(),
+        ))))
+    }
+
+    fn advance(&self, name: &'static str) -> Instant {
+        let mut stage = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        stage.advance(now, name);
+        now
+    }
+
+    fn expired(&self, finished: bool, observed_at: Instant) -> Option<&'static str> {
+        let mut stage = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if finished {
+            stage.expired
+        } else {
+            stage.check(observed_at)
+        }
+    }
 }
 
 /// Retains every concurrent test worker until all of them have crossed a
-/// bounded join. If one worker panics, the remaining owners still settle
-/// before that first panic is resumed.
-struct WorkerJoins<T>(Vec<JoinHandle<T>>);
+/// bounded stage and joined teardown. Only real RPC completions advance a
+/// worker's stage; waiting never refreshes its deadline. If one worker panics,
+/// the remaining owners still settle before that first panic is resumed.
+struct WorkerJoins<T>(Vec<(JoinHandle<T>, WorkerProgress)>);
 
 impl<T> WorkerJoins<T> {
     fn new() -> Self {
         Self(Vec::new())
     }
 
-    fn push(&mut self, handle: JoinHandle<T>) {
-        self.0.push(handle);
+    fn push(&mut self, handle: JoinHandle<T>, progress: WorkerProgress) {
+        self.0.push((handle, progress));
+    }
+
+    fn wait(&self, owner: &str) {
+        loop {
+            let mut all_finished = true;
+            for (handle, progress) in &self.0 {
+                // Sample time before completion, so descheduling after the
+                // completion read cannot expire a worker that has since exited.
+                let observed_at = Instant::now();
+                let finished = handle.is_finished();
+                if let Some(stage) = progress.expired(finished, observed_at) {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "{owner} exceeded its bounded {stage} stage in {:?}",
+                        thread::current().name()
+                    );
+                    std::process::abort();
+                }
+                all_finished &= finished;
+            }
+            if all_finished {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn join_all(mut self, owner: &str) -> Vec<T> {
+        self.wait(owner);
         let mut values = Vec::with_capacity(self.0.len());
         let mut first_panic = None;
-        for handle in self.0.drain(..) {
-            match join_thread_with_bound(handle, owner) {
+        for (handle, _) in self.0.drain(..) {
+            match handle.join() {
                 Ok(value) => values.push(value),
                 Err(payload) if first_panic.is_none() => first_panic = Some(payload),
                 Err(_) => {}
@@ -280,9 +376,10 @@ impl<T> WorkerJoins<T> {
 
 impl<T> Drop for WorkerJoins<T> {
     fn drop(&mut self) {
+        self.wait("concurrent E2E worker");
         let mut first_panic = None;
-        for handle in self.0.drain(..) {
-            match join_thread_with_bound(handle, "concurrent E2E worker") {
+        for (handle, _) in self.0.drain(..) {
+            match handle.join() {
                 Ok(_) => {}
                 Err(payload) if first_panic.is_none() => first_panic = Some(payload),
                 Err(_) => {}
@@ -293,6 +390,42 @@ impl<T> Drop for WorkerJoins<T> {
                 std::panic::resume_unwind(payload);
             }
         }
+    }
+}
+
+#[test]
+fn worker_stage_deadlines_preserve_progress_and_latch_late_completion() {
+    let start = Instant::now();
+    for slow_rpc in [false, true] {
+        let mut stage = WorkerStage::new(start);
+        stage.advance(start + Duration::from_secs(1), "RPC");
+        let completion = start
+            + if slow_rpc {
+                Duration::from_millis(3_001)
+            } else {
+                Duration::from_secs(2)
+            };
+        // Only the RPC duration changes. No supervisor poll sees its return.
+        stage.advance(completion, "server teardown");
+        stage.advance(completion + Duration::from_secs(1), "worker return");
+        assert_eq!(stage.expired, slow_rpc.then_some("RPC"));
+        let progress = WorkerProgress(Arc::new(std::sync::Mutex::new(stage)));
+        assert_eq!(
+            progress.expired(true, completion + Duration::from_secs(100)),
+            slow_rpc.then_some("RPC"),
+            "finished workers retain stage failures but do not acquire new timeouts"
+        );
+        let mut stage = progress.0.lock().unwrap();
+        // The healthy workload exceeds two seconds in aggregate. Repeated
+        // observer checks do not extend its final stage or clear a prior fault.
+        assert_eq!(
+            stage.check(completion + Duration::from_millis(1_500)),
+            slow_rpc.then_some("RPC")
+        );
+        assert_eq!(
+            stage.check(completion + Duration::from_secs(3)),
+            Some(if slow_rpc { "RPC" } else { "worker return" })
+        );
     }
 }
 
@@ -1069,6 +1202,9 @@ fn workflow_sequential_clients_same_server() {
 
 #[test]
 fn workflow_two_independent_servers() {
+    // Raw client transports must also close before server settlement on unwind.
+    let mut server_joins = ThreadJoins::new(Vec::new());
+
     // Server A: tools only
     let (builder_a, client_a_transport, server_a_transport) = TestServer::builder()
         .with_name("server-a")
@@ -1080,6 +1216,7 @@ fn workflow_two_independent_servers() {
             .run_transport_returning_with_cx(&cx, server_a_transport)
             .expect("server A loop");
     });
+    server_joins.push(handle_a);
 
     // Server B: resources only
     let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
@@ -1092,8 +1229,7 @@ fn workflow_two_independent_servers() {
             .run_transport_returning_with_cx(&cx, server_b_transport)
             .expect("server B loop");
     });
-
-    let _joins = ThreadJoins::new(vec![handle_a, handle_b]);
+    server_joins.push(handle_b);
 
     // Client A
     let mut client_a = TestClient::new(client_a_transport);
@@ -1474,7 +1610,8 @@ impl Drop for FinalTasksHttpStartupGuard {
         };
         let settlement = settle_final_tasks_http_server(shutdown, finished, &mut self.join);
         if settlement.is_err() && self.join.is_some() {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "final Tasks HTTP server startup left a live unjoinable thread after bounded settlement"
             );
             std::process::abort();
@@ -2410,17 +2547,26 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         status, 400,
         "the native HTTP boundary maps missing Tasks capability to its canonical refusal"
     );
-    assert!(
-        missing_capability_response
-            .as_ref()
-            .and_then(|response| response.get("error"))
-            .is_some(),
-        "changing only the Tasks capability rejects task creation"
+    let missing_capability_response =
+        missing_capability_response.expect("missing-capability rejection has a JSON-RPC body");
+    assert_eq!(missing_capability_response["id"], admitted_request["id"]);
+    assert_eq!(
+        missing_capability_response["error"]["code"],
+        fastmcp_protocol::MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+        "changing only the Tasks capability returns the canonical capability error"
+    );
+    assert_eq!(
+        missing_capability_response["error"]["data"],
+        json!({
+            "requiredCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        })
     );
     assert_eq!(
         task_handler_calls.load(Ordering::SeqCst),
-        0,
-        "missing Tasks capability rejects before the task-capable handler"
+        1,
+        "missing Tasks capability rejects CreateTask after one handler invocation"
     );
     assert_eq!(
         store.task_count(),
@@ -2441,8 +2587,8 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     );
     assert_eq!(
         task_handler_calls.load(Ordering::SeqCst),
-        0,
-        "Mcp-Name rejection does not invoke the task-capable handler"
+        1,
+        "Mcp-Name rejection does not invoke the task-capable handler again"
     );
     assert_eq!(
         store.task_count(),
@@ -2478,7 +2624,11 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     };
     let task_id = created.task.base().task_id.clone();
     assert!(matches!(created.task, FinalTask::Working(_)));
-    assert_eq!(task_handler_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        2,
+        "admitted task creation invokes the handler exactly once more"
+    );
 
     input_required_rx
         .recv_timeout(FINAL_TASKS_E2E_BOUND)
@@ -3461,8 +3611,11 @@ fn workflow_concurrent_interleaved_operations() {
 
     for client_num in 0..4 {
         let counter = Arc::clone(&operation_counter);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
         let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("interleaved-server", "1.0.0")
@@ -3475,12 +3628,13 @@ fn workflow_concurrent_interleaved_operations() {
                     .run_transport_returning_with_cx(&cx, server_transport)
                     .expect("server transport loop settles cleanly");
             });
-            let _server_join = ThreadJoins::new(vec![server_handle]);
+            server_join.push(server_handle);
 
             let mut client = TestClient::new(client_transport)
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
 
             client.initialize().unwrap();
+            worker_progress.advance("RPC");
 
             // Perform multiple operations
             for op in 0..5 {
@@ -3504,12 +3658,13 @@ fn workflow_concurrent_interleaved_operations() {
                     "Operation {} result mismatch",
                     op_num
                 );
+                worker_progress.advance("RPC");
             }
 
             client_num
         });
 
-        workers.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads to complete
@@ -3533,8 +3688,11 @@ fn workflow_concurrent_no_crosstalk() {
 
     for client_num in 0..3 {
         let results = Arc::clone(&results);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
         let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("crosstalk-server", "1.0.0")
@@ -3548,16 +3706,18 @@ fn workflow_concurrent_no_crosstalk() {
                     .run_transport_returning_with_cx(&cx, server_transport)
                     .expect("server transport loop settles cleanly");
             });
-            let _server_join = ThreadJoins::new(vec![server_handle]);
+            server_join.push(server_handle);
 
             let mut client = TestClient::new(client_transport);
             client.initialize().unwrap();
+            worker_progress.advance("RPC");
 
             // Store a per-client value (ensure no cross-talk).
             let value = format!("value_{}", client_num);
             client
                 .call_tool("session_store", json!({"key": "value", "value": &value}))
                 .unwrap();
+            worker_progress.advance("RPC");
 
             // Sleep briefly to allow interleaving
             thread::sleep(std::time::Duration::from_millis(10));
@@ -3566,6 +3726,7 @@ fn workflow_concurrent_no_crosstalk() {
             let result = client
                 .call_tool("session_get", json!({"key": "value"}))
                 .unwrap();
+            worker_progress.advance("RPC");
 
             assert!(
                 matches!(result.first(), Some(LegacyContent::Text { .. })),
@@ -3582,7 +3743,7 @@ fn workflow_concurrent_no_crosstalk() {
                 .push((client_num, value.clone(), retrieved));
         });
 
-        workers.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads
@@ -3678,8 +3839,11 @@ fn workflow_concurrent_stress_test() {
 
     for client_num in 0..NUM_CLIENTS {
         let success = Arc::clone(&success_count);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
         let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("stress-server", "1.0.0")
@@ -3694,12 +3858,13 @@ fn workflow_concurrent_stress_test() {
                     .run_transport_returning_with_cx(&cx, server_transport)
                     .expect("server transport loop settles cleanly");
             });
-            let _server_join = ThreadJoins::new(vec![server_handle]);
+            server_join.push(server_handle);
 
             let mut client = TestClient::new(client_transport);
             if client.initialize().is_err() {
                 return;
             }
+            worker_progress.advance("RPC");
 
             for op in 0..OPS_PER_CLIENT {
                 // Alternate between different operations
@@ -3718,10 +3883,11 @@ fn workflow_concurrent_stress_test() {
                 if result.is_ok() {
                     success.fetch_add(1, Ordering::SeqCst);
                 }
+                worker_progress.advance("RPC");
             }
         });
 
-        workers.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads
@@ -3772,6 +3938,8 @@ fn session_initialization_stores_server_info() {
 fn session_capabilities_reflect_server_handlers() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
+    let mut server_joins = ThreadJoins::new(Vec::new());
+
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
@@ -3781,6 +3949,7 @@ fn session_capabilities_reflect_server_handlers() {
             .run_transport_returning_with_cx(&cx, server_transport)
             .expect("server transport loop settles cleanly");
     });
+    server_joins.push(server_handle);
 
     // Server with only resources
     let (client_transport2, server_transport2) = create_memory_transport_pair();
@@ -3793,6 +3962,7 @@ fn session_capabilities_reflect_server_handlers() {
             .run_transport_returning_with_cx(&cx, server_transport2)
             .expect("server transport loop settles cleanly");
     });
+    server_joins.push(server_handle2);
 
     // Server with only prompts
     let (client_transport3, server_transport3) = create_memory_transport_pair();
@@ -3805,7 +3975,7 @@ fn session_capabilities_reflect_server_handlers() {
             .run_transport_returning_with_cx(&cx, server_transport3)
             .expect("server transport loop settles cleanly");
     });
-    let _server_joins = ThreadJoins::new(vec![server_handle, server_handle2, server_handle3]);
+    server_joins.push(server_handle3);
 
     let mut client = TestClient::new(client_transport);
     client.initialize().unwrap();
@@ -3907,6 +4077,8 @@ fn session_close_graceful() {
 fn session_state_isolated_per_client() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
+    let mut server_joins = ThreadJoins::new(Vec::new());
+
     // Create two separate client-server pairs
     let (client_a_transport, server_a_transport) = create_memory_transport_pair();
     let (client_b_transport, server_b_transport) = create_memory_transport_pair();
@@ -3927,13 +4099,14 @@ fn session_state_isolated_per_client() {
             .run_transport_returning_with_cx(&cx, server_a_transport)
             .expect("server transport loop settles cleanly");
     });
+    server_joins.push(server_a_handle);
     let server_b_handle = spawn_thread(move || {
         let cx = Cx::for_testing();
         server_b
             .run_transport_returning_with_cx(&cx, server_b_transport)
             .expect("server transport loop settles cleanly");
     });
-    let _server_joins = ThreadJoins::new(vec![server_a_handle, server_b_handle]);
+    server_joins.push(server_b_handle);
 
     let mut client_a = TestClient::new(client_a_transport);
     let mut client_b = TestClient::new(client_b_transport);

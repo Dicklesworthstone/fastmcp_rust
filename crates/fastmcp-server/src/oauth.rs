@@ -41,7 +41,7 @@
 //! ```ignore
 //! use std::sync::Arc;
 //! use fastmcp_rust::oauth::{OAuthClient, OAuthServer, OAuthServerConfig};
-//! use fastmcp_rust::{Server, TokenAuthProvider};
+//! use fastmcp_rust::{modern::ServerBuilder, TokenAuthProvider};
 //!
 //! let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
 //!
@@ -54,12 +54,13 @@
 //!
 //! oauth.register_client(client)?;
 //!
-//! // Use with MCP server
+//! // Inside the application's async entry point, with its supplied `cx`.
 //! let verifier = oauth.token_verifier();
-//! Server::new("my-server", "1.0.0")
+//! ServerBuilder::new("my-server", "1.0.0")
 //!     .auth_provider(TokenAuthProvider::new(verifier))
 //!     .build()
-//!     .run_stdio();
+//!     .run_stdio_with_cx(cx)
+//!     .await;
 //! ```
 
 use std::collections::{HashMap, HashSet};

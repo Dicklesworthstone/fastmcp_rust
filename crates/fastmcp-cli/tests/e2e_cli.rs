@@ -2795,7 +2795,11 @@ mod task_commands {
         let output = fixture.stdio("watch", &["--json", "--timeout", "1"]);
         assert!(!output.status.success());
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(stderr_str(&output).contains("--timeout"));
+        assert!(
+            stderr_str(&output).contains("--timeout"),
+            "watch must report its configured timeout; stderr: {}",
+            stderr_str(&output)
+        );
         let events: Vec<Value> = stdout_str(&output)
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())

@@ -279,6 +279,72 @@ pub fn probe() {
         absent_feature_diagnostic: None,
     },
     DownstreamFeatureSymbolProbe {
+        name: "modern-server-caller-owned-stdio-present",
+        features: &[],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::modern::Server) -> ! {
+    server.run_stdio_with_cx(cx).await
+}
+",
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "modern-server-hidden-runtime-stdio-absent",
+        features: &[],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::modern::Server) -> ! {
+    server.run_stdio()
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("run_stdio"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "auto-server-caller-owned-stdio-present",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::auto::Server) -> ! {
+    server.run_stdio_with_cx(cx).await
+}
+",
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "auto-server-hidden-runtime-stdio-absent",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::auto::Server) -> ! {
+    server.run_stdio()
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("run_stdio"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "legacy-server-caller-owned-stdio-present",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::legacy_2024::Server) -> ! {
+    server.run_stdio_with_cx(cx).await
+}
+",
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "legacy-server-hidden-runtime-stdio-absent",
+        features: &["legacy-2024-11-05"],
+        source: r"
+pub async fn probe(cx: &asupersync::Cx, server: mcp::legacy_2024::Server) -> ! {
+    server.run_stdio()
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("run_stdio"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "server-escape-root",
         features: &[],
         source: r#"

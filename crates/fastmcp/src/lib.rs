@@ -29,6 +29,7 @@
 //! # Quick Start
 //!
 //! ```ignore
+//! use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 //! use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 //!
 //! #[tool]
@@ -38,10 +39,19 @@
 //! }
 //!
 //! fn main() {
-//!     ServerBuilder::new("my-server", "1.0.0")
-//!         .tool(Greet)
+//!     let runtime = RuntimeBuilder::current_thread()
+//!         .with_reactor(create_reactor().expect("create I/O reactor"))
+//!         .blocking_threads(0, 16)
 //!         .build()
-//!         .run_stdio();
+//!         .expect("create application runtime");
+//!     runtime.block_on(async {
+//!         let cx = Cx::current().expect("application context");
+//!         ServerBuilder::new("my-server", "1.0.0")
+//!             .tool(Greet)
+//!             .build()
+//!             .run_stdio_with_cx(&cx)
+//!             .await
+//!     });
 //! }
 //! ```
 //!
@@ -2399,10 +2409,6 @@ pub mod auto {
             addr: impl Into<String>,
         ) -> McpResult<crate::WebSocketServerShutdown> {
             self.inner.serve_websocket(cx, addr).await
-        }
-
-        pub fn run_stdio(self) -> ! {
-            self.inner.run_stdio()
         }
 
         /// Runs this Auto server over stdio on the supplied caller-owned context.
@@ -6969,11 +6975,6 @@ pub mod modern {
             self.inner.serve_websocket(cx, addr).await
         }
 
-        /// Runs this final-only server over stdio.
-        pub fn run_stdio(self) -> ! {
-            self.inner.run_stdio()
-        }
-
         /// Runs this final-only server over stdio on the supplied caller-owned context.
         ///
         /// The facade does not create a runtime or detach the stdio pump; the
@@ -7712,11 +7713,6 @@ pub mod legacy_2024 {
         #[must_use]
         pub const fn protocol_policy(&self) -> ProtocolPolicy {
             ProtocolPolicy::LegacyOnly
-        }
-
-        /// Runs this exact-2024 server over stdio.
-        pub fn run_stdio(self) -> ! {
-            self.inner.run_stdio()
         }
 
         /// Runs this exact-2024 server over stdio on the supplied caller-owned context.

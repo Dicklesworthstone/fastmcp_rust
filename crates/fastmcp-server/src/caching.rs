@@ -34,7 +34,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_rust::prelude::*;
+//! use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 //! use fastmcp_rust::caching::ResponseCachingMiddleware;
 //!
 //! let caching = ResponseCachingMiddleware::new()
@@ -42,10 +42,12 @@
 //!     .call_ttl_secs(3600) // 1 hour TTL for call/get/read operations
 //!     .include_tools(vec!["deterministic_lookup".to_string()]);
 //!
-//! Server::new("my-server", "1.0.0")
+//! // Inside the application's async entry point, with its supplied `cx`.
+//! ServerBuilder::new("my-server", "1.0.0")
 //!     .middleware(caching)
 //!     .build()
-//!     .run_stdio();
+//!     .run_stdio_with_cx(cx)
+//!     .await;
 //! ```
 
 use std::collections::HashMap;

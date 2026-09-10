@@ -2590,12 +2590,15 @@ impl ServerBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// Server::new("demo", "1.0.0")
+    /// // Inside the application's async entry point, with its supplied `cx`.
+    /// ServerBuilder::new("demo", "1.0.0")
     ///     .on_startup(|| {
-    ///         println!("Server starting up...");
-    ///         Ok(())
+    ///         eprintln!("Server starting up...");
+    ///         Ok::<(), std::io::Error>(())
     ///     })
-    ///     .run_stdio();
+    ///     .build()
+    ///     .run_stdio_with_cx(cx)
+    ///     .await;
     /// ```
     #[must_use]
     pub fn on_startup<F, E>(mut self, hook: F) -> Self
@@ -2622,11 +2625,14 @@ impl ServerBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// Server::new("demo", "1.0.0")
+    /// // Inside the application's async entry point, with its supplied `cx`.
+    /// ServerBuilder::new("demo", "1.0.0")
     ///     .on_shutdown(|| {
-    ///         println!("Server shutting down...");
+    ///         eprintln!("Server shutting down...");
     ///     })
-    ///     .run_stdio();
+    ///     .build()
+    ///     .run_stdio_with_cx(cx)
+    ///     .await;
     /// ```
     #[must_use]
     pub fn on_shutdown<F>(mut self, hook: F) -> Self

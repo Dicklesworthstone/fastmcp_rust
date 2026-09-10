@@ -13,7 +13,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_rust::prelude::*;
+//! use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+//! use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 //!
 //! #[tool]
 //! async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
@@ -22,10 +23,19 @@
 //! }
 //!
 //! fn main() {
-//!     Server::new("my-server", "1.0.0")
-//!         .tool(Greet)
+//!     let runtime = RuntimeBuilder::current_thread()
+//!         .with_reactor(create_reactor().expect("create I/O reactor"))
+//!         .blocking_threads(0, 16)
 //!         .build()
-//!         .run_stdio();
+//!         .expect("create application runtime");
+//!     runtime.block_on(async {
+//!         let cx = Cx::current().expect("application context");
+//!         ServerBuilder::new("my-server", "1.0.0")
+//!             .tool(Greet)
+//!             .build()
+//!             .run_stdio_with_cx(&cx)
+//!             .await
+//!     });
 //! }
 //! ```
 //!
@@ -3447,19 +3457,22 @@ pub type ShutdownHook = Box<dyn FnOnce() + Send>;
 /// # Example
 ///
 /// ```ignore
-/// use fastmcp_rust::prelude::*;
+/// use fastmcp_rust::{modern::ServerBuilder, prelude::*};
 ///
-/// Server::new("demo", "1.0.0")
+/// // Inside the application's async entry point, with its supplied `cx`.
+/// ServerBuilder::new("demo", "1.0.0")
 ///     .on_startup(|| {
-///         println!("Initializing...");
+///         eprintln!("Initializing...");
 ///         // Initialize database, caches, etc.
-///         Ok(())
+///         Ok::<(), std::io::Error>(())
 ///     })
 ///     .on_shutdown(|| {
-///         println!("Cleaning up...");
+///         eprintln!("Cleaning up...");
 ///         // Close connections, flush buffers, etc.
 ///     })
-///     .run_stdio();
+///     .build()
+///     .run_stdio_with_cx(cx)
+///     .await;
 /// ```
 #[derive(Default)]
 pub struct LifespanHooks {
@@ -14680,19 +14693,10 @@ impl Server {
         )
     }
 
-    /// Runs the server on stdio transport.
-    ///
-    /// This is the primary way to run MCP servers as subprocesses. The
-    /// blocking stdio pump runs as a caller-owned blocking child, leaving the
-    /// caller runtime free to schedule bounded, request-owned modern children.
-    pub fn run_stdio(self) -> ! {
-        block_on(async move {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_stdio_with_cx(&cx).await
-        })
-    }
-
     /// Runs the server on stdio with a provided Cx.
+    ///
+    /// The application owns the runtime and must configure a blocking pool
+    /// for the receive pump. This method does not create or re-enter a runtime.
     ///
     /// On Unix, the receive pump uses readiness polling so cancellation from a
     /// failed dispatch worker remains observable while stdin is silent or a

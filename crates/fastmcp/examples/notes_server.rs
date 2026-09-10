@@ -373,7 +373,7 @@ fn summarize_notes(_ctx: &McpContext, notes_content: String) -> Vec<PromptMessag
 // ============================================================================
 
 fn main() {
-    ServerBuilder::new("notes-server", "1.0.0")
+    let server = ServerBuilder::new("notes-server", "1.0.0")
         // CRUD operations
         .tool(CreateNote)
         .tool(GetNote)
@@ -398,6 +398,14 @@ fn main() {
              use 'list_notes' to see all, 'search_notes' to find specific content, and \
              'notes_by_tag' to filter by tag. Check 'notes://help' resource for full documentation.",
         )
+        .build();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("stdio reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("application-owned runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::current().expect("application caller context");
+        server.run_stdio_with_cx(&cx).await;
+    });
 }

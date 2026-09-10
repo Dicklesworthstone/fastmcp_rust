@@ -51,14 +51,14 @@ fn main() {
     let server = builder.build();
     #[cfg(feature = "tasks")]
     let http_ready = http_ready.or_else(|| std::env::args().nth(3));
-    if let Some(ready_file) = http_ready {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("HTTP reactor"))
-            .blocking_threads(0, 16)
-            .build()
-            .expect("fixture-owned runtime");
-        runtime.block_on(async move {
-            let cx = asupersync::Cx::current().expect("fixture caller context");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("fixture reactor"))
+        .blocking_threads(0, 16)
+        .build()
+        .expect("fixture-owned runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::current().expect("fixture caller context");
+        if let Some(ready_file) = http_ready {
             let bound = server
                 .bind_http(&cx, "127.0.0.1:0")
                 .await
@@ -73,10 +73,10 @@ fn main() {
             {
                 shutdown.settle(&cx).await.expect("settle HTTP children");
             }
-        });
-        return;
-    }
-    server.run_stdio();
+        } else {
+            server.run_stdio_with_cx(&cx).await;
+        }
+    });
 }
 
 /// Seed real application-owned state supplied by the test at runtime. All
