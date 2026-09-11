@@ -15974,7 +15974,7 @@ impl Server {
                     let _writer = send
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    queue.cancel_reserved(Self::cancellation_wire_request_id(&cancellation));
+                    let _ = Self::cancellation_wire_request_id(&cancellation);
                 }
                 continue;
             }
