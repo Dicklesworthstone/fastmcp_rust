@@ -130,10 +130,24 @@ jobs:
 
       - name: Compile renamed facade-only macro consumer
         if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
-          cargo test --locked -p fastmcp-rust --test trybuild_tests \
+          set -euo pipefail
+          status=0
+          transcript="$(cargo test --locked -p fastmcp-rust --test trybuild_tests \
             renamed_facade_only_consumer_compiles_every_macro_family \
-            -- --exact --ignored
+            -- --exact 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+          printf '%s\n' "$transcript" | grep -Fx \
+            'test renamed_facade_only_consumer_compiles_every_macro_family ... ok'
+          result="$(printf '%s\n' "$transcript" | awk '/^test result: / { result = $0 } END { print result }')"
+          case "$result" in
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"*) ;;
+            *) printf 'Renamed facade consumer did not complete its one-test inventory: %s\n' "$result" >&2; exit 1 ;;
+          esac
 
       - name: Run default-feature doc tests
         run: cargo test --locked --workspace --doc
