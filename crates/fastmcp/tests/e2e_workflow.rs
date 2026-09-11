@@ -3630,7 +3630,7 @@ fn workflow_concurrent_interleaved_operations() {
             });
             server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport)
+            let mut client = TestClient::with_cx(client_transport, Cx::for_testing())
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
 
             client.initialize().unwrap();
@@ -3708,7 +3708,7 @@ fn workflow_concurrent_no_crosstalk() {
             });
             server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport);
+            let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
             client.initialize().unwrap();
             worker_progress.advance("RPC");
 
@@ -3860,7 +3860,7 @@ fn workflow_concurrent_stress_test() {
             });
             server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport);
+            let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
             if client.initialize().is_err() {
                 return;
             }
