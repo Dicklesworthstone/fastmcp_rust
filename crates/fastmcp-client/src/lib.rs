@@ -27991,6 +27991,9 @@ mod tests {
                 assert!(Instant::now() < deadline, "native MRTR peer is bounded");
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // BSD accepted sockets inherit the listener's nonblocking mode.
+                        // Request reads use blocking I/O bounded by the timeouts below.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
