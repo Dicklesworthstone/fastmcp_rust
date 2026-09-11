@@ -1,0 +1,3 @@
+# Preserve pinned upstream bytes across checkouts, including core.autocrlf=true.
+crates/fastmcp-protocol/schema/** -text
+evidence/fnd-01/vendor/** -text

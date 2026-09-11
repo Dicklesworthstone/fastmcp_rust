@@ -1774,10 +1774,26 @@ mod tests {
 
     #[test]
     fn leg_01_schema_parity_positive() {
+        use fastmcp_core::crypto::sha256_bounded;
+
         let schema = legacy_2024_11_05_schema().unwrap();
         assert_eq!(
             LEGACY_2024_11_05_SCHEMA_SHA256,
             "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce"
+        );
+        let expected_digest: [u8; 32] = std::array::from_fn(|index| {
+            u8::from_str_radix(
+                &LEGACY_2024_11_05_SCHEMA_SHA256[index * 2..index * 2 + 2],
+                16,
+            )
+            .expect("published schema digest must contain hexadecimal byte pairs")
+        });
+        let digest = sha256_bounded(LEGACY_2024_11_05_SCHEMA_JSON.as_bytes(), 128 * 1024)
+            .expect("pinned schema must fit its byte bound");
+        assert_eq!(
+            digest.as_bytes(),
+            &expected_digest,
+            "embedded schema bytes must match the full published SHA-256"
         );
         assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
         assert_eq!(
@@ -1789,6 +1805,18 @@ mod tests {
             None
         );
         assert!(LEGACY_2024_11_05_SCHEMA_JSON.as_bytes().starts_with(b"{\n"));
+
+        let crlf_schema = LEGACY_2024_11_05_SCHEMA_JSON.replace('\n', "\r\n");
+        let crlf_parsed: Value =
+            serde_json::from_str(&crlf_schema).expect("CRLF conversion must preserve valid JSON");
+        assert_eq!(&crlf_parsed, schema);
+        let crlf_digest = sha256_bounded(crlf_schema.as_bytes(), 128 * 1024)
+            .expect("CRLF schema copy must fit the same byte bound");
+        assert_ne!(
+            crlf_digest.as_bytes(),
+            &expected_digest,
+            "equivalent JSON with changed line endings must fail the pinned byte digest"
+        );
     }
 
     #[test]

@@ -7010,15 +7010,21 @@ impl BoundHttpServer {
                 .spawn_in(&connection_scope, move |connection_cx| async move {
                     let _permit = permit;
                     #[cfg(any(feature = "legacy-2024-11-05", test))]
-                    Box::pin(serve_http_connection(
-                        &connection_cx,
-                        stream,
-                        endpoint,
-                        legacy_sessions,
-                        modern_sessions,
-                        listener_shutdown,
-                    ))
-                    .await;
+                    {
+                        // Keep the nested connection future's Send proof in
+                        // this crate instead of exhausting downstream crates'
+                        // default trait-recursion limit during code generation.
+                        let connection: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                            Box::pin(serve_http_connection(
+                                &connection_cx,
+                                stream,
+                                endpoint,
+                                legacy_sessions,
+                                modern_sessions,
+                                listener_shutdown,
+                            ));
+                        connection.await;
+                    }
                     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
                     serve_modern_http_connection(
                         &connection_cx,

@@ -1291,11 +1291,11 @@ fn prepare_fixture_lock(
     );
     let workspace_chacha = workspace_packages
         .iter()
-        .find(|package| package.name == "chacha20" && package.version == "0.10.1")
-        .expect("workspace lock must freeze chacha20 0.10.1 for the asupersync graph");
+        .find(|package| package.name == "chacha20" && package.version == "0.10.2")
+        .expect("workspace lock must freeze chacha20 0.10.2 for the asupersync graph");
     assert!(
         fixture_packages.contains(workspace_chacha),
-        "{label} lock must retain the exact workspace chacha20 0.10.1 tuple",
+        "{label} lock must retain the exact workspace chacha20 0.10.2 tuple",
     );
 }
 
