@@ -2162,7 +2162,6 @@ pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<InMemoryFinalTaskState>,
-    heartbeat_interval: Option<StdDuration>,
 }
 
 #[derive(Default)]
@@ -2226,19 +2225,7 @@ impl InMemoryFinalTaskStore {
             max_tasks,
             clock,
             state: Mutex::new(InMemoryFinalTaskState::default()),
-            heartbeat_interval: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_clock_and_heartbeat(
-        max_tasks: usize,
-        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
-        heartbeat: StdDuration,
-    ) -> McpResult<Self> {
-        let mut store = Self::with_clock(max_tasks, clock)?;
-        store.heartbeat_interval = Some(heartbeat);
-        Ok(store)
     }
 
     /// Returns the configured maximum number of retained tasks.
@@ -3044,9 +3031,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
-        Ok(self
-            .heartbeat_interval
-            .unwrap_or(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT))
+        Ok(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT)
     }
 
     fn finish_handoff_dispatch_if_current(
@@ -8488,26 +8473,6 @@ mod tests {
         (
             Arc::new(
                 InMemoryFinalTaskStore::with_clock(max_tasks, clock)
-                    .expect("positive bounded store capacity is valid"),
-            ),
-            now,
-        )
-    }
-
-    fn in_memory_store_with_test_clock_and_heartbeat(
-        max_tasks: usize,
-        heartbeat: StdDuration,
-    ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
-        let now = Arc::new(Mutex::new(Instant::now()));
-        let clock_now = Arc::clone(&now);
-        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
-            *clock_now
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        (
-            Arc::new(
-                InMemoryFinalTaskStore::with_clock_and_heartbeat(max_tasks, clock, heartbeat)
                     .expect("positive bounded store capacity is valid"),
             ),
             now,
