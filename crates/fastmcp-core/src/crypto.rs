@@ -2458,11 +2458,20 @@ mod tests {
 
     #[test]
     fn api_deny_random_draws_have_only_fixed_purposes() {
-        let production = production_source();
-        let production_digest = sha256_bounded(production.as_bytes(), production.len())
+        let raw_production = production_source();
+        let production_digest = sha256_bounded(raw_production.as_bytes(), raw_production.len())
             .expect("production source is within its caller-owned hash bound");
-        validate_random_draw_api(production)
+        validate_random_draw_api(raw_production)
             .expect("current production source must expose only sealed random-draw APIs");
+        // Multiline mutation anchors use LF even when include_str! preserves
+        // a Windows checkout's CRLF. The validator still sees raw source above.
+        let normalized_production = raw_production.replace("\r\n", "\n");
+        let production = normalized_production.as_str();
+        validate_random_draw_api(production)
+            .expect("LF fixture must retain the sealed random-draw APIs");
+        let crlf_production = production.replace('\n', "\r\n");
+        validate_random_draw_api(&crlf_production)
+            .expect("CRLF source must retain the same sealed random-draw APIs");
 
         let arbitrary_free_function = format!(
             "{production}\n\npub fn arbitrary_random_bytes() -> [u8; 32] {{ draw_bytes::<32>(&OsRandomSource).expect(\"operating-system random draw\") }}\n"
@@ -2916,11 +2925,16 @@ mod tests {
             RandomDrawApiDenyError::GetrandomFillOutsideOsRandomSource,
             "random draw API denial: getrandom::fill is not owned by the private OsRandomSource implementation",
         );
+        assert_random_draw_denial(
+            &moved_fill.replace('\n', "\r\n"),
+            RandomDrawApiDenyError::GetrandomFillOutsideOsRandomSource,
+            "random draw API denial: getrandom::fill is not owned by the private OsRandomSource implementation",
+        );
 
-        validate_random_draw_api(production)
+        validate_random_draw_api(raw_production)
             .expect("unchanged production source must validate again after the planted rejection");
         assert_eq!(
-            sha256_bounded(production.as_bytes(), production.len())
+            sha256_bounded(raw_production.as_bytes(), raw_production.len())
                 .expect("unchanged production source is within its caller-owned hash bound"),
             production_digest,
         );

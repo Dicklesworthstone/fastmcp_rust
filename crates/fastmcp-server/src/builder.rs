@@ -3690,7 +3690,7 @@ mod tests {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
     fn no_legacy_source_exposes_a_modern_endpoint_builder_and_gates_the_dual_era_one() {
-        let source = include_str!("builder.rs");
+        let source = include_str!("builder.rs").replace("\r\n", "\n");
         assert!(source.contains(
             "/// Builds a live modern Streamable HTTP endpoint.\n    #[cfg(not(any(feature = \"legacy-2024-11-05\", test)))]\n    pub fn build_http_endpoint"
         ));

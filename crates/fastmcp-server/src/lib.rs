@@ -21794,7 +21794,7 @@ mod lib_unit_tests {
 
     #[test]
     fn websocket_profile_exposes_turnkey_server_endpoint_behind_its_feature() {
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
         assert!(source.contains("#[cfg(feature = \"websocket\")]\nimpl Server"));
         assert!(source.contains("pub async fn bind_websocket"));
         assert!(source.contains("pub async fn serve_websocket"));
@@ -34280,7 +34280,7 @@ mod lib_unit_tests {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
     fn no_legacy_source_gates_standalone_sse_and_keeps_modern_sse_framing() {
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
 
         assert!(source.contains(
             "#[cfg(feature = \"legacy-2024-11-05\")]\nuse fastmcp_transport::sse::SseServerTransport;"
@@ -34317,7 +34317,7 @@ mod lib_unit_tests {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
     fn no_legacy_source_exposes_only_the_public_modern_http_contract() {
-        let source = include_str!("lib.rs");
+        let source = include_str!("lib.rs").replace("\r\n", "\n");
 
         assert!(source.contains("pub enum ServerHttpEndpointError"));
         assert!(source.contains(

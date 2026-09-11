@@ -11119,10 +11119,10 @@ mod tests {
 
     #[test]
     fn oauth_crypto_ownership_and_fallbacks_are_denied() {
-        let source = include_str!("oauth.rs");
+        let source = include_str!("oauth.rs").replace("\r\n", "\n");
         let production = source
             .split_once("\n#[cfg(test)]\nmod tests")
-            .map_or(source, |(production, _)| production);
+            .map_or(source.as_str(), |(production, _)| production);
 
         assert!(!production.contains("getrandom::"));
         assert!(!production.contains("sha2::"));
