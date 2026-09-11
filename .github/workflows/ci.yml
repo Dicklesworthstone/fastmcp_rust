@@ -98,9 +98,10 @@ jobs:
             "test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
             *) printf 'e2e_protocol did not complete its exact 163-test inventory: %s\n' "$protocol_result" >&2; exit 1 ;;
           esac
+          # Includes the worker-stage deadline regression test added to the original 79.
           case "$workflow_result" in
-            "test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
-            *) printf 'e2e_workflow did not complete its exact 79-test inventory: %s\n' "$workflow_result" >&2; exit 1 ;;
+            "test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'e2e_workflow did not complete its exact 80-test inventory: %s\n' "$workflow_result" >&2; exit 1 ;;
           esac
 
       - name: Prove the shipped CLI and echo server compose under every policy
