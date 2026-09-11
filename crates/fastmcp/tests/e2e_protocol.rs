@@ -3721,7 +3721,8 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
     // arguments. `call_tool` differs from `call_tool_outcome` only by omitting
     // the official Tasks client capability. The bounded one-task store makes
     // the following successful creation a public proof that this refusal did
-    // not persist a Task.
+    // not persist a Task. The handler runs to select its outcome before the
+    // framework admits CreateTask, so its invocation counter still advances.
     let missing_capability = client
         .call_tool("durable_task", json!({}))
         .expect_err("a task-capable tool requires the declared Tasks capability");
@@ -3736,8 +3737,8 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
     assert!(matches!(created.task, modern::FinalTask::Working(_)));
     assert_eq!(
         created.task.base().status_message.as_deref(),
-        Some("durable stdio task call 1"),
-        "the created Task proves the missing-capability call reached no durable Task state"
+        Some("durable stdio task call 2"),
+        "both calls select an outcome, but only the admitted outcome occupies the sole Task slot"
     );
     let task_id = created.task.base().task_id.clone();
 

@@ -13,13 +13,15 @@
 //!
 //! # Architecture
 //!
-//! [`AsyncWsClientTransport::connect`] establishes a native `ws://`
-//! connection and performs the HTTP Upgrade handshake. [`connect_wss`] does
+//! [`AsyncWsClientTransport::connect`](crate::websocket::AsyncWsClientTransport::connect)
+//! establishes a native `ws://` connection and performs the HTTP Upgrade handshake.
+//! [`connect_wss`](crate::websocket::AsyncWsClientTransport::connect_wss) does
 //! the same over a caller-supplied or WebPKI-rooted asupersync TLS connector.
-//! [`WebSocketUpgradeAdmission`] validates one bounded server Upgrade request,
-//! while [`WebSocketListener`] returns a bounded parsed request for the
-//! caller's route and authentication decision before it can complete that
-//! admission.
+//! [`WebSocketUpgradeAdmission`](crate::websocket::WebSocketUpgradeAdmission)
+//! validates one bounded server Upgrade request, while
+//! [`WebSocketListener`](crate::websocket::WebSocketListener) returns a bounded
+//! parsed request for the caller's route and authentication decision before
+//! it can complete that admission.
 //!
 //! # Example
 //!
@@ -41,7 +43,8 @@
 //! only as a focused test fixture. It is not part of the public transport
 //! because an arbitrary blocking reader cannot be interrupted safely.
 //!
-//! [`AsyncWsServerTransport`] and [`AsyncWsClientTransport`] are the
+//! [`AsyncWsServerTransport`](crate::websocket::AsyncWsServerTransport) and
+//! [`AsyncWsClientTransport`](crate::websocket::AsyncWsClientTransport) are the
 //! cancellation-safe API for owned asupersync socket I/O. The client uses
 //! asupersync's native WebSocket implementation; the server adapter owns its
 //! bounded RFC 6455 framing over the upgraded byte stream. Both poll the owned
@@ -754,8 +757,10 @@ impl AsyncWsClientTransport<TcpStream> {
     ///
     /// The connection, HTTP Upgrade, framing, masking, and close handshake are
     /// all owned by asupersync. `wss://` is deliberately rejected here so TLS
-    /// authentication cannot be bypassed accidentally; use [`connect_wss`]
-    /// or [`connect_wss_with_connector`] for that scheme.
+    /// authentication cannot be bypassed accidentally; use
+    /// [`connect_wss`](AsyncWsClientTransport::connect_wss) or
+    /// [`connect_wss_with_connector`](AsyncWsClientTransport::connect_wss_with_connector)
+    /// for that scheme.
     pub async fn connect(cx: &Cx, url: &str) -> Result<Self, TransportError> {
         let parsed = WsUrl::parse(url).map_err(websocket_handshake_error)?;
         if parsed.tls {
@@ -783,7 +788,8 @@ impl AsyncWsClientTransport<TlsStream<TcpStream>> {
     ///
     /// This uses asupersync's Rustls implementation with SNI and HTTP/1.1
     /// ALPN advertisement. Applications with private roots, pinning, or client
-    /// certificates should use [`connect_wss_with_connector`] instead.
+    /// certificates should use
+    /// [`connect_wss_with_connector`](Self::connect_wss_with_connector) instead.
     pub async fn connect_wss(cx: &Cx, url: &str) -> Result<Self, TransportError> {
         let connector = TlsConnector::builder()
             .with_webpki_roots()

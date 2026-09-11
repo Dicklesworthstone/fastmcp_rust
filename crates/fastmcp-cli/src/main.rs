@@ -12285,13 +12285,34 @@ IFS= read -r end
 
     #[test]
     fn production_cli_has_one_runtime_boundary_and_no_library_runtime_entry() {
-        let source = include_str!("main.rs");
-        let (production, _) = source
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .expect("the CLI unit-test boundary must remain present");
+        let production_source = |source: &str| {
+            source
+                .replace("\r\n", "\n")
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map(|(production, _)| production.to_owned())
+        };
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        for source in [source.clone(), source.replace('\n', "\r\n")] {
+            let production =
+                production_source(&source).expect("the CLI unit-test boundary must remain present");
 
-        assert_eq!(production.matches(".block_on(").count(), 1);
-        assert!(!production.contains("fastmcp_core::runtime::block_on"));
+            assert_eq!(production.matches(".block_on(").count(), 1);
+            assert!(!production.contains("fastmcp_core::runtime::block_on"));
+
+            let wrong_boundary = source.replacen("mod tests {", "mod other_tests {", 1);
+            assert!(production_source(&wrong_boundary).is_none());
+
+            let duplicate_runtime = format!("runtime.block_on(async {{}});\n{source}");
+            let duplicate_runtime =
+                production_source(&duplicate_runtime).expect("unchanged test boundary");
+            assert_eq!(duplicate_runtime.matches(".block_on(").count(), 2);
+
+            let library_runtime = format!("fastmcp_core::runtime::block_on(async {{}});\n{source}");
+            let library_runtime =
+                production_source(&library_runtime).expect("unchanged test boundary");
+            assert_eq!(library_runtime.matches(".block_on(").count(), 1);
+            assert!(library_runtime.contains("fastmcp_core::runtime::block_on"));
+        }
     }
 
     fn make_test_server_info() -> fastmcp_protocol::ServerInfo {
@@ -17228,11 +17249,38 @@ IFS= read -r end
                 Some(OsString::from("\\Users\\test")),
             )
             .expect("drive-and-home-path fallback");
+            assert_eq!(
+                drive_home,
+                Path::new(r"C:\Users\test")
+                    .join(".cline")
+                    .join("data")
+                    .join("settings")
+                    .join("cline_mcp_settings.json")
+            );
+
             assert!(
-                drive_home
-                    .as_os_str()
-                    .to_string_lossy()
-                    .ends_with("C:\\Users\\test/.cline/data/settings/cline_mcp_settings.json")
+                resolve_cline_config_path(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(OsString::from("C:")),
+                    Some(OsString::from("  ")),
+                )
+                .is_err()
+            );
+            assert!(
+                resolve_cline_config_path(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(OsString::new()),
+                    Some(OsString::from(r"\Users\test")),
+                )
+                .is_err()
             );
 
             assert!(resolve_cline_config_path(None, None, None, None, None, None, None).is_err());
