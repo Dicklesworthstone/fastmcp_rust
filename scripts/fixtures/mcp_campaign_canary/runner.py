@@ -204,6 +204,9 @@ class Runner:
         if completed.returncode:
             raise RuntimeError(f"cannot report {provider} {status}: {completed.stderr}")
 
+    def status_revision(self, issue_id: str) -> int:
+        return issue_status_revision(self.db, issue_id)
+
     def close(
         self,
         issue_id: str,
@@ -320,21 +323,201 @@ class Runner:
         )
 
 
-def provider_statuses(value: Any) -> list[tuple[str, str]]:
-    found: list[tuple[str, str]] = []
-    if isinstance(value, dict):
-        provider = value.get("provider") or value.get("provider_name")
-        status = value.get("status")
-        if isinstance(provider, str) and isinstance(status, str):
-            found.append((provider, status.lower()))
-        elif isinstance(provider, str) and isinstance(value.get("passed"), bool):
-            found.append((provider, "pass" if value["passed"] else "fail"))
-        for child in value.values():
-            found.extend(provider_statuses(child))
-    elif isinstance(value, list):
-        for child in value:
-            found.extend(provider_statuses(child))
-    return found
+def issue_status_revision(db_path: Path, issue_id: str) -> int:
+    """Authoritatively determine the current status_revision from the native events table.
+
+    Mirrors beads_rust storage/sqlite.rs:4213 `status_revision_in_tx`.
+    Uses a strict read-only URI connection with as_uri() to never create or mutate the database file
+    and ensure paths containing '?' or '#' remain safe.
+    """
+    if not isinstance(db_path, Path) or not db_path.is_file():
+        raise ValueError(f"database file {db_path} does not exist")
+    if not isinstance(issue_id, str) or not issue_id.strip():
+        raise ValueError("issue_id must be a non-empty string")
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM events WHERE issue_id = ? AND event_type = 'status_changed' ORDER BY id DESC LIMIT 1",
+            (issue_id.strip(),),
+        )
+        row = cursor.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+
+def observed_providers(ledger: Any) -> list[str]:
+    """Collect all unique provider names observed across history and legacy records for scrub.
+
+    This satisfies the operational scrub requirement: collecting every provider who ever
+    reported in order to overwrite their verdicts to FAIL. It does NOT authorize transitions.
+    """
+    if not isinstance(ledger, dict):
+        raise ValueError(f"ledger must be a dict, got {type(ledger).__name__}")
+    ledger_issue = ledger.get("issue_id")
+    target_issue_id = ledger_issue.strip() if isinstance(ledger_issue, str) and ledger_issue.strip() else None
+
+    providers: set[str] = set()
+    for section in ("history", "legacy_results"):
+        records = ledger.get(section)
+        if records is None:
+            continue
+        if not isinstance(records, list):
+            raise ValueError(f"ledger {section} must be a list, got {type(records).__name__}")
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError(f"malformed record in {section} (expected dict): {record!r}")
+            rec_issue = record.get("issue_id")
+            if target_issue_id and isinstance(rec_issue, str) and rec_issue.strip() != target_issue_id:
+                continue
+            provider = record.get("provider")
+            if not isinstance(provider, str) or not provider.strip():
+                raise ValueError(f"missing or invalid provider in {section} record: {record!r}")
+            providers.add(provider.strip())
+    return sorted(providers)
+
+
+def effective_scoped_gate_records(
+    ledger: Any,
+    *,
+    issue_id: str | None = None,
+    from_status: str,
+    to_status: str,
+    status_revision: int,
+    gate: str = "batch_verify",
+) -> dict[str, dict[str, Any]]:
+    """Compute effective gate records strictly matching the authoritative br contract.
+
+    Mirrors `get_scoped_gate_results_in_tx` (sqlite.rs:4261) and `execute_list` (gate.rs:260):
+    1. Scoped strictly by (issue_id, from_status, to_status, status_revision, gate).
+    2. legacy_results are AUDIT ONLY and never authorize transitions.
+    3. Rows ordered by id ASC: later verdicts for the same provider overwrite earlier verdicts.
+    4. Fail-closed on malformed records or schemas: no fallback defaults pretending valid.
+    """
+    if not isinstance(ledger, dict):
+        raise ValueError(f"ledger must be a dict, got {type(ledger).__name__}")
+    ledger_issue = ledger.get("issue_id")
+    if not isinstance(ledger_issue, str) or not ledger_issue.strip():
+        raise ValueError("ledger issue_id must be a non-empty string")
+    target_issue_id = ledger_issue.strip()
+    if issue_id is not None:
+        if not isinstance(issue_id, str) or not issue_id.strip():
+            raise ValueError("issue_id must be a non-empty string")
+        if issue_id.strip() != target_issue_id:
+            raise ValueError(f"ledger issue_id {target_issue_id!r} does not match expected {issue_id.strip()!r}")
+
+    if not isinstance(from_status, str) or not from_status.strip():
+        raise ValueError("from_status must be a non-empty string")
+    if not isinstance(to_status, str) or not to_status.strip():
+        raise ValueError("to_status must be a non-empty string")
+    if not isinstance(status_revision, int) or isinstance(status_revision, bool):
+        raise ValueError("status_revision must be an integer")
+    if not isinstance(gate, str) or not gate.strip():
+        raise ValueError("gate must be a non-empty string")
+
+    history = ledger.get("history")
+    if not isinstance(history, list):
+        raise ValueError(f"ledger history must be a list, got {type(history).__name__}")
+
+    from_clean = from_status.strip().lower()
+    to_clean = to_status.strip().lower()
+    gate_clean = gate.strip().lower()
+
+    validated_records = []
+    for record in history:
+        if not isinstance(record, dict):
+            raise ValueError(f"malformed history record (expected dict): {record!r}")
+
+        rec_id = record.get("id")
+        if not isinstance(rec_id, int) or isinstance(rec_id, bool):
+            raise ValueError(f"malformed history record id: {record!r}")
+
+        rec_issue = record.get("issue_id")
+        if not isinstance(rec_issue, str) or not rec_issue.strip():
+            raise ValueError(f"malformed history record issue_id: {record!r}")
+
+        rec_gate = record.get("gate")
+        if not isinstance(rec_gate, str) or not rec_gate.strip():
+            raise ValueError(f"malformed history record gate: {record!r}")
+
+        rec_provider = record.get("provider")
+        if not isinstance(rec_provider, str) or not rec_provider.strip():
+            raise ValueError(f"malformed history record provider: {record!r}")
+
+        rec_passed = record.get("passed")
+        if not isinstance(rec_passed, bool):
+            raise ValueError(f"malformed history record passed (must be bool): {record!r}")
+
+        rec_from = record.get("from_status")
+        if not isinstance(rec_from, str) or not rec_from.strip():
+            raise ValueError(f"malformed history record from_status: {record!r}")
+
+        rec_to = record.get("to_status")
+        if not isinstance(rec_to, str) or not rec_to.strip():
+            raise ValueError(f"malformed history record to_status: {record!r}")
+
+        rec_rev = record.get("status_revision")
+        if not isinstance(rec_rev, int) or isinstance(rec_rev, bool):
+            raise ValueError(f"malformed history record status_revision: {record!r}")
+
+        rec_note = record.get("note")
+        if rec_note is not None and not isinstance(rec_note, str):
+            raise ValueError(f"malformed history record note: {record!r}")
+
+        validated_records.append({
+            "id": rec_id,
+            "issue_id": rec_issue.strip(),
+            "gate": rec_gate.strip(),
+            "provider": rec_provider.strip(),
+            "passed": rec_passed,
+            "from_status": rec_from.strip().lower(),
+            "to_status": rec_to.strip().lower(),
+            "status_revision": rec_rev,
+            "note": rec_note,
+        })
+
+    matching = [
+        r for r in validated_records
+        if r["issue_id"] == target_issue_id
+        and r["from_status"] == from_clean
+        and r["to_status"] == to_clean
+        and r["status_revision"] == status_revision
+        and r["gate"].lower() == gate_clean
+    ]
+    matching.sort(key=lambda r: r["id"])
+
+    effective_by_provider: dict[str, dict[str, Any]] = {}
+    for r in matching:
+        provider_key = r["provider"].lower()
+        effective_by_provider[provider_key] = {
+            "id": r["id"],
+            "issue_id": r["issue_id"],
+            "provider": r["provider"],
+            "status": "pass" if r["passed"] else "fail",
+            "passed": r["passed"],
+            "note": r["note"],
+        }
+
+    return {k: effective_by_provider[k] for k in sorted(effective_by_provider.keys())}
+
+
+def effective_scoped_gate_results(
+    ledger: Any,
+    *,
+    issue_id: str | None = None,
+    from_status: str,
+    to_status: str,
+    status_revision: int,
+    gate: str = "batch_verify",
+) -> list[tuple[str, str]]:
+    records = effective_scoped_gate_records(
+        ledger,
+        issue_id=issue_id,
+        from_status=from_status,
+        to_status=to_status,
+        status_revision=status_revision,
+        gate=gate,
+    )
+    return [(rec["provider"], rec["status"]) for rec in records.values()]
 
 
 def same(value: Any, other: Any) -> bool:
@@ -362,8 +545,25 @@ def isolated_close_reason_min_length(policy_path: Path) -> int:
     raise RuntimeError("tracked policy does not declare close_policy.require_close_reason.min_length")
 
 
+def record_subject_revisions(record: dict[str, Any]) -> set[str]:
+    """Extract explicit subject_revision:<sha> tokens strictly from a single gate record note."""
+    note = record.get("note")
+    if not isinstance(note, str):
+        return set()
+    found: set[str] = set()
+    for token in note.split():
+        if token.startswith(SUBJECT_REVISION_PREFIX):
+            found.add(token.removeprefix(SUBJECT_REVISION_PREFIX))
+    return found
+
+
+def record_bound_to_subject_revision(record: dict[str, Any], revision: str) -> bool:
+    """True if and only if the record note explicitly binds to the exact revision."""
+    return record_subject_revisions(record) == {revision}
+
+
 def subject_revisions_in_notes(value: Any) -> set[str]:
-    """Collect only explicit subject_revision:<sha> tokens from gate notes."""
+    """Collect only explicit subject_revision:<sha> tokens from gate notes (audit-only diagnostic)."""
     found: set[str] = set()
     if isinstance(value, dict):
         for key in ("note", "notes"):
@@ -380,8 +580,33 @@ def subject_revisions_in_notes(value: Any) -> set[str]:
     return found
 
 
-def bound_to_subject_revision(ledger: Any, revision: str) -> bool:
-    return subject_revisions_in_notes(ledger) == {revision}
+def bound_to_subject_revision(
+    ledger: Any,
+    revision: str,
+    *,
+    issue_id: str | None = None,
+    from_status: str = "review",
+    to_status: str = "closed",
+    status_revision: int,
+    gate: str = "batch_verify",
+    provider: str = "batch_verify",
+) -> bool:
+    """Check that the effective accepted record for the scope binds to the exact subject revision."""
+    try:
+        records = effective_scoped_gate_records(
+            ledger,
+            issue_id=issue_id,
+            from_status=from_status,
+            to_status=to_status,
+            status_revision=status_revision,
+            gate=gate,
+        )
+    except (ValueError, TypeError, KeyError):
+        return False
+    rec = records.get(provider.lower())
+    if not rec or rec["status"] != "pass":
+        return False
+    return record_bound_to_subject_revision(rec, revision)
 
 
 def issue_field(issue: Any, field: str) -> Any:
@@ -435,15 +660,228 @@ def guarded_close_rejection(
         return "tier-one closer attribution is required"
     if closer_agent_name != actor:
         return "closer agent_name must equal the closer actor"
-    if provider_statuses(ledger) != [("batch_verify", "pass")]:
+
+    issue_id = issue_field(issue, "id")
+    if not isinstance(issue_id, str) or not issue_id.strip():
+        return "issue id is missing"
+    current_status = issue_field(issue, "status")
+
+    try:
+        status_rev = issue_status_revision(explicit_db, issue_id)
+        effective_records = effective_scoped_gate_records(
+            ledger,
+            issue_id=issue_id,
+            from_status=current_status,
+            to_status="closed",
+            status_revision=status_rev,
+            gate="batch_verify",
+        )
+    except (sqlite3.Error, ValueError, TypeError, KeyError, OSError) as err:
+        return f"cannot evaluate effective gates: {err}"
+
+    effective_statuses = [(rec["provider"], rec["status"]) for rec in effective_records.values()]
+    if effective_statuses != [("batch_verify", "pass")]:
         return "sole effective batch_verify PASS is required"
-    if not bound_to_subject_revision(ledger, subject_revision):
+
+    accepted_record = effective_records.get("batch_verify")
+    if not accepted_record or not record_bound_to_subject_revision(accepted_record, subject_revision):
         return "batch_verify PASS is not bound to the subject revision"
+
     if len(reason) < close_reason_min_length:
         return SHORT_REASON_REJECTION
     if not has_concrete_typed_references(reason, subject_revision, case_id):
         return "concrete typed close references are required"
     return None
+
+
+def planted_adapter_assertions() -> None:
+    """Bounded in-process planted assertions verifying RH-1 gate scoping dimensions.
+
+    Verifies:
+    1. latestFail: Current FAIL following old PASS overwrites to FAIL.
+    2. wronggate: Unrelated gate PASS never satisfies batch_verify.
+    3. wrongtransition: Records from other transitions never satisfy target transition.
+    4. staleRevision: Records from earlier status revisions never satisfy current revision.
+    5. legacyOnly: legacy_results are AUDIT ONLY and never authorize transitions.
+    6. malformed: Schema deviations fail closed via ValueError; no pretending valid.
+    7. fresh_after_stale: Current fresh PASS plus old stale-note PASS succeeds.
+    8. stale_after_fresh: Inverse current stale PASS plus old fresh-note PASS fails.
+    9. provider_case_norm & foreign_issue: Case normalization and foreign issue exclusion.
+    """
+    valid_base = {
+        "id": 1,
+        "issue_id": "test-issue",
+        "gate": "batch_verify",
+        "provider": "batch_verify",
+        "passed": True,
+        "from_status": "review",
+        "to_status": "closed",
+        "status_revision": 10,
+        "note": f"{SUBJECT_REVISION_PREFIX}abc123",
+    }
+
+    # 1. latestFail: current FAIL following old PASS overwrites to fail
+    ledger_overwrite = {
+        "issue_id": "test-issue",
+        "history": [
+            valid_base,
+            {**valid_base, "id": 2, "passed": False},
+        ],
+        "legacy_results": [],
+    }
+    res_overwrite = effective_scoped_gate_results(
+        ledger_overwrite, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_overwrite == [("batch_verify", "fail")], f"expected fail, got {res_overwrite}"
+
+    # 2. wronggate: unrelated gate PASS cannot authorize batch_verify
+    ledger_wrong_gate = {
+        "issue_id": "test-issue",
+        "history": [{**valid_base, "gate": "audit_check"}],
+        "legacy_results": [],
+    }
+    res_wrong_gate = effective_scoped_gate_results(
+        ledger_wrong_gate, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_wrong_gate == [], f"expected empty, got {res_wrong_gate}"
+
+    # 3. wrongtransition: wrong transition cannot authorize review -> closed
+    ledger_wrong_trans = {
+        "issue_id": "test-issue",
+        "history": [{**valid_base, "from_status": "open", "to_status": "in_progress"}],
+        "legacy_results": [],
+    }
+    res_wrong_trans = effective_scoped_gate_results(
+        ledger_wrong_trans, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_wrong_trans == [], f"expected empty, got {res_wrong_trans}"
+
+    # 4. staleRevision: old status revision cannot authorize current revision
+    ledger_stale_rev = {
+        "issue_id": "test-issue",
+        "history": [{**valid_base, "status_revision": 9}],
+        "legacy_results": [],
+    }
+    res_stale_rev = effective_scoped_gate_results(
+        ledger_stale_rev, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_stale_rev == [], f"expected empty, got {res_stale_rev}"
+
+    # 5. legacyOnly: legacy_results are AUDIT ONLY and never authorize
+    ledger_legacy_only = {
+        "issue_id": "test-issue",
+        "history": [],
+        "legacy_results": [{"gate": "batch_verify", "provider": "batch_verify", "passed": True}],
+    }
+    res_legacy_only = effective_scoped_gate_results(
+        ledger_legacy_only, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_legacy_only == [], f"expected empty, got {res_legacy_only}"
+
+    # 6. malformed: missing or invalid types must fail closed with ValueError
+    malformed_variants = [
+        None,  # ledger not dict
+        {"history": "invalid"},  # history not list
+        {"history": [valid_base]},  # ledger missing issue_id
+        {"issue_id": "test-issue", "history": [{**valid_base, "passed": "pass"}]},  # passed not bool
+        {"issue_id": "test-issue", "history": [{**valid_base, "status_revision": "10"}]},  # status_revision not int
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "passed"}]},  # missing passed
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "gate"}]},  # missing gate
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "provider"}]},  # missing provider
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "from_status"}]},  # missing from_status
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "to_status"}]},  # missing to_status
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "status_revision"}]},  # missing status_revision
+        {"issue_id": "test-issue", "history": [{k: v for k, v in valid_base.items() if k != "issue_id"}]},  # missing record issue_id
+    ]
+    for variant in malformed_variants:
+        try:
+            effective_scoped_gate_results(
+                variant, from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for malformed variant: {variant!r}")
+
+    # 7. current fresh PASS plus old stale-note PASS: fresh must succeed
+    ledger_fresh_after_stale = {
+        "issue_id": "test-issue",
+        "history": [
+            {**valid_base, "id": 1, "note": f"{SUBJECT_REVISION_PREFIX}old_stale_sha"},
+            {**valid_base, "id": 2, "note": f"{SUBJECT_REVISION_PREFIX}new_fresh_sha"},
+        ],
+        "legacy_results": [],
+    }
+    res_fresh = effective_scoped_gate_results(
+        ledger_fresh_after_stale, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_fresh == [("batch_verify", "pass")], f"expected pass, got {res_fresh}"
+    assert bound_to_subject_revision(
+        ledger_fresh_after_stale, "new_fresh_sha",
+        issue_id="test-issue", from_status="review", to_status="closed", status_revision=10,
+    ), "fresh subject revision must succeed when latest accepted record binds to fresh sha"
+    assert not bound_to_subject_revision(
+        ledger_fresh_after_stale, "old_stale_sha",
+        issue_id="test-issue", from_status="review", to_status="closed", status_revision=10,
+    ), "old stale subject revision must not succeed when overwritten by fresh record"
+
+    # 8. inverse current stale PASS plus old fresh-note PASS: must fail
+    ledger_stale_after_fresh = {
+        "issue_id": "test-issue",
+        "history": [
+            {**valid_base, "id": 1, "note": f"{SUBJECT_REVISION_PREFIX}old_fresh_sha"},
+            {**valid_base, "id": 2, "note": f"{SUBJECT_REVISION_PREFIX}new_stale_sha"},
+        ],
+        "legacy_results": [],
+    }
+    assert not bound_to_subject_revision(
+        ledger_stale_after_fresh, "old_fresh_sha",
+        issue_id="test-issue", from_status="review", to_status="closed", status_revision=10,
+    ), "old fresh subject revision must fail when overwritten by current stale record"
+    assert bound_to_subject_revision(
+        ledger_stale_after_fresh, "new_stale_sha",
+        issue_id="test-issue", from_status="review", to_status="closed", status_revision=10,
+    ), "current stale sha is what the latest accepted record actually binds"
+
+    # 9. provider case normalization & foreign issue row rejection
+    ledger_case_norm = {
+        "issue_id": "test-issue",
+        "history": [
+            {**valid_base, "id": 1, "provider": "Batch_Verify", "passed": True},
+            {**valid_base, "id": 2, "provider": "BATCH_VERIFY", "passed": False},
+        ],
+        "legacy_results": [],
+    }
+    res_case_norm = effective_scoped_gate_results(
+        ledger_case_norm, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_case_norm == [("BATCH_VERIFY", "fail")], f"expected normalized fail, got {res_case_norm}"
+
+    ledger_foreign_issue = {
+        "issue_id": "test-issue",
+        "history": [
+            {**valid_base, "id": 1, "issue_id": "foreign-issue", "passed": True},
+        ],
+        "legacy_results": [],
+    }
+    res_foreign = effective_scoped_gate_results(
+        ledger_foreign_issue, issue_id="test-issue", from_status="review", to_status="closed", status_revision=10, gate="batch_verify"
+    )
+    assert res_foreign == [], f"foreign issue row must not authorize test-issue, got {res_foreign}"
+
+    try:
+        effective_scoped_gate_results(
+            {"issue_id": "foreign-ledger", "history": [valid_base]},
+            issue_id="test-issue",
+            from_status="review",
+            to_status="closed",
+            status_revision=10,
+            gate="batch_verify",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when ledger issue_id does not match target issue_id")
 
 
 def guard_rejected_for(attempt: subprocess.CompletedProcess[str], reason: str) -> bool:
@@ -503,13 +941,18 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
+            status_rev_before = runner.status_revision(issue_id)
             stale_only = subject_revisions_in_notes(ledger_before) == {runner.stale_revision}
             execution_outcomes["stale"] = 1 if stale_only else 0
             execution_outcomes["mixed"] = 1 if len(subject_revisions_in_notes(ledger_before)) > 1 else 0
             passed = (
                 runner.stale_revision != runner.subject_revision
                 and stale_only
-                and not bound_to_subject_revision(ledger_before, runner.subject_revision)
+                and not bound_to_subject_revision(
+                    ledger_before, runner.subject_revision,
+                    issue_id=issue_id,
+                    from_status="review", to_status="closed", status_revision=status_rev_before,
+                )
                 and guard_rejected_for(attempt, "batch_verify PASS is not bound to the subject revision")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
@@ -545,9 +988,22 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 agent_name=WORKER, harness=HARNESS, model=MODEL,
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
+            status_rev_before = runner.status_revision(issue_id)
+            effective_before = effective_scoped_gate_results(
+                ledger_before,
+                issue_id=issue_id,
+                from_status="review",
+                to_status="closed",
+                status_revision=status_rev_before,
+                gate="batch_verify",
+            )
             passed = (
-                bound_to_subject_revision(ledger_before, runner.subject_revision)
-                and provider_statuses(ledger_before) == [("batch_verify", "pass")]
+                bound_to_subject_revision(
+                    ledger_before, runner.subject_revision,
+                    issue_id=issue_id,
+                    from_status="review", to_status="closed", status_revision=status_rev_before,
+                )
+                and effective_before == [("batch_verify", "pass")]
                 and guard_rejected_for(attempt, "closer must be distinct from the worker")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
@@ -634,6 +1090,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
+            status_rev_before = runner.status_revision(issue_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             # Intentional direct br close: this frozen limitation case proves that
             # installed br accepts an unauthorized provider PASS.  It is never a
@@ -643,7 +1100,14 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            statuses = provider_statuses(ledger_before)
+            statuses = effective_scoped_gate_results(
+                ledger_before,
+                issue_id=issue_id,
+                from_status="review",
+                to_status="closed",
+                status_revision=status_rev_before,
+                gate="batch_verify",
+            )
             passed = attempt.returncode == 0 and ("impostor", "pass") in statuses
             detail = "intentional direct-close bypass proves installed br accepts an unauthorized provider PASS; harness records the limitation"
         elif case_id == "canary_complete_provider_scrub_retained":
@@ -652,7 +1116,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.report_gate(issue_id, "impostor", "pass", "ImpostorProvider")
             runner.report_gate(issue_id, "old_batch", "pass", ORCHESTRATOR)
             before, ledger_before, _scrub_audit = runner.snapshot(issue_id)
-            for provider, _status in sorted(set(provider_statuses(ledger_before))):
+            for provider in observed_providers(ledger_before):
                 runner.report_gate(issue_id, provider, "fail", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
@@ -660,10 +1124,19 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
+            status_rev = runner.status_revision(issue_id)
+            effective_after = effective_scoped_gate_results(
+                ledger_after,
+                issue_id=issue_id,
+                from_status="review",
+                to_status="closed",
+                status_revision=status_rev,
+                gate="batch_verify",
+            )
             passed = (
                 guard_rejected_for(attempt, "sole effective batch_verify PASS is required")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
-                and not any(status == "pass" for _, status in provider_statuses(ledger_after))
+                and not any(status == "pass" for _, status in effective_after)
             )
             detail = "all observed providers are overwritten to FAIL and cannot close"
         elif case_id == POSITIVE_ID:
@@ -671,16 +1144,36 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            statuses = provider_statuses(ledger_before)
+            status_rev_before = runner.status_revision(issue_id)
+            effective_before = effective_scoped_gate_results(
+                ledger_before,
+                issue_id=issue_id,
+                from_status="review",
+                to_status="closed",
+                status_revision=status_rev_before,
+                gate="batch_verify",
+            )
             fresh = (
                 runner.subject_revision == runner.receipt_revision
-                and bound_to_subject_revision(ledger_before, runner.subject_revision)
+                and bound_to_subject_revision(
+                    ledger_before, runner.subject_revision,
+                    issue_id=issue_id,
+                    from_status="review", to_status="closed", status_revision=status_rev_before,
+                )
             )
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
                 reason=valid_reason(runner), **orchestrator_attribution(),
-            ) if fresh and statuses == [("batch_verify", "pass")] else None
+            ) if fresh and effective_before == [("batch_verify", "pass")] else None
             after, ledger_after, audit_after = runner.snapshot(issue_id)
+            effective_after = effective_scoped_gate_results(
+                ledger_after,
+                issue_id=issue_id,
+                from_status="review",
+                to_status="closed",
+                status_revision=status_rev_before,
+                gate="batch_verify",
+            )
             passed = (
                 issue_field(before, "acceptance_criteria") == "- [x] verified canary acceptance"
                 and issue_field(before, "status") == "review"
@@ -688,9 +1181,13 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
                 and last_guard_decision(runner, case_id) == "accepted"
                 and attempt.returncode == 0
                 and issue_field(after, "status") == "closed"
-                and provider_statuses(ledger_before) == [("batch_verify", "pass")]
-                and provider_statuses(ledger_after) == [("batch_verify", "pass")]
-                and bound_to_subject_revision(ledger_after, runner.subject_revision)
+                and effective_before == [("batch_verify", "pass")]
+                and effective_after == [("batch_verify", "pass")]
+                and bound_to_subject_revision(
+                    ledger_after, runner.subject_revision,
+                    issue_id=issue_id,
+                    from_status="review", to_status="closed", status_revision=status_rev_before,
+                )
             )
             detail = "distinct orchestrator closes only after guarded-close accepts a fresh sole batch_verify PASS; status becomes closed"
         else:
@@ -708,6 +1205,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
 
 
 def main() -> int:
+    planted_adapter_assertions()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="retained receipt directory (default: preserved temporary directory)")
     parser.add_argument("--subject-revision", default=None, help="revision being certified; defaults to current HEAD")
