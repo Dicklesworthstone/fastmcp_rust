@@ -4,6 +4,9 @@
 //! verifier module. This example only supplies Cargo's executable entrypoint
 //! for the integration producer.
 
+// The dedicated fnd_01_dependency_evidence target owns the verifier tests.
+// Explicit --all-targets selection overrides the manifest's test = false.
+#![cfg(not(test))]
 #![forbid(unsafe_code)]
 #![cfg_attr(windows, feature(windows_by_handle))]
 
