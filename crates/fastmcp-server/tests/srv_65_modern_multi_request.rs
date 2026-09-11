@@ -731,31 +731,41 @@ impl WireScenario {
                 .unwrap();
             let result = runtime.block_on(async move {
                 let root = Cx::current().unwrap();
-                // block_on polls its root future on the caller thread; even
-                // current_thread() has a separate scheduler worker. Run the
-                // scenario on that worker so hold_first_poll really prevents
-                // request children from executing before cancellation.
-                let mut scenario = root
-                    .spawn(move |root| async move {
-                        if !separate_dispatch {
-                            return server.run_split_transport_returning_with_cx(&root, recv, send);
-                        }
-                        let dispatch_cx = root.clone();
-                        let mut pump = root
-                            .spawn_blocking(move |pump_cx| {
-                                server.run_split_transport_returning_with_dispatch_cx(
-                                    &pump_cx,
-                                    &dispatch_cx,
-                                    recv,
-                                    send,
-                                )
-                            })
-                            .unwrap();
+                if !separate_dispatch {
+                    return server.run_split_transport_returning_with_cx(&root, recv, send);
+                }
+                let dispatch_cx = root.clone();
+                let (started_tx, started_rx) = mpsc::sync_channel(1);
+                let (ingress_tx, ingress_rx) = mpsc::sync_channel(1);
+                let mut pump = root
+                    .spawn_blocking(move |pump_cx| {
                         if hold_first_poll {
-                            // Keep the only async worker occupied until the pump
-                            // answers the authentication probe after cancellation.
-                            // The probe is rejected synchronously by the pump, so
-                            // this does not require polling a request child.
+                            started_tx.send(()).unwrap();
+                            ingress_rx
+                                .recv_timeout(Duration::from_secs(3))
+                                .expect("scheduler worker must permit ingress");
+                        }
+                        server.run_split_transport_returning_with_dispatch_cx(
+                            &pump_cx,
+                            &dispatch_cx,
+                            recv,
+                            send,
+                        )
+                    })
+                    .unwrap();
+                if hold_first_poll {
+                    // block_on uses the caller thread. Let spawn_blocking's
+                    // async wrapper run on the separate scheduler worker and
+                    // start the pump before deliberately occupying that worker.
+                    started_rx
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("blocking pump must start before holding the worker");
+                    let mut held_worker = root
+                        .spawn(move |_cx| async move {
+                            // No input reaches dispatch until this task owns
+                            // the only worker. The auth probe is answered by
+                            // the blocking pump without polling a request child.
+                            ingress_tx.send(()).unwrap();
                             let deadline = std::time::Instant::now() + Duration::from_secs(3);
                             while response_count.load(Ordering::Acquire) == 0
                                 && std::time::Instant::now() < deadline
@@ -763,14 +773,14 @@ impl WireScenario {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                             assert_eq!(response_count.load(Ordering::Acquire), 1);
-                        }
-                        pump.join(&root).await.expect("pump child must join")
-                    })
-                    .expect("scenario must run on the scheduler worker");
-                scenario
-                    .join(&root)
-                    .await
-                    .expect("scenario child must join")
+                        })
+                        .expect("hold task must run on the scheduler worker");
+                    held_worker
+                        .join(&root)
+                        .await
+                        .expect("held worker must join");
+                }
+                pump.join(&root).await.expect("pump child must join")
             });
             let _ = tx.send(result);
         });
@@ -872,8 +882,8 @@ impl Drop for WireScenario {
 #[test]
 fn srv_65_modern_pending_request_allows_other_requests() {
     // The no-legacy synchronous split entry point must also make progress
-    // when its caller occupies the only async worker, using the bounded
-    // bridge. The unchanged dual-era pump requires a separate dispatch Cx.
+    // when its caller supplies the same context for ingress and dispatch.
+    // The unchanged dual-era pump requires a separate dispatch Cx.
     let dispatch_modes: &[bool] = if cfg!(feature = "legacy-2024-11-05") {
         &[true]
     } else {

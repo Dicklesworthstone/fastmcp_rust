@@ -7689,7 +7689,7 @@ pub mod legacy_2024 {
     /// A bound exact-2024 HTTP+SSE server lifecycle.
     ///
     /// This wrapper can arise only from a [`Server`] built by the
-    /// [`legacy_2024`] facade. Its inner listener is intentionally private so
+    /// [`crate::legacy_2024`] facade. Its inner listener is intentionally private so
     /// callers cannot change the preselected `LegacyOnly` protocol policy.
     pub struct HttpServer {
         inner: fastmcp_server::BoundHttpServer,
