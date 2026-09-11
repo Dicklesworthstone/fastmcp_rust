@@ -34936,6 +34936,7 @@ exec sleep 30
         client.close().expect("client cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn eager_initialization_uses_bounded_server_response_writes() {
