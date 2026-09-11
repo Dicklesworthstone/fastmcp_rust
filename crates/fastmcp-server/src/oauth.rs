@@ -130,7 +130,10 @@ const MAX_OAUTH_SESSION_OWNER_INPUT_BYTES: usize = OAUTH_SESSION_OWNER_DOMAIN.le
     + OAUTH_REGISTRATION_EPOCH_BYTES
     + 1
     + 8
-    + MAX_OAUTH_SUBJECT_BYTES;
+    + MAX_OAUTH_SUBJECT_BYTES
+    + 1
+    + 8
+    + MAX_OAUTH_RESOURCE_BYTES;
 /// Maximum UTF-8 byte length of an OAuth authorization `state` value.
 pub const MAX_OAUTH_STATE_BYTES: usize = 4_096;
 
@@ -3967,6 +3970,7 @@ impl TokenVerifier for OAuthTokenVerifier {
             &client_id,
             registration_epoch,
             subject.as_deref(),
+            resource.as_deref(),
         )?;
         let display_subject = subject
             .clone()
@@ -3994,12 +3998,16 @@ fn oauth_session_owner(
     client_id: &str,
     registration_epoch: OAuthRegistrationEpoch,
     subject: Option<&str>,
+    resource: Option<&str>,
 ) -> McpResult<Sha256Digest> {
     if issuer.len() > MAX_OAUTH_ISSUER_BYTES
         || client_id.is_empty()
         || client_id.len() > MAX_OAUTH_CLIENT_ID_BYTES
         || subject
             .is_some_and(|subject| subject.is_empty() || subject.len() > MAX_OAUTH_SUBJECT_BYTES)
+        || resource.is_some_and(|resource| {
+            resource.is_empty() || resource.len() > MAX_OAUTH_RESOURCE_BYTES
+        })
     {
         return Err(McpError::internal_error(
             "OAuth session owner facts are outside admitted bounds",
@@ -4007,6 +4015,7 @@ fn oauth_session_owner(
     }
 
     let subject_bytes = subject.map_or(0, str::len);
+    let resource_bytes = resource.map_or(0, str::len);
     let capacity = OAUTH_SESSION_OWNER_DOMAIN
         .len()
         .checked_add(8)
@@ -4017,6 +4026,9 @@ fn oauth_session_owner(
         .and_then(|size| size.checked_add(1))
         .and_then(|size| size.checked_add(8))
         .and_then(|size| size.checked_add(subject_bytes))
+        .and_then(|size| size.checked_add(1))
+        .and_then(|size| size.checked_add(8))
+        .and_then(|size| size.checked_add(resource_bytes))
         .filter(|size| *size <= MAX_OAUTH_SESSION_OWNER_INPUT_BYTES)
         .ok_or_else(|| McpError::internal_error("OAuth session owner framing overflow"))?;
     let mut framed = Vec::new();
@@ -4047,6 +4059,18 @@ fn oauth_session_owner(
                     .to_be_bytes(),
             );
             framed.extend_from_slice(subject.as_bytes());
+        }
+    }
+    match resource {
+        None => framed.push(0),
+        Some(resource) => {
+            framed.push(1);
+            framed.extend_from_slice(
+                &u64::try_from(resource.len())
+                    .map_err(|_| McpError::internal_error("OAuth resource length overflow"))?
+                    .to_be_bytes(),
+            );
+            framed.extend_from_slice(resource.as_bytes());
         }
     }
 
@@ -5510,8 +5534,39 @@ mod tests {
                 .refresh_tokens
                 .get(&refresh_token_digest(&rotated_refresh))
                 .and_then(|token| token.resource.as_deref()),
+            Some(RESOURCE),
+        );
+        let rotated_auth = server
+            .token_verifier()
+            .verify(
+                &McpContext::new(asupersync::Cx::for_testing(), 1),
+                AuthRequest {
+                    method: "tools/list",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 2,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: rotated.access_token.clone(),
+                },
+            )
+            .expect("token verifier accepts rotated access token");
+        assert_eq!(
+            rotated_auth
+                .claims
+                .as_ref()
+                .and_then(|facts| facts["resource"].as_str()),
             Some(RESOURCE)
         );
+        assert_eq!(auth.session_owner(), rotated_auth.session_owner());
+        let session_principal = crate::session::SessionPrincipalBinding::default();
+        let initial_fp =
+            crate::auth::principal_fingerprint(Some(&auth)).expect("initial fingerprint");
+        assert!(session_principal.bind_or_verify(initial_fp));
+        let rotated_fp =
+            crate::auth::principal_fingerprint(Some(&rotated_auth)).expect("rotated fingerprint");
+        assert!(session_principal.bind_or_verify(rotated_fp));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -5727,6 +5782,197 @@ mod tests {
 
         assert!(matches!(error, OAuthError::AccessDenied(_)));
         assert_oauth_stats_unchanged(&before, &server.stats());
+    }
+
+    #[test]
+    fn oauth_token_verifier_resource_isolation_and_session_binding_rejection() {
+        const RESOURCE_A: &str = "https://resource-a.example/api";
+        const RESOURCE_B: &str = "https://resource-b.example/api";
+
+        let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let server = Arc::new(server_with_counting_approval(Arc::clone(&backend)));
+        server
+            .register_client(
+                OAuthClient::builder("resource-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded client"),
+            )
+            .expect("register client");
+
+        // 1. Authorize and exchange code for RESOURCE_A
+        let auth_req_a = AuthorizationRequest {
+            resource: Some(RESOURCE_A.to_string()),
+            state: Some("state-a".to_string()),
+            scopes: vec!["read".to_string()],
+            ..bounded_authorization_request("resource-client")
+        };
+        let (code_a, _) = server.authorize(&auth_req_a).expect("authorized a");
+        let issued_a = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code_a,
+                RESOURCE_A,
+            ))
+            .expect("exchange a");
+        let refresh_a = issued_a.refresh_token.clone().expect("refresh token a");
+
+        // Verify token A with OAuthTokenVerifier
+        let cx = McpContext::new(asupersync::Cx::for_testing(), 1);
+        let verifier = server.token_verifier();
+        let auth_a = verifier
+            .verify(
+                &cx,
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 1,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: issued_a.access_token.clone(),
+                },
+            )
+            .expect("verify token a");
+
+        assert_eq!(auth_a.subject.as_deref(), Some("approved-subject"));
+        assert_eq!(
+            auth_a.claims.as_ref().and_then(|c| c["resource"].as_str()),
+            Some(RESOURCE_A)
+        );
+        let owner_a = auth_a.session_owner().expect("session owner a");
+
+        // 2. Refresh token A and verify rotated token retains same session_owner
+        let rotated_a = server
+            .token(&bounded_refresh_request("resource-client", &refresh_a))
+            .expect("refresh rotation a");
+        let rotated_auth_a = verifier
+            .verify(
+                &cx,
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 2,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: rotated_a.access_token,
+                },
+            )
+            .expect("verify rotated token a");
+
+        assert_eq!(rotated_auth_a.session_owner(), Some(owner_a));
+
+        // 3. Authorize and exchange code for RESOURCE_B (same client, same subject, different resource)
+        let auth_req_b = AuthorizationRequest {
+            resource: Some(RESOURCE_B.to_string()),
+            state: Some("state-b".to_string()),
+            scopes: vec!["read".to_string()],
+            ..bounded_authorization_request("resource-client")
+        };
+        let (code_b, _) = server.authorize(&auth_req_b).expect("authorized b");
+        let issued_b = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code_b,
+                RESOURCE_B,
+            ))
+            .expect("exchange b");
+
+        let auth_b = verifier
+            .verify(
+                &cx,
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 3,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: issued_b.access_token,
+                },
+            )
+            .expect("verify token b");
+
+        assert_eq!(auth_b.subject.as_deref(), Some("approved-subject"));
+        assert_eq!(
+            auth_b.claims.as_ref().and_then(|c| c["resource"].as_str()),
+            Some(RESOURCE_B)
+        );
+        let owner_b = auth_b.session_owner().expect("session owner b");
+
+        // Different resources produce distinct session owners despite same client and subject
+        assert_ne!(owner_a, owner_b);
+
+        // 4. Also authorize and exchange for a token without resource
+        let auth_req_no_res = AuthorizationRequest {
+            resource: None,
+            state: Some("state-no-res".to_string()),
+            scopes: vec!["read".to_string()],
+            ..bounded_authorization_request("resource-client")
+        };
+        let (code_no_res, _) = server
+            .authorize(&auth_req_no_res)
+            .expect("authorized no res");
+        let issued_no_res = server
+            .token(&bounded_code_exchange_request(
+                "resource-client",
+                &code_no_res,
+            ))
+            .expect("exchange no res");
+        let auth_no_res = verifier
+            .verify(
+                &cx,
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 4,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: issued_no_res.access_token,
+                },
+            )
+            .expect("verify token without resource");
+
+        let owner_no_res = auth_no_res.session_owner().expect("session owner no res");
+        assert_ne!(owner_a, owner_no_res);
+        assert_ne!(owner_b, owner_no_res);
+
+        // 5. Connect to SessionPrincipalBinding consumer
+        let fp_a = crate::auth::principal_fingerprint(Some(&auth_a)).expect("fingerprint a");
+        let fp_a_rotated = crate::auth::principal_fingerprint(Some(&rotated_auth_a))
+            .expect("fingerprint a rotated");
+        let fp_b = crate::auth::principal_fingerprint(Some(&auth_b)).expect("fingerprint b");
+        let fp_no_res =
+            crate::auth::principal_fingerprint(Some(&auth_no_res)).expect("fingerprint no res");
+
+        assert_eq!(fp_a, fp_a_rotated);
+        assert_ne!(fp_a, fp_b);
+        assert_ne!(fp_a, fp_no_res);
+        assert_ne!(fp_b, fp_no_res);
+
+        let binding = crate::session::SessionPrincipalBinding::default();
+        // First frame with resource A binds the session
+        assert!(binding.bind_or_verify(fp_a));
+        // Same-resource refreshed token is accepted on the bound session
+        assert!(binding.bind_or_verify(fp_a_rotated));
+        // Different-resource token is rejected on the bound session
+        assert!(!binding.bind_or_verify(fp_b));
+        // Token without resource is rejected on the bound session
+        assert!(!binding.bind_or_verify(fp_no_res));
+        // Control-frame verification: existing bound principal matches
+        assert!(binding.verify_existing(fp_a));
+        assert!(binding.verify_existing(fp_a_rotated));
+        assert!(!binding.verify_existing(fp_b));
+        assert!(!binding.verify_existing(fp_no_res));
+        // Original binding remains uncorrupted after cross-resource rejections
+        assert!(binding.bind_or_verify(fp_a));
     }
 
     fn bounded_refresh_request(client_id: &str, refresh_token: &str) -> TokenRequest {
@@ -9284,18 +9530,24 @@ mod tests {
     fn oauth_session_owner_frames_every_identity_namespace() {
         let issuer = "https://issuer.example/";
         let epoch = test_registration_epoch(1);
-        let stable = oauth_session_owner(issuer, "service-client", epoch, Some("subject"))
+        let stable = oauth_session_owner(issuer, "service-client", epoch, Some("subject"), None)
             .expect("bounded owner");
 
         assert_eq!(
             stable,
-            oauth_session_owner(issuer, "service-client", epoch, Some("subject"))
+            oauth_session_owner(issuer, "service-client", epoch, Some("subject"), None)
                 .expect("stable owner")
         );
         assert_ne!(
-            oauth_session_owner(issuer, "service-client", epoch, None).expect("client owner"),
-            oauth_session_owner(issuer, "service-client", epoch, Some("service-client"))
-                .expect("subject owner")
+            oauth_session_owner(issuer, "service-client", epoch, None, None).expect("client owner"),
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("service-client"),
+                None
+            )
+            .expect("subject owner")
         );
         assert_ne!(
             stable,
@@ -9304,12 +9556,13 @@ mod tests {
                 "service-client",
                 epoch,
                 Some("subject"),
+                None,
             )
             .expect("different issuer owner")
         );
         assert_ne!(
             stable,
-            oauth_session_owner(issuer, "other-client", epoch, Some("subject"))
+            oauth_session_owner(issuer, "other-client", epoch, Some("subject"), None)
                 .expect("different client owner")
         );
         assert_ne!(
@@ -9319,8 +9572,52 @@ mod tests {
                 "service-client",
                 test_registration_epoch(2),
                 Some("subject"),
+                None,
             )
             .expect("different registration owner")
+        );
+        assert_ne!(
+            stable,
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("subject"),
+                Some("https://mcp.example.com/res-a"),
+            )
+            .expect("different resource owner")
+        );
+        assert_ne!(
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("subject"),
+                Some("https://mcp.example.com/res-a"),
+            )
+            .expect("resource a"),
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("subject"),
+                Some("https://mcp.example.com/res-b"),
+            )
+            .expect("resource b")
+        );
+        assert!(
+            oauth_session_owner(issuer, "service-client", epoch, Some("subject"), Some(""),)
+                .is_err()
+        );
+        assert!(
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("subject"),
+                Some(&"x".repeat(MAX_OAUTH_RESOURCE_BYTES + 1)),
+            )
+            .is_err()
         );
 
         let first = AuthContext::with_subject("same-display").with_session_owner(stable);
@@ -9330,12 +9627,27 @@ mod tests {
                 "service-client",
                 test_registration_epoch(2),
                 Some("subject"),
+                None,
             )
             .expect("second registration owner"),
+        );
+        let third = AuthContext::with_subject("same-display").with_session_owner(
+            oauth_session_owner(
+                issuer,
+                "service-client",
+                epoch,
+                Some("subject"),
+                Some("https://mcp.example.com/res-a"),
+            )
+            .expect("third resource owner"),
         );
         assert_ne!(
             crate::auth::principal_fingerprint(Some(&first)).expect("first fingerprint"),
             crate::auth::principal_fingerprint(Some(&second)).expect("second fingerprint")
+        );
+        assert_ne!(
+            crate::auth::principal_fingerprint(Some(&first)).expect("first fingerprint"),
+            crate::auth::principal_fingerprint(Some(&third)).expect("third fingerprint")
         );
     }
 
@@ -9392,6 +9704,13 @@ mod tests {
             crate::auth::principal_fingerprint(Some(&initial_auth)).expect("initial fingerprint"),
             crate::auth::principal_fingerprint(Some(&rotated_auth)).expect("rotated fingerprint")
         );
+        let principal_binding = crate::session::SessionPrincipalBinding::default();
+        let initial_fp =
+            crate::auth::principal_fingerprint(Some(&initial_auth)).expect("initial fingerprint");
+        assert!(principal_binding.bind_or_verify(initial_fp));
+        let rotated_fp =
+            crate::auth::principal_fingerprint(Some(&rotated_auth)).expect("rotated fingerprint");
+        assert!(principal_binding.bind_or_verify(rotated_fp));
         let state = server.state.read().unwrap();
         let stored = state
             .refresh_tokens
