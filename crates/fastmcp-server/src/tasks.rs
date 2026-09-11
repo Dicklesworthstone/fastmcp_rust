@@ -2048,6 +2048,31 @@ pub trait FinalTaskStore: Send + Sync {
 
     /// Returns the durable cooperative-cancellation intent for a known task.
     fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool>;
+
+    /// Returns the store's authoritative monotonic clock reading for retention and lease checks.
+    fn retention_clock_now(&self) -> Instant;
+
+    /// Reads the store-issued retention deadline for this exact task generation.
+    ///
+    /// Returns `Ok(Some(FinalTaskRetentionDeadline::Finite(deadline)))` if the task retains
+    /// this generation and has a finite TTL deadline.
+    /// Returns `Ok(Some(FinalTaskRetentionDeadline::Unlimited))` if the task retains this
+    /// generation and has unlimited retention.
+    /// Returns `Ok(None)` if the task does not exist or has a different generation (stale).
+    fn task_retention_deadline_if_current(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+    ) -> McpResult<Option<FinalTaskRetentionDeadline>>;
+}
+
+/// Authoritative store-issued retention deadline for a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalTaskRetentionDeadline {
+    /// The task was created with a finite TTL and expires at this monotonic instant.
+    Finite(Instant),
+    /// The task was created with unlimited retention (null TTL).
+    Unlimited,
 }
 
 /// One final task plus the opaque monotonic generation assigned by its store.
@@ -2137,6 +2162,7 @@ pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<InMemoryFinalTaskState>,
+    heartbeat_interval: Option<StdDuration>,
 }
 
 #[derive(Default)]
@@ -2200,7 +2226,19 @@ impl InMemoryFinalTaskStore {
             max_tasks,
             clock,
             state: Mutex::new(InMemoryFinalTaskState::default()),
+            heartbeat_interval: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock_and_heartbeat(
+        max_tasks: usize,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+        heartbeat: StdDuration,
+    ) -> McpResult<Self> {
+        let mut store = Self::with_clock(max_tasks, clock)?;
+        store.heartbeat_interval = Some(heartbeat);
+        Ok(store)
     }
 
     /// Returns the configured maximum number of retained tasks.
@@ -3006,7 +3044,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
-        Ok(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT)
+        Ok(self
+            .heartbeat_interval
+            .unwrap_or(IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT))
     }
 
     fn finish_handoff_dispatch_if_current(
@@ -3171,6 +3211,33 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             return Err(McpError::invalid_params("Task not found"));
         }
         Ok(state.cancellation_requests.contains(task_id))
+    }
+
+    fn retention_clock_now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    fn task_retention_deadline_if_current(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+    ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
+        if state.generations.get(task_id) != Some(&generation) {
+            return Ok(None);
+        }
+        if let Some(expires_at) = state.expires_at.get(task_id).copied() {
+            Ok(Some(FinalTaskRetentionDeadline::Finite(expires_at)))
+        } else if state.tasks.contains_key(task_id) {
+            Ok(Some(FinalTaskRetentionDeadline::Unlimited))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -5214,12 +5281,20 @@ impl FinalTaskRuntime {
         Ok(task)
     }
 
-    fn load_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<FinalTaskSnapshot> {
-        let snapshot = self
-            .store
-            .get_task_snapshot(task_id)?
-            .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+    fn load_optional_task_snapshot(
+        &self,
+        task_id: &FinalTaskId,
+    ) -> McpResult<Option<FinalTaskSnapshot>> {
+        let Some(snapshot) = self.store.get_task_snapshot(task_id)? else {
+            return Ok(None);
+        };
         self.validate_loaded_task_snapshot(snapshot, Some(task_id))
+            .map(Some)
+    }
+
+    fn load_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<FinalTaskSnapshot> {
+        self.load_optional_task_snapshot(task_id)?
+            .ok_or_else(|| McpError::invalid_params("Task not found"))
     }
 
     pub(crate) fn task_for_request(
@@ -5681,6 +5756,19 @@ impl FinalTaskRuntime {
         )
     }
 
+    fn retention_clock_now(&self) -> Instant {
+        self.store.retention_clock_now()
+    }
+
+    fn task_retention_deadline(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+    ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+        self.store
+            .task_retention_deadline_if_current(task_id, generation)
+    }
+
     /// Verifies, without mutation, that a live entered task-service runner
     /// currently owns this runtime's readiness generation.
     ///
@@ -6056,6 +6144,10 @@ impl AuthorizedTaskServiceRunner {
         let cancellation_wake = self
             .runtime
             .register_task_cancellation_wake(self.service_id, guard.task_id())?;
+        if guard.is_authoritatively_expired() {
+            guard.disarm();
+            return Ok(());
+        }
         if guard.retire_if_cancellation_requested()? {
             return Ok(());
         }
@@ -6065,6 +6157,10 @@ impl AuthorizedTaskServiceRunner {
             .await
         {
             Ok(()) => {
+                if guard.is_authoritatively_expired() {
+                    guard.disarm();
+                    return Ok(());
+                }
                 if guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
@@ -6093,6 +6189,10 @@ impl AuthorizedTaskServiceRunner {
                 // Returned errors restore synchronously so a recovery runner
                 // sees the exact pre-await payload. Cancellation, dropped
                 // futures, and unwinding use the same lease in `Drop`.
+                if guard.is_authoritatively_expired() {
+                    guard.disarm();
+                    return Ok(());
+                }
                 if guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
@@ -6113,7 +6213,6 @@ impl AuthorizedTaskServiceRunner {
         cancellation_wake: &FinalTaskCancellationWakeRegistration,
     ) -> McpResult<()> {
         let mut supervisor = self.supervisor.resume(cx, handoff);
-        let heartbeat_interval = guard.heartbeat_interval()?;
         loop {
             // The application callback is allowed to be pending for longer
             // than one lease interval. The service context is nevertheless
@@ -6121,9 +6220,14 @@ impl AuthorizedTaskServiceRunner {
             // application work and before renewing durable ownership.
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
+            if guard.is_authoritatively_expired() {
+                guard.disarm();
+                return Ok(());
+            }
             if guard.retire_if_cancellation_requested()? {
                 return Ok(());
             }
+            let heartbeat_interval = guard.bounded_heartbeat_interval()?;
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
             // The supervisor is promised one poll boundary in which to observe
             // and honour a cancellation winner. Electing the winner on the
@@ -6156,6 +6260,9 @@ impl AuthorizedTaskServiceRunner {
                     // handoff the application already consumed.
                     return std::task::Poll::Ready(Some(result));
                 }
+                if guard.is_authoritatively_expired() {
+                    return std::task::Poll::Ready(None);
+                }
                 // The supervisor declined this boundary, so the runner elects
                 // the cancellation winner and records terminal cancellation --
                 // but only after granting the one promised boundary above.
@@ -6182,16 +6289,28 @@ impl AuthorizedTaskServiceRunner {
             let Some(result) = completed else {
                 cx.checkpoint()
                     .map_err(|error| McpError::internal_error(error.to_string()))?;
+                if guard.is_authoritatively_expired() {
+                    guard.disarm();
+                    return Ok(());
+                }
                 if guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
                 if !guard.renew()? {
+                    if guard.is_authoritatively_expired() {
+                        guard.disarm();
+                        return Ok(());
+                    }
                     return Err(McpError::internal_error(
                         "Final task dispatch lease was lost while application work was running",
                     ));
                 }
                 continue;
             };
+            if guard.is_authoritatively_expired() {
+                guard.disarm();
+                return Ok(());
+            }
             if guard.retire_if_cancellation_requested()? {
                 return Ok(());
             }
@@ -6221,6 +6340,7 @@ struct FinalTaskExecutionGuard {
     generation: u64,
     owner_id: String,
     dispatch_fence: Option<u64>,
+    retention_deadline: Option<FinalTaskRetentionDeadline>,
     restoration: Option<FinalTaskHandoffRestoration>,
 }
 
@@ -6248,17 +6368,25 @@ impl FinalTaskExecutionGuard {
             generation,
             owner_id: owner_id.to_owned(),
             dispatch_fence: None,
+            retention_deadline: None,
             restoration: Some(restoration),
         }
     }
 
     fn elect(&mut self) -> McpResult<bool> {
+        let Some(deadline) = self
+            .runtime
+            .task_retention_deadline(&self.task_id, self.generation)?
+        else {
+            return Ok(false);
+        };
         let Some(dispatch_fence) =
             self.runtime
                 .begin_handoff_dispatch(&self.task_id, self.generation, &self.owner_id)?
         else {
             return Ok(false);
         };
+        self.retention_deadline = Some(deadline);
         self.dispatch_fence = Some(dispatch_fence);
         Ok(true)
     }
@@ -6267,8 +6395,24 @@ impl FinalTaskExecutionGuard {
         &self.task_id
     }
 
+    fn is_authoritatively_expired(&self) -> bool {
+        let Some(FinalTaskRetentionDeadline::Finite(deadline)) = self.retention_deadline else {
+            return false;
+        };
+        let store_now = self.runtime.retention_clock_now();
+        store_now >= deadline
+    }
+
     fn is_cancellation_requested(&self) -> McpResult<bool> {
-        let current = self.runtime.load_task_snapshot(&self.task_id)?;
+        if self.is_authoritatively_expired() {
+            return Ok(false);
+        }
+        let Some(current) = self.runtime.load_optional_task_snapshot(&self.task_id)? else {
+            if self.is_authoritatively_expired() {
+                return Ok(false);
+            }
+            return Err(McpError::invalid_params("Task not found"));
+        };
         if current.generation() != self.generation {
             // A terminal or newer fenced transition already consumed this
             // handoff. It is not this guard's cancellation to retire.
@@ -6283,6 +6427,9 @@ impl FinalTaskExecutionGuard {
     /// strand a `working` task merely because application work returns, errors,
     /// or is dropped at the same time.
     fn retire_if_cancellation_requested(&mut self) -> McpResult<bool> {
+        if self.is_authoritatively_expired() {
+            return Ok(false);
+        }
         if !self.is_cancellation_requested()? {
             return Ok(false);
         }
@@ -6317,12 +6464,33 @@ impl FinalTaskExecutionGuard {
         self.runtime.handoff_dispatch_lease_heartbeat_interval()
     }
 
+    fn bounded_heartbeat_interval(&self) -> McpResult<StdDuration> {
+        let base_interval = self.heartbeat_interval()?;
+        if let Some(FinalTaskRetentionDeadline::Finite(deadline)) = self.retention_deadline {
+            let store_now = self.runtime.retention_clock_now();
+            if store_now >= deadline {
+                return Ok(StdDuration::ZERO);
+            }
+            let remaining = deadline.saturating_duration_since(store_now);
+            return Ok(base_interval.min(remaining));
+        }
+        Ok(base_interval)
+    }
+
     /// Returns whether the elected handoff remains the exact live `working`
     /// state without a cancellation winner. A successful supervisor return in
     /// that state has not consumed its mutation authority and must be restored
     /// for a later service generation rather than silently dropping work.
     fn is_recoverable_without_transition(&self) -> McpResult<bool> {
-        let current = self.runtime.load_task_snapshot(&self.task_id)?;
+        if self.is_authoritatively_expired() {
+            return Ok(false);
+        }
+        let Some(current) = self.runtime.load_optional_task_snapshot(&self.task_id)? else {
+            if self.is_authoritatively_expired() {
+                return Ok(false);
+            }
+            return Err(McpError::invalid_params("Task not found"));
+        };
         Ok(current.generation() == self.generation
             && matches!(current.task(), FinalTask::Working(_))
             && !self
@@ -6363,6 +6531,10 @@ impl FinalTaskExecutionGuard {
     }
 
     fn restore(&mut self) -> McpResult<bool> {
+        if self.is_authoritatively_expired() {
+            self.disarm();
+            return Ok(false);
+        }
         let Some(restoration) = self.restoration.as_ref() else {
             return Ok(false);
         };
@@ -6402,6 +6574,10 @@ impl Drop for FinalTaskExecutionGuard {
         // resurrected. A cancellation winner is retired before restoration;
         // if it races the first probe, in-memory restoration retains the
         // elected fence and the second probe records the terminal outcome.
+        if self.is_authoritatively_expired() {
+            self.disarm();
+            return;
+        }
         if self.retire_if_cancellation_requested().unwrap_or(false) {
             return;
         }
@@ -7392,6 +7568,19 @@ mod tests {
                 cancelled_notification,
             )
         }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
+        }
     }
 
     struct LoseFirstAcceptedRecoveryCandidateStore {
@@ -7534,6 +7723,19 @@ mod tests {
 
         fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
             self.inner.is_cancellation_requested(task_id)
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
         }
     }
 
@@ -7679,6 +7881,19 @@ mod tests {
 
         fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
             self.inner.is_cancellation_requested(task_id)
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner
+                .task_retention_deadline_if_current(task_id, generation)
         }
     }
 
@@ -8279,6 +8494,26 @@ mod tests {
         )
     }
 
+    fn in_memory_store_with_test_clock_and_heartbeat(
+        max_tasks: usize,
+        heartbeat: StdDuration,
+    ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock_now = Arc::clone(&now);
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+            *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        (
+            Arc::new(
+                InMemoryFinalTaskStore::with_clock_and_heartbeat(max_tasks, clock, heartbeat)
+                    .expect("positive bounded store capacity is valid"),
+            ),
+            now,
+        )
+    }
+
     /// Deliberately permissive custom store used to prove that the runtime,
     /// rather than one built-in store implementation, guards task data at its
     /// durable read and write boundaries.
@@ -8547,6 +8782,22 @@ mod tests {
 
         fn is_cancellation_requested(&self, _task_id: &FinalTaskId) -> McpResult<bool> {
             Ok(true)
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            Instant::now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            let snapshot = self.snapshot();
+            if &snapshot.task().base().task_id != task_id || snapshot.generation() != generation {
+                return Ok(None);
+            }
+            Ok(Some(FinalTaskRetentionDeadline::Unlimited))
         }
     }
 
@@ -9314,6 +9565,459 @@ mod tests {
             "changing only null TTL to a positive TTL permits reclamation at its deadline"
         );
         assert_eq!(store.task_count(), 0);
+    }
+
+    struct RetentionExpiryDropFlag(Arc<AtomicBool>);
+    impl Drop for RetentionExpiryDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    struct ExpiryThenCompletingSupervisor {
+        clock: Arc<Mutex<Instant>>,
+        advance_ms: u64,
+        task1_id: FinalTaskId,
+        task1_dropped: Arc<AtomicBool>,
+        task2_id: FinalTaskId,
+        task2_completed: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for ExpiryThenCompletingSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let clock = Arc::clone(&self.clock);
+            let advance_ms = self.advance_ms;
+            let is_task1 = *final_task_handoff_task_id(&handoff) == self.task1_id;
+            let is_task2 = *final_task_handoff_task_id(&handoff) == self.task2_id;
+            let task1_dropped = Arc::clone(&self.task1_dropped);
+            let task2_completed = Arc::clone(&self.task2_completed);
+
+            Box::pin(async move {
+                if is_task1 {
+                    let _drop_guard = RetentionExpiryDropFlag(task1_dropped);
+                    // Advance the store's authoritative clock past Task 1's TTL.
+                    let mut clk = clock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *clk = clk
+                        .checked_add(StdDuration::from_millis(advance_ms))
+                        .expect("advance test clock");
+                    drop(clk);
+                    // Yield to trigger the runner's authoritative expiry check.
+                    std::future::pending::<McpResult<()>>().await
+                } else if is_task2 {
+                    let result: FinalTaskCallToolResult =
+                        serde_json::from_value(serde_json::json!({"content": []}))
+                            .expect("typed terminal task result");
+                    match handoff {
+                        FinalTaskSupervisorHandoff::Initial(initial) => {
+                            initial
+                                .complete_task(result, None)
+                                .expect("complete task 2");
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                            accepted
+                                .complete_task(result, None)
+                                .expect("complete task 2");
+                        }
+                    }
+                    task2_completed.store(true, AtomicOrdering::SeqCst);
+                    cx.cancel_with(CancelKind::User, None);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    struct UnexpiredLostLeaseSupervisor {
+        store: Arc<InMemoryFinalTaskStore>,
+        task_id: FinalTaskId,
+    }
+
+    impl ApplicationTaskSupervisor for UnexpiredLostLeaseSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let store = Arc::clone(&self.store);
+            let task_id = self.task_id.clone();
+            assert_eq!(final_task_handoff_task_id(&handoff), &task_id);
+            Box::pin(async move {
+                // Remove the elected handoff lease while the task remains UNEXPIRED.
+                // This simulates lease loss (e.g. timeout, worker stall, external steal).
+                store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .handoff_leases
+                    .remove(&task_id);
+                // Yield so the heartbeat lease renewal fails.
+                std::future::pending::<McpResult<()>>().await
+            })
+        }
+    }
+
+    #[test]
+    fn task_03_final_runtime_worker_quiesces_on_retention_expiry_and_proceeds_to_next_task() {
+        const TTL_MS: u64 = 60_000;
+        let (store, now) = in_memory_store_with_test_clock(2);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
+                .expect("positive TTL is a valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+        let dummy_runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install initial dummy runner to create tasks");
+        let dummy_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
+
+        let created1 = runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("finite-TTL task 1 is durably created");
+        let task_id1 = created1.task.base().task_id.clone();
+
+        let created2 = runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("finite-TTL task 2 is durably created");
+        let task_id2 = created2.task.base().task_id.clone();
+
+        drop(_running_service);
+
+        let task1_dropped = Arc::new(AtomicBool::new(false));
+        let task2_completed = Arc::new(AtomicBool::new(false));
+        let supervisor = Arc::new(ExpiryThenCompletingSupervisor {
+            clock: Arc::clone(&now),
+            advance_ms: TTL_MS + 1000,
+            task1_id: task_id1.clone(),
+            task1_dropped: Arc::clone(&task1_dropped),
+            task2_id: task_id2.clone(),
+            task2_completed: Arc::clone(&task2_completed),
+        });
+
+        let mut runner = runtime
+            .install_task_service(2, supervisor)
+            .expect("install test supervisor runner");
+        let service_cx = Cx::for_testing();
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.run_service(&service_cx))
+            .expect("service runner completes without aborting on task 1 expiry");
+
+        assert!(
+            task1_dropped.load(AtomicOrdering::SeqCst),
+            "supervisor future for task 1 must be dropped and quiesced upon retention expiry"
+        );
+        assert!(
+            task2_completed.load(AtomicOrdering::SeqCst),
+            "the runner must proceed to execute and complete the second task in the backlog"
+        );
+        assert!(
+            runtime.get_task(&task_id1).is_err(),
+            "task 1 was purged upon retention expiry without aborting the runner"
+        );
+        assert!(
+            store
+                .get_task(&task_id1)
+                .expect("store read")
+                .is_none(),
+            "task 1 is deleted from the durable store"
+        );
+        assert!(
+            matches!(
+                store
+                    .get_task(&task_id2)
+                    .expect("store read"),
+                Some(FinalTask::Completed { .. })
+            ),
+            "task 2 remains committed as Completed in the store"
+        );
+        assert_eq!(
+            store.task_count(),
+            1,
+            "task 1 retention expiry freed its store quota while task 2 remains retained"
+        );
+    }
+
+    #[test]
+    fn task_03_final_runtime_worker_unexpired_lost_lease_fails() {
+        const TTL_MS: u64 = 60_000;
+        // Set heartbeat to 1ms so lease renewal check happens promptly.
+        let (store, _now) = in_memory_store_with_test_clock_and_heartbeat(
+            1,
+            StdDuration::from_millis(1),
+        );
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
+                .expect("positive TTL is a valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+        let dummy_runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install initial dummy runner to create tasks");
+        let dummy_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
+
+        let created = runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("finite-TTL task is durably created");
+        let task_id = created.task.base().task_id.clone();
+
+        drop(_running_service);
+
+        let supervisor = Arc::new(UnexpiredLostLeaseSupervisor {
+            store: Arc::clone(&store),
+            task_id: task_id.clone(),
+        });
+        let runner = runtime
+            .install_task_service(2, supervisor)
+            .expect("install test supervisor runner");
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("initial handoff is present");
+
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        let result = application_runtime.block_on(runner.resume_handoff(
+            &Cx::for_testing(),
+            FinalTaskSupervisorHandoff::Initial(initial),
+        ));
+
+        let error = result.expect_err("an unexpired lost lease must fail strictly");
+        assert!(
+            error
+                .to_string()
+                .contains("Final task dispatch lease was lost while application work was running"),
+            "unexpected error message: {error}"
+        );
+        // The unexpired task must NOT be deleted or treated as expired!
+        assert!(
+            runtime.get_task(&task_id).is_ok(),
+            "unexpired task with lost lease must remain in the store"
+        );
+        assert!(
+            matches!(
+                store.get_task(&task_id).expect("store read"),
+                Some(FinalTask::Working(_))
+            ),
+            "unexpired task remains in Working state"
+        );
+        assert_eq!(
+            store.task_count(),
+            1,
+            "unexpired task retains its store quota"
+        );
+    }
+
+    struct FailingSnapshotProbeStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        fail_snapshots: AtomicBool,
+    }
+
+    impl FinalTaskStore for FailingSnapshotProbeStore {
+        fn create_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+        fn create_task_with_work(&self, task: FinalTask, notification: FinalTaskStatusNotification, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<()> {
+            self.inner.create_task_with_work(task, notification, work_descriptor)
+        }
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            if self.fail_snapshots.load(AtomicOrdering::SeqCst) {
+                return Err(McpError::internal_error("simulated durable backend failure"));
+            }
+            self.inner.get_task_snapshot(task_id)
+        }
+        fn replace_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+        fn replace_task_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<bool> {
+            self.inner.replace_task_if_current(expected, task, notification)
+        }
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            self.inner.is_cancellation_requested(task_id)
+        }
+        fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot()
+        }
+        fn next_initial_work_snapshot_after(&self, after_task_id: Option<&FinalTaskId>) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot_after(after_task_id)
+        }
+        fn take_initial_work_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.take_initial_work_if_current(expected)
+        }
+        fn take_initial_work_for_owner_if_current(&self, expected: &FinalTaskSnapshot, owner_id: &str) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.take_initial_work_for_owner_if_current(expected, owner_id)
+        }
+        fn take_initial_work_handoff_for_owner_if_current(&self, expected: &FinalTaskSnapshot, owner_id: &str) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+            self.inner.take_initial_work_handoff_for_owner_if_current(expected, owner_id)
+        }
+        fn restore_initial_work_if_current(&self, task_id: &FinalTaskId, generation: u64, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<bool> {
+            self.inner.restore_initial_work_if_current(task_id, generation, work_descriptor)
+        }
+        fn restore_initial_work_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: Option<u64>, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<bool> {
+            self.inner.restore_initial_work_for_owner_if_current(task_id, generation, owner_id, dispatch_fence, work_descriptor)
+        }
+        fn replace_task_and_append_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification, input_responses: FinalTaskInputResponses) -> McpResult<bool> {
+            self.inner.replace_task_and_append_input_if_current(expected, task, notification, input_responses)
+        }
+        fn replace_task_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<bool> {
+            self.inner.replace_task_and_clear_input_if_current(expected, task, notification)
+        }
+        fn begin_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<bool> {
+            self.inner.begin_handoff_dispatch_if_current(task_id, generation)
+        }
+        fn begin_handoff_dispatch_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str) -> McpResult<Option<u64>> {
+            self.inner.begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
+        }
+        fn renew_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: u64) -> McpResult<bool> {
+            self.inner.renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+        }
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+            self.inner.handoff_dispatch_lease_heartbeat_interval()
+        }
+        fn finish_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_if_current(task_id, generation)
+        }
+        fn finish_handoff_dispatch_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: u64) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id, dispatch_fence)
+        }
+        fn request_cancellation_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, cancelled_task: FinalTask, cancelled_notification: FinalTaskStatusNotification) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.request_cancellation_and_clear_input_if_current(expected, cancelled_task, cancelled_notification)
+        }
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+        fn task_retention_deadline_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner.task_retention_deadline_if_current(task_id, generation)
+        }
+    }
+
+    #[test]
+    fn task_03_final_runtime_backend_snapshot_error_propagates_without_laundering() {
+        const TTL_MS: u64 = 60_000;
+        let (inner, _now) = in_memory_store_with_test_clock(1);
+        let store = Arc::new(FailingSnapshotProbeStore {
+            inner,
+            fail_snapshots: AtomicBool::new(false),
+        });
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
+                .expect("positive TTL is a valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+        let dummy_runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install initial dummy runner to create tasks");
+        let dummy_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
+
+        let created = runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("create task");
+        let task_id = created.task.base().task_id.clone();
+        drop(_running_service);
+
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial")
+            .expect("initial present");
+        let handoff = FinalTaskSupervisorHandoff::Initial(initial);
+        let mut guard = FinalTaskExecutionGuard::new(&runtime, "test-owner", &handoff);
+        assert!(guard.elect().expect("election succeeds"));
+
+        // Enable simulated backend failure.
+        store.fail_snapshots.store(true, AtomicOrdering::SeqCst);
+
+        // Neither is_cancellation_requested nor is_recoverable_without_transition
+        // may catch or suppress this backend error.
+        let cancellation_err = guard
+            .is_cancellation_requested()
+            .expect_err("backend error must propagate from is_cancellation_requested");
+        assert!(
+            cancellation_err.to_string().contains("simulated durable backend failure"),
+            "backend error must not be laundered: {cancellation_err}"
+        );
+
+        let recoverable_err = guard
+            .is_recoverable_without_transition()
+            .expect_err("backend error must propagate from is_recoverable_without_transition");
+        assert!(
+            recoverable_err.to_string().contains("simulated durable backend failure"),
+            "backend error must not be laundered: {recoverable_err}"
+        );
+    }
+
+    #[test]
+    fn task_03_final_guard_elect_refuses_missing_or_stale_retention_evidence() {
+        const TTL_MS: u64 = 60_000;
+        let (store, _now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
+                .expect("positive TTL is a valid Task retention value"),
+            Arc::new(|_| {}),
+        );
+        let dummy_runner = runtime
+            .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+            .expect("install initial dummy runner to create tasks");
+        let dummy_cx = Cx::for_testing();
+        let _running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
+
+        let created = runtime
+            .create_task_with_work(final_test_work_descriptor(), None)
+            .expect("create task");
+        let task_id = created.task.base().task_id.clone();
+        drop(_running_service);
+
+        // A guard with a deliberately stale generation (generation + 99).
+        let stale_generation = created.snapshot.generation() + 99;
+        let mut stale_guard = FinalTaskExecutionGuard {
+            runtime: runtime.clone(),
+            task_id: task_id.clone(),
+            generation: stale_generation,
+            owner_id: "test-owner".to_owned(),
+            dispatch_fence: None,
+            retention_deadline: None,
+            restoration: None,
+        };
+
+        assert!(
+            !stale_guard.elect().expect("elect check succeeds"),
+            "elect must refuse stale generation without setting retention_deadline"
+        );
+        assert!(
+            stale_guard.retention_deadline.is_none(),
+            "retention deadline must remain None on refused election"
+        );
+        assert!(
+            stale_guard.dispatch_fence.is_none(),
+            "dispatch fence must remain None on refused election"
+        );
     }
 
     #[test]
