@@ -14,6 +14,10 @@ Pre-1.0 minor release with breaking runtime API changes. MCP 2026-07-28
 support remains under implementation; this release does not establish
 aggregate conformance or complete runtime migration.
 
+The optional frozen FND-01 attestation verifier still rejects the current
+workspace dependency snapshot. Its historical asupersync 0.4.9 proof is not
+reissued for this release, which uses asupersync 0.4.10.
+
 ### Runtime ownership and cancellation
 
 - Removed `ServerHttpSession::handle`; embedders now await `handle_async`
