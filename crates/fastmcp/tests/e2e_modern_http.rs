@@ -24721,6 +24721,18 @@ fn e2e_public_http_resource_and_prompt_list_changed_are_retained_on_incremental_
 }
 
 fn spawn_modern_auth_admission_http_server() -> HttpServerFixture {
+    spawn_modern_auth_admission_http_server_with_credentials(
+        "alpha",
+        PUBLIC_HTTP_AUTH_SUBJECT,
+    )
+}
+
+fn spawn_modern_auth_admission_http_server_with_credentials(
+    token: impl Into<String>,
+    subject: impl Into<String>,
+) -> HttpServerFixture {
+    let token = token.into();
+    let subject = subject.into();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -24736,8 +24748,8 @@ fn spawn_modern_auth_admission_http_server() -> HttpServerFixture {
                 return Err("auth admission HTTP server control receiver went away".to_owned());
             }
             let verifier = StaticTokenVerifier::new([(
-                "alpha",
-                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                token.clone(),
+                AuthContext::with_subject(&subject),
             )])
             .expect("the deterministic native bearer verifier is valid")
             .with_allowed_schemes(["Bearer"])
@@ -24816,119 +24828,136 @@ fn spawn_modern_auth_admission_http_server() -> HttpServerFixture {
     }
 }
 
+const MAX_AUTH_ADMISSION_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+fn auth_admission_exchange(
+    address: SocketAddr,
+    path_and_query: &str,
+    authorization: Option<&str>,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+        .expect("native HTTP client connects to the auth admission listener");
+    stream
+        .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client read deadline is configured");
+    stream
+        .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client write deadline is configured");
+    let authorization_header =
+        authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+    let request = format!(
+        "POST {path_and_query} HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {PUBLIC_HTTP_AUTH_TOOL_NAME}\r\nContent-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .expect("native HTTP request commits to the auth admission listener");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = read_native_http_response(&mut stream, &mut buffer);
+        if read == 0 {
+            break;
+        }
+        assert!(
+            response
+                .len()
+                .checked_add(read)
+                .is_some_and(|size| size <= MAX_AUTH_ADMISSION_HTTP_RESPONSE_BYTES),
+            "native HTTP response exceeds the test's bounded response budget"
+        );
+        response.extend_from_slice(&buffer[..read]);
+    }
+    response
+}
+
+fn auth_admission_response_headers(response: &[u8]) -> &str {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native HTTP response contains a complete header terminator");
+    std::str::from_utf8(&response[..header_end])
+        .expect("native HTTP response headers are ASCII")
+}
+
+fn auth_admission_response_json_body(response: &[u8]) -> serde_json::Value {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native HTTP response contains a complete header terminator");
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("native HTTP response headers are ASCII");
+    let mut content_length = None;
+    let mut chunked = false;
+    for header in headers.lines().skip(1) {
+        let (name, value) = header
+            .split_once(':')
+            .expect("native HTTP response header has a field delimiter");
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("native HTTP Content-Length is a valid byte count"),
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+    }
+    let body = &response[header_end + 4..];
+    let decoded = if chunked {
+        let mut cursor = 0;
+        let mut decoded = Vec::new();
+        loop {
+            let size_end = body[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|offset| cursor + offset)
+                .expect("chunked response contains a complete chunk-size line");
+            let size_line = std::str::from_utf8(&body[cursor..size_end])
+                .expect("chunked response chunk size is ASCII");
+            let size =
+                usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                    .expect("chunked response chunk size is hexadecimal");
+            cursor = size_end + 2;
+            if size == 0 {
+                return serde_json::from_slice(&decoded)
+                    .expect("authenticated tool response is JSON-RPC");
+            }
+            let chunk_end = cursor
+                .checked_add(size)
+                .expect("chunked response chunk length does not overflow");
+            decoded.extend_from_slice(&body[cursor..chunk_end]);
+            cursor = chunk_end + 2;
+        }
+    } else {
+        let content_length = content_length
+            .expect("native HTTP response uses Content-Length or chunked framing");
+        body[..content_length].to_vec()
+    };
+    serde_json::from_slice(&decoded).expect("authenticated tool response is JSON-RPC")
+}
+
 #[test]
 fn e2e_public_http_static_token_refuses_missing_and_wrong_and_commits_subject() {
-    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
-
     fn exchange(address: SocketAddr, authorization: Option<&str>, body: &[u8]) -> Vec<u8> {
-        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
-            .expect("native HTTP client connects to the auth admission listener");
-        stream
-            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
-            .expect("native HTTP client read deadline is configured");
-        stream
-            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
-            .expect("native HTTP client write deadline is configured");
-        let authorization_header =
-            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
-        let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {PUBLIC_HTTP_AUTH_TOOL_NAME}\r\nContent-Length: {}\r\n\r\n",
-            modern::PROTOCOL_VERSION,
-            body.len(),
-        );
-        stream
-            .write_all(request.as_bytes())
-            .and_then(|()| stream.write_all(body))
-            .expect("native HTTP request commits to the auth admission listener");
-        let mut response = Vec::new();
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            let read = read_native_http_response(&mut stream, &mut buffer);
-            if read == 0 {
-                break;
-            }
-            assert!(
-                response
-                    .len()
-                    .checked_add(read)
-                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
-                "native HTTP response exceeds the test's bounded response budget"
-            );
-            response.extend_from_slice(&buffer[..read]);
-        }
-        response
+        auth_admission_exchange(address, "/mcp", authorization, body)
     }
 
     fn response_headers(response: &[u8]) -> &str {
-        let header_end = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("native HTTP response contains a complete header terminator");
-        std::str::from_utf8(&response[..header_end])
-            .expect("native HTTP response headers are ASCII")
+        auth_admission_response_headers(response)
     }
 
     fn response_json_body(response: &[u8]) -> serde_json::Value {
-        let header_end = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("native HTTP response contains a complete header terminator");
-        let headers = std::str::from_utf8(&response[..header_end])
-            .expect("native HTTP response headers are ASCII");
-        let mut content_length = None;
-        let mut chunked = false;
-        for header in headers.lines().skip(1) {
-            let (name, value) = header
-                .split_once(':')
-                .expect("native HTTP response header has a field delimiter");
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .expect("native HTTP Content-Length is a valid byte count"),
-                );
-            }
-            if name.eq_ignore_ascii_case("transfer-encoding")
-                && value
-                    .split(',')
-                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
-            {
-                chunked = true;
-            }
-        }
-        let body = &response[header_end + 4..];
-        let decoded = if chunked {
-            let mut cursor = 0;
-            let mut decoded = Vec::new();
-            loop {
-                let size_end = body[cursor..]
-                    .windows(2)
-                    .position(|window| window == b"\r\n")
-                    .map(|offset| cursor + offset)
-                    .expect("chunked response contains a complete chunk-size line");
-                let size_line = std::str::from_utf8(&body[cursor..size_end])
-                    .expect("chunked response chunk size is ASCII");
-                let size =
-                    usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
-                        .expect("chunked response chunk size is hexadecimal");
-                cursor = size_end + 2;
-                if size == 0 {
-                    return serde_json::from_slice(&decoded)
-                        .expect("authenticated tool response is JSON-RPC");
-                }
-                let chunk_end = cursor
-                    .checked_add(size)
-                    .expect("chunked response chunk length does not overflow");
-                decoded.extend_from_slice(&body[cursor..chunk_end]);
-                cursor = chunk_end + 2;
-            }
-        } else {
-            let content_length = content_length
-                .expect("native HTTP response uses Content-Length or chunked framing");
-            body[..content_length].to_vec()
-        };
-        serde_json::from_slice(&decoded).expect("authenticated tool response is JSON-RPC")
+        auth_admission_response_json_body(response)
     }
 
     let server = spawn_modern_auth_admission_http_server();
@@ -25003,6 +25032,191 @@ fn e2e_public_http_static_token_refuses_missing_and_wrong_and_commits_subject() 
         server.handler_call_snapshot().tool,
         1,
         "only the matching bearer token may invoke the authenticated handler"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn auth_01_a_positive() {
+    let runtime_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let token = format!("runtime-bearer-token-{runtime_id}");
+    let subject = format!("runtime-auth-subject-{runtime_id}");
+    let server = spawn_modern_auth_admission_http_server_with_credentials(&token, &subject);
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {
+                "Token": "application-param-preserved",
+            },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-modern tool request serializes");
+
+    let admitted = auth_admission_exchange(
+        server.address(),
+        "/mcp",
+        Some(&format!("Bearer {token}")),
+        &tool_body,
+    );
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let admitted_json = auth_admission_response_json_body(&admitted);
+    assert!(
+        admitted_json.get("error").is_none(),
+        "the matching bearer token must reach the handler: {admitted_json}"
+    );
+    let content = admitted_json["result"]["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        content.iter().any(|block| {
+            block["text"].as_str() == Some(&format!("subject:{subject}"))
+        }),
+        "admitted native HTTP must commit the runtime verifier subject into ctx.auth(): {admitted_json}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the matching bearer token must invoke the authenticated handler exactly once"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn auth_01_a_planted_negative() {
+    let runtime_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let token = format!("runtime-bearer-token-{runtime_id}");
+    let subject = format!("runtime-auth-subject-{runtime_id}");
+    let server = spawn_modern_auth_admission_http_server_with_credentials(&token, &subject);
+    let initial_calls = server.handler_call_snapshot().tool;
+
+    let positive_tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {
+                "Token": "application-param-preserved",
+            },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        2_i64,
+    );
+    let positive_body =
+        serde_json::to_vec(&positive_tool).expect("positive tool request serializes");
+
+    // 1. In-band body credential contamination (nested headers AUTHORIZATION).
+    // Near-identical request differing ONLY in the forbidden credential location.
+    let contaminated_tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {
+                "Token": "application-param-preserved",
+            },
+            "headers": {
+                "AUTHORIZATION": format!("Bearer {token}"),
+            },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        2_i64,
+    );
+    let contaminated_body =
+        serde_json::to_vec(&contaminated_tool).expect("contaminated tool request serializes");
+
+    let body_rejected = auth_admission_exchange(
+        server.address(),
+        "/mcp",
+        Some(&format!("Bearer {token}")),
+        &contaminated_body,
+    );
+    assert!(
+        body_rejected.starts_with(b"HTTP/1.1 401"),
+        "body credential contamination must be rejected with HTTP 401: {}",
+        String::from_utf8_lossy(&body_rejected)
+    );
+    assert!(
+        auth_admission_response_headers(&body_rejected)
+            .to_ascii_lowercase()
+            .contains("www-authenticate: bearer"),
+        "body rejection must challenge with Bearer"
+    );
+    let body_error = auth_admission_response_json_body(&body_rejected);
+    assert_eq!(body_error["error"], "invalid_request");
+    assert_eq!(
+        body_error["message"],
+        "HTTP credentials must use the Authorization header"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        initial_calls,
+        "body credential contamination must not invoke the handler"
+    );
+
+    // 2. Query credential contamination: near-identical positive body, but adds ?access_token.
+    let query_rejected = auth_admission_exchange(
+        server.address(),
+        &format!("/mcp?access_token={token}"),
+        Some(&format!("Bearer {token}")),
+        &positive_body,
+    );
+    assert!(
+        query_rejected.starts_with(b"HTTP/1.1 401"),
+        "query credential contamination must be rejected with HTTP 401: {}",
+        String::from_utf8_lossy(&query_rejected)
+    );
+    let query_error = auth_admission_response_json_body(&query_rejected);
+    assert_eq!(query_error["error"], "invalid_request");
+    assert_eq!(
+        query_error["message"],
+        "HTTP credentials must use the Authorization header"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        initial_calls,
+        "query credential contamination must not invoke the handler"
+    );
+
+    // 3. Prove non-corruption: clean positive request immediately succeeds on the same server.
+    let clean_admitted = auth_admission_exchange(
+        server.address(),
+        "/mcp",
+        Some(&format!("Bearer {token}")),
+        &positive_body,
+    );
+    assert!(
+        clean_admitted.starts_with(b"HTTP/1.1 200"),
+        "clean positive after rejections must succeed: {}",
+        String::from_utf8_lossy(&clean_admitted)
+    );
+    let clean_json = auth_admission_response_json_body(&clean_admitted);
+    assert!(clean_json.get("error").is_none());
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        initial_calls + 1,
+        "only the clean positive request invokes the authenticated handler"
     );
     server.shutdown();
 }

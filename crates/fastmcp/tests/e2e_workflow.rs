@@ -1004,9 +1004,7 @@ fn workflow_complete_lifecycle() {
     assert_eq!(text, "workflow test");
 
     let status = client.read_resource("app://status").unwrap();
-    let LegacyResourceContent::Text { text, .. } = &status[0] else {
-        return;
-    };
+    let text = require_legacy_text(&status[0], "app://status");
     let status_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(status_json["status"], "healthy");
 
@@ -1166,9 +1164,7 @@ fn workflow_unknown_resource_doesnt_break_session() {
 
     // Read a valid resource again (should still work)
     let content = client.read_resource("file:///README.md").unwrap();
-    let LegacyResourceContent::Text { text, .. } = &content[0] else {
-        return;
-    };
+    let text = require_legacy_text(&content[0], "file:///README.md");
     assert!(text.contains("Test Project"));
 }
 
@@ -3861,9 +3857,9 @@ fn workflow_concurrent_stress_test() {
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
-            if client.initialize().is_err() {
-                return;
-            }
+            client
+                .initialize()
+                .expect("stress client worker must initialize successfully");
             worker_progress.advance("RPC");
 
             for op in 0..OPS_PER_CLIENT {
@@ -5069,6 +5065,15 @@ fn failing_res() -> McpResult<String> {
     ))
 }
 
+fn require_legacy_text<'a>(content: &'a LegacyResourceContent, context: &str) -> &'a str {
+    match content {
+        LegacyResourceContent::Text { text, .. } => text.as_str(),
+        LegacyResourceContent::Blob { .. } => {
+            panic!("expected Text resource for {context}, got Blob variant: {content:?}");
+        }
+    }
+}
+
 fn setup_resource_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("resource-test-server")
@@ -5111,7 +5116,10 @@ fn resource_read_plain_text() {
         ..
     } = &content[0]
     else {
-        return;
+        panic!(
+            "expected Text content in text://plain, got {:?}",
+            &content[0]
+        );
     };
     assert_eq!(uri, "text://plain");
     assert_eq!(mime_type.as_deref(), Some("text/plain"));
@@ -5130,7 +5138,10 @@ fn resource_read_json() {
         mime_type, text, ..
     } = &content[0]
     else {
-        return;
+        panic!(
+            "expected Text content in data://config.json, got {:?}",
+            &content[0]
+        );
     };
     assert_eq!(mime_type.as_deref(), Some("application/json"));
 
@@ -5154,7 +5165,10 @@ fn resource_read_binary() {
         mime_type, blob, ..
     } = &content[0]
     else {
-        return;
+        panic!(
+            "expected Blob content in binary://data.bin, got {:?}",
+            &content[0]
+        );
     };
     assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
 
@@ -5175,9 +5189,7 @@ fn resource_read_unicode() {
     let content = client.read_resource("text://unicode").unwrap();
 
     assert_eq!(content.len(), 1);
-    let LegacyResourceContent::Text { text, .. } = &content[0] else {
-        return;
-    };
+    let text = require_legacy_text(&content[0], "text://unicode");
     assert!(text.contains("日本語"));
     assert!(text.contains("中文"));
     assert!(text.contains("العربية"));
@@ -5193,9 +5205,7 @@ fn resource_read_large_content() {
     let content = client.read_resource("data://large").unwrap();
 
     assert_eq!(content.len(), 1);
-    let LegacyResourceContent::Text { text, .. } = &content[0] else {
-        return;
-    };
+    let text = require_legacy_text(&content[0], "data://large");
     assert_eq!(text.len(), 100_000);
     assert!(text.chars().all(|c| c == 'x'));
 }
@@ -5215,7 +5225,10 @@ fn resource_read_multiple_content_items() {
         LegacyResourceContent::Text { text: third, .. },
     ] = content.as_slice()
     else {
-        return;
+        panic!(
+            "expected 3 Text contents in data://multi, got {:?}",
+            content.as_slice()
+        );
     };
     assert_eq!(first, "Part 1");
     assert_eq!(second, "Part 2");
@@ -5274,15 +5287,9 @@ fn resource_read_sequential() {
     let content2 = client.read_resource("data://config.json").unwrap();
     let content3 = client.read_resource("text://unicode").unwrap();
 
-    let LegacyResourceContent::Text { text: text1, .. } = &content1[0] else {
-        return;
-    };
-    let LegacyResourceContent::Text { text: text2, .. } = &content2[0] else {
-        return;
-    };
-    let LegacyResourceContent::Text { text: text3, .. } = &content3[0] else {
-        return;
-    };
+    let text1 = require_legacy_text(&content1[0], "text://plain");
+    let text2 = require_legacy_text(&content2[0], "data://config.json");
+    let text3 = require_legacy_text(&content3[0], "text://unicode");
     assert_eq!(text1, "Hello, World!");
     assert!(text2.contains("test-config"));
     assert!(text3.contains("日本語"));

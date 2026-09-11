@@ -376,9 +376,9 @@ pub mod server {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -762,9 +762,9 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-    FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore,
+    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
 };
 
 /// Proxy APIs are available only with the proxy profile.
@@ -2784,9 +2784,9 @@ pub mod modern {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
 
     #[cfg(feature = "apps")]
@@ -10544,10 +10544,11 @@ pub mod prelude {
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskHandle, FinalTaskId,
         FinalTaskInitialWork, FinalTaskInputResponses, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStatusNotification, FinalTaskStore, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
-        FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
+        FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStatusNotification, FinalTaskStore,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWatch,
+        FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
+        FinalUpdateTaskResult, InMemoryFinalTaskStore,
         OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
         official_tasks_descriptor, official_tasks_empty_settings,
         register_official_tasks_extension, tasks_extension,
