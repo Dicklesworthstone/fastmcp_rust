@@ -1192,7 +1192,9 @@ server = http.server.ThreadingHTTPServer(('127.0.0.1',0), Peer)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain('leaf.pem', 'leaf.key')
 server.socket = context.wrap_socket(server.socket, server_side=True)
-with open('ready', 'w') as ready: ready.write('https://127.0.0.1:%d/mcp' % server.server_port)
+# Publish only after closing the complete URL so the parent cannot read an empty file.
+with open('ready.pending', 'x') as ready: ready.write('https://127.0.0.1:%d/mcp' % server.server_port)
+os.link('ready.pending', 'ready')
 server.serve_forever()
 ";
 }
