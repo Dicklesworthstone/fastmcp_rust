@@ -52,6 +52,8 @@ aggregate conformance or complete runtime migration.
 
 - Updated pinned dependencies, including asupersync 0.4.10, while retaining
   the dated nightly-2026-08-25 toolchain.
+- Replaced yanked transitive `chacha20` 0.10.1 with 0.10.2, which fixes use
+  of an SSE4.1 instruction in the SSE2 RNG and legacy-cipher backend.
 - Restored facade E2E execution and explicit CLI/server composition checks.
   Windows tests now handle native path separators and CRLF source checkouts;
   WebSocket API documentation resolves its intra-doc links.
