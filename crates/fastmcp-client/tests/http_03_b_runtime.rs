@@ -2,24 +2,26 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(feature = "legacy-2024-11-05")]
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::{CancelKind, Cx};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::ProtocolEra;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::http_executor::ModernHttpResponseKind;
-use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpClientError};
+use fastmcp_client::http_executor::{
+    ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError,
+};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
 use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolPolicy};
+use fastmcp_protocol::RequestId;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 #[cfg(feature = "legacy-2024-11-05")]
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
 
 #[derive(Debug)]
 struct CapturedHttpRequest {
@@ -509,6 +511,477 @@ fn http_03_b_bound_credential_mismatch_refuses_before_contact() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+fn test_policy() -> ProtocolPolicy {
+    #[cfg(feature = "legacy-2024-11-05")]
+    return ProtocolPolicy::Auto;
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    return ProtocolPolicy::ModernOnly;
+}
+
+struct RedirectTestRig {
+    primary_listener: TcpListener,
+    redirect_listener: TcpListener,
+    primary_target: String,
+    redirect_target: String,
+}
+
+impl RedirectTestRig {
+    fn new() -> Self {
+        let primary_listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind primary HTTP listener");
+        let primary_addr = primary_listener
+            .local_addr()
+            .expect("read primary listener address");
+        let redirect_listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind redirect target listener");
+        redirect_listener
+            .set_nonblocking(true)
+            .expect("set redirect listener nonblocking");
+        let redirect_addr = redirect_listener
+            .local_addr()
+            .expect("read redirect listener address");
+        Self {
+            primary_target: format!("http://{primary_addr}/mcp"),
+            redirect_target: format!("http://{redirect_addr}/forbidden-redirect-target"),
+            primary_listener,
+            redirect_listener,
+        }
+    }
+
+    fn accept_primary(&self) -> TcpStream {
+        accept_bounded_stream(&self.primary_listener)
+    }
+}
+
+fn accept_bounded_stream(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted stream blocking");
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for client connection on listener");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("unexpected accept error on listener: {error}"),
+        }
+    }
+
+    fn assert_zero_redirect_connections(&self) {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            match self.redirect_listener.accept() {
+                Ok((_, peer)) => panic!("forbidden connection to redirect target from {peer}"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("unexpected error on redirect listener: {error}"),
+            }
+        }
+    }
+}
+
+fn respond_probe_ok(stream: &mut TcpStream) {
+    let req = read_request(stream);
+    assert_final_metadata(&req, "server/discover");
+    write_response(
+        stream,
+        200,
+        "application/json",
+        br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+    );
+}
+
+fn write_redirect_response(stream: &mut TcpStream, status: u16, location: &str) {
+    let reason = match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        _ => "Redirect",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write redirect response");
+    stream.flush().expect("flush redirect response");
+}
+
+fn assert_connection_closed_by_client(stream: &mut TcpStream) {
+    let mut buffer = [0_u8; 128];
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .expect("set read timeout");
+    match stream.read(&mut buffer) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Ok(bytes) => panic!("expected connection close/EOF from client, got {bytes} bytes"),
+        Err(error) => panic!("expected connection close/EOF from client, got error: {error:?}"),
+    }
+}
+
+#[test]
+fn http_03_b_redirect_normal_response_positive() {
+    let rig = RedirectTestRig::new();
+    let target = rig.primary_target.clone();
+    let server = thread::spawn(move || {
+        let mut probe = rig.accept_primary();
+        respond_probe_ok(&mut probe);
+        let mut req = rig.accept_primary();
+        let normal_req = read_request(&mut req);
+        assert_final_metadata(&normal_req, "tools/call");
+        write_response(
+            &mut req,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+        );
+        rig
+    });
+
+    let cx = Cx::for_request();
+    let outcome = runtime_block_on(ModernHttpClient::connect(
+        &cx,
+        plan(
+            &target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            test_policy(),
+        ),
+        client_info(),
+        ClientCapabilities::default(),
+    ))
+    .expect("connect must succeed");
+
+    let client = outcome
+        .into_modern()
+        .expect("modern client must be selected");
+    let response = runtime_block_on(client.request(
+        &cx,
+        "tools/call",
+        serde_json::json!({"name": "test_tool", "arguments": {}}),
+        Some(RequestId::Number(2)),
+    ))
+    .expect("request must succeed");
+
+    assert_eq!(response.metadata().status(), 200);
+    let body = runtime_block_on(response.read_to_end(&cx, 4096)).expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["result"]["content"][0]["text"], "ok");
+
+    let rig = server.join().expect("server join");
+    rig.assert_zero_redirect_connections();
+}
+
+#[test]
+fn http_03_b_request_redirect_statuses_planted_negative() {
+    for status in [301_u16, 302, 303, 307, 308] {
+        let rig = RedirectTestRig::new();
+        let target = rig.primary_target.clone();
+        let server_loc = rig.redirect_target.clone();
+        let client_loc = rig.redirect_target.clone();
+        let server = thread::spawn(move || {
+            let mut probe = rig.accept_primary();
+            respond_probe_ok(&mut probe);
+            let mut req = rig.accept_primary();
+            let normal_req = read_request(&mut req);
+            assert_final_metadata(&normal_req, "tools/call");
+            write_redirect_response(&mut req, status, &server_loc);
+            assert_connection_closed_by_client(&mut req);
+            rig
+        });
+
+        let cx = Cx::for_request();
+        let outcome = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                test_policy(),
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        ))
+        .expect("probe must succeed");
+
+        let client = outcome
+            .into_modern()
+            .expect("modern client must be selected");
+        let result = runtime_block_on(client.request(
+            &cx,
+            "tools/call",
+            serde_json::json!({"name": "redirect_tool", "arguments": {"token": "app-argument"}}),
+            Some(RequestId::Number(2)),
+        ));
+
+        match result {
+            Ok(_) => panic!("expected redirect error for status {status}, got Ok"),
+            Err(error) => {
+                match &error {
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Redirect {
+                        status: actual,
+                    }) => assert_eq!(*actual, status, "must report status {status}"),
+                    other => panic!("expected Redirect {{{status}}}, got: {other:?}"),
+                }
+                let err_debug = format!("{error:?}");
+                assert!(
+                    !err_debug.contains(&client_loc),
+                    "diagnostics must not leak redirect target URL: {err_debug}"
+                );
+            }
+        }
+
+        let rig = server.join().expect("server join");
+        rig.assert_zero_redirect_connections();
+    }
+}
+
+#[test]
+fn http_03_b_probe_redirect_statuses_planted_negative() {
+    for status in [301_u16, 302, 303, 307, 308] {
+        let rig = RedirectTestRig::new();
+        let target = rig.primary_target.clone();
+        let server_loc = rig.redirect_target.clone();
+        let client_loc = rig.redirect_target.clone();
+        let server = thread::spawn(move || {
+            let mut probe = rig.accept_primary();
+            let probe_req = read_request(&mut probe);
+            assert_final_metadata(&probe_req, "server/discover");
+            write_redirect_response(&mut probe, status, &server_loc);
+            assert_connection_closed_by_client(&mut probe);
+            rig
+        });
+
+        let cx = Cx::for_request();
+        let result = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                test_policy(),
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        ));
+
+        match result {
+            Ok(_) => panic!("expected probe redirect error for status {status}, got Ok"),
+            Err(error) => {
+                match &error {
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Redirect {
+                        status: actual,
+                    }) => assert_eq!(*actual, status, "probe must report status {status}"),
+                    other => panic!("expected Redirect {{{status}}}, got: {other:?}"),
+                }
+                let err_debug = format!("{error:?}");
+                assert!(
+                    !err_debug.contains(&client_loc),
+                    "diagnostics must not leak redirect target URL: {err_debug}"
+                );
+            }
+        }
+
+        let rig = server.join().expect("server join");
+        rig.assert_zero_redirect_connections();
+    }
+}
+
+#[test]
+fn http_03_b_pending_body_read_positive() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("read listener address");
+    let target = format!("http://{addr}/mcp");
+
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut req1 = accept_bounded_stream(&listener);
+        let req1_cap = read_request(&mut req1);
+        assert_final_metadata(&req1_cap, "tools/call");
+        write_response(
+            &mut req1,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"positive-1"}]}}"#,
+        );
+
+        let mut req2 = accept_bounded_stream(&listener);
+        let req2_cap = read_request(&mut req2);
+        assert_final_metadata(&req2_cap, "tools/call");
+        write_response(
+            &mut req2,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"positive-2"}]}}"#,
+        );
+    });
+
+    let cx = Cx::for_request();
+    let outcome = runtime_block_on(ModernHttpClient::connect(
+        &cx,
+        plan(
+            &target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            test_policy(),
+        ),
+        client_info(),
+        ClientCapabilities::default(),
+    ))
+    .expect("connect must succeed");
+
+    let client = outcome
+        .into_modern()
+        .expect("modern client must be selected");
+
+    let response1 = runtime_block_on(client.request(
+        &cx,
+        "tools/call",
+        serde_json::json!({"name": "test_tool", "arguments": {}}),
+        Some(RequestId::Number(2)),
+    ))
+    .expect("request 1 must succeed");
+    assert_eq!(response1.metadata().status(), 200);
+    let body1 = runtime_block_on(response1.read_to_end(&cx, 4096)).expect("read body 1");
+    let json1: serde_json::Value = serde_json::from_slice(&body1).expect("parse json 1");
+    assert_eq!(json1["result"]["content"][0]["text"], "positive-1");
+
+    let response2 = runtime_block_on(client.request(
+        &cx,
+        "tools/call",
+        serde_json::json!({"name": "test_tool", "arguments": {}}),
+        Some(RequestId::Number(3)),
+    ))
+    .expect("sibling request must succeed");
+    assert_eq!(response2.metadata().status(), 200);
+    let body2 = runtime_block_on(response2.read_to_end(&cx, 4096)).expect("read body 2");
+    let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse json 2");
+    assert_eq!(json2["result"]["content"][0]["text"], "positive-2");
+
+    server.join().expect("server join");
+}
+
+#[test]
+fn http_03_b_pending_body_ambient_cancellation_planted_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("read listener address");
+    let target = format!("http://{addr}/mcp");
+
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut req1 = accept_bounded_stream(&listener);
+        let req1_cap = read_request(&mut req1);
+        assert_final_metadata(&req1_cap, "tools/call");
+        write!(
+            req1,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write response headers");
+        req1.flush().expect("flush response headers");
+
+        assert_connection_closed_by_client(&mut req1);
+
+        let mut req2 = accept_bounded_stream(&listener);
+        let req2_cap = read_request(&mut req2);
+        assert_final_metadata(&req2_cap, "tools/call");
+        write_response(
+            &mut req2,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"sibling-ok"}]}}"#,
+        );
+    });
+
+    let cx = Cx::for_request();
+    let outcome = runtime_block_on(ModernHttpClient::connect(
+        &cx,
+        plan(
+            &target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            test_policy(),
+        ),
+        client_info(),
+        ClientCapabilities::default(),
+    ))
+    .expect("connect must succeed");
+
+    let client = outcome
+        .into_modern()
+        .expect("modern client must be selected");
+
+    let response1 = runtime_block_on(client.request(
+        &cx,
+        "tools/call",
+        serde_json::json!({"name": "test_tool", "arguments": {}}),
+        Some(RequestId::Number(2)),
+    ))
+    .expect("request 1 headers must arrive");
+    assert_eq!(response1.metadata().status(), 200);
+
+    let cancel_cx = cx.clone();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let cancel_thread = thread::spawn(move || {
+        cancel_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel thread must receive trigger");
+        thread::sleep(Duration::from_millis(20));
+        cancel_cx.cancel_with(
+            CancelKind::User,
+            Some("ambient cx cancellation while body pending"),
+        );
+    });
+    cancel_tx.send(()).expect("send cancel trigger");
+    let body_result = runtime_block_on(response1.read_to_end(&cx, 4096));
+    cancel_thread.join().expect("cancel thread join");
+
+    assert!(
+        matches!(body_result, Err(ModernHttpExecutorError::Cancelled)),
+        "pending body read must fail with Cancelled on ambient cx cancellation, got {body_result:?}"
+    );
+
+    let sibling_cx = Cx::for_request();
+    let response2 = runtime_block_on(client.request(
+        &sibling_cx,
+        "tools/call",
+        serde_json::json!({"name": "test_tool", "arguments": {}}),
+        Some(RequestId::Number(3)),
+    ))
+    .expect("sibling request must succeed");
+    assert_eq!(response2.metadata().status(), 200);
+    let body2 =
+        runtime_block_on(response2.read_to_end(&sibling_cx, 4096)).expect("read sibling body");
+    let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse sibling json");
+    assert_eq!(json2["result"]["content"][0]["text"], "sibling-ok");
+
+    server.join().expect("server join");
 }
 
 /// TLS protocol-peer tests, not a deployed MCP server or tenant-isolation proof.

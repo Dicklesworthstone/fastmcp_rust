@@ -613,14 +613,19 @@ impl ModernHttpResponseStream {
     ) -> Result<Vec<u8>, ModernHttpExecutorError> {
         let mut response = self.response;
         let mut bytes = Vec::new();
+        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
 
         loop {
             if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
                 return Err(ModernHttpExecutorError::Cancelled);
             }
+            let mut ambient_cancelled = std::pin::pin!(cancellation_signal.recv(cx));
             let frame = poll_fn(|task_cx| {
-                if cancelled.as_mut().poll(task_cx).is_ready() {
+                if cx.checkpoint().is_err()
+                    || cancelled.as_mut().poll(task_cx).is_ready()
+                    || ambient_cancelled.as_mut().poll(task_cx).is_ready()
+                {
                     return Poll::Ready(Err(()));
                 }
                 match Pin::new(&mut response.body).poll_frame(task_cx) {
@@ -642,7 +647,7 @@ impl ModernHttpResponseStream {
             };
 
             while data.has_remaining() {
-                if cancellation.is_cancel_requested() {
+                if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
                 let chunk = data.chunk();
