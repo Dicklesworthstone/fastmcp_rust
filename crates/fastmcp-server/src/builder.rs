@@ -718,7 +718,7 @@ impl ServerBuilder {
     /// no Tasks owner yet.
     ///
     /// A caller-supplied [`Self::final_tasks`] runtime, a proxy Tasks relay,
-    /// or the quarantined [`Self::with_task_manager`] path all suppress this
+    /// or the test-only legacy task-manager adapter all suppress this
     /// default. If an existing extension registry already owns the official
     /// Tasks methods, the default is left uninstalled rather than panicking.
     #[cfg(feature = "tasks")]
@@ -2670,9 +2670,8 @@ impl ServerBuilder {
     /// installed a local or proxy Tasks owner, this installs a process-local
     /// in-memory official Tasks runtime so `tasks/get`, `tasks/update`, and
     /// `tasks/cancel` are served. Call [`Self::final_tasks`] to replace that
-    /// default with an application-owned store. The historical
-    /// [`Self::with_task_manager`] path stays quarantined and does not receive
-    /// the official methods.
+    /// default with an application-owned store. The historical task-manager
+    /// adapter is test-only and does not serve the official methods.
     #[must_use]
     pub fn build(mut self) -> Server {
         // Configure router with strict input validation setting

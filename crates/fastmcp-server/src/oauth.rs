@@ -271,8 +271,8 @@ pub enum OAuthParameterSource {
 /// A parameter name whose value may influence the matching endpoint.
 ///
 /// Names outside the selected endpoint profile remain admitted as bounded,
-/// ordered unknown parameters and never appear through
-/// [`OAuthParameterAdmission::take_defined_value`].
+/// ordered metadata in [`OAuthParameterAdmission::unknown_parameters`]. Their
+/// values are discarded after validation and cannot influence endpoint parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OAuthParameterName {
     /// `response_type`

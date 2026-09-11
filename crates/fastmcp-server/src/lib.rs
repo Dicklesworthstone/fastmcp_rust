@@ -6923,7 +6923,7 @@ impl BoundHttpServer {
     /// Cooperative connection children are joined during shutdown. If a
     /// synchronous handler ignores cancellation, this method returns
     /// [`HttpServerShutdown::Nonquiescent`] after
-    /// [`HTTP_CONNECTION_SHUTDOWN_TIMEOUT`] instead of claiming a clean
+    /// the bounded connection-shutdown wait instead of claiming a clean
     /// shutdown. The caller owns the returned settlement handle and chooses a
     /// further bounded observation or eventual join.
     pub async fn serve(self, cx: &Cx) -> McpResult<HttpServerShutdown> {
@@ -7010,14 +7010,14 @@ impl BoundHttpServer {
                 .spawn_in(&connection_scope, move |connection_cx| async move {
                     let _permit = permit;
                     #[cfg(any(feature = "legacy-2024-11-05", test))]
-                    serve_http_connection(
+                    Box::pin(serve_http_connection(
                         &connection_cx,
                         stream,
                         endpoint,
                         legacy_sessions,
                         modern_sessions,
                         listener_shutdown,
-                    )
+                    ))
                     .await;
                     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
                     serve_modern_http_connection(

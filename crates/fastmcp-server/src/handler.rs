@@ -386,9 +386,9 @@ where
 /// fields and serialization failures, and contains callback panics so a
 /// reporting failure cannot unwind through the request handler.
 ///
-/// The exact-2024 path remains immediate. Final request-owned dispatch can
-/// instead install [`FinalProgressRuntime`] and retain its explicit flush and
-/// terminal-finalization primitives in the outer transport owner.
+/// The exact-2024 path remains immediate. Final request-owned dispatch can use
+/// an internal progress queue whose flush and terminal-finalization lifecycle
+/// is managed by the outer transport owner.
 pub struct ProgressNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,
@@ -1457,9 +1457,9 @@ pub enum ToolErrorKind {
 /// Legacy diagnostic label for an exact-final tool's schema ownership.
 ///
 /// This value no longer grants admission authority. A normal handler can
-/// report `Upstream`, so the router accepts bypasses only through the sealed
-/// [`UpstreamFinalToolSchemaRegistration`] token issued to exact proxy
-/// registration.
+/// report `Upstream`, so the router accepts bypasses only through a sealed
+/// token issued to exact proxy registration and returned by
+/// [`ToolHandler::upstream_final_tool_schema_registration`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalToolSchemaAuthority {
     /// The local router owns final schema admission and framework error mapping.
