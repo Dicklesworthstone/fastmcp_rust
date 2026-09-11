@@ -7014,7 +7014,7 @@ impl BoundHttpServer {
                         // Keep the nested connection future's Send proof in
                         // this crate instead of exhausting downstream crates'
                         // default trait-recursion limit during code generation.
-                        let connection: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                        let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> =
                             Box::pin(serve_http_connection(
                                 &connection_cx,
                                 stream,
