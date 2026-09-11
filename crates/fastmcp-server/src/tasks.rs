@@ -9540,11 +9540,11 @@ mod tests {
     }
 
     struct ExpiryThenCompletingSupervisor {
+        runtime: FinalTaskRuntime,
         clock: Arc<Mutex<Instant>>,
-        advance_ms: u64,
         task1_id: FinalTaskId,
         task1_dropped: Arc<AtomicBool>,
-        task2_id: FinalTaskId,
+        task2_id_slot: Arc<Mutex<Option<FinalTaskId>>>,
         task2_completed: Arc<AtomicBool>,
     }
 
@@ -9554,27 +9554,69 @@ mod tests {
             cx: &'a Cx,
             handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
+            let runtime = self.runtime.clone();
             let clock = Arc::clone(&self.clock);
-            let advance_ms = self.advance_ms;
-            let is_task1 = *final_task_handoff_task_id(&handoff) == self.task1_id;
-            let is_task2 = *final_task_handoff_task_id(&handoff) == self.task2_id;
+            let task1_id = self.task1_id.clone();
             let task1_dropped = Arc::clone(&self.task1_dropped);
+            let task2_id_slot = Arc::clone(&self.task2_id_slot);
             let task2_completed = Arc::clone(&self.task2_completed);
+            let current_id = final_task_handoff_task_id(&handoff).clone();
 
             Box::pin(async move {
-                if is_task1 {
+                if current_id == task1_id {
                     let _drop_guard = RetentionExpiryDropFlag(task1_dropped);
-                    // Advance the store's authoritative clock past Task 1's TTL.
-                    let mut clk = clock
+
+                    // 1. Advance clock partway into task 1's 60s TTL (30 seconds).
+                    {
+                        let mut clk = clock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *clk = clk
+                            .checked_add(StdDuration::from_millis(30_000))
+                            .expect("advance test clock partway");
+                    }
+
+                    // 2. Create task 2 through the same live runtime at this later store time (t0 + 30s).
+                    // With a 60s TTL, task 2's deadline is t0 + 90s.
+                    let created2 = runtime
+                        .create_task_with_work(final_test_work_descriptor(), None)
+                        .expect("finite-TTL task 2 is created while service is ready");
+                    let task2_id = created2.task.base().task_id.clone();
+                    *task2_id_slot
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *clk = clk
-                        .checked_add(StdDuration::from_millis(advance_ms))
-                        .expect("advance test clock");
-                    drop(clk);
-                    // Yield to trigger the runner's authoritative expiry check.
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task2_id);
+
+                    // 3. Advance clock past task 1's expiry (t0 + 65s > t0 + 60s),
+                    // but before task 2's expiry (t0 + 65s < t0 + 90s).
+                    {
+                        let mut clk = clock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *clk = clk
+                            .checked_add(StdDuration::from_millis(35_000))
+                            .expect("advance test clock past task 1 expiry");
+                    }
+
+                    // 4. Yield so that the runner checks authoritative expiry and quiesces this supervisor future.
                     std::future::pending::<McpResult<()>>().await
-                } else if is_task2 {
+                } else {
+                    // This is invocation for task 2!
+                    // Ensure task 1 future was dropped before task 2 invocation.
+                    assert!(
+                        task1_dropped.load(AtomicOrdering::SeqCst),
+                        "supervisor future for task 1 must be dropped before task 2 invocation"
+                    );
+
+                    let expected_task2_id = task2_id_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                        .expect("task 2 id must have been recorded during task 1 execution");
+                    assert_eq!(
+                        current_id, expected_task2_id,
+                        "second invocation must execute task 2"
+                    );
+
                     let result: FinalTaskCallToolResult =
                         serde_json::from_value(serde_json::json!({"content": []}))
                             .expect("typed terminal task result");
@@ -9592,8 +9634,6 @@ mod tests {
                     }
                     task2_completed.store(true, AtomicOrdering::SeqCst);
                     cx.cancel_with(CancelKind::User, None);
-                    Ok(())
-                } else {
                     Ok(())
                 }
             })
@@ -9629,6 +9669,95 @@ mod tests {
         }
     }
 
+    struct FastHeartbeatProbeStore {
+        inner: Arc<InMemoryFinalTaskStore>,
+        heartbeat: StdDuration,
+    }
+
+    impl FinalTaskStore for FastHeartbeatProbeStore {
+        fn create_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()> {
+            self.inner.create_task(task, notification)
+        }
+        fn create_task_with_work(&self, task: FinalTask, notification: FinalTaskStatusNotification, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<()> {
+            self.inner.create_task_with_work(task, notification, work_descriptor)
+        }
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            self.inner.get_task(task_id)
+        }
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.get_task_snapshot(task_id)
+        }
+        fn replace_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()> {
+            self.inner.replace_task(task, notification)
+        }
+        fn replace_task_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<bool> {
+            self.inner.replace_task_if_current(expected, task, notification)
+        }
+        fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+            self.inner.request_cancellation(task_id)
+        }
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            self.inner.request_cancellation_if_current(expected)
+        }
+        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+            self.inner.is_cancellation_requested(task_id)
+        }
+        fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot()
+        }
+        fn next_initial_work_snapshot_after(&self, after_task_id: Option<&FinalTaskId>) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_initial_work_snapshot_after(after_task_id)
+        }
+        fn take_initial_work_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.take_initial_work_if_current(expected)
+        }
+        fn take_initial_work_for_owner_if_current(&self, expected: &FinalTaskSnapshot, owner_id: &str) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+            self.inner.take_initial_work_for_owner_if_current(expected, owner_id)
+        }
+        fn take_initial_work_handoff_for_owner_if_current(&self, expected: &FinalTaskSnapshot, owner_id: &str) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+            self.inner.take_initial_work_handoff_for_owner_if_current(expected, owner_id)
+        }
+        fn restore_initial_work_if_current(&self, task_id: &FinalTaskId, generation: u64, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<bool> {
+            self.inner.restore_initial_work_if_current(task_id, generation, work_descriptor)
+        }
+        fn restore_initial_work_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: Option<u64>, work_descriptor: FinalTaskWorkDescriptor) -> McpResult<bool> {
+            self.inner.restore_initial_work_for_owner_if_current(task_id, generation, owner_id, dispatch_fence, work_descriptor)
+        }
+        fn replace_task_and_append_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification, input_responses: FinalTaskInputResponses) -> McpResult<bool> {
+            self.inner.replace_task_and_append_input_if_current(expected, task, notification, input_responses)
+        }
+        fn replace_task_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<bool> {
+            self.inner.replace_task_and_clear_input_if_current(expected, task, notification)
+        }
+        fn begin_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<bool> {
+            self.inner.begin_handoff_dispatch_if_current(task_id, generation)
+        }
+        fn begin_handoff_dispatch_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str) -> McpResult<Option<u64>> {
+            self.inner.begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
+        }
+        fn renew_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: u64) -> McpResult<bool> {
+            self.inner.renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+        }
+        fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
+            Ok(self.heartbeat)
+        }
+        fn finish_handoff_dispatch_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_if_current(task_id, generation)
+        }
+        fn finish_handoff_dispatch_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: u64) -> McpResult<bool> {
+            self.inner.finish_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id, dispatch_fence)
+        }
+        fn request_cancellation_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, cancelled_task: FinalTask, cancelled_notification: FinalTaskStatusNotification) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.request_cancellation_and_clear_input_if_current(expected, cancelled_task, cancelled_notification)
+        }
+        fn retention_clock_now(&self) -> Instant {
+            self.inner.retention_clock_now()
+        }
+        fn task_retention_deadline_if_current(&self, task_id: &FinalTaskId, generation: u64) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            self.inner.task_retention_deadline_if_current(task_id, generation)
+        }
+    }
+
     #[test]
     fn task_03_final_runtime_worker_quiesces_on_retention_expiry_and_proceeds_to_next_task() {
         const TTL_MS: u64 = 60_000;
@@ -9645,40 +9774,47 @@ mod tests {
         let dummy_cx = Cx::for_testing();
         let _running_service = enter_task_service_runner(dummy_runner, &dummy_cx);
 
+        // Start with ONLY task 1 created before runner starts.
         let created1 = runtime
             .create_task_with_work(final_test_work_descriptor(), None)
             .expect("finite-TTL task 1 is durably created");
         let task_id1 = created1.task.base().task_id.clone();
 
-        let created2 = runtime
-            .create_task_with_work(final_test_work_descriptor(), None)
-            .expect("finite-TTL task 2 is durably created");
-        let task_id2 = created2.task.base().task_id.clone();
-
         drop(_running_service);
 
         let task1_dropped = Arc::new(AtomicBool::new(false));
+        let task2_id_slot = Arc::new(Mutex::new(None));
         let task2_completed = Arc::new(AtomicBool::new(false));
         let supervisor = Arc::new(ExpiryThenCompletingSupervisor {
+            runtime: runtime.clone(),
             clock: Arc::clone(&now),
-            advance_ms: TTL_MS + 1000,
             task1_id: task_id1.clone(),
             task1_dropped: Arc::clone(&task1_dropped),
-            task2_id: task_id2.clone(),
+            task2_id_slot: Arc::clone(&task2_id_slot),
             task2_completed: Arc::clone(&task2_completed),
         });
 
         let mut runner = runtime
-            .install_task_service(2, supervisor)
+            .install_task_service(4, supervisor)
             .expect("install test supervisor runner");
         let service_cx = Cx::for_testing();
         let application_runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("build application-owned structured runtime");
 
-        application_runtime
-            .block_on(runner.run_service(&service_cx))
-            .expect("service runner completes without aborting on task 1 expiry");
+        let timeout_duration = StdDuration::from_secs(5);
+        let run_outcome = application_runtime
+            .block_on(async {
+                asupersync::time::timeout(
+                    service_cx.now(),
+                    timeout_duration,
+                    runner.run_service(&service_cx),
+                )
+                .await
+            })
+            .expect("service runner must finish within finite timeout");
+
+        run_outcome.expect("service runner completes without aborting on task 1 expiry");
 
         assert!(
             task1_dropped.load(AtomicOrdering::SeqCst),
@@ -9688,6 +9824,11 @@ mod tests {
             task2_completed.load(AtomicOrdering::SeqCst),
             "the runner must proceed to execute and complete the second task in the backlog"
         );
+        let task_id2 = task2_id_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("task 2 id was captured during execution");
         assert!(
             runtime.get_task(&task_id1).is_err(),
             "task 1 was purged upon retention expiry without aborting the runner"
@@ -9718,11 +9859,11 @@ mod tests {
     #[test]
     fn task_03_final_runtime_worker_unexpired_lost_lease_fails() {
         const TTL_MS: u64 = 60_000;
-        // Set heartbeat to 1ms so lease renewal check happens promptly.
-        let (store, _now) = in_memory_store_with_test_clock_and_heartbeat(
-            1,
-            StdDuration::from_millis(1),
-        );
+        let (inner_store, _now) = in_memory_store_with_test_clock(1);
+        let store = Arc::new(FastHeartbeatProbeStore {
+            inner: Arc::clone(&inner_store),
+            heartbeat: StdDuration::from_millis(1),
+        });
         let runtime = FinalTaskRuntime::new(
             store.clone(),
             FinalTaskRuntimeConfig::with_ttl(Some(TTL_MS), None)
@@ -9743,14 +9884,14 @@ mod tests {
         drop(_running_service);
 
         let supervisor = Arc::new(UnexpiredLostLeaseSupervisor {
-            store: Arc::clone(&store),
+            store: Arc::clone(&inner_store),
             task_id: task_id.clone(),
         });
         let runner = runtime
             .install_task_service(2, supervisor)
             .expect("install test supervisor runner");
         let initial = runtime
-            .recover_initial_work()
+            .recover_initial_work_with_checkpoints(&Cx::for_testing(), &runner.dispatch_owner, None)
             .expect("recover initial handoff")
             .expect("initial handoff is present");
 
@@ -9758,10 +9899,21 @@ mod tests {
             .build()
             .expect("build application-owned structured runtime");
 
-        let result = application_runtime.block_on(runner.resume_handoff(
-            &Cx::for_testing(),
-            FinalTaskSupervisorHandoff::Initial(initial),
-        ));
+        let test_cx = Cx::for_testing();
+        let timeout_duration = StdDuration::from_secs(5);
+        let result = application_runtime
+            .block_on(async {
+                asupersync::time::timeout(
+                    test_cx.now(),
+                    timeout_duration,
+                    runner.resume_handoff(
+                        &test_cx,
+                        FinalTaskSupervisorHandoff::Initial(initial),
+                    ),
+                )
+                .await
+            })
+            .expect("resume_handoff must complete within finite timeout");
 
         let error = result.expect_err("an unexpired lost lease must fail strictly");
         assert!(
@@ -9777,13 +9929,13 @@ mod tests {
         );
         assert!(
             matches!(
-                store.get_task(&task_id).expect("store read"),
+                inner_store.get_task(&task_id).expect("store read"),
                 Some(FinalTask::Working(_))
             ),
             "unexpired task remains in Working state"
         );
         assert_eq!(
-            store.task_count(),
+            inner_store.task_count(),
             1,
             "unexpired task retains its store quota"
         );
@@ -9908,7 +10060,7 @@ mod tests {
         drop(_running_service);
 
         let initial = runtime
-            .recover_initial_work()
+            .recover_initial_work_with_checkpoints(&Cx::for_testing(), "test-owner", None)
             .expect("recover initial")
             .expect("initial present");
         let handoff = FinalTaskSupervisorHandoff::Initial(initial);
