@@ -32829,7 +32829,13 @@ activate = 1\n";
     struct RestrictedYamlLine {
         indent: usize,
         raw: String,
-        semantic: String,
+        semantic: VResult<String>,
+    }
+
+    impl RestrictedYamlLine {
+        fn semantic(&self) -> VResult<&str> {
+            self.semantic.as_deref().map_err(Clone::clone)
+        }
     }
 
     const MAX_RESTRICTED_YAML_BYTES: usize = 1_048_576;
@@ -32916,17 +32922,19 @@ activate = 1\n";
                     return Err(Diagnostic::error("E_WORKFLOW_YAML_INDENT", subject).at((index + 1).to_string()));
                 }
                 let content = &raw[indent..];
-                let semantic = strip_yaml_comment(content, &format!("{subject}:{}", index + 1))?;
+                // Literal block contents are raw text, so enforce YAML quoting
+                // only when the parser consumes this line as YAML syntax.
+                let semantic = strip_yaml_comment(content, &format!("{subject}:{}", index + 1));
                 Ok(RestrictedYamlLine { indent, raw: raw.to_owned(), semantic })
             })
             .collect()
     }
 
-    fn yaml_next_semantic(lines: &[RestrictedYamlLine], mut index: usize) -> usize {
-        while index < lines.len() && lines[index].semantic.trim().is_empty() {
+    fn yaml_next_semantic(lines: &[RestrictedYamlLine], mut index: usize) -> VResult<usize> {
+        while index < lines.len() && lines[index].semantic()?.trim().is_empty() {
             index += 1;
         }
-        index
+        Ok(index)
     }
 
     fn split_yaml_mapping_entry<'a>(value: &'a str, subject: &str) -> VResult<(String, &'a str)> {
@@ -33146,15 +33154,15 @@ activate = 1\n";
             budget.check_collection_len(mapping.len(), subject)?;
         }
         loop {
-            *index = yaml_next_semantic(lines, *index);
+            *index = yaml_next_semantic(lines, *index)?;
             if *index >= lines.len() || lines[*index].indent < indent {
                 break;
             }
-            if lines[*index].indent != indent || lines[*index].semantic.trim_start().starts_with("- ") {
+            if lines[*index].indent != indent || lines[*index].semantic()?.trim_start().starts_with("- ") {
                 break;
             }
             let line_subject = format!("{subject}:{}", *index + 1);
-            let (key, value) = split_yaml_mapping_entry(lines[*index].semantic.trim(), &line_subject)?;
+            let (key, value) = split_yaml_mapping_entry(lines[*index].semantic()?.trim(), &line_subject)?;
             if mapping.contains_key(&key) {
                 return Err(Diagnostic::error("E_WORKFLOW_YAML_DUPLICATE", &line_subject).at(&key));
             }
@@ -33162,7 +33170,7 @@ activate = 1\n";
             let parsed = if value == "|" {
                 parse_restricted_yaml_literal(lines, index, indent, &line_subject, budget, depth.saturating_add(1))?
             } else if value.is_empty() {
-                let child = yaml_next_semantic(lines, *index);
+                let child = yaml_next_semantic(lines, *index)?;
                 if child >= lines.len() || lines[child].indent <= indent {
                     budget.note_scalar("", depth.saturating_add(1), &line_subject)?;
                     RestrictedYamlValue::Scalar(String::new())
@@ -33185,7 +33193,7 @@ activate = 1\n";
         budget.note_node(depth, subject)?;
         let mut values = Vec::new();
         loop {
-            *index = yaml_next_semantic(lines, *index);
+            *index = yaml_next_semantic(lines, *index)?;
             if *index >= lines.len() || lines[*index].indent < indent {
                 break;
             }
@@ -33193,7 +33201,7 @@ activate = 1\n";
             if line.indent != indent {
                 return Err(Diagnostic::error("E_WORKFLOW_YAML_INDENT", subject).at((*index + 1).to_string()));
             }
-            let Some(item) = line.semantic.trim_start().strip_prefix("- ") else {
+            let Some(item) = line.semantic()?.trim_start().strip_prefix("- ") else {
                 break;
             };
             let item_subject = format!("{subject}:{}", *index + 1);
@@ -33220,12 +33228,12 @@ activate = 1\n";
         if depth > MAX_RESTRICTED_YAML_DEPTH {
             return Err(Diagnostic::error("E_WORKFLOW_YAML_LIMIT", subject).at("depth"));
         }
-        *index = yaml_next_semantic(lines, *index);
+        *index = yaml_next_semantic(lines, *index)?;
         let line = lines.get(*index).ok_or_else(|| Diagnostic::error("E_WORKFLOW_YAML_EMPTY", subject))?;
         if line.indent != indent {
             return Err(Diagnostic::error("E_WORKFLOW_YAML_INDENT", subject));
         }
-        if line.semantic.trim_start().starts_with("- ") {
+        if line.semantic()?.trim_start().starts_with("- ") {
             parse_restricted_yaml_sequence(lines, index, indent, subject, budget, depth)
         } else {
             parse_restricted_yaml_mapping(lines, index, indent, subject, None, budget, depth)
@@ -33234,13 +33242,13 @@ activate = 1\n";
 
     fn parse_restricted_workflow_yaml(text: &str, subject: &str) -> VResult<RestrictedYamlValue> {
         let lines = restricted_yaml_lines(text, subject)?;
-        let mut index = yaml_next_semantic(&lines, 0);
+        let mut index = yaml_next_semantic(&lines, 0)?;
         if index >= lines.len() {
             return Err(Diagnostic::error("E_WORKFLOW_YAML_EMPTY", subject));
         }
         let mut budget = RestrictedYamlBudget::default();
         let value = parse_restricted_yaml_node(&lines, &mut index, 0, subject, &mut budget, 0)?;
-        if yaml_next_semantic(&lines, index) != lines.len() {
+        if yaml_next_semantic(&lines, index)? != lines.len() {
             return Err(Diagnostic::error("E_WORKFLOW_YAML_TRAILING", subject));
         }
         validate_restricted_workflow_shape(&value, subject)?;
@@ -50951,6 +50959,30 @@ activate = 1\n";
             "          test -f binary\n",
         );
         parse_restricted_workflow_yaml(valid, "synthetic workflow").verified();
+        let literal = concat!(
+            "jobs:\n",
+            "  build:\n",
+            "    steps:\n",
+            "      - name: Literal body\n",
+            "        run: |\n",
+            "          echo \"first line\n",
+            "          second line\" # retained script comment\n",
+            "          # retained full-line comment\n",
+            "        env:\n",
+            "          NOTE: \"closed\"\n",
+        );
+        let parsed_literal = parse_restricted_workflow_yaml(literal, "literal workflow").verified();
+        let jobs = parsed_literal.as_mapping("literal workflow").verified()["jobs"].as_mapping("jobs").verified();
+        let build = jobs["build"].as_mapping("build").verified();
+        let steps = build["steps"].as_sequence("steps").verified();
+        let step = steps[0].as_mapping("step").verified();
+        assert_eq!(yaml_scalar_field(step, "run", "step").verified(), "echo \"first line\nsecond line\" # retained script comment\n# retained full-line comment\n");
+        let malformed_after_literal = literal.replacen("NOTE: \"closed\"", "NOTE: \"closed", 1);
+        assert_ne!(malformed_after_literal, literal);
+        let error = parse_restricted_workflow_yaml(&malformed_after_literal, "literal workflow")
+            .expect_err("an unclosed YAML quote after a literal block must still fail");
+        assert_eq!(error.stable(), "FND01|Error|E_WORKFLOW_YAML_QUOTE|literal workflow:10|");
+        assert_eq!(parse_restricted_workflow_yaml(literal, "literal workflow").verified(), parsed_literal, "rejected following YAML must leave literal parsing unchanged");
         assert_eq!(
             parse_restricted_workflow_yaml("jobs:\n  build:\n    steps: []\n    steps: []\n", "duplicate workflow",).expect_err("duplicate YAML keys must fail").code,
             "E_WORKFLOW_YAML_DUPLICATE",
@@ -51733,7 +51765,21 @@ version = "0.0.0"
 
         let current_lock_bytes = fs::read(root.join("Cargo.lock")).expect("current Cargo.lock must be readable");
         let current_lock = parse_cargo_lock_strict(&current_lock_bytes, &policy.bounds, "current Cargo.lock").verified();
-        assert!(!registry_packages_from_lock(&current_lock, &policy.bounds, &workspace_lock_local_packages(), "current Cargo.lock",).verified().is_empty());
+        let current_local_packages = PACKAGE_IDS.iter().map(|name| ((*name).to_owned(), env!("CARGO_PKG_VERSION").to_owned())).collect::<BTreeSet<_>>();
+        let accepted = registry_packages_from_lock(&current_lock, &policy.bounds, &current_local_packages, "current Cargo.lock").verified();
+        assert!(!accepted.is_empty());
+
+        let mut wrong_local_version = current_local_packages.clone();
+        assert!(wrong_local_version.remove(&("fastmcp-rust".to_owned(), env!("CARGO_PKG_VERSION").to_owned())));
+        assert!(wrong_local_version.insert(("fastmcp-rust".to_owned(), format!("{}-wrong", env!("CARGO_PKG_VERSION")))));
+        assert_eq!(wrong_local_version.len(), current_local_packages.len());
+        assert_eq!(wrong_local_version.difference(&current_local_packages).count(), 1);
+        assert_eq!(current_local_packages.difference(&wrong_local_version).count(), 1);
+        let error = registry_packages_from_lock(&current_lock, &policy.bounds, &wrong_local_version, "current Cargo.lock")
+            .expect_err("changing only one expected local package version must fail");
+        assert_eq!(error.stable(), "FND01|Error|E_SUPPLY_LOCK_LOCAL_PACKAGE|current Cargo.lock|unexpected source-less package set");
+        assert_eq!(registry_packages_from_lock(&current_lock, &policy.bounds, &current_local_packages, "current Cargo.lock").verified(), accepted);
+        assert_eq!(fs::read(root.join("Cargo.lock")).expect("current Cargo.lock remains readable"), current_lock_bytes, "rejection must not change the live lock bytes");
     }
 
     #[test]
