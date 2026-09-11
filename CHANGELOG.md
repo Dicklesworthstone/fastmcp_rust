@@ -6,7 +6,59 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.8.1)
+## [Unreleased] (after v0.9.0)
+
+## [v0.9.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.9.0) -- 2026-09-11
+
+Pre-1.0 minor release with breaking runtime API changes. MCP 2026-07-28
+support remains under implementation; this release does not establish
+aggregate conformance or complete runtime migration.
+
+### Runtime ownership and cancellation
+
+- Removed `ServerHttpSession::handle`; embedders now await `handle_async`
+  from their caller-owned asupersync runtime. Stdio startup likewise requires
+  a caller-owned context. Modern request handlers run in request-owned child
+  regions, including concurrent ModernOnly dispatch.
+- Unix stdio initialization, partial-frame reads, subscription polling, and
+  child reaping yield to the caller runtime. Bounded writes retire failed
+  connections; receive cancellation retains incomplete frame prefixes.
+- Added cooperative `close_with_cx` and connected CLI teardown to it.
+  Cancellation leaves unfinished cleanup retryable instead of discarding it.
+- Rebinding a request context preserves spent quota, local deadlines, and
+  pending cancellation. Leaving the final cancellation mask wakes waiters.
+- Proxy connection, catalog discovery, subscriptions, typed calls, MRTR
+  continuations, and Tasks controls now await their upstream operations on
+  the caller context. Failed resource subscriptions restore local state.
+
+### Client, server, and CLI
+
+- Async public tool/resource/prompt calls follow installed modern MRTR
+  handlers. Pending HTTP and WebSocket callbacks observe cancellation and
+  deadlines; abandoned callbacks cannot send a continuation.
+- Stateless HTTP MRTR retries retain framework-issued, single-use state
+  across POSTs, bound to the method, target, arguments, and principal.
+- Modern clients retain notifications received alongside final responses;
+  servers emit protocol-appropriate catalog and resource notifications.
+- Connected HTTPS bearer-token files to CLI and SDK builders. HTTP
+  authentication requires the Authorization header and rejects credentials
+  supplied through query strings or request bodies.
+- Authenticated Tasks and subscriptions enforce principal ownership. The
+  optional CLI `tasks` feature exposes get, watch, update, and cancel commands;
+  default prebuilt binaries retain the default CLI feature set.
+- Exposed modern cache controls and the Auto WebSocket typed client surface.
+
+### Build and verification repairs
+
+- Updated pinned dependencies, including asupersync 0.4.10, while retaining
+  the dated nightly-2026-08-25 toolchain.
+- Restored facade E2E execution and explicit CLI/server composition checks.
+  Windows tests now handle native path separators and CRLF source checkouts;
+  WebSocket API documentation resolves its intra-doc links.
+- Corrected the Tasks lifecycle test to distinguish handler invocation from
+  durable task creation, retaining its one-slot-store rejection check.
+
+**Exact changes:** [v0.8.1...v0.9.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.8.1...v0.9.0)
 
 ## [v0.8.1](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.1) -- 2026-08-30 (GitHub Release)
 

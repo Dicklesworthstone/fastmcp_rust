@@ -24,7 +24,7 @@
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
 > historical parity rows are not conformance or release evidence. Versions
-> through 0.8.1 have been published, but publication and source edits alone do
+> through 0.9.0 have been published, but publication and source edits alone do
 > not prove historical workflow identities, queued runs, or credentials inert;
 > provider-side release-safety evidence is still required.
 
@@ -98,7 +98,7 @@
 
 ```bash
 # Current published package; publication is not aggregate conformance evidence
-cargo add fastmcp-rust@0.8.1
+cargo add fastmcp-rust@0.9.0
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -361,15 +361,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (current 0.8.1 package)
+### From crates.io (current 0.9.0 package)
 
-The `0.8.1` package was published on 2026-08-30. Publication does
+The `0.9.0` package was published on 2026-09-11. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.8.1"
+fastmcp-rust = "0.9.0"
 ```
 
 ### As a Git Dependency
@@ -390,7 +390,7 @@ cargo build --release
 
 ### CLI binaries (GitHub Releases)
 
-The latest published release, v0.8.1, provides prebuilt `fastmcp` binaries on
+The latest published release, v0.9.0, provides prebuilt `fastmcp` binaries on
 GitHub Releases. The `fastmcp-cli` source package is also available from
 crates.io for Cargo-based installation. Its archives use
 `fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on Windows). Linux and
@@ -412,7 +412,7 @@ tar -xJf fastmcp-darwin-aarch64.tar.xz
 ### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli --version 0.8.1
+cargo install fastmcp-cli --version 0.9.0
 ```
 
 ### Client request deadlines (current source tree)
@@ -532,7 +532,7 @@ same client. An already-admitted valid task result survives caller cancellation;
 other results remain cancellation-first. Input-required results are returned
 without automatic continuation. Pipe writes remain synchronous.
 
-The published 0.8.1 CLI includes these flags. From a current source checkout,
+The published 0.9.0 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash
@@ -554,7 +554,7 @@ portable process-tree containment or a substitute for Windows Job Objects.
 Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,
 and `cancel`. These commands require modern MCP and bilateral
 `io.modelcontextprotocol/tasks` support. The pinned extension is experimental;
-this source implementation remains provisional. The published 0.8.1 binary
+this source implementation remains provisional. The published 0.9.0 binary
 does not include these commands.
 
 ```bash
