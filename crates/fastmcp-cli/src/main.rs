@@ -6032,6 +6032,16 @@ fn task_terminal_fields(value: serde_json::Value) -> serde_json::Value {
 }
 
 #[cfg(feature = "tasks")]
+fn is_terminal_task_status(status: fastmcp_protocol::tasks_extension::TaskStatus) -> bool {
+    matches!(
+        status,
+        fastmcp_protocol::tasks_extension::TaskStatus::Completed
+            | fastmcp_protocol::tasks_extension::TaskStatus::Failed
+            | fastmcp_protocol::tasks_extension::TaskStatus::Cancelled
+    )
+}
+
+#[cfg(feature = "tasks")]
 async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) -> McpResult<()> {
     use fastmcp_protocol::tasks_extension::TaskId;
     let task_id = TaskId::parse(action.task_id()).map_err(|_| {
@@ -6139,6 +6149,13 @@ fn run_stdio_task(
         }
         TaskAction::Watch { max_events, .. } => {
             write_task_event(connection.json, "snapshot", &task)?;
+            if is_terminal_task_status(task.base().status) {
+                return write_task_event(
+                    connection.json,
+                    "watch-ended",
+                    &serde_json::json!({"reason": "task-terminal", "updates": 0}),
+                );
+            }
             let mut filter = fastmcp_protocol::SubscriptionFilter::default();
             fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
                 .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
@@ -6188,6 +6205,13 @@ async fn run_yielding_stdio_task(
         }
         TaskAction::Watch { max_events, .. } => {
             write_task_event(connection.json, "snapshot", &task)?;
+            if is_terminal_task_status(task.base().status) {
+                return write_task_event(
+                    connection.json,
+                    "watch-ended",
+                    &serde_json::json!({"reason": "task-terminal", "updates": 0}),
+                );
+            }
             let mut filter = fastmcp_protocol::SubscriptionFilter::default();
             fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
                 .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
@@ -6297,6 +6321,14 @@ fn poll_stdio_task_watch(
             }
             write_task_event(connection.json, "task-updated", &notification.params.task)?;
             *updates += 1;
+            if is_terminal_task_status(notification.params.task.base().status) {
+                write_task_event(
+                    connection.json,
+                    "watch-ended",
+                    &serde_json::json!({"reason": "task-terminal", "updates": updates}),
+                )?;
+                return Ok(true);
+            }
             if *updates >= max_events {
                 write_task_event(
                     connection.json,
@@ -6361,6 +6393,13 @@ async fn run_http_task(
         }
         TaskAction::Watch { max_events, .. } => {
             write_task_event(connection.json, "snapshot", handle.task())?;
+            if is_terminal_task_status(handle.task().base().status) {
+                return write_task_event(
+                    connection.json,
+                    "watch-ended",
+                    &serde_json::json!({"reason": "task-terminal", "updates": 0}),
+                );
+            }
             let limits = fastmcp_client::sse::SseLimits::new(1024 * 1024, 2 * 1024 * 1024, 256)
                 .ok_or_else(|| fastmcp_core::McpError::internal_error("invalid CLI SSE bounds"))?;
             let mut watch = handle.watch(cx, &mut client, limits).await.map_err(error)?;
@@ -6377,6 +6416,13 @@ async fn run_http_task(
                             &notification.params.task,
                         )?;
                         updates += 1;
+                        if is_terminal_task_status(notification.params.task.base().status) {
+                            return write_task_event(
+                                connection.json,
+                                "watch-ended",
+                                &serde_json::json!({"reason": "task-terminal", "updates": updates}),
+                            );
+                        }
                         if updates >= *max_events {
                             // The watcher owns its HTTP response stream. Dropping
                             // it closes this listen without cancelling the task.

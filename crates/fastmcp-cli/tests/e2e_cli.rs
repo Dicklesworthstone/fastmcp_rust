@@ -2363,18 +2363,30 @@ mod task_commands {
 
     impl TaskFixture {
         fn new(input_required: bool) -> Self {
+            Self::new_with_status(if input_required {
+                "input_required"
+            } else {
+                "working"
+            })
+        }
+
+        fn new_with_status(status: &str) -> Self {
             let root = TestTempDir::new("official-tasks");
             let task_id = format!("task-{}", root.file_name().unwrap().to_string_lossy());
             let mut task = json!({
                 "taskId": task_id,
-                "status": if input_required { "input_required" } else { "working" },
+                "status": status,
                 "statusMessage": "[bold]work\u{1b}[2J\nAuthorization: Bearer test-secret-123",
                 "createdAt": "2026-07-28T12:00:00.000Z",
                 "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
                 "ttlMs": null,
             });
-            if input_required {
+            if status == "input_required" {
                 task["inputRequests"] = json!({"roots": {"method": "roots/list"}});
+            } else if status == "completed" {
+                task["result"] = json!({"content": []});
+            } else if status == "failed" {
+                task["error"] = json!({"code": -32603, "message": "task execution failed"});
             }
             std::fs::write(root.join("task.json"), serde_json::to_vec(&task).unwrap()).unwrap();
             Self { root, task }
@@ -2419,6 +2431,136 @@ mod task_commands {
             let endpoint = std::fs::read_to_string(self.root.join("ready")).unwrap();
             (process, endpoint)
         }
+
+        fn with_supervisor(self, scenario: &str) -> Self {
+            std::fs::write(self.root.join(format!("transition_to_{scenario}")), b"").unwrap();
+            self
+        }
+
+        fn spawn_http_watch(
+            &self,
+            endpoint: &str,
+            tag: &str,
+            extra: &[&str],
+        ) -> (ProcessGroupGuard, PathBuf, PathBuf) {
+            let stdout_path = self.root.join(format!("watch_{tag}.stdout"));
+            let stderr_path = self.root.join(format!("watch_{tag}.stderr"));
+            let mut command = Command::new(get_binary_path());
+            command
+                .args([
+                    "tasks",
+                    "watch",
+                    self.id(),
+                    "--http-url",
+                    endpoint,
+                    "--json",
+                ])
+                .args(extra)
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap());
+            let watch = ProcessGroupGuard::spawn(&mut command);
+            wait_for_file(&stdout_path, "watch-acknowledged");
+            (watch, stdout_path, stderr_path)
+        }
+
+        fn send_roots_update(&self, endpoint: &str) -> Value {
+            let input = self.root.join("input.json");
+            std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+            document(&run_cli(&[
+                "tasks",
+                "update",
+                self.id(),
+                "--http-url",
+                endpoint,
+                "--json",
+                "--input-file",
+                input.to_str().unwrap(),
+            ]))
+        }
+
+        fn spawn_stdio_watch(
+            &self,
+            tag: &str,
+            extra: &[&str],
+        ) -> (ProcessGroupGuard, PathBuf, PathBuf) {
+            let stdout_path = self.root.join(format!("watch_stdio_{tag}.stdout"));
+            let stderr_path = self.root.join(format!("watch_stdio_{tag}.stderr"));
+            let mut command = Command::new(get_binary_path());
+            command
+                .args([
+                    "tasks",
+                    "watch",
+                    self.id(),
+                    "--server",
+                    env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"),
+                    "--server-arg",
+                ])
+                .arg(self.root.join("task.json"))
+                .arg("--server-arg")
+                .arg(self.root.join("changed.json"))
+                .args(["--json"])
+                .args(extra)
+                .stdout(std::fs::File::create(&stdout_path).unwrap())
+                .stderr(std::fs::File::create(&stderr_path).unwrap());
+            let watch = ProcessGroupGuard::spawn(&mut command);
+            wait_for_file(&stdout_path, "watch-acknowledged");
+            std::fs::write(self.root.join("watch_ready"), b"").unwrap();
+            (watch, stdout_path, stderr_path)
+        }
+    }
+
+    fn read_json_lines(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn assert_initial_terminal(output: &Output, expected_status: &str) {
+        assert!(output.status.success(), "{}", stderr_str(output));
+        let events: Vec<Value> = stdout_str(output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"]["status"], expected_status);
+        assert_eq!(events[1]["event"], "watch-ended");
+        assert_eq!(events[1]["data"]["reason"], "task-terminal");
+        assert_eq!(events[1]["data"]["updates"], 0);
+    }
+
+    fn assert_streamed_terminal(
+        mut watch: ProcessGroupGuard,
+        stdout_path: &Path,
+        initial_status: &str,
+        expected_status: &str,
+    ) {
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("streamed terminal watch exits promptly without timeout");
+        assert!(status.success());
+        let events = read_json_lines(stdout_path);
+        assert!(events.len() >= 4);
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"]["status"], initial_status);
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+        let last_update = events
+            .iter()
+            .rev()
+            .find(|e| e["event"] == "task-updated")
+            .unwrap();
+        assert_eq!(last_update["data"]["status"], expected_status);
+        let update_count = events
+            .iter()
+            .filter(|e| e["event"] == "task-updated")
+            .count() as u64;
+        assert!(update_count >= 1);
+        let end_event = events.last().unwrap();
+        assert_eq!(end_event["event"], "watch-ended");
+        assert_eq!(end_event["data"]["reason"], "task-terminal");
+        assert_eq!(end_event["data"]["updates"], update_count);
     }
 
     fn wait_for_file(path: &Path, text: &str) {
@@ -2835,5 +2977,151 @@ mod task_commands {
             "a failed RPC remains a failed CLI command despite peer exit_code=0"
         );
         assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_initial_terminal_completed() {
+        let fixture = TaskFixture::new_with_status("completed");
+        assert_initial_terminal(
+            &fixture.stdio("watch", &["--json", "--timeout", "10"]),
+            "completed",
+        );
+
+        let human = fixture.stdio("watch", &["--timeout", "10"]);
+        assert!(human.status.success(), "{}", stderr_str(&human));
+        let text = stdout_str(&human);
+        assert!(text.contains("snapshot"));
+        assert!(text.contains("watch-ended"));
+        assert!(text.contains("task-terminal"));
+        assert!(!human.stdout.contains(&0x1b));
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_initial_terminal_failed() {
+        let fixture = TaskFixture::new_with_status("failed");
+        assert_initial_terminal(
+            &fixture.stdio("watch", &["--json", "--timeout", "10"]),
+            "failed",
+        );
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_initial_terminal_cancelled() {
+        let fixture = TaskFixture::new_with_status("cancelled");
+        assert_initial_terminal(
+            &fixture.stdio("watch", &["--json", "--timeout", "10"]),
+            "cancelled",
+        );
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_initial_terminal_completed() {
+        let fixture = TaskFixture::new_with_status("completed");
+        let (mut server, endpoint) = fixture.http();
+        let output = run_cli(&[
+            "tasks",
+            "watch",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+            "--timeout",
+            "10",
+        ]);
+        assert_initial_terminal(&output, "completed");
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_streamed_cancelled() {
+        let fixture = TaskFixture::new(true);
+        let (mut server, endpoint) = fixture.http();
+        let (watch, stdout_path, _) =
+            fixture.spawn_http_watch(&endpoint, "cancelled", &["--timeout", "20"]);
+        let cancel = document(&run_cli(&[
+            "tasks",
+            "cancel",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ]));
+        assert_eq!(cancel["event"], "cancellation-acknowledged");
+        assert_streamed_terminal(watch, &stdout_path, "input_required", "cancelled");
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_streamed_completed() {
+        let fixture = TaskFixture::new(true).with_supervisor("completed");
+        let (mut server, endpoint) = fixture.http();
+        let (watch, stdout_path, _) =
+            fixture.spawn_http_watch(&endpoint, "completed", &["--timeout", "20"]);
+        let update = fixture.send_roots_update(&endpoint);
+        assert_eq!(update["event"], "update-acknowledged");
+        assert_streamed_terminal(watch, &stdout_path, "input_required", "completed");
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_streamed_failed() {
+        let fixture = TaskFixture::new(true).with_supervisor("failed");
+        let (mut server, endpoint) = fixture.http();
+        let (watch, stdout_path, _) =
+            fixture.spawn_http_watch(&endpoint, "failed", &["--timeout", "20"]);
+        let update = fixture.send_roots_update(&endpoint);
+        assert_eq!(update["event"], "update-acknowledged");
+        assert_streamed_terminal(watch, &stdout_path, "input_required", "failed");
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_streamed_terminal() {
+        for expected_status in ["completed", "failed"] {
+            let fixture = TaskFixture::new(false).with_supervisor(expected_status);
+            let (watch, stdout_path, _) =
+                fixture.spawn_stdio_watch(expected_status, &["--timeout", "20"]);
+            assert_streamed_terminal(watch, &stdout_path, "working", expected_status);
+        }
+    }
+
+    #[test]
+    fn cli_02_b_watch_nonterminal_keeps_watching_planted_negative() {
+        let fixture = TaskFixture::new(true);
+        let (mut server, endpoint) = fixture.http();
+        let (mut watch, stdout_path, stderr_path) = fixture.spawn_http_watch(
+            &endpoint,
+            "nonterminal",
+            &["--timeout", "2", "--max-events", "100"],
+        );
+        let update = fixture.send_roots_update(&endpoint);
+        assert_eq!(update["event"], "update-acknowledged");
+
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("watch completes after timeout expires");
+        assert!(
+            !status.success(),
+            "watch on nonterminal update must not exit with success"
+        );
+        let stderr = std::fs::read_to_string(stderr_path).unwrap();
+        assert!(
+            stderr.contains("--timeout"),
+            "stderr must report timeout expiration: {stderr}"
+        );
+
+        let events = read_json_lines(&stdout_path);
+        assert!(events.len() >= 3);
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+        assert_eq!(events[2]["event"], "task-updated");
+        assert_eq!(events[2]["data"]["status"], "working");
+        assert!(
+            !events.iter().any(|e| {
+                e.get("data").and_then(|d| d.get("reason")) == Some(&json!("task-terminal"))
+            }),
+            "nonterminal working update must not emit task-terminal watch-ended event"
+        );
+        server.kill_and_reap().expect("HTTP server cleanup");
     }
 }
