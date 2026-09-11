@@ -610,8 +610,8 @@ impl ToolHandler for PendingTool {
     }
 }
 
-struct WireRecv(BufReader<TcpStream>, Arc<AtomicUsize>);
-struct WireSend(TcpStream);
+struct WireRecv(BufReader<TcpStream>);
+struct WireSend(TcpStream, Arc<AtomicUsize>);
 
 fn read_wire(reader: &mut BufReader<TcpStream>) -> Result<JsonRpcMessage, TransportError> {
     let mut line = String::new();
@@ -636,9 +636,7 @@ fn write_wire(stream: &mut TcpStream, message: &JsonRpcMessage) -> Result<(), Tr
 
 impl TransportRecvHalf for WireRecv {
     fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        let message = read_wire(&mut self.0)?;
-        self.1.fetch_add(1, Ordering::Release);
-        Ok(message)
+        read_wire(&mut self.0)
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -653,7 +651,9 @@ impl TransportSendHalf for WireSend {
             "modern-pump outbound={}",
             serde_json::to_string(message).unwrap()
         );
-        write_wire(&mut self.0, message)
+        write_wire(&mut self.0, message)?;
+        self.1.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -720,12 +720,9 @@ impl WireScenario {
                 shutdown_probe.store(true, Ordering::Release);
             })
             .build();
-        let ingress_count = Arc::new(AtomicUsize::new(0));
-        let recv = WireRecv(
-            BufReader::new(server_socket.try_clone().unwrap()),
-            Arc::clone(&ingress_count),
-        );
-        let send = WireSend(server_socket);
+        let response_count = Arc::new(AtomicUsize::new(0));
+        let recv = WireRecv(BufReader::new(server_socket.try_clone().unwrap()));
+        let send = WireSend(server_socket, Arc::clone(&response_count));
         let (tx, outcome) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -749,16 +746,17 @@ impl WireScenario {
                     })
                     .unwrap();
                 if hold_first_poll {
-                    // Deliberately occupy the only async worker until the
-                    // blocking pump has read beyond the cancellation frame.
-                    // Request children cannot get their first poll before it.
+                    // Keep the only async worker occupied until the pump
+                    // answers the authentication probe after cancellation.
+                    // Reading socket bytes alone is not a dispatch fence:
+                    // the receive worker can run ahead of the pump.
                     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                    while ingress_count.load(Ordering::Acquire) < 3
+                    while response_count.load(Ordering::Acquire) == 0
                         && std::time::Instant::now() < deadline
                     {
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    assert_eq!(ingress_count.load(Ordering::Acquire), 3);
+                    assert_eq!(response_count.load(Ordering::Acquire), 1);
                 }
                 pump.join(&root).await.expect("pump child must join")
             });
@@ -897,6 +895,19 @@ fn srv_65_modern_cancellation_preserves_unrelated_request() {
                 })),
             ));
             queued.cancel(cancellation_id);
+            // Admission rejects credentials without an auth provider on the
+            // pump itself, before submitting an async child. Its response
+            // proves the preceding cancellation was processed while the
+            // original request still could not receive its first poll.
+            queued.send(modern_request(
+                "tools/list",
+                52,
+                Some(serde_json::json!({"token": "unadmitted-peer"})),
+            ));
+            assert_eq!(
+                queued.response(52).error.unwrap().code,
+                fastmcp_core::McpErrorCode::ResourceForbidden.into()
+            );
             queued.send(modern_request("tools/list", 51, None));
             let responses = (0..2)
                 .map(|_| match read_wire(&mut queued.reader).unwrap() {
