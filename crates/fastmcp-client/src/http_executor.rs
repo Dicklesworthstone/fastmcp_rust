@@ -9618,7 +9618,12 @@ mod tests {
     }
 
     fn write_chunked_sse_event(stream: &mut TcpStream, event: &str) {
-        write!(stream, "{:X}\r\n{event}\r\n", event.len()).expect("write chunked legacy SSE event");
+        // Keep the payload and chunk trailer in the same buffer: receiving a
+        // terminal event can make the client close before a later trailer write.
+        let chunk = format!("{:X}\r\n{event}\r\n", event.len());
+        stream
+            .write_all(chunk.as_bytes())
+            .expect("write chunked legacy SSE event");
         stream.flush().expect("flush chunked legacy SSE event");
     }
 
@@ -9657,6 +9662,25 @@ mod tests {
         stream
             .flush()
             .expect("flush finished chunked legacy SSE response");
+    }
+
+    fn assert_sse_peer_closed(stream: &mut TcpStream) {
+        // A terminal event makes the client release this still-open response.
+        // Writing a final HTTP chunk races that close, particularly on Windows.
+        // Observe closure instead; a retained connection must time out and fail.
+        stream
+            .set_read_timeout(Some(LEGACY_TEST_PEER_BOUND))
+            .expect("bound terminal SSE peer closure");
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            result => panic!("terminal SSE client must close its socket: {result:?}"),
+        }
     }
 
     fn modern_discovery_body() -> &'static [u8] {
@@ -10544,7 +10568,7 @@ mod tests {
                 &mut stream,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -10811,7 +10835,7 @@ mod tests {
                 &mut stream,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -10952,7 +10976,7 @@ mod tests {
                 &mut stream,
                 "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -11027,7 +11051,7 @@ mod tests {
                 &mut stream,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"task\",\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -11101,7 +11125,7 @@ mod tests {
                 &mut stream,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"task\",\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}\n\n",
             );
-            finish_chunked_sse(&mut stream);
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
@@ -11249,11 +11273,9 @@ mod tests {
                     "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":1e400,\"total\":1e401,\"message\":\"exact\"}}\n\n",
                 );
             }
-            write_chunked_sse_event(
-                &mut stream,
-                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n",
-            );
-            finish_chunked_sse(&mut stream);
+            // The excess progress event itself must close the stream, before
+            // the peer supplies a terminal event or ends the HTTP response.
+            assert_sse_peer_closed(&mut stream);
         });
 
         let cx = Cx::for_request();
