@@ -731,34 +731,46 @@ impl WireScenario {
                 .unwrap();
             let result = runtime.block_on(async move {
                 let root = Cx::current().unwrap();
-                if !separate_dispatch {
-                    return server.run_split_transport_returning_with_cx(&root, recv, send);
-                }
-                let dispatch_cx = root.clone();
-                let mut pump = root
-                    .spawn_blocking(move |pump_cx| {
-                        server.run_split_transport_returning_with_dispatch_cx(
-                            &pump_cx,
-                            &dispatch_cx,
-                            recv,
-                            send,
-                        )
+                // block_on polls its root future on the caller thread; even
+                // current_thread() has a separate scheduler worker. Run the
+                // scenario on that worker so hold_first_poll really prevents
+                // request children from executing before cancellation.
+                let mut scenario = root
+                    .spawn(move |root| async move {
+                        if !separate_dispatch {
+                            return server.run_split_transport_returning_with_cx(&root, recv, send);
+                        }
+                        let dispatch_cx = root.clone();
+                        let mut pump = root
+                            .spawn_blocking(move |pump_cx| {
+                                server.run_split_transport_returning_with_dispatch_cx(
+                                    &pump_cx,
+                                    &dispatch_cx,
+                                    recv,
+                                    send,
+                                )
+                            })
+                            .unwrap();
+                        if hold_first_poll {
+                            // Keep the only async worker occupied until the pump
+                            // answers the authentication probe after cancellation.
+                            // The probe is rejected synchronously by the pump, so
+                            // this does not require polling a request child.
+                            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                            while response_count.load(Ordering::Acquire) == 0
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            assert_eq!(response_count.load(Ordering::Acquire), 1);
+                        }
+                        pump.join(&root).await.expect("pump child must join")
                     })
-                    .unwrap();
-                if hold_first_poll {
-                    // Keep the only async worker occupied until the pump
-                    // answers the authentication probe after cancellation.
-                    // Reading socket bytes alone is not a dispatch fence:
-                    // the receive worker can run ahead of the pump.
-                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                    while response_count.load(Ordering::Acquire) == 0
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    assert_eq!(response_count.load(Ordering::Acquire), 1);
-                }
-                pump.join(&root).await.expect("pump child must join")
+                    .expect("scenario must run on the scheduler worker");
+                scenario
+                    .join(&root)
+                    .await
+                    .expect("scenario child must join")
             });
             let _ = tx.send(result);
         });
