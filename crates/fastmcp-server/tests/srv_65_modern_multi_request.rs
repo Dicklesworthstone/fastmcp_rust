@@ -593,6 +593,7 @@ impl ToolHandler for PendingTool {
         Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let action = arguments.get("action").and_then(serde_json::Value::as_str);
             self.0.active.fetch_add(1, Ordering::AcqRel);
             let _active = ActiveInvocation(Arc::clone(&self.0));
             self.0.entered.fetch_add(1, Ordering::AcqRel);
@@ -601,6 +602,17 @@ impl ToolHandler for PendingTool {
                     return McpOutcome::Err(error.into());
                 }
                 asupersync::time::sleep(ctx.cx().now(), Duration::from_millis(5)).await;
+            }
+            if action == Some("cancel_cx") {
+                // Cancel the spawned child task's Cx directly and return without
+                // checkpointing so cancellation_acknowledged remains false, forcing
+                // asupersync classify_spawn_completion to attribute dominant cancellation
+                // and produce JoinError::Cancelled on TaskHandle::join.
+                ctx.cx().cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("deliberate child task cancellation"),
+                );
+                return McpOutcome::Err(fastmcp_core::McpError::request_cancelled());
             }
             match Echo.call_final(ctx, arguments) {
                 Ok(result) => McpOutcome::Ok(FinalToolOutcome::Complete(result)),
@@ -611,7 +623,7 @@ impl ToolHandler for PendingTool {
 }
 
 struct WireRecv(BufReader<TcpStream>);
-struct WireSend(TcpStream, Arc<AtomicUsize>);
+struct WireSend(TcpStream, Arc<AtomicUsize>, Arc<AtomicBool>);
 
 fn read_wire(reader: &mut BufReader<TcpStream>) -> Result<JsonRpcMessage, TransportError> {
     let mut line = String::new();
@@ -647,6 +659,11 @@ impl TransportRecvHalf for WireRecv {
 
 impl TransportSendHalf for WireSend {
     fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.2.load(Ordering::Acquire) {
+            return Err(TransportError::Io(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )));
+        }
         eprintln!(
             "modern-pump outbound={}",
             serde_json::to_string(message).unwrap()
@@ -669,6 +686,7 @@ struct WireScenario {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     control: Arc<PendingControl>,
+    fail_writes: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     shutdown_active: Arc<AtomicUsize>,
     outcome: mpsc::Receiver<McpResult<()>>,
@@ -704,6 +722,7 @@ impl WireScenario {
             .unwrap();
         let reader = BufReader::new(writer.try_clone().unwrap());
         let control = Arc::new(PendingControl::default());
+        let fail_writes = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_active = Arc::new(AtomicUsize::new(usize::MAX));
         let shutdown_probe = Arc::clone(&shutdown);
@@ -722,7 +741,11 @@ impl WireScenario {
             .build();
         let response_count = Arc::new(AtomicUsize::new(0));
         let recv = WireRecv(BufReader::new(server_socket.try_clone().unwrap()));
-        let send = WireSend(server_socket, Arc::clone(&response_count));
+        let send = WireSend(
+            server_socket,
+            Arc::clone(&response_count),
+            Arc::clone(&fail_writes),
+        );
         let (tx, outcome) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -788,6 +811,7 @@ impl WireScenario {
             reader,
             writer,
             control,
+            fail_writes,
             shutdown,
             shutdown_active,
             outcome,
@@ -841,6 +865,10 @@ impl WireScenario {
         );
         request.id = None;
         self.send(request);
+    }
+
+    fn fail_writes(&self) {
+        self.fail_writes.store(true, Ordering::Release);
     }
 
     fn close_input(&mut self) {
@@ -1051,4 +1079,176 @@ fn srv_65_modern_subscription_drains_before_shutdown() {
         40
     );
     wire.finish();
+}
+
+#[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn srv_65_modern_child_task_cancellation_preserves_connection_and_quiesces() {
+    let mut wire = WireScenario::start_with_dispatch(true);
+    wire.send(modern_request(
+        "tools/call",
+        60,
+        Some(serde_json::json!({
+            "name": "pending",
+            "arguments": {
+                "value": wire.subject,
+                "action": "cancel_cx",
+            },
+        })),
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wire.control.entered.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(wire.control.entered.load(Ordering::Acquire), 1);
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+
+    // Concurrent sibling request is processed and answered while request 60 is active.
+    wire.send(modern_request("tools/list", 61, None));
+    let sibling = wire.response(61);
+    assert_ok_response(&sibling, "sibling tools/list response");
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+
+    // Release request 60 so it cancels its Cx and completes.
+    // Public wire semantics return RequestCancelled error for the cancelled request.
+    // TaskHandle::join evaluates to Err(JoinError::Cancelled(_)), which the server
+    // reaper must classify as quiescent rather than failing the connection.
+    wire.control.released.store(true, Ordering::Release);
+    let cancelled_response = wire.response(60);
+    assert_eq!(
+        cancelled_response.error.as_ref().map(|err| err.code),
+        Some(fastmcp_core::McpErrorCode::RequestCancelled.into()),
+        "cancelled child request must return RequestCancelled error"
+    );
+
+    // The connection and pump remain responsive: subsequent requests succeed.
+    wire.send(modern_request("tools/list", 62, None));
+    let subsequent = wire.response(62);
+    assert_ok_response(&subsequent, "subsequent tools/list response");
+
+    // Clean finish proves shutdown hook ordering and quiescence:
+    // - returning split transport returns Ok(())
+    // - on_shutdown hook ran after child cleanup
+    // - no active child work survives after return
+    wire.finish();
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        0,
+        "no child work survives after return"
+    );
+}
+
+#[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn srv_65_modern_child_task_cancellation_during_shutdown_quiesces() {
+    let mut wire = WireScenario::start_with_dispatch(true);
+    wire.send(modern_request(
+        "tools/call",
+        80,
+        Some(serde_json::json!({
+            "name": "pending",
+            "arguments": {
+                "value": wire.subject,
+                "action": "cancel_cx",
+            },
+        })),
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wire.control.entered.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(wire.control.entered.load(Ordering::Acquire), 1);
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+
+    // Close client input while the handler is still pending, forcing shutdown drain
+    // to join the cancelled child task handle directly.
+    wire.close_input();
+
+    // Release the handler to complete with cancel_cx during shutdown drain
+    wire.control.released.store(true, Ordering::Release);
+
+    let cancelled_response = wire.response(80);
+    assert_eq!(
+        cancelled_response.error.as_ref().map(|err| err.code),
+        Some(fastmcp_core::McpErrorCode::RequestCancelled.into()),
+        "drained child request must return RequestCancelled error"
+    );
+
+    let result = wire
+        .outcome
+        .recv_timeout(SCENARIO_DEADLINE)
+        .expect("pump must settle during shutdown drain");
+    wire.worker.take().unwrap().join().unwrap();
+    assert!(result.is_ok(), "returning pump must succeed: {result:?}");
+    assert!(wire.shutdown.load(Ordering::Acquire));
+    assert_eq!(
+        wire.shutdown_active.load(Ordering::Acquire),
+        0,
+        "shutdown hook must run after child quiescence"
+    );
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        0,
+        "no child work survives after return"
+    );
+}
+
+#[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+fn srv_65_modern_child_task_cancellation_with_failed_write_terminates_connection() {
+    let mut wire = WireScenario::start_with_dispatch(true);
+    wire.send(modern_request(
+        "tools/call",
+        70,
+        Some(serde_json::json!({
+            "name": "pending",
+            "arguments": {
+                "value": wire.subject,
+                "action": "cancel_cx",
+            },
+        })),
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while wire.control.entered.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(wire.control.entered.load(Ordering::Acquire), 1);
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+
+    // Sibling request succeeds and is received by the client before failure injection.
+    wire.send(modern_request("tools/list", 71, None));
+    let sibling = wire.response(71);
+    assert_ok_response(&sibling, "sibling tools/list response");
+    assert_eq!(wire.control.active.load(Ordering::Acquire), 1);
+
+    // Fail transport writes before releasing request 70, so its cancelled error
+    // response cannot be written. ModernDispatchReservation::Drop must latch
+    // worker_failed, proving Cancelled join classification does not mask missing responses.
+    wire.fail_writes();
+    wire.control.released.store(true, Ordering::Release);
+
+    let outcome = wire
+        .outcome
+        .recv_timeout(SCENARIO_DEADLINE)
+        .expect("pump must settle after failed response write");
+    wire.worker.take().unwrap().join().unwrap();
+    let error = outcome.expect_err("connection MUST fail when response write fails");
+    assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(|r| r.as_str()),
+        Some("pump_failure"),
+        "error reason must be pump_failure"
+    );
+    assert_eq!(
+        wire.control.active.load(Ordering::Acquire),
+        0,
+        "no child work survives after return"
+    );
 }

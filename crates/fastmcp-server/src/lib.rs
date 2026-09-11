@@ -160,9 +160,9 @@ use session::{
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-    FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore,
+    FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
@@ -15886,8 +15886,9 @@ impl Server {
             for index in (0..children.len()).rev() {
                 if children[index].is_finished() {
                     let mut child = children.swap_remove(index);
-                    if poll_on_cx(cx, child.join(cx)).is_err() {
-                        worker_failed.store(true, Ordering::Release);
+                    match poll_on_cx(cx, child.join(cx)) {
+                        Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                        Err(_) => worker_failed.store(true, Ordering::Release),
                     }
                 }
             }
@@ -16194,8 +16195,9 @@ impl Server {
                 child.0.wait();
             }
             for mut child in children {
-                if poll_on_cx(cx, child.join(cx)).is_err() {
-                    exit_code = 1;
+                match poll_on_cx(cx, child.join(cx)) {
+                    Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                    Err(_) => exit_code = 1,
                 }
             }
             if owns_server_lifecycle {
@@ -25800,6 +25802,31 @@ mod lib_unit_tests {
                 return Err(McpError::invalid_params("Task not found"));
             }
             Ok(state.cancellation_requests.contains(task_id))
+        }
+
+        fn retention_clock_now(&self) -> Instant {
+            self.now()
+        }
+
+        fn task_retention_deadline_if_current(
+            &self,
+            task_id: &fastmcp_protocol::FinalTaskId,
+            generation: u64,
+        ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generations.get(task_id) != Some(&generation) {
+                return Ok(None);
+            }
+            if let Some(expires_at) = state.expires_at.get(task_id).copied() {
+                Ok(Some(FinalTaskRetentionDeadline::Finite(expires_at)))
+            } else if state.tasks.contains_key(task_id) {
+                Ok(Some(FinalTaskRetentionDeadline::Unlimited))
+            } else {
+                Ok(None)
+            }
         }
     }
 
