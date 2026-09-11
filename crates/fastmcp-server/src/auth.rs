@@ -346,6 +346,22 @@ fn scan_credential_map<'a>(
     Ok(())
 }
 
+fn is_header_access_token_field(key: &str) -> bool {
+    key.eq_ignore_ascii_case("authorization") || ACCESS_TOKEN_FIELDS.contains(&key)
+}
+
+fn scan_headers_credential_map<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    candidate: &mut Option<&'a serde_json::Value>,
+) -> Result<(), CredentialSourceError> {
+    for (key, value) in map {
+        if is_header_access_token_field(key) {
+            record_credential_candidate(candidate, value)?;
+        }
+    }
+    Ok(())
+}
+
 fn single_in_band_credential(
     params: Option<&serde_json::Value>,
 ) -> Option<Result<&serde_json::Value, CredentialSourceError>> {
@@ -361,12 +377,15 @@ fn single_in_band_credential(
     if let Err(error) = scan_credential_map(map, &mut candidate) {
         return Some(Err(error));
     }
-    for container in ["_meta", "headers"] {
-        if let Some(nested) = map.get(container).and_then(serde_json::Value::as_object)
-            && let Err(error) = scan_credential_map(nested, &mut candidate)
-        {
-            return Some(Err(error));
-        }
+    if let Some(nested) = map.get("_meta").and_then(serde_json::Value::as_object)
+        && let Err(error) = scan_credential_map(nested, &mut candidate)
+    {
+        return Some(Err(error));
+    }
+    if let Some(nested_headers) = map.get("headers").and_then(serde_json::Value::as_object)
+        && let Err(error) = scan_headers_credential_map(nested_headers, &mut candidate)
+    {
+        return Some(Err(error));
     }
     candidate.map(Ok)
 }
@@ -447,13 +466,17 @@ pub(crate) fn strip_recognized_access_credentials(params: &mut Option<serde_json
         return;
     };
     remove_access_token_fields(map);
-    for container in ["_meta", "headers"] {
-        if let Some(nested) = map
-            .get_mut(container)
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            remove_access_token_fields(nested);
-        }
+    if let Some(nested) = map
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        remove_access_token_fields(nested);
+    }
+    if let Some(nested_headers) = map
+        .get_mut("headers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        remove_headers_access_token_fields(nested_headers);
     }
 }
 
@@ -461,6 +484,10 @@ fn remove_access_token_fields(map: &mut serde_json::Map<String, serde_json::Valu
     for key in ACCESS_TOKEN_FIELDS {
         map.remove(key);
     }
+}
+
+fn remove_headers_access_token_fields(map: &mut serde_json::Map<String, serde_json::Value>) {
+    map.retain(|key, _| !is_header_access_token_field(key));
 }
 
 /// Authentication provider interface.
@@ -1960,5 +1987,218 @@ mod tests {
         assert_eq!(req.method, "prompts/get");
         assert_eq!(req.request_id, 99);
         assert!(req.params.is_some());
+    }
+
+    // ── AUTH-01 Implementation A tests ──────────────────────────────
+
+    #[test]
+    fn auth_01_a_positive() {
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(verifier);
+        let params = serde_json::json!({
+            "headers": {
+                "content-type": "application/json"
+            },
+            "arguments": {
+                "Token": "ordinary-arg"
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: Some("Bearer valid-token-123"),
+            request_id: 1,
+        };
+
+        assert!(req.credential_sources_are_admissible());
+        assert!(!req.has_multiple_credential_sources());
+        let token = req.access_token().expect("native transport token admitted");
+        assert_eq!(token.scheme, "Bearer");
+        assert_eq!(token.token, "valid-token-123");
+
+        let auth = provider
+            .authenticate(&ctx(), req)
+            .expect("provider authenticates");
+        assert_eq!(auth.subject.as_deref(), Some("alice"));
+        let fingerprint = principal_fingerprint(Some(&auth)).expect("fingerprint computed");
+        assert_eq!(
+            fingerprint,
+            principal_fingerprint(Some(&AuthContext::with_subject("alice"))).unwrap()
+        );
+    }
+
+    #[test]
+    fn auth_01_a_planted_negative() {
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(verifier);
+        // Near-identical request differing ONLY in the forbidden dimension:
+        // params.headers introduces a nested legacy authorization header.
+        let params = serde_json::json!({
+            "headers": {
+                "content-type": "application/json",
+                "AUTHORIZATION": "Bearer in-band-token"
+            },
+            "arguments": {
+                "Token": "ordinary-arg"
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: Some("Bearer valid-token-123"),
+            request_id: 1,
+        };
+
+        assert!(!req.credential_sources_are_admissible());
+        assert!(req.has_multiple_credential_sources());
+        assert!(req.access_token().is_none());
+
+        let err = provider
+            .authenticate(&ctx(), req)
+            .expect_err("must deny ambiguous credential");
+        assert_eq!(err.code, McpErrorCode::ResourceForbidden);
+
+        // Prove stripping removes the in-band authorization header while preserving
+        // non-credential headers and tool arguments.
+        let mut stripped_params = Some(params);
+        strip_recognized_access_credentials(&mut stripped_params);
+        assert_eq!(
+            stripped_params,
+            Some(serde_json::json!({
+                "headers": {
+                    "content-type": "application/json"
+                },
+                "arguments": {
+                    "Token": "ordinary-arg"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn nested_headers_mixed_case_duplicate_with_canonical_spelling_rejected() {
+        let params = serde_json::json!({
+            "headers": {
+                "authorization": "Bearer canon",
+                "AUTHORIZATION": "Bearer uppercase"
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: None,
+            request_id: 1,
+        };
+
+        assert!(req.access_token().is_none());
+        assert!(req.has_multiple_credential_sources());
+        assert!(!req.credential_sources_are_admissible());
+    }
+
+    #[test]
+    fn nested_headers_native_plus_mixed_case_source_rejection() {
+        for header_key in [
+            "authorization",
+            "Authorization",
+            "AUTHORIZATION",
+            "AuThOrIzAtIoN",
+        ] {
+            let params = serde_json::json!({
+                "headers": {
+                    header_key: "Bearer in-band"
+                }
+            });
+            let req = AuthRequest {
+                method: "tools/call",
+                params: Some(&params),
+                transport_authorization: Some("Bearer native"),
+                request_id: 1,
+            };
+            assert!(
+                req.access_token().is_none(),
+                "should reject conflicting source for header spelling {header_key}"
+            );
+            assert!(req.has_multiple_credential_sources());
+            assert!(!req.credential_sources_are_admissible());
+        }
+    }
+
+    #[test]
+    fn nested_headers_stripping_removes_all_recognized_header_spellings_and_aliases() {
+        let mut params = Some(serde_json::json!({
+            "headers": {
+                "AUTHORIZATION": "Bearer secret1",
+                "AuThOrIzAtIoN": "Bearer secret2",
+                "token": "token-secret",
+                "content-type": "application/json",
+                "x-request-id": "12345"
+            },
+            "arguments": {
+                "Token": "application-argument"
+            }
+        }));
+
+        strip_recognized_access_credentials(&mut params);
+
+        assert_eq!(
+            params,
+            Some(serde_json::json!({
+                "headers": {
+                    "content-type": "application/json",
+                    "x-request-id": "12345"
+                },
+                "arguments": {
+                    "Token": "application-argument"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn nested_headers_malformed_value_rejected() {
+        let params = serde_json::json!({
+            "headers": {
+                "AUTHORIZATION": "Bearer "
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: None,
+            request_id: 1,
+        };
+
+        assert!(req.access_token().is_none());
+        assert!(!req.credential_sources_are_admissible());
+        assert!(!req.has_multiple_credential_sources());
+    }
+
+    #[test]
+    fn preservation_of_token_ordinary_tool_argument() {
+        let params = serde_json::json!({
+            "Token": "ordinary-arg-value",
+            "arguments": {
+                "Token": "another-arg"
+            }
+        });
+        let req = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: Some("Bearer valid"),
+            request_id: 1,
+        };
+
+        let token = req.access_token().expect("native token extracted");
+        assert_eq!(token.token, "valid");
+        assert!(!req.has_in_band_credential_source());
+        assert!(!req.has_multiple_credential_sources());
+
+        let mut stripped = Some(params.clone());
+        strip_recognized_access_credentials(&mut stripped);
+        assert_eq!(stripped, Some(params));
     }
 }
