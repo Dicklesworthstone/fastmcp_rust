@@ -14,7 +14,7 @@ the dated nightly toolchain remain outside dependency upgrades.
 | asupersync | 0.4.10 | 0.5.0 | Passed: original four shutdown tests and caller-capability test after two production scheduling fixes; full suite pending |
 | console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 2, live CLI integration 74 |
 | dirs | 6.0.0 | 7.0.0 | Passed: all 727 client library tests with all features |
-| html5ever | 0.39.0 | 0.40.0 | Research complete; update pending |
+| html5ever | 0.39.0 | 0.40.0 | Passed: both Apps graphs compile and their selected tests pass |
 | toml | 1.1.5 | 1.1.6 | Research complete; update pending |
 | trybuild | 1.0.120 | 1.0.121 | Research complete; update pending |
 
@@ -106,6 +106,14 @@ progress count incorrectly carried forward a 16-test contract inventory;
 the actual two discovered contract tests are authoritative.
 
 ### Remaining migration research
+
+The html5ever 0.40 update compiled both optional Apps graphs. Source10
+(`1d259515d5c2f4fe19ace1a69c158f75ac27b5422fb63050053431ee8e5de8ad`)
+passed the selected client and server Apps tests, with no ignored tests.
+Log: `/tmp/fastmcp-release-html5ever-040-ssh-10b-20260912.log`.
+The first invocation started before source transfer completed and failed
+before compilation; that failed attempt remains in the corresponding `10` log.
+Only the corrected invocation after successful transfer provides test evidence.
 
 The dirs 7 update passed all 727 client library tests, zero ignored or
 filtered, in 23.47 seconds on source09. The run includes configuration-path
