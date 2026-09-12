@@ -8,6 +8,7 @@ receipt artifact; callers may remove it under their own retention policy.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import shutil
@@ -82,7 +83,7 @@ class Runner:
     def __init__(self, output: Path, subject_revision: str, br_binary: Path, bv_binary: Path) -> None:
         self.output = output
         self.workspace = output / "workspace"
-        self.db = self.workspace / ".beads" / "canary.db"
+        self.db = self.workspace / ".beads" / "beads.db"
         self.events: list[dict[str, Any]] = []
         self.commands: list[dict[str, Any]] = []
         self.subject_revision = subject_revision
@@ -335,7 +336,7 @@ def issue_status_revision(db_path: Path, issue_id: str) -> int:
     if not isinstance(issue_id, str) or not issue_id.strip():
         raise ValueError("issue_id must be a non-empty string")
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
+    with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id FROM events WHERE issue_id = ? AND event_type = 'status_changed' ORDER BY id DESC LIMIT 1",
@@ -1261,7 +1262,8 @@ def main() -> int:
     if tracked:
         initialized = runner.initialize_isolated_tracker()
         if initialized.returncode == 0:
-            with sqlite3.connect(runner.db) as connection:
+            preflight_uri = f"{runner.db.resolve().as_uri()}?mode=ro"
+            with contextlib.closing(sqlite3.connect(preflight_uri, uri=True)) as connection:
                 rows = connection.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
             preflight["tracker_schema_sha256"] = sha256_bytes(json.dumps(rows, sort_keys=True).encode())
             preflight["isolated_policy_sha256"] = digest_path(runner.workspace / ".beads" / "policy.yaml")
