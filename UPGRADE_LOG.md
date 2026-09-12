@@ -16,7 +16,7 @@ the dated nightly toolchain remain outside dependency upgrades.
 | dirs | 6.0.0 | 7.0.0 | Passed: all 727 client library tests with all features |
 | html5ever | 0.39.0 | 0.40.0 | Passed: both Apps graphs compile and their selected tests pass |
 | toml | 1.1.5 | 1.1.6 | Passed: 46 client configuration tests and all 186 CLI unit tests |
-| trybuild | 1.0.120 | 1.0.121 | Research complete; update pending |
+| trybuild | 1.0.120 | 1.0.121 | Passed: all six downstream compilation harness tests, no golden regeneration |
 
 ### asupersync 0.4.11
 
@@ -106,6 +106,23 @@ progress count incorrectly carried forward a 16-test contract inventory;
 the actual two discovered contract tests are authoritative.
 
 ### Remaining migration research
+
+Trybuild 1.0.121 passed all six downstream harness tests, with zero ignored or
+filtered tests, in 742.91 seconds. This includes unchanged diagnostic fixtures,
+direct Tasks derives, feature and symbol isolation, renamed-facade consumers,
+and bounded child-process exit handling. Source12 SHA256:
+`3ebbe445b2440140ae5ec7548fa65498684c18ae4d8f60aa6a237006b42f43e0`.
+Log: `/tmp/fastmcp-release-trybuild-121-csd-12-20260912.log`; command exited zero.
+
+The first source12 attempt on hz3 was interrupted with exit 143 after sustained
+filesystem waits; it is not a completed test result. Only its two observed
+process groups were terminated, and all files were retained. The identical
+source ran on the previous release host, csd, using the pinned real Cargo in
+a task-private command path. The replacement profile disables debug symbols
+and incremental artifacts (`CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_INCREMENTAL=0`), retaining debug assertions.
+It uses eight compilation jobs and a separate target directory. No shared
+toolchain, RCH routing, or security configuration was modified.
 
 TOML 1.1.6 passed all 46 selected client configuration tests and all 186 CLI
 unit tests, with zero ignored tests. The CLI run includes schema rejection,

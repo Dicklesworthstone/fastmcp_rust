@@ -8,6 +8,11 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.9.0)
 
+- Breaking: custom `FinalTaskStore` implementations must provide
+  `retention_clock_now` and `task_retention_deadline_if_current`. Return the
+  store's monotonic time and the retention deadline for the exact requested
+  generation; stale or absent generations return `None`. The built-in
+  `InMemoryFinalTaskStore` implements both methods.
 - Tasks supervisors stop polling expired work, release its owned execution,
   and let eligible successor work proceed without aborting the service.
 - CLI task watches end on terminal snapshots and reconcile state after the
@@ -19,6 +24,12 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 - Server child cancellation remains cancellation instead of being reported as
   a worker panic. Tests exercise live child-region drain and public retention
   expiry through the actual runtime and HTTP interfaces.
+- Cancelled blocking-handler drains explicitly yield to the caller runtime
+  while waiting for physical completion, preventing shutdown from spinning
+  indefinitely on a current-thread executor.
+- Update asupersync to 0.5.0, preserving caller capability restrictions, and
+  update console, dirs, html5ever, TOML, and trybuild to their current stable
+  releases. The pinned nightly toolchain remains unchanged.
 
 ## [v0.9.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.9.0) -- 2026-09-11
 
