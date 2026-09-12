@@ -377,7 +377,7 @@ fastmcp-rust = "0.9.0"
 ```toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-asupersync = "=0.4.10"
+asupersync = "=0.5.0"
 ```
 
 ### From Source
@@ -642,7 +642,7 @@ cd my-mcp-server
 # Cargo.toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-asupersync = "=0.4.10"
+asupersync = "=0.5.0"
 ```
 
 ### 3. Write Your Server
