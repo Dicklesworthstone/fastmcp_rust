@@ -71,6 +71,64 @@ fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("Hello, {name}!"))
 }
 
+#[test]
+fn poll_on_cx_preserves_caller_capabilities_and_restores_parent() {
+    let ((), report) = asupersync::lab::run_async_under_lab(5050, |root| async move {
+        let parent = Cx::current().expect("lab installs a caller context");
+        let parent_caps = parent.capabilities();
+        assert!(parent.timer_driver().is_some(), "positive timer control");
+
+        for restricted in [false, true] {
+            let caller = if restricted {
+                let _guard = root
+                    .restrict::<asupersync::cx::cap::None>()
+                    .set_current_restricted();
+                Cx::current().expect("capture the caller's narrowed runtime ceiling")
+            } else {
+                root.clone()
+            };
+            let expected_caps = caller.capabilities();
+            let request = McpContext::new(caller.clone(), 1);
+            let mut polls = 0;
+            let greeting = crate::poll_on_cx(
+                &caller,
+                std::future::poll_fn(|task| {
+                    polls += 1;
+                    let ambient = Cx::current().expect("server polling installs the caller");
+                    assert_eq!(ambient.task_id(), caller.task_id());
+                    assert_eq!(ambient.capabilities(), expected_caps);
+                    assert_eq!(ambient.timer_driver().is_some(), !restricted);
+                    if restricted {
+                        assert!(!ambient.capabilities().spawn);
+                        assert!(!ambient.capabilities().io);
+                        assert!(!ambient.capabilities().remote);
+                        assert!(ambient.io().is_none());
+                    }
+                    if polls == 1 {
+                        task.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(greet(&request, "caller".to_owned()))
+                    }
+                }),
+            );
+            assert_eq!(
+                greeting.expect("authorized pure tool completes"),
+                "Hello, caller!"
+            );
+            assert_eq!(polls, 2);
+            let restored = Cx::current().expect("server polling restores its parent");
+            assert_eq!(restored.task_id(), parent.task_id());
+            assert_eq!(restored.capabilities(), parent_caps);
+            assert!(restored.timer_driver().is_some());
+        }
+    });
+    assert!(report.quiescent, "{report:?}");
+    assert!(report.oracle_report.total > 0, "{report:?}");
+    assert!(report.oracle_report.all_passed(), "{report:?}");
+    assert!(report.invariant_violations.is_empty(), "{report:?}");
+}
+
 #[tool(
     name = "greet_default",
     description = "Greets a user by name (with a default)",

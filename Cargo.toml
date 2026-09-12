@@ -34,9 +34,10 @@ strip = true
 # owners install an ambient context only at their top-level runtime boundary.
 # Test-only constructors remain opt-in at the test or facade-lab boundary and
 # must not leak into the workspace production graph.
-# 0.4.11 and 0.5.0 regress bounded shutdown; retain the verified runtime until
-# those ownership tests pass. Failed upgrade evidence is in UPGRADE_LOG.md.
-asupersync = { version = "=0.4.10" }
+# 0.5.0 preserves runtime capability ceilings when caller-owned contexts are
+# installed by server polling. Test-only constructors remain opt-in above.
+# Bounded shutdown migration is still under verification; see UPGRADE_LOG.md.
+asupersync = { version = "=0.5.0" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
