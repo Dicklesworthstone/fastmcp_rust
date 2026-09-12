@@ -15846,6 +15846,15 @@ IFS= read -r end
     #[cfg(feature = "tasks")]
     #[test]
     fn fnd_04_proxy_listener_region_admission_preserves_parent_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LiveWork(Arc<AtomicBool>);
+        impl Drop for LiveWork {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("native runtime builds");
@@ -15875,10 +15884,36 @@ IFS= read -r end
                         .spawn(|_| async { 42 })
                         .expect("listener region can execute work");
                     assert_eq!(body.join(&parent).await.expect("body joins"), 42);
+                    let started = Arc::new(AtomicBool::new(false));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let child_started = Arc::clone(&started);
+                    let child_dropped = Arc::clone(&dropped);
+                    let (unreleased, mut parked) = asupersync::channel::oneshot::channel::<()>();
+                    let live_work = nested
+                        .cx()
+                        .spawn(move |child_cx| async move {
+                            let _live = LiveWork(child_dropped);
+                            child_started.store(true, Ordering::Release);
+                            let _ = parked.recv(&child_cx).await;
+                        })
+                        .expect("nested region admits live work");
+                    while !started.load(Ordering::Acquire) {
+                        asupersync::runtime::yield_now().await;
+                    }
+                    assert!(!dropped.load(Ordering::Acquire));
+                    nested
+                        .cancel(asupersync::CancelReason::user("listener closes"))
+                        .expect("the child subtree cancels independently");
+                    assert!(!parent.is_cancel_requested());
                     nested
                         .close()
                         .await
                         .expect("nested listener region quiesces");
+                    assert!(
+                        dropped.load(Ordering::Acquire),
+                        "close must drain live work before returning, with its join handle retained"
+                    );
+                    drop((live_work, unreleased));
                     region.close().await.expect("listener region quiesces");
                     assert!(
                         super::open_owned_proxy_listener_region(&retained, kind)
