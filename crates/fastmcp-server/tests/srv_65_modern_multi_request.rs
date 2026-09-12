@@ -776,7 +776,12 @@ impl WireScenario {
             let result = runtime.block_on(async move {
                 let root = Cx::current().unwrap();
                 if !separate_dispatch {
-                    return server.run_split_transport_returning_with_cx(&root, recv, send);
+                    let mut pump = root
+                        .spawn_blocking(move |pump_cx| {
+                            server.run_split_transport_returning_with_cx(&pump_cx, recv, send)
+                        })
+                        .expect("the caller runtime must admit the same-context split pump");
+                    return pump.join(&root).await.expect("same-context pump must join");
                 }
                 let dispatch_cx = root.clone();
                 let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -798,12 +803,25 @@ impl WireScenario {
                     })
                     .unwrap();
                 if hold_first_poll {
-                    // block_on uses the caller thread. Let spawn_blocking's
-                    // async wrapper run on the separate scheduler worker and
-                    // start the pump before deliberately occupying that worker.
-                    started_rx
-                        .recv_timeout(Duration::from_secs(3))
-                        .expect("blocking pump must start before holding the worker");
+                    // The blocking-pool wrapper needs this current-thread
+                    // executor to poll it before the pump can announce start.
+                    // Keep that startup wait cooperative, then deliberately
+                    // occupy the worker to test cancellation before first poll.
+                    let started_deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    loop {
+                        match started_rx.try_recv() {
+                            Ok(()) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                panic!("blocking pump ended before announcing start")
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                        assert!(
+                            std::time::Instant::now() < started_deadline,
+                            "blocking pump must start before holding the worker"
+                        );
+                        asupersync::time::sleep(root.now(), Duration::from_millis(1)).await;
+                    }
                     let mut held_worker = root
                         .spawn(move |_cx| async move {
                             // No input reaches dispatch until this task owns
