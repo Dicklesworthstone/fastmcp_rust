@@ -1,5 +1,40 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-09-12 | **Project:** fastmcp_rust | **Language:** Rust
+
+## Current upgrade run
+
+The crates.io API was queried for all 38 direct registry dependencies. Six have
+new stable releases; the other 32 pins are current. Registry build metadata
+suffixes are ignored when comparing versions. Internal path dependencies and
+the dated nightly toolchain remain outside dependency upgrades.
+
+| Dependency | Current | Target | Status |
+|---|---|---|---|
+| asupersync | 0.4.10 | 0.4.11 | Updated; consumer tests pending |
+| console | 0.16.4 | 0.16.6 | Research pending |
+| dirs | 6.0.0 | 7.0.0 | Research pending |
+| html5ever | 0.39.0 | 0.40.0 | Research pending |
+| toml | 1.1.5 | 1.1.6 | Research pending |
+| trybuild | 1.0.120 | 1.0.121 | Research pending |
+
+### asupersync 0.4.11
+
+[Published release](https://github.com/Dicklesworthstone/asupersync/releases/tag/v0.4.11)
+at `9b114c1f2305f20f8373a476c9decc74122b961c` retains the documented public API
+floor. It repairs runtime teardown, cancellation and I/O readiness. Its
+current-thread runtime now drives child tasks on the calling thread while
+`block_on` runs; a root that synchronously waits for a child can deadlock.
+FastMCP's bridge and proxy consumers therefore require runtime tests, not just
+a successful compile. No passing upgrade test is claimed yet.
+
+Full product tests, strict Clippy, dependency audit, and release artifact checks
+remain pending. Historical FND attestation failures retain their original
+revision boundary; dependency hashes will not be rewritten to manufacture a
+passing attestation.
+
+---
+
 **Date:** 2026-09-04  |  **Project:** fastmcp_rust  |  **Language:** Rust
 
 ## Summary

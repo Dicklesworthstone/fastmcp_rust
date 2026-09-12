@@ -34,10 +34,10 @@ strip = true
 # owners install an ambient context only at their top-level runtime boundary.
 # Test-only constructors remain opt-in at the test or facade-lab boundary and
 # must not leak into the workspace production graph.
-# =0.4.10 (was =0.4.9): latest crates.io patch on the v0.4.3 public floor.
-# Adds lock-free cancellation observation for hot loops and repairs the
-# upstream RaptorQ lib-test build. No public item was removed or renamed.
-asupersync = { version = "=0.4.10" }
+# =0.4.11 retains the v0.4.3 public API floor and fixes runtime teardown,
+# cancellation and I/O readiness. Current-thread roots must yield while
+# waiting for child tasks because they now drive their runtime's worker.
+asupersync = { version = "=0.4.11" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
