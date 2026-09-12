@@ -1651,23 +1651,55 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
-    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
-    #[test]
-    fn config_client_auto_reopens_a_fresh_child_for_exact_legacy_fallback() {
-        let script = r#"IFS= read -r first || exit 1;
+    #[cfg(unix)]
+    fn legacy_fallback_config_fixture(discovery_error_id: u64) -> (ServerConfig, PathBuf) {
+        let trace = std::env::temp_dir().join(format!(
+            "fastmcp-config-auto-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock follows Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::File::create_new(&trace).expect("reserve a unique child trace");
+        let script = r#"printf 'spawn:%s\n' "$$" >> "$FASTMCP_CONFIG_SPAWN_TRACE" || exit 90;
+            IFS= read -r first || exit 1;
             case "$first" in
                 *server/discover*)
-                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}';
+                    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$FASTMCP_CONFIG_DISCOVERY_ERROR_ID";
                     exec sleep 2 ;;
                 *initialize*2024-11-05*)
                     printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"configured-legacy","version":"1.0.0"}}}';
                     IFS= read -r lifecycle || exit 1;
                     case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
-                    exec sleep 2 ;;
+                    IFS= read -r ping || exit 2;
+                    case "$ping" in *'"method":"ping"'*) ;; *) exit 3 ;; esac;
+                    case "$ping" in *'"id":2}'*|*'"id":2,'*) ;; *) exit 4 ;; esac;
+                    case "$ping" in *'"params":{}'*) ;; *) exit 5 ;; esac;
+                    printf 'ping:%s\n' "$$" >> "$FASTMCP_CONFIG_SPAWN_TRACE" || exit 91;
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}';
+                    IFS= read -r end ;;
                 *) exit 1 ;;
             esac"#;
+        let server = ServerConfig::new("sh")
+            .with_args(["-c", script])
+            .with_env(
+                "FASTMCP_CONFIG_DISCOVERY_ERROR_ID",
+                discovery_error_id.to_string(),
+            )
+            .with_env(
+                "FASTMCP_CONFIG_SPAWN_TRACE",
+                trace.to_str().expect("test trace path is UTF-8"),
+            );
+        (server, trace)
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn config_client_auto_reopens_a_fresh_child_for_exact_legacy_fallback() {
+        let (server, trace) = legacy_fallback_config_fixture(1);
         let mut config = McpConfig::new();
-        config.add_server("legacy", ServerConfig::new("sh").with_args(["-c", script]));
+        config.add_server("legacy", server);
 
         let mut client = config
             .client(&Cx::for_request(), "legacy")
@@ -1678,7 +1710,26 @@ mod tests {
             client.selected_protocol_era(),
             Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
         );
+        client
+            .ping()
+            .expect("the fresh configured legacy child is usable");
         client.close().expect("configured legacy client cleanup");
+        let trace = std::fs::read_to_string(trace).expect("read the complete child trace");
+        let events: Vec<_> = trace.lines().collect();
+        assert_eq!(
+            events.len(),
+            3,
+            "exactly two children and one ping: {trace}"
+        );
+        let probe = events[0].strip_prefix("spawn:").expect("discovery child");
+        let legacy = events[1]
+            .strip_prefix("spawn:")
+            .expect("fresh legacy child");
+        assert_ne!(
+            probe, legacy,
+            "fallback must not reuse the discovery process"
+        );
+        assert_eq!(events[2], format!("ping:{legacy}"));
     }
 
     #[cfg(unix)]
@@ -1695,7 +1746,12 @@ mod tests {
             case "$discover" in *server/discover*) ;; *) exit 94 ;; esac;
             case "$discover" in *fastmcp-client:modern*) ;; *) exit 95 ;; esac;
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"configured-modern","version":"1.0.0"}}}}';
-            exec sleep 2"#;
+            IFS= read -r ping || exit 96;
+            case "$ping" in *'"method":"ping"'*) ;; *) exit 97 ;; esac;
+            case "$ping" in *'"id":2}'*|*'"id":2,'*) ;; *) exit 98 ;; esac;
+            case "$ping" in *2026-07-28*) ;; *) exit 99 ;; esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}';
+            IFS= read -r end"#;
         let mut config = McpConfig::new();
         config.add_server(
             "modern",
@@ -1725,29 +1781,18 @@ mod tests {
         );
         assert_eq!(client.protocol_version(), "2026-07-28");
         assert_eq!(client.request_timeout_policy(), timeout_policy);
+        client
+            .ping()
+            .expect("the configured modern session is usable");
         client.close().expect("configured modern client cleanup");
     }
 
-    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[cfg(unix)]
     #[test]
     fn config_client_wrong_id_discovery_never_authorizes_legacy_fallback() {
-        let script = r#"IFS= read -r first || exit 1;
-            case "$first" in
-                *server/discover*)
-                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found"}}';
-                    exec sleep 2 ;;
-                *initialize*2024-11-05*)
-                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"forbidden-legacy","version":"1.0.0"}}}';
-                    IFS= read -r lifecycle || exit 1;
-                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
-                    exec sleep 2 ;;
-                *) exit 1 ;;
-            esac"#;
+        let (server, trace) = legacy_fallback_config_fixture(2);
         let mut config = McpConfig::new();
-        config.add_server(
-            "wrong-id",
-            ServerConfig::new("sh").with_args(["-c", script]),
-        );
+        config.add_server("wrong-id", server);
         let config_before = config.to_json();
         let timeout_policy = RequestTimeoutPolicy::new(
             std::time::Duration::from_millis(100),
@@ -1767,6 +1812,14 @@ mod tests {
 
         assert!(matches!(error, ConfigError::ClientError(_)));
         assert_eq!(config.to_json(), config_before);
+        let trace = std::fs::read_to_string(trace).expect("read the rejected discovery trace");
+        let events: Vec<_> = trace.lines().collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "wrong-ID refusal must spawn only one child: {trace}"
+        );
+        assert!(events[0].starts_with("spawn:"));
     }
 
     #[test]
