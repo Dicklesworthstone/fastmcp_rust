@@ -11,9 +11,9 @@ the dated nightly toolchain remain outside dependency upgrades.
 
 | Dependency | Current | Target | Status |
 |---|---|---|---|
-| asupersync | 0.4.10 | 0.5.0 | Deferred: both 0.4.11 and 0.5.0 regress bounded shutdown; retain verified 0.4.10 |
-| console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 16, live CLI integration 74 |
-| dirs | 6.0.0 | 7.0.0 | Research complete; update pending |
+| asupersync | 0.4.10 | 0.5.0 | Passed: original four shutdown tests and caller-capability test after two production scheduling fixes; full suite pending |
+| console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 2, live CLI integration 74 |
+| dirs | 6.0.0 | 7.0.0 | Passed: all 727 client library tests with all features |
 | html5ever | 0.39.0 | 0.40.0 | Research complete; update pending |
 | toml | 1.1.5 | 1.1.6 | Research complete; update pending |
 | trybuild | 1.0.120 | 1.0.121 | Research complete; update pending |
@@ -69,26 +69,48 @@ isolated candidate process group was then terminated; this is a failed run,
 not completed suite evidence. The logs are
 `/tmp/fastmcp-release-asupersync-0410-shutdown-ssh-03-20260912.log` and
 `/tmp/fastmcp-release-asupersync-050-shutdown-ssh-04-20260912.log`.
-Retain 0.4.10 for this release. Fixing the upstream runtime interaction remains
-required before either newer version can be adopted; no assertions, shutdown
-bounds, or runtime behavior were weakened to admit the upgrade.
+These failures initially led to retaining 0.4.10 while investigating the
+runtime interaction. No assertions or shutdown bounds were weakened.
 
 Subsequent fetch found independently pushed commit `57899320`, which adopts
 0.5.0 for caller capability ceilings. That work includes a real polling
-regression and must be integrated before the final runtime decision. The
-shutdown failures above remain unresolved release blockers for its pin;
-the earlier retention decision applies only to the verified local baseline.
+regression. It was preserved in merge `d0d62955`. The failure was then traced
+to two FastMCP blocking-completion loops: cancelled `Sleep` becomes ready
+immediately, so HTTP cleanup and modern router dispatch can monopolize one
+current-thread scheduler poll. Both loops now explicitly yield after cancelled
+sleep while retaining the exact physical-completion requirement.
+
+The HTTP-only correction passed all three ownership cases in source07; stdio
+still failed because the router loop had the same defect. A wakeable-channel
+test-harness experiment in source08 did not fix stdio and was reverted. The
+original stdio channel, 30-second deadline, and all assertions are restored.
+Source09 verifies both production fixes with the original four shutdown tests
+and the upstream caller-capability regression: all five passed, none ignored,
+in 15.79 seconds. Snapshot SHA256:
+`5e4d5cad839d2bd61ff4b97911d57f2bb9b437a28f5472b35b3923216f039fcf`.
+Log: `/tmp/fastmcp-release-asupersync-050-shutdown-ssh-09-20260912.log`.
+Independent review checked both production loops and confirmed that physical
+completion, error handling, and the original test assertions remain intact.
+The full workspace matrix remains required before release.
 
 ### console 0.16.6
 
 Source snapshot `151041c934692eb62af8177847e11b6ee9b218419b39ea6e0e101ce73f3f2e7b`
-passed all 276 selected CLI tests (186 unit, 16 documentation contract, 74 live
+passed all 262 selected CLI tests (186 unit, 2 documentation contract, 74 live
 integration), with zero ignored or filtered tests. Direct SSH log:
 `/tmp/fastmcp-release-console-0166-ssh-05b-20260912.log`. The first invocation
 incorrectly selected a nonexistent CLI library target and exited before
 compilation; the corrected command selects its binary targets.
+The fixture binary contains no unit tests and earns no test credit. An earlier
+progress count incorrectly carried forward a 16-test contract inventory;
+the actual two discovered contract tests are authoritative.
 
 ### Remaining migration research
+
+The dirs 7 update passed all 727 client library tests, zero ignored or
+filtered, in 23.47 seconds on source09. The run includes configuration-path
+selection, actual configured connections, HTTP, and WebSocket consumers.
+Log: `/tmp/fastmcp-release-dirs-070-ssh-09-20260912.log`.
 
 - [console 0.16.4–0.16.6](https://github.com/console-rs/console/compare/0.16.4...0.16.6):
   repairs OSC/DCS stripping and UTF-8 truncation, improves visible-width
@@ -98,8 +120,10 @@ compilation; the corrected command selects its binary targets.
   FastMCP uses `home_dir` and `data_dir`, whose APIs remain unchanged.
 - [html5ever 0.39–0.40 source comparison](https://github.com/servo/html5ever/compare/ce64836c685025a5fef0860fa2e9c80b2683e8d0...a193ea7f2492d1e51eb32955a09c241345348dba):
   updates markup5ever and prevents a truncated meta-charset panic. Its Rust
-  1.85 minimum is below this project's pinned compiler. Both optional Apps
-  consumers require parser/sanitizer tests.
+  1.85 minimum is below this project's pinned compiler. It is an optional
+  dependency in both Apps graphs, but no current production code calls its
+  parser. Compile those graphs and run their existing Apps tests; do not claim
+  parser/sanitizer runtime verification or newly implemented HTML handling.
 - [toml 1.1.5–1.1.6 source comparison](https://github.com/toml-rs/toml/compare/e93ed4e1dec245fb523aec2afd0a300da4207f4e...572c005d80cca5f7bd163805c2f33ba0a5207b6d):
   removes unnecessary parser key clones; verify CLI configuration parsing.
 - [trybuild 1.0.120–1.0.121](https://github.com/dtolnay/trybuild/compare/1.0.120...1.0.121):
