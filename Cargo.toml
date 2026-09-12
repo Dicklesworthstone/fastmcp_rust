@@ -71,7 +71,7 @@ glob = { version = "=0.3.4" }
 console = { version = "=0.16.6" }
 
 # Configuration file parsing
-toml = { version = "=1.1.5" }
+toml = { version = "=1.1.6" }
 dirs = { version = "=7.0.0" }
 
 # FND-01 foundation pins (exact feature surfaces)

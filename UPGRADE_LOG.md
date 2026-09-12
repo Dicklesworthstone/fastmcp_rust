@@ -15,7 +15,7 @@ the dated nightly toolchain remain outside dependency upgrades.
 | console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 2, live CLI integration 74 |
 | dirs | 6.0.0 | 7.0.0 | Passed: all 727 client library tests with all features |
 | html5ever | 0.39.0 | 0.40.0 | Passed: both Apps graphs compile and their selected tests pass |
-| toml | 1.1.5 | 1.1.6 | Research complete; update pending |
+| toml | 1.1.5 | 1.1.6 | Passed: 46 client configuration tests and all 186 CLI unit tests |
 | trybuild | 1.0.120 | 1.0.121 | Research complete; update pending |
 
 ### asupersync 0.4.11
@@ -106,6 +106,12 @@ progress count incorrectly carried forward a 16-test contract inventory;
 the actual two discovered contract tests are authoritative.
 
 ### Remaining migration research
+
+TOML 1.1.6 passed all 46 selected client configuration tests and all 186 CLI
+unit tests, with zero ignored tests. The CLI run includes schema rejection,
+credential redaction, and actual server command execution. Source11 SHA256:
+`e0e6022ad89f3642ce2b3e998a7dd218efe714eab96d6c900d54c7161d92e79a`.
+Log: `/tmp/fastmcp-release-toml-116-ssh-11-20260912.log`; command exited zero.
 
 The html5ever 0.40 update compiled both optional Apps graphs. Source10
 (`1d259515d5c2f4fe19ace1a69c158f75ac27b5422fb63050053431ee8e5de8ad`)
