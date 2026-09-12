@@ -12271,7 +12271,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
         } else {
             let completion = if cancel_after_ack {
                 r#"IFS= read -r cancel_get || exit 105
-case "$cancel_get" in *'"method":"notifications/cancelled"'*'"requestId":6'*) ;; *) exit 106 ;; esac"#
+case "$cancel_get" in *'"method":"notifications/cancelled"'*'"requestId":6,'*|*'"method":"notifications/cancelled"'*'"requestId":6}'*) ;; *) exit 106 ;; esac"#
                     .to_owned()
             } else {
                 format!(r#"printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{snapshot}}}'"#)
@@ -12309,7 +12309,7 @@ case "$second_ping" in *'"method":"ping"'*'"id":5'*) ;; *) exit 98 ;; esac
 {reconciliation}
 {event}
 IFS= read -r control || exit 99
-case "$control" in *'"method":"notifications/cancelled"'*'"requestId":4'*) ;; *) exit 100 ;; esac
+case "$control" in *'"method":"notifications/cancelled"'*'"requestId":4,'*|*'"method":"notifications/cancelled"'*'"requestId":4}}'*) ;; *) exit 100 ;; esac
 {late_ping}
 IFS= read -r recovery || exit 101
 case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":{recovery_id}'*) ;; *) exit 102 ;; esac
