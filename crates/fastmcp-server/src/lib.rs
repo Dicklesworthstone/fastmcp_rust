@@ -14891,6 +14891,12 @@ impl Server {
     /// Transport failures carry fixed `stage` and `kind` fields in the error
     /// data without copying peer-controlled I/O or codec text.
     ///
+    /// This entry point and [`Transport::recv`] are synchronous. When the
+    /// caller uses an async runtime, run this loop through [`Cx::spawn_blocking`],
+    /// pass the closure's child context here, and await its task handle from
+    /// the caller. Calling the loop directly on a cooperative runtime worker
+    /// can prevent that same runtime from polling the request children.
+    ///
     /// # Errors
     ///
     /// Returns an error when startup fails, a fatal receive/protocol failure is

@@ -2425,6 +2425,9 @@ pub mod auto {
         /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
         /// not terminate the process, so embedding applications retain
         /// structured shutdown and error handling.
+        /// This is a synchronous loop: async callers must use their
+        /// [`Cx::spawn_blocking`] pool and await its task handle, passing the
+        /// blocking closure's child context into this method.
         pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
         where
             T: crate::Transport + Send + 'static,
@@ -6989,6 +6992,9 @@ pub mod modern {
         /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
         /// not terminate the process, so embedding applications retain
         /// structured shutdown and error handling.
+        /// This is a synchronous loop: async callers must use their
+        /// [`Cx::spawn_blocking`] pool and await its task handle, passing the
+        /// blocking closure's child context into this method.
         pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
         where
             T: crate::Transport + Send + 'static,
@@ -7729,6 +7735,9 @@ pub mod legacy_2024 {
         /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
         /// not terminate the process, so embedding applications retain
         /// structured shutdown and error handling.
+        /// This is a synchronous loop: async callers must use their
+        /// [`Cx::spawn_blocking`] pool and await its task handle, passing the
+        /// blocking closure's child context into this method.
         pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
         where
             T: crate::Transport + Send + 'static,

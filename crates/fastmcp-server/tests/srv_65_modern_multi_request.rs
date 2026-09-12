@@ -174,10 +174,21 @@ fn run_scenario(label: &'static str, requests: Vec<JsonRpcRequest>) -> ScenarioO
         .spawn(move || {
             let run = block_on(async move {
                 let cx = Cx::current().expect("the asupersync runtime installs a current Cx");
-                Server::new("srv-65-multi-request", "1.0.0")
+                let server = Server::new("srv-65-multi-request", "1.0.0")
                     .tool(Echo)
-                    .build()
-                    .run_transport_returning_with_cx(&cx, transport)
+                    .build();
+                // Transport::recv and this returning entry point are
+                // synchronous. Keep the caller's current-thread executor
+                // free to drive request children while its blocking pool
+                // owns the transport loop.
+                let mut pump = cx
+                    .spawn_blocking(move |pump_cx| {
+                        server.run_transport_returning_with_cx(&pump_cx, transport)
+                    })
+                    .expect("the caller runtime must admit the transport pump");
+                pump.join(&cx)
+                    .await
+                    .expect("the caller-owned pump must report a final status")
             });
             // Send before the thread ends so the receiver never waits on a
             // join that a panicking dispatcher would never complete.
