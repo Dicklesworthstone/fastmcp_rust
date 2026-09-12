@@ -36,7 +36,7 @@ strip = true
 # must not leak into the workspace production graph.
 # 0.5.0 preserves runtime capability ceilings when caller-owned contexts are
 # installed by server polling. Test-only constructors remain opt-in above.
-# Bounded shutdown migration is still under verification; see UPGRADE_LOG.md.
+# Bounded shutdown migration and product-profile verification: UPGRADE_LOG.md.
 asupersync = { version = "=0.5.0" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and

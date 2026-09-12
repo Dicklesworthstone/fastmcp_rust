@@ -11,7 +11,7 @@ the dated nightly toolchain remain outside dependency upgrades.
 
 | Dependency | Current | Target | Status |
 |---|---|---|---|
-| asupersync | 0.4.10 | 0.5.0 | Passed: original four shutdown tests and caller-capability test after two production scheduling fixes; full suite pending |
+| asupersync | 0.4.10 | 0.5.0 | Passed: original shutdown/capability regressions and default/all-feature product profiles after the scheduling and test-caller fixes below |
 | console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 2, live CLI integration 74 |
 | dirs | 6.0.0 | 7.0.0 | Passed: all 727 client library tests with all features |
 | html5ever | 0.39.0 | 0.40.0 | Passed: both Apps graphs compile and their selected tests pass |
@@ -161,10 +161,38 @@ Log: `/tmp/fastmcp-release-dirs-070-ssh-09-20260912.log`.
   renames its target metadata dependency from `target-triple` to `target-tuple`.
   All six downstream compile harness tests must run after upgrading.
 
-Full product tests, strict Clippy, dependency audit, and release artifact checks
-remain pending. Historical FND attestation failures retain their original
-revision boundary; dependency hashes will not be rewritten to manufacture a
-passing attestation.
+### Release verification
+
+The default and all-feature product profiles passed through a composed,
+scope-derived verification run. Source15 (`7f6aaad3`) completed the unchanged
+CLI, client, core, protocol, and facade default tests, including all six
+downstream compilation tests. It then exposed a test-caller error: the modern
+pump integration harness synchronously blocked the current-thread executor.
+The corrected harness uses the caller's blocking pool and awaits startup
+cooperatively, retaining its original deadlines and assertions. Source17
+(`bf37905d`) passed all eight default and eleven no-default pump scenarios.
+
+The source17 continuation passed default server and transport tests, all-feature
+component and facade product tests, both doctest profiles, both client feature
+variants, and protocol/workflow integration. Its six downstream compilation
+tests passed in 696.86 seconds without changing diagnostic fixtures. All 41
+live CLI tests ran against the actual echo server with none ignored. Both
+workspace/all-target compiler checks and both strict Clippy profiles passed.
+The first strict documentation build found a link to the feature-gated
+WebSocket module; the link now targets its always-present transport namespace
+and names the required feature. Final documentation and artifact results are
+recorded separately in the release receipts.
+
+Logs: `/tmp/fastmcp-release-full-gate-csd-15-20260912.log`,
+`/tmp/fastmcp-release-srv65-csd-17-20260912.log`, and
+`/tmp/fastmcp-release-continuation-gate-csd-17-20260912.log`.
+This is not a claim that either full-workspace invocation completed in one run.
+The dependency audit found no new advisories outside the existing exceptions,
+and the locked production graph contains no banned runtime dependencies.
+The historical FND attestation target remains bound to its original dependency
+snapshot and is excluded from the all-feature product invocation. Its hashes
+are not rewritten, ignored examples earn no execution credit, and this release
+does not claim aggregate MCP conformance.
 
 ---
 

@@ -1568,8 +1568,8 @@ pub mod auto {
     ///
     /// It preserves Auto's stdio and HTTP policy selection while withholding
     /// the component's synchronous split-WebSocket constructors. The supported
-    /// socket client remains the caller-driven async transport at
-    /// [`crate::transport::websocket`].
+    /// socket client remains the caller-driven async WebSocket transport in
+    /// [`crate::transport`], available with the `websocket-experimental` feature.
     #[derive(Clone)]
     pub struct ClientBuilder {
         inner: fastmcp_client::ClientBuilder,

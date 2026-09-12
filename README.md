@@ -412,7 +412,8 @@ tar -xJf fastmcp-darwin-aarch64.tar.xz
 ### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli --version 0.10.0
+rustup toolchain install nightly-2026-08-25
+cargo +nightly-2026-08-25 install fastmcp-cli --version 0.10.0 --locked
 ```
 
 ### Client request deadlines (current source tree)
