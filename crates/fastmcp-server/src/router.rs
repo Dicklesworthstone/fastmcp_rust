@@ -1868,6 +1868,11 @@ async fn run_modern_blocking_dispatch(
     // not turn its still-live effects into a completed request-region close.
     while !task.0.is_done() {
         asupersync::time::sleep(request_cx.now(), Duration::from_millis(1)).await;
+        // Cancelled Sleep is immediately ready. Retain the blocking task,
+        // but yield so its owner's bounded shutdown can still make progress.
+        if request_cx.is_cancel_requested() {
+            asupersync::runtime::yield_now().await;
+        }
     }
     match receiver.try_recv() {
         Ok(Ok(result)) => result,

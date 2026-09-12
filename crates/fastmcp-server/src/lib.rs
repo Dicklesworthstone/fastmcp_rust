@@ -6256,6 +6256,12 @@ where
             // channel drain cannot race an in-flight send.
             while !blocking_dispatch_guard.0.is_done() {
                 asupersync::time::sleep(dispatch_cx.now(), Duration::from_millis(1)).await;
+                // Sleep becomes ready immediately after cancellation. Yield
+                // explicitly so retained blocking work cannot monopolize a
+                // current-thread runtime while the listener transfers it.
+                if dispatch_cx.is_cancel_requested() {
+                    asupersync::runtime::yield_now().await;
+                }
             }
             let outcome = dispatch_receiver.try_recv().ok();
             drop(blocking_dispatch_guard);
