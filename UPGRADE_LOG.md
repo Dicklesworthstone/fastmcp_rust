@@ -11,8 +11,8 @@ the dated nightly toolchain remain outside dependency upgrades.
 
 | Dependency | Current | Target | Status |
 |---|---|---|---|
-| asupersync | 0.4.10 | 0.4.11 | Updated; two shutdown tests under investigation |
-| console | 0.16.4 | 0.16.6 | Research complete; update pending |
+| asupersync | 0.4.10 | 0.5.0 | Deferred: both 0.4.11 and 0.5.0 regress bounded shutdown; retain verified 0.4.10 |
+| console | 0.16.4 | 0.16.6 | Passed: CLI units 186, help contract 16, live CLI integration 74 |
 | dirs | 6.0.0 | 7.0.0 | Research complete; update pending |
 | html5ever | 0.39.0 | 0.40.0 | Research complete; update pending |
 | toml | 1.1.5 | 1.1.6 | Research complete; update pending |
@@ -30,9 +30,63 @@ a successful compile. The first all-feature library/binary run compiled and
 completed CLI, client, console, core, derive, protocol, and facade suites, but
 the server's nonquiescent stdio shutdown test failed and its noncooperative
 HTTP shutdown test stalled. RCH then lost its connection and exited 103;
-server and transport suite completion is not claimed. A focused diagnostic
-run is pending. The failed run is retained as
-`/tmp/fastmcp-release-asupersync-0411-tests-20260912.log`.
+server and transport suite completion is not claimed. The focused stdio test
+also failed its 30-second result bound; releasing its child allowed teardown
+to complete. The failed runs are retained as
+`/tmp/fastmcp-release-asupersync-0411-tests-20260912.log` and
+`/tmp/fastmcp-release-asupersync-0411-stdio-diagnostic-20260912.log`.
+
+An initial HTTP diagnostic incorrectly wrapped shutdown in `timeout_at`:
+0.4.11's cancellation-aware sleep completed early when the probe deliberately
+cancelled its caller, producing a spurious deadline error in both ownership
+tests. Those wrappers were removed. The release-on-failure guard remains,
+with all original shutdown assertions. The cooperative case then passed;
+the noncooperative case still exceeded 60 seconds. These attempts are retained
+in the `http-ssh-01` and `http-ssh-02` logs under `/tmp/fastmcp-release-asupersync-0411-*`.
+
+The baseline verification snapshot retains 0.4.10 and the exact preceding lockfile selection
+(asupersync-macros and the three franken support crates at 0.4.9). No upstream
+root cause or successful runtime migration is claimed. The user authorized
+direct SSH builds in isolated directories without sync deletion or cleanup,
+after the installed RCH synchronization path was found to delete files.
+
+### asupersync 0.5.0
+
+A registry recheck at 19:14 UTC found [0.5.0](https://github.com/Dicklesworthstone/asupersync/releases/tag/v0.5.0),
+published at 06:22 UTC during the pause. The other five upgrade targets are
+unchanged. This release preserves existing public method signatures while
+making ambient context installation retain capability restrictions. FastMCP
+must not depend on installing a narrowed context to regain authority.
+It also retires workers and wake callbacks outside their locks and exposes
+inherited blocking-pool handles only with spawn authority. The source is
+`78b64636e99fea4ea2d868096576021dd3b8e519`; the registry checksum is
+`f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511`.
+The identical four shutdown tests passed on the restored 0.4.10 lockfile
+(4 passed, 0 ignored, 10.78 seconds). On 0.5.0 the cooperative HTTP and SSE
+ownership cases passed, but the stdio case again failed its 30-second result
+bound and the noncooperative HTTP case stalled for over six minutes. The
+isolated candidate process group was then terminated; this is a failed run,
+not completed suite evidence. The logs are
+`/tmp/fastmcp-release-asupersync-0410-shutdown-ssh-03-20260912.log` and
+`/tmp/fastmcp-release-asupersync-050-shutdown-ssh-04-20260912.log`.
+Retain 0.4.10 for this release. Fixing the upstream runtime interaction remains
+required before either newer version can be adopted; no assertions, shutdown
+bounds, or runtime behavior were weakened to admit the upgrade.
+
+Subsequent fetch found independently pushed commit `57899320`, which adopts
+0.5.0 for caller capability ceilings. That work includes a real polling
+regression and must be integrated before the final runtime decision. The
+shutdown failures above remain unresolved release blockers for its pin;
+the earlier retention decision applies only to the verified local baseline.
+
+### console 0.16.6
+
+Source snapshot `151041c934692eb62af8177847e11b6ee9b218419b39ea6e0e101ce73f3f2e7b`
+passed all 276 selected CLI tests (186 unit, 16 documentation contract, 74 live
+integration), with zero ignored or filtered tests. Direct SSH log:
+`/tmp/fastmcp-release-console-0166-ssh-05b-20260912.log`. The first invocation
+incorrectly selected a nonexistent CLI library target and exited before
+compilation; the corrected command selects its binary targets.
 
 ### Remaining migration research
 

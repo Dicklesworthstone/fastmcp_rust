@@ -43436,15 +43436,16 @@ mod lib_unit_tests {
             })
             .map_err(|error| format!("shutdown-ownership client was not admitted: {error}"))?;
 
-        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-        let shutdown = asupersync::time::timeout_at(deadline, bound.serve(cx))
+        // This probe deliberately cancels the caller. A timeout_at wrapper
+        // would mistake its cancellation-aware timer's early completion for
+        // deadline expiry while the server is still settling its children.
+        let shutdown = bound
+            .serve(cx)
             .await
-            .map_err(|_| live_http_test_timeout("shutdown-ownership server stop"))?
             .map_err(|error| format!("shutdown-ownership server failed: {error}"))?;
-        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-        let (_sse, _call) = asupersync::time::timeout_at(deadline, client.join(cx))
+        let (_sse, _call) = client
+            .join(cx)
             .await
-            .map_err(|_| live_http_test_timeout("shutdown-ownership client join"))?
             .map_err(|error| format!("shutdown-ownership client failed: {error:?}"))??;
         if !cancellation_observed.load(Ordering::Acquire) {
             return Err("live HTTP shutdown did not reach the busy handler".to_owned());
@@ -43491,10 +43492,9 @@ mod lib_unit_tests {
                     }
                     asupersync::runtime::yield_now().await;
                 }
-                let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-                asupersync::time::timeout_at(deadline, shutdown.settle(cx))
+                shutdown
+                    .settle(cx)
                     .await
-                    .map_err(|_| live_http_test_timeout("released HTTP child settlement"))?
                     .map_err(|error| format!("caller-owned HTTP child join failed: {error}"))
             }
         }

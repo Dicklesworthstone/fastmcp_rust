@@ -34,10 +34,9 @@ strip = true
 # owners install an ambient context only at their top-level runtime boundary.
 # Test-only constructors remain opt-in at the test or facade-lab boundary and
 # must not leak into the workspace production graph.
-# =0.4.11 retains the v0.4.3 public API floor and fixes runtime teardown,
-# cancellation and I/O readiness. Current-thread roots must yield while
-# waiting for child tasks because they now drive their runtime's worker.
-asupersync = { version = "=0.4.11" }
+# 0.4.11 and 0.5.0 regress bounded shutdown; retain the verified runtime until
+# those ownership tests pass. Failed upgrade evidence is in UPGRADE_LOG.md.
+asupersync = { version = "=0.4.10" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
@@ -68,7 +67,7 @@ notify = { version = "=8.2.0" }
 glob = { version = "=0.3.4" }
 
 # Console output
-console = { version = "=0.16.4" }
+console = { version = "=0.16.6" }
 
 # Configuration file parsing
 toml = { version = "=1.1.5" }
