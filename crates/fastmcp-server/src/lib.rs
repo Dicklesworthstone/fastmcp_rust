@@ -43329,9 +43329,20 @@ mod lib_unit_tests {
         cx: &Cx,
         cooperate_with_cancellation: bool,
     ) -> Result<(), String> {
+        struct ReleaseOnExit(Arc<AtomicBool>);
+
+        impl Drop for ReleaseOnExit {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
         let started = Arc::new(AtomicBool::new(false));
         let cancellation_observed = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
+        // A failed observation must release the deliberately parked handler
+        // before runtime teardown joins its blocking thread.
+        let _release_on_exit = ReleaseOnExit(Arc::clone(&release));
         let finished = Arc::new(AtomicBool::new(false));
         let tool_name = if cooperate_with_cancellation {
             "live_http_cooperative_shutdown_tool"
@@ -43425,13 +43436,15 @@ mod lib_unit_tests {
             })
             .map_err(|error| format!("shutdown-ownership client was not admitted: {error}"))?;
 
-        let shutdown = bound
-            .serve(cx)
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let shutdown = asupersync::time::timeout_at(deadline, bound.serve(cx))
             .await
+            .map_err(|_| live_http_test_timeout("shutdown-ownership server stop"))?
             .map_err(|error| format!("shutdown-ownership server failed: {error}"))?;
-        let (_sse, _call) = client
-            .join(cx)
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let (_sse, _call) = asupersync::time::timeout_at(deadline, client.join(cx))
             .await
+            .map_err(|_| live_http_test_timeout("shutdown-ownership client join"))?
             .map_err(|error| format!("shutdown-ownership client failed: {error:?}"))??;
         if !cancellation_observed.load(Ordering::Acquire) {
             return Err("live HTTP shutdown did not reach the busy handler".to_owned());
@@ -43478,9 +43491,10 @@ mod lib_unit_tests {
                     }
                     asupersync::runtime::yield_now().await;
                 }
-                shutdown
-                    .settle(cx)
+                let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+                asupersync::time::timeout_at(deadline, shutdown.settle(cx))
                     .await
+                    .map_err(|_| live_http_test_timeout("released HTTP child settlement"))?
                     .map_err(|error| format!("caller-owned HTTP child join failed: {error}"))
             }
         }
