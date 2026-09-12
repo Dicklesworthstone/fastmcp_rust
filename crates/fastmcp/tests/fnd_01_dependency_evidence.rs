@@ -54616,6 +54616,26 @@ original = "value"
         text: String,
         tokens: TokenStream,
         parsed_text_sha256: [u8; 32],
+        reference_counts: StatePartitionRngReferenceCounts,
+    }
+
+    // Pure token facts travel with the parsed source, so unchanged files need
+    // not be walked again for every one-file mutation in the seam matrix.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct StatePartitionRngReferenceCounts {
+        getrandom_namespace: usize,
+        getrandom_fill: usize,
+        sealed_apis: [usize; STATE_PARTITION_RNG_SEALED_APIS.len()],
+    }
+
+    impl StatePartitionRngReferenceCounts {
+        fn from_tokens(tokens: &TokenStream) -> Self {
+            Self {
+                getrandom_namespace: state_partition_rng_namespace_reference_count(tokens, "getrandom"),
+                getrandom_fill: state_partition_rng_qualified_call_count(tokens, &["getrandom", "fill"]),
+                sealed_apis: STATE_PARTITION_RNG_SEALED_APIS.map(|api| state_partition_rng_sealed_api_reference_count(tokens, api)),
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -54638,7 +54658,8 @@ original = "value"
         let text = fs::read_to_string(absolute_path).map_err(|_| state_partition_rng_inventory_error(&logical_path))?;
         let tokens = TokenStream::from_str(&text).map_err(|error| state_partition_rng_inventory_error(format!("{logical_path}:{error}")))?;
         let parsed_text_sha256 = Sha256::digest(text.as_bytes()).into();
-        if inventory.rust_sources.insert(logical_path.clone(), StatePartitionRngRustSource { text, tokens, parsed_text_sha256 }).is_some() {
+        let reference_counts = StatePartitionRngReferenceCounts::from_tokens(&tokens);
+        if inventory.rust_sources.insert(logical_path.clone(), StatePartitionRngRustSource { text, tokens, parsed_text_sha256, reference_counts }).is_some() {
             return Err(state_partition_rng_inventory_error(format!("duplicate:{logical_path}")));
         }
         Ok(())
@@ -54885,9 +54906,11 @@ original = "value"
             return Err(state_partition_rng_inventory_error(format!("{logical}:text-token-sync")));
         }
         let parsed_text_sha256 = Sha256::digest(appended_text.as_bytes()).into();
+        let reference_counts = StatePartitionRngReferenceCounts::from_tokens(&appended_tokens);
         source.text = appended_text;
         source.tokens = appended_tokens;
         source.parsed_text_sha256 = parsed_text_sha256;
+        source.reference_counts = reference_counts;
         Ok(())
     }
 
@@ -54897,9 +54920,11 @@ original = "value"
         }
         let tokens = TokenStream::from_str(&replacement_text).map_err(|error| state_partition_rng_inventory_error(format!("{logical}:source:{error}")))?;
         let parsed_text_sha256 = Sha256::digest(replacement_text.as_bytes()).into();
+        let reference_counts = StatePartitionRngReferenceCounts::from_tokens(&tokens);
         source.text = replacement_text;
         source.tokens = tokens;
         source.parsed_text_sha256 = parsed_text_sha256;
+        source.reference_counts = reference_counts;
         Ok(())
     }
 
@@ -56024,7 +56049,7 @@ original = "value"
             .rust_sources
             .iter()
             .filter_map(|(path, source)| {
-                let count = state_partition_rng_namespace_reference_count(&source.tokens, "getrandom");
+                let count = source.reference_counts.getrandom_namespace;
                 (count != 0).then_some((path.as_str(), count))
             })
             .collect::<Vec<_>>();
@@ -56034,8 +56059,8 @@ original = "value"
             return Err(Diagnostic::error(code, "state-partition-rng").at(path));
         }
 
-        let direct_fill_count = inventory.rust_sources.values().map(|source| state_partition_rng_qualified_call_count(&source.tokens, &["getrandom", "fill"])).sum::<usize>();
-        if direct_fill_count != 1 || state_partition_rng_qualified_call_count(&crypto.tokens, &["getrandom", "fill"]) != 1 {
+        let direct_fill_count = inventory.rust_sources.values().map(|source| source.reference_counts.getrandom_fill).sum::<usize>();
+        if direct_fill_count != 1 || crypto.reference_counts.getrandom_fill != 1 {
             return Err(Diagnostic::error("E_CORE_CRYPTO_RNG_OWNER", "state-partition-rng").at("crates/fastmcp-core/src/crypto.rs"));
         }
 
@@ -56054,8 +56079,7 @@ original = "value"
         }
 
         for (path, source) in &inventory.rust_sources {
-            for api in STATE_PARTITION_RNG_SEALED_APIS {
-                let references = state_partition_rng_sealed_api_reference_count(&source.tokens, api);
+            for (api, references) in STATE_PARTITION_RNG_SEALED_APIS.into_iter().zip(source.reference_counts.sealed_apis) {
                 if references != 0 && !state_partition_rng_sealed_api_is_allowlisted(path, api) {
                     return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(path));
                 }
@@ -56487,6 +56511,7 @@ original = "value"
         let mut stale_tokens_planted = baseline.clone();
         let stale_state = stale_tokens_planted.rust_sources.get_mut("crates/fastmcp-core/src/state.rs").expect("state source is present for stale-token planting");
         let stale_parsed_digest = stale_state.parsed_text_sha256;
+        let stale_reference_counts = stale_state.reference_counts;
         let stale_token_fingerprint = token_trees_fingerprint(&stale_state.tokens.clone().into_iter().collect::<Vec<_>>());
         stale_state.text.push_str("\nconst FND01_STALE_TOKEN_BYPASS: () = ();\n");
         let stale_text_before_validation = stale_state.text.clone();
@@ -56497,6 +56522,7 @@ original = "value"
         let rejected_stale_state = state_partition_rng_source(&stale_tokens_planted, "crates/fastmcp-core/src/state.rs").expect("rejected stale-token source remains present");
         assert_eq!(rejected_stale_state.text, stale_text_before_validation);
         assert_eq!(rejected_stale_state.parsed_text_sha256, stale_parsed_digest);
+        assert_eq!(rejected_stale_state.reference_counts, stale_reference_counts);
         assert_eq!(
             token_trees_fingerprint(&rejected_stale_state.tokens.clone().into_iter().collect::<Vec<_>>(),),
             stale_token_fingerprint,
@@ -56509,6 +56535,7 @@ original = "value"
         let parse_failure_state = parse_failure_planted.rust_sources.get_mut("crates/fastmcp-core/src/state.rs").expect("state source is present for parse-failure planting");
         let parse_failure_text = parse_failure_state.text.clone();
         let parse_failure_digest = parse_failure_state.parsed_text_sha256;
+        let parse_failure_reference_counts = parse_failure_state.reference_counts;
         let parse_failure_token_fingerprint = token_trees_fingerprint(&parse_failure_state.tokens.clone().into_iter().collect::<Vec<_>>());
         let parse_failure_error = state_partition_rng_append_rust_source_fragment(parse_failure_state, "\npub mod fnd01_parse_failure {\n", "parse-failure-atomicity")
             .expect_err("an unclosed appended Rust fragment must reject before mutation");
@@ -56520,6 +56547,7 @@ original = "value"
         assert_eq!(replacement_parse_failure_error.code, "E_STATE_PARTITION_RNG_INVENTORY");
         assert_eq!(parse_failure_state.text, parse_failure_text);
         assert_eq!(parse_failure_state.parsed_text_sha256, parse_failure_digest);
+        assert_eq!(parse_failure_state.reference_counts, parse_failure_reference_counts);
         assert_eq!(
             token_trees_fingerprint(&parse_failure_state.tokens.clone().into_iter().collect::<Vec<_>>(),),
             parse_failure_token_fingerprint,
