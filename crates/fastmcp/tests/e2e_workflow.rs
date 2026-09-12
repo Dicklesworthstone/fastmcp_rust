@@ -2745,6 +2745,245 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     fixture.shutdown();
 }
 
+struct RetentionWorkDrop(Arc<AtomicBool>);
+
+impl Drop for RetentionWorkDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct RetentionTaskSupervisor {
+    started: mpsc::Sender<fastmcp_rust::FinalTaskId>,
+    successor_completed: mpsc::Sender<fastmcp_rust::FinalTaskId>,
+    invocations: Arc<AtomicUsize>,
+    clock_offset_ms: Arc<AtomicUsize>,
+    observed_clock_ms: Arc<AtomicUsize>,
+    release_first: Arc<AtomicBool>,
+    first_dropped: Arc<AtomicBool>,
+}
+
+impl ApplicationTaskSupervisor for RetentionTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                return Err(McpError::internal_error(
+                    "retention test expects initial work",
+                ));
+            };
+            let ordinal = self.invocations.fetch_add(1, Ordering::SeqCst);
+            assert!(ordinal < 2, "each created task executes exactly once");
+            let _lifetime =
+                (ordinal == 0).then(|| RetentionWorkDrop(Arc::clone(&self.first_dropped)));
+            if ordinal == 1 {
+                assert!(
+                    self.first_dropped.load(Ordering::SeqCst),
+                    "first application future is dropped before successor execution"
+                );
+            }
+            let task_id = initial.task_id().clone();
+            self.started
+                .send(task_id.clone())
+                .expect("task-start observer remains live");
+            if ordinal == 0 {
+                while !self.release_first.load(Ordering::SeqCst) {
+                    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                    self.observed_clock_ms.store(
+                        self.clock_offset_ms.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            }
+            let result = serde_json::from_value(json!({
+                "content": [{"type": "text", "text": format!("completed-{}", task_id.as_str())}]
+            }))
+            .expect("typed application result");
+            initial.complete_task(result, None)?;
+            if ordinal == 1 {
+                self.successor_completed
+                    .send(task_id)
+                    .expect("successor observer remains live");
+            }
+            Ok(())
+        })
+    }
+}
+
+fn public_final_task_retention_boundary(expire_first: bool) {
+    let clock_origin = Instant::now();
+    let clock_offset_ms = Arc::new(AtomicUsize::new(0));
+    let store_clock = Arc::clone(&clock_offset_ms);
+    let store = Arc::new(
+        InMemoryFinalTaskStore::with_clock(
+            2,
+            Arc::new(move || {
+                clock_origin + Duration::from_millis(store_clock.load(Ordering::SeqCst) as u64)
+            }),
+        )
+        .expect("bounded public store with application-owned retention clock"),
+    );
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(1_000, Some(10)).expect("finite one-second retention"),
+        Arc::new(|_| {}),
+    );
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let observed_clock_ms = Arc::new(AtomicUsize::new(usize::MAX));
+    let release_first = Arc::new(AtomicBool::new(false));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let (started, starts) = mpsc::channel();
+    let (successor_completed, completion) = mpsc::channel();
+    let runner = runtime
+        .install_task_service(
+            2,
+            Arc::new(RetentionTaskSupervisor {
+                started,
+                successor_completed,
+                invocations: Arc::clone(&invocations),
+                clock_offset_ms: Arc::clone(&clock_offset_ms),
+                observed_clock_ms: Arc::clone(&observed_clock_ms),
+                release_first: Arc::clone(&release_first),
+                first_dropped: Arc::clone(&first_dropped),
+            }),
+        )
+        .expect("public application-owned supervisor installs");
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let server = auto::server_builder("final-tasks-retention", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::clone(&handler_calls),
+        })
+        .final_tasks(runtime)
+        .expect("public Tasks extension installs")
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public client discovers live Tasks server");
+    let create_task = |request_id| {
+        let outcome = final_tasks_runtime_block_on_bounded(
+            &cx,
+            client.connection().call_tool_final_outcome(
+                &cx,
+                RequestId::Number(request_id),
+                "public-final-task",
+                json!({}),
+                1 << 20,
+            ),
+        )
+        .expect("live tools/call creates a task");
+        let FinalToolCallOutcome::Task(created) = outcome else {
+            panic!("task-capable tool returns a real Task");
+        };
+        assert!(matches!(created.task, FinalTask::Working(_)));
+        created.task.base().task_id.clone()
+    };
+    let first_id = create_task(2);
+    assert_eq!(
+        starts
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("first task starts"),
+        first_id
+    );
+    // The successor has its own later deadline, while the first work remains owned.
+    clock_offset_ms.store(500, Ordering::SeqCst);
+    let successor_id = create_task(3);
+    assert_eq!(store.task_count(), 2);
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    // Only this clock value changes between the expiry and no-expiry scenarios.
+    clock_offset_ms.store(if expire_first { 1_001 } else { 999 }, Ordering::SeqCst);
+    if !expire_first {
+        let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+        while observed_clock_ms.load(Ordering::SeqCst) != 999 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(observed_clock_ms.load(Ordering::SeqCst), 999);
+        for (request_id, task_id) in [(4, &first_id), (5, &successor_id)] {
+            let retained = final_tasks_runtime_block_on_bounded(
+                &cx,
+                client.connection().get_task_final(
+                    &cx,
+                    RequestId::Number(request_id),
+                    task_id.clone(),
+                    1 << 20,
+                ),
+            )
+            .expect("unexpired tasks remain readable on the live server");
+            assert!(matches!(retained.task, FinalTask::Working(_)));
+        }
+        assert!(!first_dropped.load(Ordering::SeqCst));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(store.task_count(), 2);
+        // Ordinary application completion still lets this same service advance.
+        release_first.store(true, Ordering::SeqCst);
+    }
+    assert_eq!(
+        completion
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("same live service completes the successor"),
+        successor_id
+    );
+    assert!(first_dropped.load(Ordering::SeqCst));
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    let completed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.connection().get_task_final(
+            &cx,
+            RequestId::Number(6),
+            successor_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("public tasks/get returns the committed successor result");
+    let FinalTask::Completed { result, .. } = completed.task else {
+        panic!("successor must be Completed");
+    };
+    assert_eq!(
+        serde_json::to_value(result).expect("task result serializes")["content"][0]["text"],
+        format!("completed-{}", successor_id.as_str())
+    );
+    assert_eq!(store.task_count(), if expire_first { 1 } else { 2 });
+    if expire_first {
+        let error = final_tasks_runtime_block_on_bounded(
+            &cx,
+            client
+                .connection()
+                .get_task_final(&cx, RequestId::Number(7), first_id, 1 << 20),
+        )
+        .expect_err("expired task is not revived by the service");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(
+                fastmcp_rust::ModernHttpClientError::TasksRemoteError { code, .. }
+            ) if code.as_i32() == Some(McpErrorCode::InvalidParams.into())
+        ));
+    }
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+    drop(client);
+    fixture.shutdown();
+}
+
+#[test]
+fn workflow_final_tasks_retention_expiry_releases_work_and_runs_successor() {
+    public_final_task_retention_boundary(true);
+}
+
+#[test]
+fn workflow_final_tasks_unexpired_work_remains_owned() {
+    public_final_task_retention_boundary(false);
+}
+
 struct HoldingInitialTaskSupervisor;
 
 impl ApplicationTaskSupervisor for HoldingInitialTaskSupervisor {
@@ -5118,7 +5357,7 @@ fn resource_read_plain_text() {
     else {
         panic!(
             "expected Text content in text://plain, got {:?}",
-            &content[0]
+            content[0]
         );
     };
     assert_eq!(uri, "text://plain");
@@ -5140,7 +5379,7 @@ fn resource_read_json() {
     else {
         panic!(
             "expected Text content in data://config.json, got {:?}",
-            &content[0]
+            content[0]
         );
     };
     assert_eq!(mime_type.as_deref(), Some("application/json"));
@@ -5167,7 +5406,7 @@ fn resource_read_binary() {
     else {
         panic!(
             "expected Blob content in binary://data.bin, got {:?}",
-            &content[0]
+            content[0]
         );
     };
     assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));

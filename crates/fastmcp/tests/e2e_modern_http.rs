@@ -504,6 +504,7 @@ struct PublicHttpHandlerCallCounters {
     resource: AtomicUsize,
     prompt: AtomicUsize,
     completion: AtomicUsize,
+    auth: AtomicUsize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -512,6 +513,7 @@ struct PublicHttpHandlerCallSnapshot {
     resource: usize,
     prompt: usize,
     completion: usize,
+    auth: usize,
 }
 
 impl PublicHttpHandlerCallCounters {
@@ -521,6 +523,7 @@ impl PublicHttpHandlerCallCounters {
             resource: self.resource.load(Ordering::SeqCst),
             prompt: self.prompt.load(Ordering::SeqCst),
             completion: self.completion.load(Ordering::SeqCst),
+            auth: self.auth.load(Ordering::SeqCst),
         }
     }
 }
@@ -633,13 +636,17 @@ impl ToolHandler for PublicHttpAuthSubject {
         }
     }
 
-    fn call(&self, context: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.counters.tool.fetch_add(1, Ordering::SeqCst);
         let subject = context
             .auth()
             .and_then(|auth| auth.subject)
             .unwrap_or_else(|| "anonymous".to_owned());
-        Ok(vec![Content::text(format!("subject:{subject}"))])
+        let mut content = vec![Content::text(format!("subject:{subject}"))];
+        if let Some(token) = arguments.get("Token").and_then(serde_json::Value::as_str) {
+            content.push(Content::text(format!("argument:Token:{token}")));
+        }
+        Ok(content)
     }
 }
 
@@ -661,6 +668,25 @@ impl TokenVerifier for PublicHttpCustomVerifier {
         Err(McpError::invalid_request("unknown custom token"))
     }
 }
+
+/// Wraps a `TokenVerifier` to count verification attempts on `PublicHttpHandlerCallCounters`.
+struct CountingTokenVerifier<V> {
+    inner: V,
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl<V: TokenVerifier> TokenVerifier for CountingTokenVerifier<V> {
+    fn verify(
+        &self,
+        ctx: &McpContext,
+        request: AuthRequest<'_>,
+        token: &AccessToken,
+    ) -> McpResult<AuthContext> {
+        self.counters.auth.fetch_add(1, Ordering::SeqCst);
+        self.inner.verify(ctx, request, token)
+    }
+}
+
 /// Admission mode for shared as_proxy gateway fixtures: no auth provider,
 /// the deterministic static-token verifier, or the custom non-static
 /// verifier. One-variable admission proofs swap only this variant.
@@ -24721,10 +24747,7 @@ fn e2e_public_http_resource_and_prompt_list_changed_are_retained_on_incremental_
 }
 
 fn spawn_modern_auth_admission_http_server() -> HttpServerFixture {
-    spawn_modern_auth_admission_http_server_with_credentials(
-        "alpha",
-        PUBLIC_HTTP_AUTH_SUBJECT,
-    )
+    spawn_modern_auth_admission_http_server_with_credentials("alpha", PUBLIC_HTTP_AUTH_SUBJECT)
 }
 
 fn spawn_modern_auth_admission_http_server_with_credentials(
@@ -24747,15 +24770,16 @@ fn spawn_modern_auth_admission_http_server_with_credentials(
                 cx.set_cancel_requested(true);
                 return Err("auth admission HTTP server control receiver went away".to_owned());
             }
-            let verifier = StaticTokenVerifier::new([(
-                token.clone(),
-                AuthContext::with_subject(&subject),
-            )])
-            .expect("the deterministic native bearer verifier is valid")
-            .with_allowed_schemes(["Bearer"])
-            .expect("the bearer scheme allowlist is valid");
+            let verifier =
+                StaticTokenVerifier::new([(token.clone(), AuthContext::with_subject(&subject))])
+                    .expect("the deterministic native bearer verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the bearer scheme allowlist is valid");
             let server = modern::ServerBuilder::new("facade-http-auth-admission", "1.0.0")
-                .auth_provider(TokenAuthProvider::new(verifier))
+                .auth_provider(TokenAuthProvider::new(CountingTokenVerifier {
+                    inner: verifier,
+                    counters: Arc::clone(&tool_calls),
+                }))
                 .tool(PublicHttpAuthSubject {
                     counters: tool_calls,
                 })
@@ -24879,8 +24903,7 @@ fn auth_admission_response_headers(response: &[u8]) -> &str {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .expect("native HTTP response contains a complete header terminator");
-    std::str::from_utf8(&response[..header_end])
-        .expect("native HTTP response headers are ASCII")
+    std::str::from_utf8(&response[..header_end]).expect("native HTTP response headers are ASCII")
 }
 
 fn auth_admission_response_json_body(response: &[u8]) -> serde_json::Value {
@@ -24924,9 +24947,8 @@ fn auth_admission_response_json_body(response: &[u8]) -> serde_json::Value {
                 .expect("chunked response contains a complete chunk-size line");
             let size_line = std::str::from_utf8(&body[cursor..size_end])
                 .expect("chunked response chunk size is ASCII");
-            let size =
-                usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
-                    .expect("chunked response chunk size is hexadecimal");
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                .expect("chunked response chunk size is hexadecimal");
             cursor = size_end + 2;
             if size == 0 {
                 return serde_json::from_slice(&decoded)
@@ -24939,8 +24961,8 @@ fn auth_admission_response_json_body(response: &[u8]) -> serde_json::Value {
             cursor = chunk_end + 2;
         }
     } else {
-        let content_length = content_length
-            .expect("native HTTP response uses Content-Length or chunked framing");
+        let content_length =
+            content_length.expect("native HTTP response uses Content-Length or chunked framing");
         body[..content_length].to_vec()
     };
     serde_json::from_slice(&decoded).expect("authenticated tool response is JSON-RPC")
@@ -25083,11 +25105,18 @@ fn auth_01_a_positive() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        content.iter().any(|block| {
-            block["text"].as_str() == Some(&format!("subject:{subject}"))
-        }),
+        content
+            .iter()
+            .any(|block| { block["text"].as_str() == Some(&format!("subject:{subject}")) }),
         "admitted native HTTP must commit the runtime verifier subject into ctx.auth(): {admitted_json}"
     );
+    assert!(
+        content.iter().any(|block| {
+            block["text"].as_str() == Some("argument:Token:application-param-preserved")
+        }),
+        "ordinary tool arguments must reach the handler unchanged: {admitted_json}"
+    );
+    assert_eq!(server.handler_call_snapshot().auth, 1);
     assert_eq!(
         server.handler_call_snapshot().tool,
         1,
@@ -25105,7 +25134,9 @@ fn auth_01_a_planted_negative() {
     let token = format!("runtime-bearer-token-{runtime_id}");
     let subject = format!("runtime-auth-subject-{runtime_id}");
     let server = spawn_modern_auth_admission_http_server_with_credentials(&token, &subject);
-    let initial_calls = server.handler_call_snapshot().tool;
+    let initial_calls = server.handler_call_snapshot();
+    assert_eq!(initial_calls.auth, 0);
+    assert_eq!(initial_calls.tool, 0);
 
     let positive_tool = JsonRpcRequest::new(
         "tools/call",
@@ -25170,9 +25201,9 @@ fn auth_01_a_planted_negative() {
         "HTTP credentials must use the Authorization header"
     );
     assert_eq!(
-        server.handler_call_snapshot().tool,
+        server.handler_call_snapshot(),
         initial_calls,
-        "body credential contamination must not invoke the handler"
+        "body credential contamination must not invoke the verifier or any handler"
     );
 
     // 2. Query credential contamination: near-identical positive body, but adds ?access_token.
@@ -25194,9 +25225,9 @@ fn auth_01_a_planted_negative() {
         "HTTP credentials must use the Authorization header"
     );
     assert_eq!(
-        server.handler_call_snapshot().tool,
+        server.handler_call_snapshot(),
         initial_calls,
-        "query credential contamination must not invoke the handler"
+        "query credential contamination must not invoke the verifier or any handler"
     );
 
     // 3. Prove non-corruption: clean positive request immediately succeeds on the same server.
@@ -25213,9 +25244,24 @@ fn auth_01_a_planted_negative() {
     );
     let clean_json = auth_admission_response_json_body(&clean_admitted);
     assert!(clean_json.get("error").is_none());
+    assert!(
+        clean_json["result"]["content"]
+            .as_array()
+            .expect("clean response has content")
+            .iter()
+            .any(|block| {
+                block["text"].as_str() == Some("argument:Token:application-param-preserved")
+            }),
+        "clean retry must preserve ordinary tool arguments: {clean_json}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().auth,
+        initial_calls.auth + 1,
+        "only the clean positive request invokes the real verifier"
+    );
     assert_eq!(
         server.handler_call_snapshot().tool,
-        initial_calls + 1,
+        initial_calls.tool + 1,
         "only the clean positive request invokes the authenticated handler"
     );
     server.shutdown();
