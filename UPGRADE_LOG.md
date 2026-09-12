@@ -11,12 +11,12 @@ the dated nightly toolchain remain outside dependency upgrades.
 
 | Dependency | Current | Target | Status |
 |---|---|---|---|
-| asupersync | 0.4.10 | 0.4.11 | Updated; consumer tests pending |
-| console | 0.16.4 | 0.16.6 | Research pending |
-| dirs | 6.0.0 | 7.0.0 | Research pending |
-| html5ever | 0.39.0 | 0.40.0 | Research pending |
-| toml | 1.1.5 | 1.1.6 | Research pending |
-| trybuild | 1.0.120 | 1.0.121 | Research pending |
+| asupersync | 0.4.10 | 0.4.11 | Updated; two shutdown tests under investigation |
+| console | 0.16.4 | 0.16.6 | Research complete; update pending |
+| dirs | 6.0.0 | 7.0.0 | Research complete; update pending |
+| html5ever | 0.39.0 | 0.40.0 | Research complete; update pending |
+| toml | 1.1.5 | 1.1.6 | Research complete; update pending |
+| trybuild | 1.0.120 | 1.0.121 | Research complete; update pending |
 
 ### asupersync 0.4.11
 
@@ -26,7 +26,31 @@ floor. It repairs runtime teardown, cancellation and I/O readiness. Its
 current-thread runtime now drives child tasks on the calling thread while
 `block_on` runs; a root that synchronously waits for a child can deadlock.
 FastMCP's bridge and proxy consumers therefore require runtime tests, not just
-a successful compile. No passing upgrade test is claimed yet.
+a successful compile. The first all-feature library/binary run compiled and
+completed CLI, client, console, core, derive, protocol, and facade suites, but
+the server's nonquiescent stdio shutdown test failed and its noncooperative
+HTTP shutdown test stalled. RCH then lost its connection and exited 103;
+server and transport suite completion is not claimed. A focused diagnostic
+run is pending. The failed run is retained as
+`/tmp/fastmcp-release-asupersync-0411-tests-20260912.log`.
+
+### Remaining migration research
+
+- [console 0.16.4–0.16.6](https://github.com/console-rs/console/compare/0.16.4...0.16.6):
+  repairs OSC/DCS stripping and UTF-8 truncation, improves visible-width
+  calculation. The CLI consumes its terminal and styling APIs.
+- [dirs 6–7 source comparison](https://codeberg.org/dirs/dirs-rs/compare/00511bdc252f491a72ac89f6d6a2463406266fb2...793c8a97bea55669a806499839abd7b1d844279f):
+  Windows `preference_dir` changes from local to roaming application data.
+  FastMCP uses `home_dir` and `data_dir`, whose APIs remain unchanged.
+- [html5ever 0.39–0.40 source comparison](https://github.com/servo/html5ever/compare/ce64836c685025a5fef0860fa2e9c80b2683e8d0...a193ea7f2492d1e51eb32955a09c241345348dba):
+  updates markup5ever and prevents a truncated meta-charset panic. Its Rust
+  1.85 minimum is below this project's pinned compiler. Both optional Apps
+  consumers require parser/sanitizer tests.
+- [toml 1.1.5–1.1.6 source comparison](https://github.com/toml-rs/toml/compare/e93ed4e1dec245fb523aec2afd0a300da4207f4e...572c005d80cca5f7bd163805c2f33ba0a5207b6d):
+  removes unnecessary parser key clones; verify CLI configuration parsing.
+- [trybuild 1.0.120–1.0.121](https://github.com/dtolnay/trybuild/compare/1.0.120...1.0.121):
+  renames its target metadata dependency from `target-triple` to `target-tuple`.
+  All six downstream compile harness tests must run after upgrading.
 
 Full product tests, strict Clippy, dependency audit, and release artifact checks
 remain pending. Historical FND attestation failures retain their original

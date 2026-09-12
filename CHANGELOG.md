@@ -8,6 +8,18 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.9.0)
 
+- Tasks supervisors stop polling expired work, release its owned execution,
+  and let eligible successor work proceed without aborting the service.
+- CLI task watches end on terminal snapshots and reconcile state after the
+  subscription acknowledgment, covering completion before subscription
+  admission. Cancelling reconciliation preserves the connection for reuse.
+- HTTP waits observe caller cancellation; rejected redirects do not replay
+  credentials. Authentication rejects nested mixed-case credential aliases,
+  and OAuth session ownership includes the verifier's resource identity.
+- Server child cancellation remains cancellation instead of being reported as
+  a worker panic. Tests exercise live child-region drain and public retention
+  expiry through the actual runtime and HTTP interfaces.
+
 ## [v0.9.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.9.0) -- 2026-09-11
 
 Pre-1.0 minor release with breaking runtime API changes. MCP 2026-07-28
