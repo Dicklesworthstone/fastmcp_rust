@@ -6,7 +6,7 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.9.0)
+## [v0.10.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.10.0) -- 2026-09-12
 
 - Breaking: custom `FinalTaskStore` implementations must provide
   `retention_clock_now` and `task_retention_deadline_if_current`. Return the
@@ -30,6 +30,17 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 - Update asupersync to 0.5.0, preserving caller capability restrictions, and
   update console, dirs, html5ever, TOML, and trybuild to their current stable
   releases. The pinned nightly toolchain remains unchanged.
+- Add explicit application-owned timeout and retry configuration for embedders
+  that need larger limits. Ordinary setters retain their existing bounds;
+  application settings still observe cancellation and checked clock arithmetic.
+- Add opt-in application tool content on legacy connections, preserving audio
+  and optional resource payloads. Exact legacy routes remain strict by default.
+- Correct the release quarantine inventory after an earlier workflow action
+  pin change, retaining its manual, read-only checks and negative controls.
+
+MCP 2026-07-28 support remains under implementation. The historical FND-01
+attestation is not reissued for this dependency snapshot; this release does
+not claim aggregate conformance.
 
 ## [v0.9.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.9.0) -- 2026-09-11
 
