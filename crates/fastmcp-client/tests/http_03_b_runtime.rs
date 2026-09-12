@@ -2,6 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -553,30 +555,6 @@ impl RedirectTestRig {
     fn accept_primary(&self) -> TcpStream {
         accept_bounded_stream(&self.primary_listener)
     }
-}
-
-fn accept_bounded_stream(listener: &TcpListener) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    listener
-        .set_nonblocking(true)
-        .expect("set listener nonblocking");
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream
-                    .set_nonblocking(false)
-                    .expect("set accepted stream blocking");
-                return stream;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for client connection on listener");
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("unexpected accept error on listener: {error}"),
-        }
-    }
 
     fn assert_zero_redirect_connections(&self) {
         let deadline = Instant::now() + Duration::from_millis(100);
@@ -591,6 +569,36 @@ fn accept_bounded_stream(listener: &TcpListener) -> TcpStream {
                 }
                 Err(error) => panic!("unexpected error on redirect listener: {error}"),
             }
+        }
+    }
+}
+
+fn accept_bounded_stream(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted stream blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("bound accepted stream reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .expect("bound accepted stream writes");
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for client connection on listener");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("unexpected accept error on listener: {error}"),
         }
     }
 }
@@ -810,11 +818,34 @@ fn http_03_b_probe_redirect_statuses_planted_negative() {
     }
 }
 
+struct WakeCounter(AtomicUsize);
+
+impl WakeCounter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicUsize::new(0)))
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn http_03_b_pending_body_read_positive() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("read listener address");
     let target = format!("http://{addr}/mcp");
+    let (allow_body_tx, allow_body_rx) = mpsc::channel();
 
     let server = thread::spawn(move || {
         let mut probe = accept_bounded_stream(&listener);
@@ -823,12 +854,20 @@ fn http_03_b_pending_body_read_positive() {
         let mut req1 = accept_bounded_stream(&listener);
         let req1_cap = read_request(&mut req1);
         assert_final_metadata(&req1_cap, "tools/call");
-        write_response(
-            &mut req1,
-            200,
-            "application/json",
-            br#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"positive-1"}]}}"#,
-        );
+        let body_bytes = br#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"positive-1"}]}}"#;
+        write!(
+            req1,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body_bytes.len()
+        )
+        .expect("write response headers");
+        req1.flush().expect("flush response headers");
+
+        allow_body_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server must receive allow_body signal");
+        req1.write_all(body_bytes).expect("write body bytes");
+        req1.flush().expect("flush body bytes");
 
         let mut req2 = accept_bounded_stream(&listener);
         let req2_cap = read_request(&mut req2);
@@ -841,47 +880,68 @@ fn http_03_b_pending_body_read_positive() {
         );
     });
 
-    let cx = Cx::for_request();
-    let outcome = runtime_block_on(ModernHttpClient::connect(
-        &cx,
-        plan(
-            &target,
-            "http://127.0.0.1:9/legacy-sse",
-            "http://127.0.0.1:9/legacy-message",
-            test_policy(),
-        ),
-        client_info(),
-        ClientCapabilities::default(),
-    ))
-    .expect("connect must succeed");
+    runtime_block_on(async {
+        let cx = Cx::for_request();
+        let outcome = ModernHttpClient::connect(
+            &cx,
+            plan(
+                &target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                test_policy(),
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("connect must succeed");
 
-    let client = outcome
-        .into_modern()
-        .expect("modern client must be selected");
+        let client = outcome
+            .into_modern()
+            .expect("modern client must be selected");
 
-    let response1 = runtime_block_on(client.request(
-        &cx,
-        "tools/call",
-        serde_json::json!({"name": "test_tool", "arguments": {}}),
-        Some(RequestId::Number(2)),
-    ))
-    .expect("request 1 must succeed");
-    assert_eq!(response1.metadata().status(), 200);
-    let body1 = runtime_block_on(response1.read_to_end(&cx, 4096)).expect("read body 1");
-    let json1: serde_json::Value = serde_json::from_slice(&body1).expect("parse json 1");
-    assert_eq!(json1["result"]["content"][0]["text"], "positive-1");
+        let response1 = client
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "test_tool", "arguments": {}}),
+                Some(RequestId::Number(2)),
+            )
+            .await
+            .expect("request 1 headers must arrive");
+        assert_eq!(response1.metadata().status(), 200);
 
-    let response2 = runtime_block_on(client.request(
-        &cx,
-        "tools/call",
-        serde_json::json!({"name": "test_tool", "arguments": {}}),
-        Some(RequestId::Number(3)),
-    ))
-    .expect("sibling request must succeed");
-    assert_eq!(response2.metadata().status(), 200);
-    let body2 = runtime_block_on(response2.read_to_end(&cx, 4096)).expect("read body 2");
-    let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse json 2");
-    assert_eq!(json2["result"]["content"][0]["text"], "positive-2");
+        let mut read_future = Box::pin(response1.read_to_end(&cx, 4096));
+        let wake_counter = WakeCounter::new();
+        let waker = std::task::Waker::from(Arc::clone(&wake_counter));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+
+        let initial_poll = std::future::Future::poll(read_future.as_mut(), &mut task_cx);
+        assert!(
+            initial_poll.is_pending(),
+            "body read must be Pending while peer body is withheld"
+        );
+        allow_body_tx
+            .send(())
+            .expect("send allow_body signal to server");
+        let body1 = read_future.await.expect("read body 1");
+        let json1: serde_json::Value = serde_json::from_slice(&body1).expect("parse json 1");
+        assert_eq!(json1["result"]["content"][0]["text"], "positive-1");
+
+        let response2 = client
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "test_tool", "arguments": {}}),
+                Some(RequestId::Number(3)),
+            )
+            .await
+            .expect("sibling request must succeed");
+        assert_eq!(response2.metadata().status(), 200);
+        let body2 = response2.read_to_end(&cx, 4096).await.expect("read body 2");
+        let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse json 2");
+        assert_eq!(json2["result"]["content"][0]["text"], "positive-2");
+    });
 
     server.join().expect("server join");
 }
@@ -919,67 +979,88 @@ fn http_03_b_pending_body_ambient_cancellation_planted_negative() {
         );
     });
 
-    let cx = Cx::for_request();
-    let outcome = runtime_block_on(ModernHttpClient::connect(
-        &cx,
-        plan(
-            &target,
-            "http://127.0.0.1:9/legacy-sse",
-            "http://127.0.0.1:9/legacy-message",
-            test_policy(),
-        ),
-        client_info(),
-        ClientCapabilities::default(),
-    ))
-    .expect("connect must succeed");
+    runtime_block_on(async {
+        let cx = Cx::for_request();
+        let outcome = ModernHttpClient::connect(
+            &cx,
+            plan(
+                &target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                test_policy(),
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("connect must succeed");
 
-    let client = outcome
-        .into_modern()
-        .expect("modern client must be selected");
+        let client = outcome
+            .into_modern()
+            .expect("modern client must be selected");
 
-    let response1 = runtime_block_on(client.request(
-        &cx,
-        "tools/call",
-        serde_json::json!({"name": "test_tool", "arguments": {}}),
-        Some(RequestId::Number(2)),
-    ))
-    .expect("request 1 headers must arrive");
-    assert_eq!(response1.metadata().status(), 200);
+        let response1 = client
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "test_tool", "arguments": {}}),
+                Some(RequestId::Number(2)),
+            )
+            .await
+            .expect("request 1 headers must arrive");
+        assert_eq!(response1.metadata().status(), 200);
 
-    let cancel_cx = cx.clone();
-    let (cancel_tx, cancel_rx) = mpsc::channel();
-    let cancel_thread = thread::spawn(move || {
-        cancel_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("cancel thread must receive trigger");
-        thread::sleep(Duration::from_millis(20));
-        cancel_cx.cancel_with(
-            CancelKind::User,
-            Some("ambient cx cancellation while body pending"),
+        let mut read_future = Box::pin(response1.read_to_end(&cx, 4096));
+        let wake_counter = WakeCounter::new();
+        let waker = std::task::Waker::from(Arc::clone(&wake_counter));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+
+        let initial_poll = std::future::Future::poll(read_future.as_mut(), &mut task_cx);
+        assert!(
+            initial_poll.is_pending(),
+            "body read must be Pending while peer body is withheld"
         );
+        let wakes_before_cancellation = wake_counter.count();
+
+        // Synchronously cancel ambient Cx: must wake the registered cancel waker before repoll.
+        cx.cancel_with(
+            CancelKind::User,
+            Some("deterministic ambient cancellation while body pending"),
+        );
+        assert!(
+            wake_counter.count() > wakes_before_cancellation,
+            "synchronous cancellation must wake the registered cancel waker before repoll"
+        );
+
+        let cancelled_poll = std::future::Future::poll(read_future.as_mut(), &mut task_cx);
+        assert!(
+            matches!(
+                cancelled_poll,
+                std::task::Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
+            ),
+            "pending body read must resolve to Cancelled on repoll after cancellation wake, got {cancelled_poll:?}"
+        );
+
+        drop(read_future);
+
+        let sibling_cx = Cx::for_request();
+        let response2 = client
+            .request(
+                &sibling_cx,
+                "tools/call",
+                serde_json::json!({"name": "test_tool", "arguments": {}}),
+                Some(RequestId::Number(3)),
+            )
+            .await
+            .expect("sibling request must succeed");
+        assert_eq!(response2.metadata().status(), 200);
+        let body2 = response2
+            .read_to_end(&sibling_cx, 4096)
+            .await
+            .expect("read sibling body");
+        let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse sibling json");
+        assert_eq!(json2["result"]["content"][0]["text"], "sibling-ok");
     });
-    cancel_tx.send(()).expect("send cancel trigger");
-    let body_result = runtime_block_on(response1.read_to_end(&cx, 4096));
-    cancel_thread.join().expect("cancel thread join");
-
-    assert!(
-        matches!(body_result, Err(ModernHttpExecutorError::Cancelled)),
-        "pending body read must fail with Cancelled on ambient cx cancellation, got {body_result:?}"
-    );
-
-    let sibling_cx = Cx::for_request();
-    let response2 = runtime_block_on(client.request(
-        &sibling_cx,
-        "tools/call",
-        serde_json::json!({"name": "test_tool", "arguments": {}}),
-        Some(RequestId::Number(3)),
-    ))
-    .expect("sibling request must succeed");
-    assert_eq!(response2.metadata().status(), 200);
-    let body2 =
-        runtime_block_on(response2.read_to_end(&sibling_cx, 4096)).expect("read sibling body");
-    let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse sibling json");
-    assert_eq!(json2["result"]["content"][0]["text"], "sibling-ok");
 
     server.join().expect("server join");
 }
