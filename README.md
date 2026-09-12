@@ -570,12 +570,16 @@ and its method is `roots/list`. Files are limited to 1 MiB. Updates use the
 current task's input request types. Update and cancellation success mean
 acknowledgement; use `get` or `watch` to observe subsequent task state.
 
-Watch emits an initial snapshot, subscription acknowledgement, live task
-updates, and an exit reason. It does not reconnect or promise replay across
-disconnects. `--timeout` defaults to 30 seconds; timeout is a failed command,
-while reaching `--max-events` ends the watch successfully without cancelling
-the task. JSON mode emits one document per event; human output bounds and
-sanitizes fields and redacts recognizable credentials.
+Watch emits an initial snapshot and exits successfully if the task is already
+completed, failed, or cancelled. Otherwise it subscribes to live updates and
+reads the task again after subscription acknowledgement, so a terminal change
+during subscription setup is also reported. It ends successfully on a terminal
+update or after `--max-events` updates. Each
+successful exit includes a `watch-ended` event; ending a watch does not cancel
+the task. It does not reconnect or promise replay across disconnects.
+`--timeout` defaults to 30 seconds, and timeout is a failed command. JSON mode
+emits one document per event; human output bounds and sanitizes fields and
+redacts recognizable credentials.
 
 Use `--server EXECUTABLE` and repeat `--server-arg ARGUMENT` for stdio. Each
 command starts a fresh process, so previously issued task IDs require a store

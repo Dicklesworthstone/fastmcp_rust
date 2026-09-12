@@ -6042,6 +6042,63 @@ fn is_terminal_task_status(status: fastmcp_protocol::tasks_extension::TaskStatus
 }
 
 #[cfg(feature = "tasks")]
+enum TaskWatchStep {
+    Pending,
+    Reconcile,
+    Finished,
+}
+
+#[cfg(feature = "tasks")]
+fn validate_task_watch_acknowledgement(
+    filter: &fastmcp_protocol::SubscriptionFilter,
+    task_id: &fastmcp_protocol::FinalTaskId,
+) -> McpResult<()> {
+    let ids = fastmcp_protocol::task_subscription_ids(filter).map_err(|_| {
+        fastmcp_core::McpError::invalid_request("invalid task watch acknowledgement")
+    })?;
+    if ids.as_deref() != Some(std::slice::from_ref(task_id)) {
+        return Err(fastmcp_core::McpError::invalid_request(
+            "task watch did not accept exactly the requested task",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tasks")]
+fn end_watch_if_reconciled_terminal(
+    connection: &TaskConnection,
+    task: &fastmcp_protocol::tasks_extension::Task,
+    updates: &mut u64,
+) -> McpResult<bool> {
+    if !is_terminal_task_status(task.base().status) {
+        return Ok(false);
+    }
+    write_task_event(connection.json, "task-updated", task)?;
+    *updates += 1;
+    write_task_event(
+        connection.json,
+        "watch-ended",
+        &serde_json::json!({"reason": "task-terminal", "updates": updates}),
+    )?;
+    Ok(true)
+}
+
+#[cfg(feature = "tasks")]
+fn remaining_task_watch_time(
+    connection: &TaskConnection,
+    started: std::time::Instant,
+) -> McpResult<std::time::Duration> {
+    std::time::Duration::from_secs(connection.timeout)
+        .checked_sub(started.elapsed())
+        .filter(|remaining| *remaining >= std::time::Duration::from_millis(1))
+        .ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "task watch reached --timeout; task completion is unknown",
+            )
+        })
+}
+
+#[cfg(feature = "tasks")]
 async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) -> McpResult<()> {
     use fastmcp_protocol::tasks_extension::TaskId;
     let task_id = TaskId::parse(action.task_id()).map_err(|_| {
@@ -6162,7 +6219,9 @@ fn run_stdio_task(
             client.open_final_task_subscription_listener(filter)?;
             let outcome =
                 watch_stdio_task(cx, client, connection, &task_id, *max_events, &cancellation);
-            finish_inspect_acquisition(outcome, || client.cancel_live_final_task_subscription(cx))
+            finish_inspect_acquisition(outcome, || {
+                cx.masked(|| client.cancel_live_final_task_subscription(cx))
+            })
         }
         TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
     }
@@ -6224,25 +6283,46 @@ async fn run_yielding_stdio_task(
             let started = std::time::Instant::now();
             client.open_final_task_subscription_listener(filter)?;
             let mut updates = 0;
-            let outcome = loop {
-                match poll_stdio_task_watch(
-                    cx,
-                    client,
-                    connection,
-                    &task_id,
-                    *max_events,
-                    &cancellation,
-                    started,
-                    &mut updates,
-                ) {
-                    Ok(false) => asupersync::runtime::yield_now().await,
-                    Ok(true) => break Ok(()),
-                    Err(error) => break Err(error),
+            let outcome = async {
+                loop {
+                    match poll_stdio_task_watch(
+                        cx,
+                        client,
+                        connection,
+                        &task_id,
+                        *max_events,
+                        &cancellation,
+                        started,
+                        &mut updates,
+                    )? {
+                        TaskWatchStep::Pending => asupersync::runtime::yield_now().await,
+                        TaskWatchStep::Finished => break Ok(()),
+                        TaskWatchStep::Reconcile => {
+                            // The subscription is now admitted. A fresh read
+                            // covers a terminal transition before its admission.
+                            let remaining = remaining_task_watch_time(connection, started)?;
+                            client.set_request_timeout_policy(
+                                fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+                            )?;
+                            let task = client
+                                .get_task_final_with_cx(cx, &cancellation, task_id.clone())
+                                .await?
+                                .task;
+                            remaining_task_watch_time(connection, started)?;
+                            if end_watch_if_reconciled_terminal(connection, &task, &mut updates)? {
+                                break Ok(());
+                            }
+                        }
+                    }
                 }
-            };
-            // A cancelled event poll has already retired its listener using
-            // the connection context. Other exits still need explicit cleanup.
-            finish_inspect_acquisition(outcome, || client.cancel_live_final_task_subscription(cx))
+            }
+            .await;
+            // Reconciliation can be cancelled with the listener still live.
+            // Mask only its bounded cancellation write, preserving the original
+            // operation error and any actual cleanup failure.
+            finish_inspect_acquisition(outcome, || {
+                cx.masked(|| client.cancel_live_final_task_subscription(cx))
+            })
         }
         TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
     }
@@ -6260,7 +6340,7 @@ fn watch_stdio_task(
     let started = std::time::Instant::now();
     let mut updates = 0;
     loop {
-        if poll_stdio_task_watch(
+        match poll_stdio_task_watch(
             cx,
             client,
             connection,
@@ -6270,7 +6350,21 @@ fn watch_stdio_task(
             started,
             &mut updates,
         )? {
-            return Ok(());
+            TaskWatchStep::Pending => {}
+            TaskWatchStep::Finished => return Ok(()),
+            TaskWatchStep::Reconcile => {
+                let remaining = remaining_task_watch_time(connection, started)?;
+                client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                    remaining, remaining,
+                )?)?;
+                let task = client
+                    .get_task_final_with_cancellation(cx, cancellation, task_id.clone())?
+                    .task;
+                remaining_task_watch_time(connection, started)?;
+                if end_watch_if_reconciled_terminal(connection, &task, &mut updates)? {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -6285,7 +6379,7 @@ fn poll_stdio_task_watch(
     cancellation: &fastmcp_core::McpRequestCancellation,
     started: std::time::Instant,
     updates: &mut u64,
-) -> McpResult<bool> {
+) -> McpResult<TaskWatchStep> {
     use fastmcp_client::StdioTaskSubscriptionEvent;
     let timeout = std::time::Duration::from_secs(connection.timeout);
     let event = if started.elapsed() < timeout {
@@ -6303,15 +6397,9 @@ fn poll_stdio_task_watch(
     match event? {
         None => {}
         Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
-            let ids = fastmcp_protocol::task_subscription_ids(&filter).map_err(|_| {
-                fastmcp_core::McpError::invalid_request("invalid task watch acknowledgement")
-            })?;
-            if ids.as_deref() != Some(std::slice::from_ref(task_id)) {
-                return Err(fastmcp_core::McpError::invalid_request(
-                    "task watch did not accept exactly the requested task",
-                ));
-            }
+            validate_task_watch_acknowledgement(&filter, task_id)?;
             write_task_event(connection.json, "watch-acknowledged", &filter)?;
+            return Ok(TaskWatchStep::Reconcile);
         }
         Some(StdioTaskSubscriptionEvent::Notification(notification)) => {
             if &notification.params.task.base().task_id != task_id {
@@ -6327,7 +6415,7 @@ fn poll_stdio_task_watch(
                     "watch-ended",
                     &serde_json::json!({"reason": "task-terminal", "updates": updates}),
                 )?;
-                return Ok(true);
+                return Ok(TaskWatchStep::Finished);
             }
             if *updates >= max_events {
                 write_task_event(
@@ -6335,7 +6423,7 @@ fn poll_stdio_task_watch(
                     "watch-ended",
                     &serde_json::json!({"reason": "max-events", "updates": updates}),
                 )?;
-                return Ok(true);
+                return Ok(TaskWatchStep::Finished);
             }
         }
         Some(StdioTaskSubscriptionEvent::Terminal) => {
@@ -6344,10 +6432,10 @@ fn poll_stdio_task_watch(
                 "watch-ended",
                 &serde_json::json!({"reason": "stream-ended", "updates": updates}),
             )?;
-            return Ok(true);
+            return Ok(TaskWatchStep::Finished);
         }
     }
-    Ok(false)
+    Ok(TaskWatchStep::Pending)
 }
 
 #[cfg(feature = "tasks")]
@@ -6402,14 +6490,38 @@ async fn run_http_task(
             }
             let limits = fastmcp_client::sse::SseLimits::new(1024 * 1024, 2 * 1024 * 1024, 256)
                 .ok_or_else(|| fastmcp_core::McpError::internal_error("invalid CLI SSE bounds"))?;
-            let mut watch = handle.watch(cx, &mut client, limits).await.map_err(error)?;
+            let task_id = handle.task_id().clone();
+            let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+            fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
+            client
+                .open_final_task_subscription_listener(cx, filter, limits)
+                .await
+                .map_err(error)?;
             let mut updates = 0;
-            while let Some(event) = watch.next_event(cx).await.map_err(error)? {
+            loop {
+                let event = client
+                    .next_final_task_subscription_event(cx)
+                    .await
+                    .map_err(error)?;
                 match event {
-                    fastmcp_client::FinalTaskWatchEvent::Acknowledged { accepted_filter } => {
-                        write_task_event(connection.json, "watch-acknowledged", &accepted_filter)?;
+                    fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(filter) => {
+                        validate_task_watch_acknowledgement(&filter, &task_id)?;
+                        write_task_event(connection.json, "watch-acknowledged", &filter)?;
+                        // Retain the listener while reconciling the snapshot:
+                        // transitions before admission are visible to this read,
+                        // and later transitions remain queued on the same stream.
+                        let task = handle.poll(cx, &mut client).await.map_err(error)?;
+                        if end_watch_if_reconciled_terminal(connection, task, &mut updates)? {
+                            return Ok(());
+                        }
                     }
-                    fastmcp_client::FinalTaskWatchEvent::TaskUpdated(notification) => {
+                    fastmcp_client::StdioTaskSubscriptionEvent::Notification(notification) => {
+                        if notification.params.task.base().task_id != task_id {
+                            return Err(fastmcp_core::McpError::invalid_request(
+                                "task watch returned a different task ID",
+                            ));
+                        }
                         write_task_event(
                             connection.json,
                             "task-updated",
@@ -6424,8 +6536,8 @@ async fn run_http_task(
                             );
                         }
                         if updates >= *max_events {
-                            // The watcher owns its HTTP response stream. Dropping
-                            // it closes this listen without cancelling the task.
+                            // Dropping the client closes its listen response
+                            // without cancelling the task.
                             return write_task_event(
                                 connection.json,
                                 "watch-ended",
@@ -6433,7 +6545,7 @@ async fn run_http_task(
                             );
                         }
                     }
-                    fastmcp_client::FinalTaskWatchEvent::Terminal { .. } => break,
+                    fastmcp_client::StdioTaskSubscriptionEvent::Terminal => break,
                 }
             }
             write_task_event(
@@ -12051,9 +12163,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                             for id in 2..=5 {
                                 let expected = id.to_string();
                                 let deadline = Instant::now() + Duration::from_secs(15);
+                                let mut polls = 0_u64;
                                 while std::fs::read_to_string(&ready).unwrap() != expected {
-                                    assert!(Instant::now() < deadline, "catalog command must yield at every request");
+                                    polls += 1;
+                                    assert!(Instant::now() < deadline,
+                                        "catalog command must yield at every request: id={id}, sibling_polls={polls}, ready={:?}",
+                                        std::fs::read_to_string(&ready).unwrap());
+                                    let yielded_at = Instant::now();
                                     asupersync::runtime::yield_now().await;
+                                    if yielded_at.elapsed() > Duration::from_millis(100) {
+                                        eprintln!("CLI_CORE_RUNTIME_DELAY id={id} elapsed={:?}", yielded_at.elapsed());
+                                    }
                                 }
                                 if cancel { command_cx.set_cancel_requested(true); }
                                 std::fs::write(&release, expected).unwrap();
@@ -12097,17 +12217,23 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn stdio_tasks_command_caller_runtime_positive() {
-        assert_stdio_tasks_command_caller_runtime(false);
+        assert_stdio_tasks_command_caller_runtime(false, false);
     }
 
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn stdio_tasks_command_caller_runtime_planted_negative() {
-        assert_stdio_tasks_command_caller_runtime(true);
+        assert_stdio_tasks_command_caller_runtime(true, false);
     }
 
     #[cfg(all(unix, feature = "tasks"))]
-    fn assert_stdio_tasks_command_caller_runtime(cancel: bool) {
+    #[test]
+    fn stdio_tasks_command_reconciliation_cancellation_preserves_connection() {
+        assert_stdio_tasks_command_caller_runtime(true, true);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_stdio_tasks_command_caller_runtime(cancel: bool, cancel_after_ack: bool) {
         use fastmcp_protocol::tasks_extension::TaskId;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12140,6 +12266,31 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
         let event = format!(
             r#"printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":4}},"taskId":"{subject}","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null}}}}'"#
         );
+        let reconciliation = if cancel && !cancel_after_ack {
+            String::new()
+        } else {
+            let completion = if cancel_after_ack {
+                r#"IFS= read -r cancel_get || exit 105
+case "$cancel_get" in *'"method":"notifications/cancelled"'*'"requestId":6'*) ;; *) exit 106 ;; esac"#
+                    .to_owned()
+            } else {
+                format!(r#"printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{snapshot}}}'"#)
+            };
+            format!(
+                r#"
+IFS= read -r reconcile || exit 103
+case "$reconcile" in *'"method":"tasks/get"'*'{subject}'*'"id":6'*) ;; *) exit 104 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete"}}}}'
+{completion}
+"#
+            )
+        };
+        let recovery_id = if cancel && !cancel_after_ack { 6 } else { 7 };
+        let late_ping = if cancel && !cancel_after_ack {
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete"}}'"#
+        } else {
+            ""
+        };
         let script = format!(
             r#"
 IFS= read -r discovery || exit 90
@@ -12155,13 +12306,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete"}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":4}},"notifications":{{"taskIds":["{subject}"]}}}}}}'
 IFS= read -r second_ping || exit 97
 case "$second_ping" in *'"method":"ping"'*'"id":5'*) ;; *) exit 98 ;; esac
+{reconciliation}
 {event}
 IFS= read -r control || exit 99
 case "$control" in *'"method":"notifications/cancelled"'*'"requestId":4'*) ;; *) exit 100 ;; esac
-printf '%s\n' '{{"jsonrpc":"2.0","id":5,"result":{{"resultType":"complete"}}}}'
+{late_ping}
 IFS= read -r recovery || exit 101
-case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":6'*) ;; *) exit 102 ;; esac
-printf '%s\n' '{{"jsonrpc":"2.0","id":6,"result":{snapshot}}}'
+case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":{recovery_id}'*) ;; *) exit 102 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":{recovery_id},"result":{snapshot}}}'
 IFS= read -r end
 "#
         );
@@ -12196,8 +12348,21 @@ IFS= read -r end
                         assert!(Instant::now() < deadline, "watch must yield its worker to sibling");
                         asupersync::runtime::yield_now().await;
                     }
-                    if cancel { command_cx.set_cancel_requested(true); }
-                    sibling_executor.execute(&sibling_cx, "ping", Some(serde_json::json!({}))).unwrap()
+                    if cancel && !cancel_after_ack { command_cx.set_cancel_requested(true); }
+                    let mut second = sibling_executor.execute(&sibling_cx, "ping", Some(serde_json::json!({}))).unwrap();
+                    if cancel_after_ack {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        loop {
+                            if let Some(response) = sibling_executor.try_take_response(&mut second).unwrap() {
+                                assert!(response.error.is_none());
+                                command_cx.set_cancel_requested(true);
+                                return None;
+                            }
+                            assert!(Instant::now() < deadline, "reconciliation must yield before cancellation");
+                            asupersync::runtime::yield_now().await;
+                        }
+                    }
+                    Some(second)
                 }).unwrap();
                 let task_id = TaskId::parse(subject.clone()).unwrap();
                 let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, bearer_token_file: None, json: true, timeout: 5 };
@@ -12210,9 +12375,14 @@ IFS= read -r end
                 sibling_root.checkpoint().unwrap();
                 let recovered = client.get_task_final_with_cx(&sibling_root, &fastmcp_core::McpRequestCancellation::new(), task_id.clone()).await.unwrap();
                 assert_eq!(recovered.task.base().task_id, task_id);
-                let mut last = sibling.join(&sibling_root).await.unwrap();
-                assert!(executor.try_take_response(&mut last).unwrap().unwrap().error.is_none());
-                eprintln!("CLI_TASK_RUNTIME_PROOF {}", serde_json::json!({"cancel": cancel, "subject": subject, "sameWorker": true, "sibling": true, "recovery": true, "listenerCancellationId": 4, "recoveryId": 6}));
+                let last = sibling.join(&sibling_root).await.unwrap();
+                if let Some(mut last) = last {
+                    assert!(!cancel_after_ack);
+                    assert!(executor.try_take_response(&mut last).unwrap().unwrap().error.is_none());
+                } else {
+                    assert!(cancel_after_ack);
+                }
+                eprintln!("CLI_TASK_RUNTIME_PROOF {}", serde_json::json!({"cancel": cancel, "cancelAfterAck": cancel_after_ack, "subject": subject, "sameWorker": true, "sibling": true, "recovery": true, "listenerCancellationId": 4, "recoveryId": recovery_id, "reconciled": !cancel}));
                 client.close().unwrap();
                 observed_completion.store(true, Ordering::SeqCst);
             }).unwrap();

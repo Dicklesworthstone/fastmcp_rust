@@ -164,10 +164,12 @@ impl fastmcp_rust::ApplicationTaskSupervisor for FixtureTaskSupervisor {
                             .expect("valid task error");
                         match handoff {
                             fastmcp_rust::FinalTaskSupervisorHandoff::Initial(initial) => {
-                                initial.fail_task(error, Some("failed by supervisor".to_owned()))?;
+                                initial
+                                    .fail_task(error, Some("failed by supervisor".to_owned()))?;
                             }
                             fastmcp_rust::FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                                accepted.fail_task(error, Some("failed by supervisor".to_owned()))?;
+                                accepted
+                                    .fail_task(error, Some("failed by supervisor".to_owned()))?;
                             }
                         }
                         return Ok(());
@@ -209,21 +211,42 @@ fn install_task_fixture(
     let task: Task =
         serde_json::from_slice(&std::fs::read(&path).expect("read runtime task fixture"))
             .expect("decode runtime task fixture");
+    let task_id = task.base().task_id.clone();
+    let watch_gap = dir.join("watch_gap").exists().then(|| dir.clone());
     let store = Arc::new(InMemoryFinalTaskStore::default());
     let supervisor_requested =
         dir.join("transition_to_completed").exists() || dir.join("transition_to_failed").exists();
-    if matches!(task, Task::Working(_)) && supervisor_requested {
+    if supervisor_requested && matches!(task, Task::Working(_) | Task::InputRequired { .. }) {
+        // Seed the originating work before projecting a persisted input wait.
+        // A resumed handoff must retain that descriptor; a bare InputRequired
+        // record cannot supply application work to the real service runner.
+        let mut initial_base = task.base().clone();
+        initial_base.status = fastmcp_rust::tasks_extension::TaskStatus::Working;
+        let initial_task = Task::Working(initial_base);
         store
             .create_task_with_work(
-                task.clone(),
+                initial_task.clone(),
                 TaskStatusNotification::new(TaskStatusNotificationParams {
-                    task,
+                    task: initial_task,
                     meta: None,
                     additional: std::collections::BTreeMap::new(),
                 }),
-                fastmcp_rust::FinalTaskWorkDescriptor::new(serde_json::json!({})),
+                fastmcp_rust::FinalTaskWorkDescriptor::new(serde_json::json!({}))
+                    .expect("valid fixture work descriptor"),
             )
             .expect("seed real task store with work");
+        if matches!(task, Task::InputRequired { .. }) {
+            store
+                .replace_task(
+                    task.clone(),
+                    TaskStatusNotification::new(TaskStatusNotificationParams {
+                        task,
+                        meta: None,
+                        additional: std::collections::BTreeMap::new(),
+                    }),
+                )
+                .expect("persist input wait while retaining the originating work");
+        }
     } else {
         store
             .create_task(
@@ -239,7 +262,7 @@ fn install_task_fixture(
     let state_output = std::env::args().nth(2);
     let error_output = state_output.clone();
     let runtime = FinalTaskRuntime::new(
-        store,
+        store.clone(),
         FinalTaskRuntimeConfig::new(60_000, Some(100)).expect("task retention policy"),
         Arc::new(move |notification| {
             if let Some(path) = &state_output {
@@ -263,16 +286,86 @@ fn install_task_fixture(
     let builder = builder
         .final_tasks(runtime)
         .expect("install official Tasks runtime")
-        .middleware(TaskErrorExitData(error_output))
+        .middleware(TaskErrorExitData {
+            error_output,
+            watch_gap,
+            store,
+            task_id,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
         .mask_error_details(false);
     (builder, runner)
 }
 
 #[cfg(feature = "tasks")]
-struct TaskErrorExitData(Option<String>);
+struct TaskErrorExitData {
+    error_output: Option<String>,
+    watch_gap: Option<std::path::PathBuf>,
+    store: std::sync::Arc<fastmcp_rust::InMemoryFinalTaskStore>,
+    task_id: fastmcp_rust::FinalTaskId,
+    reads: std::sync::atomic::AtomicUsize,
+}
 
 #[cfg(feature = "tasks")]
 impl fastmcp_rust::Middleware for TaskErrorExitData {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        request: &fastmcp_protocol::JsonRpcRequest,
+    ) -> McpResult<fastmcp_rust::MiddlewareDecision> {
+        use fastmcp_rust::FinalTaskStore;
+        use fastmcp_rust::tasks_extension::{
+            Task, TaskStatus, TaskStatusNotification, TaskStatusNotificationParams,
+        };
+        use std::sync::atomic::Ordering;
+
+        if let Some(dir) = &self.watch_gap {
+            if request.method == "tasks/get" {
+                let reads = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+                std::fs::write(dir.join("watch_gap_reads"), reads.to_string())
+                    .expect("retain real task read count");
+            } else if request.method == "subscriptions/listen" {
+                assert_eq!(self.reads.load(Ordering::SeqCst), 1);
+                let task = self
+                    .store
+                    .get_task(&self.task_id)?
+                    .expect("task retained before listener admission");
+                assert!(matches!(task, Task::Working(_)));
+                let complete = std::fs::read_to_string(dir.join("watch_gap"))
+                    .expect("read runtime-selected gap scenario")
+                    == "complete";
+                let after = if complete {
+                    let mut base = task.base().clone();
+                    base.status = TaskStatus::Completed;
+                    let completed = Task::Completed {
+                        base,
+                        result: serde_json::from_value(serde_json::json!({
+                            "content": [{"type": "text", "text": "completed before listen"}]
+                        }))
+                        .expect("typed completed result"),
+                    };
+                    self.store.replace_task(
+                        completed.clone(),
+                        TaskStatusNotification::new(TaskStatusNotificationParams {
+                            task: completed.clone(),
+                            meta: None,
+                            additional: std::collections::BTreeMap::new(),
+                        }),
+                    )?;
+                    completed
+                } else {
+                    task
+                };
+                std::fs::write(
+                    dir.join("watch_gap_state"),
+                    serde_json::to_vec(&after).expect("encode state at listener admission"),
+                )
+                .expect("retain state at listener admission");
+            }
+        }
+        Ok(fastmcp_rust::MiddlewareDecision::Continue)
+    }
+
     fn on_error(
         &self,
         _ctx: &McpContext,
@@ -281,7 +374,7 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
     ) -> McpError {
         if request.method == "tasks/get" {
             error.data = Some(serde_json::json!({"exit_code": 0}));
-            if let Some(path) = &self.0 {
+            if let Some(path) = &self.error_output {
                 std::fs::write(path, serde_json::to_vec(&error).expect("encode peer error"))
                     .expect("retain peer error observation");
             }

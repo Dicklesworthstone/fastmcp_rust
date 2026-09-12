@@ -2540,7 +2540,12 @@ mod task_commands {
         let status = watch
             .wait_until(Duration::from_secs(10))
             .expect("streamed terminal watch exits promptly without timeout");
-        assert!(status.success());
+        assert!(
+            status.success(),
+            "streamed watch failed with {status}: {}",
+            std::fs::read_to_string(stdout_path.with_extension("stderr"))
+                .expect("watch stderr is retained")
+        );
         let events = read_json_lines(stdout_path);
         assert!(events.len() >= 4);
         assert_eq!(events[0]["event"], "snapshot");
@@ -3123,5 +3128,86 @@ mod task_commands {
             "nonterminal working update must not emit task-terminal watch-ended event"
         );
         server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    fn check_watch_snapshot_admission_gap(http: bool, complete: bool) {
+        let fixture = TaskFixture::new(false);
+        std::fs::write(
+            fixture.root.join("watch_gap"),
+            if complete { "complete" } else { "hold" },
+        )
+        .unwrap();
+        let output = if http {
+            let (mut server, endpoint) = fixture.http();
+            let output = run_cli(&[
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--timeout",
+                "2",
+            ]);
+            server.kill_and_reap().expect("HTTP server cleanup");
+            output
+        } else {
+            fixture.stdio("watch", &["--json", "--timeout", "2"])
+        };
+        let events: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.len() >= 2, "{}", stderr_str(&output));
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"], fixture.task);
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("watch_gap_reads")).unwrap(),
+            "2",
+            "watch must reconcile through a real tasks/get after listener admission"
+        );
+        let admitted: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("watch_gap_state")).unwrap())
+                .unwrap();
+        if complete {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["event"], "task-updated");
+            assert_eq!(events[2]["data"], admitted);
+            assert_eq!(events[2]["data"]["status"], "completed");
+            assert_eq!(
+                events[2]["data"]["result"]["content"][0]["text"],
+                "completed before listen"
+            );
+            assert_eq!(events[3]["event"], "watch-ended");
+            assert_eq!(events[3]["data"]["reason"], "task-terminal");
+            assert_eq!(events[3]["data"]["updates"], 1);
+        } else {
+            assert!(!output.status.success());
+            assert!(stderr_str(&output).contains("--timeout"));
+            assert_eq!(admitted, fixture.task, "unexpired work stays unchanged");
+            assert_eq!(events.len(), 2, "no fabricated update or terminal event");
+        }
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_reconciles_terminal_before_acknowledgment() {
+        check_watch_snapshot_admission_gap(true, true);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_reconciles_terminal_before_acknowledgment() {
+        check_watch_snapshot_admission_gap(false, true);
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_unexpired_before_acknowledgment() {
+        check_watch_snapshot_admission_gap(true, false);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_unexpired_before_acknowledgment() {
+        check_watch_snapshot_admission_gap(false, false);
     }
 }
