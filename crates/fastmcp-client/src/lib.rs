@@ -1510,8 +1510,11 @@ const CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
 /// request.
 ///
 /// Both timers start after the request send commits; they do not bound a
-/// blocking send or later connection teardown. Both limits are nonzero and
-/// bounded. The idle timer may be restarted by a valid, strictly increasing
+/// blocking send or later connection teardown. Both limits are nonzero.
+/// [`Self::new`] applies the library's ordinary safety caps; trusted local
+/// applications can explicitly preserve their own fixed timeout with
+/// [`Self::from_application_timeout_ms`]. The idle timer may be restarted by a
+/// valid, strictly increasing
 /// progress notification carrying the request's exact progress token when
 /// [`Self::reset_idle_on_matching_progress`] is enabled. The absolute timer
 /// never moves.
@@ -1520,6 +1523,13 @@ pub struct RequestTimeoutPolicy {
     idle_timeout: Duration,
     absolute_timeout: Duration,
     reset_idle_on_matching_progress: bool,
+    bounds: RequestTimeoutBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestTimeoutBounds {
+    Bounded,
+    ApplicationConfigured,
 }
 
 impl RequestTimeoutPolicy {
@@ -1535,6 +1545,31 @@ impl RequestTimeoutPolicy {
             idle_timeout,
             absolute_timeout,
             reset_idle_on_matching_progress: true,
+            bounds: RequestTimeoutBounds::Bounded,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Preserves a positive, application-configured response timeout.
+    ///
+    /// Both response deadlines use this exact duration and matching progress
+    /// does not extend them. This explicit local configuration path has no
+    /// library duration cap; it must not be populated from peer-controlled
+    /// protocol fields. Caller cancellation and checked clock arithmetic still
+    /// apply. The ordinary [`Self::new`] and default policy remain bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-parameters error for zero or a duration that cannot
+    /// be represented by the current monotonic clock.
+    pub fn from_application_timeout_ms(timeout_ms: u64) -> McpResult<Self> {
+        let timeout = Duration::from_millis(timeout_ms);
+        let policy = Self {
+            idle_timeout: timeout,
+            absolute_timeout: timeout,
+            reset_idle_on_matching_progress: false,
+            bounds: RequestTimeoutBounds::ApplicationConfigured,
         };
         policy.validate()?;
         Ok(policy)
@@ -1567,6 +1602,17 @@ impl RequestTimeoutPolicy {
     }
 
     fn validate(self) -> McpResult<()> {
+        if self.bounds == RequestTimeoutBounds::ApplicationConfigured {
+            let now = Instant::now();
+            for timeout in [self.idle_timeout, self.absolute_timeout] {
+                if timeout < Duration::from_millis(1) || now.checked_add(timeout).is_none() {
+                    return Err(McpError::invalid_params(
+                        "Application request timeout must be positive and fit the monotonic clock",
+                    ));
+                }
+            }
+            return Ok(());
+        }
         validate_timeout_duration(
             self.idle_timeout,
             MAX_CLIENT_IDLE_TIMEOUT,
@@ -1586,6 +1632,7 @@ impl Default for RequestTimeoutPolicy {
             idle_timeout: DEFAULT_CLIENT_IDLE_TIMEOUT,
             absolute_timeout: DEFAULT_CLIENT_ABSOLUTE_TIMEOUT,
             reset_idle_on_matching_progress: true,
+            bounds: RequestTimeoutBounds::Bounded,
         }
     }
 }
@@ -30370,6 +30417,82 @@ mod tests {
     }
 
     #[test]
+    fn application_timeout_preserves_fixed_deadlines_and_checked_range() {
+        let timeout = Duration::from_mins(30);
+        let policy = RequestTimeoutPolicy::from_application_timeout_ms(1_800_000).unwrap();
+        assert_eq!(policy.idle_timeout(), timeout);
+        assert_eq!(policy.absolute_timeout(), timeout);
+        assert!(!policy.resets_idle_on_matching_progress());
+        assert!(RequestTimeoutPolicy::new(timeout, timeout).is_err());
+        assert!(RequestTimeoutPolicy::from_application_timeout_ms(0).is_err());
+
+        let committed_at = Instant::now();
+        let deadlines = RequestDeadlines::start_at(policy, committed_at).unwrap();
+        assert_eq!(deadlines.idle, committed_at.checked_add(timeout).unwrap());
+        assert_eq!(deadlines.absolute, deadlines.idle);
+        assert_eq!(deadlines.expired_at(committed_at), None);
+        assert_eq!(
+            deadlines.expired_at(deadlines.absolute),
+            Some(RequestTimeoutSource::Absolute)
+        );
+
+        let largest = RequestTimeoutPolicy::from_application_timeout_ms(u64::MAX);
+        assert_eq!(
+            largest.is_ok(),
+            Instant::now()
+                .checked_add(Duration::from_millis(u64::MAX))
+                .is_some()
+        );
+        let invalid = RequestTimeoutPolicy {
+            idle_timeout: Duration::MAX,
+            absolute_timeout: Duration::MAX,
+            reset_idle_on_matching_progress: false,
+            bounds: RequestTimeoutBounds::ApplicationConfigured,
+        };
+        assert!(invalid.validate().is_err());
+        assert!(RequestDeadlines::start_at(invalid, committed_at).is_err());
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn application_timeout_matching_progress_does_not_extend_fixed_deadline() {
+        let script = r#"
+IFS= read -r request || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":0.5}}'
+IFS= read -r cancellation || exit 91
+case "$cancellation" in *notifications/cancelled*) ;; *) exit 92;; esac
+IFS= read -r remaining
+"#;
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        client
+            .set_request_timeout_policy(
+                RequestTimeoutPolicy::from_application_timeout_ms(500).unwrap(),
+            )
+            .unwrap();
+        let marker = ProgressMarker::Number(JsonInteger::from(2));
+        let mut events = Vec::new();
+        let mut callback = |progress: f64, _: Option<f64>, _: Option<&str>| events.push(progress);
+        let error = client
+            .send_request_with_progress::<_, serde_json::Value>(
+                "test/application-timeout",
+                serde_json::json!({}),
+                2,
+                &marker,
+                &mut callback,
+            )
+            .expect_err("valid progress cannot extend the fixed application deadline");
+        assert_eq!(events, vec![0.5]);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert_eq!(client.responses.cancellation_control_len(), 1);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("reap the progress peer");
+        assert!(client.child.is_none());
+    }
+
+    #[test]
     fn request_deadline_tie_selects_absolute_source() {
         let committed_at = Instant::now();
         let policy =
@@ -30398,6 +30521,7 @@ mod tests {
             idle_timeout: Duration::ZERO,
             absolute_timeout: Duration::from_secs(1),
             reset_idle_on_matching_progress: true,
+            bounds: RequestTimeoutBounds::Bounded,
         };
 
         let result: McpResult<serde_json::Value> =

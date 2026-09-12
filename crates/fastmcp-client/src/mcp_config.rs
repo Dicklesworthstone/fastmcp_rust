@@ -1586,6 +1586,7 @@ mod tests {
             idle_timeout: std::time::Duration::ZERO,
             absolute_timeout: std::time::Duration::from_secs(1),
             reset_idle_on_matching_progress: true,
+            bounds: crate::RequestTimeoutBounds::Bounded,
         };
 
         let error = match config.client_with_timeout_policy(
