@@ -26,6 +26,31 @@ use fastmcp_protocol::methods::{
 };
 use serde_json::{Value, json};
 
+fn validate_application_tool_result(result: Value) -> Result<Value, Legacy2024AdapterError> {
+    let invalid = || Legacy2024AdapterError {
+        code: JsonInteger::from(-32603),
+        message: "handler result is not valid application tool content on a legacy connection"
+            .to_owned(),
+    };
+    let object = result.as_object().ok_or_else(invalid)?;
+    let content = object.get("content").ok_or_else(invalid)?;
+    serde_json::from_value::<Vec<fastmcp_protocol::Content>>(content.clone())
+        .map_err(|_| invalid())?;
+
+    // Reuse exact validation for every envelope member, including reserved
+    // metadata and modern-only fields. Only content uses the application's
+    // existing typed vocabulary. This validation projection is never emitted;
+    // the original complete result crosses the normal response boundary.
+    let mut envelope: serde_json::Map<String, Value> = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "content")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    envelope.insert("content".to_owned(), Value::Array(Vec::new()));
+    translate_legacy_2024_result(TOOLS_CALL, Value::Object(envelope)).map_err(|_| invalid())?;
+    Ok(result)
+}
+
 /// Maximum combined subscriptions and pending reverse requests retained by
 /// one exact-2024 adapter binding.
 ///
@@ -393,6 +418,7 @@ pub struct Legacy2024ServerAdapter<H> {
     operating_transition_count: u64,
     config: Legacy2024ServerConfig,
     handler: H,
+    application_tool_content: bool,
     client_capabilities: Option<Legacy2024ClientCapabilities>,
     client_capabilities_bytes: Vec<u8>,
     client_info: Option<fastmcp_protocol::ClientInfo>,
@@ -634,6 +660,7 @@ where
             operating_transition_count: 0,
             config,
             handler,
+            application_tool_content: false,
             client_capabilities: None,
             client_capabilities_bytes: Vec::new(),
             client_info: None,
@@ -646,6 +673,12 @@ where
             close_release_count: 0,
             next_reverse_request_id: 1,
         })
+    }
+
+    /// Selects only the application-owned tool content projection.
+    pub(crate) fn with_application_tool_content(mut self, enabled: bool) -> Self {
+        self.application_tool_content = enabled;
+        self
     }
 
     /// Returns the binding that exclusively owns this lifecycle state.
@@ -1104,6 +1137,9 @@ where
                         message: error.message().to_owned(),
                     })?;
                 match method {
+                    TOOLS_CALL if self.application_tool_content => {
+                        validate_application_tool_result(result)
+                    }
                     TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
                         translate_legacy_2024_result(method, result).map_err(|_| {
                             Legacy2024AdapterError {

@@ -71,6 +71,14 @@ use fastmcp_protocol::{
 /// during request handling. The callback receives a JSON-RPC request (notification format).
 pub type NotificationSender = Arc<dyn Fn(JsonRpcRequest) + Send + Sync>;
 
+/// Application handler output before the exact legacy wire projection.
+#[derive(serde::Serialize)]
+pub(crate) struct ApplicationToolResult {
+    content: Vec<Content>,
+    #[serde(rename = "isError", skip_serializing_if = "std::ops::Not::not")]
+    is_error: bool,
+}
+
 /// Allowlisted transport provenance attached to a sanitized inbound request.
 ///
 /// This deliberately contains no peer address, headers, cookies, or
@@ -5135,6 +5143,33 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
+        let result = self
+            .handle_application_tools_call_in_request(
+                request_ctx,
+                request_cx,
+                params,
+                session_state,
+                notification_sender,
+                bidirectional_senders,
+            )
+            .await?;
+        Ok(CallToolResult {
+            content: legacy_contents_from_handler(result.content)?,
+            is_error: result.is_error,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+    }
+
+    pub(crate) async fn handle_application_tools_call_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: CallToolParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+    ) -> McpResult<ApplicationToolResult> {
         debug!(
             target: targets::HANDLER,
             "calling modern tool; tool_key={}; arguments_present={}",
@@ -5208,26 +5243,20 @@ impl Router {
             .await?;
 
         match outcome {
-            Outcome::Ok(content) => Ok(CallToolResult {
-                content: legacy_contents_from_handler(content)?,
+            Outcome::Ok(content) => Ok(ApplicationToolResult {
+                content,
                 is_error: false,
-                meta: None,
-                additional: BTreeMap::new(),
             }),
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
                 if is_framework_terminal_tool_error(error.code) {
                     return Err(error);
                 }
-                Ok(CallToolResult {
-                    content: vec![LegacyContent::Text {
+                Ok(ApplicationToolResult {
+                    content: vec![Content::Text {
                         text: error.message,
-                        annotations: None,
-                        additional: BTreeMap::new(),
                     }],
                     is_error: true,
-                    meta: None,
-                    additional: BTreeMap::new(),
                 })
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),

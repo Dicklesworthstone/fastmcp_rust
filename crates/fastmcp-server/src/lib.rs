@@ -9292,25 +9292,26 @@ impl ServerHttpSession {
         let adapter = match self.legacy_adapter.as_mut() {
             Some(adapter) => adapter,
             None => {
-                let adapter = Legacy2024ServerAdapter::install(
-                    self.legacy_binding,
-                    self.server.legacy_2024_server_config(),
-                    HttpLegacy2024RuntimeHandler {
-                        server: Arc::clone(&self.server),
-                        session_id: self.legacy_binding.generation(),
-                        session_principal: self.legacy_session.principal_binding(),
-                        active_request: Arc::clone(&self.legacy_active_request),
-                        request_cx: Arc::clone(&self.legacy_request_cx),
-                        runtime: self.legacy_runtime.clone(),
-                        legacy_admissions: Arc::clone(&self.legacy_admissions),
-                        auth_receipt: Arc::clone(&self.legacy_auth_receipt),
-                    },
-                )
-                .map_err(|error| {
-                    DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::other(
-                        error.to_string(),
-                    )))
-                })?;
+                let adapter = self
+                    .server
+                    .install_legacy_2024_adapter(
+                        self.legacy_binding,
+                        HttpLegacy2024RuntimeHandler {
+                            server: Arc::clone(&self.server),
+                            session_id: self.legacy_binding.generation(),
+                            session_principal: self.legacy_session.principal_binding(),
+                            active_request: Arc::clone(&self.legacy_active_request),
+                            request_cx: Arc::clone(&self.legacy_request_cx),
+                            runtime: self.legacy_runtime.clone(),
+                            legacy_admissions: Arc::clone(&self.legacy_admissions),
+                            auth_receipt: Arc::clone(&self.legacy_auth_receipt),
+                        },
+                    )
+                    .map_err(|error| {
+                        DualEraHttpEndpointError::Transport(TransportError::Io(
+                            std::io::Error::other(error.to_string()),
+                        ))
+                    })?;
                 self.legacy_adapter.insert(adapter)
             }
         };
@@ -12159,6 +12160,8 @@ pub struct Server {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy selected by [`ServerBuilder`].
     protocol_policy: ProtocolPolicy,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    legacy_application_tool_content: bool,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
     /// Optional OAuth-only public routes admitted before MCP transport conversion.
@@ -12390,6 +12393,17 @@ impl Server {
             },
             instructions: self.instructions.clone(),
         }
+    }
+
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    fn install_legacy_2024_adapter<H: Legacy2024Handler>(
+        &self,
+        binding: LegacyPeerBinding,
+        handler: H,
+    ) -> Result<Legacy2024ServerAdapter<H>, Legacy2024AdapterError> {
+        Legacy2024ServerAdapter::install(binding, self.legacy_2024_server_config(), handler).map(
+            |adapter| adapter.with_application_tool_content(self.legacy_application_tool_content),
+        )
     }
 
     /// Returns the final discovery result for this constructed server.
@@ -14207,6 +14221,21 @@ impl Server {
                     }
                     "tools/call" => {
                         let params: CallToolParams = parse_params(params)?;
+                        if self.legacy_application_tool_content {
+                            return serde_json::to_value(
+                                self.router
+                                    .handle_application_tools_call_in_request(
+                                        &request_ctx,
+                                        cx,
+                                        params,
+                                        session_state.clone(),
+                                        runtime.map(|runtime| &runtime.notification_sender),
+                                        bidirectional_senders.as_ref(),
+                                    )
+                                    .await?,
+                            )
+                            .map_err(McpError::from);
+                        }
                         serde_json::to_value(
                             self.router
                                 .handle_tools_call_in_request(
@@ -16532,9 +16561,8 @@ impl Server {
                 let adapter = match legacy_adapter.as_mut() {
                     Some(adapter) => adapter,
                     None => {
-                        let adapter = Legacy2024ServerAdapter::install(
+                        let adapter = worker_server.install_legacy_2024_adapter(
                             legacy_binding,
-                            worker_server.legacy_2024_server_config(),
                             LiveLegacy2024RuntimeHandler {
                                 server: worker_server.as_ref(),
                                 cx: worker_cx.clone(),
@@ -17839,9 +17867,8 @@ impl Server {
                         let adapter = match legacy_adapter.as_mut() {
                             Some(adapter) => adapter,
                             None => {
-                                let adapter = Legacy2024ServerAdapter::install(
+                                let adapter = server.install_legacy_2024_adapter(
                                     legacy_binding,
-                                    server.legacy_2024_server_config(),
                                     LiveLegacy2024RuntimeHandler {
                                         server: server.as_ref(),
                                         cx: cx.clone(),
@@ -18251,9 +18278,8 @@ impl Server {
                         let adapter = match legacy_adapter.as_mut() {
                             Some(adapter) => adapter,
                             None => {
-                                let adapter = Legacy2024ServerAdapter::install(
+                                let adapter = server.install_legacy_2024_adapter(
                                     legacy_binding,
-                                    server.legacy_2024_server_config(),
                                     LiveLegacy2024RuntimeHandler {
                                         server: server.as_ref(),
                                         cx: cx.clone(),
@@ -34988,6 +35014,288 @@ mod lib_unit_tests {
         );
     }
 
+    struct ApplicationContentTool {
+        content: Vec<Content>,
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl ToolHandler for ApplicationContentTool {
+        fn definition(&self) -> Tool {
+            let mut definition = LiveRuntimeListedTool.definition();
+            definition.name = "application_content".to_owned();
+            definition
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            ctx.checkpoint()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(McpError::tool_error("application tool failed"))
+            } else {
+                Ok(self.content.clone())
+            }
+        }
+    }
+
+    struct ApplicationContentResultMiddleware(serde_json::Value);
+
+    impl Middleware for ApplicationContentResultMiddleware {
+        fn on_response(
+            &self,
+            _ctx: &McpContext,
+            request: &JsonRpcRequest,
+            response: serde_json::Value,
+        ) -> McpResult<serde_json::Value> {
+            Ok(if request.method == "tools/call" {
+                self.0.clone()
+            } else {
+                response
+            })
+        }
+    }
+
+    fn application_content_transcript(builder: ServerBuilder) -> Vec<JsonRpcMessage> {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let call = |id| {
+            JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": "application_content", "arguments": {}})),
+                id,
+            ))
+        };
+        // Finite transport fixture; all parsing, lifecycle admission,
+        // middleware, request-owned handler execution, and result validation
+        // use the actual returning server entry point.
+        builder
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("legacy test profile")
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
+                        call(40_i64),
+                        JsonRpcMessage::Request(JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        )),
+                        call(42_i64),
+                        JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 43_i64)),
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .expect("finite legacy transport closes cleanly");
+        let messages = sent.lock().expect("captured server responses").clone();
+        let response = |id: i64| {
+            messages
+                .iter()
+                .find_map(|message| match message {
+                    JsonRpcMessage::Response(response) if response.id == Some(id.into()) => {
+                        Some(response)
+                    }
+                    _ => None,
+                })
+                .expect("correlated response")
+        };
+        assert_eq!(
+            response(40_i64)
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
+            Some((-32600).into())
+        );
+        assert!(response(40_i64).result.is_none());
+        assert!(response(43_i64).error.is_none(), "connection stays usable");
+        messages
+    }
+
+    fn application_content_response(messages: &[JsonRpcMessage]) -> &JsonRpcResponse {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                JsonRpcMessage::Response(response) if response.id == Some(42_i64.into()) => {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .expect("tool call has its original response ID")
+    }
+
+    #[test]
+    fn legacy_application_content_roundtrips_and_strict_mode_rejects_extensions() {
+        for payload in [
+            serde_json::json!({"type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav"}),
+            serde_json::json!({"type": "resource", "resource": {"uri": "file:///empty"}}),
+            serde_json::json!({"type": "resource", "resource": {
+                "uri": "file:///both", "text": "text", "blob": "Ynl0ZXM="
+            }}),
+            serde_json::json!({"type": "text", "text": "ordinary"}),
+        ] {
+            for enabled in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut builder =
+                    Server::new("application-content", "1").tool(ApplicationContentTool {
+                        content: vec![serde_json::from_value(payload.clone()).unwrap()],
+                        calls: Arc::clone(&calls),
+                        fail: false,
+                    });
+                if enabled {
+                    builder = builder.legacy_application_tool_content(true);
+                }
+                let messages = application_content_transcript(builder);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "uninitialized call is denied; admitted call executes once"
+                );
+                let response = application_content_response(&messages);
+                if enabled || payload["type"] == "text" {
+                    assert!(response.error.is_none(), "{response:?}");
+                    assert_eq!(
+                        response.result,
+                        Some(serde_json::json!({"content": [payload.clone()]}))
+                    );
+                } else {
+                    assert_eq!(
+                        response.error.as_ref().map(|error| error.code.clone()),
+                        Some((-32603).into())
+                    );
+                    assert!(response.result.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_application_content_rejects_malformed_results_and_forbidden_envelopes() {
+        let mut rejected = vec![
+            serde_json::json!({"content": [{"type": "text", "text": 3}]}),
+            serde_json::json!({"content": [{"type": "audio", "data": "YQ=="}]}),
+            serde_json::json!({"content": [{"type": "resource", "resource": {"text": "missing URI"}}]}),
+            serde_json::json!({"content": [{"type": "resource", "resource": {"uri": "file:///both", "text": "ok", "blob": 42}}]}),
+            serde_json::json!({"content": [{"type": "audio", "data": "YQ==", "mimeType": "audio/wav", "extension": {"kept": true}}]}),
+            serde_json::json!({"content": [{"type": "resource", "resource": {"uri": "file:///both", "text": "text", "blob": "Yg==", "extension": 7}}]}),
+            serde_json::json!({"content": null}),
+            serde_json::json!({"content": [], "isError": null}),
+            serde_json::json!({"content": [], "_meta": null}),
+            serde_json::json!({"content": [], "resultType": "complete"}),
+        ];
+        for key in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/logLevel",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            rejected.push(serde_json::json!({"content": [], "_meta": {key: "forbidden"}}));
+        }
+        for result in rejected {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let builder = Server::new("application-invalid-content", "1")
+                .legacy_application_tool_content(true)
+                .tool(ApplicationContentTool {
+                    content: vec![Content::text("ordinary handler result")],
+                    calls: Arc::clone(&calls),
+                    fail: false,
+                })
+                .middleware(ApplicationContentResultMiddleware(result.clone()));
+            let messages = application_content_transcript(builder);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let response = application_content_response(&messages);
+            assert!(
+                response.result.is_none(),
+                "invalid result escaped: {result}"
+            );
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code.clone()),
+                Some((-32603).into())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_application_content_preserves_open_metadata_and_content_fields() {
+        let result = serde_json::json!({
+            "content": [
+                {"type": "audio", "data": "YQ==", "mimeType": "audio/wav"},
+                {"type": "resource", "resource": {"uri": "file:///both", "text": "text", "blob": "Yg=="}}
+            ],
+            "isError": false,
+            "_meta": {"caller-note": {"kept": true}}
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let messages = application_content_transcript(
+            Server::new("application-open-content", "1")
+                .legacy_application_tool_content(true)
+                .tool(ApplicationContentTool {
+                    content: Vec::new(),
+                    calls: Arc::clone(&calls),
+                    fail: false,
+                })
+                .middleware(ApplicationContentResultMiddleware(result.clone())),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let response = application_content_response(&messages);
+        assert!(response.error.is_none(), "{response:?}");
+        assert_eq!(response.result, Some(result));
+    }
+
+    #[test]
+    fn legacy_application_content_does_not_bypass_authentication() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let messages = application_content_transcript(
+            Server::new("application-denied-content", "1")
+                .legacy_application_tool_content(true)
+                .auth_provider(AlwaysFailAuthProvider)
+                .tool(ApplicationContentTool {
+                    content: vec![Content::text("must not execute")],
+                    calls: Arc::clone(&calls),
+                    fail: false,
+                }),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = application_content_response(&messages);
+        assert!(response.result.is_none());
+        // Authentication admission deliberately normalizes provider errors to
+        // ResourceForbidden; the provider's own invalid-request code is private.
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.clone()),
+            Some((-32002).into())
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.message.as_str()),
+            Some("Authentication failed")
+        );
+    }
+
+    #[test]
+    fn legacy_application_content_preserves_tool_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let messages = application_content_transcript(
+            Server::new("application-tool-error", "1")
+                .legacy_application_tool_content(true)
+                .tool(ApplicationContentTool {
+                    content: Vec::new(),
+                    calls: Arc::clone(&calls),
+                    fail: true,
+                }),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let response = application_content_response(&messages);
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({
+                "content": [{"type": "text", "text": "application tool failed"}], "isError": true
+            }))
+        );
+    }
+
     #[test]
     fn live_runtime_routes_exact_legacy_frames_through_the_2024_adapter() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -44513,11 +44821,42 @@ mod lib_unit_tests {
 
     #[test]
     fn live_runtime_cancels_exact_legacy_tool_by_its_original_wire_id() {
+        run_live_legacy_active_cancellation(false);
+    }
+
+    #[test]
+    fn legacy_application_content_preserves_active_wire_cancellation() {
+        run_live_legacy_active_cancellation(true);
+    }
+
+    fn run_live_legacy_active_cancellation(application_content: bool) {
+        let cx = Cx::for_testing();
+        let worker_cx = cx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            live_legacy_active_cancellation_probe(application_content, &worker_cx);
+            done_tx.send(()).expect("cancellation completion observer");
+        });
+        match done_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(()) => worker.join().expect("cancellation probe completes"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().expect("cancellation probe must not panic");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                cx.set_cancel_requested(true);
+                let cleanup = done_rx.recv_timeout(Duration::from_secs(5));
+                panic!("legacy cancellation probe exceeded 20 seconds; cleanup={cleanup:?}");
+            }
+        }
+    }
+
+    fn live_legacy_active_cancellation_probe(application_content: bool, cx: &Cx) {
         let started = Arc::new(AtomicBool::new(false));
         let observed_cancellation = Arc::new(AtomicBool::new(false));
         let responses = Arc::new(LiveModernResponses::default());
 
         Server::new("live-legacy-cancellation", "1.0.0")
+            .legacy_application_tool_content(application_content)
             .protocol_policy(ProtocolPolicy::Auto)
             .expect("Auto must be available to this test build")
             .tool(LiveLegacyCancellationTool {
@@ -44526,7 +44865,7 @@ mod lib_unit_tests {
             })
             .build()
             .run_split_transport_returning_with_cx(
-                &Cx::for_testing(),
+                cx,
                 LiveLegacyActiveCancellationRecv {
                     phase: 0,
                     started: Arc::clone(&started),

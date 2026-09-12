@@ -179,6 +179,9 @@ pub struct ServerBuilder {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
+    /// Explicit application vocabulary for legacy tools/call results only.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    legacy_application_tool_content: bool,
     /// Reserved policy selected before construction by a launch setting or a
     /// sealed embedding component.
     launch_protocol_policy: Option<ProtocolPolicy>,
@@ -304,6 +307,8 @@ impl ServerBuilder {
             max_bidirectional_requests_per_connection:
                 crate::bidirectional::DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             protocol_policy,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            legacy_application_tool_content: false,
             launch_protocol_policy,
             http_config: HttpServerConfig::default(),
             oauth_http_routes: None,
@@ -518,6 +523,22 @@ impl ServerBuilder {
     ) -> Result<Self, ServerLaunchPolicyError> {
         self.try_set_protocol_policy(policy)?;
         Ok(self)
+    }
+
+    /// Preserves the broader application [`fastmcp_protocol::Content`]
+    /// vocabulary in legacy `tools/call` responses.
+    ///
+    /// This explicit compatibility option permits audio and resources with
+    /// either, both, or neither optional payload. It does not claim those
+    /// responses conform to exact MCP 2024-11-05. Request admission, authority,
+    /// cancellation, response metadata validation, and other methods retain
+    /// their existing rules. The default and typed exact-legacy router APIs
+    /// continue to require exact legacy content.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    #[must_use]
+    pub fn legacy_application_tool_content(mut self, enabled: bool) -> Self {
+        self.legacy_application_tool_content = enabled;
+        self
     }
 
     /// Attempts to select the immutable MCP protocol-era policy without
@@ -2784,6 +2805,8 @@ impl ServerBuilder {
             max_bidirectional_requests_per_connection: self
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
+            legacy_application_tool_content: self.legacy_application_tool_content,
             http_config: self.http_config,
             oauth_http_routes: self.oauth_http_routes,
             extension_runtime,
