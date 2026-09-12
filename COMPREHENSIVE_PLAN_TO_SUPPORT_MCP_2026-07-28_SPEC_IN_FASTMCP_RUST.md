@@ -3698,9 +3698,9 @@ They must never be reachable from a modern transport policy.
 
 ### 7.23 Reality-check vision checklist
 
-#### Current assessment: 2026-09-04
+#### Current assessment: 2026-09-12
 
-The project contains substantial usable framework code and a published `0.8.1`
+The project contains substantial usable framework code and a published `0.9.0`
 CLI. It is not a qualified implementation of the complete dual-era product
 specified by section 0. The older checklist below is a historical observation;
 its claims that modern discovery, the concurrent client, and all modern HTTP
@@ -3717,37 +3717,57 @@ schema validation, client/transport wiring, auth, Tasks, Apps, CLI, and proof
 machinery. It is not a line-by-line review of every source file or every
 historical paragraph of this approximately 40,000-line campaign document.
 
-The starting tracker snapshot contained 1,060 non-tombstone issues: 316 closed,
-724 open, 18 review, one in progress, and one blocked. All 145 formal package
+The current tracker snapshot contains 1,060 non-tombstone issues: 316 closed,
+718 open, 16 review, nine in progress, and one blocked. All 145 formal package
 parents were present. BV counted another 23 tombstones and reported no graph
-cycles. `br ready` returned only `bd-deft5`, the RCH capability-prober defect;
-BV's broader actionable count was 19. These different scheduling views must
+cycles. `br ready` now returns `bd-deft5`, the RCH capability-prober defect,
+and `bd-ojh8u`, returned to rework after the downstream compile-probe abort.
+BV's broader actionable count is 19. These different scheduling views must
 not be reported as 19 claimable implementation tasks or as a completion
 percentage. The forecast's low-confidence effort estimate is not a delivery
 date.
 
+The September 11–12 implementation window added real Tasks expiry cleanup,
+CLI watch reconciliation, configured-client Auto selection, authenticated cache
+isolation, and cancellation fixes. The central RCH all-feature run has executed
+the CLI unit and end-to-end targets, the client library, modern HTTP, and the
+163 protocol plus 82 workflow cases, all 2,387 server tests and 568 transport
+tests, including the new pre-poll expiry pair. It is nevertheless **red and
+incomplete**:
+the workflow identity validator found an unapproved action pin, and the slow
+foundation target was deliberately interrupted after more than 25 minutes so
+the remaining product targets could proceed. The downstream compile-probe
+target also aborted during child cleanup; its underlying diagnostic still needs
+a replay with capture disabled. Neither this attempt nor focused passes
+establish complete workspace qualification. The corrected workflow pins,
+stricter cancellation-ID assertions, stronger live-child drain test and a
+profile-driven cache of pure validator token counts are newer
+than that remote snapshot and still require central execution. A substantial
+part of the requested eight-pane window was unavailable because of provider
+quota; commit count and repeated source reviews are not substitute evidence.
+
 | # | Testable vision goal and source | Current status | Concrete evidence and remaining gap | Existing owner |
 |---|---|---|---|---|
-| 1 | Install and invoke the published CLI (README installation/CLI) | `WORKING` for this narrow smoke | Official macOS arm64 `0.8.1` archive checksum passed; version, help, inspect help and install dry-run executed. No full server interoperability claim follows. | CLI-CORE-01, CLI-01, REL-01/02 |
+| 1 | Install and invoke the published CLI (README installation/CLI) | `PARTIAL` | GitHub `v0.9.0` availability was read back, published 2026-09-11T07:08:11Z. The earlier checksum/install smoke belongs to `0.8.1`; it is not a fresh `0.9.0` installation or platform matrix. | CLI-CORE-01, CLI-01, REL-01/02 |
 | 2 | Coherent facade, macros, tools/resources/prompts/completion (README; sections 12–18) | `PARTIAL` | Nine crates and real handler/derive implementations exist. Public packaged and renamed-facade consumers still need current, complete mapped evidence. | API-CORE-01, API-01, MAC-01, TOOL/RES/PRM/CMP, DX-TEST-01 |
 | 3 | Exact modern stateless discovery and per-request negotiation (section 0; PRT/SRV) | `PARTIAL` | Modern protocol types, discovery, policy and raw HTTP tests now exist. Old July absence claims are obsolete; complete current wire matrices remain unqualified. | FND-03, PRT-01..05, SRV-01..04 |
 | 4 | Exact legacy `2024-11-05` with Auto selection and era isolation (section 0) | `PARTIAL` | Legacy adapters and dual-era tests exist; Auto is exposed in the published inspect CLI. All selection, negative and compatibility consumers still need revision-bound proof. | LEG packages, CLT-02, PXY-LEG packages |
-| 5 | Consumer-owned structured concurrency, cleanup and cancellation (AGENTS; FND-04) | `WRONG_APPROACH` on remaining ambient adapters | `fastmcp-core/src/runtime.rs` still publicly exposes lazy thread-local runtime/block_on. Pinned asupersync `0.4.10` already exposes `open_child_region`; proxy code uses it. The blocker is completing and proving migration, not waiting for that API to exist. | FND-04/05, LIMIT-01, STD-01, HTTP-01/03 |
+| 5 | Consumer-owned structured concurrency, cleanup and cancellation (AGENTS; FND-04) | `WRONG_APPROACH` on remaining ambient adapters | `fastmcp-core/src/runtime.rs` still publicly exposes lazy thread-local runtime/block_on. The facade's doc-hidden public `__private::core` also leaks that API, so th72.5 is back in rework. Pinned asupersync `0.4.10` already exposes `open_child_region`; proxy code uses it. A new test retains live work through cancellation/close, but its execution is pending. | FND-04/05, LIMIT-01, STD-01, HTTP-01/03 |
 | 6 | Concurrent client correlation, deadlines, MRTR and subscriptions (CLT/MRTR/SUB) | `PARTIAL` | `client/execution.rs` is real bounded correlation/timeout machinery; MRTR/subscription code exists. Cancellation, cross-request isolation, overload and public transport compositions need complete qualification. | CLT-01/02, MRTR-01..03, SUB-01..03 |
 | 7 | Production stdio and Streamable HTTP on every supported platform (STD/HTTP/XPORT) | `PARTIAL` | Native HTTP/client/server and live socket tests exist. Platform reactor, child-process, half-close, routing-header, notification and cancellation obligations remain. | STD-01, HTTP-01..06, XPORT-01, TST-02/03 |
 | 8 | Full applicable Draft 2020-12 with bounded work (SCH-01) | `WRONG_APPROACH` relative to the frozen design; behavioral coverage unqualified | A substantial custom validator supports refs, dynamic refs, conditionals and unevaluated keywords, but rejects unknown keywords and uses Rust regex. SCH-01 requires the full applicable suite, explicit regex/work policy and pinned instrumented engine. A toy-subset or refusal-only closure cannot satisfy it. | SCH-01..03 |
-| 9 | Secure auth discovery, registration, issuer/resource binding and custody (AUTH-00..07) | `PARTIAL` | Static/custom, OAuth and fail-closed OIDC paths exist. AUTH-05 children are mislabeled as static-token work although the parent requires protected credential persistence; AUTH-07 children describe authorization policy although the parent requires an interactive authorization driver. | AUTH-00..07, FND-06/09 |
+| 9 | Secure auth discovery, registration, issuer/resource binding and custody (AUTH-00..07) | `PARTIAL` | Static/custom, OAuth and fail-closed OIDC paths exist. AUTH-05/07 child descriptions now preserve protected credential persistence and the interactive authorization driver; that tracker correction does not implement either missing workflow. Live static-token verification and OAuth ownership tests prove narrower current behavior. | AUTH-00..07, FND-06/09 |
 | 10 | Enterprise OIDC/SAML and OAuth client credentials extensions (section 0.2) | `NOT_STARTED` for inspected runtime implementations | Protocol feature names exist, but no corresponding operational enterprise-auth/client-credentials implementation was found in the inspected runtime paths. These are mandatory final-product implementations even when activation is optional. | AUTHX-01..05 |
 | 11 | Principal-safe cache hints, lookup, invalidation and middleware (CACHE/SRV-MW) | `PARTIAL` | Cache code and paired live HTTP tests exist. Partition identity, auth changes, expiry, error precedence and composition require joint proof. | CACHE-01..03, SRV-MW-01, AUTH packages |
-| 12 | Tasks including persistence and distributed profile (TASK/TASKP/TASKR) | `PARTIAL` | Real final Tasks machinery and default `InMemoryFinalTaskStore` exist. Its contract explicitly lacks crash persistence; retained Docket source is excluded, Redis absent. Durable/distributed capability is still required by its own profiles. | TASK-01..03, TASKP-01, TASKR-01 |
+| 12 | Tasks including persistence and distributed profile (TASK/TASKP/TASKR) | `PARTIAL` | Real final Tasks machinery and `InMemoryFinalTaskStore` exist. Public expiry/successor tests execute through HTTP; both pre-poll expiry tests passed in the server suite, with the guard-removal mutation still pending. The store explicitly lacks crash persistence; Docket is excluded and Redis absent. Durable/distributed profiles remain required. | TASK-01..03, TASKP-01, TASKR-01 |
 | 13 | Apps resources and host lifecycle (APP packages) | `PARTIAL` | Typed UI resources, CSP metadata and `McpAppsHost<T,P>` with activation/lifecycle state exist. Browser embedding, policy enforcement and composed end-to-end behavior remain unqualified. | APP-01..04, COMP-ALL-01 |
 | 14 | Proxy catalog, credentials, Tasks and dual-era isolation (PXY packages) | `PARTIAL` | Substantial proxy code and owned child regions exist. Upstream failure, custody, shutdown and mixed-profile qualification remain. | PXY and PXY-LEG packages |
-| 15 | Complete CLI including specified Tasks command surface (CLI-02) | `PARTIAL` | Published dispatch has run/inspect/install/list/test/dev; `fastmcp tasks --help` exits 2 as an unknown command. The planned Tasks CLI is not delivered by `0.8.1`. | CLI-02, TASK packages |
+| 15 | Complete CLI including specified Tasks command surface (CLI-02) | `PARTIAL` | The source Tasks CLI now performs real get/list/cancel/watch operations. Four HTTP/stdio tests cover completion before listener admission and the unchanged Working control. Cancellation/reuse tests execute, with stricter request-ID checks still awaiting replay. The released default CLI does not include the Tasks profile; replay/reconnect and full profile qualification are not claimed. | CLI-02, TASK packages |
 | 16 | Safe rich stderr, predictable diagnostics and docs (README; console plan) | `PARTIAL` | Real console sanitization/redaction and stderr output exist. Console README license text and old feature/status tables need reconciliation with the current root claims and packaged files. | DOC-01/02, CLI-CORE-01 |
-| 17 | Security, platform, interoperability and aggregate conformance (section 28) | `UNPROVEN` | Extensive tests exist. This audit has no current complete compiling/executed matrix; one foundation harness controller path still explicitly returns platform failure. No aggregate PASS is inferred. | TST, CONF, INTEROP, CI packages |
+| 17 | Security, platform, interoperability and aggregate conformance (section 28) | `UNPROVEN` | Workspace all-target/all-feature compilation passed for the earlier source snapshot and substantial live tests execute. The full test run is red/incomplete; six CLI E2Es require a fresh explicitly supplied echo-server binary. Remaining default/no-default, platform and foundation obligations remain gates. | TST, CONF, INTEROP, CI packages |
 | 18 | Measured performance, capacity and eight-hour soak (OPS/PERF) | `UNPROVEN` | Existing microbenchmarks are not evidence of full modern transport/auth/profile latency, resource bounds or soak targets. | OPS-01, PERF-01 |
-| 19 | Safe publication and truthful final-product support claim (section 0.7; REL/DOC) | `PARTIAL` | GitHub and crates.io published `0.8.1` on 2026-08-30. Availability is verified; stable aggregate MCP support is not. Provider-side quarantine still has externally blocked work. | REL-QUAR-00, REL-PREP-01, REL-01/02, DOC-02 |
-| 20 | Executable tracker coverage of the complete vision (section 36) | `PARTIAL` | No missing top-level package parent was found. Semantic child mismatches and 578 unfinished issues containing broad workspace test selectors prevent parent presence from proving executable coverage. | FND-02 and the affected existing A/B/I/V records |
+| 19 | Safe publication and truthful final-product support claim (section 0.7; REL/DOC) | `PARTIAL` | GitHub `v0.9.0` publication was independently read back. This window has not cut another release, and availability does not establish stable aggregate MCP support. Provider-side quarantine still has externally blocked work. | REL-QUAR-00, REL-PREP-01, REL-01/02, DOC-02 |
+| 20 | Executable tracker coverage of the complete vision (section 36) | `PARTIAL` | All 145 top-level package parents remain present. Completing their full requirements could cover the vision; broad selectors, pending proofs and remaining child/runtime mismatches prevent parent presence or review status from proving delivery. The facade export defect and CI pin drift stay on their existing Beads. | FND-02 and the affected existing A/B/I/V records |
 
 #### Historical assessment: 2026-07-31/2026-08-01
 
@@ -3778,7 +3798,66 @@ item; it never implies aggregate MCP 2026-07-28 support.
 
 ### 7.24 Gap classification and bridge plan
 
-#### Current bridge: 2026-09-04
+#### Current bridge: 2026-09-12
+
+The immediate order is to finish the already-written capabilities and their
+original acceptance before expanding the coding frontier:
+
+1. Complete the active RCH run without crediting its failed/interrupted
+   foundation target. Execute a normal-dispatch, zero-filter workspace check
+   for `bd-deft5`; the original four workers currently probe healthy, while the
+   expanded fleet is only 9/13 healthy. Neither a forced healthy worker nor
+   an admission-only dry run satisfies that remaining dispatch requirement.
+2. Compile and execute the latest source before interpreting its test counts.
+   Prove the Tasks pre-poll expiry pair, exact CLI cancellation IDs and
+   pre-admission terminal reconciliation, and proxy live-child drain. Remove
+   each specific guard independently to demonstrate that its positive fails
+   while its closely matched control remains green; restore exact source
+   bytes and rerun. Keep broader TASK-02 and CLI-02 requirements open.
+3. Run the six CLI E2Es that need a freshly built echo-server executable,
+   client library default/no-default profiles, final Clippy and formatting,
+   and all remaining mandated workspace/platform matrices. Existing focused
+   results are not full-target or cross-platform proof. Restore the approved
+   workflow action identities without relaxing the identity validator, then
+   prove its real repository positive and bounded rejection cases.
+4. Finish FND-04 runtime migration. The dependency API blocker now needs proof
+   of already-published functionality, not another API implementation. Its
+   positive retains a live child, sender and join handle through independent
+   cancellation and close; its negative changes only parent liveness and
+   proves unchanged budget. The separate facade export Bead must remove the
+   `__private::core::block_on` leak while preserving every macro symbol and
+   the RNG ownership contract. A separately reviewed validator update must
+   reject reintroduced runtime authority; dropping its check is forbidden.
+5. Continue the existing credential persistence/browser driver, schema,
+   durable/distributed Tasks, enterprise extensions, platform, interoperability
+   and performance/soak packages in their dependency order. Their complete
+   frozen requirements remain below. No newly created follow-up may absorb
+   an unmet acceptance item to close its current implementation Bead.
+
+The next three ambition rounds strengthen those same existing owners. First,
+test the complete CLI/server journey at the snapshot-to-listener boundary:
+completion before admission must still terminate the watch, and an unchanged
+Working task must retain state until the original deadline. Second, conserve
+ownership across cancellation and expiry: no application repoll after expiry,
+no escaped live child after close, and cancellation of the two exact request
+IDs must leave the same connection reusable. Third, retain the distinction
+between source presence, executed public effects and complete qualification:
+cache/transport unit or local socket proofs cannot substitute for persistence,
+supported-platform behavior, external interoperability or the eight-hour soak.
+These refine TASK-02-B, CLI-02-B, FND-04 and their current integration owners;
+they do not create another layer of reports or change the final product goal.
+
+The five refinement passes checked complete original scope, exact proof
+profiles, source freshness, current scenario cardinalities, and the resulting
+dependency/ownership map. The fourth corrected `bd-ti60f`'s stale 79-workflow
+acceptance to the actual required 82, preserving its original scenarios and
+adding the worker-stage and two retention controls. The fifth found no further
+change in these revised slices; it does not certify every historical leaf.
+BV reports no cycles and 744 unfinished records. Forecasts still rely on sparse
+historical velocity and are not delivery commitments. No implementation Bead
+has been closed in this window, and no gate PASS has been granted.
+
+#### Previous bridge and refinement baseline: 2026-09-04
 
 Implementing every unfinished issue's **complete parent requirements** could
 close the documented vision gap. Completing only the current child headlines
@@ -3931,7 +4010,7 @@ a counterexample or covers a remaining acceptance item. No independent
 mathematical sophistication claim, extra status dashboard or new process gate
 earns capability credit.
 
-##### Evidence limits and implementation handoff
+##### September 4 evidence limits and implementation handoff
 
 The published artifact observation is GitHub release `v0.8.1`, published
 2026-08-30, and crates.io `fastmcp-rust/0.8.1`, not a build of this worktree.
