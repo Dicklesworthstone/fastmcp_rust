@@ -2212,6 +2212,8 @@ impl InMemoryFinalTaskStore {
     }
 
     /// Creates a store with an application-supplied monotonic retention clock.
+    /// The callback is sampled while the state mutex is held by
+    /// expiry-bearing transitions, so it must be bounded and non-reentrant.
     pub fn with_clock(
         max_tasks: usize,
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -2414,11 +2416,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let task_id = task.base().task_id.clone();
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(&task_id) {
             return Err(McpError::invalid_params("Task not found"));
@@ -2557,16 +2559,20 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
             lease.generation == expected.generation()
                 && lease.dispatch_elected
                 && lease.owner_id == owner_id
                 && lease.dispatch_fence == Some(dispatch_fence)
+                && lease
+                    .recovery_expires_at
+                    .is_some_and(|expires_at| expires_at > now)
         });
         if state.generations.get(&task_id) != Some(&expected.generation())
             || !owns_exact_dispatch
@@ -2614,11 +2620,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         let task_id = &expected.task().base().task_id;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
                 .tasks
@@ -2663,11 +2670,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
     ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
         let task_id = &expected.task().base().task_id;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
@@ -2694,11 +2701,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         after_task_id: Option<&FinalTaskId>,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(task_id) = next_in_memory_final_task_recovery_id(
             state.initial_work.keys(),
@@ -2762,11 +2769,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         let task_id = &expected.task().base().task_id;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
                 .tasks
@@ -2819,11 +2827,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
                 && lease.kind == InMemoryFinalTaskHandoffKind::Initial
                 && lease.owner_id == owner_id
                 && lease.dispatch_fence == dispatch_fence
+                && lease
+                    .recovery_expires_at
+                    .is_some_and(|expires_at| expires_at > now)
         });
         if !owns_matching_lease {
             return Ok(false);
@@ -2848,11 +2861,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         &self,
         after_task_id: Option<&FinalTaskId>,
     ) -> McpResult<Option<FinalTaskSnapshot>> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
 
         let Some(task_id) = next_in_memory_final_task_recovery_id(
@@ -2913,11 +2926,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
                 && lease.kind == InMemoryFinalTaskHandoffKind::Resumed
                 && lease.owner_id == owner_id
                 && lease.dispatch_fence == dispatch_fence
+                && lease
+                    .recovery_expires_at
+                    .is_some_and(|expires_at| expires_at > now)
         });
         if !owns_matching_lease {
             return Ok(false);
@@ -2959,11 +2977,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "Final task handoff owner must be non-empty",
             ));
         }
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&generation)
             || !state
                 .tasks
@@ -3002,11 +3021,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let renewed_expires_at = in_memory_final_task_handoff_lease_expiry(now)?;
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
@@ -3015,6 +3035,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             || !lease.dispatch_elected
             || lease.owner_id != owner_id
             || lease.dispatch_fence != Some(dispatch_fence)
+            || lease
+                .recovery_expires_at
+                .is_none_or(|expires_at| expires_at <= now)
             || state.generations.get(task_id) != Some(&generation)
             || !state
                 .tasks
@@ -3055,6 +3078,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
         };
@@ -3062,6 +3087,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             || !lease.dispatch_elected
             || lease.owner_id != owner_id
             || lease.dispatch_fence != Some(dispatch_fence)
+            || lease
+                .recovery_expires_at
+                .is_none_or(|expires_at| expires_at <= now)
         {
             return Ok(false);
         }
@@ -9543,6 +9571,962 @@ mod tests {
             "changing only null TTL to a positive TTL permits reclamation at its deadline"
         );
         assert_eq!(store.task_count(), 0);
+    }
+
+    #[test]
+    fn task_02_final_expired_handoff_claim_releases_work_for_successor_recovery() {
+        let (store, now) = in_memory_store_with_test_clock(3);
+        let expired = final_working_task_with_ttl("task-expired-handoff-claim", 1_000);
+        let expired_id = expired.base().task_id.clone();
+        let stale_election = final_working_task_with_ttl("task-stale-handoff-election", 1_000);
+        let stale_election_id = stale_election.base().task_id.clone();
+        let successor = final_working_task_with_ttl("task-successor-handoff-claim", 10_000);
+        let successor_id = successor.base().task_id.clone();
+        let work_descriptor = final_test_work_descriptor();
+
+        store
+            .create_task_with_work(
+                expired.clone(),
+                final_task_notification(&expired),
+                work_descriptor.clone(),
+            )
+            .expect("expired candidate creates with a durable work descriptor");
+        store
+            .create_task_with_work(
+                stale_election.clone(),
+                final_task_notification(&stale_election),
+                work_descriptor.clone(),
+            )
+            .expect("stale election candidate creates with a durable work descriptor");
+        store
+            .create_task_with_work(
+                successor.clone(),
+                final_task_notification(&successor),
+                work_descriptor.clone(),
+            )
+            .expect("successor candidate creates with a durable work descriptor");
+        let expired_snapshot = store
+            .get_task_snapshot(&expired_id)
+            .expect("expired candidate snapshot is readable before the boundary")
+            .expect("expired candidate is retained before the boundary");
+        let stale_election_snapshot = store
+            .get_task_snapshot(&stale_election_id)
+            .expect("stale election snapshot is readable before the boundary")
+            .expect("stale election candidate is retained before the boundary");
+        let stale_election_claim = store
+            .take_initial_work_handoff_for_owner_if_current(&stale_election_snapshot, "old-owner")
+            .expect("stale election claim is readable before the boundary")
+            .expect("stale election candidate is claimable before the boundary");
+
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_millis(1_001);
+
+        assert!(
+            store
+                .take_initial_work_handoff_for_owner_if_current(&expired_snapshot, "old-owner")
+                .expect("expired claim boundary is readable")
+                .is_none(),
+            "retention expiry must prevent an old snapshot from acquiring ownership"
+        );
+        assert!(
+            store
+                .get_task(&expired_id)
+                .expect("expired candidate cleanup is readable")
+                .is_none(),
+            "expired work must be reclaimed before successor recovery"
+        );
+        assert!(
+            store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &stale_election_id,
+                    stale_election_claim.generation,
+                    "old-owner",
+                )
+                .expect("expired dispatch election boundary is readable")
+                .is_none(),
+            "retention expiry must prevent an old claim from electing dispatch"
+        );
+
+        let successor_snapshot = store
+            .next_initial_work_snapshot()
+            .expect("successor recovery scan is readable")
+            .expect("successor remains eligible after the expired candidate is reclaimed");
+        assert_eq!(successor_snapshot.task().base().task_id, successor_id);
+        let successor_claim = store
+            .take_initial_work_handoff_for_owner_if_current(&successor_snapshot, "new-owner")
+            .expect("successor owner claim is readable")
+            .expect("successor claim remains eligible");
+        assert_eq!(successor_claim.task_id, successor_id);
+        assert!(
+            store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &successor_id,
+                    successor_claim.generation,
+                    "new-owner",
+                )
+                .expect("successor dispatch election is readable")
+                .is_some(),
+            "successor must be electable through the real store after expiry cleanup"
+        );
+    }
+
+    #[test]
+    fn task_02_final_unexpired_handoff_claim_retains_live_owner() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let task = final_working_task_with_ttl("task-unexpired-handoff-claim", 1_000);
+        let task_id = task.base().task_id.clone();
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                final_test_work_descriptor(),
+            )
+            .expect("unexpired candidate creates with a durable work descriptor");
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("unexpired candidate snapshot is readable")
+            .expect("unexpired candidate is retained");
+
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_millis(999);
+
+        let claim = store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "live-owner")
+            .expect("unexpired owner claim is readable")
+            .expect("live owner retains its claim before the retention boundary");
+        let dispatch_fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "live-owner")
+            .expect("unexpired dispatch election is readable")
+            .expect("live owner retains dispatch election before expiry");
+
+        assert!(
+            store
+                .renew_handoff_dispatch_if_current(
+                    &task_id,
+                    claim.generation,
+                    "live-owner",
+                    dispatch_fence,
+                )
+                .expect("live owner heartbeat is readable")
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = state
+            .handoff_leases
+            .get(&task_id)
+            .expect("live owner lease remains retained");
+        assert_eq!(lease.owner_id, "live-owner");
+        assert!(lease.dispatch_elected);
+        assert_eq!(lease.dispatch_fence, Some(dispatch_fence));
+        assert!(matches!(
+            state.tasks.get(&task_id),
+            Some(FinalTask::Working(_))
+        ));
+    }
+
+    #[test]
+    fn task_02_final_expired_dispatch_lease_fences_initial_owner_renew_finish_restore_and_recovers()
+    {
+        let work_descriptor = final_test_work_descriptor();
+
+        // A stale owner must not commit a terminal replacement that clears the
+        // retained initial payload before the recovery fence runs.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-expired-dispatch-initial-replace", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durably retained");
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("initial snapshot is readable")
+                .expect("initial task is retained");
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("initial owner claim is readable")
+                .expect("initial owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("initial dispatch election is readable")
+                .expect("initial owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            let result: FinalTaskCallToolResult =
+                serde_json::from_value(serde_json::json!({"content": []}))
+                    .expect("typed terminal task result");
+            let replacement = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Completed,
+                    Some("stale owner replacement must be fenced".to_owned()),
+                )
+                .expect("construct terminal replacement for the stale owner"),
+                result,
+            };
+            assert!(
+                !store
+                    .replace_task_and_clear_input_for_handoff_if_current(
+                        &snapshot,
+                        "stale-owner",
+                        dispatch_fence,
+                        false,
+                        replacement.clone(),
+                        final_task_notification(&replacement),
+                    )
+                    .expect("expired replacement refusal is readable")
+            );
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.initial_work.get(&task_id), Some(&work_descriptor));
+            assert!(matches!(
+                state.tasks.get(&task_id),
+                Some(FinalTask::Working(_))
+            ));
+            drop(state);
+            let successor = store
+                .next_initial_work_snapshot()
+                .expect("initial recovery scan is readable")
+                .expect("expired replacement leaves initial work recoverable");
+            assert_eq!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor initial claim is readable")
+                    .expect("successor can recover retained initial work")
+                    .work_descriptor,
+                work_descriptor
+            );
+        }
+
+        // Renewal must not extend an already-expired dispatch lease. The
+        // retained descriptor remains available to a newly fenced owner.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-expired-dispatch-initial-renew", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durably retained");
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("initial snapshot is readable")
+                .expect("initial task is retained");
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("initial owner claim is readable")
+                .expect("initial owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("initial dispatch election is readable")
+                .expect("initial owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .renew_handoff_dispatch_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        dispatch_fence,
+                    )
+                    .expect("expired renewal refusal is readable")
+            );
+            let successor = store
+                .next_initial_work_snapshot()
+                .expect("initial recovery scan is readable")
+                .expect("expired dispatch owner leaves retained work recoverable");
+            assert_ne!(successor.generation(), claim.generation);
+            assert_eq!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor initial claim is readable")
+                    .expect("successor can recover retained initial work")
+                    .work_descriptor,
+                work_descriptor
+            );
+        }
+
+        // Completion after lease expiry must not consume the descriptor before
+        // recovery has fenced the old owner.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-expired-dispatch-initial-finish", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durably retained");
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("initial snapshot is readable")
+                .expect("initial task is retained");
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("initial owner claim is readable")
+                .expect("initial owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("initial dispatch election is readable")
+                .expect("initial owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .finish_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        dispatch_fence,
+                    )
+                    .expect("expired completion refusal is readable")
+            );
+            let successor = store
+                .next_initial_work_snapshot()
+                .expect("initial recovery scan is readable")
+                .expect("expired completion leaves retained work recoverable");
+            assert_eq!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor initial claim is readable")
+                    .expect("successor can recover retained initial work")
+                    .work_descriptor,
+                work_descriptor
+            );
+        }
+
+        // Restoration after lease expiry is also fenced, while the exact
+        // retained descriptor remains available for successor recovery.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-expired-dispatch-initial-restore", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    work_descriptor.clone(),
+                )
+                .expect("initial work is durably retained");
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("initial snapshot is readable")
+                .expect("initial task is retained");
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("initial owner claim is readable")
+                .expect("initial owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("initial dispatch election is readable")
+                .expect("initial owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .restore_initial_work_for_owner_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        Some(dispatch_fence),
+                        work_descriptor.clone(),
+                    )
+                    .expect("expired restoration refusal is readable")
+            );
+            let successor = store
+                .next_initial_work_snapshot()
+                .expect("initial recovery scan is readable")
+                .expect("expired restoration leaves retained work recoverable");
+            assert_eq!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor initial claim is readable")
+                    .expect("successor can recover retained initial work")
+                    .work_descriptor,
+                work_descriptor
+            );
+        }
+    }
+
+    #[test]
+    fn task_02_final_unexpired_dispatch_lease_retains_initial_owner() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let task = final_working_task_with_ttl("task-unexpired-dispatch-initial", 60_000);
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = final_test_work_descriptor();
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("initial work is durably retained");
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("initial snapshot is readable")
+            .expect("initial task is retained");
+        let claim = store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "live-owner")
+            .expect("initial owner claim is readable")
+            .expect("initial owner claim succeeds");
+        let dispatch_fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "live-owner")
+            .expect("initial dispatch election is readable")
+            .expect("initial owner wins dispatch election");
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+                .checked_sub(StdDuration::from_millis(1))
+                .expect("handoff lease exceeds one millisecond");
+
+        assert!(
+            store
+                .renew_handoff_dispatch_if_current(
+                    &task_id,
+                    claim.generation,
+                    "live-owner",
+                    dispatch_fence,
+                )
+                .expect("live renewal is readable")
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = state
+            .handoff_leases
+            .get(&task_id)
+            .expect("live dispatch lease remains retained");
+        assert_eq!(lease.owner_id, "live-owner");
+        assert_eq!(lease.dispatch_fence, Some(dispatch_fence));
+        assert_eq!(state.initial_work.get(&task_id), Some(&work_descriptor));
+        assert!(matches!(
+            state.tasks.get(&task_id),
+            Some(FinalTask::Working(_))
+        ));
+    }
+
+    #[test]
+    fn task_02_final_expired_dispatch_lease_fences_resumed_owner_renew_finish_restore_and_recovers()
+    {
+        let input_responses: FinalTaskInputResponses = serde_json::from_value(
+            serde_json::json!({"roots": {"roots": [{"uri": "file:///expired-dispatch"}]}}),
+        )
+        .expect("typed retained roots response");
+
+        // A stale owner must not commit a terminal replacement that clears the
+        // retained accepted-input payload before the recovery fence runs.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("accepted-input snapshot is readable")
+                .expect("accepted-input task is retained");
+            let claim = store
+                .take_input_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("accepted-input owner claim is readable")
+                .expect("accepted-input owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("resumed dispatch election is readable")
+                .expect("resumed owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            let result: FinalTaskCallToolResult =
+                serde_json::from_value(serde_json::json!({"content": []}))
+                    .expect("typed terminal task result");
+            let replacement = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Completed,
+                    Some("stale owner replacement must be fenced".to_owned()),
+                )
+                .expect("construct terminal replacement for the stale owner"),
+                result,
+            };
+            assert!(
+                !store
+                    .replace_task_and_clear_input_for_handoff_if_current(
+                        &snapshot,
+                        "stale-owner",
+                        dispatch_fence,
+                        false,
+                        replacement.clone(),
+                        final_task_notification(&replacement),
+                    )
+                    .expect("expired replacement refusal is readable")
+            );
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.accepted_inputs.get(&task_id), Some(&input_responses));
+            assert!(matches!(
+                state.tasks.get(&task_id),
+                Some(FinalTask::Working(_))
+            ));
+            drop(state);
+            let successor = store
+                .next_accepted_input_snapshot()
+                .expect("accepted-input recovery scan is readable")
+                .expect("expired replacement leaves accepted input recoverable");
+            assert_eq!(
+                store
+                    .take_input_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor accepted-input claim is readable")
+                    .expect("successor can recover accepted input")
+                    .input_responses,
+                input_responses
+            );
+        }
+
+        // Renewal must not extend an expired resumed-input dispatch lease.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("accepted-input snapshot is readable")
+                .expect("accepted-input task is retained");
+            let claim = store
+                .take_input_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("accepted-input owner claim is readable")
+                .expect("accepted-input owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("resumed dispatch election is readable")
+                .expect("resumed owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .renew_handoff_dispatch_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        dispatch_fence,
+                    )
+                    .expect("expired resumed renewal refusal is readable")
+            );
+            let successor = store
+                .next_accepted_input_snapshot()
+                .expect("accepted-input recovery scan is readable")
+                .expect("expired resumed lease leaves accepted input recoverable");
+            assert_ne!(successor.generation(), claim.generation);
+            assert_eq!(
+                store
+                    .take_input_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor accepted-input claim is readable")
+                    .expect("successor can recover accepted input")
+                    .input_responses,
+                input_responses
+            );
+        }
+
+        // Completion after expiry must not remove accepted input.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("accepted-input snapshot is readable")
+                .expect("accepted-input task is retained");
+            let claim = store
+                .take_input_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("accepted-input owner claim is readable")
+                .expect("accepted-input owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("resumed dispatch election is readable")
+                .expect("resumed owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .finish_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        dispatch_fence,
+                    )
+                    .expect("expired resumed completion refusal is readable")
+            );
+            let successor = store
+                .next_accepted_input_snapshot()
+                .expect("accepted-input recovery scan is readable")
+                .expect("expired completion leaves accepted input recoverable");
+            assert_eq!(
+                store
+                    .take_input_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor accepted-input claim is readable")
+                    .expect("successor can recover accepted input")
+                    .input_responses,
+                input_responses
+            );
+        }
+
+        // Restoration after expiry must be fenced while accepted input remains
+        // available to a successor.
+        {
+            let (store, now) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("accepted-input snapshot is readable")
+                .expect("accepted-input task is retained");
+            let claim = store
+                .take_input_handoff_for_owner_if_current(&snapshot, "stale-owner")
+                .expect("accepted-input owner claim is readable")
+                .expect("accepted-input owner claim succeeds");
+            let dispatch_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    claim.generation,
+                    "stale-owner",
+                )
+                .expect("resumed dispatch election is readable")
+                .expect("resumed owner wins dispatch election");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+
+            assert!(
+                !store
+                    .restore_input_for_owner_if_current(
+                        &task_id,
+                        claim.generation,
+                        "stale-owner",
+                        Some(dispatch_fence),
+                        input_responses.clone(),
+                    )
+                    .expect("expired resumed restoration refusal is readable")
+            );
+            let successor = store
+                .next_accepted_input_snapshot()
+                .expect("accepted-input recovery scan is readable")
+                .expect("expired restoration leaves accepted input recoverable");
+            assert_eq!(
+                store
+                    .take_input_handoff_for_owner_if_current(&successor, "new-owner")
+                    .expect("successor accepted-input claim is readable")
+                    .expect("successor can recover accepted input")
+                    .input_responses,
+                input_responses
+            );
+        }
+    }
+
+    #[test]
+    fn task_02_final_unexpired_dispatch_lease_retains_resumed_owner() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("accepted-input snapshot is readable")
+            .expect("accepted-input task is retained");
+        let claim = store
+            .take_input_handoff_for_owner_if_current(&snapshot, "live-owner")
+            .expect("accepted-input owner claim is readable")
+            .expect("accepted-input owner claim succeeds");
+        let dispatch_fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "live-owner")
+            .expect("resumed dispatch election is readable")
+            .expect("resumed owner wins dispatch election");
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+            IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+                .checked_sub(StdDuration::from_millis(1))
+                .expect("handoff lease exceeds one millisecond");
+
+        assert!(
+            store
+                .renew_handoff_dispatch_if_current(
+                    &task_id,
+                    claim.generation,
+                    "live-owner",
+                    dispatch_fence,
+                )
+                .expect("live resumed renewal is readable")
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = state
+            .handoff_leases
+            .get(&task_id)
+            .expect("live resumed dispatch lease remains retained");
+        assert_eq!(lease.owner_id, "live-owner");
+        assert_eq!(lease.dispatch_fence, Some(dispatch_fence));
+        assert_eq!(state.accepted_inputs.get(&task_id), Some(&input_responses));
+        assert!(matches!(
+            state.tasks.get(&task_id),
+            Some(FinalTask::Working(_))
+        ));
+    }
+
+    #[test]
+    fn task_02_final_expired_resumed_input_claim_releases_work_for_successor_recovery() {
+        let (store, now) = in_memory_store_with_test_clock(2);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(1_000, None).expect("finite retention policy is valid"),
+            Arc::new(|_| {}),
+        );
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let expired_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let expired_snapshot = store
+            .get_task_snapshot(&expired_id)
+            .expect("expired candidate snapshot is readable before the boundary")
+            .expect("expired candidate is retained before the boundary");
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_millis(1_000);
+        assert!(
+            store
+                .take_input_handoff_for_owner_if_current(&expired_snapshot, "old-owner")
+                .expect("expired resumed claim boundary is readable")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_task(&expired_id)
+                .expect("expired resumed task cleanup is readable")
+                .is_none()
+        );
+
+        let successor_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let successor = store
+            .next_accepted_input_snapshot()
+            .expect("successor accepted-input scan is readable")
+            .expect("successor remains eligible after expired cleanup");
+        assert_eq!(successor.task().base().task_id, successor_id);
+        let claim = store
+            .take_input_handoff_for_owner_if_current(&successor, "new-owner")
+            .expect("successor resumed claim is readable")
+            .expect("successor resumed claim remains eligible");
+        assert_eq!(claim.input_responses, input_responses);
+    }
+
+    #[test]
+    fn task_02_final_unexpired_resumed_input_claim_retains_live_owner() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(1_000, None).expect("finite retention policy is valid"),
+            Arc::new(|_| {}),
+        );
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("accepted-input snapshot is readable")
+            .expect("accepted-input task is retained");
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_millis(999);
+
+        let claim = store
+            .take_input_handoff_for_owner_if_current(&snapshot, "live-owner")
+            .expect("unexpired resumed claim is readable")
+            .expect("live owner retains accepted-input claim before the boundary");
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.accepted_inputs.get(&task_id), Some(&input_responses));
+        assert_eq!(state.handoff_leases[&task_id].owner_id, "live-owner");
+        assert_eq!(state.handoff_leases[&task_id].generation, claim.generation);
+        assert!(matches!(
+            state.tasks.get(&task_id),
+            Some(FinalTask::Working(_))
+        ));
+    }
+
+    #[test]
+    fn task_02_final_clock_sampling_is_linearized_with_fenced_lease_transition() {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock_now = Arc::clone(&now);
+        let armed = Arc::new(AtomicBool::new(false));
+        let clock_armed = Arc::clone(&armed);
+        let (sampled_sender, sampled_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let release_receiver = Arc::new(Mutex::new(release_receiver));
+        let clock_release_receiver = Arc::clone(&release_receiver);
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+            let sampled_now = *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if clock_armed.swap(false, AtomicOrdering::SeqCst) {
+                sampled_sender
+                    .send(sampled_now)
+                    .expect("clock callback consumer remains available");
+                clock_release_receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(StdDuration::from_secs(1))
+                    .expect("clock callback release is bounded");
+            }
+            sampled_now
+        });
+        let store = Arc::new(
+            InMemoryFinalTaskStore::with_clock(1, clock)
+                .expect("positive bounded store capacity is valid"),
+        );
+        let task = final_working_task_without_ttl("task-clock-linearization");
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = final_test_work_descriptor();
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("initial work is durably retained");
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("initial snapshot is readable")
+            .expect("initial task is retained");
+        let claim = store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "clock-owner")
+            .expect("initial owner claim is readable")
+            .expect("initial owner claim succeeds");
+        let dispatch_fence = store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "clock-owner")
+            .expect("initial dispatch election is readable")
+            .expect("initial owner wins dispatch election");
+        {
+            let mut clock = now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *clock += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+                .checked_sub(StdDuration::from_millis(1))
+                .expect("handoff lease exceeds one millisecond");
+        }
+        // Arm only the operation under test. Setup clock reads above must not
+        // participate in the interleaving probe.
+        armed.store(true, AtomicOrdering::SeqCst);
+        let worker_store = Arc::clone(&store);
+        let worker_task_id = task_id.clone();
+        let worker = thread::spawn(move || {
+            FinalTaskStore::renew_handoff_dispatch_if_current(
+                &*worker_store,
+                &worker_task_id,
+                claim.generation,
+                "clock-owner",
+                dispatch_fence,
+            )
+        });
+        let sampled_at = sampled_receiver
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("worker reaches the armed clock callback");
+        let parent_won_state_lock = match store.state.try_lock() {
+            Ok(state) => {
+                // This is the legacy clock-before-lock ordering. Move the
+                // authoritative clock to the exact lease boundary while the
+                // worker still has only its pre-lock sample.
+                *now.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = sampled_at
+                    .checked_add(StdDuration::from_millis(1))
+                    .expect("test clock reaches the exact dispatch boundary");
+                drop(state);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("state mutex is not poisoned during clock ordering probe")
+            }
+        };
+        release_sender
+            .send(())
+            .expect("worker clock callback remains blocked until released");
+        let renewed = worker
+            .join()
+            .expect("bounded clock ordering worker exits without panic")
+            .expect("clock ordering renewal returns a decision");
+        if parent_won_state_lock {
+            assert!(
+                !renewed,
+                "expired pre-lock clock sample must not authorize renewal"
+            );
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.initial_work.get(&task_id), Some(&work_descriptor));
+        } else {
+            assert!(
+                renewed,
+                "live owner remains valid when it serializes clock sampling"
+            );
+        }
     }
 
     struct RetentionExpiryDropFlag(Arc<AtomicBool>);
