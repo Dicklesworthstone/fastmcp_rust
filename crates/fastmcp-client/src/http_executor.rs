@@ -12057,13 +12057,17 @@ mod tests {
         });
 
         let cx = Cx::for_request();
+        #[cfg(feature = "legacy-2024-11-05")]
+        let policy = ProtocolPolicy::Auto;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let policy = ProtocolPolicy::ModernOnly;
         let client = runtime_block_on(ModernHttpClient::connect(
             &cx,
             plan(
                 &modern_target,
                 "http://127.0.0.1:9/legacy-sse",
                 "http://127.0.0.1:9/legacy-message",
-                ProtocolPolicy::Auto,
+                policy,
             ),
             ClientInfo {
                 name: "http-03-b-positive".to_owned(),
@@ -12071,7 +12075,7 @@ mod tests {
             },
             ClientCapabilities::default(),
         ))
-        .expect("Auto discovery selects modern HTTP")
+        .expect("supported discovery policy selects modern HTTP")
         .into_modern()
         .expect("successful discovery retains the modern client");
         let response = runtime_block_on(client.request(
