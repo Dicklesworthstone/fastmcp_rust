@@ -1762,6 +1762,31 @@ mod tests {
                 .with_env("FASTMCP_CONFIG_EXPECTED_CWD", cwd.as_str())
                 .with_env("FASTMCP_CONFIG_CANARY", "config-modern-env"),
         );
+        let config_before = config.to_json();
+
+        let mut default_client = config
+            .client(&Cx::for_request(), "modern")
+            .expect("default config client completes modern discovery");
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::Auto);
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(
+            default_client.request_timeout_policy(),
+            RequestTimeoutPolicy::default()
+        );
+        assert_eq!(
+            default_client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        assert_eq!(default_client.protocol_version(), "2026-07-28");
+        default_client
+            .ping()
+            .expect("default configured modern client is usable");
+        default_client
+            .close()
+            .expect("default configured modern client cleanup");
+
         let timeout_policy = RequestTimeoutPolicy::new(
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(4),
@@ -1786,6 +1811,7 @@ mod tests {
             .ping()
             .expect("the configured modern session is usable");
         client.close().expect("configured modern client cleanup");
+        assert_eq!(config.to_json(), config_before);
     }
 
     #[cfg(unix)]
