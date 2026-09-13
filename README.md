@@ -363,7 +363,7 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ### From crates.io (current 0.10.0 package)
 
-The `0.10.0` package was published on 2026-09-12. Publication does
+The `0.10.0` package was published on 2026-09-13. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 

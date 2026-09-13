@@ -6,7 +6,7 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [v0.10.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.10.0) -- 2026-09-12
+## [v0.10.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.10.0) -- 2026-09-13
 
 - Breaking: custom `FinalTaskStore` implementations must provide
   `retention_clock_now` and `task_retention_deadline_if_current`. Return the
