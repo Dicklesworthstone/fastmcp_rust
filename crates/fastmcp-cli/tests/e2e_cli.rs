@@ -2509,6 +2509,206 @@ mod task_commands {
         }
     }
 
+    struct WatchReconnectProxy {
+        endpoint: String,
+        process: ProcessGroupGuard,
+    }
+
+    impl WatchReconnectProxy {
+        fn new(backend: &str) -> Self {
+            Self::new_with_foreign_second_ack(backend, false)
+        }
+
+        fn new_with_foreign_second_ack(backend: &str, foreign_second_ack: bool) -> Self {
+            let root = TestTempDir::new("task-watch-reconnect");
+            let mut command = Command::new("python3");
+            command
+                .arg("-c")
+                .arg(WATCH_RECONNECT_PROXY)
+                .current_dir(&root)
+                .env("CLI_WATCH_BACKEND", backend)
+                .env(
+                    "CLI_WATCH_FOREIGN_SECOND_ACK",
+                    if foreign_second_ack { "1" } else { "0" },
+                )
+                .stdout(std::fs::File::create(root.join("proxy.stdout")).unwrap())
+                .stderr(std::fs::File::create(root.join("proxy.stderr")).unwrap());
+            let process = ProcessGroupGuard::spawn(&mut command);
+            wait_for_file(&root.join("ready"), "http://");
+            let endpoint = std::fs::read_to_string(root.join("ready")).unwrap();
+            Self { endpoint, process }
+        }
+
+        fn stop(&mut self) {
+            self.process
+                .kill_and_reap()
+                .expect("watch reconnect proxy process group cleanup");
+        }
+    }
+
+    const WATCH_RECONNECT_PROXY: &str = r"
+import http.client, http.server, json, os, pathlib, threading, urllib.parse
+backend = urllib.parse.urlsplit(os.environ['CLI_WATCH_BACKEND'])
+first_listen_lock = threading.Lock()
+listen_count = 0
+MAX_SSE_BUFFER_BYTES = 1048576
+
+class SseReader:
+    def __init__(self, response):
+        self.response = response
+        self.buffer = bytearray()
+    def next_event(self):
+        while True:
+            boundaries = []
+            for marker in [b'\r\n\r\n', b'\n\n', b'\r\r']:
+                offset = self.buffer.find(marker)
+                if offset >= 0:
+                    boundaries.append((offset, len(marker)))
+            if boundaries:
+                offset, marker_length = min(boundaries)
+                end = offset + marker_length
+                event = bytes(self.buffer[:end])
+                del self.buffer[:end]
+                return event
+            chunk = self.response.read1(65536)
+            if not chunk:
+                return None
+            self.buffer.extend(chunk)
+            if len(self.buffer) > MAX_SSE_BUFFER_BYTES:
+                raise RuntimeError('SSE acknowledgement exceeded the 1MB bound')
+
+def event_payload(event):
+    data_lines = []
+    for line in event.splitlines():
+        if line.startswith(b'data:'):
+            value = line[5:]
+            if value.startswith(b' '):
+                value = value[1:]
+            data_lines.append(value)
+    if not data_lines:
+        return None
+    try:
+        return json.loads(b'\n'.join(data_lines))
+    except (TypeError, ValueError):
+        return None
+
+def is_correlated_ack(event, request_id):
+    payload = event_payload(event)
+    if (not isinstance(payload, dict)
+            or payload.get('method') != 'notifications/subscriptions/acknowledged'):
+        return False
+    params = payload.get('params')
+    if not isinstance(params, dict):
+        return False
+    metadata = params.get('_meta')
+    return (isinstance(metadata, dict)
+            and metadata.get('io.modelcontextprotocol/subscriptionId') == request_id)
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *args): pass
+    def do_POST(self):
+        global listen_count
+        length = int(self.headers['Content-Length'])
+        assert 0 < length <= 1048576
+        body = self.rfile.read(length)
+        request = json.loads(body)
+        with first_listen_lock:
+            listen = request.get('method') == 'subscriptions/listen'
+            if listen:
+                listen_count += 1
+            inject_terminal = listen and listen_count == 1
+            foreign_second_ack = (
+                listen
+                and listen_count == 2
+                and os.environ.get('CLI_WATCH_FOREIGN_SECOND_ACK') == '1'
+            )
+        connection = http.client.HTTPConnection(backend.hostname, backend.port, timeout=30)
+        try:
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in ['host', 'connection']
+            }
+            connection.request('POST', self.path, body, headers)
+            response = connection.getresponse()
+            self.send_response(response.status)
+            for key,value in response.getheaders():
+                if key.lower() not in ['connection','content-length','transfer-encoding']:
+                    self.send_header(key,value)
+            self.send_header('Transfer-Encoding','chunked')
+            self.end_headers()
+            if inject_terminal or foreign_second_ack:
+                reader = SseReader(response)
+                while True:
+                    event = reader.next_event()
+                    if event is None:
+                        raise RuntimeError(
+                            'backend ended before the correlated watch acknowledgement'
+                        )
+                    if is_correlated_ack(event, request['id']):
+                        if foreign_second_ack:
+                            payload = event_payload(event)
+                            payload['params']['_meta']['io.modelcontextprotocol/subscriptionId'] = (
+                                request['id'] + 1
+                                if isinstance(request['id'], int)
+                                else 'foreign-'+str(request['id'])
+                            )
+                            event = (
+                                'data: '
+                                + json.dumps(payload, separators=(',', ':'))
+                                + '\n\n'
+                            ).encode()
+                        self.wfile.write(('%x\r\n' % len(event)).encode()+event+b'\r\n')
+                        self.wfile.flush()
+                        break
+                    self.wfile.write(('%x\r\n' % len(event)).encode()+event+b'\r\n')
+                    self.wfile.flush()
+                if inject_terminal:
+                    terminal = {
+                    'jsonrpc':'2.0',
+                    'id':request['id'],
+                    'result':{
+                        'resultType':'complete',
+                        '_meta':{'io.modelcontextprotocol/subscriptionId':request['id']}
+                    }
+                    }
+                    data = ('data: '+json.dumps(terminal, separators=(',',':'))+'\n\n').encode()
+                    self.wfile.write(('%x\r\n' % len(data)).encode()+data+b'\r\n0\r\n\r\n')
+                    self.wfile.flush()
+                    pathlib.Path('first-listen-injected').write_text('terminal-response')
+                else:
+                    if reader.buffer:
+                        remainder = bytes(reader.buffer)
+                        self.wfile.write(('%x\r\n' % len(remainder)).encode()+remainder+b'\r\n')
+                        self.wfile.flush()
+                        reader.buffer.clear()
+                    while True:
+                        chunk = response.read1(65536)
+                        if not chunk: break
+                        self.wfile.write(('%x\r\n' % len(chunk)).encode()+chunk+b'\r\n')
+                        self.wfile.flush()
+                    self.wfile.write(b'0\r\n\r\n')
+                    self.wfile.flush()
+            else:
+                while True:
+                    chunk = response.read1(65536)
+                    if not chunk: break
+                    self.wfile.write(('%x\r\n' % len(chunk)).encode()+chunk+b'\r\n')
+                    self.wfile.flush()
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            connection.close()
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1',0),Proxy)
+server.daemon_threads = True
+pathlib.Path('ready').write_text('http://127.0.0.1:%d/mcp' % server.server_port)
+server.serve_forever()
+";
+
     fn read_json_lines(path: &Path) -> Vec<Value> {
         std::fs::read_to_string(path)
             .unwrap()
@@ -2577,6 +2777,23 @@ mod task_commands {
             assert!(
                 started.elapsed() < Duration::from_secs(15),
                 "timed out waiting for {text} in {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_file_occurrences(path: &Path, text: &str, minimum: usize) {
+        let started = Instant::now();
+        loop {
+            if std::fs::read_to_string(path)
+                .is_ok_and(|value| value.matches(text).count() >= minimum)
+            {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "timed out waiting for {minimum} occurrences of {text} in {}",
                 path.display()
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -3127,6 +3344,153 @@ mod task_commands {
             }),
             "nonterminal working update must not emit task-terminal watch-ended event"
         );
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_reconnects_after_terminal_response_and_receives_terminal_update() {
+        let fixture = TaskFixture::new(true).with_supervisor("completed");
+        let (mut server, backend_endpoint) = fixture.http();
+        let mut proxy = WatchReconnectProxy::new(&backend_endpoint);
+        let (mut watch, stdout_path, stderr_path) = fixture.spawn_http_watch(
+            &proxy.endpoint,
+            "reconnect-complete",
+            &["--timeout", "20", "--max-events", "100"],
+        );
+        wait_for_file_occurrences(&stdout_path, "watch-acknowledged", 2);
+        wait_for_file(&stdout_path, "watch-reconnected");
+        let update = fixture.send_roots_update(&proxy.endpoint);
+        assert_eq!(update["event"], "update-acknowledged");
+
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("reconnected watch exits after the real terminal update");
+        assert!(
+            status.success(),
+            "reconnected watch failed: {}",
+            std::fs::read_to_string(&stderr_path).unwrap()
+        );
+        let events = read_json_lines(&stdout_path);
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"]["status"], "input_required");
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+        assert_eq!(events[2]["event"], "watch-acknowledged");
+        assert_eq!(events[3]["event"], "watch-reconnected");
+        assert_eq!(events[3]["data"]["attempt"], 1);
+        let update_event = events
+            .iter()
+            .rev()
+            .find(|event| event["event"] == "task-updated")
+            .expect("the final task update is observed after successful reconnection");
+        assert_eq!(update_event["data"]["status"], "completed");
+        let end_event = events.last().unwrap();
+        assert_eq!(end_event["event"], "watch-ended");
+        assert_eq!(end_event["data"]["reason"], "task-terminal");
+        assert!(!std::fs::read(&stdout_path).unwrap().contains(&0x1b));
+        assert_eq!(
+            events[0]["data"]["statusMessage"], fixture.task["statusMessage"],
+            "JSON snapshots preserve exact task text while escaping terminal controls"
+        );
+        assert_eq!(
+            events[3]["data"]["task"]["statusMessage"], fixture.task["statusMessage"],
+            "reconnect JSON preserves the same task text contract"
+        );
+        assert!(
+            !std::fs::read_to_string(&stderr_path)
+                .unwrap()
+                .contains("test-secret-123"),
+            "diagnostics must not expose task credential text"
+        );
+        proxy.stop();
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_reconnect_timeout_preserves_nonterminal_state() {
+        let fixture = TaskFixture::new(true).with_supervisor("completed");
+        let (mut server, backend_endpoint) = fixture.http();
+        let mut proxy = WatchReconnectProxy::new(&backend_endpoint);
+        let (mut watch, stdout_path, stderr_path) = fixture.spawn_http_watch(
+            &proxy.endpoint,
+            "reconnect-timeout",
+            &["--timeout", "2", "--max-events", "100"],
+        );
+        wait_for_file(&stdout_path, "watch-reconnected");
+
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("nonterminal reconnect eventually reaches the total timeout");
+        assert!(!status.success(), "unknown completion must fail closed");
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            stderr.contains("--timeout"),
+            "timeout diagnostic missing: {stderr}"
+        );
+        let events = read_json_lines(&stdout_path);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "watch-reconnected")
+        );
+        assert!(!events.iter().any(|event| {
+            event["event"] == "watch-ended" && event["data"]["reason"] == "task-terminal"
+        }));
+        let unchanged = run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+        ]);
+        let unchanged = document(&unchanged);
+        assert_eq!(unchanged["data"]["status"], "input_required");
+        assert_eq!(unchanged["data"], fixture.task);
+        assert!(!fixture.root.join("changed.json").exists());
+        proxy.stop();
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_reconnect_foreign_ack_rejects_without_reconnected() {
+        let fixture = TaskFixture::new(true).with_supervisor("completed");
+        let (mut server, backend_endpoint) = fixture.http();
+        let mut proxy = WatchReconnectProxy::new_with_foreign_second_ack(&backend_endpoint, true);
+        let (mut watch, stdout_path, stderr_path) = fixture.spawn_http_watch(
+            &proxy.endpoint,
+            "reconnect-foreign-ack",
+            &["--timeout", "10", "--max-events", "100"],
+        );
+
+        let status = watch
+            .wait_until(Duration::from_secs(10))
+            .expect("foreign acknowledgement rejection exits promptly");
+        assert!(
+            !status.success(),
+            "foreign acknowledgement must fail closed"
+        );
+        assert!(!std::fs::read_to_string(&stderr_path).unwrap().is_empty());
+        let events = read_json_lines(&stdout_path);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["event"] == "watch-reconnected")
+        );
+        assert!(!events.iter().any(|event| {
+            event["event"] == "watch-ended" && event["data"]["reason"] == "task-terminal"
+        }));
+        let unchanged = document(&run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+        ]));
+        assert_eq!(unchanged["data"]["status"], "input_required");
+        assert_eq!(unchanged["data"], fixture.task);
+        assert!(!fixture.root.join("changed.json").exists());
+        proxy.stop();
         server.kill_and_reap().expect("HTTP server cleanup");
     }
 

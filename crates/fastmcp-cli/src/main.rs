@@ -52,6 +52,8 @@ use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, ProtocolVer
 
 const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
+#[cfg(feature = "tasks")]
+const MAX_TASK_WATCH_RECONNECTS: u64 = 3;
 const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
 const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
 const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
@@ -867,7 +869,8 @@ struct TaskConnection {
     /// Emit one JSON document per snapshot, acknowledgement, or watch event.
     #[arg(long, global = true)]
     json: bool,
-    /// Request/watch timeout in seconds. A watch never reconnects automatically.
+    /// Request/watch timeout in seconds. Watches reconcile and reconnect after
+    /// clean stream termination within a bounded retry budget.
     #[arg(long, global = true, default_value_t = 30,
         value_parser = clap::value_parser!(u64).range(1..=900))]
     timeout: u64,
@@ -6044,7 +6047,7 @@ fn is_terminal_task_status(status: fastmcp_protocol::tasks_extension::TaskStatus
 #[cfg(feature = "tasks")]
 enum TaskWatchStep {
     Pending,
-    Reconcile,
+    Reconcile { reconnect: bool },
     Finished,
 }
 
@@ -6283,7 +6286,9 @@ async fn run_yielding_stdio_task(
             let started = std::time::Instant::now();
             client.open_final_task_subscription_listener(filter)?;
             let mut updates = 0;
+            let mut reconnect_ack_pending = false;
             let outcome = async {
+                let mut reconnects = 0;
                 loop {
                     match poll_stdio_task_watch(
                         cx,
@@ -6297,7 +6302,7 @@ async fn run_yielding_stdio_task(
                     )? {
                         TaskWatchStep::Pending => asupersync::runtime::yield_now().await,
                         TaskWatchStep::Finished => break Ok(()),
-                        TaskWatchStep::Reconcile => {
+                        TaskWatchStep::Reconcile { reconnect } => {
                             // The subscription is now admitted. A fresh read
                             // covers a terminal transition before its admission.
                             let remaining = remaining_task_watch_time(connection, started)?;
@@ -6309,8 +6314,40 @@ async fn run_yielding_stdio_task(
                                 .await?
                                 .task;
                             remaining_task_watch_time(connection, started)?;
+                            if reconnect_ack_pending && !reconnect {
+                                write_task_event(
+                                    connection.json,
+                                    "watch-reconnected",
+                                    &serde_json::json!({
+                                        "attempt": reconnects,
+                                        "task": task,
+                                    }),
+                                )?;
+                                reconnect_ack_pending = false;
+                            }
                             if end_watch_if_reconciled_terminal(connection, &task, &mut updates)? {
                                 break Ok(());
+                            }
+                            if reconnect {
+                                if reconnects >= MAX_TASK_WATCH_RECONNECTS {
+                                    break Err(fastmcp_core::McpError::internal_error(
+                                        "task watch stream ended before terminal task state; reconnect budget exhausted",
+                                    ));
+                                }
+                                reconnects += 1;
+                                let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+                                fastmcp_protocol::set_task_subscription_ids(
+                                    &mut filter,
+                                    vec![task_id.clone()],
+                                )
+                                .map_err(|_| {
+                                    fastmcp_core::McpError::invalid_params(
+                                        "invalid task watch filter during reconnect",
+                                    )
+                                })?;
+                                client
+                                    .open_final_task_subscription_listener(filter)?;
+                                reconnect_ack_pending = true;
                             }
                         }
                     }
@@ -6339,6 +6376,8 @@ fn watch_stdio_task(
 ) -> McpResult<()> {
     let started = std::time::Instant::now();
     let mut updates = 0;
+    let mut reconnects = 0;
+    let mut reconnect_ack_pending = false;
     loop {
         match poll_stdio_task_watch(
             cx,
@@ -6352,7 +6391,7 @@ fn watch_stdio_task(
         )? {
             TaskWatchStep::Pending => {}
             TaskWatchStep::Finished => return Ok(()),
-            TaskWatchStep::Reconcile => {
+            TaskWatchStep::Reconcile { reconnect } => {
                 let remaining = remaining_task_watch_time(connection, started)?;
                 client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                     remaining, remaining,
@@ -6361,8 +6400,36 @@ fn watch_stdio_task(
                     .get_task_final_with_cancellation(cx, cancellation, task_id.clone())?
                     .task;
                 remaining_task_watch_time(connection, started)?;
+                if reconnect_ack_pending && !reconnect {
+                    write_task_event(
+                        connection.json,
+                        "watch-reconnected",
+                        &serde_json::json!({
+                            "attempt": reconnects,
+                            "task": task,
+                        }),
+                    )?;
+                    reconnect_ack_pending = false;
+                }
                 if end_watch_if_reconciled_terminal(connection, &task, &mut updates)? {
                     return Ok(());
+                }
+                if reconnect {
+                    if reconnects >= MAX_TASK_WATCH_RECONNECTS {
+                        return Err(fastmcp_core::McpError::internal_error(
+                            "task watch stream ended before terminal task state; reconnect budget exhausted",
+                        ));
+                    }
+                    reconnects += 1;
+                    let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+                    fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                        .map_err(|_| {
+                            fastmcp_core::McpError::invalid_params(
+                                "invalid task watch filter during reconnect",
+                            )
+                        })?;
+                    client.open_final_task_subscription_listener(filter)?;
+                    reconnect_ack_pending = true;
                 }
             }
         }
@@ -6399,7 +6466,7 @@ fn poll_stdio_task_watch(
         Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
             validate_task_watch_acknowledgement(&filter, task_id)?;
             write_task_event(connection.json, "watch-acknowledged", &filter)?;
-            return Ok(TaskWatchStep::Reconcile);
+            return Ok(TaskWatchStep::Reconcile { reconnect: false });
         }
         Some(StdioTaskSubscriptionEvent::Notification(notification)) => {
             if &notification.params.task.base().task_id != task_id {
@@ -6427,12 +6494,7 @@ fn poll_stdio_task_watch(
             }
         }
         Some(StdioTaskSubscriptionEvent::Terminal) => {
-            write_task_event(
-                connection.json,
-                "watch-ended",
-                &serde_json::json!({"reason": "stream-ended", "updates": updates}),
-            )?;
-            return Ok(TaskWatchStep::Finished);
+            return Ok(TaskWatchStep::Reconcile { reconnect: true });
         }
     }
     Ok(TaskWatchStep::Pending)
@@ -6499,6 +6561,8 @@ async fn run_http_task(
                 .await
                 .map_err(error)?;
             let mut updates = 0;
+            let mut reconnects = 0;
+            let mut reconnect_ack_pending = false;
             loop {
                 let event = client
                     .next_final_task_subscription_event(cx)
@@ -6512,6 +6576,17 @@ async fn run_http_task(
                         // transitions before admission are visible to this read,
                         // and later transitions remain queued on the same stream.
                         let task = handle.poll(cx, &mut client).await.map_err(error)?;
+                        if reconnect_ack_pending {
+                            write_task_event(
+                                connection.json,
+                                "watch-reconnected",
+                                &serde_json::json!({
+                                    "attempt": reconnects,
+                                    "task": task,
+                                }),
+                            )?;
+                            reconnect_ack_pending = false;
+                        }
                         if end_watch_if_reconciled_terminal(connection, task, &mut updates)? {
                             return Ok(());
                         }
@@ -6545,14 +6620,42 @@ async fn run_http_task(
                             );
                         }
                     }
-                    fastmcp_client::StdioTaskSubscriptionEvent::Terminal => break,
+                    fastmcp_client::StdioTaskSubscriptionEvent::Terminal => {
+                        let task = handle.poll(cx, &mut client).await.map_err(error)?;
+                        if end_watch_if_reconciled_terminal(connection, task, &mut updates)? {
+                            return Ok(());
+                        }
+                        if reconnects >= MAX_TASK_WATCH_RECONNECTS {
+                            return Err(fastmcp_core::McpError::internal_error(
+                                "task watch stream ended before terminal task state; reconnect budget exhausted",
+                            ));
+                        }
+                        reconnects += 1;
+                        let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+                        fastmcp_protocol::set_task_subscription_ids(
+                            &mut filter,
+                            vec![task_id.clone()],
+                        )
+                        .map_err(|_| {
+                            fastmcp_core::McpError::invalid_params(
+                                "invalid task watch filter during reconnect",
+                            )
+                        })?;
+                        let limits =
+                            fastmcp_client::sse::SseLimits::new(1024 * 1024, 2 * 1024 * 1024, 256)
+                                .ok_or_else(|| {
+                                    fastmcp_core::McpError::internal_error(
+                                        "invalid CLI SSE bounds during reconnect",
+                                    )
+                                })?;
+                        client
+                            .open_final_task_subscription_listener(cx, filter, limits)
+                            .await
+                            .map_err(error)?;
+                        reconnect_ack_pending = true;
+                    }
                 }
             }
-            write_task_event(
-                connection.json,
-                "watch-ended",
-                &serde_json::json!({"reason": "stream-ended", "updates": updates}),
-            )
         }
         TaskAction::Cancel { .. } => unreachable!("cancel returned before reading a snapshot"),
     }
