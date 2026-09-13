@@ -88,7 +88,9 @@ jobs:
             local target="$1"
             printf '%s\n' "$transcript" | awk -v target="$target" '
               $0 ~ "Running .*" target { active = 1; next }
-              active && /^test result: / { print; exit }
+              # Consume the entire pipe: early exit can SIGPIPE printf and
+              # reject a valid long transcript under pipefail.
+              active && /^test result: / && !reported { print; reported = 1 }
             '
           }
 
