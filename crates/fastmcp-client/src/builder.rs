@@ -942,13 +942,13 @@ impl ClientBuilder {
             #[cfg(not(unix))]
             let attempt_result = self.try_connect(command, args, cx, retry_deadline);
             match attempt_result {
-                Ok(client) => {
+                Ok(mut client) => {
                     let operation_error = if cx.checkpoint().is_err() {
                         Some(McpError::request_cancelled())
                     } else if retry_deadline.expired() {
                         Some(Self::connection_retry_elapsed_error())
                     } else {
-                        None
+                        client.set_request_timeout_policy(self.timeout_policy).err()
                     };
                     if let Some(error) = operation_error {
                         // Only failed construction retains a client across an
@@ -1010,6 +1010,10 @@ impl ClientBuilder {
                         Err(Self::connection_retry_elapsed_error()),
                         || cleanup,
                     );
+                }
+                if let Err(error) = client.set_request_timeout_policy(self.timeout_policy) {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(Err(error), || cleanup);
                 }
                 Ok(client)
             }
@@ -3504,6 +3508,138 @@ IFS= read -r remaining
                 rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()),
                 Err(rustix::io::Errno::SRCH)
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_restores_requested_timeout_policy_for_ordinary_request() {
+        let requested = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+            .expect("ordinary request policy is valid");
+        let script = r#"
+IFS= read -r discover || exit 90
+case "$discover" in
+    *server/discover*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"timeout-retention-modern","version":"1"}}}}' ;;
+    *) exit 91 ;;
+esac
+IFS= read -r ping || exit 92
+case "$ping" in
+    *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}' ;;
+    *) exit 93 ;;
+esac
+exec sleep 2
+"#;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller runtime must build");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must install a current Cx");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(requested)
+                .connection_retry_policy(1, Duration::ZERO, Duration::from_secs(1))
+                .expect("one-attempt aggregate deadline is valid")
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .await
+                .expect("modern initialization completes within its aggregate deadline");
+
+            assert_eq!(client.request_timeout_policy(), requested);
+            let executor = client
+                .multiplexed_stdio_executor()
+                .expect("successful modern client exposes its executor");
+            let mut execution = client
+                .start_multiplexed_request(&cx, "ping", None)
+                .expect("ordinary modern request commits");
+            let pending = executor.executor.pending_records();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0]
+                    .absolute_deadline
+                    .duration_since(pending[0].idle_deadline),
+                Duration::from_secs(2),
+                "the live executor must use the requested idle/absolute difference"
+            );
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("the caller runtime drives the real modern response");
+            let response = executor
+                .try_take_response(&mut execution)
+                .expect("modern response decodes")
+                .expect("modern response is correlated to the ordinary request");
+            assert_eq!(
+                response.result,
+                Some(serde_json::json!({"resultType": "complete"}))
+            );
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("successful modern client cleanup");
+        });
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn one_shot_builder_restores_requested_timeout_policy_after_bounded_initialization() {
+        let requested = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+            .expect("ordinary request policy is valid");
+        let script = r#"
+IFS= read -r first || exit 90
+case "$first" in
+    *server/discover*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"discovery unavailable"}}' ;;
+    *initialize*2024-11-05*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"timeout-retention-legacy","version":"1"}}}'
+        IFS= read -r lifecycle || exit 91
+        case "$lifecycle" in *notifications/initialized*) ;; *) exit 92 ;; esac
+        IFS= read -r ping || exit 93
+        case "$ping" in
+            *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+            *) exit 94 ;;
+        esac
+        exec sleep 2 ;;
+    *) exit 95 ;;
+esac
+"#;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller runtime must build");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must install a current Cx");
+            let mut client = ClientBuilder::new()
+                .request_timeout_policy(requested)
+                .connection_retry_policy(1, Duration::ZERO, Duration::from_secs(1))
+                .expect("one-attempt aggregate deadline is valid")
+                .connect_stdio_once_with_cx("sh", &["-c", script], &cx)
+                .expect("Auto fallback initializes its fresh legacy child");
+
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(client.request_timeout_policy(), requested);
+            let executor = client
+                .multiplexed_stdio_executor()
+                .expect("successful legacy client exposes its executor");
+            let mut execution = client
+                .start_multiplexed_request(&cx, "ping", None)
+                .expect("ordinary legacy request commits");
+            let pending = executor.executor.pending_records();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0]
+                    .absolute_deadline
+                    .duration_since(pending[0].idle_deadline),
+                Duration::from_secs(2),
+                "the fallback executor must use the requested idle/absolute difference"
+            );
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("the caller runtime drives the real legacy response");
+            let response = executor
+                .try_take_response(&mut execution)
+                .expect("legacy response decodes")
+                .expect("legacy response is correlated to the ordinary request");
+            assert_eq!(response.result, Some(serde_json::json!({})));
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("successful fallback client cleanup");
         });
     }
 
