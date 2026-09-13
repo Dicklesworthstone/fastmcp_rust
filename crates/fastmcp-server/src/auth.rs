@@ -347,7 +347,9 @@ fn scan_credential_map<'a>(
 }
 
 fn is_header_access_token_field(key: &str) -> bool {
-    key.eq_ignore_ascii_case("authorization") || ACCESS_TOKEN_FIELDS.contains(&key)
+    ACCESS_TOKEN_FIELDS
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(key))
 }
 
 fn scan_headers_credential_map<'a>(
@@ -379,6 +381,15 @@ fn single_in_band_credential(
     }
     if let Some(nested) = map.get("_meta").and_then(serde_json::Value::as_object)
         && let Err(error) = scan_credential_map(nested, &mut candidate)
+    {
+        return Some(Err(error));
+    }
+    if let Some(nested_meta_headers) = map
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|meta| meta.get("headers"))
+        .and_then(serde_json::Value::as_object)
+        && let Err(error) = scan_headers_credential_map(nested_meta_headers, &mut candidate)
     {
         return Some(Err(error));
     }
@@ -471,6 +482,12 @@ pub(crate) fn strip_recognized_access_credentials(params: &mut Option<serde_json
         .and_then(serde_json::Value::as_object_mut)
     {
         remove_access_token_fields(nested);
+        if let Some(nested_headers) = nested
+            .get_mut("headers")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            remove_headers_access_token_fields(nested_headers);
+        }
     }
     if let Some(nested_headers) = map
         .get_mut("headers")
@@ -2079,6 +2096,138 @@ mod tests {
         );
     }
 
+    struct CountingVerifier {
+        inner: StaticTokenVerifier,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TokenVerifier for CountingVerifier {
+        fn verify(
+            &self,
+            ctx: &McpContext,
+            request: AuthRequest<'_>,
+            token: &AccessToken,
+        ) -> McpResult<AuthContext> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.verify(ctx, request, token)
+        }
+    }
+
+    #[test]
+    fn auth_01_a_nested_meta_headers_legacy_positive() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        });
+        let legacy_params = serde_json::json!({
+            "_meta": {
+                "headers": {
+                    "Authorization": "Bearer valid-token-123",
+                    "content-type": "application/json"
+                }
+            },
+            "arguments": {"Token": "ordinary-arg"}
+        });
+        let legacy_request = AuthRequest {
+            method: "tools/call",
+            params: Some(&legacy_params),
+            transport_authorization: None,
+            request_id: 1,
+        };
+
+        let legacy_auth = provider
+            .authenticate(&ctx(), legacy_request)
+            .expect("legacy nested header credential is admitted");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(legacy_auth.subject.as_deref(), Some("alice"));
+
+        let native_params = serde_json::json!({
+            "_meta": {
+                "headers": {"content-type": "application/json"}
+            },
+            "arguments": {"Token": "ordinary-arg"}
+        });
+        let native_request = AuthRequest {
+            method: "tools/call",
+            params: Some(&native_params),
+            transport_authorization: Some("Bearer valid-token-123"),
+            request_id: 1,
+        };
+        let native_auth = provider
+            .authenticate(&ctx(), native_request)
+            .expect("native Authorization credential is admitted");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            principal_fingerprint(Some(&legacy_auth)).expect("legacy fingerprint"),
+            principal_fingerprint(Some(&native_auth)).expect("native fingerprint")
+        );
+
+        let mut stripped = Some(legacy_params);
+        strip_recognized_access_credentials(&mut stripped);
+        assert_eq!(
+            stripped,
+            Some(serde_json::json!({
+                "_meta": {
+                    "headers": {"content-type": "application/json"}
+                },
+                "arguments": {"Token": "ordinary-arg"}
+            }))
+        );
+    }
+
+    #[test]
+    fn auth_01_a_nested_meta_headers_native_planted_negative() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        });
+        let params = serde_json::json!({
+            "_meta": {
+                "headers": {
+                    "Authorization": "Bearer valid-token-123",
+                    "content-type": "application/json"
+                }
+            },
+            "arguments": {"Token": "ordinary-arg"}
+        });
+        let original = params.clone();
+        let request = AuthRequest {
+            method: "tools/call",
+            params: Some(&params),
+            transport_authorization: Some("Bearer valid-token-123"),
+            request_id: 1,
+        };
+
+        assert!(!request.credential_sources_are_admissible());
+        assert!(request.has_multiple_credential_sources());
+        let error = provider
+            .authenticate(&ctx(), request)
+            .expect_err("native and nested legacy credentials must be rejected");
+        assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(params, original);
+
+        let mut stripped = Some(params);
+        strip_recognized_access_credentials(&mut stripped);
+        assert_eq!(
+            stripped,
+            Some(serde_json::json!({
+                "_meta": {
+                    "headers": {"content-type": "application/json"}
+                },
+                "arguments": {"Token": "ordinary-arg"}
+            }))
+        );
+    }
+
     #[test]
     fn nested_headers_mixed_case_duplicate_with_canonical_spelling_rejected() {
         let params = serde_json::json!({
@@ -2156,6 +2305,114 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn auth_01_a_header_map_alias_case_insensitive_positive() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        });
+
+        for (request_id, header_key) in [
+            (1, "AUTH"),
+            (2, "TOKEN"),
+            (3, "ACCESS_TOKEN"),
+            (4, "ACCESSTOKEN"),
+        ] {
+            let params = serde_json::json!({
+                "headers": {
+                    header_key: "Bearer valid-token-123",
+                    "content-type": "application/json"
+                },
+                "TOKEN": "ordinary-top-level",
+                "arguments": {"TOKEN": "ordinary-argument"}
+            });
+            let request = AuthRequest {
+                method: "tools/call",
+                params: Some(&params),
+                transport_authorization: None,
+                request_id,
+            };
+
+            let auth = provider
+                .authenticate(&ctx(), request)
+                .expect("case-insensitive header alias is admitted");
+            assert_eq!(auth.subject.as_deref(), Some("alice"));
+
+            let mut stripped = Some(params);
+            strip_recognized_access_credentials(&mut stripped);
+            assert_eq!(
+                stripped,
+                Some(serde_json::json!({
+                    "headers": {"content-type": "application/json"},
+                    "TOKEN": "ordinary-top-level",
+                    "arguments": {"TOKEN": "ordinary-argument"}
+                }))
+            );
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn auth_01_a_header_map_alias_case_insensitive_native_planted_negative() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        });
+
+        for (request_id, header_key) in [
+            (1, "AUTH"),
+            (2, "TOKEN"),
+            (3, "ACCESS_TOKEN"),
+            (4, "ACCESSTOKEN"),
+        ] {
+            let params = serde_json::json!({
+                "headers": {
+                    header_key: "Bearer valid-token-123",
+                    "content-type": "application/json"
+                },
+                "TOKEN": "ordinary-top-level",
+                "arguments": {"TOKEN": "ordinary-argument"}
+            });
+            let original = params.clone();
+            let request = AuthRequest {
+                method: "tools/call",
+                params: Some(&params),
+                transport_authorization: Some("Bearer valid-token-123"),
+                request_id,
+            };
+
+            assert!(!request.credential_sources_are_admissible());
+            assert!(request.has_multiple_credential_sources());
+            let error = provider
+                .authenticate(&ctx(), request)
+                .expect_err("native and aliased header credentials must be rejected");
+            assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+            assert_eq!(params, original);
+
+            let mut stripped = Some(params);
+            strip_recognized_access_credentials(&mut stripped);
+            assert_eq!(
+                stripped,
+                Some(serde_json::json!({
+                    "headers": {"content-type": "application/json"},
+                    "TOKEN": "ordinary-top-level",
+                    "arguments": {"TOKEN": "ordinary-argument"}
+                }))
+            );
+        }
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

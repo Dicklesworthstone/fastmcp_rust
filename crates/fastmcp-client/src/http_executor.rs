@@ -2361,11 +2361,23 @@ impl ModernHttpExecutor {
             request.headers_with_credential(self.bearer_credential.as_deref()),
             request.body().to_vec(),
         ));
+        // A native response-head wait may remain pending even after the
+        // caller's Cx has been cancelled. Keep the request-owned exchange
+        // behind this select so cancellation drops it immediately and closes
+        // only this socket/route. The explicit request cancellation below is
+        // still separate because it can retire one request without cancelling
+        // the ambient connection context.
+        let (_ambient_cancellation_guard, mut ambient_cancellation_signal) =
+            oneshot::channel::<()>();
         let response = match cancellation {
             Some(cancellation) => {
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
+                let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
                 poll_fn(|task_cx| {
-                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                    if cx.checkpoint().is_err()
+                        || cancelled.as_mut().poll(task_cx).is_ready()
+                        || ambient_cancelled.as_mut().poll(task_cx).is_ready()
+                    {
                         return Poll::Ready(Err(()));
                     }
                     match exchange.as_mut().poll(task_cx) {
@@ -2377,7 +2389,23 @@ impl ModernHttpExecutor {
                 .map_err(|()| ModernHttpExecutorError::Cancelled)?
                 .map_err(map_transport_error)?
             }
-            None => exchange.await.map_err(map_transport_error)?,
+            None => {
+                let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
+                poll_fn(|task_cx| {
+                    if cx.checkpoint().is_err()
+                        || ambient_cancelled.as_mut().poll(task_cx).is_ready()
+                    {
+                        return Poll::Ready(Err(()));
+                    }
+                    match exchange.as_mut().poll(task_cx) {
+                        Poll::Ready(response) => Poll::Ready(Ok(response)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                })
+                .await
+                .map_err(|()| ModernHttpExecutorError::Cancelled)?
+                .map_err(map_transport_error)?
+            }
         };
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
@@ -8938,12 +8966,12 @@ mod tests {
         MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, MAX_MRTR_CONTINUATION_ROUNDS,
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
         MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS,
-        ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
-        ModernHttpFinalCoreListenError, ModernHttpMrtrError, ModernHttpResponseKind,
-        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        cancellation_control_is_authorized, decode_modern_discovery_response,
-        reject_body_frame_after_cancellation, retire_abandoned_persistent_waiter,
-        validate_response_head,
+        ModernHttpClient, ModernHttpClientError, ModernHttpExecutor, ModernHttpExecutorError,
+        ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpMrtrError,
+        ModernHttpRequest, ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
+        ModernHttpSubscriptionListenError, cancellation_control_is_authorized,
+        decode_modern_discovery_response, reject_body_frame_after_cancellation,
+        retire_abandoned_persistent_waiter, validate_response_head,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     use super::{
@@ -11960,6 +11988,235 @@ mod tests {
             .send(())
             .expect("release the response-owning peer");
         server.join().expect("modern SSE server must join");
+    }
+
+    #[test]
+    fn http_03_b_executor_discovery_and_request_completes_positive() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern executor listener");
+        let address = listener
+            .local_addr()
+            .expect("read modern executor listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener
+                .accept()
+                .expect("accept the Auto-style discovery request");
+            let discovery_request = read_request(&mut discovery);
+            assert!(
+                discovery_request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n")
+            );
+            assert!(
+                discovery_request
+                    .head
+                    .contains("Accept-Encoding: identity\r\n")
+            );
+            assert!(
+                discovery_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            assert!(
+                discovery_request
+                    .head
+                    .contains("Mcp-Method: server/discover\r\n")
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
+                    .expect("discovery body is JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
+
+            let (mut request_stream, _) = listener
+                .accept()
+                .expect("accept the first ordinary request after discovery");
+            let request = read_request(&mut request_stream);
+            assert!(request.head.contains("Mcp-Method: tools/list\r\n"));
+            assert!(
+                request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            let request_body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("ordinary request body is JSON-RPC");
+            assert_eq!(request_body["id"], 2);
+            assert_eq!(request_body["method"], "tools/list");
+            write_response(
+                &mut request_stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[]}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::Auto,
+            ),
+            ClientInfo {
+                name: "http-03-b-positive".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("Auto discovery selects modern HTTP")
+        .into_modern()
+        .expect("successful discovery retains the modern client");
+        let response = runtime_block_on(client.request(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            Some(RequestId::Number(2)),
+        ))
+        .expect("ordinary request opens after discovery");
+        assert_eq!(response.metadata().kind(), ModernHttpResponseKind::Json);
+        let body = runtime_block_on(response.read_to_end(&cx, 4_096))
+            .expect("ordinary JSON response completes");
+        assert!(
+            body.windows(b"\"id\":2".len())
+                .any(|window| window == b"\"id\":2")
+        );
+        server.join().expect("positive HTTP executor peer joins");
+    }
+
+    #[test]
+    fn http_03_b_executor_cancellation_releases_header_wait_without_replay_negative() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read cancellation listener address");
+        let allowed_target = format!("http://{address}/mcp");
+        let wrong_origin_listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind wrong-origin listener");
+        let wrong_origin_address = wrong_origin_listener
+            .local_addr()
+            .expect("read wrong-origin listener address");
+        let wrong_origin_target = format!("http://{wrong_origin_address}/mcp");
+        let (request_seen_sender, request_seen_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept the request that will be cancelled");
+            let request = read_request(&mut stream);
+            assert!(
+                !request.head.contains("Authorization:"),
+                "cleartext HTTP must not receive an HTTPS-bound credential"
+            );
+            request_seen_sender
+                .send(())
+                .expect("tell the caller the pending response socket is owned");
+            stream
+                .set_read_timeout(Some(LEGACY_TEST_PEER_BOUND))
+                .expect("bound cancelled request socket closure");
+            let mut byte = [0_u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!(
+                    "cancelling a pending response must close its request-owned socket: {result:?}"
+                ),
+            }
+        });
+        let wrong_origin_server = thread::spawn(move || {
+            let (mut stream, _) = wrong_origin_listener
+                .accept()
+                .expect("accept one wrong-origin request");
+            let request = read_request(&mut stream);
+            assert!(
+                !request.head.contains("Authorization:"),
+                "a bound credential must not replay to a different origin"
+            );
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+            );
+        });
+
+        let credential = crate::http_auth::BoundBearerCredential::bind(
+            CanonicalHttpUrl::parse(&format!("https://{address}/mcp"))
+                .expect("HTTPS credential target is canonical"),
+            "executor-secret",
+        )
+        .expect("test credential binds to the allowed target");
+        let matching_request = ModernHttpRequest::new(
+            credential.resource().as_str().to_owned(),
+            Vec::new(),
+            MODERN_PROTOCOL_VERSION,
+            SERVER_DISCOVER,
+            None,
+        )
+        .expect("HTTPS matching request is valid");
+        assert!(
+            matching_request
+                .headers_with_credential(Some(&credential))
+                .iter()
+                .any(|(name, value)| name == "Authorization" && value == "Bearer executor-secret")
+        );
+        let executor = ModernHttpExecutor::with_bearer_credential(Some(credential.clone()));
+        let cancelled_cx = Cx::for_request();
+        let cancellation_controller = {
+            let cancellation_cx = cancelled_cx.clone();
+            thread::spawn(move || {
+                request_seen_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the cancelled request reaches the peer");
+                cancellation_cx
+                    .cancel_with(CancelKind::User, Some("cancel pending response headers"));
+            })
+        };
+        let cancelled_request = ModernHttpRequest::new(
+            allowed_target.clone(),
+            br#"{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}"#.to_vec(),
+            MODERN_PROTOCOL_VERSION,
+            SERVER_DISCOVER,
+            None,
+        )
+        .expect("allowed discovery request is valid");
+        let cancelled = runtime_block_on(executor.execute(&cancelled_cx, &cancelled_request));
+        assert!(matches!(cancelled, Err(ModernHttpExecutorError::Cancelled)));
+        cancellation_controller
+            .join()
+            .expect("cancellation controller joins");
+        server.join().expect("cancelled request peer joins");
+
+        let wrong_origin_cx = Cx::for_request();
+        let wrong_origin_request = ModernHttpRequest::new(
+            wrong_origin_target.clone(),
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#.to_vec(),
+            MODERN_PROTOCOL_VERSION,
+            "tools/list",
+            None,
+        )
+        .expect("wrong-origin request is otherwise valid");
+        let response = runtime_block_on(executor.execute(&wrong_origin_cx, &wrong_origin_request))
+            .expect("wrong-origin request can proceed without the bound credential");
+        let body = runtime_block_on(response.read_to_end(&wrong_origin_cx, 4_096))
+            .expect("wrong-origin response completes");
+        assert!(
+            body.windows(b"\"id\":3".len())
+                .any(|window| window == b"\"id\":3")
+        );
+        wrong_origin_server
+            .join()
+            .expect("wrong-origin peer joins without a credential replay");
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

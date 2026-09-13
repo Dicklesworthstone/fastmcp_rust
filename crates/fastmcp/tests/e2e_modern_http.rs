@@ -25155,56 +25155,83 @@ fn auth_01_a_planted_negative() {
     let positive_body =
         serde_json::to_vec(&positive_tool).expect("positive tool request serializes");
 
-    // 1. In-band body credential contamination (nested headers AUTHORIZATION).
-    // Near-identical request differing ONLY in the forbidden credential location.
-    let contaminated_tool = JsonRpcRequest::new(
-        "tools/call",
-        Some(json!({
-            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
-            "arguments": {
-                "Token": "application-param-preserved",
-            },
-            "headers": {
-                "AUTHORIZATION": format!("Bearer {token}"),
-            },
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        })),
-        2_i64,
-    );
-    let contaminated_body =
-        serde_json::to_vec(&contaminated_tool).expect("contaminated tool request serializes");
+    // 1. In-band body credential contamination. Each request is near-identical
+    // to the positive body and differs ONLY in the forbidden credential location.
+    let contaminated_bodies = [
+        (
+            "params.headers",
+            serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+                    "arguments": {
+                        "Token": "application-param-preserved",
+                    },
+                    "headers": {
+                        "AUTHORIZATION": format!("Bearer {token}"),
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                2_i64,
+            ))
+            .expect("headers-contaminated tool request serializes"),
+        ),
+        (
+            "params._meta.headers",
+            serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+                    "arguments": {
+                        "Token": "application-param-preserved",
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        "headers": {
+                            "AUTHORIZATION": format!("Bearer {token}"),
+                        },
+                    },
+                })),
+                2_i64,
+            ))
+            .expect("meta-headers-contaminated tool request serializes"),
+        ),
+    ];
 
-    let body_rejected = auth_admission_exchange(
-        server.address(),
-        "/mcp",
-        Some(&format!("Bearer {token}")),
-        &contaminated_body,
-    );
-    assert!(
-        body_rejected.starts_with(b"HTTP/1.1 401"),
-        "body credential contamination must be rejected with HTTP 401: {}",
-        String::from_utf8_lossy(&body_rejected)
-    );
-    assert!(
-        auth_admission_response_headers(&body_rejected)
-            .to_ascii_lowercase()
-            .contains("www-authenticate: bearer"),
-        "body rejection must challenge with Bearer"
-    );
-    let body_error = auth_admission_response_json_body(&body_rejected);
-    assert_eq!(body_error["error"], "invalid_request");
-    assert_eq!(
-        body_error["message"],
-        "HTTP credentials must use the Authorization header"
-    );
-    assert_eq!(
-        server.handler_call_snapshot(),
-        initial_calls,
-        "body credential contamination must not invoke the verifier or any handler"
-    );
+    for (location, contaminated_body) in contaminated_bodies {
+        let body_rejected = auth_admission_exchange(
+            server.address(),
+            "/mcp",
+            Some(&format!("Bearer {token}")),
+            &contaminated_body,
+        );
+        assert!(
+            body_rejected.starts_with(b"HTTP/1.1 401"),
+            "{location} credential contamination must be rejected with HTTP 401: {}",
+            String::from_utf8_lossy(&body_rejected)
+        );
+        assert!(
+            auth_admission_response_headers(&body_rejected)
+                .to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{location} rejection must challenge with Bearer"
+        );
+        let body_error = auth_admission_response_json_body(&body_rejected);
+        assert_eq!(body_error["error"], "invalid_request", "{location}");
+        assert_eq!(
+            body_error["message"], "HTTP credentials must use the Authorization header",
+            "{location}"
+        );
+        assert_eq!(
+            server.handler_call_snapshot(),
+            initial_calls,
+            "{location} credential contamination must not invoke the verifier or any handler"
+        );
+    }
 
     // 2. Query credential contamination: near-identical positive body, but adds ?access_token.
     let query_rejected = auth_admission_exchange(
