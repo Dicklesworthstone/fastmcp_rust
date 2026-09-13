@@ -32386,12 +32386,8 @@ activate = 1\n";
                     Err(()) => return false,
                 };
                 match resolution {
-                    CoreRouteResolution::CoreCrate => {
-                        let allowed_private_alias = direct_core_path && !leaf.glob && leaf.alias.as_deref() == Some("core") && !route.conditional && public_core_scope_is(&route.scope, "__private");
-                        if !allowed_private_alias {
-                            return false;
-                        }
-                    }
+                    CoreRouteResolution::CoreCrate => return false,
+                    CoreRouteResolution::CoreMember(resolved) if matches!(resolved.as_str(), "block_on" | "runtime") => return false,
                     CoreRouteResolution::CoreMember(resolved) if resolved == member => {
                         let allowed_member_route =
                             direct_core_path && !leaf.glob && leaf.alias.is_none() && !route.conditional && (route.scope.is_empty() || public_core_scope_is(&route.scope, "core"));
@@ -32438,7 +32434,7 @@ activate = 1\n";
 
     fn public_core_route_pattern(member: &str) -> String {
         format!(
-            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*#[doc(hidden)]::__private::fastmcp_core as core;forbid=absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr;resolver=semantic-ident|all-inline-modules|bounded-64|cycle-ambiguity-unresolved-external-fail-closed"
+            "root=1*fastmcp_core::{{{member}}};curated=1*core::fastmcp_core::{{{member}}};private=1*#[doc(hidden)]::__private::core{{explicit-core-members}};forbid=runtime|block_on|absolute|grouped-root|alias-target|member-alias|glob|whole-crate|extern-crate|cfg|gating-cfg-attr;resolver=semantic-ident|all-inline-modules|bounded-64|cycle-ambiguity-unresolved-external-fail-closed"
         )
     }
 
@@ -32488,12 +32484,17 @@ activate = 1\n";
                 return false;
             }
         }
+        let macro_modules = inventory.public_modules.iter().filter(|module| {
+            module.scope.len() == 2 && module.scope[0] == "__private" && module.scope[1] == "core"
+        }).collect::<Vec<_>>();
+        if macro_modules.len() != 1 || !macro_modules[0].public || !macro_modules[0].inline || macro_modules[0].conditional {
+            return false;
+        }
 
         let mut root_routes = 0usize;
         let mut curated_routes = 0usize;
         let mut exact_member_routes = 0usize;
         let mut member_references = 0usize;
-        let mut private_alias_routes = 0usize;
         for route in inventory.routes.iter().filter(|route| route.public) {
             match public_core_scope_is_publicly_reachable(&inventory, &route.scope) {
                 Ok(true) => {}
@@ -32516,13 +32517,7 @@ activate = 1\n";
             if suffix.is_empty() {
                 return false;
             }
-            if suffix.len() == 2 && token_tree_matches_atom(&suffix[0], SourceTokenAtom::Keyword("as")) && matches!(&suffix[1], TokenTree::Ident(_)) {
-                let exact_private_alias = !route.conditional && public_core_scope_is(&route.scope, "__private") && token_tree_matches_atom(&suffix[1], SourceTokenAtom::Ident("core"));
-                if !exact_private_alias {
-                    return false;
-                }
-                private_alias_routes = private_alias_routes.saturating_add(1);
-            } else if suffix.len() < 3
+            if suffix.len() < 3
                 || !source_token_is_punct(&suffix[0], ':')
                 || !source_token_is_punct(&suffix[1], ':')
                 || suffix[2..].iter().any(|tree| token_tree_ident_count(tree, "self") != 0 || source_token_tree_contains_punct(tree, '*'))
@@ -32542,7 +32537,87 @@ activate = 1\n";
             }
             member_references = member_references.saturating_add(route_member_references);
         }
-        root_routes == 1 && curated_routes == 1 && exact_member_routes == 2 && member_references == 2 && private_alias_routes == 1
+        root_routes == 1 && curated_routes == 1 && exact_member_routes == 2 && member_references == 2
+    }
+
+    #[test]
+    fn facade_macro_namespace_preserves_exact_core_routes() {
+        let source = r"
+            pub use fastmcp_core::{crypto, uri};
+            pub mod core { pub use fastmcp_core::{crypto, uri}; }
+            #[doc(hidden)]
+            pub mod __private {
+                pub mod core { pub use fastmcp_core::{McpContext, McpError, McpOutcome}; }
+            }
+        ";
+        for spelling in [source.to_owned(), source.replace("pub mod __private", "pub mod r#__private")] {
+            let tokens = TokenStream::from_str(&spelling).expect("permitted macro namespace tokenizes");
+            for member in ["crypto", "uri"] {
+                assert!(public_core_export_route_set_is_exact(&tokens, member), "explicit macro members preserve {member} ownership");
+            }
+        }
+    }
+
+    #[test]
+    fn facade_macro_namespace_rejects_runtime_authority_mutants() {
+        let source = r"
+            pub use fastmcp_core::{crypto, uri};
+            pub mod core { pub use fastmcp_core::{crypto, uri}; }
+            #[doc(hidden)]
+            pub mod __private {
+                pub mod core { pub use fastmcp_core::{McpContext, McpError, McpOutcome}; }
+            }
+        ";
+        let permitted = "pub use fastmcp_core::{McpContext, McpError, McpOutcome};";
+        for forbidden in [
+            "pub use fastmcp_core::block_on;",
+            "pub use fastmcp_core::block_on as hidden_runner;",
+            "pub use fastmcp_core::runtime;",
+            "pub use fastmcp_core::runtime as hidden_runtime;",
+            "pub use fastmcp_core::runtime::block_on;",
+            "pub use fastmcp_core as hidden_core;",
+            "pub use fastmcp_core::*;",
+        ] {
+            let mutant = source.replace(permitted, &format!("{permitted} {forbidden}"));
+            let tokens = TokenStream::from_str(&mutant).expect("runtime authority mutant tokenizes");
+            for member in ["crypto", "uri"] {
+                assert!(!public_core_export_route_set_is_exact(&tokens, member), "must reject {forbidden}");
+            }
+        }
+        let alias = source.replace(
+            "pub mod core { pub use fastmcp_core::{McpContext, McpError, McpOutcome}; }",
+            "pub use fastmcp_core as core;",
+        );
+        let tokens = TokenStream::from_str(&alias).expect("historical whole-core leak tokenizes");
+        for member in ["crypto", "uri"] {
+            assert!(!public_core_export_route_set_is_exact(&tokens, member), "historical private alias must remain rejected");
+        }
+    }
+
+    #[test]
+    fn facade_macro_namespace_current_source_has_no_runtime_authority() {
+        let source = include_str!("../src/lib.rs");
+        let tokens = TokenStream::from_str(source).expect("shipped facade source tokenizes");
+        for member in ["crypto", "uri"] {
+            assert!(public_core_export_route_set_is_exact(&tokens, member), "shipped facade must preserve exact {member} routes without runtime authority");
+        }
+        let marker = "pub mod __private {";
+        assert_eq!(source.matches(marker).count(), 1, "mutation must target the sole shipped macro namespace");
+        for forbidden in [
+            "pub use fastmcp_core::block_on;",
+            "pub use fastmcp_core::block_on as hidden_runner;",
+            "pub use fastmcp_core::runtime;",
+            "pub use fastmcp_core::runtime as hidden_runtime;",
+            "pub use fastmcp_core::runtime::block_on;",
+            "pub use fastmcp_core as hidden_core;",
+            "pub use fastmcp_core::*;",
+        ] {
+            let mutant = source.replacen(marker, &format!("{marker}\n{forbidden}"), 1);
+            let tokens = TokenStream::from_str(&mutant).expect("shipped facade mutant tokenizes");
+            for member in ["crypto", "uri"] {
+                assert!(!public_core_export_route_set_is_exact(&tokens, member), "shipped facade must reject {forbidden}");
+            }
+        }
     }
 
     fn token_tree_fingerprint(tree: &TokenTree, output: &mut String) {
@@ -32714,10 +32789,10 @@ activate = 1\n";
         let (id, reason) = match member {
             "crypto" => (
                 "FACADE-EXPORT-CRYPTO",
-                "facade exposes shared crypto through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias",
+                "facade exposes shared crypto through one exact root route and one exact curated core route while the doc-hidden macro namespace exposes explicit members without runtime authority",
             ),
             "uri" => {
-                ("FACADE-EXPORT-URI", "facade exposes shared URI through one exact root route and one exact curated core route while accounting for the sole doc-hidden macro-expansion core alias")
+                ("FACADE-EXPORT-URI", "facade exposes shared URI through one exact root route and one exact curated core route while the doc-hidden macro namespace exposes explicit members without runtime authority")
             }
             _ => ("FACADE-EXPORT-INVALID", "invalid facade integration route"),
         };
@@ -56972,7 +57047,7 @@ original = "value"
             for (label, anchor, replacement) in [
                 ("raw-crate-positive", root_module_route, "pub use r#fastmcp_core::{crypto, uri};"),
                 ("raw-module-positive", "pub mod core {", "pub mod r#core {"),
-                ("raw-private-alias-positive", "pub use fastmcp_core as core;", "pub use fastmcp_core as r#core;"),
+                ("raw-private-module-positive", "pub mod __private {", "pub mod r#__private {"),
             ] {
                 let mut planted = baseline.clone();
                 let facade = planted.rust_sources.get_mut(facade_path).expect("facade source is present for semantic raw-identifier planting");

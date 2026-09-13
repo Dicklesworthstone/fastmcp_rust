@@ -129,6 +129,19 @@
 //! use fastmcp_rust::core::runtime::block_on;
 //! # let _ = block_on(async {});
 //! ```
+//!
+//! The doc-hidden macro support route is also deliberately curated. It is not
+//! a runtime construction API for downstream consumers:
+//!
+//! ```compile_fail
+//! use fastmcp_rust::__private::core::block_on;
+//! # let _ = block_on(async {});
+//! ```
+//!
+//! ```compile_fail
+//! use fastmcp_rust::__private::core::runtime::block_on;
+//! # let _ = block_on(async {});
+//! ```
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -145,7 +158,17 @@ extern crate self as fastmcp_rust;
 /// the facade re-exports above rather than couple themselves to these names.
 #[doc(hidden)]
 pub mod __private {
-    pub use fastmcp_core as core;
+    /// The exact core vocabulary emitted by the handler macros.
+    ///
+    /// Keep this list explicit. This namespace is reachable from downstream
+    /// macro expansions, but it must not turn into a public alias for the
+    /// whole core crate (which would expose its runtime adapter and
+    /// `block_on` helper).
+    pub mod core {
+        pub use fastmcp_core::{
+            Cx, McpContext, McpError, McpOutcome, McpResult, Outcome, cancelled,
+        };
+    }
     pub use serde_json;
 
     /// Macro-expansion server vocabulary.
@@ -10620,7 +10643,74 @@ pub mod prelude {
 mod tests {
     use std::time::Duration;
 
-    use super::{RequestTimeoutPolicy, RequestTimeoutSource};
+    use super::{
+        Content, Cx, McpContext, McpResult, PromptHandler, PromptMessage, RequestTimeoutPolicy,
+        RequestTimeoutSource, ResourceHandler, ToolHandler, prompt, resource, tool,
+    };
+
+    #[tool]
+    async fn facade_private_core_generated_tool(
+        ctx: &McpContext,
+        value: String,
+    ) -> McpResult<String> {
+        asupersync::runtime::yield_now().await;
+        ctx.checkpoint()?;
+        Ok(value)
+    }
+
+    #[resource(uri = "test://facade-private-core")]
+    fn facade_private_core_generated_resource(ctx: &McpContext) -> McpResult<String> {
+        ctx.checkpoint()?;
+        Ok("resource".to_owned())
+    }
+
+    #[prompt]
+    fn facade_private_core_generated_prompt(
+        ctx: &McpContext,
+        name: String,
+    ) -> McpResult<Vec<PromptMessage>> {
+        ctx.checkpoint()?;
+        let _ = name;
+        Ok(Vec::new())
+    }
+
+    #[test]
+    fn facade_private_core_generated_resource_and_prompt_compile() {
+        let resource = FacadePrivateCoreGeneratedResourceResource;
+        let prompt = FacadePrivateCoreGeneratedPromptPrompt;
+
+        assert_eq!(resource.definition().uri, "test://facade-private-core");
+        assert_eq!(
+            prompt.definition().name,
+            "facade_private_core_generated_prompt"
+        );
+    }
+
+    #[test]
+    fn facade_private_core_generated_tool_runs_with_caller_cx() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned runtime must build");
+
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must provide Cx");
+            let context = McpContext::new(cx, 7);
+            let result = FacadePrivateCoreGeneratedTool
+                .call_async(&context, serde_json::json!({"value": "from-cx"}))
+                .await;
+
+            match result {
+                super::Outcome::Ok(contents) => {
+                    assert_eq!(contents.len(), 1);
+                    assert!(matches!(
+                        contents.as_slice(),
+                        [Content::Text { text }] if text == "from-cx"
+                    ));
+                }
+                other => panic!("generated handler did not complete successfully: {other:?}"),
+            }
+        });
+    }
 
     #[cfg(feature = "websocket-experimental")]
     use asupersync::io::AsyncWriteExt;
