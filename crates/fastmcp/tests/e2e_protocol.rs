@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 #[cfg(unix)]
 use fastmcp_core::block_on;
 use fastmcp_protocol::{LegacyContent, LegacyResourceContent};
@@ -209,6 +210,58 @@ fn spawn_thread(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
     std::thread::spawn(f)
 }
 
+/// Runs a returning server pump from a caller-owned runtime context.
+///
+/// Legacy request admission requires a runtime-backed child region, so these
+/// real client/server fixtures must not use detached testing contexts. The
+/// pump remains blocking work admitted by the caller runtime while the
+/// runtime task drives its result channel to completion.
+fn spawn_test_server_with_runtime(
+    server: fastmcp_server::Server,
+    server_transport: fastmcp_transport::memory::MemoryTransport,
+) -> JoinHandle<()> {
+    spawn_thread(move || {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("protocol test reactor must initialize"))
+            .blocking_threads(2, 64)
+            .build()
+            .expect("protocol test runtime must initialize");
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let result = runtime.block_on(async move {
+            let cx = Cx::current().expect("protocol test runtime must install its Cx");
+            let pump = cx
+                .spawn_blocking(move |pump_cx| {
+                    let result = server.run_transport_returning_with_cx(&pump_cx, server_transport);
+                    let _ = result_sender.send(result);
+                })
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            let deadline = cx.now().saturating_add_nanos(5_000_000_000);
+            loop {
+                match result_receiver.try_recv() {
+                    Ok(result) => {
+                        drop(pump);
+                        break result;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(McpError::internal_error(
+                            "protocol test server pump exited without a result",
+                        ));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(1)),
+                        )
+                        .await
+                        .map_err(|_| McpError::internal_error("protocol test server timed out"))?;
+                    }
+                }
+            }
+        });
+        result.expect("protocol test server loop");
+    })
+}
+
 /// Spawns a server with all test handlers and returns a connected TestClient.
 ///
 /// The server runs in a background thread and is cleaned up when the
@@ -229,13 +282,7 @@ fn setup_test_server_and_client() -> TestHarness {
         .prompt(CodeReviewPromptHandlerPrompt)
         .build();
 
-    // Run server in background thread
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -255,12 +302,7 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
         .auth_provider(provider)
         .build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -1136,12 +1178,7 @@ fn e2e_server_with_tools_only() {
 
     let server = builder.tool(GreetingToolHandler).build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
@@ -1164,12 +1201,7 @@ fn e2e_server_with_resources_only() {
 
     let server = builder.resource(TextFileResourceHandlerResource).build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
@@ -1190,12 +1222,7 @@ fn e2e_server_with_prompts_only() {
 
     let server = builder.prompt(GreetingPromptHandlerPrompt).build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
@@ -1216,12 +1243,7 @@ fn e2e_empty_server() {
 
     let server = builder.build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
     let init = client.initialize().unwrap();
@@ -1243,12 +1265,7 @@ fn e2e_custom_client_info() {
 
     let server = builder.tool(GreetingToolHandler).build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_test_server_with_runtime(server, server_transport);
 
     let client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");
     let mut client = TestHarness::new(client, handle);

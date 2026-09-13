@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::types::CancelReason;
 use fastmcp_rust::testing::TraceRetentionConfig;
 use fastmcp_rust::testing::prelude::*;
@@ -77,6 +78,11 @@ fn read_vm_rss_kb() -> Option<u64> {
     None
 }
 
+// This is a generous anti-hang cap for one complete stress-server fixture,
+// not a per-operation deadline or a latency target. The workflows below keep
+// their existing operation counts and latency measurements unchanged.
+const STRESS_SERVER_LIFETIME_CAP: Duration = Duration::from_secs(120);
+
 fn spawn_stress_server(
     name: &str,
 ) -> (
@@ -94,10 +100,47 @@ fn spawn_stress_server(
         .build();
 
     let server_handle = std::thread::spawn(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("stress server loop");
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("stress server reactor must initialize"))
+            .blocking_threads(2, 64)
+            .build()
+            .expect("stress server runtime must initialize");
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let result = runtime.block_on(async move {
+            let cx = Cx::current().expect("stress server runtime must install Cx");
+            let pump = cx
+                .spawn_blocking(move |pump_cx| {
+                    let result = server.run_transport_returning_with_cx(&pump_cx, server_transport);
+                    let _ = result_sender.send(result);
+                })
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            let deadline = cx.now().saturating_add_nanos(
+                u64::try_from(STRESS_SERVER_LIFETIME_CAP.as_nanos())
+                    .expect("stress server lifetime cap must fit in nanoseconds"),
+            );
+            loop {
+                match result_receiver.try_recv() {
+                    Ok(result) => {
+                        drop(pump);
+                        break result;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(McpError::internal_error(
+                            "stress server pump exited without a result",
+                        ));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                        )
+                        .await
+                        .map_err(|_| McpError::internal_error("stress server pump timed out"))?;
+                    }
+                }
+            }
+        });
+        result.expect("stress server loop");
     });
 
     (client_transport, server_handle)
@@ -122,7 +165,7 @@ fn stress_simultaneous_tool_calls_and_reads_reports_percentiles() {
     let mut handles = Vec::new();
     for client_num in 0..NUM_CLIENTS {
         let name = format!("stress-server-{client_num}");
-        let handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || -> Result<_, &'static str> {
             let (transport, server_handle) = spawn_stress_server(&name);
             let mut client = TestClient::new(transport)
                 .with_client_info(format!("stress-client-{client_num}"), "1.0.0");
@@ -132,8 +175,10 @@ fn stress_simultaneous_tool_calls_and_reads_reports_percentiles() {
 
             if client.initialize().is_err() {
                 drop(client);
-                let _ = server_handle.join();
-                return (durations_ms, OPS_PER_CLIENT * 2, OPS_PER_CLIENT * 2);
+                server_handle
+                    .join()
+                    .map_err(|_| "stress server thread panicked")?;
+                return Ok((durations_ms, OPS_PER_CLIENT * 2, OPS_PER_CLIENT * 2));
             }
 
             for op in 0..OPS_PER_CLIENT {
@@ -160,8 +205,10 @@ fn stress_simultaneous_tool_calls_and_reads_reports_percentiles() {
             }
 
             drop(client);
-            let _ = server_handle.join();
-            (durations_ms, errors, OPS_PER_CLIENT * 2)
+            server_handle
+                .join()
+                .map_err(|_| "stress server thread panicked")?;
+            Ok((durations_ms, errors, OPS_PER_CLIENT * 2))
         });
 
         handles.push(handle);
@@ -171,7 +218,9 @@ fn stress_simultaneous_tool_calls_and_reads_reports_percentiles() {
     let mut total_errors = 0usize;
     let mut total_ops = 0usize;
     for handle in handles {
-        if let Ok((mut d, errors, ops)) = handle.join() {
+        if let Ok(worker_result) = handle.join() {
+            let (mut d, errors, ops) =
+                worker_result.expect("stress server thread must exit cleanly");
             all_durations_ms.append(&mut d);
             total_errors += errors;
             total_ops += ops;
@@ -238,7 +287,7 @@ fn stress_client_cancellation_under_load_is_non_deadlocking() {
 
         let name = format!("cancel-server-{client_num}");
         let cancelled_ops_started = cancelled_ops_started.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || -> Result<_, &'static str> {
             let (transport, server_handle) = spawn_stress_server(&name);
             let mut client = TestClient::with_cx(transport, cx)
                 .with_client_info(format!("cancel-client-{client_num}"), "1.0.0");
@@ -249,8 +298,10 @@ fn stress_client_cancellation_under_load_is_non_deadlocking() {
 
             if client.initialize().is_err() {
                 drop(client);
-                let _ = server_handle.join();
-                return (ok, OPS_PER_CLIENT, client_num);
+                server_handle
+                    .join()
+                    .map_err(|_| "stress server thread panicked")?;
+                return Ok((ok, OPS_PER_CLIENT, client_num));
             }
 
             for op in 0..OPS_PER_CLIENT {
@@ -269,8 +320,10 @@ fn stress_client_cancellation_under_load_is_non_deadlocking() {
             }
 
             drop(client);
-            let _ = server_handle.join();
-            (ok, err, client_num)
+            server_handle
+                .join()
+                .map_err(|_| "stress server thread panicked")?;
+            Ok((ok, err, client_num))
         });
 
         handles.push(handle);
@@ -298,7 +351,9 @@ fn stress_client_cancellation_under_load_is_non_deadlocking() {
     let mut live_err = 0usize;
 
     for handle in handles {
-        if let Ok((ok, err, client_num)) = handle.join() {
+        if let Ok(worker_result) = handle.join() {
+            let (ok, err, client_num) =
+                worker_result.expect("stress server thread must exit cleanly");
             if client_num % 2 == 0 {
                 cancelled_ok += ok;
                 cancelled_err += err;
@@ -380,6 +435,8 @@ fn stress_large_payload_reports_rss_delta_best_effort() {
     assert!(errors == 0, "expected no errors, got {errors}");
 
     drop(client);
-    let _ = server_handle.join();
+    server_handle
+        .join()
+        .expect("stress server thread must exit cleanly");
     let _ = trace.auto_save(Some(&TraceRetentionConfig::default()));
 }

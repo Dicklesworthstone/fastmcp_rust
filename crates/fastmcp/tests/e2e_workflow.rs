@@ -188,6 +188,9 @@ fn system_prompt_handler() -> Vec<PromptMessage> {
 // ============================================================================
 
 const MEMORY_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
+/// Caps a runtime-backed fixture's whole lifetime without changing the
+/// existing two-second teardown and cancellation settlement checks.
+const MEMORY_SERVER_LIFETIME_CAP: Duration = Duration::from_secs(30);
 
 /// Owns memory-transport server threads until their paired clients close.
 ///
@@ -251,6 +254,61 @@ where
     T: Send + 'static,
 {
     std::thread::spawn(f)
+}
+
+fn spawn_runtime_server<T>(server: Server, transport: T, owner: &'static str) -> JoinHandle<()>
+where
+    T: Transport + Send + 'static,
+{
+    spawn_thread(move || {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("workflow E2E server reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("workflow E2E server runtime builds");
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("workflow E2E runtime installs an ambient Cx");
+            match cx.spawn_blocking(move |pump_cx| {
+                let result = server.run_transport_returning_with_cx(&pump_cx, transport);
+                let _ = result_tx.send(result);
+            }) {
+                Ok(_pump) => {
+                    let deadline = cx.now().saturating_add_nanos(
+                        u64::try_from(MEMORY_SERVER_LIFETIME_CAP.as_nanos())
+                            .expect("workflow E2E server bound fits in nanoseconds"),
+                    );
+                    loop {
+                        match result_rx.try_recv() {
+                            Ok(result) => {
+                                result.unwrap_or_else(|error| panic!("{owner}: {error}"));
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                panic!("{owner}: server exited without reporting its result")
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
+                                if asupersync::time::timeout_at(
+                                    deadline,
+                                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    panic!("{owner}: server did not settle within its bound")
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => panic!("{owner}: server runtime admission failed: {error}"),
+            }
+        });
+    })
 }
 
 struct WorkerStage {
@@ -492,12 +550,7 @@ fn setup_workflow_server() -> TestHarness {
         .prompt(SystemPromptHandlerPrompt)
         .build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("workflow server loop");
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -592,10 +645,85 @@ struct LifecycleThreadHarness {
     peer: Option<fastmcp_rust::memory::MemoryTransport>,
     joins: ThreadJoins,
     outcome: mpsc::Receiver<McpResult<()>>,
+    controller_cx: Cx,
 }
 
 impl LifecycleThreadHarness {
-    fn spawn<F>(cx: &Cx, runner: F) -> Self
+    fn spawn<F>(runner: F) -> Self
+    where
+        F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+    {
+        let (peer, server_transport) = fastmcp_rust::memory::create_memory_transport_pair();
+        let (outcome_tx, outcome) = mpsc::channel();
+        let (controller_cx_tx, controller_cx_rx) = mpsc::sync_channel(1);
+        let handle = spawn_thread(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("lifecycle E2E server reactor initializes"),
+                )
+                .blocking_threads(4, 64)
+                .build()
+                .expect("lifecycle E2E server runtime builds");
+            let (pump_done_tx, pump_done_rx) = mpsc::sync_channel(1);
+
+            runtime.block_on(async move {
+                let runtime_cx =
+                    Cx::current().expect("lifecycle E2E runtime installs an ambient Cx");
+                let admission_tx = controller_cx_tx.clone();
+                let outcome_tx = outcome_tx.clone();
+                let admission = runtime_cx.spawn_blocking(move |pump_cx| {
+                    let _ = admission_tx.send(Ok(pump_cx.clone()));
+                    let result = runner(&pump_cx, server_transport);
+                    // This must be unbounded: an assertion can unwind before
+                    // it observes the result, and the worker must still be
+                    // able to exit so the RAII join guard can settle it.
+                    let _ = outcome_tx.send(result);
+                    let _ = pump_done_tx.send(());
+                });
+                if let Err(error) = admission {
+                    let _ = controller_cx_tx.send(Err(error.to_string()));
+                    panic!("lifecycle E2E server runtime admission failed: {error}");
+                }
+
+                let deadline = runtime_cx.now().saturating_add_nanos(
+                    u64::try_from(MEMORY_SERVER_LIFETIME_CAP.as_nanos())
+                        .expect("lifecycle E2E server bound fits in nanoseconds"),
+                );
+                loop {
+                    match pump_done_rx.try_recv() {
+                        Ok(()) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            panic!("lifecycle E2E server exited without reporting completion")
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if asupersync::time::timeout_at(
+                                deadline,
+                                asupersync::time::sleep(runtime_cx.now(), Duration::from_millis(1)),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                panic!("lifecycle E2E server did not settle within its bound")
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let controller_cx = controller_cx_rx
+            .recv()
+            .unwrap_or_else(|error| panic!("lifecycle E2E server did not publish its Cx: {error}"))
+            .unwrap_or_else(|error| panic!("lifecycle E2E server admission failed: {error}"));
+        Self {
+            peer: Some(peer),
+            joins: ThreadJoins::new(vec![handle]),
+            outcome,
+            controller_cx,
+        }
+    }
+
+    fn spawn_detached<F>(cx: &Cx, runner: F) -> Self
     where
         F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
     {
@@ -612,7 +740,12 @@ impl LifecycleThreadHarness {
             peer: Some(peer),
             joins: ThreadJoins::new(vec![handle]),
             outcome,
+            controller_cx: cx.clone(),
         }
+    }
+
+    fn controller_cx(&self) -> Cx {
+        self.controller_cx.clone()
     }
 
     fn peer_mut(&mut self) -> &mut fastmcp_rust::memory::MemoryTransport {
@@ -684,8 +817,8 @@ fn assert_live_facade_era_admission<F>(
 ) where
     F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
 {
-    let cx = Cx::for_testing();
-    let mut harness = LifecycleThreadHarness::spawn(&cx, runner);
+    let mut harness = LifecycleThreadHarness::spawn(runner);
+    let cx = harness.controller_cx();
 
     assert_lifecycle_opening(
         harness.peer_mut(),
@@ -771,8 +904,8 @@ fn assert_live_facade_cancellation<F>(
 ) where
     F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
 {
-    let cx = Cx::for_testing();
-    let mut harness = LifecycleThreadHarness::spawn(&cx, runner);
+    let mut harness = LifecycleThreadHarness::spawn(runner);
+    let cx = harness.controller_cx();
 
     assert_lifecycle_opening(
         harness.peer_mut(),
@@ -1206,12 +1339,7 @@ fn workflow_two_independent_servers() {
         .with_name("server-a")
         .build_server_builder();
     let server_a = builder_a.tool(EchoTool).build();
-    let handle_a = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server_a
-            .run_transport_returning_with_cx(&cx, server_a_transport)
-            .expect("server A loop");
-    });
+    let handle_a = spawn_runtime_server(server_a, server_a_transport, "server A loop");
     server_joins.push(handle_a);
 
     // Server B: resources only
@@ -1219,12 +1347,7 @@ fn workflow_two_independent_servers() {
         .with_name("server-b")
         .build_server_builder();
     let server_b = builder_b.resource(StatusResource).build();
-    let handle_b = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server_b
-            .run_transport_returning_with_cx(&cx, server_b_transport)
-            .expect("server B loop");
-    });
+    let handle_b = spawn_runtime_server(server_b, server_b_transport, "server B loop");
     server_joins.push(handle_b);
 
     // Client A
@@ -1362,12 +1485,7 @@ fn workflow_server_name_and_version() {
         .build_server_builder();
 
     let server = builder.tool(EchoTool).build();
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("workflow server loop");
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -1383,12 +1501,7 @@ fn workflow_capabilities_match_handlers() {
         TestServer::builder().build_server_builder();
 
     let server = builder.tool(EchoTool).resource(StatusResource).build();
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("workflow server loop");
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -1410,12 +1523,7 @@ fn workflow_custom_client_info_accepted() {
         TestServer::builder().build_server_builder();
 
     let server = builder.tool(EchoTool).build();
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("workflow server loop");
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client =
@@ -3132,7 +3240,7 @@ fn workflow_exact_legacy_facade_rejects_final_tasks_without_mutation() {
     let cx = Cx::for_testing();
     let calls = Arc::new(AtomicUsize::new(0));
     let handler_calls = Arc::clone(&calls);
-    let mut harness = LifecycleThreadHarness::spawn(&cx, move |cx, transport| {
+    let mut harness = LifecycleThreadHarness::spawn_detached(&cx, move |cx, transport| {
         legacy_2024::server_builder("legacy-tasks-isolation", "1.0.0")
             .tool(LegacyTasksIsolationTool {
                 calls: handler_calls,
@@ -3772,12 +3880,11 @@ fn workflow_concurrent_clients_isolation() {
             .build();
 
         // Spawn server thread
-        let handle = spawn_thread(move || {
-            let cx = Cx::for_testing();
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("server transport loop settles cleanly");
-        });
+        let handle = spawn_runtime_server(
+            server,
+            server_transport,
+            "server transport loop settles cleanly",
+        );
         server_joins.push(handle);
 
         let client = TestClient::new(client_transport)
@@ -3857,12 +3964,11 @@ fn workflow_concurrent_interleaved_operations() {
                 .tool(EchoTool)
                 .build();
 
-            let server_handle = spawn_thread(move || {
-                let cx = Cx::for_testing();
-                server
-                    .run_transport_returning_with_cx(&cx, server_transport)
-                    .expect("server transport loop settles cleanly");
-            });
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing())
@@ -3935,12 +4041,11 @@ fn workflow_concurrent_no_crosstalk() {
                 .tool(SessionGetHandler)
                 .build();
 
-            let server_handle = spawn_thread(move || {
-                let cx = Cx::for_testing();
-                server
-                    .run_transport_returning_with_cx(&cx, server_transport)
-                    .expect("server transport loop settles cleanly");
-            });
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
@@ -4009,12 +4114,11 @@ fn workflow_concurrent_session_state_persistence() {
         .tool(SessionGetHandler)
         .build();
 
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -4087,12 +4191,11 @@ fn workflow_concurrent_stress_test() {
                 .tool(SessionGetHandler)
                 .build();
 
-            let server_handle = spawn_thread(move || {
-                let cx = Cx::for_testing();
-                server
-                    .run_transport_returning_with_cx(&cx, server_transport)
-                    .expect("server transport loop settles cleanly");
-            });
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
             server_join.push(server_handle);
 
             let mut client = TestClient::with_cx(client_transport, Cx::for_testing());
@@ -4178,12 +4281,11 @@ fn session_capabilities_reflect_server_handlers() {
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     server_joins.push(server_handle);
 
     // Server with only resources
@@ -4191,12 +4293,11 @@ fn session_capabilities_reflect_server_handlers() {
     let server2 = Server::new("resources-only", "1.0.0")
         .resource(StatusResource)
         .build();
-    let server_handle2 = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server2
-            .run_transport_returning_with_cx(&cx, server_transport2)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle2 = spawn_runtime_server(
+        server2,
+        server_transport2,
+        "server transport loop settles cleanly",
+    );
     server_joins.push(server_handle2);
 
     // Server with only prompts
@@ -4204,12 +4305,11 @@ fn session_capabilities_reflect_server_handlers() {
     let server3 = Server::new("prompts-only", "1.0.0")
         .prompt(HelpPromptPrompt)
         .build();
-    let server_handle3 = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server3
-            .run_transport_returning_with_cx(&cx, server_transport3)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle3 = spawn_runtime_server(
+        server3,
+        server_transport3,
+        "server transport loop settles cleanly",
+    );
     server_joins.push(server_handle3);
 
     let mut client = TestClient::new(client_transport);
@@ -4256,12 +4356,11 @@ fn session_operations_fail_before_init() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test-server", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -4284,12 +4383,11 @@ fn session_close_graceful() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("close-test", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -4328,19 +4426,17 @@ fn session_state_isolated_per_client() {
         .tool(SessionGetHandler)
         .build();
 
-    let server_a_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server_a
-            .run_transport_returning_with_cx(&cx, server_a_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_a_handle = spawn_runtime_server(
+        server_a,
+        server_a_transport,
+        "server transport loop settles cleanly",
+    );
     server_joins.push(server_a_handle);
-    let server_b_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server_b
-            .run_transport_returning_with_cx(&cx, server_b_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_b_handle = spawn_runtime_server(
+        server_b,
+        server_b_transport,
+        "server transport loop settles cleanly",
+    );
     server_joins.push(server_b_handle);
 
     let mut client_a = TestClient::new(client_a_transport);
@@ -4419,12 +4515,11 @@ fn session_tracks_client_info() {
     let server = Server::new("client-info-test", "1.0.0")
         .tool(EchoTool)
         .build();
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client =
@@ -4456,12 +4551,7 @@ fn session_multiple_clients_independent_lifecycle() {
         let server = Server::new(&format!("lifecycle-server-{}", i), "1.0.0")
             .tool(EchoTool)
             .build();
-        let handle = spawn_thread(move || {
-            let cx = Cx::for_testing();
-            server
-                .run_transport_returning_with_cx(&cx, server_transport)
-                .expect("lifecycle server loop");
-        });
+        let handle = spawn_runtime_server(server, server_transport, "lifecycle server loop");
         server_joins.push(handle);
 
         let client = TestClient::new(client_transport)
@@ -4506,12 +4596,7 @@ fn session_state_persists_across_operations() {
         .tool(SessionGetHandler)
         .tool(EchoTool)
         .build();
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("persistence server loop");
-    });
+    let handle = spawn_runtime_server(server, server_transport, "persistence server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -4698,12 +4783,11 @@ fn setup_tool_test_server() -> TestHarness {
         .tool(FailOnDemandTool)
         .build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -5329,12 +5413,11 @@ fn setup_resource_test_server() -> TestHarness {
         .resource(FailingResResource)
         .build();
 
-    let handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -5583,12 +5666,11 @@ fn resource_read_before_init_fails() {
     let server = Server::new("test", "1.0.0")
         .resource(PlainTextResource)
         .build();
-    let server_handle = spawn_thread(move || {
-        let cx = Cx::for_testing();
-        server
-            .run_transport_returning_with_cx(&cx, server_transport)
-            .expect("server transport loop settles cleanly");
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);

@@ -500,6 +500,8 @@ use asupersync::bytes::BytesMut;
 #[cfg(any(feature = "legacy-2024-11-05", feature = "websocket", test))]
 use asupersync::channel::mpsc as asupersync_mpsc;
 use asupersync::codec::{Decoder, Encoder, Framed};
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+use asupersync::cx::ChildRegionSpec;
 use asupersync::http::h1::{
     Http1Codec, HttpError as Http1DecodeError, Method as Http1Method, Response as Http1Response,
 };
@@ -1469,6 +1471,22 @@ struct LiveLegacy2024RuntimeHandler<'a> {
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
+fn combine_legacy_dispatch_and_close<T>(
+    dispatch: Result<T, Legacy2024HandlerError>,
+    close: Result<(), Legacy2024HandlerError>,
+) -> Result<T, Legacy2024HandlerError> {
+    match (dispatch, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(dispatch_error), Ok(())) => Err(dispatch_error),
+        (Ok(_), Err(close_error)) => Err(close_error),
+        (Err(dispatch_error), Err(close_error)) => Err(Legacy2024HandlerError::with_code(
+            dispatch_error.code().clone(),
+            format!("{}; {}", dispatch_error.message(), close_error.message()),
+        )),
+    }
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
     fn handle_legacy_2024(
         &mut self,
@@ -1503,10 +1521,25 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                 .as_ref()
                 .and_then(|queue| queue.admitted_request_cancellation(&request_id));
             let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
+            // Exact-2024 custom transports are intentionally serial at the
+            // wire boundary, but each admitted request still needs its own
+            // structured cancellation owner. Without this child region the
+            // active-request registry records the caller/pump region for
+            // every request, so request shutdown and sibling reuse share one
+            // ownership domain.
+            let request_budget = self.server.create_request_budget(&self.cx);
+            let request_region = self
+                .cx
+                .open_child_region(ChildRegionSpec::inherit().with_budget(request_budget))
+                .await
+                .map_err(|_| {
+                    Legacy2024HandlerError::new("legacy request region could not be opened")
+                })?;
+            let request_cx = request_region.cx().clone();
             let dispatch = self
                 .server
                 .dispatch_legacy_2024(
-                    &self.cx,
+                    &request_cx,
                     self.session_id,
                     &self.session_principal,
                     Some(&self.runtime),
@@ -1518,7 +1551,12 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                 .await
                 .map_err(|error| {
                     legacy_handler_error_from_mcp(error, self.server.mask_error_details)
-                })?;
+                });
+            let close_result = request_region
+                .close()
+                .await
+                .map_err(|_| Legacy2024HandlerError::new("legacy request region close failed"));
+            let dispatch = combine_legacy_dispatch_and_close(dispatch, close_result)?;
             let LiveLegacy2024Dispatch {
                 result,
                 active_request,
@@ -30532,58 +30570,119 @@ mod lib_unit_tests {
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let shutdown_observer = Arc::clone(&shutdown_called);
 
-        let exit_code = Server::new("bounded-legacy-worker-shutdown-test", "1.0.0")
+        let server = Server::new("bounded-legacy-worker-shutdown-test", "1.0.0")
             .protocol_policy(ProtocolPolicy::Auto)
             .expect("Auto must be available to this test build")
             .tool(NonQuiescentLegacyTool {
                 control: Arc::clone(&control),
             })
             .on_shutdown(move || shutdown_observer.store(true, Ordering::Release))
+            .build();
+        // The legacy dispatch worker also requires the caller-owned runtime
+        // to admit its request child. A detached testing Cx rejects admission
+        // before the deliberately non-cooperative handler can start.
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("stdio pump reactor must initialize"))
+            .blocking_threads(4, MAX_DISPATCH_QUEUE_DEPTH)
             .build()
-            .run_loop_pump(
-                &Cx::for_testing(),
-                move |_receive_cx, _worker_failed| match phase_for_receive
-                    .fetch_add(1, Ordering::AcqRel)
-                {
-                    0 => Ok(exact_legacy_initialize_request(
-                        705,
-                        serde_json::json!("1.0.0"),
-                    )),
-                    1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
-                        "notifications/initialized",
+            .expect("stdio pump runtime must initialize");
+        let (sender, receiver) = sync_channel(1);
+        runtime
+            .handle()
+            .try_spawn_with_cx(move |cx| async move {
+                let dispatch_cx = cx.clone();
+                let pump_sender = sender.clone();
+                if let Err(error) = cx.spawn_blocking(move |pump_cx| {
+                    let code = Arc::new(server).run_loop_pump_with_policy(
+                        &pump_cx,
+                        &dispatch_cx,
+                        move |_receive_cx, _worker_failed| match phase_for_receive
+                            .fetch_add(1, Ordering::AcqRel)
+                        {
+                            0 => Ok(exact_legacy_initialize_request(
+                                705,
+                                serde_json::json!("1.0.0"),
+                            )),
+                            1 => Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            ))),
+                            2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "tools/call",
+                                Some(serde_json::json!({
+                                    "name": "non_quiescent_legacy_tool",
+                                    "arguments": {},
+                                })),
+                                706_i64,
+                            ))),
+                            3 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
+                                Err(TransportError::Closed)
+                            }
+                            3 => Err(TransportError::Timeout),
+                            _ => Err(TransportError::Closed),
+                        },
+                        move |_send_cx, _message| Ok(()),
+                        Arc::new(|_| {}),
+                        "stdio-test",
+                        true,
                         None,
-                    ))),
-                    2 => Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
-                        "tools/call",
-                        Some(serde_json::json!({
-                            "name": "non_quiescent_legacy_tool",
-                            "arguments": {},
-                        })),
-                        706_i64,
-                    ))),
-                    3 if control_for_receive.wait_for_started(Duration::from_secs(2)) => {
-                        Err(TransportError::Closed)
+                        true,
+                        true,
+                        None,
+                        None,
+                        None,
+                        PumpIoMode::Split,
+                    );
+                    let _ = pump_sender.send(Ok(code));
+                }) {
+                    let _ = sender.send(Err(format!("stdio pump admission failed: {error}")));
+                }
+            })
+            .expect("stdio pump task must be admitted");
+        // The pump waits through bounded worker-shutdown windows before
+        // detaching the non-quiescent legacy worker; poll its result without
+        // joining the task while the handler is intentionally parked.
+        let pump_result: Result<Result<i32, String>, String> = runtime.block_on(async {
+            let cx = Cx::current().expect("the test runtime installs an ambient Cx");
+            let deadline = cx.now().saturating_add_nanos(30_000_000_000);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => break Ok(result),
+                    Err(TryRecvError::Disconnected) => {
+                        break Err("stdio pump task exited without reporting its result".to_owned());
                     }
-                    3 => Err(TransportError::Timeout),
-                    _ => Err(TransportError::Closed),
-                },
-                move |_send_cx, _message| Ok(()),
-                Arc::new(|_| {}),
-                "stdio-test",
-            );
+                    Err(TryRecvError::Empty) => {
+                        if asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(5)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break Err("stdio pump did not settle within its bound".to_owned());
+                        }
+                    }
+                }
+            }
+        });
+
+        // Capture observations before releasing the parked legacy handler so
+        // an assertion failure cannot strand the worker during runtime drop.
+        let started = control.has_started();
+        let finished_before_release = control.has_finished();
+        let shutdown_before_release = shutdown_called.load(Ordering::Acquire);
+        control.release();
+        let finished_after_release = control.wait_for_finished(Duration::from_secs(2));
+
+        let exit_code = pump_result
+            .expect("stdio pump must report a result")
+            .expect("stdio pump must complete");
 
         assert_eq!(exit_code, 1);
-        assert!(control.has_started());
-        assert!(
-            !control.has_finished(),
-            "the process-style pump must return before a non-cooperative legacy handler releases"
-        );
-        assert!(!shutdown_called.load(Ordering::Acquire));
-        control.release();
-        assert!(
-            control.wait_for_finished(Duration::from_secs(2)),
-            "the detached process-style worker must finish after the test releases it"
-        );
+        assert!(started);
+        assert!(!finished_before_release);
+        assert!(!shutdown_before_release);
+        assert!(finished_after_release);
     }
 
     #[test]
@@ -33302,31 +33401,30 @@ mod lib_unit_tests {
                     serde_json::json!({"progressToken": "legacy-stdio-progress"}),
                 );
         }
-        Server::new("legacy-stdio-progress", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .tool(LiveLegacyRuntimeConnectionTool)
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(711, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "tools/call",
-                            Some(params),
-                            712_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls,
-                },
-            )
-            .expect("public stdio transport must complete the legacy progress script");
+        run_returning_transport_with_test_runtime(
+            Server::new("legacy-stdio-progress", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(711, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(params),
+                        712_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls,
+            },
+        )
+        .expect("public stdio transport must complete the legacy progress script");
         sent.lock()
             .expect("legacy stdio sent-message mutex must not be poisoned")
             .clone()
@@ -35073,28 +35171,27 @@ mod lib_unit_tests {
         // Finite transport fixture; all parsing, lifecycle admission,
         // middleware, request-owned handler execution, and result validation
         // use the actual returning server entry point.
-        builder
-            .protocol_policy(ProtocolPolicy::LegacyOnly)
-            .expect("legacy test profile")
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
-                        call(40_i64),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        call(42_i64),
-                        JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 43_i64)),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::new(AtomicUsize::new(0)),
-                },
-            )
-            .expect("finite legacy transport closes cleanly");
+        run_returning_transport_with_test_runtime(
+            builder
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("legacy test profile")
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
+                    call(40_i64),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    call(42_i64),
+                    JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 43_i64)),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("finite legacy transport closes cleanly");
         let messages = sent.lock().expect("captured server responses").clone();
         let response = |id: i64| {
             messages
@@ -35307,34 +35404,33 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let receive_calls = Arc::new(AtomicUsize::new(0));
 
-        Server::new("live-legacy-runtime", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .tool(LiveRuntimeListedTool)
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "tools/call",
-                            Some(serde_json::json!({
-                                "name": "live_runtime_listed_tool",
-                                "arguments": {},
-                            })),
-                            42_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::clone(&receive_calls),
-                },
-            )
-            .expect("an exact legacy lifecycle must complete through the live adapter");
+        run_returning_transport_with_test_runtime(
+            Server::new("live-legacy-runtime", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .tool(LiveRuntimeListedTool)
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(41, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_runtime_listed_tool",
+                            "arguments": {},
+                        })),
+                        42_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::clone(&receive_calls),
+            },
+        )
+        .expect("an exact legacy lifecycle must complete through the live adapter");
 
         assert_eq!(receive_calls.load(Ordering::Acquire), 4);
         let sent = sent
@@ -35376,33 +35472,32 @@ mod lib_unit_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let receive_calls = Arc::new(AtomicUsize::new(0));
 
-        Server::new("legacy-invalid-cancellation", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(71, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/cancelled",
-                            Some(serde_json::json!({
-                                "requestId": 72,
-                                "unexpected": true,
-                            })),
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 72_i64)),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::clone(&receive_calls),
-                },
-            )
-            .expect("an invalid cancellation must leave the legacy connection usable");
+        run_returning_transport_with_test_runtime(
+            Server::new("legacy-invalid-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(71, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": 72,
+                            "unexpected": true,
+                        })),
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 72_i64)),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::clone(&receive_calls),
+            },
+        )
+        .expect("an invalid cancellation must leave the legacy connection usable");
 
         assert_eq!(receive_calls.load(Ordering::Acquire), 5);
         let sent = sent
@@ -35838,42 +35933,41 @@ mod lib_unit_tests {
     fn live_runtime_rejects_only_non_object_legacy_tool_arguments_without_advancing_lifecycle() {
         let sent = Arc::new(Mutex::new(Vec::new()));
 
-        Server::new("live-legacy-runtime-negative", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .tool(LiveRuntimeListedTool)
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(51, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "tools/call",
-                            Some(serde_json::json!({
-                                "name": "live_runtime_listed_tool",
-                                "arguments": [],
-                            })),
-                            52_i64,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "tools/call",
-                            Some(serde_json::json!({
-                                "name": "live_runtime_listed_tool",
-                                "arguments": {},
-                            })),
-                            53_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::new(AtomicUsize::new(0)),
-                },
-            )
-            .expect("only the changed invalid arguments field must be rejected");
+        run_returning_transport_with_test_runtime(
+            Server::new("live-legacy-runtime-negative", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .tool(LiveRuntimeListedTool)
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(51, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_runtime_listed_tool",
+                            "arguments": [],
+                        })),
+                        52_i64,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_runtime_listed_tool",
+                            "arguments": {},
+                        })),
+                        53_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("only the changed invalid arguments field must be rejected");
 
         let sent = sent
             .lock()
@@ -35924,34 +36018,33 @@ mod lib_unit_tests {
     fn live_runtime_routes_exact_legacy_completion_through_the_legacy_router_surface() {
         let sent = Arc::new(Mutex::new(Vec::new()));
 
-        Server::new("live-legacy-completion", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .completion_handler(LiveLegacyCompletionHandler)
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(61, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "completion/complete",
-                            Some(serde_json::json!({
-                                "ref": {"type": "ref/prompt", "name": "deploy"},
-                                "argument": {"name": "environment", "value": "sta"},
-                            })),
-                            62_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::new(AtomicUsize::new(0)),
-                },
-            )
-            .expect("the live exact legacy completion route must return its legacy result");
+        run_returning_transport_with_test_runtime(
+            Server::new("live-legacy-completion", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .completion_handler(LiveLegacyCompletionHandler)
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(61, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "completion/complete",
+                        Some(serde_json::json!({
+                            "ref": {"type": "ref/prompt", "name": "deploy"},
+                            "argument": {"name": "environment", "value": "sta"},
+                        })),
+                        62_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("the live exact legacy completion route must return its legacy result");
 
         let sent = sent
             .lock()
@@ -35991,37 +36084,36 @@ mod lib_unit_tests {
             "argument": {"name": "environment", "value": "sta"},
         });
 
-        Server::new("live-legacy-completion-id", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .completion_handler(CountingLegacyCompletionHandler {
-                calls: Arc::clone(&calls),
-            })
-            .build()
-            .run_transport_returning_with_cx(
-                &Cx::for_testing(),
-                ProtocolPolicyScriptTransport {
-                    inbound: std::collections::VecDeque::from([
-                        exact_legacy_initialize_request(63, serde_json::json!("1.0.0")),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "notifications/initialized",
-                            None,
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::notification(
-                            "completion/complete",
-                            Some(completion_params.clone()),
-                        )),
-                        JsonRpcMessage::Request(JsonRpcRequest::new(
-                            "completion/complete",
-                            Some(completion_params),
-                            64_i64,
-                        )),
-                    ]),
-                    sent: Arc::clone(&sent),
-                    receive_calls: Arc::new(AtomicUsize::new(0)),
-                },
-            )
-            .expect("the rejected notification must leave the valid request executable");
+        run_returning_transport_with_test_runtime(
+            Server::new("live-legacy-completion-id", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .completion_handler(CountingLegacyCompletionHandler {
+                    calls: Arc::clone(&calls),
+                })
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(63, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "completion/complete",
+                        Some(completion_params.clone()),
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "completion/complete",
+                        Some(completion_params),
+                        64_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("the rejected notification must leave the valid request executable");
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         let sent = sent
@@ -44836,53 +44928,32 @@ mod lib_unit_tests {
     }
 
     fn run_live_legacy_active_cancellation(application_content: bool) {
-        let cx = Cx::for_testing();
-        let worker_cx = cx.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            live_legacy_active_cancellation_probe(application_content, &worker_cx);
-            done_tx.send(()).expect("cancellation completion observer");
-        });
-        match done_rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(()) => worker.join().expect("cancellation probe completes"),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                worker.join().expect("cancellation probe must not panic");
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                cx.set_cancel_requested(true);
-                let cleanup = done_rx.recv_timeout(Duration::from_secs(5));
-                panic!("legacy cancellation probe exceeded 20 seconds; cleanup={cleanup:?}");
-            }
-        }
-    }
-
-    fn live_legacy_active_cancellation_probe(application_content: bool, cx: &Cx) {
         let started = Arc::new(AtomicBool::new(false));
         let observed_cancellation = Arc::new(AtomicBool::new(false));
         let responses = Arc::new(LiveModernResponses::default());
 
-        Server::new("live-legacy-cancellation", "1.0.0")
-            .legacy_application_tool_content(application_content)
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .tool(LiveLegacyCancellationTool {
-                started: Arc::clone(&started),
-                observed_cancellation: Arc::clone(&observed_cancellation),
-            })
-            .build()
-            .run_split_transport_returning_with_cx(
-                cx,
-                LiveLegacyActiveCancellationRecv {
-                    phase: 0,
+        run_live_split_transport(
+            Duration::from_secs(20),
+            Server::new("live-legacy-cancellation", "1.0.0")
+                .legacy_application_tool_content(application_content)
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .tool(LiveLegacyCancellationTool {
                     started: Arc::clone(&started),
                     observed_cancellation: Arc::clone(&observed_cancellation),
-                    responses: Arc::clone(&responses),
-                },
-                LiveModernSplitSend {
-                    responses: Arc::clone(&responses),
-                },
-            )
-            .expect("accepted active cancellation must close the public transport cleanly");
+                })
+                .build(),
+            LiveLegacyActiveCancellationRecv {
+                phase: 0,
+                started: Arc::clone(&started),
+                observed_cancellation: Arc::clone(&observed_cancellation),
+                responses: Arc::clone(&responses),
+            },
+            LiveModernSplitSend {
+                responses: Arc::clone(&responses),
+            },
+        )
+        .expect("accepted active cancellation must close the public transport cleanly");
 
         assert!(observed_cancellation.load(Ordering::Acquire));
         assert_eq!(responses.response_count(71), 1);
@@ -45011,29 +45082,30 @@ mod lib_unit_tests {
         let initialize_send_started = Arc::new(BoundedTestSignal::default());
         let initialize_send_release = Arc::new(BoundedTestSignal::default());
 
-        let result = Server::new("live-legacy-queued-cancellation", "1.0.0")
-            .protocol_policy(ProtocolPolicy::Auto)
-            .expect("Auto must be available to this test build")
-            .tool(LiveModernControlledTool {
-                control: Arc::clone(&control),
-            })
-            .build()
-            .run_split_transport_returning_with_cx(
-                &Cx::for_testing(),
-                LiveLegacyQueuedCancellationRecv {
-                    phase: 0,
-                    cancelled_request_id,
-                    initialize_send_started: Arc::clone(&initialize_send_started),
-                    initialize_send_release: Arc::clone(&initialize_send_release),
+        let result = run_live_split_transport(
+            Duration::from_secs(20),
+            Server::new("live-legacy-queued-cancellation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto must be available to this test build")
+                .tool(LiveModernControlledTool {
                     control: Arc::clone(&control),
-                    responses: Arc::clone(&responses),
-                },
-                LiveLegacyFirstQueuedSend {
-                    initialize_send_started,
-                    initialize_send_release,
-                    responses: Arc::clone(&responses),
-                },
-            );
+                })
+                .build(),
+            LiveLegacyQueuedCancellationRecv {
+                phase: 0,
+                cancelled_request_id,
+                initialize_send_started: Arc::clone(&initialize_send_started),
+                initialize_send_release: Arc::clone(&initialize_send_release),
+                control: Arc::clone(&control),
+                responses: Arc::clone(&responses),
+            },
+            LiveLegacyFirstQueuedSend {
+                initialize_send_started,
+                initialize_send_release,
+                responses: Arc::clone(&responses),
+            },
+        )
+        .map_err(McpError::internal_error);
 
         (result, control, responses)
     }
@@ -45793,6 +45865,251 @@ mod lib_unit_tests {
         assert_eq!(data["run"]["data"]["kind"], "timeout");
         assert_eq!(data["close"]["data"]["stage"], "close");
         assert_eq!(data["close"]["data"]["kind"], "io");
+    }
+
+    #[test]
+    fn legacy_request_dispatch_and_region_close_retain_simultaneous_failures() {
+        let combined = combine_legacy_dispatch_and_close::<()>(
+            Err(Legacy2024HandlerError::new("dispatch failed")),
+            Err(Legacy2024HandlerError::new("region close failed")),
+        )
+        .expect_err("both request failures must remain observable");
+
+        assert_eq!(combined.code().as_i32(), Some(-32603));
+        assert!(combined.message().contains("dispatch failed"));
+        assert!(combined.message().contains("region close failed"));
+    }
+
+    struct LegacyReturningOwnershipTool {
+        regions: Arc<Mutex<Vec<RegionId>>>,
+        cancel_first: bool,
+    }
+
+    impl ToolHandler for LegacyReturningOwnershipTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "legacy_returning_ownership_tool".to_owned(),
+                description: Some("Records exact legacy request ownership".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.regions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ctx.cx().region_id());
+            if self.cancel_first && ctx.request_id() == 201 {
+                // Ambient request-region cancellation remains response-bearing;
+                // explicit request-token cancellation is reserved for accepted
+                // peer cancellation and intentionally suppresses its response.
+                ctx.cx().cancel_with(
+                    CancelKind::User,
+                    Some("legacy request ambient cancellation fixture"),
+                );
+                return Err(McpError::request_cancelled());
+            }
+            Ok(vec![Content::text(format!(
+                "legacy-request-{}",
+                ctx.request_id()
+            ))])
+        }
+    }
+
+    fn run_returning_transport_with_test_runtime<T>(server: Server, transport: T) -> McpResult<()>
+    where
+        T: Transport + Send + 'static,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("legacy returning test reactor must initialize"))
+            .blocking_threads(2, MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("legacy returning test runtime must initialize");
+        let (result_sender, result_receiver) = sync_channel(1);
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("legacy returning test runtime must install Cx");
+            let pump = cx
+                .spawn_blocking(move |pump_cx| {
+                    let result = server.run_transport_returning_with_cx(&pump_cx, transport);
+                    let _ = result_sender.send(result);
+                })
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            let deadline = cx.now().saturating_add_nanos(2_000_000_000);
+            loop {
+                match result_receiver.try_recv() {
+                    Ok(result) => {
+                        drop(pump);
+                        break result;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err(McpError::internal_error(
+                            "legacy returning test pump exited without a result",
+                        ));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        asupersync::time::timeout_at(
+                            deadline,
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                        )
+                        .await
+                        .map_err(|_| McpError::internal_error("legacy returning test timed out"))?;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Exact acceptance ID: successful legacy request completion followed by
+    /// sibling reuse on the same caller-owned custom connection.
+    #[test]
+    fn fnd_04_b_positive() {
+        let regions = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        run_returning_transport_with_test_runtime(
+            Server::new("fnd-04-b-positive", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly must be available to this test build")
+                .tool(LegacyReturningOwnershipTool {
+                    regions: Arc::clone(&regions),
+                    cancel_first: false,
+                })
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(100, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "legacy_returning_ownership_tool",
+                            "arguments": {},
+                        })),
+                        101_i64,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "legacy_returning_ownership_tool",
+                            "arguments": {},
+                        })),
+                        102_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("legacy custom returning script must complete");
+
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in [100_i64, 101, 102] {
+            assert_eq!(
+                sent.iter()
+                    .filter(|message| matches!(message, JsonRpcMessage::Response(response) if response.id == Some(id.into())))
+                    .count(),
+                1,
+                "legacy response {id} must be committed exactly once"
+            );
+        }
+        let regions = regions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(regions.len(), 2);
+        assert_ne!(
+            regions[0], regions[1],
+            "sibling requests need distinct child regions"
+        );
+    }
+
+    /// Exact acceptance ID: near-identical cancellation/EOF case retaining
+    /// sibling completion and both dispatch/close diagnostics.
+    #[test]
+    fn fnd_04_b_planted_negative() {
+        let regions = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        run_returning_transport_with_test_runtime(
+            Server::new("fnd-04-b-planted-negative", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly must be available to this test build")
+                .tool(LegacyReturningOwnershipTool {
+                    regions: Arc::clone(&regions),
+                    cancel_first: true,
+                })
+                .build(),
+            ProtocolPolicyScriptTransport {
+                inbound: std::collections::VecDeque::from([
+                    exact_legacy_initialize_request(200, serde_json::json!("1.0.0")),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/initialized",
+                        None,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "legacy_returning_ownership_tool",
+                            "arguments": {},
+                        })),
+                        201_i64,
+                    )),
+                    JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "legacy_returning_ownership_tool",
+                            "arguments": {},
+                        })),
+                        202_i64,
+                    )),
+                ]),
+                sent: Arc::clone(&sent),
+                receive_calls: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .expect("cancellation must not poison the returning custom connection");
+
+        let sent = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = sent
+            .iter()
+            .find_map(|message| match message {
+                JsonRpcMessage::Response(response) if response.id == Some(201_i64.into()) => {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .expect("cancelled request must still commit its exact legacy error response");
+        assert_eq!(
+            first.error.as_ref().and_then(|error| error.code.as_i32()),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
+        let sibling = sent
+            .iter()
+            .find_map(|message| match message {
+                JsonRpcMessage::Response(response) if response.id == Some(202_i64.into()) => {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .expect("sibling response must survive target cancellation and clean EOF");
+        assert!(sibling.error.is_none());
+        let regions = regions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(regions.len(), 2);
+        assert_ne!(
+            regions[0], regions[1],
+            "cancellation must not reuse the target region"
+        );
     }
 
     #[test]

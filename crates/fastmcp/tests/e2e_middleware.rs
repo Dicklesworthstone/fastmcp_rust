@@ -297,11 +297,64 @@ fn spawn_middleware_server(
     let server = build(builder);
 
     let handle = std::thread::spawn(move || {
-        set_echo_tool_calls(echo_calls);
-        let cx = Cx::for_testing();
-        let run_result = server.run_transport_returning_with_cx(&cx, server_transport);
-        set_echo_tool_calls(None);
-        run_result.expect("middleware server loop");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("middleware test reactor must initialize"),
+            )
+            .blocking_threads(2, 16)
+            .build()
+            .expect("middleware test runtime must initialize");
+        runtime
+            .block_on(async move {
+                let cx = Cx::current().expect("middleware runtime installs its caller Cx");
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                let mut pump = cx
+                    .spawn_blocking(move |pump_cx| {
+                        // The unsplit returning pump executes these handlers
+                        // on this thread, where their real call counter lives.
+                        set_echo_tool_calls(echo_calls);
+                        let result =
+                            server.run_transport_returning_with_cx(&pump_cx, server_transport);
+                        set_echo_tool_calls(None);
+                        let _ = sender.send(result);
+                    })
+                    .map_err(|error| McpError::internal_error(error.to_string()))?;
+                let deadline = cx.now().saturating_add_nanos(30_000_000_000);
+                loop {
+                    match receiver.try_recv() {
+                        Ok(result) => {
+                            // The channel preserves the server's result; join
+                            // also waits for the admitted task to become terminal.
+                            // Server shutdown can cancel its wrapper after the
+                            // result has already been sent.
+                            match pump.join(&cx).await {
+                                Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                                Err(error) => {
+                                    return Err(McpError::internal_error(error.to_string()));
+                                }
+                            }
+                            break result;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            break Err(McpError::internal_error(
+                                "middleware pump exited without a result",
+                            ));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            asupersync::time::timeout_at(
+                                deadline,
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                            )
+                            .await
+                            .map_err(|_| {
+                                McpError::internal_error("middleware test server timed out")
+                            })?;
+                        }
+                    }
+                }
+            })
+            .expect("middleware server loop");
     });
 
     (client_transport, handle)

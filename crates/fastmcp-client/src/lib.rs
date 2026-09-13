@@ -15995,11 +15995,33 @@ impl Client {
         execution: &mut StdioRequestExecution,
     ) -> McpResult<JsonRpcResponse> {
         let executor = self.multiplexed_stdio_executor()?;
+        let connection_cx = self.cx.clone();
         loop {
             if let Some(response) = executor.try_take_response(execution)? {
                 return Ok(response);
             }
-            self.drive_multiplexed_stdio(cx)?;
+            if cx.checkpoint().is_err() {
+                self.cancel_multiplexed_request_with_connection_cx(
+                    &connection_cx,
+                    &executor,
+                    execution,
+                )?;
+                return Err(McpError::request_cancelled());
+            }
+            // The caller's cancellation must not abort the shared ingress
+            // turn: doing so would make a request-local cancellation look
+            // like a connection failure and retire unrelated siblings. Keep
+            // each receive on the retained connection context, but bound the
+            // turn so a silent peer cannot hide the caller's deadline until
+            // the request's much longer transport deadline. The loop head
+            // remains response-first for frames admitted by this turn. The
+            // silent-peer responsiveness bound is Unix-only: non-Unix child
+            // pipe reads retain their existing blocking behavior after the
+            // transport's one-time deadline check.
+            let receive_deadline = Instant::now()
+                .checked_add(REVERSE_CALLBACK_POLL_SLICE)
+                .unwrap_or_else(Instant::now);
+            self.drive_multiplexed_stdio_until(&connection_cx, Some(receive_deadline))?;
         }
     }
 
@@ -16131,7 +16153,6 @@ impl Client {
         }
     }
 
-    #[cfg(unix)]
     fn cancel_multiplexed_request_with_connection_cx(
         &mut self,
         connection_cx: &Cx,
@@ -31181,6 +31202,173 @@ IFS= read -r remaining
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fnd_04_b_multiplexed_response_reuses_sibling_positive() {
+        let script = r#"
+IFS= read -r first || exit 90
+IFS= read -r second || exit 91
+case "$first" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 92 ;; esac
+case "$second" in *'"method":"ping"'*'"id":3'*) ;; *) exit 93 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"request":"first"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"request":"sibling"}}'
+IFS= read -r end
+"#;
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let connection_cx = client.cx.clone();
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("initialized client exposes its shared request executor");
+        let mut first = client
+            .start_multiplexed_request(&connection_cx, "tools/list", None)
+            .expect("first request commits");
+        let mut sibling = client
+            .start_multiplexed_request(&connection_cx, "ping", None)
+            .expect("sibling request commits on the same connection");
+
+        let first_response = client
+            .wait_multiplexed_request(&connection_cx, &mut first)
+            .expect("first response is correlated to its owner");
+        assert_eq!(first_response.id, Some(RequestId::Number(2)));
+        assert_eq!(
+            first_response.result,
+            Some(serde_json::json!({"request": "first"}))
+        );
+        let sibling_response = client
+            .wait_multiplexed_request(&connection_cx, &mut sibling)
+            .expect("same-connection sibling remains reusable");
+        assert_eq!(sibling_response.id, Some(RequestId::Number(3)));
+        assert_eq!(
+            sibling_response.result,
+            Some(serde_json::json!({"request": "sibling"}))
+        );
+        assert!(executor.executor.pending_records().is_empty());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fnd_04_b_delayed_receive_deadline_preserves_sibling_negative() {
+        let script = r#"
+IFS= read -r first || exit 90
+IFS= read -r second || exit 91
+case "$first" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 92 ;; esac
+case "$second" in *'"method":"ping"'*'"id":3'*) ;; *) exit 93 ;; esac
+sleep 0.10
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":999,"progress":0.5}}'
+IFS= read -r cancellation || exit 94
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 95 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"request":"sibling"}}'
+IFS= read -r end
+"#;
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let connection_cx = client.cx.clone();
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("initialized client exposes its shared request executor");
+        let mut first = client
+            .start_multiplexed_request(&connection_cx, "tools/list", None)
+            .expect("first request commits");
+        let mut sibling = client
+            .start_multiplexed_request(&connection_cx, "ping", None)
+            .expect("sibling request commits on the same connection");
+        let sibling_before = executor
+            .executor
+            .pending_records()
+            .into_iter()
+            .find(|record| record.request_id == RequestId::Number(3))
+            .expect("sibling correlation is pending before cancellation");
+
+        let deadline = Cx::for_testing().now().saturating_add_nanos(20_000_000);
+        let cancelled_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(deadline));
+        let error = client
+            .wait_multiplexed_request(&cancelled_cx, &mut first)
+            .expect_err("delayed receive deadline must retire only its target request");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        let sibling_after = executor
+            .executor
+            .pending_records()
+            .into_iter()
+            .find(|record| record.request_id == RequestId::Number(3))
+            .expect("sibling correlation remains pending after target cancellation");
+        assert_eq!(sibling_after, sibling_before);
+        assert!(client.responses.terminal_error().is_none());
+
+        let sibling_response = client
+            .wait_multiplexed_request(&connection_cx, &mut sibling)
+            .expect("sibling remains usable after target cancellation");
+        assert_eq!(sibling_response.id, Some(RequestId::Number(3)));
+        assert_eq!(
+            sibling_response.result,
+            Some(serde_json::json!({"request": "sibling"}))
+        );
+        assert!(executor.executor.pending_records().is_empty());
+        assert!(client.responses.terminal_error().is_none());
+        client.close().expect("client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fnd_04_b_silent_peer_deadline_preserves_sibling_negative() {
+        let script = r#"
+IFS= read -r first || exit 90
+IFS= read -r second || exit 91
+case "$first" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 92 ;; esac
+case "$second" in *'"method":"ping"'*'"id":3'*) ;; *) exit 93 ;; esac
+IFS= read -r cancellation || exit 94
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 95 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"request":"sibling"}}'
+IFS= read -r end
+"#;
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(2));
+        let connection_cx = client.cx.clone();
+        let executor = client
+            .multiplexed_stdio_executor()
+            .expect("initialized client exposes its shared request executor");
+        let mut first = client
+            .start_multiplexed_request(&connection_cx, "tools/list", None)
+            .expect("first request commits");
+        let mut sibling = client
+            .start_multiplexed_request(&connection_cx, "ping", None)
+            .expect("sibling request commits on the same connection");
+        let sibling_before = executor
+            .executor
+            .pending_records()
+            .into_iter()
+            .find(|record| record.request_id == RequestId::Number(3))
+            .expect("sibling correlation is pending before cancellation");
+
+        let deadline = Cx::for_testing().now().saturating_add_nanos(20_000_000);
+        let cancelled_cx =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(deadline));
+        let error = client
+            .wait_multiplexed_request(&cancelled_cx, &mut first)
+            .expect_err("silent peer must not delay caller deadline");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        let sibling_after = executor
+            .executor
+            .pending_records()
+            .into_iter()
+            .find(|record| record.request_id == RequestId::Number(3))
+            .expect("sibling correlation remains pending after target cancellation");
+        assert_eq!(sibling_after, sibling_before);
+        assert!(client.responses.terminal_error().is_none());
+
+        let sibling_response = client
+            .wait_multiplexed_request(&connection_cx, &mut sibling)
+            .expect("sibling remains usable after silent target cancellation");
+        assert_eq!(sibling_response.id, Some(RequestId::Number(3)));
+        assert_eq!(
+            sibling_response.result,
+            Some(serde_json::json!({"request": "sibling"}))
+        );
+        assert!(executor.executor.pending_records().is_empty());
         assert!(client.responses.terminal_error().is_none());
         client.close().expect("client cleanup");
     }
