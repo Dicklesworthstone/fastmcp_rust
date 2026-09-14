@@ -32075,6 +32075,7 @@ mod lib_unit_tests {
                     return Ok(Vec::new());
                 }
                 thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -32094,6 +32095,7 @@ mod lib_unit_tests {
                     return Err(McpError::request_cancelled());
                 }
                 thread::yield_now();
+                thread::sleep(Duration::from_millis(1));
             }
             if self.released.load(Ordering::Acquire) {
                 Ok(())
