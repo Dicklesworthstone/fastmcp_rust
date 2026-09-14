@@ -3122,11 +3122,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
     }
 
     fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
         if !state.tasks.contains_key(task_id) {
             return Err(McpError::invalid_params("Task not found"));
@@ -3141,6 +3141,8 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -3168,11 +3170,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         ensure_final_task_notification_matches_task(&cancelled_task, &cancelled_notification)?;
         validate_final_task_transition(expected.task(), &cancelled_task)?;
         validate_final_task_runtime_durations(&cancelled_task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(None);
         }
@@ -13754,6 +13757,248 @@ mod tests {
             !state.cancellation_requests.contains(&task_id),
             "the rejected cancellation records no cooperative intent"
         );
+    }
+
+    #[test]
+    fn task_03_final_in_memory_cancellation_reclaims_expired_preexpiry_snapshot() {
+        for (variant, target_name) in [
+            (0_u8, "task-cancel-expired-atomic"),
+            (1_u8, "task-cancel-expired-raw"),
+            (2_u8, "task-cancel-expired-direct"),
+        ] {
+            let (store, now) = in_memory_store_with_test_clock(2);
+            let target_id = FinalTaskId::parse(target_name).unwrap();
+            let target = final_working_task_with_ttl(target_name, 1_000);
+            store
+                .create_task_with_work(
+                    target.clone(),
+                    final_task_notification(&target),
+                    final_test_work_descriptor(),
+                )
+                .expect("finite-TTL cancellation fixture is retained");
+            let sibling_id = FinalTaskId::parse("task-cancel-expired-sibling").unwrap();
+            let sibling = final_working_task_with_ttl("task-cancel-expired-sibling", 2_000);
+            store
+                .create_task_with_work(
+                    sibling.clone(),
+                    final_task_notification(&sibling),
+                    final_test_work_descriptor(),
+                )
+                .expect("live sibling cancellation fixture is retained");
+            let target_snapshot = store
+                .get_task_snapshot(&target_id)
+                .expect("expired cancellation snapshot is readable before expiry")
+                .expect("expired cancellation task is retained before expiry");
+            let sibling_snapshot = store
+                .get_task_snapshot(&sibling_id)
+                .expect("live sibling snapshot is readable before expiry")
+                .expect("live sibling is retained before expiry");
+            let sibling_notification = store
+                .latest_notification(&sibling_id)
+                .expect("live sibling notification is retained before expiry");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_secs(1);
+
+            let cancelled = FinalTask::Cancelled(
+                transition_terminal_final_task_base(
+                    target_snapshot.task().base().clone(),
+                    FinalTaskStatus::Cancelled,
+                    None,
+                )
+                .expect("expired cancellation transition is structurally valid"),
+            );
+            let mutation_rejected = match variant {
+                0 => {
+                    let cancelled_notification = final_task_notification(&cancelled);
+                    FinalTaskStore::request_cancellation_and_clear_input_if_current(
+                        &*store,
+                        &target_snapshot,
+                        cancelled,
+                        cancelled_notification,
+                    )
+                    .expect("expired atomic cancellation CAS is readable")
+                    .is_none()
+                }
+                1 => !FinalTaskStore::request_cancellation_if_current(&*store, &target_snapshot)
+                    .expect("expired raw cancellation CAS is readable"),
+                2 => {
+                    let error = FinalTaskStore::request_cancellation(&*store, &target_id)
+                        .expect_err("expired direct cancellation must report a missing task");
+                    assert_eq!(error.message, "Task not found");
+                    true
+                }
+                _ => unreachable!("all cancellation variants are covered"),
+            };
+            assert!(
+                mutation_rejected,
+                "retention expiry must fence each cancellation mutation variant"
+            );
+
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!state.tasks.contains_key(&target_id));
+            assert!(!state.generations.contains_key(&target_id));
+            assert!(!state.cancellation_requests.contains(&target_id));
+            assert!(
+                !state.latest_notifications.contains_key(&target_id),
+                "expired target has no retained Cancelled notification"
+            );
+            assert!(!state.handoff_leases.contains_key(&target_id));
+            assert_eq!(
+                serde_json::to_value(state.tasks.get(&sibling_id))
+                    .expect("encode retained sibling task"),
+                serde_json::to_value(sibling_snapshot.task())
+                    .expect("encode pre-expiry sibling task"),
+                "reclaiming expired cancellation tasks leaves the sibling task unchanged"
+            );
+            assert_eq!(
+                state.generations.get(&sibling_id),
+                Some(&sibling_snapshot.generation())
+            );
+            assert_eq!(
+                serde_json::to_value(state.latest_notifications.get(&sibling_id))
+                    .expect("encode retained sibling notification"),
+                serde_json::to_value(&sibling_notification)
+                    .expect("encode pre-expiry sibling notification"),
+                "reclaiming expired cancellation tasks leaves the sibling notification unchanged"
+            );
+            assert!(!state.cancellation_requests.contains(&sibling_id));
+        }
+    }
+
+    #[test]
+    fn task_03_final_in_memory_cancellation_retains_live_preexpiry_snapshot() {
+        for (variant, target_name) in [
+            (0_u8, "task-cancel-live-atomic"),
+            (1_u8, "task-cancel-live-raw"),
+            (2_u8, "task-cancel-live-direct"),
+        ] {
+            let (store, now) = in_memory_store_with_test_clock(2);
+            let target_id = FinalTaskId::parse(target_name).unwrap();
+            let target = final_working_task_with_ttl(target_name, 1_000);
+            store
+                .create_task_with_work(
+                    target.clone(),
+                    final_task_notification(&target),
+                    final_test_work_descriptor(),
+                )
+                .expect("finite-TTL live-cancellation fixture is retained");
+            let sibling_id = FinalTaskId::parse("task-cancel-live-sibling").unwrap();
+            let sibling = final_working_task_with_ttl("task-cancel-live-sibling", 2_000);
+            store
+                .create_task_with_work(
+                    sibling.clone(),
+                    final_task_notification(&sibling),
+                    final_test_work_descriptor(),
+                )
+                .expect("live sibling cancellation fixture is retained");
+            let target_snapshot = store
+                .get_task_snapshot(&target_id)
+                .expect("live cancellation snapshot is readable")
+                .expect("live cancellation task is retained");
+            let sibling_snapshot = store
+                .get_task_snapshot(&sibling_id)
+                .expect("live sibling snapshot is readable")
+                .expect("live sibling is retained");
+            let sibling_notification = store
+                .latest_notification(&sibling_id)
+                .expect("live sibling notification is retained");
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                StdDuration::from_millis(999);
+
+            let target_generation = {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state
+                    .next_generation
+                    .checked_add(1)
+                    .expect("live cancellation generation remains representable")
+            };
+            match variant {
+                0 => {
+                    let cancelled = FinalTask::Cancelled(
+                        transition_terminal_final_task_base(
+                            target_snapshot.task().base().clone(),
+                            FinalTaskStatus::Cancelled,
+                            None,
+                        )
+                        .expect("live cancellation transition is structurally valid"),
+                    );
+                    let cancelled_notification = final_task_notification(&cancelled);
+                    let cancelled_snapshot =
+                        FinalTaskStore::request_cancellation_and_clear_input_if_current(
+                            &*store,
+                            &target_snapshot,
+                            cancelled,
+                            cancelled_notification,
+                        )
+                        .expect("live atomic cancellation CAS is readable")
+                        .expect("live atomic cancellation commits");
+                    assert!(matches!(cancelled_snapshot.task(), FinalTask::Cancelled(_)));
+                }
+                1 => {
+                    assert!(
+                        FinalTaskStore::request_cancellation_if_current(&*store, &target_snapshot)
+                            .expect("live raw cancellation CAS is readable"),
+                        "a live snapshot retains its raw cancellation capability"
+                    );
+                }
+                2 => {
+                    FinalTaskStore::request_cancellation(&*store, &target_id)
+                        .expect("live direct cancellation records intent");
+                }
+                _ => unreachable!("all cancellation variants are covered"),
+            }
+
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.generations.get(&target_id), Some(&target_generation));
+            match variant {
+                0 => {
+                    assert!(matches!(
+                        state.tasks.get(&target_id),
+                        Some(FinalTask::Cancelled(_))
+                    ));
+                    assert!(!state.cancellation_requests.contains(&target_id));
+                    assert!(state.latest_notifications.contains_key(&target_id));
+                }
+                1 | 2 => {
+                    assert!(matches!(
+                        state.tasks.get(&target_id),
+                        Some(FinalTask::Working(_))
+                    ));
+                    assert!(state.cancellation_requests.contains(&target_id));
+                    assert!(state.latest_notifications.contains_key(&target_id));
+                }
+                _ => unreachable!("all cancellation variants are covered"),
+            }
+            assert_eq!(
+                serde_json::to_value(state.tasks.get(&sibling_id))
+                    .expect("encode retained sibling task"),
+                serde_json::to_value(sibling_snapshot.task())
+                    .expect("encode pre-expiry sibling task"),
+                "cancellation leaves the live sibling task unchanged"
+            );
+            assert_eq!(
+                state.generations.get(&sibling_id),
+                Some(&sibling_snapshot.generation())
+            );
+            assert_eq!(
+                serde_json::to_value(state.latest_notifications.get(&sibling_id))
+                    .expect("encode retained sibling notification"),
+                serde_json::to_value(&sibling_notification)
+                    .expect("encode pre-expiry sibling notification"),
+                "cancellation leaves the live sibling notification unchanged"
+            );
+            assert!(!state.cancellation_requests.contains(&sibling_id));
+        }
     }
 
     #[test]
