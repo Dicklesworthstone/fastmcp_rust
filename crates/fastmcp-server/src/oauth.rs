@@ -2871,14 +2871,50 @@ impl OAuthServer {
         Ok((state, now))
     }
 
-    /// Acquires the write-side mutation gate only after rechecking a resource
-    /// binding against the uncleaned state. This makes a resource mismatch a
-    /// strict no-op: opportunistic expiry cleanup cannot run before the
-    /// mismatch is rejected.
-    fn state_for_resource_checked_mutation<F>(
+    /// Acquires the mutation gate only after authenticating the client while
+    /// holding the same write lock that will commit the transition. Failed
+    /// client authentication must not perform opportunistic expiry cleanup:
+    /// an otherwise denied request is not allowed to mutate retained OAuth
+    /// state before it is rejected.
+    fn state_for_authenticated_mutation(
         &self,
+        client_id: &str,
+        client_secret: Option<&str>,
+    ) -> Result<
+        (
+            std::sync::RwLockWriteGuard<'_, OAuthServerState>,
+            Instant,
+            OAuthRegistrationEpoch,
+        ),
+        OAuthError,
+    > {
+        self.config.validate()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+        let registration_epoch = authenticate_client_or_dummy(&state, client_id, client_secret)?;
+        let now = Instant::now();
+        state.cleanup_expired_at(now);
+        Ok((state, now, registration_epoch))
+    }
+
+    /// Authenticates the client before expiry cleanup can occur. Resource
+    /// mismatches remain strict no-ops and preserve their existing
+    /// pre-authentication ordering.
+    fn state_for_authenticated_resource_checked_mutation<F>(
+        &self,
+        client_id: &str,
+        client_secret: Option<&str>,
         resource_matches: F,
-    ) -> Result<(std::sync::RwLockWriteGuard<'_, OAuthServerState>, Instant), OAuthError>
+    ) -> Result<
+        (
+            std::sync::RwLockWriteGuard<'_, OAuthServerState>,
+            Instant,
+            OAuthRegistrationEpoch,
+        ),
+        OAuthError,
+    >
     where
         F: FnOnce(&OAuthServerState) -> bool,
     {
@@ -2890,11 +2926,10 @@ impl OAuthServer {
         if !resource_matches(&state) {
             return Err(invalid_grant_error());
         }
-        // Capture time only after acquiring the write lock. A caller may have
-        // waited arbitrarily long behind another mutation.
+        let registration_epoch = authenticate_client_or_dummy(&state, client_id, client_secret)?;
         let now = Instant::now();
         state.cleanup_expired_at(now);
-        Ok((state, now))
+        Ok((state, now, registration_epoch))
     }
 
     // -------------------------------------------------------------------------
@@ -3353,17 +3388,17 @@ impl OAuthServer {
         // consumption, and token insertion share one write-side critical
         // section. Failed validation, capacity checks, or either random draw
         // leaves the authorization code available for a legitimate retry.
-        let (mut state, now) = self.state_for_resource_checked_mutation(|state| {
-            state
-                .authorization_codes
-                .get(&code_digest)
-                .is_none_or(|code| request.resource == code.resource)
-        })?;
-        let current_registration_epoch = authenticate_client_or_dummy(
-            &state,
-            &request.client_id,
-            request.client_secret.as_deref(),
-        )?;
+        let (mut state, now, current_registration_epoch) = self
+            .state_for_authenticated_resource_checked_mutation(
+                &request.client_id,
+                request.client_secret.as_deref(),
+                |state| {
+                    state
+                        .authorization_codes
+                        .get(&code_digest)
+                        .is_none_or(|code| request.resource == code.resource)
+                },
+            )?;
         let auth_code = state
             .authorization_codes
             .get(&code_digest)
@@ -3483,19 +3518,19 @@ impl OAuthServer {
         // mutation. A successful refresh consumes the presented token exactly
         // once. Replaying a retained rotated-token marker revokes every live
         // descendant before returning the indistinguishable grant error.
-        let (mut state, now) = self.state_for_resource_checked_mutation(|state| {
-            state
-                .refresh_tokens
-                .get(&refresh_digest)
-                .is_none_or(|token| {
-                    request.resource.is_none() || request.resource == token.resource
-                })
-        })?;
-        let current_registration_epoch = authenticate_client_or_dummy(
-            &state,
-            &request.client_id,
-            request.client_secret.as_deref(),
-        )?;
+        let (mut state, now, current_registration_epoch) = self
+            .state_for_authenticated_resource_checked_mutation(
+                &request.client_id,
+                request.client_secret.as_deref(),
+                |state| {
+                    state
+                        .refresh_tokens
+                        .get(&refresh_digest)
+                        .is_none_or(|token| {
+                            request.resource.is_none() || request.resource == token.resource
+                        })
+                },
+            )?;
         if let Some(revoked) = state.revoked_tokens.get(&refresh_digest).cloned() {
             if revoked.client_id == request.client_id {
                 state.revoke_grant_family(revoked.grant_id, &request.client_id, &self.config, now);
@@ -3772,12 +3807,12 @@ impl OAuthServer {
                 ))
             })
             .transpose()?;
-        let (mut state, now) = self.state_for_mutation()?;
+        let (mut state, now, _) =
+            self.state_for_authenticated_mutation(client_id, client_secret)?;
 
-        // Authenticate and perform the ownership check and deletion under the
-        // same write lock. In particular, never remove first and discover
-        // afterward that the token belongs to another client.
-        authenticate_client_or_dummy(&state, client_id, client_secret)?;
+        // Perform the ownership check and deletion under the same write lock.
+        // In particular, never remove first and discover afterward that the
+        // token belongs to another client.
         let Some((access_digest, refresh_digest)) = admitted_token else {
             return Ok(());
         };
@@ -9978,6 +10013,120 @@ mod tests {
 
         let err = server.revoke("any-token", "c1", Some("wrong")).unwrap_err();
         assert_eq!(err.error_code(), "invalid_client");
+    }
+
+    #[test]
+    fn oauth_auth_01_a_valid_refresh_rotation_authenticates_and_reuses_grant() {
+        let server = Arc::new(OAuthServer::with_defaults());
+        let client = OAuthClient::builder("c1")
+            .secret("correct")
+            .redirect_uri("http://127.0.0.1/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+        let initial = server.issue_tokens("c1", &[], Some("subject")).unwrap();
+        let refresh = initial.refresh_token.expect("refresh token");
+
+        let mut request = bounded_refresh_request("c1", &refresh);
+        request.client_secret = Some("correct".to_string());
+        let rotated = server
+            .token(&request)
+            .expect("valid client authentication must rotate the refresh grant");
+        let auth = server
+            .token_verifier()
+            .verify(
+                &McpContext::new(asupersync::Cx::for_testing(), 1),
+                AuthRequest {
+                    method: "tools/call",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 1,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: rotated.access_token,
+                },
+            )
+            .expect("rotated access token must remain usable");
+
+        assert_eq!(auth.subject.as_deref(), Some("subject"));
+    }
+
+    #[test]
+    fn oauth_auth_01_a_wrong_client_refresh_denial_preserves_state_before_valid_reuse() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .secret("correct")
+            .redirect_uri("http://127.0.0.1/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+        let initial = server.issue_tokens("c1", &[], Some("subject")).unwrap();
+        let refresh = initial.refresh_token.expect("refresh token");
+        let cleanup_canary = insert_expired_authorization_code_cleanup_canary(&server, "c1");
+        let before = server.stats();
+
+        let mut denied = bounded_refresh_request("c1", &refresh);
+        denied.client_secret = Some("wrong".to_string());
+        let error = server
+            .token(&denied)
+            .expect_err("wrong client authentication must deny refresh");
+        assert!(matches!(error, OAuthError::InvalidClient(_)));
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        {
+            let state = server.state.read().unwrap();
+            assert!(state.authorization_codes.contains_key(&cleanup_canary));
+            assert!(
+                state
+                    .refresh_tokens
+                    .contains_key(&refresh_token_digest(&refresh))
+            );
+        }
+
+        let mut valid = bounded_refresh_request("c1", &refresh);
+        valid.client_secret = Some("correct".to_string());
+        let rotated = server
+            .token(&valid)
+            .expect("the unchanged refresh remains reusable after denial");
+        assert!(
+            server
+                .validate_access_token(&rotated.access_token)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn oauth_auth_01_a_wrong_client_revoke_denial_preserves_state_and_token() {
+        let server = OAuthServer::with_defaults();
+        let client = OAuthClient::builder("c1")
+            .secret("correct")
+            .redirect_uri("http://127.0.0.1/cb")
+            .build()
+            .unwrap();
+        server.register_client(client).unwrap();
+        let issued = server.issue_tokens("c1", &[], Some("subject")).unwrap();
+        let cleanup_canary = insert_expired_authorization_code_cleanup_canary(&server, "c1");
+        let before = server.stats();
+
+        let error = server
+            .revoke(&issued.access_token, "c1", Some("wrong"))
+            .expect_err("wrong client authentication must deny revocation");
+        assert!(matches!(error, OAuthError::InvalidClient(_)));
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert!(server.validate_access_token(&issued.access_token).is_some());
+        assert!(
+            server
+                .state
+                .read()
+                .unwrap()
+                .authorization_codes
+                .contains_key(&cleanup_canary)
+        );
+
+        server
+            .revoke(&issued.access_token, "c1", Some("correct"))
+            .expect("valid client authentication must revoke the token");
+        assert!(server.validate_access_token(&issued.access_token).is_none());
     }
 
     #[test]
