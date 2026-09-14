@@ -3,6 +3,8 @@
 //! The root test IDs are intentionally unqualified so the frozen exact runner
 //! discovers and starts each one through the shipped server surface.
 
+#![recursion_limit = "256"]
+
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpOutcome, McpResult};
 use fastmcp_derive::tool;
