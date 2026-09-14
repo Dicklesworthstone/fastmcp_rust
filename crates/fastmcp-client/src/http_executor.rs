@@ -4707,24 +4707,40 @@ impl ClientHttpConnection {
                             },
                         );
                     }
-                    let Some(reverse_response) = modern_http_server_request_response(
+                    let callback_cancellation = ReverseRequestCancellation::new();
+                    let callback_token = callback_cancellation.clone();
+                    let callback = modern_http_server_request_response(
                         cx,
                         &client.reverse_request_handlers,
                         &server_request,
-                    ) else {
+                        callback_token.clone(),
+                    );
+                    // Keep callback execution and its reply inside the original
+                    // request's cancellation and response deadline. Dropping a
+                    // pending callback must also notify retained callback tokens.
+                    let mut callback = std::pin::pin!(callback);
+                    let _callback_owner = HttpReverseCallbackOwner(callback_cancellation);
+                    let Some(JsonRpcMessage::Response(reverse_response)) =
+                        poll_http_response_operation(
+                            cx,
+                            cancellation,
+                            &mut stream,
+                            callback.as_mut(),
+                        )
+                        .await?
+                    else {
                         return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
                             request_id,
                         });
                     };
-                    let JsonRpcMessage::Response(reverse_response) = reverse_response else {
-                        return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
-                            request_id,
-                        });
-                    };
-                    client
-                        .post_jsonrpc_response(cx, &reverse_response)
-                        .await
+                    // Recheck the original request before starting the reply POST,
+                    // including when the callback cancelled during its final poll.
+                    let mut post =
+                        std::pin::pin!(client.post_jsonrpc_response(cx, &reverse_response));
+                    poll_http_response_operation(cx, cancellation, &mut stream, post.as_mut())
+                        .await?
                         .map_err(ClientHttpConnectionError::Modern)?;
+                    callback_token.record_response_sent();
                 }
             }
         }
@@ -5294,10 +5310,11 @@ fn admit_modern_json_response_body(
 
 /// Answers one modern server-initiated request received on a request-owned SSE
 /// body by invoking the matching typed reverse handler.
-fn modern_http_server_request_response(
+async fn modern_http_server_request_response(
     cx: &Cx,
     handlers: &ReverseRequestHandlers,
     request: &JsonRpcRequest,
+    cancellation: ReverseRequestCancellation,
 ) -> Option<JsonRpcMessage> {
     let request_id = request.id.clone()?;
     if request.method.starts_with("notifications/") {
@@ -5314,15 +5331,13 @@ fn modern_http_server_request_response(
             let Some(handler) = handlers.modern_sampling_create_message.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params::<FinalCreateMessageParams>(request)
-                .and_then(|params| {
-                    crate::invoke_shared_reverse_request_handler(
-                        cx,
-                        handler,
-                        ReverseRequestCancellation::new(),
-                        params,
-                    )
-                });
+            let result =
+                match crate::decode_reverse_request_params::<FinalCreateMessageParams>(request) {
+                    Ok(params) => {
+                        invoke_http_reverse_handler(cx, handler, cancellation, params).await
+                    }
+                    Err(error) => Err(error),
+                };
             Some(crate::reverse_request_response::<FinalCreateMessageResult>(
                 request_id, result,
             ))
@@ -5332,15 +5347,13 @@ fn modern_http_server_request_response(
                 return crate::method_not_found_response(request);
             };
             let result =
-                crate::decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request)
-                    .and_then(|params| {
-                        crate::invoke_shared_reverse_request_handler(
-                            cx,
-                            handler,
-                            ReverseRequestCancellation::new(),
-                            params,
-                        )
-                    });
+                match crate::decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request)
+                {
+                    Ok(params) => {
+                        invoke_http_reverse_handler(cx, handler, cancellation, params).await
+                    }
+                    Err(error) => Err(error),
+                };
             Some(crate::reverse_request_response::<
                 FinalEmbeddedRootsListResult,
             >(request_id, result))
@@ -5349,21 +5362,97 @@ fn modern_http_server_request_response(
             let Some(handler) = handlers.modern_elicitation_create.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params::<ElicitRequestParams>(request)
-                .and_then(|params| {
-                    crate::invoke_shared_reverse_request_handler(
-                        cx,
-                        handler,
-                        ReverseRequestCancellation::new(),
-                        params,
-                    )
-                });
+            let result = match crate::decode_reverse_request_params::<ElicitRequestParams>(request)
+            {
+                Ok(params) => invoke_http_reverse_handler(cx, handler, cancellation, params).await,
+                Err(error) => Err(error),
+            };
             Some(crate::reverse_request_response::<ElicitResult>(
                 request_id, result,
             ))
         }
         _ => crate::method_not_found_response(request),
     }
+}
+
+struct HttpReverseCallbackOwner(ReverseRequestCancellation);
+
+impl Drop for HttpReverseCallbackOwner {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Await callback work or its reply while the owning SSE response continues
+/// enforcing its original idle/absolute deadline and cancellation sources.
+async fn poll_http_response_operation<F: Future>(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    stream: &mut ModernHttpSseResponseStream,
+    mut operation: Pin<&mut F>,
+) -> Result<F::Output, ClientHttpConnectionError> {
+    let error = |error| ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error));
+    let (_ambient_sender, mut ambient_receiver) = oneshot::channel::<()>();
+    let mut ambient_cancelled = std::pin::pin!(ambient_receiver.recv(cx));
+    let mut locally_cancelled = std::pin::pin!(async {
+        if let Some(cancellation) = cancellation {
+            cancellation.cancelled().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
+    poll_fn(|task_cx| {
+        check_modern_http_context(cx).map_err(error)?;
+        if ambient_cancelled.as_mut().poll(task_cx).is_ready()
+            || locally_cancelled.as_mut().poll(task_cx).is_ready()
+        {
+            return Poll::Ready(Err(error(ModernHttpExecutorError::Cancelled)));
+        }
+        let Some(response) = &mut stream.response else {
+            return Poll::Ready(Err(error(ModernHttpExecutorError::SseStreamClosed)));
+        };
+        response.body.deadline.constrain_to(cx);
+        response.body.deadline.poll(task_cx).map_err(error)?;
+        let result = operation.as_mut().poll(task_cx);
+        check_modern_http_context(cx).map_err(error)?;
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            return Poll::Ready(Err(error(ModernHttpExecutorError::Cancelled)));
+        }
+        response.body.deadline.check().map_err(error)?;
+        result.map(Ok)
+    })
+    .await
+}
+
+/// Poll callbacks on the caller runtime, catching both construction and poll
+/// panics without introducing a nested runtime or detaching their work.
+async fn invoke_http_reverse_handler<P, R>(
+    cx: &Cx,
+    handler: &Arc<
+        dyn for<'callback> Fn(
+                &'callback Cx,
+                ReverseRequestCancellation,
+                P,
+            ) -> crate::ReverseRequestFuture<'callback, R>
+            + Send
+            + Sync,
+    >,
+    cancellation: ReverseRequestCancellation,
+    params: P,
+) -> McpResult<R> {
+    cancellation.checkpoint()?;
+    let mut callback = crate::catch_client_callback_unwind(|| handler(cx, cancellation, params))
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?;
+    poll_fn(|task_cx| {
+        crate::catch_client_callback_unwind(|| callback.as_mut().poll(task_cx)).unwrap_or_else(
+            |_| {
+                Poll::Ready(Err(McpError::internal_error(
+                    "Client reverse request handler failed",
+                )))
+            },
+        )
+    })
+    .await
 }
 
 fn reject_final_only_legacy_request_metadata(

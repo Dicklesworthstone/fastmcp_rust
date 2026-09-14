@@ -4258,6 +4258,7 @@ pub trait ApplicationTaskSupervisor: Send + Sync {
 
 const MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN: usize = 64;
 const MAX_FINAL_TASK_RECOVERY_CAS_RETRIES: usize = 64;
+const FINAL_TASK_RECOVERY_WAKE_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FinalTaskRecoveryKind {
@@ -6007,8 +6008,29 @@ impl AuthorizedTaskServiceRunner {
             return Err(error);
         }
         loop {
-            let task_id = match self.receiver.recv(cx).await {
-                Ok(task_id) => task_id,
+            // Recovery must continue even when no backend event arrives. Keep
+            // this cadence independent of the active dispatch heartbeat: a
+            // store may not provide that backend policy until a lease exists.
+            let wake = {
+                let mut receiver = std::pin::pin!(self.receiver.recv(cx));
+                let mut recovery_wake = std::pin::pin!(asupersync::time::sleep(
+                    cx.now(),
+                    FINAL_TASK_RECOVERY_WAKE_INTERVAL,
+                ));
+                std::future::poll_fn(|task_context| {
+                    if let std::task::Poll::Ready(result) = receiver.as_mut().poll(task_context) {
+                        return std::task::Poll::Ready(result.map(Some));
+                    }
+                    if recovery_wake.as_mut().poll(task_context).is_ready() {
+                        return std::task::Poll::Ready(Ok(None));
+                    }
+                    std::task::Poll::Pending
+                })
+                .await
+            };
+            let task_id = match wake {
+                Ok(Some(task_id)) => Some(task_id),
+                Ok(None) => None,
                 Err(_) if cx.checkpoint().is_err() => return Ok(()),
                 Err(error) => {
                     return Err(McpError::internal_error(format!(
@@ -6016,11 +6038,13 @@ impl AuthorizedTaskServiceRunner {
                     )));
                 }
             };
-            if let Err(error) = self.resume_task(cx, &task_id).await {
-                if cx.checkpoint().is_err() {
-                    return Ok(());
+            if let Some(task_id) = task_id {
+                if let Err(error) = self.resume_task(cx, &task_id).await {
+                    if cx.checkpoint().is_err() {
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
             if let Err(error) = self.recover_pending(cx).await {
                 if cx.checkpoint().is_err() {
@@ -11096,6 +11120,190 @@ mod tests {
             self.inner
                 .task_retention_deadline_if_current(task_id, generation)
         }
+    }
+
+    #[test]
+    fn task_03_final_service_runner_recovers_after_dispatch_lease_expiry_without_event() {
+        let (inner_store, now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            inner_store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let task = final_working_task_without_ttl("task-service-expired-lease-wakeup");
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = final_test_work_descriptor();
+        inner_store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("predecessor task work is durably retained");
+        let snapshot = inner_store
+            .get_task_snapshot(&task_id)
+            .expect("predecessor task snapshot is readable")
+            .expect("predecessor task remains retained");
+        let claim = inner_store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "predecessor")
+            .expect("predecessor claim is readable")
+            .expect("predecessor claims the initial work");
+        inner_store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "predecessor")
+            .expect("predecessor dispatch election is readable")
+            .expect("predecessor wins dispatch election");
+
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RecordingInitialFinalTaskSupervisor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .expect("successor task service installs");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned runtime builds");
+        let result = application_runtime
+            .block_on(async {
+                let cx = Cx::current().expect("caller runtime supplies service context");
+                let mut service = Box::pin(runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(
+                    Future::poll(service.as_mut(), &mut context),
+                    std::task::Poll::Pending
+                ));
+                *now.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                    IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), service).await
+            })
+            .expect("periodic recovery wake completes within the bounded timeout");
+        result.expect("successor service recovers and completes the retained task");
+
+        assert_eq!(
+            started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[(task_id.clone(), work_descriptor)],
+            "the timer wake delivers the exact retained work without a task event"
+        );
+        let committed = inner_store
+            .get_task(&task_id)
+            .expect("completed task remains readable")
+            .expect("completed task remains retained");
+        assert!(
+            matches!(committed, FinalTask::Completed { .. }),
+            "successor recovery commits the supervisor result"
+        );
+        let state = inner_store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.handoff_leases.contains_key(&task_id));
+        assert!(!state.initial_work.contains_key(&task_id));
+    }
+
+    #[test]
+    fn task_03_final_service_runner_does_not_recover_live_dispatch_lease_before_expiry() {
+        let (inner_store, now) = in_memory_store_with_test_clock(1);
+        let runtime = FinalTaskRuntime::new(
+            inner_store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let task = final_working_task_without_ttl("task-service-live-lease-wakeup");
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = final_test_work_descriptor();
+        inner_store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("predecessor task work is durably retained");
+        let snapshot = inner_store
+            .get_task_snapshot(&task_id)
+            .expect("predecessor task snapshot is readable")
+            .expect("predecessor task remains retained");
+        let claim = inner_store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "predecessor")
+            .expect("predecessor claim is readable")
+            .expect("predecessor claims the initial work");
+        let dispatch_fence = inner_store
+            .begin_handoff_dispatch_for_owner_if_current(&task_id, claim.generation, "predecessor")
+            .expect("predecessor dispatch election is readable")
+            .expect("predecessor wins dispatch election");
+
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RecordingInitialFinalTaskSupervisor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .expect("successor task service installs");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned runtime builds");
+        let timed = application_runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime supplies service context");
+            let mut service = Box::pin(runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                Future::poll(service.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ));
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                IN_MEMORY_FINAL_TASK_HANDOFF_LEASE
+                    .checked_sub(StdDuration::from_millis(1))
+                    .expect("handoff lease exceeds one millisecond");
+            asupersync::time::timeout(cx.now(), StdDuration::from_secs(2), service).await
+        });
+        assert!(
+            timed.is_err(),
+            "a periodic scan must not recover a dispatch lease before expiry"
+        );
+        assert!(
+            started
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the live predecessor lease prevents successor supervisor invocation"
+        );
+        let retained = inner_store
+            .get_task(&task_id)
+            .expect("live task remains readable")
+            .expect("live task remains retained");
+        assert_eq!(
+            serde_json::to_value(retained).expect("serialize retained live task"),
+            serde_json::to_value(task).expect("serialize original live task")
+        );
+        let state = inner_store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.generations.get(&task_id),
+            Some(&snapshot.generation())
+        );
+        assert_eq!(state.initial_work.get(&task_id), Some(&work_descriptor));
+        let lease = state
+            .handoff_leases
+            .get(&task_id)
+            .expect("live predecessor lease remains retained");
+        assert_eq!(lease.owner_id, "predecessor");
+        assert_eq!(lease.dispatch_fence, Some(dispatch_fence));
+        assert!(lease.recovery_expires_at.is_some_and(|expires_at| {
+            expires_at
+                > *now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }));
     }
 
     #[test]

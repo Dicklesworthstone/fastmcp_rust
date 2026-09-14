@@ -28,8 +28,7 @@ use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientProtocolPlan, ProtocolPolicy,
     RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy,
 };
-#[cfg(feature = "legacy-2024-11-05")]
-use fastmcp_core::{McpErrorCode, McpRequestCancellation};
+use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ProgressMarker, RequestId, ServerNotification,
     SubscriptionFilter,
@@ -170,6 +169,21 @@ fn assert_final_metadata(request: &CapturedHttpRequest, expected_method: &str) {
         body["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
         "http-03-runtime-client"
     );
+}
+
+fn http_header_present(head: &str, expected_name: &str) -> bool {
+    head.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(expected_name))
+    })
+}
+
+fn http_header_equals(head: &str, expected_name: &str, expected_value: &str) -> bool {
+    head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case(expected_name) && value.trim() == expected_value
+        })
+    })
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -425,6 +439,279 @@ fn http_03_b_runtime_planted_negative() {
             .expect("negative native HTTP server must join"),
         "server/discover",
     );
+}
+
+fn modern_async_reverse_callback_result() -> fastmcp_protocol::FinalCreateMessageResult {
+    fastmcp_protocol::FinalCreateMessageResult {
+        content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+            fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                text: "sampled on the caller runtime".to_owned(),
+                annotations: None,
+                meta: None,
+                additional: std::collections::BTreeMap::new(),
+            },
+        ),
+        model: "caller-runtime-handler".to_owned(),
+        role: fastmcp_protocol::Role::Assistant,
+        stop_reason: None,
+        meta: None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AsyncReverseCallbackCase {
+    Complete,
+    Reject,
+    Cancel,
+    IdleTimeout,
+}
+
+fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
+    let callback_error = matches!(case, AsyncReverseCallbackCase::Reject);
+    let cancel_callback = matches!(case, AsyncReverseCallbackCase::Cancel);
+    let idle_timeout = matches!(case, AsyncReverseCallbackCase::IdleTimeout);
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind modern async reverse callback listener");
+    let address = listener
+        .local_addr()
+        .expect("read modern async reverse callback address");
+    let target = format!("http://{address}/mcp");
+    let (callback_started_tx, callback_started_rx) = mpsc::sync_channel(1);
+    let callback_token = Arc::new(std::sync::Mutex::new(None));
+    let callback_token_for_handler = Arc::clone(&callback_token);
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        assert_final_metadata(&read_request(&mut discovery), "server/discover");
+        write_response(
+            &mut discovery,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"async-callback-peer","version":"1"}}}}"#,
+        );
+
+        let mut request = accept_bounded_stream(&listener);
+        let request_body = read_request(&mut request);
+        assert_final_metadata(&request_body, "tools/list");
+        begin_sse_response(&mut request);
+        write_sse_event(
+            &mut request,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "sampling/createMessage",
+                "params": {
+                    "_meta": {},
+                    "messages": [{
+                        "role": "user",
+                        "content": {"type": "text", "text": "hello"}
+                    }],
+                    "maxTokens": 8
+                }
+            }),
+        )
+        .expect("write async reverse request");
+
+        if cancel_callback || idle_timeout {
+            assert_connection_closed_by_client(&mut request);
+            listener
+                .set_nonblocking(true)
+                .expect("bound cancellation peer observation");
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match listener.accept() {
+                    Ok((_, peer)) => panic!(
+                        "retired callback must not post a response after stream close: {peer}"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("observe callback response connection: {error}"),
+                }
+            }
+            return;
+        }
+
+        let mut reverse = accept_bounded_stream(&listener);
+        let reverse_request = read_request(&mut reverse);
+        assert!(reverse_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+        assert!(http_header_equals(
+            &reverse_request.head,
+            "MCP-Protocol-Version",
+            "2026-07-28"
+        ));
+        assert!(
+            !http_header_present(&reverse_request.head, "Mcp-Method"),
+            "reverse response POST must not carry a client method header"
+        );
+        let reverse_body: serde_json::Value =
+            serde_json::from_slice(&reverse_request.body).expect("reverse response is JSON-RPC");
+        assert_eq!(reverse_body["id"], 99);
+        if callback_error {
+            assert_eq!(reverse_body["error"]["code"], -32602);
+            assert_eq!(reverse_body["error"]["message"], "async callback rejected");
+        } else {
+            assert_eq!(reverse_body["result"]["model"], "caller-runtime-handler");
+            assert_eq!(
+                reverse_body["result"]["content"]["text"],
+                "sampled on the caller runtime"
+            );
+        }
+        write_response(&mut reverse, 202, "application/json", b"");
+        write_sse_event(
+            &mut request,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "tools": [],
+                    "ttlMs": 0,
+                    "cacheScope": "private"
+                }
+            }),
+        )
+        .expect("write tools/list terminal response");
+    });
+
+    let handlers = fastmcp_client::ReverseRequestHandlers::new()
+        .with_modern_sampling_create_message(move |callback_cx, cancellation, params| {
+            let callback_started_tx = callback_started_tx.clone();
+            let callback_token_for_handler = Arc::clone(&callback_token_for_handler);
+            Box::pin(async move {
+                assert_eq!(params.max_tokens.to_string(), "8");
+                callback_token_for_handler
+                    .lock()
+                    .expect("callback token lock")
+                    .replace(cancellation.clone());
+                callback_started_tx
+                    .send(())
+                    .expect("caller must observe callback admission");
+                if cancel_callback || idle_timeout {
+                    std::future::pending::<()>().await;
+                    unreachable!("retired callback must not complete normally");
+                }
+                let mut child = callback_cx
+                    .spawn(|child_cx| async move {
+                        asupersync::time::sleep(child_cx.now(), Duration::from_millis(20)).await;
+                    })
+                    .map_err(|_| McpError::internal_error("callback child spawn failed"))?;
+                child
+                    .join(callback_cx)
+                    .await
+                    .map_err(|_| McpError::internal_error("callback child join failed"))?;
+                cancellation.checkpoint()?;
+                if callback_error {
+                    Err(McpError::invalid_params("async callback rejected"))
+                } else {
+                    Ok(modern_async_reverse_callback_result())
+                }
+            })
+        });
+
+    let cancellation = McpRequestCancellation::new();
+    let cancellation_for_thread = cancellation.clone();
+    let callback_controller = thread::spawn(move || {
+        callback_started_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server-initiated callback must start");
+        if cancel_callback {
+            assert!(cancellation_for_thread.cancel());
+        } else {
+            assert!(!cancellation_for_thread.is_cancel_requested());
+        }
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("modern async callback runtime must build");
+    runtime.block_on(async {
+        let runtime_cx = Cx::current().expect("caller runtime must install a current Cx");
+        let request_cx =
+            runtime.request_cx_with_budget(runtime_cx.budget_for_timeout(Duration::from_secs(2)));
+        let mut client = public_modern_builder(
+            &target,
+            RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
+                .expect("async callback request timeout policy must be valid"),
+        )
+        .reverse_request_handlers(handlers)
+        .connect_http_client_with_cx(&request_cx)
+        .await
+        .expect("modern public HTTP client must connect");
+        let result = client
+            .list_tools_with_cancellation(&request_cx, &cancellation, None)
+            .await;
+        if cancel_callback {
+            let error = result.expect_err("cancelled callback must return a typed cancellation");
+            assert!(matches!(
+                error,
+                fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
+                ))
+            ));
+        } else if idle_timeout {
+            let error = result.expect_err("pending callback must preserve the idle deadline");
+            assert!(matches!(
+                error,
+                fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Timeout(
+                        RequestTimeoutSource::Idle
+                    ))
+                ))
+            ));
+        } else {
+            let listed = result.expect("callback response must not prevent the terminal result");
+            assert!(matches!(
+                listed,
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { .. }
+                )
+            ));
+        }
+        assert_eq!(
+            callback_token
+                .lock()
+                .expect("callback token lock")
+                .as_ref()
+                .expect("callback must retain its cancellation token")
+                .is_cancel_requested(),
+            cancel_callback || idle_timeout,
+            "only abandoned callbacks must be cancelled"
+        );
+        assert!(
+            request_cx.checkpoint().is_ok(),
+            "callback retirement must not cancel its caller"
+        );
+    });
+
+    callback_controller
+        .join()
+        .expect("callback cancellation controller must join");
+    server
+        .join()
+        .expect("modern async reverse callback peer must join");
+}
+
+#[test]
+fn http_03_b_modern_async_reverse_callback_positive() {
+    run_modern_async_reverse_callback_case(AsyncReverseCallbackCase::Complete);
+}
+
+#[test]
+fn http_03_b_modern_async_reverse_callback_typed_error_negative() {
+    run_modern_async_reverse_callback_case(AsyncReverseCallbackCase::Reject);
+}
+
+#[test]
+fn http_03_b_modern_async_reverse_callback_cancellation_negative() {
+    run_modern_async_reverse_callback_case(AsyncReverseCallbackCase::Cancel);
+}
+
+#[test]
+fn http_03_b_modern_async_reverse_callback_idle_timeout_negative() {
+    run_modern_async_reverse_callback_case(AsyncReverseCallbackCase::IdleTimeout);
 }
 
 #[cfg(feature = "legacy-2024-11-05")]

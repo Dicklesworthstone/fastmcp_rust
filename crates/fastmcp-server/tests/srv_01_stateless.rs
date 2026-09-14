@@ -685,3 +685,201 @@ fn srv_01_i_planted_negative() {
         "typed refusal changed server catalog"
     );
 }
+
+#[cfg(feature = "tasks")]
+#[test]
+fn task_service_recovers_expired_dispatch_without_new_event() {
+    assert_task_service_recovers_without_new_event(true);
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn task_service_preserves_live_dispatch_without_new_event() {
+    assert_task_service_recovers_without_new_event(false);
+}
+
+/// Exercises the shipped owner generation and runner, rather than the
+/// server library's test-only fixed dispatch owner. Only lease age differs.
+/// The 30-second boundary belongs to this concrete in-memory backend; this
+/// test does not impose that lease duration on custom stores.
+#[cfg(feature = "tasks")]
+fn assert_task_service_recovers_without_new_event(expired: bool) {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fastmcp_protocol::tasks_extension::{
+        FinalTaskCallToolResult, Task, TaskStatusNotification, TaskStatusNotificationParams,
+    };
+    use fastmcp_server::{
+        ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskStore,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore,
+    };
+
+    struct CompleteRecoveredTask(Arc<AtomicUsize>);
+
+    impl ApplicationTaskSupervisor for CompleteRecoveredTask {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                cx.checkpoint()
+                    .expect("caller-owned supervisor remains live");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let FinalTaskSupervisorHandoff::Initial(work) = handoff else {
+                    panic!("the retained initial descriptor must reach the initial hook");
+                };
+                assert_eq!(
+                    work.work_descriptor(),
+                    &FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "recover"}))?
+                );
+                let result: FinalTaskCallToolResult = serde_json::from_value(serde_json::json!({
+                    "content": [{"type": "text", "text": "recovered successfully"}]
+                }))
+                .expect("valid completed tool result");
+                work.complete_task(result, None)?;
+                Ok(())
+            })
+        }
+    }
+
+    let initial_time = Instant::now();
+    let elapsed_ms = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(
+        InMemoryFinalTaskStore::with_clock(2, {
+            let elapsed_ms = Arc::clone(&elapsed_ms);
+            Arc::new(move || {
+                initial_time + Duration::from_millis(elapsed_ms.load(Ordering::SeqCst) as u64)
+            })
+        })
+        .expect("bounded process-local store"),
+    );
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "taskId": "retained-operation", "status": "working",
+        "createdAt": "2026-07-28T12:00:00.000Z",
+        "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": 60000
+    }))
+    .expect("valid retained task");
+    let task_id = task.base().task_id.clone();
+    let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
+        task: task.clone(),
+        meta: None,
+        additional: std::collections::BTreeMap::default(),
+    });
+    store
+        .create_task_with_work(
+            task.clone(),
+            notification.clone(),
+            FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "recover"}))
+                .expect("bounded work descriptor"),
+        )
+        .expect("retained work exists before the new service starts");
+    let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+    let previous_owner = "previous-application-instance";
+    assert!(
+        store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, previous_owner)
+            .unwrap()
+            .is_some()
+    );
+    let old_fence = store
+        .begin_handoff_dispatch_for_owner_if_current(
+            &task_id,
+            snapshot.generation(),
+            previous_owner,
+        )
+        .unwrap()
+        .expect("previous owner elected its dispatch");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(60000, None).unwrap(),
+        {
+            let emitted = Arc::clone(&emitted);
+            Arc::new(move |_| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+    );
+    let mut runner = runtime
+        .install_task_service(1, Arc::new(CompleteRecoveredTask(Arc::clone(&calls))))
+        .unwrap();
+    let application = RuntimeBuilder::current_thread().build().unwrap();
+    application.block_on(async {
+        let cx = Cx::current().expect("application-owned runtime context");
+        let mut service = std::pin::pin!(runner.run_service(&cx));
+        let mut observation_bound =
+            std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(3)));
+        let mut entered = false;
+        poll_fn(|task_cx| {
+            // Check the independent observation bound before polling the
+            // service: its timeout wake must not itself trigger a late scan
+            // and masquerade as the service's own recovery wake.
+            if observation_bound.as_mut().poll(task_cx).is_ready() {
+                assert!(
+                    !expired,
+                    "expired work remained stranded without a new event"
+                );
+                return Poll::Ready(());
+            }
+            if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
+                panic!("service must remain ready while its caller is live: {result:?}");
+            }
+            if !entered {
+                assert!(runtime.is_task_service_ready());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                // No store method or channel signal follows this advancement.
+                // The runner's own timer must cause the next recovery scan.
+                elapsed_ms.store(if expired { 30000 } else { 29999 }, Ordering::SeqCst);
+                entered = true;
+            }
+            if expired && calls.load(Ordering::SeqCst) == 1 {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
+    });
+    assert!(
+        !runtime.is_task_service_ready(),
+        "dropping the run revokes readiness"
+    );
+    let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+    if expired {
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        let value = serde_json::to_value(current.task()).unwrap();
+        assert_eq!(value["status"], "completed");
+        assert_eq!(
+            value["result"]["content"][0]["text"],
+            "recovered successfully"
+        );
+        assert!(
+            !store
+                .renew_handoff_dispatch_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    previous_owner,
+                    old_fence
+                )
+                .unwrap(),
+            "late predecessor cannot regain the recovered operation"
+        );
+    } else {
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        assert_eq!(current.generation(), snapshot.generation());
+        assert_eq!(
+            serde_json::to_value(current.task()).unwrap(),
+            serde_json::to_value(task).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id)).unwrap(),
+            serde_json::to_value(Some(notification)).unwrap(),
+        );
+    }
+}
