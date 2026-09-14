@@ -767,7 +767,7 @@ fn assert_task_service_recovers_without_new_event(expired: bool) {
     let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
         task: task.clone(),
         meta: None,
-        additional: Default::default(),
+        additional: std::collections::BTreeMap::default(),
     });
     store
         .create_task_with_work(
