@@ -2546,6 +2546,45 @@ mod task_commands {
         }
     }
 
+    struct TaskTimeoutProxy {
+        root: TestTempDir,
+        endpoint: String,
+        process: ProcessGroupGuard,
+    }
+
+    impl TaskTimeoutProxy {
+        fn new(backend: &str, delay: Duration) -> Self {
+            let root = TestTempDir::new("task-timeout");
+            let mut command = Command::new("python3");
+            command
+                .arg("-c")
+                .arg(TASK_TIMEOUT_PROXY)
+                .current_dir(&root)
+                .env("CLI_TASK_TIMEOUT_BACKEND", backend)
+                .env("CLI_TASK_TIMEOUT_DELAY_MS", delay.as_millis().to_string())
+                .stdout(std::fs::File::create(root.join("proxy.stdout")).unwrap())
+                .stderr(std::fs::File::create(root.join("proxy.stderr")).unwrap());
+            let process = ProcessGroupGuard::spawn(&mut command);
+            wait_for_file(&root.join("ready"), "http://");
+            let endpoint = std::fs::read_to_string(root.join("ready")).unwrap();
+            Self {
+                root,
+                endpoint,
+                process,
+            }
+        }
+
+        fn was_update_forwarded(&self) -> bool {
+            self.root.join("update-forwarded").exists()
+        }
+
+        fn stop(&mut self) {
+            self.process
+                .kill_and_reap()
+                .expect("task timeout proxy process group cleanup");
+        }
+    }
+
     const WATCH_RECONNECT_PROXY: &str = r"
 import http.client, http.server, json, os, pathlib, threading, urllib.parse
 backend = urllib.parse.urlsplit(os.environ['CLI_WATCH_BACKEND'])
@@ -2709,12 +2748,94 @@ pathlib.Path('ready').write_text('http://127.0.0.1:%d/mcp' % server.server_port)
 server.serve_forever()
 ";
 
+    const TASK_TIMEOUT_PROXY: &str = r"
+import http.client, http.server, json, os, pathlib, socket, time, urllib.parse
+backend = urllib.parse.urlsplit(os.environ['CLI_TASK_TIMEOUT_BACKEND'])
+delay = int(os.environ['CLI_TASK_TIMEOUT_DELAY_MS']) / 1000
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *args): pass
+    def do_POST(self):
+        length = int(self.headers['Content-Length'])
+        assert 0 < length <= 1048576
+        body = self.rfile.read(length)
+        request = json.loads(body)
+        if request.get('method') == 'tasks/update':
+            time.sleep(delay)
+            pathlib.Path('update-settled').write_text('settled')
+            self.connection.setblocking(False)
+            try:
+                client_closed = False
+                try:
+                    if self.connection.recv(1, socket.MSG_PEEK) == b'':
+                        client_closed = True
+                except (ConnectionResetError, BrokenPipeError):
+                    client_closed = True
+                except BlockingIOError:
+                    pass
+            finally:
+                self.connection.setblocking(True)
+            if client_closed:
+                pathlib.Path('update-decided').write_text('closed')
+                return
+            pathlib.Path('update-forwarded').write_text('1')
+            pathlib.Path('update-decided').write_text('forwarded')
+        connection = http.client.HTTPConnection(backend.hostname, backend.port, timeout=30)
+        try:
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in ['host', 'connection']
+            }
+            connection.request('POST', self.path, body, headers)
+            response = connection.getresponse()
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in ['connection', 'content-length', 'transfer-encoding']:
+                    self.send_header(key, value)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            while True:
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(('%x\r\n' % len(chunk)).encode() + chunk + b'\r\n')
+                self.wfile.flush()
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            connection.close()
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
+server.daemon_threads = True
+pathlib.Path('ready').write_text('http://127.0.0.1:%d/mcp' % server.server_port)
+server.serve_forever()
+";
+
     fn read_json_lines(path: &Path) -> Vec<Value> {
         std::fs::read_to_string(path)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn wait_for_file_with_timeout(path: &Path, text: &str, timeout: Duration) {
+        let started = Instant::now();
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|value| value.contains(text)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < timeout,
+                "timed out waiting for {text} in {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn assert_initial_terminal(output: &Output, expected_status: &str) {
@@ -3002,6 +3123,98 @@ server.serve_forever()
         let wrong = run_cli(&["tasks", "get", &wrong_id, "--http-url", &endpoint, "--json"]);
         assert!(!wrong.status.success());
         assert!(wrong.stdout.is_empty());
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_update_within_timeout_succeeds() {
+        let fixture = TaskFixture::new(true);
+        let (mut server, endpoint) = fixture.http();
+        let mut proxy = TaskTimeoutProxy::new(&endpoint, Duration::from_secs(31));
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let output = run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+            "--timeout",
+            "35",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(document(&output)["event"], "update-acknowledged");
+        let changed: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
+                .unwrap();
+        assert_eq!(changed["taskId"], fixture.task["taskId"]);
+        assert_eq!(changed["status"], "working");
+        assert!(changed.get("inputRequests").is_none());
+        assert!(proxy.was_update_forwarded());
+        proxy.stop();
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_update_timeout_fails_without_mutation() {
+        let fixture = TaskFixture::new(true);
+        let original = std::fs::read(fixture.root.join("task.json")).unwrap();
+        let (mut server, endpoint) = fixture.http();
+        let mut proxy = TaskTimeoutProxy::new(&endpoint, Duration::from_secs(31));
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let before = run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+        ]);
+        assert_eq!(document(&before)["data"], fixture.task);
+        let output = run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+            "--timeout",
+            "30",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = stderr_str(&output);
+        assert!(
+            stderr.contains("timed out") || stderr.contains("--timeout"),
+            "timeout refusal must be visible: {stderr}"
+        );
+        wait_for_file_with_timeout(
+            &proxy.root.join("update-decided"),
+            "closed",
+            Duration::from_secs(35),
+        );
+        assert!(!proxy.was_update_forwarded());
+        assert_eq!(
+            std::fs::read(fixture.root.join("task.json")).unwrap(),
+            original
+        );
+        assert!(!fixture.root.join("changed.json").exists());
+        let unchanged = run_cli(&[
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &proxy.endpoint,
+            "--json",
+        ]);
+        assert_eq!(unchanged.stdout, before.stdout);
+        assert_eq!(document(&unchanged)["data"], fixture.task);
+        proxy.stop();
         server.kill_and_reap().expect("HTTP server cleanup");
     }
 

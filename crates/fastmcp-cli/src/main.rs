@@ -6508,6 +6508,9 @@ async fn run_http_task(
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
 ) -> McpResult<()> {
+    let started = std::time::Instant::now();
+    let remaining = remaining_task_watch_time(connection, started)?;
+    let request_timeout_policy = fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?;
     let error = |error: fastmcp_client::HttpClientError| {
         fastmcp_core::McpError::internal_error(error.to_string())
     };
@@ -6518,6 +6521,7 @@ async fn run_http_task(
         CliProtocolPolicy::ModernOnly,
     )?;
     let mut client = http_client_builder(plan, connection.bearer_token_file.as_deref())?
+        .request_timeout_policy(request_timeout_policy)
         .connect_http_client_with_cx(cx)
         .await
         .map_err(error)?;
