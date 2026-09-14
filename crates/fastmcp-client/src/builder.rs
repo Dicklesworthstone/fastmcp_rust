@@ -782,6 +782,10 @@ impl ClientBuilder {
         builder
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
+        builder
+            .timeout_policy
+            .validate()
+            .map_err(|_| Self::http_timeout_policy_error())?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let mut client_capabilities = builder.capabilities.clone();
         if reverse_request_handlers.has_modern_handlers() {
@@ -799,6 +803,7 @@ impl ClientBuilder {
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
+                request_timeout_policy: builder.timeout_policy,
             },
         )
         .await?;
@@ -863,6 +868,10 @@ impl ClientBuilder {
         builder
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
+        builder
+            .timeout_policy
+            .validate()
+            .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let mut client_capabilities = builder.capabilities.clone();
         if reverse_request_handlers.has_modern_handlers() {
@@ -878,6 +887,7 @@ impl ClientBuilder {
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
+                request_timeout_policy: builder.timeout_policy,
             },
             reverse_request_handlers,
         )
@@ -1615,6 +1625,12 @@ impl ClientBuilder {
         // `FeatureConfigurationUnavailable` outcome above.
         ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
             ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly,
+        ))
+    }
+
+    fn http_timeout_policy_error() -> ClientHttpConnectionError {
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+            ModernHttpExecutorError::InvalidTimeoutPolicy,
         ))
     }
 

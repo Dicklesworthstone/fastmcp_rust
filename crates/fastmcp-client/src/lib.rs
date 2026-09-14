@@ -3084,12 +3084,19 @@ impl ReverseCallbackState {
         true
     }
 
-    pub(crate) fn complete(&self, request_id: &RequestId) {
+    pub(crate) fn complete(
+        &self,
+        request_id: &RequestId,
+        cancellation: &ReverseRequestCancellation,
+    ) {
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active.retain(|callback| !callback.request_id.correlates_with(request_id));
+        active.retain(|callback| {
+            !(callback.request_id.correlates_with(request_id)
+                && callback.cancellation.belongs_to_same_request(cancellation))
+        });
     }
 
     /// Claims the one response write while ordering it against a cancellation
@@ -3159,7 +3166,13 @@ struct ReverseCallbackPool {
     state: Arc<ReverseCallbackState>,
     response_sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
     cx: Cx,
-    tasks: Mutex<Vec<(RequestId, asupersync::runtime::TaskHandle<()>)>>,
+    tasks: Mutex<
+        Vec<(
+            RequestId,
+            ReverseRequestCancellation,
+            asupersync::runtime::TaskHandle<()>,
+        )>,
+    >,
 }
 
 /// Performs the elected reverse response write.
@@ -3229,6 +3242,7 @@ impl ReverseCallbackPool {
         let callback_id = request_id.clone();
         let state = Arc::clone(&self.state);
         let response_sender = Arc::clone(&self.response_sender);
+        let task_cancellation = cancellation.clone();
         let task_cx = Cx::current().unwrap_or_else(|| self.cx.clone());
         let task = match task_cx.spawn(move |callback_cx| async move {
             // Admission transfers cancellation observation to the callback.
@@ -3246,22 +3260,22 @@ impl ReverseCallbackPool {
                 &cancellation,
                 &response,
             ) {
-                Ok(_) => state.complete(&callback_id),
+                Ok(_) => state.complete(&callback_id, &cancellation),
                 Err(error) => {
                     state.fail_connection(transport_error_to_mcp(error));
-                    state.complete(&callback_id);
+                    state.complete(&callback_id, &cancellation);
                 }
             }
         }) {
             Ok(task) => task,
             Err(_) => {
-                self.state.complete(&request_id);
+                self.state.complete(&request_id, &task_cancellation);
                 return Err(McpError::internal_error(
                     "Client reverse callback dispatcher is unavailable",
                 ));
             }
         };
-        tasks.push((request_id, task));
+        tasks.push((request_id, task_cancellation, task));
         Ok(())
     }
 
@@ -3272,7 +3286,7 @@ impl ReverseCallbackPool {
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (task_id, task) in tasks.iter() {
+            for (task_id, _, task) in tasks.iter() {
                 if task_id.correlates_with(request_id) {
                     // The token closes the protocol response election; the
                     // task abort also cancels and wakes the callback's Cx so
@@ -3290,7 +3304,7 @@ impl ReverseCallbackPool {
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (_, task) in tasks.iter() {
+        for (_, _, task) in tasks.iter() {
             task.abort();
         }
     }
@@ -3302,14 +3316,23 @@ impl ReverseCallbackPool {
             .map_err(|_| McpError::internal_error("Client reverse callback registry failed"))?;
         let mut active = Vec::with_capacity(tasks.len());
         let mut panicked = false;
-        for (request_id, mut task) in std::mem::take(&mut *tasks) {
+        for (request_id, cancellation, mut task) in std::mem::take(&mut *tasks) {
             match task.try_join() {
-                Ok(None) => active.push((request_id, task)),
-                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Ok(None) => active.push((request_id, cancellation, task)),
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                    // A task can be cancelled by its owning Cx before the
+                    // callback body reaches its normal completion path. Retire
+                    // the registry owner here as well, or the request ID
+                    // remains permanently occupied after its worker is gone.
+                    self.state.complete(&request_id, &cancellation);
+                }
                 Err(
                     asupersync::runtime::JoinError::Panicked(_)
                     | asupersync::runtime::JoinError::PolledAfterCompletion,
-                ) => panicked = true,
+                ) => {
+                    self.state.complete(&request_id, &cancellation);
+                    panicked = true;
+                }
             }
         }
         let active_count = active.len();
@@ -4746,7 +4769,13 @@ where
     terminal: Arc<WebSocketReverseCallbackTerminal>,
     response_sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
     cx: Cx,
-    tasks: Mutex<Vec<(RequestId, asupersync::runtime::TaskHandle<()>)>>,
+    tasks: Mutex<
+        Vec<(
+            RequestId,
+            ReverseRequestCancellation,
+            asupersync::runtime::TaskHandle<()>,
+        )>,
+    >,
 }
 
 /// Connection-terminal state published by retained WebSocket callbacks.
@@ -4829,7 +4858,7 @@ impl Drop for WebSocketReverseCallbackCompletionGuard {
             let error = McpError::internal_error("WebSocket reverse callback task panicked");
             self.terminal.publish(&self.cx, error.clone());
             self.state.fail_connection(error);
-            self.state.complete(&self.request_id);
+            self.state.complete(&self.request_id, &self.cancellation);
         }
     }
 }
@@ -4905,6 +4934,7 @@ where
         let callback_id = request_id.clone();
         let response_id = request_id.clone();
         let invoke_cancellation = cancellation.clone();
+        let task_cancellation = cancellation.clone();
         let task_cx = Cx::current().unwrap_or_else(|| self.cx.clone());
         let task = match task_cx.spawn(move |callback_cx| async move {
             let mut completion_guard = WebSocketReverseCallbackCompletionGuard::new(
@@ -4926,7 +4956,7 @@ where
                     let error =
                         McpError::internal_error("WebSocket reverse callback task panicked");
                     completion_guard.fail(error);
-                    callback_state.complete(&callback_id);
+                    callback_state.complete(&callback_id, &cancellation);
                     return;
                 }
             };
@@ -4943,7 +4973,7 @@ where
             {
                 Ok(_) => {
                     completion_guard.disarm();
-                    callback_state.complete(&callback_id);
+                    callback_state.complete(&callback_id, &cancellation);
                 }
                 // A matching protocol cancellation (or structured close)
                 // aborts this callback's Cx while it may be queued on the
@@ -4951,24 +4981,24 @@ where
                 // write failure and therefore not connection-terminal.
                 Err(TransportError::Cancelled) if !cancellation.is_open() => {
                     completion_guard.disarm();
-                    callback_state.complete(&callback_id);
+                    callback_state.complete(&callback_id, &cancellation);
                 }
                 Err(error) => {
                     let error = transport_error_to_mcp(error);
                     completion_guard.fail(error);
-                    callback_state.complete(&callback_id);
+                    callback_state.complete(&callback_id, &cancellation);
                 }
             }
         }) {
             Ok(task) => task,
             Err(_) => {
-                self.state.complete(&request_id);
+                self.state.complete(&request_id, &task_cancellation);
                 return Err(McpError::internal_error(
                     "WebSocket reverse callback dispatcher is unavailable",
                 ));
             }
         };
-        tasks.push((request_id, task));
+        tasks.push((request_id, task_cancellation, task));
         Ok(())
     }
 
@@ -4979,7 +5009,7 @@ where
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (task_id, task) in tasks.iter() {
+            for (task_id, _, task) in tasks.iter() {
                 if task_id.correlates_with(request_id) {
                     task.abort();
                 }
@@ -4994,7 +5024,7 @@ where
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (_, task) in tasks.iter() {
+        for (_, _, task) in tasks.iter() {
             task.abort();
         }
     }
@@ -5005,14 +5035,22 @@ where
         })?;
         let mut active = Vec::with_capacity(tasks.len());
         let mut panicked = false;
-        for (request_id, mut task) in std::mem::take(&mut *tasks) {
+        for (request_id, cancellation, mut task) in std::mem::take(&mut *tasks) {
             match task.try_join() {
-                Ok(None) => active.push((request_id, task)),
-                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Ok(None) => active.push((request_id, cancellation, task)),
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                    // A callback task may be cancelled before its completion
+                    // guard is constructed. Reap must retire its exact owner
+                    // so a finished worker cannot strand the request ID.
+                    self.state.complete(&request_id, &cancellation);
+                }
                 Err(
                     asupersync::runtime::JoinError::Panicked(_)
                     | asupersync::runtime::JoinError::PolledAfterCompletion,
-                ) => panicked = true,
+                ) => {
+                    self.state.complete(&request_id, &cancellation);
+                    panicked = true;
+                }
             }
         }
         let active_count = active.len();
@@ -26796,6 +26834,322 @@ mod tests {
                 .all(ReverseRequestCancellation::is_cancel_requested),
             "shutdown cancellation reaches every bounded admission"
         );
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fnd_04_b_reverse_callback_success_retires_worker_for_same_connection_reuse() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "IFS= read -r first || exit 90; case \"$first\" in *'\"id\":41'*) ;; *) exit 91;; esac; case \"$first\" in *'\"model\":\"reuse-test\"'*) ;; *) exit 91;; esac; printf 'first\\n'; IFS= read -r second || exit 92; case \"$second\" in *'\"id\":41'*) ;; *) exit 93;; esac; case \"$second\" in *'\"model\":\"reuse-test\"'*) ;; *) exit 93;; esac; printf 'second\\n'; exit 0",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("callback peer accepts the real response stream");
+        let child_stdout = child
+            .stdout
+            .take()
+            .expect("callback peer stdout is piped for response acknowledgement");
+        let (child_marker_tx, child_marker_rx) = mpsc::sync_channel::<String>(2);
+        let child_marker_reader = std::thread::spawn(move || {
+            let mut child_stdout = child_stdout;
+            let mut marker = Vec::new();
+            let mut byte = [0_u8; 1];
+            loop {
+                match child_stdout.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(1) if byte[0] == b'\n' => {
+                        child_marker_tx
+                            .send(
+                                String::from_utf8(std::mem::take(&mut marker))
+                                    .expect("callback peer acknowledgement marker is UTF-8"),
+                            )
+                            .expect("callback response acknowledgement receiver remains live");
+                    }
+                    Ok(1) => marker.push(byte[0]),
+                    Ok(_) => unreachable!("one-byte callback acknowledgement read is bounded"),
+                    Err(error) => panic!("read callback peer response acknowledgement: {error}"),
+                }
+            }
+        });
+        let sender = Arc::new(Mutex::new(
+            StdioTransport::new(
+                std::io::empty(),
+                child.stdin.take().expect("callback peer stdin is piped"),
+            )
+            .into_split()
+            .1,
+        ));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("callback retirement runtime builds");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("callback task has an ambient caller context");
+            let pool = ReverseCallbackPool::new(sender, cx.clone());
+            let request_id = RequestId::Number(41);
+            let params: CreateMessageParams = serde_json::from_value(serde_json::json!({
+                "messages": [],
+                "maxTokens": 1
+            }))
+            .expect("callback parameters are valid");
+            let second_params = params.clone();
+            let handler: SamplingRequestHandler = Arc::new(
+                |_cx: &Cx,
+                 _cancellation: ReverseRequestCancellation,
+                 _params: CreateMessageParams| {
+                    Box::pin(async { Ok(CreateMessageResult::text("ok", "reuse-test")) })
+                },
+            );
+            pool.dispatch(request_id.clone(), params, Arc::clone(&handler))
+                .expect("normal callback is admitted");
+            let first_cancellation = pool
+                .state
+                .active
+                .lock()
+                .expect("callback registry is available")
+                .iter()
+                .find(|callback| callback.request_id == request_id)
+                .expect("first callback remains registered before its worker runs")
+                .cancellation
+                .clone();
+
+            let first_deadline = Instant::now() + Duration::from_secs(2);
+            while pool
+                .reap_finished_tasks()
+                .expect("callback worker can be reaped")
+                != 0
+            {
+                assert!(
+                    Instant::now() < first_deadline,
+                    "first callback must settle"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                pool.reap_finished_tasks()
+                    .expect("completed callback worker remains reapable"),
+                0
+            );
+            pool.dispatch(request_id.clone(), second_params, handler)
+                .expect("the completed callback ID is reusable on the same connection");
+            // Model the old worker's late completion after the ID has been
+            // reused. Its exact cancellation token must not retire the new
+            // callback owner.
+            pool.state.complete(&request_id, &first_cancellation);
+            let new_cancellation = {
+                let active = pool
+                    .state
+                    .active
+                    .lock()
+                    .expect("callback registry is available");
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "stale completion must retain the new owner"
+                );
+                active
+                    .iter()
+                    .find(|callback| callback.request_id == request_id)
+                    .expect("same-ID callback remains registered after stale completion")
+                    .cancellation
+                    .clone()
+            };
+            assert!(
+                new_cancellation.is_open(),
+                "the new callback remains independently selectable"
+            );
+            assert!(
+                !new_cancellation.belongs_to_same_request(&first_cancellation),
+                "stale completion must not alias the new callback owner"
+            );
+            let mut child_markers = Vec::new();
+            let second_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                while let Ok(marker) = child_marker_rx.try_recv() {
+                    child_markers.push(marker);
+                }
+                let active_callbacks = pool
+                    .reap_finished_tasks()
+                    .expect("reused callback can be reaped");
+                if child_markers == ["first", "second"] && active_callbacks == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < second_deadline,
+                    "both callbacks and peer acknowledgements must settle: {child_markers:?}"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                child_markers,
+                ["first", "second"],
+                "the peer must validate and acknowledge both real callback responses before cleanup"
+            );
+            pool.state.cancel_all();
+        });
+        let status = child
+            .wait()
+            .expect("callback peer exits after writer close");
+        assert!(status.success(), "callback peer exit status: {status:?}");
+        child_marker_reader
+            .join()
+            .expect("callback peer acknowledgement reader joins");
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fnd_04_b_reverse_callback_cancel_retires_target_preserves_sibling() {
+        let mut child = Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("callback peer accepts the real response stream");
+        let sender = Arc::new(Mutex::new(
+            StdioTransport::new(
+                std::io::empty(),
+                child.stdin.take().expect("callback peer stdin is piped"),
+            )
+            .into_split()
+            .1,
+        ));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("callback retirement runtime builds");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("callback task has an ambient caller context");
+            let pool = ReverseCallbackPool::new(sender, cx.clone());
+            let target_id = RequestId::Number(41);
+            let sibling_id = RequestId::Number(42);
+            let started = Arc::new(AtomicUsize::new(0));
+            // Isolate retirement by the real task reaper: these runtime-owned
+            // tasks acknowledge cancellation but deliberately do not call the
+            // callback body's normal state.complete path. This is a runtime
+            // unit test; the companion test covers actual callback responses.
+            for request_id in [&target_id, &sibling_id] {
+                let cancellation = pool.state.admit(request_id).expect("owner is admitted");
+                let task_started = Arc::clone(&started);
+                let task = cx
+                    .spawn(move |task_cx| async move {
+                        let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+                        task_started.fetch_add(1, Ordering::AcqRel);
+                        assert!(receiver.recv(&task_cx).await.is_err());
+                    })
+                    .expect("caller runtime owns the cancellable task");
+                pool.tasks
+                    .lock()
+                    .expect("callback worker registry is available")
+                    .push((request_id.clone(), cancellation, task));
+            }
+            let started_deadline = Instant::now() + Duration::from_secs(2);
+            while started.load(Ordering::Acquire) != 2 {
+                assert!(
+                    Instant::now() < started_deadline,
+                    "both owned tasks must start"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+
+            let sibling_cancellation = pool
+                .state
+                .active
+                .lock()
+                .expect("callback registry is available")
+                .iter()
+                .find(|callback| callback.request_id == sibling_id)
+                .expect("sibling remains registered")
+                .cancellation
+                .clone();
+            {
+                let tasks = pool
+                    .tasks
+                    .lock()
+                    .expect("callback worker registry is available");
+                tasks
+                    .iter()
+                    .find(|(request_id, _, _)| *request_id == target_id)
+                    .expect("target worker is owned before cancellation")
+                    .2
+                    .abort();
+            }
+
+            let target_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                pool.reap_finished_tasks()
+                    .expect("cancelled worker can be reaped");
+                let target_worker_retained = pool
+                    .tasks
+                    .lock()
+                    .expect("callback worker registry is available")
+                    .iter()
+                    .any(|(request_id, _, _)| *request_id == target_id);
+                if !target_worker_retained {
+                    break;
+                }
+                assert!(
+                    Instant::now() < target_deadline,
+                    "cancelled target must settle"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            assert!(
+                !pool
+                    .tasks
+                    .lock()
+                    .expect("callback worker registry is available")
+                    .iter()
+                    .any(|(request_id, _, _)| *request_id == target_id),
+                "the aborted target worker must settle before state retirement is checked"
+            );
+            assert!(
+                !sibling_cancellation.is_cancel_requested(),
+                "reaping the target worker must not cancel its sibling"
+            );
+            assert!(
+                !pool.state.cancel(&target_id),
+                "the cancelled target must already be retired from the registry"
+            );
+            pool.state
+                .admit(&target_id)
+                .expect("the cancelled target ID is reusable after worker retirement");
+            assert!(
+                pool.state.cancel(&sibling_id),
+                "sibling cancellation remains independently selectable"
+            );
+            {
+                let tasks = pool
+                    .tasks
+                    .lock()
+                    .expect("callback worker registry is available");
+                tasks
+                    .iter()
+                    .find(|(request_id, _, _)| *request_id == sibling_id)
+                    .expect("sibling worker remains owned")
+                    .2
+                    .abort();
+            }
+            let sibling_deadline = Instant::now() + Duration::from_secs(2);
+            while pool
+                .reap_finished_tasks()
+                .expect("sibling worker can be reaped")
+                != 0
+            {
+                assert!(
+                    Instant::now() < sibling_deadline,
+                    "cancelled sibling must settle"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            pool.state.cancel_all();
+        });
+        let status = child
+            .wait()
+            .expect("callback peer exits after writer close");
+        assert!(status.success(), "callback peer exit status: {status:?}");
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[cfg(unix)]

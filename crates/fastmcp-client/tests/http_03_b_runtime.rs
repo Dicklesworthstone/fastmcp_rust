@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use asupersync::http::h1::ClientError;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{CancelKind, Cx};
 #[cfg(feature = "legacy-2024-11-05")]
@@ -15,13 +16,18 @@ use fastmcp_client::ProtocolEra;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::http_executor::ModernHttpResponseKind;
 use fastmcp_client::http_executor::{
-    ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError,
+    ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
+    ModernHttpFinalCoreListenError,
 };
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_client::sse::SseLimits;
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
-use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolPolicy};
-use fastmcp_protocol::RequestId;
-use fastmcp_protocol::{ClientCapabilities, ClientInfo};
+use fastmcp_client::{
+    CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientProtocolPlan, ProtocolPolicy,
+    RequestTimeoutPolicy, RequestTimeoutSource,
+};
+use fastmcp_protocol::{ClientCapabilities, ClientInfo, ProgressMarker, RequestId};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
 
@@ -522,6 +528,68 @@ fn test_policy() -> ProtocolPolicy {
     return ProtocolPolicy::ModernOnly;
 }
 
+fn public_modern_builder(target: &str, timeout_policy: RequestTimeoutPolicy) -> ClientBuilder {
+    ClientBuilder::new()
+        .client_info("http-03-runtime-client", "1.0.0")
+        .protocol_plan(plan(
+            target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            ProtocolPolicy::ModernOnly,
+        ))
+        .request_timeout_policy(timeout_policy)
+}
+
+fn require_modern_response(
+    response: fastmcp_client::ClientHttpResponse,
+) -> fastmcp_client::http_executor::ModernHttpResponseStream {
+    match response {
+        fastmcp_client::ClientHttpResponse::Modern(response) => response,
+        #[cfg(feature = "legacy-2024-11-05")]
+        fastmcp_client::ClientHttpResponse::Legacy(_) => {
+            panic!("modern-only builder must not select legacy HTTP")
+        }
+    }
+}
+
+fn begin_sse_response(stream: &mut TcpStream) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write SSE response head");
+    stream.flush().expect("flush SSE response head");
+}
+
+fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) -> std::io::Result<()> {
+    write!(stream, "data: {payload}\n\n")?;
+    stream.flush()
+}
+
+fn progress_event(marker: &ProgressMarker, progress: u64) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": marker,
+            "progress": progress,
+            "total": 32,
+        },
+    })
+}
+
+fn terminal_event(request_id: u64, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "resultType": "complete",
+            "content": [{"type": "text", "text": text}],
+            "isError": false,
+        },
+    })
+}
+
 struct RedirectTestRig {
     primary_listener: TcpListener,
     redirect_listener: TcpListener,
@@ -881,34 +949,26 @@ fn http_03_b_pending_body_read_positive() {
     });
 
     runtime_block_on(async {
-        let cx = Cx::for_request();
-        let outcome = ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/legacy-sse",
-                "http://127.0.0.1:9/legacy-message",
-                test_policy(),
-            ),
-            client_info(),
-            ClientCapabilities::default(),
-        )
-        .await
-        .expect("connect must succeed");
-
-        let client = outcome
-            .into_modern()
-            .expect("modern client must be selected");
-
-        let response1 = client
-            .request(
-                &cx,
-                "tools/call",
-                serde_json::json!({"name": "test_tool", "arguments": {}}),
-                Some(RequestId::Number(2)),
-            )
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(500), Duration::from_secs(3))
+                .expect("body test timeout policy must be valid");
+        let mut client = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
             .await
-            .expect("request 1 headers must arrive");
+            .expect("public builder HTTP connection must succeed");
+
+        let response1 = require_modern_response(
+            client
+                .request(
+                    &cx,
+                    "tools/call",
+                    serde_json::json!({"name": "test_tool", "arguments": {}}),
+                    RequestId::Number(2),
+                )
+                .await
+                .expect("request 1 headers must arrive"),
+        );
         assert_eq!(response1.metadata().status(), 200);
 
         let mut read_future = Box::pin(response1.read_to_end(&cx, 4096));
@@ -928,15 +988,17 @@ fn http_03_b_pending_body_read_positive() {
         let json1: serde_json::Value = serde_json::from_slice(&body1).expect("parse json 1");
         assert_eq!(json1["result"]["content"][0]["text"], "positive-1");
 
-        let response2 = client
-            .request(
-                &cx,
-                "tools/call",
-                serde_json::json!({"name": "test_tool", "arguments": {}}),
-                Some(RequestId::Number(3)),
-            )
-            .await
-            .expect("sibling request must succeed");
+        let response2 = require_modern_response(
+            client
+                .request(
+                    &cx,
+                    "tools/call",
+                    serde_json::json!({"name": "test_tool", "arguments": {}}),
+                    RequestId::Number(3),
+                )
+                .await
+                .expect("sibling request must succeed"),
+        );
         assert_eq!(response2.metadata().status(), 200);
         let body2 = response2.read_to_end(&cx, 4096).await.expect("read body 2");
         let json2: serde_json::Value = serde_json::from_slice(&body2).expect("parse json 2");
@@ -979,35 +1041,30 @@ fn http_03_b_pending_body_ambient_cancellation_planted_negative() {
         );
     });
 
-    runtime_block_on(async {
-        let cx = Cx::for_request();
-        let outcome = ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/legacy-sse",
-                "http://127.0.0.1:9/legacy-message",
-                test_policy(),
-            ),
-            client_info(),
-            ClientCapabilities::default(),
-        )
-        .await
-        .expect("connect must succeed");
-
-        let client = outcome
-            .into_modern()
-            .expect("modern client must be selected");
-
-        let response1 = client
-            .request(
-                &cx,
-                "tools/call",
-                serde_json::json!({"name": "test_tool", "arguments": {}}),
-                Some(RequestId::Number(2)),
-            )
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("cancellation-isolation runtime must build");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(500), Duration::from_secs(3))
+                .expect("body test timeout policy must be valid");
+        let mut client = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
             .await
-            .expect("request 1 headers must arrive");
+            .expect("public builder HTTP connection must succeed");
+
+        let response1 = require_modern_response(
+            client
+                .request(
+                    &cx,
+                    "tools/call",
+                    serde_json::json!({"name": "test_tool", "arguments": {}}),
+                    RequestId::Number(2),
+                )
+                .await
+                .expect("request 1 headers must arrive"),
+        );
         assert_eq!(response1.metadata().status(), 200);
 
         let mut read_future = Box::pin(response1.read_to_end(&cx, 4096));
@@ -1043,16 +1100,18 @@ fn http_03_b_pending_body_ambient_cancellation_planted_negative() {
 
         drop(read_future);
 
-        let sibling_cx = Cx::for_request();
-        let response2 = client
-            .request(
-                &sibling_cx,
-                "tools/call",
-                serde_json::json!({"name": "test_tool", "arguments": {}}),
-                Some(RequestId::Number(3)),
-            )
-            .await
-            .expect("sibling request must succeed");
+        let sibling_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let response2 = require_modern_response(
+            client
+                .request(
+                    &sibling_cx,
+                    "tools/call",
+                    serde_json::json!({"name": "test_tool", "arguments": {}}),
+                    RequestId::Number(3),
+                )
+                .await
+                .expect("sibling request must succeed"),
+        );
         assert_eq!(response2.metadata().status(), 200);
         let body2 = response2
             .read_to_end(&sibling_cx, 4096)
@@ -1063,6 +1122,474 @@ fn http_03_b_pending_body_ambient_cancellation_planted_negative() {
     });
 
     server.join().expect("server join");
+}
+
+#[test]
+fn http_03_b_public_builder_progress_resets_idle_but_not_absolute_positive() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind progress listener");
+    let address = listener
+        .local_addr()
+        .expect("read progress listener address");
+    let target = format!("http://{address}/mcp");
+    let marker = ProgressMarker::from("http-03-progress");
+    let server_marker = marker.clone();
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut request = accept_bounded_stream(&listener);
+        let captured = read_request(&mut request);
+        assert_final_metadata(&captured, "tools/call");
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("request body must be JSON");
+        assert_eq!(
+            request_json["params"]["_meta"]["progressToken"],
+            serde_json::to_value(&server_marker).expect("progress marker must serialize")
+        );
+        begin_sse_response(&mut request);
+        for progress in 1..=4 {
+            write_sse_event(&mut request, &progress_event(&server_marker, progress))
+                .expect("write progress event");
+            thread::sleep(Duration::from_millis(100));
+        }
+        write_sse_event(&mut request, &terminal_event(2, "progress-reset-ok"))
+            .expect("write terminal event");
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                .expect("progress timeout policy must be valid")
+                .reset_idle_on_matching_progress(true);
+        let connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let mut listener = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "progress_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker},
+                }),
+                RequestId::Number(2),
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("open public final core listener");
+
+        for expected in 1..=4 {
+            let event = listener
+                .next_event(&cx)
+                .await
+                .expect("matching progress must remain admissible")
+                .expect("progress event must precede terminal");
+            assert!(matches!(
+                event,
+                ModernHttpFinalCoreEvent::Progress(progress)
+                    if progress.progress_token == marker
+                        && progress.progress.as_str() == expected.to_string()
+            ));
+        }
+        let terminal = listener
+            .next_event(&cx)
+            .await
+            .expect("terminal must remain admissible")
+            .expect("terminal event must arrive after progress");
+        assert!(matches!(
+            terminal,
+            ModernHttpFinalCoreEvent::Terminal(fastmcp_protocol::FinalCoreResult::ToolsCall { .. })
+        ));
+    });
+
+    server.join().expect("progress server must join");
+}
+
+#[test]
+fn http_03_b_public_builder_progress_without_idle_reset_planted_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind idle-negative listener");
+    let address = listener
+        .local_addr()
+        .expect("read idle-negative listener address");
+    let target = format!("http://{address}/mcp");
+    let marker = ProgressMarker::from("http-03-progress");
+    let server_marker = marker.clone();
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut request = accept_bounded_stream(&listener);
+        let captured = read_request(&mut request);
+        assert_final_metadata(&captured, "tools/call");
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("request body must be JSON");
+        assert_eq!(
+            request_json["params"]["_meta"]["progressToken"],
+            serde_json::to_value(&server_marker).expect("progress marker must serialize")
+        );
+        begin_sse_response(&mut request);
+        for progress in 1..=4 {
+            if write_sse_event(&mut request, &progress_event(&server_marker, progress)).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = write_sse_event(&mut request, &terminal_event(2, "unexpected"));
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                .expect("idle-negative timeout policy must be valid")
+                .reset_idle_on_matching_progress(false);
+        let connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let mut listener = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "progress_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker},
+                }),
+                RequestId::Number(2),
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("open public final core listener");
+        let mut progress_seen = 0_usize;
+        loop {
+            match listener.next_event(&cx).await {
+                Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) => {
+                    assert_eq!(progress.progress_token, marker);
+                    progress_seen = progress_seen.saturating_add(1);
+                }
+                Ok(Some(event)) => {
+                    panic!("idle-negative stream produced a non-progress event: {event:?}")
+                }
+                Ok(None) => panic!("idle-negative stream ended before its idle timeout"),
+                Err(ModernHttpFinalCoreListenError::Executor(
+                    ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle),
+                )) => break,
+                Err(error) => {
+                    panic!("expected idle timeout after reset-disabled progress, got {error:?}")
+                }
+            }
+        }
+        assert!(
+            progress_seen >= 1,
+            "reset-disabled stream must admit at least one matching progress event"
+        );
+    });
+
+    server.join().expect("idle-negative server must join");
+}
+
+#[test]
+fn http_03_b_public_builder_progress_absolute_ceiling_planted_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind absolute-negative listener");
+    let address = listener
+        .local_addr()
+        .expect("read absolute-negative listener address");
+    let target = format!("http://{address}/mcp");
+    let marker = ProgressMarker::from("http-03-progress");
+    let server_marker = marker.clone();
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut request = accept_bounded_stream(&listener);
+        let captured = read_request(&mut request);
+        assert_final_metadata(&captured, "tools/call");
+        begin_sse_response(&mut request);
+        for progress in 1..=32 {
+            if write_sse_event(&mut request, &progress_event(&server_marker, progress)).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(300))
+                .expect("absolute-negative timeout policy must be valid")
+                .reset_idle_on_matching_progress(true);
+        let connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let mut listener = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "progress_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker},
+                }),
+                RequestId::Number(2),
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("open public final core listener");
+        let mut progress_seen = 0_usize;
+        loop {
+            match listener.next_event(&cx).await {
+                Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) => {
+                    assert_eq!(progress.progress_token, marker);
+                    progress_seen = progress_seen.saturating_add(1);
+                }
+                Ok(Some(event)) => {
+                    panic!("progress-only stream produced a non-progress event: {event:?}")
+                }
+                Ok(None) => panic!("progress-only stream ended before its absolute ceiling"),
+                Err(error) => match error {
+                    ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::Timeout(
+                        RequestTimeoutSource::Absolute,
+                    )) => break,
+                    error => {
+                        panic!("expected absolute timeout after repeated progress, got {error:?}")
+                    }
+                },
+            }
+        }
+        assert!(
+            progress_seen >= 2,
+            "absolute ceiling must be reached after repeated progress, saw {progress_seen}"
+        );
+    });
+
+    server.join().expect("absolute-negative server must join");
+}
+
+#[test]
+fn http_03_b_public_builder_json_body_idle_timeout_and_sibling_isolation_positive() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind JSON timeout listener");
+    let address = listener
+        .local_addr()
+        .expect("read JSON timeout listener address");
+    let target = format!("http://{address}/mcp");
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut timed_out = accept_bounded_stream(&listener);
+        let captured = read_request(&mut timed_out);
+        assert_final_metadata(&captured, "tools/call");
+        write!(
+            timed_out,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write withheld JSON response head");
+        timed_out
+            .flush()
+            .expect("flush withheld JSON response head");
+        assert_connection_closed_by_client(&mut timed_out);
+
+        let mut sibling = accept_bounded_stream(&listener);
+        let sibling_request = read_request(&mut sibling);
+        assert_final_metadata(&sibling_request, "tools/call");
+        write_response(
+            &mut sibling,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"sibling-after-timeout"}]}}"#,
+        );
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(50), Duration::from_millis(300))
+                .expect("JSON timeout policy must be valid");
+        let mut connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let response = connection
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "timeout_tool", "arguments": {}}),
+                RequestId::Number(2),
+            )
+            .await
+            .expect("response headers must arrive before the body timeout");
+        let error = match response {
+            fastmcp_client::http_executor::ClientHttpResponse::Modern(response) => response
+                .read_to_end(&cx, 4_096)
+                .await
+                .expect_err("withheld JSON body must hit idle timeout"),
+            #[cfg(feature = "legacy-2024-11-05")]
+            fastmcp_client::http_executor::ClientHttpResponse::Legacy(_) => {
+                panic!("modern-only builder must not select legacy HTTP")
+            }
+        };
+        assert!(matches!(
+            error,
+            ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle)
+        ));
+
+        let sibling = connection
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "timeout_tool", "arguments": {}}),
+                RequestId::Number(3),
+            )
+            .await
+            .expect("sibling request must remain usable after timeout");
+        let sibling = match sibling {
+            fastmcp_client::http_executor::ClientHttpResponse::Modern(response) => response
+                .read_to_end(&cx, 4_096)
+                .await
+                .expect("read sibling JSON body"),
+            #[cfg(feature = "legacy-2024-11-05")]
+            fastmcp_client::http_executor::ClientHttpResponse::Legacy(_) => {
+                panic!("modern-only builder must not select legacy HTTP")
+            }
+        };
+        let sibling_json: serde_json::Value =
+            serde_json::from_slice(&sibling).expect("sibling body must be JSON");
+        assert_eq!(
+            sibling_json["result"]["content"][0]["text"],
+            "sibling-after-timeout"
+        );
+    });
+
+    server.join().expect("JSON timeout server must join");
+}
+
+#[test]
+fn http_03_b_public_builder_json_body_shorter_caller_budget_planted_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind caller-budget listener");
+    let address = listener
+        .local_addr()
+        .expect("read caller-budget listener address");
+    let target = format!("http://{address}/mcp");
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+
+        let mut request = accept_bounded_stream(&listener);
+        let captured = read_request(&mut request);
+        assert_final_metadata(&captured, "tools/call");
+        write!(
+            request,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write withheld caller-budget response head");
+        request
+            .flush()
+            .expect("flush withheld caller-budget response head");
+        assert_connection_closed_by_client(&mut request);
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("caller-budget runtime must build");
+    runtime.block_on(async {
+        let runtime_cx = Cx::current().expect("caller runtime must install a current Cx");
+        let request_cx =
+            runtime.request_cx_with_budget(runtime_cx.budget_for_timeout(Duration::from_secs(5)));
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+                .expect("caller-budget timeout policy must be valid");
+        let mut connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&request_cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let response = connection
+            .request(
+                &request_cx,
+                "tools/call",
+                serde_json::json!({"name": "caller_budget_tool", "arguments": {}}),
+                RequestId::Number(2),
+            )
+            .await
+            .expect("response headers must arrive before caller body deadline");
+        let body_cx = runtime
+            .request_cx_with_budget(runtime_cx.budget_for_timeout(Duration::from_millis(50)));
+        let error = match response {
+            fastmcp_client::http_executor::ClientHttpResponse::Modern(response) => response
+                .read_to_end(&body_cx, 4_096)
+                .await
+                .expect_err("shorter caller body budget must stop the withheld body"),
+            #[cfg(feature = "legacy-2024-11-05")]
+            fastmcp_client::http_executor::ClientHttpResponse::Legacy(_) => {
+                panic!("modern-only builder must not select legacy HTTP")
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded)
+            ),
+            "the shorter caller budget must remain a typed deadline: {error:?}"
+        );
+    });
+
+    server.join().expect("caller-budget server must join");
+}
+
+#[test]
+fn http_03_b_public_builder_response_head_timeout_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind response-head listener");
+    let address = listener
+        .local_addr()
+        .expect("read response-head listener address");
+    let target = format!("http://{address}/mcp");
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut probe);
+        let mut request = accept_bounded_stream(&listener);
+        let captured = read_request(&mut request);
+        assert_final_metadata(&captured, "tools/call");
+        assert_connection_closed_by_client(&mut request);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(50), Duration::from_millis(300))
+                .expect("response-head timeout policy must be valid");
+        let mut connection = public_modern_builder(&target, timeout_policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder HTTP connection must succeed");
+        let error = connection
+            .request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "head_timeout_tool", "arguments": {}}),
+                RequestId::Number(2),
+            )
+            .await;
+        let error = match error {
+            Ok(response) => {
+                let _ = require_modern_response(response);
+                panic!("withheld response headers must hit idle timeout");
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle)
+            ))
+        ));
+    });
+
+    server.join().expect("response-head server must join");
 }
 
 /// TLS protocol-peer tests, not a deployed MCP server or tenant-isolation proof.

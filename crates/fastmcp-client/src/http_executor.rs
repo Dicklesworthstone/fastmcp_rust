@@ -8,18 +8,23 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::bytes::Buf;
 use asupersync::channel::oneshot;
-use asupersync::http::h1::http_client::ClientIo;
+use asupersync::http::h1::http_client::{ClientIo, ParsedUrl, Scheme};
 use asupersync::http::h1::{
-    ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
+    ClientError, ClientIncomingBody, ClientStreamingResponse, Http1Client, Method, Request,
 };
+use asupersync::http::h1::{HttpClient, RedirectPolicy, RetryPolicy};
 use asupersync::http::{Body, Frame};
+use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+use asupersync::net::TcpStream;
+use asupersync::time::Sleep;
+use asupersync::types::Time;
 use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::ExtensionDirection;
@@ -65,8 +70,9 @@ use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError, Sse
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
-    MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, ReverseCallbackState,
-    ReverseRequestCancellation, ReverseRequestHandlers, validate_protocol_plan_feature,
+    MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
+    ReverseCallbackState, ReverseRequestCancellation, ReverseRequestHandlers,
+    validate_protocol_plan_feature,
 };
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
@@ -432,12 +438,238 @@ impl ModernHttpResponseMetadata {
     }
 }
 
+// Only the full HTTP request flush commits a response wait. Modern requests
+// never use Expect: 100-continue, so there is no earlier header-only flush.
+struct ModernHttpIo {
+    inner: ClientIo,
+    cx: Cx,
+    committed_at: Arc<OnceLock<Time>>,
+}
+
+impl AsyncRead for ModernHttpIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let _caller = Cx::set_current(Some(self.cx.clone()));
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ModernHttpIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let _caller = Cx::set_current(Some(self.cx.clone()));
+        Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let _caller = Cx::set_current(Some(self.cx.clone()));
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                let _ = self.committed_at.set(self.cx.now());
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let _caller = Cx::set_current(Some(self.cx.clone()));
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct HttpResponseDeadline {
+    cx: Cx,
+    committed_at: Arc<OnceLock<Time>>,
+    policy: Option<RequestTimeoutPolicy>,
+    response_deadlines: Option<(Time, Time)>,
+    caller_deadline: Option<Time>,
+    sleep: Option<Sleep>,
+    progress_marker: Option<fastmcp_protocol::ProgressMarker>,
+    last_progress: Option<fastmcp_protocol::common_types::ExactNonNegativeJsonNumber>,
+}
+
+impl HttpResponseDeadline {
+    fn add_timeout(
+        now: Time,
+        timeout: std::time::Duration,
+    ) -> Result<Time, ModernHttpExecutorError> {
+        u64::try_from(timeout.as_nanos())
+            .ok()
+            .and_then(|nanos| now.as_nanos().checked_add(nanos))
+            .map(Time::from_nanos)
+            .ok_or(ModernHttpExecutorError::InvalidTimeoutPolicy)
+    }
+
+    fn check(&mut self) -> Result<(), ModernHttpExecutorError> {
+        check_modern_http_context(&self.cx)?;
+        if self.response_deadlines.is_none()
+            && let (Some(policy), Some(committed_at)) = (self.policy, self.committed_at.get())
+        {
+            self.response_deadlines = Some((
+                Self::add_timeout(*committed_at, policy.idle_timeout())?,
+                Self::add_timeout(*committed_at, policy.absolute_timeout())?,
+            ));
+        }
+        let now = self.cx.now();
+        let response_bound = self
+            .response_deadlines
+            .map(|(idle, absolute)| idle.min(absolute));
+        if let Some(caller_deadline) = self.caller_deadline
+            && now >= caller_deadline
+            && response_bound.is_none_or(|bound| caller_deadline <= bound)
+        {
+            return Err(ModernHttpExecutorError::Transport(
+                ClientError::DeadlineExceeded,
+            ));
+        }
+        if let Some((idle, absolute)) = self.response_deadlines {
+            let (deadline, source) = if absolute <= idle {
+                (absolute, RequestTimeoutSource::Absolute)
+            } else {
+                (idle, RequestTimeoutSource::Idle)
+            };
+            if now >= deadline {
+                return Err(ModernHttpExecutorError::Timeout(source));
+            }
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Result<(), ModernHttpExecutorError> {
+        self.check()?;
+        let next = self
+            .response_deadlines
+            .map(|(idle, absolute)| idle.min(absolute));
+        let Some(next) = next.into_iter().chain(self.caller_deadline).min() else {
+            return Ok(());
+        };
+        let sleep = self.sleep.get_or_insert_with(|| Sleep::new(next));
+        if sleep.deadline() != next {
+            sleep.reset(next);
+        }
+        // Native Sleep binds its driver at poll time. Install only the actual
+        // caller context for this poll, restoring the ambient context before
+        // returning; no runtime or independent timer task is created here.
+        let ready = {
+            let _caller = Cx::set_current(Some(self.cx.clone()));
+            Pin::new(sleep).poll(cx).is_ready()
+        };
+        if ready {
+            self.check()?;
+        }
+        // Registration and a timer firing can race; do not admit late data.
+        self.check()
+    }
+
+    fn constrain_to(&mut self, cx: &Cx) {
+        self.caller_deadline = self
+            .caller_deadline
+            .into_iter()
+            .chain(cx.budget().deadline)
+            .min();
+    }
+
+    fn observe_progress(
+        &mut self,
+        progress: &FinalProgressNotificationParams,
+    ) -> Result<(), ModernHttpExecutorError> {
+        self.check()?;
+        if self.progress_marker.as_ref() != Some(&progress.progress_token)
+            || self
+                .last_progress
+                .as_ref()
+                .is_some_and(|last| progress.progress.cmp(last).is_le())
+        {
+            return Ok(());
+        }
+        self.last_progress = Some(progress.progress.clone());
+        if let Some(policy) = self.policy
+            && policy.resets_idle_on_matching_progress()
+            && let Some((idle, _)) = &mut self.response_deadlines
+        {
+            *idle = Self::add_timeout(self.cx.now(), policy.idle_timeout())?;
+        }
+        Ok(())
+    }
+}
+
+/// A native response body retaining its request's deadline and socket ownership.
+/// Extracting the native response does not remove idle/absolute enforcement.
+pub struct ModernHttpBody {
+    inner: Option<ClientIncomingBody<ModernHttpIo>>,
+    deadline: HttpResponseDeadline,
+}
+
+impl ModernHttpBody {
+    fn check_deadline(&mut self) -> Result<(), ModernHttpExecutorError> {
+        if let Err(error) = self.deadline.check() {
+            self.inner = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Body for ModernHttpBody {
+    type Data = asupersync::bytes::BytesCursor;
+    type Error = ModernHttpExecutorError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        if let Err(error) = self.deadline.poll(cx) {
+            self.inner = None;
+            return Poll::Ready(Some(Err(error)));
+        }
+        let frame = Pin::new(self.inner.as_mut().expect("body ownership checked")).poll_frame(cx);
+        if let Err(error) = self.check_deadline() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        match frame {
+            Poll::Ready(Some(Err(_))) => {
+                self.inner = None;
+                Poll::Ready(Some(Err(ModernHttpExecutorError::ResponseBodyReadFailed)))
+            }
+            Poll::Ready(None) => {
+                self.inner = None;
+                Poll::Ready(None)
+            }
+            other => other.map(|frame| {
+                frame.map(|result| {
+                    result.map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)
+                })
+            }),
+        }
+    }
+}
+
+/// Native HTTP response metadata and a body that keeps MCP deadline enforcement.
+pub struct ModernHttpNativeResponse {
+    /// The admitted HTTP response head.
+    pub head: asupersync::http::h1::stream::ResponseHead,
+    /// The exclusively owned, deadline-aware response body.
+    pub body: ModernHttpBody,
+    /// Whether the native sender withheld a request body.
+    pub body_withheld: bool,
+}
+
 /// A live native response stream, owned by one modern POST.
 pub struct ModernHttpResponseStream {
     metadata: ModernHttpResponseMetadata,
     // Keep the native connection state out of each enclosing request future.
     // Ownership remains exclusive, including on cancellation and stream refusal.
-    response: Box<ClientStreamingResponse<ClientIo>>,
+    response: Box<ModernHttpNativeResponse>,
     diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
 }
 
@@ -457,9 +689,11 @@ impl ModernHttpResponseStream {
         &self.metadata
     }
 
-    /// Consumes this wrapper and returns the native cancel-aware response stream.
+    /// Returns the native response with its request-owned deadline still enforced.
+    /// Use [`Self::into_sse_stream`] when admitted MCP progress should reset
+    /// idle time; raw body bytes never count as progress.
     #[must_use]
-    pub fn into_native(self) -> ClientStreamingResponse<ClientIo> {
+    pub fn into_native(self) -> ModernHttpNativeResponse {
         *self.response
     }
 
@@ -588,7 +822,7 @@ impl ModernHttpResponseStream {
     ///
     /// This consumes the stream. It is appropriate for the disposable modern
     /// connection probe and ordinary JSON responses; callers expecting an SSE
-    /// stream should retain [`Self::into_native`] instead.
+    /// stream should use [`Self::into_sse_stream`] instead.
     pub async fn read_to_end(
         self,
         cx: &Cx,
@@ -612,21 +846,25 @@ impl ModernHttpResponseStream {
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, ModernHttpExecutorError> {
         let mut response = self.response;
+        response.body.deadline.constrain_to(cx);
         let mut bytes = Vec::new();
         let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
 
         loop {
-            if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
+            if cancellation.is_cancel_requested() {
                 return Err(ModernHttpExecutorError::Cancelled);
             }
+            check_modern_http_context(cx)?;
             let mut ambient_cancelled = std::pin::pin!(cancellation_signal.recv(cx));
             let frame = poll_fn(|task_cx| {
-                if cx.checkpoint().is_err()
-                    || cancelled.as_mut().poll(task_cx).is_ready()
-                    || ambient_cancelled.as_mut().poll(task_cx).is_ready()
-                {
-                    return Poll::Ready(Err(()));
+                if cancelled.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
+                }
+                check_modern_http_context(cx)?;
+                if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
+                    check_modern_http_context(cx)?;
+                    return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                 }
                 match Pin::new(&mut response.body).poll_frame(task_cx) {
                     Poll::Ready(frame) => Poll::Ready(Ok(frame)),
@@ -634,22 +872,20 @@ impl ModernHttpResponseStream {
                 }
             })
             .await;
-            let frame = frame.map_err(|()| ModernHttpExecutorError::Cancelled)?;
+            let frame = frame?;
             let frame = reject_body_frame_after_cancellation(cx, frame)?;
             let Some(frame) = frame else {
                 break;
             };
-            let Some(mut data) = frame
-                .map_err(|_| ModernHttpExecutorError::ResponseBodyReadFailed)?
-                .into_data()
-            else {
+            let Some(mut data) = frame?.into_data() else {
                 continue;
             };
 
             while data.has_remaining() {
-                if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
+                if cancellation.is_cancel_requested() {
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
+                check_modern_http_context(cx)?;
                 let chunk = data.chunk();
                 if chunk.len() > maximum_bytes.saturating_sub(bytes.len()) {
                     return Err(ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes });
@@ -1438,7 +1674,7 @@ fn decode_final_core_terminal(
 /// refusal immediately drops the response body instead of allowing callers
 /// to continue using a malformed stream.
 pub struct ModernHttpSseResponseStream {
-    response: Option<Box<ClientStreamingResponse<ClientIo>>>,
+    response: Option<Box<ModernHttpNativeResponse>>,
     diagnostic_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
     parser: Option<BoundedSseParser>,
     pending_events: VecDeque<String>,
@@ -1508,6 +1744,18 @@ impl ModernHttpSseResponseStream {
             })?;
         debug_assert!(event_count <= MAX_PENDING_MODERN_HTTP_SSE_EVENTS);
         reject_reflected_credential(self.diagnostic_credential.as_deref(), event.as_bytes())?;
+        // Reset at receipt, not when a slow consumer later dequeues the
+        // event. Invalid JSON-RPC, unrelated tokens, bytes and SSE comments
+        // cannot extend a response wait. The public listener still performs
+        // its own full method/result admission before delivering the event.
+        if let Ok(JsonRpcMessage::Request(request)) =
+            decode_strict_jsonrpc_message(event.as_bytes(), event.len())
+            && request.is_notification()
+            && let Ok(ModernHttpRequestScopedNotification::Progress(progress)) =
+                classify_modern_http_request_scoped_notification(&request, event.as_bytes())
+        {
+            self.observe_progress(&progress)?;
+        }
         self.pending_events.push_back(event);
         self.pending_event_bytes = event_bytes;
         Ok(())
@@ -1544,10 +1792,14 @@ impl ModernHttpSseResponseStream {
     /// The returned payload is not JSON-RPC-admitted. Its caller must decode
     /// it through the protocol's strict response/notification admission path.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
-        if cx.checkpoint().is_err() {
+        if let Err(error) = check_modern_http_context(cx) {
             self.close();
-            return Err(ModernHttpExecutorError::Cancelled);
+            return Err(error);
         }
+        if let Some(response) = &mut self.response {
+            response.body.deadline.constrain_to(cx);
+        }
+        self.check_deadline()?;
         if let Some(event) = self.take_pending_sse_event() {
             return Ok(Some(event));
         }
@@ -1557,9 +1809,9 @@ impl ModernHttpSseResponseStream {
         let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
 
         loop {
-            if cx.checkpoint().is_err() {
+            if let Err(error) = check_modern_http_context(cx) {
                 self.close();
-                return Err(ModernHttpExecutorError::Cancelled);
+                return Err(error);
             }
             let frame = {
                 let response = self
@@ -1582,16 +1834,16 @@ impl ModernHttpSseResponseStream {
                 Ok(frame) => frame,
                 Err(()) => {
                     self.close();
+                    check_modern_http_context(cx)?;
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
             };
             let frame = match reject_body_frame_after_cancellation(cx, frame) {
                 Ok(frame) => frame,
-                Err(ModernHttpExecutorError::Cancelled) => {
+                Err(error) => {
                     self.close();
-                    return Err(ModernHttpExecutorError::Cancelled);
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             };
             let Some(frame) = frame else {
                 let parser = self
@@ -1605,9 +1857,9 @@ impl ModernHttpSseResponseStream {
             };
             let frame = match frame {
                 Ok(frame) => frame,
-                Err(_) => {
+                Err(error) => {
                     self.close();
-                    return Err(ModernHttpExecutorError::ResponseBodyReadFailed);
+                    return Err(error);
                 }
             };
             let Some(mut data) = frame.into_data() else {
@@ -1631,6 +1883,59 @@ impl ModernHttpSseResponseStream {
         Some(event)
     }
 
+    /// Reads one event while also observing cancellation of this request alone.
+    /// The selected cancellation drops the pending read and releases the owned
+    /// stream without cancelling the ambient context or sibling requests.
+    pub async fn next_event_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<Option<String>, ModernHttpExecutorError> {
+        let result = {
+            let mut next = std::pin::pin!(self.next_event(cx));
+            let mut cancelled = std::pin::pin!(cancellation.cancelled());
+            poll_fn(|task_cx| {
+                if cancelled.as_mut().poll(task_cx).is_ready() {
+                    return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
+                }
+                let event = next.as_mut().poll(task_cx);
+                if cancellation.is_cancel_requested() {
+                    Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
+                } else {
+                    event
+                }
+            })
+            .await
+        };
+        if matches!(&result, Err(ModernHttpExecutorError::Cancelled)) {
+            self.close();
+        }
+        result
+    }
+
+    fn check_deadline(&mut self) -> Result<(), ModernHttpExecutorError> {
+        if let Some(response) = &mut self.response
+            && let Err(error) = response.body.check_deadline()
+        {
+            self.close();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn observe_progress(
+        &mut self,
+        progress: &FinalProgressNotificationParams,
+    ) -> Result<(), ModernHttpExecutorError> {
+        if let Some(response) = &mut self.response
+            && let Err(error) = response.body.deadline.observe_progress(progress)
+        {
+            self.close();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Polls for one completed SSE `data` payload without waiting on the body.
     ///
     /// `Poll::Pending` means the body has no frame ready, so a proxy route can
@@ -1639,10 +1944,14 @@ impl ModernHttpSseResponseStream {
         &mut self,
         cx: &Cx,
     ) -> Result<Poll<Option<String>>, ModernHttpExecutorError> {
-        if cx.checkpoint().is_err() {
+        if let Err(error) = check_modern_http_context(cx) {
             self.close();
-            return Err(ModernHttpExecutorError::Cancelled);
+            return Err(error);
         }
+        if let Some(response) = &mut self.response {
+            response.body.deadline.constrain_to(cx);
+        }
+        self.check_deadline()?;
         if let Some(event) = self.take_pending_sse_event() {
             return Ok(Poll::Ready(Some(event)));
         }
@@ -1658,7 +1967,13 @@ impl ModernHttpSseResponseStream {
         let Poll::Ready(frame) = Pin::new(&mut response.body).poll_frame(&mut task_cx) else {
             return Ok(Poll::Pending);
         };
-        let frame = reject_body_frame_after_cancellation(cx, frame)?;
+        let frame = match reject_body_frame_after_cancellation(cx, frame) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
         let Some(frame) = frame else {
             let parser = self
                 .parser
@@ -1671,9 +1986,9 @@ impl ModernHttpSseResponseStream {
         };
         let frame = match frame {
             Ok(frame) => frame,
-            Err(_) => {
+            Err(error) => {
                 self.close();
-                return Err(ModernHttpExecutorError::ResponseBodyReadFailed);
+                return Err(error);
             }
         };
         let Some(mut data) = frame.into_data() else {
@@ -2181,6 +2496,10 @@ pub enum ModernHttpExecutorError {
     InvalidRequestMetadata,
     /// Caller cancellation was observed before dispatching the POST.
     Cancelled,
+    /// A post-commit response deadline expired; the owned exchange is closed.
+    Timeout(RequestTimeoutSource),
+    /// The caller's response policy cannot be represented by the runtime clock.
+    InvalidTimeoutPolicy,
     /// The native HTTP client could not complete the single exchange.
     Transport(ClientError),
     /// A redirect is terminal for MCP and was not followed.
@@ -2231,6 +2550,13 @@ impl fmt::Display for ModernHttpExecutorError {
                 formatter.write_str("invalid modern MCP request metadata")
             }
             Self::Cancelled => formatter.write_str("modern MCP request was cancelled"),
+            Self::Timeout(source) => write!(
+                formatter,
+                "modern MCP request timed out at the {source:?} deadline"
+            ),
+            Self::InvalidTimeoutPolicy => {
+                formatter.write_str("invalid modern MCP response timeout policy")
+            }
             Self::Transport(error) => write!(formatter, "native HTTP exchange failed: {error}"),
             Self::Redirect { status } => {
                 write!(
@@ -2288,7 +2614,7 @@ impl std::error::Error for ModernHttpExecutorError {}
 /// Executes modern MCP HTTP POSTs through explicit native HTTP primitives.
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
-    client: HttpClient,
+    request_timeout_policy: RequestTimeoutPolicy,
     bearer_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
 }
 
@@ -2303,7 +2629,7 @@ impl ModernHttpExecutor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: native_http_client(),
+            request_timeout_policy: RequestTimeoutPolicy::default(),
             bearer_credential: None,
         }
     }
@@ -2312,9 +2638,14 @@ impl ModernHttpExecutor {
         bearer_credential: Option<crate::http_auth::BoundBearerCredential>,
     ) -> Self {
         Self {
-            client: native_http_client(),
+            request_timeout_policy: RequestTimeoutPolicy::default(),
             bearer_credential: bearer_credential.map(Arc::new),
         }
+    }
+
+    fn with_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
+        self.request_timeout_policy = policy;
+        self
     }
 
     /// Sends exactly one POST and returns its still-live response stream.
@@ -2349,17 +2680,41 @@ impl ModernHttpExecutor {
         cancellation: Option<&McpRequestCancellation>,
         request: &ModernHttpRequest,
     ) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
-        if cx.checkpoint().is_err()
-            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-        {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        let mut exchange = Box::pin(self.client.request_streaming(
+        check_modern_http_context(cx)?;
+        self.request_timeout_policy
+            .validate()
+            .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
+        // Reject unrepresentable application timeouts before opening a socket.
+        HttpResponseDeadline::add_timeout(cx.now(), self.request_timeout_policy.idle_timeout())?;
+        HttpResponseDeadline::add_timeout(
+            cx.now(),
+            self.request_timeout_policy.absolute_timeout(),
+        )?;
+        let committed_at = Arc::new(OnceLock::new());
+        let progress_marker = serde_json::from_slice::<serde_json::Value>(request.body())
+            .ok()
+            .and_then(|body| body.pointer("/params/_meta/progressToken").cloned())
+            .and_then(|marker| serde_json::from_value(marker).ok());
+        let mut deadline = HttpResponseDeadline {
+            cx: cx.clone(),
+            committed_at: Arc::clone(&committed_at),
+            // Subscription acknowledgement/event/comment lifetimes are a
+            // separate policy; an ordinary progress-only policy is not one.
+            policy: (request.method != SUBSCRIPTIONS_LISTEN).then_some(self.request_timeout_policy),
+            response_deadlines: None,
+            caller_deadline: cx.budget().deadline,
+            sleep: None,
+            progress_marker,
+            last_progress: None,
+        };
+        let mut exchange = Box::pin(execute_native_modern_request(
             cx,
-            Method::Post,
-            request.target(),
-            request.headers_with_credential(self.bearer_credential.as_deref()),
-            request.body().to_vec(),
+            request,
+            self.bearer_credential.as_deref(),
+            committed_at,
         ));
         // A native response-head wait may remain pending even after the
         // caller's Cx has been cancelled. Keep the request-owned exchange
@@ -2374,44 +2729,49 @@ impl ModernHttpExecutor {
                 let mut cancelled = std::pin::pin!(cancellation.cancelled());
                 let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
                 poll_fn(|task_cx| {
-                    if cx.checkpoint().is_err()
-                        || cancelled.as_mut().poll(task_cx).is_ready()
-                        || ambient_cancelled.as_mut().poll(task_cx).is_ready()
-                    {
-                        return Poll::Ready(Err(()));
+                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                        return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
-                    match exchange.as_mut().poll(task_cx) {
-                        Poll::Ready(response) => Poll::Ready(Ok(response)),
-                        Poll::Pending => Poll::Pending,
+                    check_modern_http_context(cx)?;
+                    if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
+                        check_modern_http_context(cx)?;
+                        return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
+                    deadline.poll(task_cx)?;
+                    let response = {
+                        let _caller = Cx::set_current(Some(cx.clone()));
+                        exchange.as_mut().poll(task_cx)
+                    };
+                    deadline.poll(task_cx)?;
+                    response.map(Ok)
                 })
-                .await
-                .map_err(|()| ModernHttpExecutorError::Cancelled)?
+                .await?
                 .map_err(map_transport_error)?
             }
             None => {
                 let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
                 poll_fn(|task_cx| {
-                    if cx.checkpoint().is_err()
-                        || ambient_cancelled.as_mut().poll(task_cx).is_ready()
-                    {
-                        return Poll::Ready(Err(()));
+                    check_modern_http_context(cx)?;
+                    if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
+                        check_modern_http_context(cx)?;
+                        return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
-                    match exchange.as_mut().poll(task_cx) {
-                        Poll::Ready(response) => Poll::Ready(Ok(response)),
-                        Poll::Pending => Poll::Pending,
-                    }
+                    deadline.poll(task_cx)?;
+                    let response = {
+                        let _caller = Cx::set_current(Some(cx.clone()));
+                        exchange.as_mut().poll(task_cx)
+                    };
+                    deadline.poll(task_cx)?;
+                    response.map(Ok)
                 })
-                .await
-                .map_err(|()| ModernHttpExecutorError::Cancelled)?
+                .await?
                 .map_err(map_transport_error)?
             }
         };
-        if cx.checkpoint().is_err()
-            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
-        {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
             return Err(ModernHttpExecutorError::Cancelled);
         }
+        check_modern_http_context(cx)?;
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
         let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
             let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
@@ -2422,10 +2782,75 @@ impl ModernHttpExecutor {
         });
         Ok(ModernHttpResponseStream {
             metadata,
-            response: Box::new(response),
+            response: Box::new(ModernHttpNativeResponse {
+                head: response.head,
+                body: ModernHttpBody {
+                    inner: Some(response.body),
+                    deadline,
+                },
+                body_withheld: response.body_withheld,
+            }),
             diagnostic_credential,
         })
     }
+}
+
+async fn execute_native_modern_request(
+    cx: &Cx,
+    request: &ModernHttpRequest,
+    credential: Option<&crate::http_auth::BoundBearerCredential>,
+    committed_at: Arc<OnceLock<Time>>,
+) -> Result<ClientStreamingResponse<ModernHttpIo>, ClientError> {
+    let parsed = ParsedUrl::parse(request.target())?;
+    cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+    let host = parsed.host.trim_start_matches('[').trim_end_matches(']');
+    let stream = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        TcpStream::connect(std::net::SocketAddr::new(ip, parsed.port)).await
+    } else {
+        TcpStream::connect(parsed.connect_authority()).await
+    }
+    .map_err(ClientError::ConnectError)?;
+    cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+    let inner = match parsed.scheme {
+        Scheme::Http => ClientIo::Plain(stream),
+        Scheme::Https => {
+            let builder = asupersync::tls::TlsConnectorBuilder::new()
+                .alpn_protocols(vec![b"http/1.1".to_vec()]);
+            #[cfg(feature = "native-tls-roots")]
+            let builder = builder
+                .with_native_roots()
+                .map_err(|error| ClientError::TlsError(error.to_string()))?;
+            #[cfg(not(feature = "native-tls-roots"))]
+            let builder = builder.with_webpki_roots();
+            let connector = builder
+                .build()
+                .map_err(|error| ClientError::TlsError(error.to_string()))?;
+            let tls = connector
+                .connect(host, stream)
+                .await
+                .map_err(|error| ClientError::TlsError(error.to_string()))?;
+            cx.checkpoint().map_err(|_| ClientError::Cancelled)?;
+            ClientIo::Tls(tls)
+        }
+    };
+    // Preserve the native streaming client's wire defaults without introducing
+    // pooling, cookies, proxy routing, redirects, or request replay.
+    let native_request = Request::builder(Method::Post, parsed.path.clone())
+        .header("Host", parsed.authority())
+        .header("User-Agent", "asupersync/0.1")
+        .headers(request.headers_with_credential(credential))
+        .body(request.body().to_vec())
+        .build();
+    Http1Client::request_streaming(
+        ModernHttpIo {
+            inner,
+            cx: cx.clone(),
+            committed_at,
+        },
+        native_request,
+    )
+    .await
+    .map_err(ClientError::from)
 }
 
 fn native_http_client() -> HttpClient {
@@ -2444,6 +2869,7 @@ pub(crate) struct HttpConnectionSettings {
     pub(crate) mcp_apps: Option<McpAppsClientSettings>,
     pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
     pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
+    pub(crate) request_timeout_policy: RequestTimeoutPolicy,
 }
 
 /// A configured native modern HTTP client after one successful modern probe.
@@ -4033,7 +4459,10 @@ impl ClientHttpConnection {
                     ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
                 ));
             }
-            let event = match stream.next_event(cx).await {
+            let event = match match cancellation {
+                Some(cancellation) => stream.next_event_with_cancellation(cx, cancellation).await,
+                None => stream.next_event(cx).await,
+            } {
                 Ok(Some(event)) => event,
                 Ok(None) => {
                     return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
@@ -5189,6 +5618,7 @@ impl ModernHttpClient {
             mcp_apps: mcp_apps_settings,
             extensions: client_extension_runtime,
             bearer: bearer_credential,
+            request_timeout_policy,
         } = settings;
         if let Some(credential) = &bearer_credential {
             let target = protocol_plan
@@ -5248,6 +5678,7 @@ impl ModernHttpClient {
         )?;
 
         let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
+            .with_timeout_policy(request_timeout_policy)
             .execute(cx, &probe_request)
             .await
             .map_err(ModernHttpClientError::Executor)?;
@@ -5302,7 +5733,8 @@ impl ModernHttpClient {
                         server_discovery,
                         negotiated_extensions,
                     }),
-                    executor: ModernHttpExecutor::with_bearer_credential(bearer_credential),
+                    executor: ModernHttpExecutor::with_bearer_credential(bearer_credential)
+                        .with_timeout_policy(request_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
                 }))
             }
@@ -6846,7 +7278,15 @@ fn retire_abandoned_persistent_waiter(
 /// callback that claims its still-open entry may begin a response POST.
 struct LegacySseReverseCallbackDispatcher {
     state: Arc<ReverseCallbackState>,
-    tasks: Arc<std::sync::Mutex<Vec<(Option<RequestId>, asupersync::runtime::TaskHandle<()>)>>>,
+    tasks: Arc<
+        std::sync::Mutex<
+            Vec<(
+                Option<RequestId>,
+                Option<ReverseRequestCancellation>,
+                asupersync::runtime::TaskHandle<()>,
+            )>,
+        >,
+    >,
 }
 
 impl LegacySseReverseCallbackDispatcher {
@@ -6893,6 +7333,7 @@ impl LegacySseReverseCallbackDispatcher {
         let response_id = request_id.clone();
         let callback_id = request_id.clone();
         let invoke_cancellation = cancellation.clone();
+        let task_cancellation = cancellation.clone();
         let task = match cx.spawn(move |callback_cx| async move {
             // This task is connection-owned. It deliberately performs no OS
             // thread handoff: the callback receives the task Cx and can await
@@ -6911,17 +7352,17 @@ impl LegacySseReverseCallbackDispatcher {
                         .stop();
                 }
             }
-            callback_state.complete(&callback_id);
+            callback_state.complete(&callback_id, &cancellation);
         }) {
             Ok(task) => task,
             Err(_) => {
-                self.state.complete(&request_id);
+                self.state.complete(&request_id, &task_cancellation);
                 return Err(McpError::internal_error(
                     "Legacy reverse callback dispatcher is unavailable",
                 ));
             }
         };
-        tasks.push((Some(request_id), task));
+        tasks.push((Some(request_id), Some(task_cancellation), task));
         Ok(())
     }
 
@@ -6956,7 +7397,7 @@ impl LegacySseReverseCallbackDispatcher {
             .map_err(|_| {
                 McpError::internal_error("Legacy reverse response dispatcher is unavailable")
             })?;
-        tasks.push((None, task));
+        tasks.push((None, None, task));
         Ok(())
     }
 
@@ -6967,7 +7408,7 @@ impl LegacySseReverseCallbackDispatcher {
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (task_id, task) in tasks.iter() {
+            for (task_id, _, task) in tasks.iter() {
                 if task_id
                     .as_ref()
                     .is_some_and(|task_id| task_id.correlates_with(request_id))
@@ -6989,11 +7430,27 @@ impl LegacySseReverseCallbackDispatcher {
         })?;
         let mut active = Vec::with_capacity(tasks.len());
         let mut panicked = false;
-        for (request_id, mut task) in std::mem::take(&mut *tasks) {
+        for (request_id, cancellation, mut task) in std::mem::take(&mut *tasks) {
             match task.try_join() {
-                Ok(None) => active.push((request_id, task)),
-                Ok(Some(())) => {}
-                Err(_) => panicked = true,
+                Ok(None) => active.push((request_id, cancellation, task)),
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                    if let (Some(request_id), Some(cancellation)) =
+                        (request_id.as_ref(), cancellation.as_ref())
+                    {
+                        self.state.complete(request_id, cancellation);
+                    }
+                }
+                Err(
+                    asupersync::runtime::JoinError::Panicked(_)
+                    | asupersync::runtime::JoinError::PolledAfterCompletion,
+                ) => {
+                    if let (Some(request_id), Some(cancellation)) =
+                        (request_id.as_ref(), cancellation.as_ref())
+                    {
+                        self.state.complete(request_id, cancellation);
+                    }
+                    panicked = true;
+                }
             }
         }
         let active_count = active.len();
@@ -7015,7 +7472,7 @@ impl LegacySseReverseCallbackDispatcher {
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (_, task) in tasks.iter() {
+        for (_, _, task) in tasks.iter() {
             task.abort();
         }
     }
@@ -8255,6 +8712,21 @@ fn validate_legacy_sse_response_head(
     }
 }
 
+/// Preserve the runtime's deadline reason rather than collapsing every failed
+/// checkpoint into explicit cancellation.
+fn check_modern_http_context(cx: &Cx) -> Result<(), ModernHttpExecutorError> {
+    cx.checkpoint().map_err(|_| {
+        if cx
+            .cancel_reason()
+            .is_some_and(|reason| reason.kind == asupersync::CancelKind::Deadline)
+        {
+            ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded)
+        } else {
+            ModernHttpExecutorError::Cancelled
+        }
+    })
+}
+
 /// Applies the cancellation boundary after the body poll has selected a ready
 /// frame or EOF. The body and cancellation signal can become ready in the same
 /// poll, so the pre-poll cancellation select alone cannot safely admit either
@@ -8263,8 +8735,7 @@ fn reject_body_frame_after_cancellation<T, E>(
     cx: &Cx,
     frame: Option<Result<Frame<T>, E>>,
 ) -> Result<Option<Result<Frame<T>, E>>, ModernHttpExecutorError> {
-    cx.checkpoint()
-        .map_err(|_| ModernHttpExecutorError::Cancelled)?;
+    check_modern_http_context(cx)?;
     Ok(frame)
 }
 
@@ -9318,6 +9789,7 @@ mod tests {
                 ),
                 extensions: Some(generic_mcp_apps_runtime(generic_mime_type)),
                 bearer: None,
+                request_timeout_policy: crate::RequestTimeoutPolicy::default(),
             },
         ))
         .expect("generic Apps discovery selects the modern connection");
@@ -9914,6 +10386,7 @@ mod tests {
                     mcp_apps: None,
                     extensions: Some(Arc::clone(&settings)),
                     bearer: None,
+                    request_timeout_policy: crate::RequestTimeoutPolicy::default(),
                 },
             )
             .await;
@@ -16417,5 +16890,180 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             fastmcp_protocol::methods::final_2026_07_28_method("ping").is_none(),
             "ping must remain outside the official 2026 client-request union"
         );
+    }
+
+    #[test]
+    fn modern_http_ping_with_cancellation_closes_stalled_sse_and_preserves_sibling() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read cancellation listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept cancellation discovery");
+            let discovery_request = read_request(&mut discovery);
+            let discovery_body =
+                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
+                    .expect("cancellation discovery is JSON-RPC");
+            assert_eq!(discovery_body["id"], 1);
+            assert_eq!(discovery_body["method"], "server/discover");
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"cancellation-peer","version":"1"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            let (mut stalled, _) = listener.accept().expect("accept stalled ping");
+            let stalled_request = read_request(&mut stalled);
+            let stalled_body = serde_json::from_slice::<serde_json::Value>(&stalled_request.body)
+                .expect("stalled ping is JSON-RPC");
+            assert_eq!(stalled_body["id"], 2);
+            assert_eq!(stalled_body["method"], "ping");
+            begin_chunked_sse(&mut stalled);
+            ready_sender
+                .send(())
+                .expect("tell caller the stalled SSE body is live");
+            assert_sse_peer_closed(&mut stalled);
+
+            let (mut sibling, _) = listener.accept().expect("accept sibling ping");
+            let sibling_request = read_request(&mut sibling);
+            let sibling_body = serde_json::from_slice::<serde_json::Value>(&sibling_request.body)
+                .expect("sibling ping is JSON-RPC");
+            assert_eq!(sibling_body["id"], 3);
+            assert_eq!(sibling_body["method"], "ping");
+            write_response(
+                &mut sibling,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+            );
+        });
+
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        let cancel_for_thread = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            ready_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("peer exposed the stalled SSE response");
+            thread::sleep(Duration::from_millis(50));
+            assert!(cancel_for_thread.cancel());
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().expect("public HTTP calls use the caller runtime Cx");
+            let mut client = crate::HttpClient::connect(
+                &cx,
+                plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ),
+                ClientInfo {
+                    name: "public-http-cancellation-client".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                ClientCapabilities::default(),
+            )
+            .await
+            .expect("public modern HTTP client completes discovery");
+            let started = Instant::now();
+            let error = client
+                .ping_with_cancellation(&cx, &cancellation)
+                .await
+                .expect_err("local cancellation must stop a stalled public SSE ping");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "local cancellation must beat the long response idle bound: {elapsed:?}"
+            );
+            assert!(matches!(
+                error,
+                crate::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
+                ))
+            ));
+            assert!(cx.checkpoint().is_ok(), "ambient Cx remains usable");
+            assert!(
+                !cx.is_cancel_requested(),
+                "local cancellation must not cancel Cx"
+            );
+
+            client
+                .ping(&cx)
+                .await
+                .expect("a sibling ping succeeds after cancellation");
+        });
+        canceller.join().expect("cancellation thread joins");
+        server.join().expect("cancellation peer joins");
+    }
+
+    #[test]
+    fn modern_http_ping_without_cancellation_accepts_valid_sse_terminal_and_closes_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind terminal listener");
+        let address = listener
+            .local_addr()
+            .expect("read terminal listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept terminal discovery");
+            let discovery_request = read_request(&mut discovery);
+            let discovery_body =
+                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
+                    .expect("terminal discovery is JSON-RPC");
+            assert_eq!(discovery_body["id"], 1);
+            assert_eq!(discovery_body["method"], "server/discover");
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"terminal-peer","version":"1"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            let (mut terminal, _) = listener.accept().expect("accept terminal ping");
+            let terminal_request = read_request(&mut terminal);
+            let terminal_body = serde_json::from_slice::<serde_json::Value>(&terminal_request.body)
+                .expect("terminal ping is JSON-RPC");
+            assert_eq!(terminal_body["id"], 2);
+            assert_eq!(terminal_body["method"], "ping");
+            write_response(
+                &mut terminal,
+                200,
+                "text/event-stream",
+                br#"data: {"jsonrpc":"2.0","id":2,"result":{}}
+
+"#,
+            );
+            assert_sse_peer_closed(&mut terminal);
+        });
+
+        runtime_block_on(async {
+            let cx = Cx::current().expect("public HTTP calls use the caller runtime Cx");
+            let mut client = crate::HttpClient::connect(
+                &cx,
+                plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ),
+                ClientInfo {
+                    name: "public-http-terminal-client".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                ClientCapabilities::default(),
+            )
+            .await
+            .expect("public modern HTTP client completes discovery");
+            client
+                .ping(&cx)
+                .await
+                .expect("valid terminal SSE ping succeeds");
+            assert!(cx.checkpoint().is_ok(), "ambient Cx remains usable");
+        });
+        server
+            .join()
+            .expect("terminal peer joins after clean close");
     }
 }
