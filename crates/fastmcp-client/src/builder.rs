@@ -64,7 +64,7 @@ use crate::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
-    combine_operation_and_cleanup, combine_operation_with_cleanup,
+    SubscriptionTimeoutPolicy, combine_operation_and_cleanup, combine_operation_with_cleanup,
     combine_operation_with_cleanup_async, is_cleanup_unverified, resolve_stdio_command,
     validate_protocol_plan_feature,
 };
@@ -193,6 +193,8 @@ pub struct ClientBuilder {
     client_icons: Vec<fastmcp_protocol::common_types::RawIcon>,
     /// Validated ordinary-request idle/absolute timeout policy.
     timeout_policy: RequestTimeoutPolicy,
+    /// Validated modern HTTP subscription idle/absolute timeout policy.
+    subscription_timeout_policy: SubscriptionTimeoutPolicy,
     /// Maximum number of connection retries.
     max_retries: u32,
     /// Delay between retries in milliseconds.
@@ -229,6 +231,10 @@ impl std::fmt::Debug for ClientBuilder {
         f.debug_struct("ClientBuilder")
             .field("client_info", &self.client_info)
             .field("timeout_policy", &self.timeout_policy)
+            .field(
+                "subscription_timeout_policy",
+                &self.subscription_timeout_policy,
+            )
             .field("max_retries", &self.max_retries)
             .field("retry_delay_ms", &self.retry_delay_ms)
             .field("retry_policy", &self.retry_policy)
@@ -268,6 +274,8 @@ impl ClientBuilder {
     /// - Request idle timeout: 30 seconds
     /// - Request absolute timeout: 120 seconds
     /// - Matching strictly increasing progress resets idle: enabled
+    /// - Modern HTTP subscription idle timeout: 5 minutes
+    /// - Modern HTTP subscription absolute timeout: 1 hour
     /// - Max retries: 0 (no retries)
     /// - Retry delay: 1 second
     /// - Inherit environment: true
@@ -285,6 +293,7 @@ impl ClientBuilder {
             client_website_url: None,
             client_icons: Vec::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
+            subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             max_retries: 0,
             retry_delay_ms: 1_000,
             retry_policy: None,
@@ -385,6 +394,17 @@ impl ClientBuilder {
     #[must_use]
     pub fn request_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
         self.timeout_policy = policy;
+        self
+    }
+
+    /// Sets the modern HTTP `subscriptions/listen` idle and absolute policy.
+    ///
+    /// The policy is validated before an HTTP connection opens. It applies
+    /// only to modern HTTP subscription response streams; ordinary requests
+    /// retain [`RequestTimeoutPolicy`].
+    #[must_use]
+    pub fn subscription_timeout_policy(mut self, policy: SubscriptionTimeoutPolicy) -> Self {
+        self.subscription_timeout_policy = policy;
         self
     }
 
@@ -786,6 +806,10 @@ impl ClientBuilder {
             .timeout_policy
             .validate()
             .map_err(|_| Self::http_timeout_policy_error())?;
+        builder
+            .subscription_timeout_policy
+            .validate()
+            .map_err(|_| Self::http_timeout_policy_error())?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let mut client_capabilities = builder.capabilities.clone();
         if reverse_request_handlers.has_modern_handlers() {
@@ -804,6 +828,7 @@ impl ClientBuilder {
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
                 request_timeout_policy: builder.timeout_policy,
+                subscription_timeout_policy: builder.subscription_timeout_policy,
             },
         )
         .await?;
@@ -872,6 +897,10 @@ impl ClientBuilder {
             .timeout_policy
             .validate()
             .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
+        builder
+            .subscription_timeout_policy
+            .validate()
+            .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let mut client_capabilities = builder.capabilities.clone();
         if reverse_request_handlers.has_modern_handlers() {
@@ -888,6 +917,7 @@ impl ClientBuilder {
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
                 request_timeout_policy: builder.timeout_policy,
+                subscription_timeout_policy: builder.subscription_timeout_policy,
             },
             reverse_request_handlers,
         )

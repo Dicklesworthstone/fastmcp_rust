@@ -1489,6 +1489,10 @@ const DEFAULT_STDIO_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
 const DEFAULT_STDIO_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::ModernOnly;
 const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(15);
+const DEFAULT_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFAULT_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT: Duration = Duration::from_hours(1);
+const MAX_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
+const MAX_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT: Duration = Duration::from_hours(24);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
@@ -1633,6 +1637,73 @@ impl Default for RequestTimeoutPolicy {
             absolute_timeout: DEFAULT_CLIENT_ABSOLUTE_TIMEOUT,
             reset_idle_on_matching_progress: true,
             bounds: RequestTimeoutBounds::Bounded,
+        }
+    }
+}
+
+/// Idle and absolute limits for one modern HTTP `subscriptions/listen`
+/// response stream.
+///
+/// Both timers begin only after the full subscription POST send commits. The
+/// idle timer may reset on a valid acknowledgement, an accepted delivered
+/// event, or a bounded complete SSE comment keepalive. The absolute timer
+/// never moves. The earlier caller [`Cx`] deadline and cancellation remain
+/// authoritative; this policy cannot bypass them and applies only to modern
+/// HTTP subscriptions, not ordinary requests or other transports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubscriptionTimeoutPolicy {
+    idle_timeout: Duration,
+    absolute_timeout: Duration,
+}
+
+impl SubscriptionTimeoutPolicy {
+    /// Creates and validates a modern HTTP subscription timeout policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-parameters error when either duration is below
+    /// 1 millisecond or exceeds its subscription safety cap: one hour for
+    /// idle and 24 hours for absolute lifetime.
+    pub fn new(idle_timeout: Duration, absolute_timeout: Duration) -> McpResult<Self> {
+        let policy = Self {
+            idle_timeout,
+            absolute_timeout,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Returns the subscription idle timeout.
+    #[must_use]
+    pub const fn idle_timeout(self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Returns the non-resettable subscription absolute timeout.
+    #[must_use]
+    pub const fn absolute_timeout(self) -> Duration {
+        self.absolute_timeout
+    }
+
+    pub(crate) fn validate(self) -> McpResult<()> {
+        validate_timeout_duration(
+            self.idle_timeout,
+            MAX_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT,
+            "Client subscription idle timeout must be between 1 millisecond and 1 hour",
+        )?;
+        validate_timeout_duration(
+            self.absolute_timeout,
+            MAX_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT,
+            "Client subscription absolute timeout must be between 1 millisecond and 24 hours",
+        )
+    }
+}
+
+impl Default for SubscriptionTimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            idle_timeout: DEFAULT_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT,
+            absolute_timeout: DEFAULT_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT,
         }
     }
 }
@@ -30758,6 +30829,49 @@ mod tests {
                 .expect("the exact idle maximum and absolute minimum are valid");
         assert_eq!(exact_bounds.idle_timeout(), MAX_CLIENT_IDLE_TIMEOUT);
         assert_eq!(exact_bounds.absolute_timeout(), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn http_03_b_subscription_timeout_policy_defaults_and_bounds_positive() {
+        let default = SubscriptionTimeoutPolicy::default();
+        assert_eq!(default.idle_timeout(), Duration::from_mins(5));
+        assert_eq!(default.absolute_timeout(), Duration::from_hours(1));
+
+        let exact_bounds =
+            SubscriptionTimeoutPolicy::new(Duration::from_hours(1), Duration::from_hours(24))
+                .expect("subscription policy accepts exact safety caps");
+        assert_eq!(exact_bounds.idle_timeout(), Duration::from_hours(1));
+        assert_eq!(exact_bounds.absolute_timeout(), Duration::from_hours(24));
+
+        let exact_minimum =
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(1), Duration::from_millis(1))
+                .expect("subscription policy accepts the one-millisecond minimum");
+        assert_eq!(exact_minimum.idle_timeout(), Duration::from_millis(1));
+        assert_eq!(exact_minimum.absolute_timeout(), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn http_03_b_subscription_timeout_policy_rejects_zero_and_overcap_negative() {
+        let default = SubscriptionTimeoutPolicy::default();
+        for (idle_timeout, absolute_timeout) in [
+            (Duration::ZERO, default.absolute_timeout()),
+            (Duration::from_nanos(999_999), default.absolute_timeout()),
+            (
+                Duration::from_hours(1) + Duration::from_nanos(1),
+                default.absolute_timeout(),
+            ),
+            (default.idle_timeout(), Duration::ZERO),
+            (default.idle_timeout(), Duration::from_nanos(999_999)),
+            (
+                default.idle_timeout(),
+                Duration::from_hours(24) + Duration::from_nanos(1),
+            ),
+        ] {
+            assert!(
+                SubscriptionTimeoutPolicy::new(idle_timeout, absolute_timeout).is_err(),
+                "invalid subscription policy ({idle_timeout:?}, {absolute_timeout:?}) must refuse"
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,8 @@ use fastmcp_client::ProtocolEra;
 use fastmcp_client::http_executor::ModernHttpResponseKind;
 use fastmcp_client::http_executor::{
     ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
-    ModernHttpFinalCoreListenError,
+    ModernHttpFinalCoreListenError, ModernHttpSubscriptionListenError,
+    ModernHttpSubscriptionListenEvent,
 };
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_client::sse::SseLimits;
@@ -25,9 +26,12 @@ use fastmcp_client::sse::SseLimits;
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
 use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientProtocolPlan, ProtocolPolicy,
-    RequestTimeoutPolicy, RequestTimeoutSource,
+    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy,
 };
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, ProgressMarker, RequestId};
+use fastmcp_protocol::{
+    ClientCapabilities, ClientInfo, ProgressMarker, RequestId, ServerNotification,
+    SubscriptionFilter,
+};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
 
@@ -588,6 +592,516 @@ fn terminal_event(request_id: u64, text: &str) -> serde_json::Value {
             "isError": false,
         },
     })
+}
+
+fn public_subscription_builder(
+    target: &str,
+    subscription_timeout_policy: SubscriptionTimeoutPolicy,
+) -> ClientBuilder {
+    public_modern_builder(
+        target,
+        RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(10))
+            .expect("subscription request policy must be valid"),
+    )
+    .subscription_timeout_policy(subscription_timeout_policy)
+}
+
+fn subscription_filter() -> SubscriptionFilter {
+    SubscriptionFilter {
+        tools_list_changed: Some(true),
+        ..SubscriptionFilter::default()
+    }
+}
+
+fn subscription_ack_event(filter: &SubscriptionFilter) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/subscriptions/acknowledged",
+        "params": {
+            "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+            "notifications": filter,
+        },
+    })
+}
+
+fn subscription_tools_changed_event() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    })
+}
+
+fn subscription_terminal_event() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+        },
+    })
+}
+
+fn assert_subscription_request(request: &CapturedHttpRequest, filter: &SubscriptionFilter) {
+    assert_final_metadata(request, "subscriptions/listen");
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("subscription request must be JSON-RPC");
+    assert_eq!(
+        body["params"]["notifications"],
+        serde_json::to_value(filter).expect("subscription filter must serialize")
+    );
+}
+
+fn write_sse_comment(stream: &mut TcpStream, comment: &str) -> std::io::Result<()> {
+    write!(stream, ": {comment}\n\n")?;
+    stream.flush()
+}
+
+#[test]
+fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind subscription positive listener");
+    let address = listener
+        .local_addr()
+        .expect("read subscription positive listener address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut discovery);
+        let mut stream = accept_bounded_stream(&listener);
+        let request = read_request(&mut stream);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut stream);
+        thread::sleep(Duration::from_millis(120));
+        write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
+            .expect("write subscription acknowledgement");
+        thread::sleep(Duration::from_millis(120));
+        write_sse_event(&mut stream, &subscription_tools_changed_event())
+            .expect("write accepted tools event");
+        thread::sleep(Duration::from_millis(120));
+        write_sse_event(&mut stream, &subscription_terminal_event())
+            .expect("write subscription terminal");
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(180), Duration::from_secs(1))
+                .expect("subscription positive policy must be valid");
+        let connection = public_subscription_builder(&target, policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder subscription connection must succeed");
+        let mut listener = connection
+            .open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                filter.clone(),
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("public builder must open subscription listener");
+
+        let acknowledgement = listener
+            .next_event(&cx)
+            .await
+            .expect("acknowledgement must be admitted")
+            .expect("acknowledgement must be present");
+        assert!(matches!(
+            acknowledgement,
+            ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }
+                if accepted_filter == filter
+        ));
+        let event = listener
+            .next_event(&cx)
+            .await
+            .expect("accepted event must be admitted")
+            .expect("accepted event must be present");
+        assert!(matches!(
+            event,
+            ModernHttpSubscriptionListenEvent::Notification(ServerNotification::ToolsListChanged(
+                _
+            ))
+        ));
+        let terminal = listener
+            .next_event(&cx)
+            .await
+            .expect("terminal must be admitted after refreshed idle")
+            .expect("terminal must be present");
+        assert!(matches!(
+            terminal,
+            ModernHttpSubscriptionListenEvent::Terminal { .. }
+        ));
+    });
+
+    server
+        .join()
+        .expect("subscription positive server must join");
+}
+
+#[test]
+fn http_03_b_subscription_delayed_ack_hits_idle_timeout_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed-ack listener");
+    let address = listener
+        .local_addr()
+        .expect("read delayed-ack listener address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut discovery);
+        let mut stream = accept_bounded_stream(&listener);
+        let request = read_request(&mut stream);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut stream);
+        thread::sleep(Duration::from_millis(320));
+        assert_connection_closed_by_client(&mut stream);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(180), Duration::from_secs(1))
+                .expect("delayed-ack policy must be valid");
+        let connection = public_subscription_builder(&target, policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder subscription connection must succeed");
+        let mut listener = connection
+            .open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                filter,
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("public builder must open delayed-ack listener");
+        let result = listener.next_event(&cx).await;
+        let error = match result {
+            Ok(_) => panic!("delayed acknowledgement must not be admitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ModernHttpSubscriptionListenError::Executor(ModernHttpExecutorError::Timeout(
+                RequestTimeoutSource::Idle
+            ))
+        ));
+    });
+
+    server.join().expect("delayed-ack server must join");
+}
+
+#[test]
+fn http_03_b_subscription_valid_comments_refresh_idle_but_absolute_expires_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind comment listener");
+    let address = listener
+        .local_addr()
+        .expect("read comment listener address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut discovery);
+        let mut stream = accept_bounded_stream(&listener);
+        let request = read_request(&mut stream);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut stream);
+        write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
+            .expect("write comment acknowledgement");
+        for index in 0..6 {
+            thread::sleep(Duration::from_millis(60));
+            if write_sse_comment(&mut stream, &format!("bounded-{index}")).is_err() {
+                return;
+            }
+        }
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(110), Duration::from_millis(300))
+                .expect("comment policy must be valid");
+        let connection = public_subscription_builder(&target, policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder subscription connection must succeed");
+        let mut listener = connection
+            .open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                filter,
+                SseLimits::new(4_096, 65_536, 32).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("public builder must open comment listener");
+        let acknowledgement = listener
+            .next_event(&cx)
+            .await
+            .expect("comment acknowledgement must be admitted")
+            .expect("comment acknowledgement must be present");
+        assert!(matches!(
+            acknowledgement,
+            ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+        ));
+        let result = listener.next_event(&cx).await;
+        let error = match result {
+            Ok(_) => {
+                panic!("comment-only stream must not produce a terminal event")
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ModernHttpSubscriptionListenError::Executor(ModernHttpExecutorError::Timeout(
+                RequestTimeoutSource::Absolute
+            ))
+        ));
+    });
+
+    server.join().expect("comment server must join");
+}
+
+#[test]
+fn http_03_b_subscription_inert_fields_and_partial_comments_do_not_reset_idle_negative() {
+    for partial_comments in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind inert-field listener");
+        let address = listener
+            .local_addr()
+            .expect("read inert-field listener address");
+        let target = format!("http://{address}/mcp");
+        let filter = subscription_filter();
+        let server_filter = filter.clone();
+        let server = thread::spawn(move || {
+            let mut discovery = accept_bounded_stream(&listener);
+            respond_probe_ok(&mut discovery);
+            let mut stream = accept_bounded_stream(&listener);
+            let request = read_request(&mut stream);
+            assert_subscription_request(&request, &server_filter);
+            begin_sse_response(&mut stream);
+            write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
+                .expect("write inert-field acknowledgement");
+            for index in 0..6 {
+                thread::sleep(Duration::from_millis(60));
+                let bytes = if partial_comments {
+                    format!(": partial-{index}").into_bytes()
+                } else {
+                    format!("event: inert-{index}\n\n").into_bytes()
+                };
+                if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
+                    return;
+                }
+            }
+        });
+
+        runtime_block_on(async {
+            let cx = Cx::current().expect("caller runtime must install a current Cx");
+            let policy = SubscriptionTimeoutPolicy::new(
+                Duration::from_millis(110),
+                Duration::from_millis(300),
+            )
+            .expect("inert-field policy must be valid");
+            let connection = public_subscription_builder(&target, policy)
+                .connect_http_with_cx(&cx)
+                .await
+                .expect("public builder subscription connection must succeed");
+            let mut listener = connection
+                .open_subscriptions_listener(
+                    &cx,
+                    RequestId::Number(2),
+                    filter,
+                    SseLimits::new(4_096, 65_536, 32).expect("bounded SSE limits"),
+                )
+                .await
+                .expect("public builder must open inert-field listener");
+            let acknowledgement = listener
+                .next_event(&cx)
+                .await
+                .expect("inert-field acknowledgement must be admitted")
+                .expect("inert-field acknowledgement must be present");
+            assert!(matches!(
+                acknowledgement,
+                ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+            ));
+            let result = listener.next_event(&cx).await;
+            let error = match result {
+                Ok(_) => {
+                    panic!("inert fields and partial comments must not reset idle")
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                ModernHttpSubscriptionListenError::Executor(ModernHttpExecutorError::Timeout(
+                    RequestTimeoutSource::Idle
+                ))
+            ));
+        });
+
+        server.join().expect("inert-field server must join");
+    }
+}
+
+#[test]
+fn http_03_b_subscription_tighter_caller_budget_closes_only_listener_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind caller-budget listener");
+    let address = listener
+        .local_addr()
+        .expect("read caller-budget listener address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut discovery);
+        let mut stream = accept_bounded_stream(&listener);
+        let request = read_request(&mut stream);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut stream);
+        write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
+            .expect("write caller-budget acknowledgement");
+        thread::sleep(Duration::from_millis(800));
+        assert_connection_closed_by_client(&mut stream);
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("caller-budget runtime must build");
+    runtime.block_on(async {
+        let runtime_cx = Cx::current().expect("caller runtime must install a current Cx");
+        let caller_cx = runtime
+            .request_cx_with_budget(runtime_cx.budget_for_timeout(Duration::from_millis(500)));
+        let policy = SubscriptionTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+            .expect("caller-budget policy must be valid");
+        let connection = public_subscription_builder(&target, policy)
+            .connect_http_with_cx(&caller_cx)
+            .await
+            .expect("public builder subscription connection must succeed");
+        let mut listener = connection
+            .open_subscriptions_listener(
+                &caller_cx,
+                RequestId::Number(2),
+                filter,
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("public builder must open caller-budget listener");
+        let acknowledgement = listener
+            .next_event(&caller_cx)
+            .await
+            .expect("caller-budget acknowledgement must be admitted")
+            .expect("caller-budget acknowledgement must be present");
+        assert!(matches!(
+            acknowledgement,
+            ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+        ));
+        let result = listener.next_event(&caller_cx).await;
+        let error = match result {
+            Ok(_) => panic!("caller budget must expire before a later event"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ModernHttpSubscriptionListenError::Executor(ModernHttpExecutorError::Transport(
+                ClientError::DeadlineExceeded
+            ))
+        ));
+    });
+
+    server.join().expect("caller-budget server must join");
+}
+
+#[test]
+fn http_03_b_subscription_expired_listener_closes_socket_sibling_ping_succeeds_negative() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolation listener");
+    let address = listener
+        .local_addr()
+        .expect("read isolation listener address");
+    let target = format!("http://{address}/mcp");
+    let filter = subscription_filter();
+    let server_filter = filter.clone();
+    let server = thread::spawn(move || {
+        let mut discovery = accept_bounded_stream(&listener);
+        respond_probe_ok(&mut discovery);
+        let mut subscription = accept_bounded_stream(&listener);
+        let request = read_request(&mut subscription);
+        assert_subscription_request(&request, &server_filter);
+        begin_sse_response(&mut subscription);
+        write_sse_event(&mut subscription, &subscription_ack_event(&server_filter))
+            .expect("write isolation acknowledgement");
+        thread::sleep(Duration::from_millis(260));
+        assert_connection_closed_by_client(&mut subscription);
+
+        let mut ping = accept_bounded_stream(&listener);
+        let request = read_request(&mut ping);
+        assert_final_metadata(&request, "ping");
+        write_response(
+            &mut ping,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+        );
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(120), Duration::from_secs(1))
+                .expect("isolation policy must be valid");
+        let mut connection = public_subscription_builder(&target, policy)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("public builder subscription connection must succeed");
+        let mut subscription = connection
+            .open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                filter,
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            )
+            .await
+            .expect("public builder must open isolation listener");
+        let acknowledgement = subscription
+            .next_event(&cx)
+            .await
+            .expect("isolation acknowledgement must be admitted")
+            .expect("isolation acknowledgement must be present");
+        assert!(matches!(
+            acknowledgement,
+            ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+        ));
+        let result = subscription.next_event(&cx).await;
+        let error = match result {
+            Ok(_) => panic!("expired subscription must not produce an event"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ModernHttpSubscriptionListenError::Executor(ModernHttpExecutorError::Timeout(
+                RequestTimeoutSource::Idle
+            ))
+        ));
+
+        let sibling = require_modern_response(
+            connection
+                .request(&cx, "ping", serde_json::json!({}), RequestId::Number(3))
+                .await
+                .expect("sibling public ping must succeed after listener expiry"),
+        );
+        let body = sibling
+            .read_to_end(&cx, 4_096)
+            .await
+            .expect("read sibling ping body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("sibling ping body must be JSON");
+        assert_eq!(body["id"], 3);
+        assert_eq!(body["result"], serde_json::json!({}));
+    });
+
+    server.join().expect("isolation server must join");
 }
 
 struct RedirectTestRig {

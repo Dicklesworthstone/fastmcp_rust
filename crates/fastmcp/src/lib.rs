@@ -259,7 +259,7 @@ pub mod client {
         ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
         RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
         StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
-        SubscriptionListenCollector,
+        SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
     #[cfg(feature = "tasks")]
@@ -855,6 +855,7 @@ pub use fastmcp_client::{
     RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
     ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
     StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
+    SubscriptionTimeoutPolicy,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
@@ -2594,7 +2595,7 @@ pub mod modern {
         MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, OpaquePagination, PaginationBounds,
         PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
         ReverseRequestHandlers, StdioSubscriptionEvent, SubscriptionFilter,
-        SubscriptionListenCollector,
+        SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
@@ -10543,6 +10544,7 @@ pub mod prelude {
         SubscriptionFilter,
         SubscriptionListenCollector,
         SubscriptionListenHandle,
+        SubscriptionTimeoutPolicy,
         TemplateValue,
         TemplateValues,
         TokenAuthProvider,
@@ -10645,7 +10647,8 @@ mod tests {
 
     use super::{
         Content, Cx, McpContext, McpResult, PromptHandler, PromptMessage, RequestTimeoutPolicy,
-        RequestTimeoutSource, ResourceHandler, ToolHandler, prompt, resource, tool,
+        RequestTimeoutSource, ResourceHandler, SubscriptionTimeoutPolicy, ToolHandler, prompt,
+        resource, tool,
     };
 
     #[tool]
@@ -10828,6 +10831,22 @@ mod tests {
         assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
         assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
         assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[test]
+    fn http_03_b_facade_reexports_subscription_timeout_policy_positive() {
+        let policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_secs(30), Duration::from_hours(1))
+                .expect("facade subscription timeout policy must validate");
+        assert_eq!(policy.idle_timeout(), Duration::from_secs(30));
+        assert_eq!(policy.absolute_timeout(), Duration::from_hours(1));
+
+        let modern_policy = super::modern::SubscriptionTimeoutPolicy::default();
+        assert_eq!(modern_policy, SubscriptionTimeoutPolicy::default());
+        let client_policy = super::client::SubscriptionTimeoutPolicy::default();
+        assert_eq!(client_policy, SubscriptionTimeoutPolicy::default());
+        let prelude_policy = super::prelude::SubscriptionTimeoutPolicy::default();
+        assert_eq!(prelude_policy, SubscriptionTimeoutPolicy::default());
     }
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]

@@ -72,7 +72,7 @@ use crate::{
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
     ReverseCallbackState, ReverseRequestCancellation, ReverseRequestHandlers,
-    validate_protocol_plan_feature,
+    SubscriptionTimeoutPolicy, validate_protocol_plan_feature,
 };
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
@@ -484,10 +484,32 @@ impl AsyncWrite for ModernHttpIo {
     }
 }
 
+#[derive(Clone, Copy)]
+enum HttpResponseTimeoutPolicy {
+    Ordinary(RequestTimeoutPolicy),
+    Subscription(SubscriptionTimeoutPolicy),
+}
+
+impl HttpResponseTimeoutPolicy {
+    fn idle_timeout(self) -> std::time::Duration {
+        match self {
+            Self::Ordinary(policy) => policy.idle_timeout(),
+            Self::Subscription(policy) => policy.idle_timeout(),
+        }
+    }
+
+    fn absolute_timeout(self) -> std::time::Duration {
+        match self {
+            Self::Ordinary(policy) => policy.absolute_timeout(),
+            Self::Subscription(policy) => policy.absolute_timeout(),
+        }
+    }
+}
+
 struct HttpResponseDeadline {
     cx: Cx,
     committed_at: Arc<OnceLock<Time>>,
-    policy: Option<RequestTimeoutPolicy>,
+    policy: HttpResponseTimeoutPolicy,
     response_deadlines: Option<(Time, Time)>,
     caller_deadline: Option<Time>,
     sleep: Option<Sleep>,
@@ -510,11 +532,11 @@ impl HttpResponseDeadline {
     fn check(&mut self) -> Result<(), ModernHttpExecutorError> {
         check_modern_http_context(&self.cx)?;
         if self.response_deadlines.is_none()
-            && let (Some(policy), Some(committed_at)) = (self.policy, self.committed_at.get())
+            && let Some(committed_at) = self.committed_at.get()
         {
             self.response_deadlines = Some((
-                Self::add_timeout(*committed_at, policy.idle_timeout())?,
-                Self::add_timeout(*committed_at, policy.absolute_timeout())?,
+                Self::add_timeout(*committed_at, self.policy.idle_timeout())?,
+                Self::add_timeout(*committed_at, self.policy.absolute_timeout())?,
             ));
         }
         let now = self.cx.now();
@@ -581,6 +603,9 @@ impl HttpResponseDeadline {
         progress: &FinalProgressNotificationParams,
     ) -> Result<(), ModernHttpExecutorError> {
         self.check()?;
+        let HttpResponseTimeoutPolicy::Ordinary(policy) = self.policy else {
+            return Ok(());
+        };
         if self.progress_marker.as_ref() != Some(&progress.progress_token)
             || self
                 .last_progress
@@ -590,10 +615,21 @@ impl HttpResponseDeadline {
             return Ok(());
         }
         self.last_progress = Some(progress.progress.clone());
-        if let Some(policy) = self.policy
-            && policy.resets_idle_on_matching_progress()
+        if policy.resets_idle_on_matching_progress()
             && let Some((idle, _)) = &mut self.response_deadlines
         {
+            *idle = Self::add_timeout(self.cx.now(), policy.idle_timeout())?;
+        }
+        Ok(())
+    }
+
+    fn observe_subscription_activity(&mut self) -> Result<(), ModernHttpExecutorError> {
+        self.check()?;
+        if let HttpResponseTimeoutPolicy::Subscription(policy) = self.policy
+            && let Some((idle, _)) = &mut self.response_deadlines
+        {
+            // An admitted keepalive or delivered event can restart idle, but
+            // neither it nor a late consumer can move the absolute deadline.
             *idle = Self::add_timeout(self.cx.now(), policy.idle_timeout())?;
         }
         Ok(())
@@ -1016,7 +1052,7 @@ impl ModernHttpSubscriptionListener {
                 return Err(ModernHttpSubscriptionListenError::Executor(error));
             }
         };
-        let result = self.admit_listen_payload(payload).map(Some);
+        let result = self.admit_and_observe_listen_payload(payload).map(Some);
         self.close_after_listen_result(&result);
         result
     }
@@ -1060,7 +1096,20 @@ impl ModernHttpSubscriptionListener {
             }
             Err(error) => return Err(ModernHttpSubscriptionListenError::Executor(error)),
         };
-        self.admit_listen_payload(event).map(Some)
+        self.admit_and_observe_listen_payload(event).map(Some)
+    }
+
+    fn admit_and_observe_listen_payload(
+        &mut self,
+        event: String,
+    ) -> Result<ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListenError> {
+        let admitted = self.admit_listen_payload(event)?;
+        if !matches!(admitted, ModernHttpSubscriptionListenEvent::Terminal { .. }) {
+            self.stream
+                .observe_subscription_activity()
+                .map_err(ModernHttpSubscriptionListenError::Executor)?;
+        }
+        Ok(admitted)
     }
 
     fn admit_listen_payload(
@@ -1772,8 +1821,13 @@ impl ModernHttpSseResponseStream {
             .take()
             .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
         match parser.push_with(chunk, |event| self.retain_pending_event(event)) {
-            Ok(()) => {
+            Ok(comment_activity) => {
                 self.parser = Some(parser);
+                if comment_activity {
+                    // Only complete, bounded colon-comments count. Partial
+                    // lines, inert fields, and refused frames never get here.
+                    self.observe_subscription_activity()?;
+                }
                 Ok(())
             }
             Err(SsePushError::Parse(error)) => {
@@ -1929,6 +1983,16 @@ impl ModernHttpSseResponseStream {
     ) -> Result<(), ModernHttpExecutorError> {
         if let Some(response) = &mut self.response
             && let Err(error) = response.body.deadline.observe_progress(progress)
+        {
+            self.close();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn observe_subscription_activity(&mut self) -> Result<(), ModernHttpExecutorError> {
+        if let Some(response) = &mut self.response
+            && let Err(error) = response.body.deadline.observe_subscription_activity()
         {
             self.close();
             return Err(error);
@@ -2615,6 +2679,7 @@ impl std::error::Error for ModernHttpExecutorError {}
 #[derive(Clone)]
 pub struct ModernHttpExecutor {
     request_timeout_policy: RequestTimeoutPolicy,
+    subscription_timeout_policy: SubscriptionTimeoutPolicy,
     bearer_credential: Option<Arc<crate::http_auth::BoundBearerCredential>>,
 }
 
@@ -2630,6 +2695,7 @@ impl ModernHttpExecutor {
     pub fn new() -> Self {
         Self {
             request_timeout_policy: RequestTimeoutPolicy::default(),
+            subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: None,
         }
     }
@@ -2639,12 +2705,18 @@ impl ModernHttpExecutor {
     ) -> Self {
         Self {
             request_timeout_policy: RequestTimeoutPolicy::default(),
+            subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             bearer_credential: bearer_credential.map(Arc::new),
         }
     }
 
     fn with_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
         self.request_timeout_policy = policy;
+        self
+    }
+
+    fn with_subscription_timeout_policy(mut self, policy: SubscriptionTimeoutPolicy) -> Self {
+        self.subscription_timeout_policy = policy;
         self
     }
 
@@ -2687,12 +2759,17 @@ impl ModernHttpExecutor {
         self.request_timeout_policy
             .validate()
             .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
+        self.subscription_timeout_policy
+            .validate()
+            .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
+        let policy = if request.method == SUBSCRIPTIONS_LISTEN {
+            HttpResponseTimeoutPolicy::Subscription(self.subscription_timeout_policy)
+        } else {
+            HttpResponseTimeoutPolicy::Ordinary(self.request_timeout_policy)
+        };
         // Reject unrepresentable application timeouts before opening a socket.
-        HttpResponseDeadline::add_timeout(cx.now(), self.request_timeout_policy.idle_timeout())?;
-        HttpResponseDeadline::add_timeout(
-            cx.now(),
-            self.request_timeout_policy.absolute_timeout(),
-        )?;
+        HttpResponseDeadline::add_timeout(cx.now(), policy.idle_timeout())?;
+        HttpResponseDeadline::add_timeout(cx.now(), policy.absolute_timeout())?;
         let committed_at = Arc::new(OnceLock::new());
         let progress_marker = serde_json::from_slice::<serde_json::Value>(request.body())
             .ok()
@@ -2701,9 +2778,7 @@ impl ModernHttpExecutor {
         let mut deadline = HttpResponseDeadline {
             cx: cx.clone(),
             committed_at: Arc::clone(&committed_at),
-            // Subscription acknowledgement/event/comment lifetimes are a
-            // separate policy; an ordinary progress-only policy is not one.
-            policy: (request.method != SUBSCRIPTIONS_LISTEN).then_some(self.request_timeout_policy),
+            policy,
             response_deadlines: None,
             caller_deadline: cx.budget().deadline,
             sleep: None,
@@ -2870,6 +2945,7 @@ pub(crate) struct HttpConnectionSettings {
     pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
     pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
     pub(crate) request_timeout_policy: RequestTimeoutPolicy,
+    pub(crate) subscription_timeout_policy: SubscriptionTimeoutPolicy,
 }
 
 /// A configured native modern HTTP client after one successful modern probe.
@@ -5619,6 +5695,7 @@ impl ModernHttpClient {
             extensions: client_extension_runtime,
             bearer: bearer_credential,
             request_timeout_policy,
+            subscription_timeout_policy,
         } = settings;
         if let Some(credential) = &bearer_credential {
             let target = protocol_plan
@@ -5679,6 +5756,7 @@ impl ModernHttpClient {
 
         let probe_response = ModernHttpExecutor::with_bearer_credential(bearer_credential.clone())
             .with_timeout_policy(request_timeout_policy)
+            .with_subscription_timeout_policy(subscription_timeout_policy)
             .execute(cx, &probe_request)
             .await
             .map_err(ModernHttpClientError::Executor)?;
@@ -5734,7 +5812,8 @@ impl ModernHttpClient {
                         negotiated_extensions,
                     }),
                     executor: ModernHttpExecutor::with_bearer_credential(bearer_credential)
-                        .with_timeout_policy(request_timeout_policy),
+                        .with_timeout_policy(request_timeout_policy)
+                        .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
                 }))
             }
@@ -9790,6 +9869,7 @@ mod tests {
                 extensions: Some(generic_mcp_apps_runtime(generic_mime_type)),
                 bearer: None,
                 request_timeout_policy: crate::RequestTimeoutPolicy::default(),
+                subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
             },
         ))
         .expect("generic Apps discovery selects the modern connection");
@@ -10387,6 +10467,7 @@ mod tests {
                     extensions: Some(Arc::clone(&settings)),
                     bearer: None,
                     request_timeout_policy: crate::RequestTimeoutPolicy::default(),
+                    subscription_timeout_policy: crate::SubscriptionTimeoutPolicy::default(),
                 },
             )
             .await;

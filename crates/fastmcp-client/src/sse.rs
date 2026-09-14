@@ -226,14 +226,17 @@ impl BoundedSseParser {
     /// closed.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, SseParseError> {
         let mut dispatched = Vec::new();
-        self.push_with(chunk, |payload| {
-            dispatched.push(payload);
-            Ok::<_, ()>(())
-        })
-        .map_err(|error| match error {
-            SsePushError::Parse(error) => error,
-            SsePushError::Consumer(()) => unreachable!("infallible SSE event collector refused"),
-        })?;
+        let _ = self
+            .push_with(chunk, |payload| {
+                dispatched.push(payload);
+                Ok::<_, ()>(())
+            })
+            .map_err(|error| match error {
+                SsePushError::Parse(error) => error,
+                SsePushError::Consumer(()) => {
+                    unreachable!("infallible SSE event collector refused")
+                }
+            })?;
         Ok(dispatched)
     }
 
@@ -243,16 +246,20 @@ impl BoundedSseParser {
     ///
     /// This lets an integration enforce its aggregate pending count and byte
     /// budgets before a chunk packed with individually valid SSE events can
-    /// allocate every payload at once. On either parser or consumer refusal,
-    /// parser buffers are released and further input is poisoned.
+    /// allocate every payload at once. The returned flag is true only when
+    /// this push successfully completed at least one bounded colon-comment
+    /// line; it is false for partial, blank, data, and inert lines. On either
+    /// parser or consumer refusal, parser buffers are released and further
+    /// input is poisoned.
     pub(crate) fn push_with<E>(
         &mut self,
         chunk: &[u8],
         mut accept: impl FnMut(String) -> Result<(), E>,
-    ) -> Result<(), SsePushError<E>> {
+    ) -> Result<bool, SsePushError<E>> {
         if self.poisoned {
             return Err(SsePushError::Parse(SseParseError::Poisoned));
         }
+        let mut comment_activity = false;
         for &byte in chunk {
             if self.pending_cr {
                 self.pending_cr = false;
@@ -262,10 +269,10 @@ impl BoundedSseParser {
             }
             match byte {
                 b'\r' => {
-                    self.complete_line_with(&mut accept)?;
+                    comment_activity |= self.complete_line_with(&mut accept)?;
                     self.pending_cr = true;
                 }
-                b'\n' => self.complete_line_with(&mut accept)?,
+                b'\n' => comment_activity |= self.complete_line_with(&mut accept)?,
                 other => {
                     if self.raw_line.len() >= self.limits.line_bytes {
                         return Err(SsePushError::Parse(self.poison(
@@ -278,7 +285,7 @@ impl BoundedSseParser {
                 }
             }
         }
-        Ok(())
+        Ok(comment_activity)
     }
 
     /// Terminates the stream, reporting what pending state was discarded.
@@ -315,7 +322,7 @@ impl BoundedSseParser {
     fn complete_line_with<E>(
         &mut self,
         accept: &mut impl FnMut(String) -> Result<(), E>,
-    ) -> Result<(), SsePushError<E>> {
+    ) -> Result<bool, SsePushError<E>> {
         let mut raw = core::mem::take(&mut self.raw_line);
         if self.bom_window_open {
             self.bom_window_open = false;
@@ -340,7 +347,7 @@ impl BoundedSseParser {
             )));
         }
         match self.process_line_with(&line, raw_len, accept) {
-            Ok(()) => Ok(()),
+            Ok(activity) => Ok(activity),
             Err(SsePushError::Parse(error)) => Err(SsePushError::Parse(self.poison(error))),
             Err(SsePushError::Consumer(error)) => Err(SsePushError::Consumer(error)),
         }
@@ -351,7 +358,7 @@ impl BoundedSseParser {
         line: &str,
         raw_len: usize,
         accept: &mut impl FnMut(String) -> Result<(), E>,
-    ) -> Result<(), SsePushError<E>> {
+    ) -> Result<bool, SsePushError<E>> {
         if line.is_empty() {
             // Dispatch step. The empty-buffer check precedes trailing-LF
             // removal, so one empty data field ("\n" in the buffer) really
@@ -360,6 +367,7 @@ impl BoundedSseParser {
             if self.data.is_empty() {
                 return self
                     .count_non_dispatching_line()
+                    .map(|()| false)
                     .map_err(SsePushError::Parse);
             }
             let mut payload = core::mem::take(&mut self.data);
@@ -368,15 +376,17 @@ impl BoundedSseParser {
             }
             self.event_raw_bytes = 0;
             self.keepalive_lines = 0;
-            return accept(payload).map_err(|error| {
-                self.poison(SseParseError::Poisoned);
-                SsePushError::Consumer(error)
-            });
+            return accept(payload)
+                .map_err(|error| {
+                    self.poison(SseParseError::Poisoned);
+                    SsePushError::Consumer(error)
+                })
+                .map(|()| false);
         }
         if line.starts_with(':') {
-            return self
-                .count_non_dispatching_line()
-                .map_err(SsePushError::Parse);
+            self.count_non_dispatching_line()
+                .map_err(SsePushError::Parse)?;
+            return Ok(true);
         }
         let (field, value) = match line.split_once(':') {
             Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
@@ -400,7 +410,7 @@ impl BoundedSseParser {
             self.data.push('\n');
             self.event_raw_bytes = raw_after;
             self.keepalive_lines = 0;
-            return Ok(());
+            return Ok(false);
         }
         // `event`, `id`, `retry`, and unknown fields: bounded framing only.
         // Deliberately no retained ID, no `Last-Event-ID`, no reconnect
@@ -408,6 +418,7 @@ impl BoundedSseParser {
         // are accepted without reviving removed modern SSE state.
         self.count_non_dispatching_line()
             .map_err(SsePushError::Parse)
+            .map(|()| false)
     }
 
     fn count_non_dispatching_line(&mut self) -> Result<(), SseParseError> {
@@ -791,5 +802,127 @@ mod tests {
         let (events, end) = assert_chunk_invariant(input, generous_limits());
         assert_eq!(events, ["first", "second", "third"]);
         assert!(!end.discarded_pending_event);
+    }
+
+    #[test]
+    fn sse_push_with_reports_complete_comment_activity() {
+        let mut parser = BoundedSseParser::new(generous_limits());
+        let mut events = Vec::new();
+        let activity = parser
+            .push_with(b": first\n: second\n", |payload| {
+                events.push(payload);
+                Ok::<_, ()>(())
+            })
+            .expect("complete bounded comments are accepted");
+        assert!(activity);
+        assert!(events.is_empty(), "comments never dispatch MCP payloads");
+
+        let activity = parser
+            .push_with(b"data: result\n\n", |payload| {
+                events.push(payload);
+                Ok::<_, ()>(())
+            })
+            .expect("data event remains accepted after comment activity");
+        assert!(
+            !activity,
+            "data and dispatch lines are not comment activity"
+        );
+        assert_eq!(events, ["result"]);
+    }
+
+    #[test]
+    fn sse_push_with_reports_no_activity_for_partial_or_inert_lines() {
+        let mut partial = BoundedSseParser::new(generous_limits());
+        assert!(
+            !partial
+                .push_with(b": partial", |_| Ok::<_, ()>(()))
+                .expect("partial comment remains buffered")
+        );
+        assert!(
+            !partial
+                .push_with(b" tail", |_| Ok::<_, ()>(()))
+                .expect("partial comment remains unterminated")
+        );
+
+        let mut inert = BoundedSseParser::new(generous_limits());
+        assert!(
+            !inert
+                .push_with(b"event: keepalive\n", |_| Ok::<_, ()>(()))
+                .expect("inert event field is bounded")
+        );
+        assert!(
+            !inert
+                .push_with(b"\n", |_| Ok::<_, ()>(()))
+                .expect("blank no-data line is bounded")
+        );
+
+        let mut data = BoundedSseParser::new(generous_limits());
+        assert!(
+            !data
+                .push_with(b"data: payload\n", |_| Ok::<_, ()>(()))
+                .expect("data line is bounded")
+        );
+    }
+
+    #[test]
+    fn sse_push_with_comment_activity_is_crlf_chunk_invariant() {
+        let mut parser = BoundedSseParser::new(generous_limits());
+        assert!(
+            !parser
+                .push_with(b": split", |_| Ok::<_, ()>(()))
+                .expect("partial comment is not activity")
+        );
+        assert!(
+            parser
+                .push_with(b" comment\r", |_| Ok::<_, ()>(()))
+                .expect("CR completes the comment line")
+        );
+        assert!(
+            !parser
+                .push_with(b"\n", |_| Ok::<_, ()>(()))
+                .expect("LF after CR is the same CRLF terminator")
+        );
+
+        let mut parser = BoundedSseParser::new(generous_limits());
+        assert!(
+            parser
+                .push_with(b": one\r\n: two\n", |_| Ok::<_, ()>(()))
+                .expect("CRLF and LF comments are activity")
+        );
+    }
+
+    #[test]
+    fn sse_push_with_comment_activity_never_overrides_bounds_or_flood_refusal() {
+        let line_limits = SseLimits::new(3, 65_536, 64).expect("line limits");
+        let mut line_parser = BoundedSseParser::new(line_limits);
+        let line_error = line_parser
+            .push_with(b":ok\n:too\n", |_| Ok::<_, ()>(()))
+            .expect_err("line refusal wins over earlier comment activity");
+        assert!(matches!(
+            line_error,
+            SsePushError::Parse(SseParseError::LineTooLong { limit_bytes: 3 })
+        ));
+        assert_eq!(line_parser.buffered_bytes(), 0);
+        assert_eq!(
+            line_parser.push(b": later\n"),
+            Err(SseParseError::Poisoned),
+            "line refusal poisons the parser"
+        );
+
+        let flood_limits = SseLimits::new(4_096, 65_536, 2).expect("flood limits");
+        let mut flood_parser = BoundedSseParser::new(flood_limits);
+        let flood_error = flood_parser
+            .push_with(b": one\n: two\n: three\n", |_| Ok::<_, ()>(()))
+            .expect_err("keepalive flood refuses the overflowing comment");
+        assert!(matches!(
+            flood_error,
+            SsePushError::Parse(SseParseError::KeepaliveFlood { limit_lines: 2 })
+        ));
+        assert_eq!(flood_parser.buffered_bytes(), 0);
+        assert_eq!(
+            flood_parser.finish(),
+            Err(SseParseError::Poisoned),
+            "flood refusal releases state and poisons the parser"
+        );
     }
 }
