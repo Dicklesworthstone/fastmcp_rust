@@ -4,7 +4,11 @@
 //! runner can select its literal ID with `--exact`.
 
 use std::collections::VecDeque;
+use std::io::{BufWriter, Write};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
@@ -101,6 +105,211 @@ fn stateless_public_catalog_snapshot(server: &Server) -> Vec<u8> {
         "prompts": server.prompts(),
     }))
     .expect("public stateless catalog must serialize")
+}
+
+/// An actual buffered stdout transport: only close commits the queued reply.
+/// This integration crate links the shipped server, including its feature-off
+/// pump, rather than selecting the server's `cfg(test)` dispatcher.
+struct ProcessOwnedTransport {
+    request: Option<JsonRpcRequest>,
+    output: BufWriter<std::io::Stdout>,
+    scenario: String,
+    fail_close: bool,
+    shutdown_calls: Arc<AtomicUsize>,
+    close_calls: usize,
+}
+
+impl Transport for ProcessOwnedTransport {
+    fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.scenario == "send" {
+            return Err(TransportError::Io(std::io::Error::other(
+                "process transport send failed",
+            )));
+        }
+        serde_json::to_writer(&mut self.output, message)
+            .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
+        self.output.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if let Some(request) = self.request.take() {
+            return Ok(JsonRpcMessage::Request(request));
+        }
+        match self.scenario.as_str() {
+            "cancel" => Err(TransportError::Cancelled),
+            "receive" => Err(TransportError::Io(std::io::Error::other(
+                "process transport receive failed",
+            ))),
+            _ => Err(TransportError::Closed),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.close_calls += 1;
+        self.output.flush()?;
+        serde_json::to_writer(
+            &mut self.output,
+            &serde_json::json!({
+                "event": "transport_closed",
+                "closeCalls": self.close_calls,
+                "shutdownCalls": self.shutdown_calls.load(Ordering::Acquire),
+            }),
+        )
+        .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
+        self.output.write_all(b"\n")?;
+        self.output.flush()?;
+        if self.fail_close {
+            return Err(TransportError::Io(std::io::Error::other(
+                "process transport close failed",
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn run_process_owned_transport_child(scenario: String, fail_close: bool) -> ! {
+    let shutdown_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::clone(&shutdown_calls);
+    let startup_fails = scenario == "startup";
+    let transport = ProcessOwnedTransport {
+        request: Some(JsonRpcRequest::new(
+            "server/discover",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            917_i64,
+        )),
+        output: BufWriter::with_capacity(64 * 1024, std::io::stdout()),
+        scenario,
+        fail_close,
+        shutdown_calls,
+        close_calls: 0,
+    };
+    let server = Server::new("process-close-public-runtime", "1.0.0")
+        .on_startup(move || -> Result<(), std::io::Error> {
+            if startup_fails {
+                Err(std::io::Error::other("process startup failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .on_shutdown(move || {
+            hook_calls.fetch_add(1, Ordering::AcqRel);
+        })
+        .build();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("process transport runtime must build");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime installs its context");
+        server.run_transport_with_cx(&cx, transport);
+    });
+    panic!("process-owned server must exit rather than return");
+}
+
+fn run_process_owned_transport_test(test_name: &str, fail_close: bool) {
+    const CHILD_SCENARIO: &str = "FASTMCP_PROCESS_CLOSE_TEST_SCENARIO";
+    if let Ok(scenario) = std::env::var(CHILD_SCENARIO) {
+        run_process_owned_transport_child(scenario, fail_close);
+    }
+
+    for scenario in ["eof", "cancel", "startup", "receive", "send"] {
+        let mut child =
+            Command::new(std::env::current_exe().expect("locate integration executable"))
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_SCENARIO, scenario)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn process-owned server test");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timed_out = loop {
+            if child.try_wait().expect("observe server process").is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop this nonterminating test child");
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let output = child.wait_with_output().expect("reap server test child");
+        let stdout = String::from_utf8(output.stdout).expect("server stdout is UTF-8");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "{scenario}: process did not terminate: {stderr}"
+        );
+        let expected_code =
+            i32::from(fail_close || matches!(scenario, "startup" | "receive" | "send"));
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{scenario}: {stderr}"
+        );
+        let frames: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let closes: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["event"] == "transport_closed")
+            .collect();
+        assert_eq!(
+            closes.len(),
+            1,
+            "{scenario}: close must commit exactly once: {stdout}"
+        );
+        assert_eq!(closes[0]["closeCalls"], 1, "{scenario}");
+        assert_eq!(
+            closes[0]["shutdownCalls"], 1,
+            "{scenario}: cleanup must precede close"
+        );
+        let responses: Vec<_> = frames.iter().filter(|frame| frame["id"] == 917).collect();
+        if matches!(scenario, "startup" | "send") {
+            assert!(
+                responses.is_empty(),
+                "{scenario}: no response was committed"
+            );
+        } else {
+            assert_eq!(
+                responses.len(),
+                1,
+                "{scenario}: queued discovery response was lost: {stdout}"
+            );
+            assert_eq!(
+                responses[0]["result"]["supportedVersions"],
+                serde_json::json!(["2026-07-28"])
+            );
+            assert!(responses[0].get("error").is_none(), "{scenario}");
+            assert_eq!(
+                frames.first(),
+                Some(responses[0]),
+                "{scenario}: flush must precede close completion"
+            );
+        }
+    }
+}
+
+#[test]
+fn process_owned_custom_transport_flushes_pending_data_before_exit() {
+    run_process_owned_transport_test(
+        "process_owned_custom_transport_flushes_pending_data_before_exit",
+        false,
+    );
+}
+
+#[test]
+fn process_owned_custom_transport_close_failure_changes_exit_status() {
+    run_process_owned_transport_test(
+        "process_owned_custom_transport_close_failure_changes_exit_status",
+        true,
+    );
 }
 
 #[test]

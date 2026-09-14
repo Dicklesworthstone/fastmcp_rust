@@ -78,6 +78,8 @@ use crate::{
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
+const LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
+
 /// Exact request headers required for a modern MCP JSON-RPC POST.
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
@@ -3296,8 +3298,79 @@ impl LegacyHttpRequest {
         }
     }
 
+    /// Awaits this committed request while honoring an independent caller
+    /// cancellation domain. The response waiter is polled first on every
+    /// turn, so a response already routed by the connection-owned reader wins
+    /// over a cancellation observed in the same turn. A losing cancellation
+    /// retires the waiter before emitting the exact-2024 cancellation control,
+    /// leaving the existing tombstone in place for a late response.
+    async fn wait_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<JsonRpcMessage, ClientHttpConnectionError> {
+        let result = {
+            let mut response = std::pin::pin!(self.receiver.recv(cx));
+            let mut cancelled = std::pin::pin!(cancellation.cancelled());
+            poll_fn(|task_cx| match response.as_mut().poll(task_cx) {
+                Poll::Ready(result) => Poll::Ready(Ok(result)),
+                Poll::Pending => {
+                    if cancellation.is_cancel_requested()
+                        || cancelled.as_mut().poll(task_cx).is_ready()
+                    {
+                        Poll::Ready(Err(()))
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            })
+            .await
+        };
+        match result {
+            Ok(Ok(LegacyPersistentResponse::Response(response))) => {
+                self.terminal = true;
+                Ok(JsonRpcMessage::Response(response))
+            }
+            Ok(Ok(LegacyPersistentResponse::IdMismatch { actual })) => {
+                self.terminal = true;
+                Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
+                    expected: self.commit.request_id.clone(),
+                    actual: Some(actual),
+                })
+            }
+            Ok(Ok(LegacyPersistentResponse::Cancelled)) => {
+                self.terminal = true;
+                Err(ClientHttpConnectionError::LegacyRequestCancelled {
+                    request_id: self.commit.request_id.clone(),
+                })
+            }
+            Ok(Err(_)) => {
+                self.retire()?;
+                Err(ClientHttpConnectionError::LegacyPersistentReceiverStopped)
+            }
+            Err(()) => match self
+                .cancel(cx, Some("caller request cancellation".to_owned()))
+                .await
+            {
+                Ok(()) => Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::Cancelled,
+                )),
+                Err(ClientHttpConnectionError::LegacyRequestNoLongerPending { .. }) => {
+                    // The reader won the state-locked election between the
+                    // response poll and retirement. Consume that terminal
+                    // response instead of manufacturing a cancellation.
+                    self.wait(cx).await
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
     /// Emits one exact-2024 cancellation notification after the request's
-    /// POST commit and retires this waiter for late-response draining.
+    /// POST commit and retires this waiter for late-response draining. The
+    /// control POST has a short caller-clock bound; a peer that withholds its
+    /// HTTP acknowledgement yields an explicit transport deadline error while
+    /// the installed tombstone remains authoritative for the late response.
     pub async fn cancel(
         &mut self,
         cx: &Cx,
@@ -3321,16 +3394,26 @@ impl LegacyHttpRequest {
         .map_err(|_| {
             ClientHttpConnectionError::Legacy(LegacySseHttpClientError::MessageEncodingFailed)
         })?;
-        self.outbound
-            .send(
-                cx,
-                &JsonRpcMessage::Request(JsonRpcRequest::notification(
-                    fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED,
-                    Some(params),
+        let control = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED,
+            Some(params),
+        ));
+        let send = self.outbound.send(cx, &control);
+        match asupersync::time::timeout_at(
+            cx.now()
+                .saturating_add_nanos(LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS),
+            send,
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(ClientHttpConnectionError::Legacy(error.error)),
+            Err(_) => Err(ClientHttpConnectionError::Legacy(
+                LegacySseHttpClientError::Executor(ModernHttpExecutorError::Transport(
+                    ClientError::DeadlineExceeded,
                 )),
-            )
-            .await
-            .map_err(|error| ClientHttpConnectionError::Legacy(error.error))
+            )),
+        }
     }
 
     fn retire(&mut self) -> Result<LegacyPersistentWaiterRetirement, ClientHttpConnectionError> {
@@ -4078,7 +4161,7 @@ impl ClientHttpConnection {
                 reject_final_only_legacy_request_metadata(&parameters)?;
                 if let Some(receiver) = persistent_receiver.as_ref() {
                     return receiver
-                        .request(cx, method, parameters, request_id)
+                        .request(cx, method, parameters, request_id, cancellation)
                         .await
                         .map(ClientHttpResponse::Legacy);
                 }
@@ -7954,11 +8037,47 @@ impl LegacySsePersistentReceiver {
         method: &str,
         parameters: serde_json::Value,
         request_id: RequestId,
+        cancellation: Option<&McpRequestCancellation>,
     ) -> Result<JsonRpcMessage, ClientHttpConnectionError> {
-        let mut request = self
-            .start_request(cx, method, parameters, request_id)
-            .await?;
-        request.wait(cx).await
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            return Err(ClientHttpConnectionError::Legacy(
+                LegacySseHttpClientError::Cancelled,
+            ));
+        }
+        let mut request = match cancellation {
+            Some(cancellation) => {
+                let mut opening =
+                    std::pin::pin!(self.start_request(cx, method, parameters, request_id.clone(),));
+                let mut cancelled = std::pin::pin!(cancellation.cancelled());
+                poll_fn(|task_cx| {
+                    // A completed POST is a committed request and must win
+                    // over a cancellation observed on the same poll turn.
+                    match opening.as_mut().poll(task_cx) {
+                        Poll::Ready(result) => Poll::Ready(result),
+                        Poll::Pending => {
+                            if cancellation.is_cancel_requested()
+                                || cancelled.as_mut().poll(task_cx).is_ready()
+                            {
+                                Poll::Ready(Err(ClientHttpConnectionError::Legacy(
+                                    LegacySseHttpClientError::Cancelled,
+                                )))
+                            } else {
+                                Poll::Pending
+                            }
+                        }
+                    }
+                })
+                .await?
+            }
+            None => {
+                self.start_request(cx, method, parameters, request_id)
+                    .await?
+            }
+        };
+        match cancellation {
+            Some(cancellation) => request.wait_with_cancellation(cx, cancellation).await,
+            None => request.wait(cx).await,
+        }
     }
 }
 

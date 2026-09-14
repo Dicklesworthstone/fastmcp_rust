@@ -2449,11 +2449,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2482,11 +2486,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2514,11 +2522,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         }
         ensure_final_task_notification_matches_task(&task, &notification)?;
         validate_final_task_runtime_durations(&task)?;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generations.get(&task_id) != Some(&expected.generation()) {
+            return Ok(false);
+        }
+        let now = (self.clock)();
+        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -8523,6 +8535,51 @@ mod tests {
         )
     }
 
+    fn final_update_precommit_fixture(
+        boundary: StdDuration,
+    ) -> (Arc<InMemoryFinalTaskStore>, FinalTaskRuntime, FinalTaskId) {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock_now = Arc::clone(&now);
+        let clock_armed = Arc::new(AtomicBool::new(false));
+        let clock_sampled_boundary = Arc::new(AtomicBool::new(false));
+        let armed_for_clock = Arc::clone(&clock_armed);
+        let sampled_for_clock = Arc::clone(&clock_sampled_boundary);
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+            let sampled_now = *clock_now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if armed_for_clock.load(AtomicOrdering::SeqCst)
+                && sampled_for_clock.swap(true, AtomicOrdering::SeqCst)
+            {
+                sampled_now
+                    .checked_add(boundary)
+                    .expect("precommit boundary remains representable")
+            } else {
+                sampled_now
+            }
+        });
+        let store = Arc::new(
+            InMemoryFinalTaskStore::with_clock(1, clock)
+                .expect("positive bounded store capacity is valid"),
+        );
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(1_000, None)
+                .expect("finite update fixture retention is valid"),
+            Arc::new(|_| {}),
+        );
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .expect("update fixture enters input_required");
+        clock_armed.store(true, AtomicOrdering::SeqCst);
+        (store, runtime, task_id)
+    }
+
     /// Deliberately permissive custom store used to prove that the runtime,
     /// rather than one built-in store implementation, guards task data at its
     /// durable read and write boundaries.
@@ -9322,6 +9379,48 @@ mod tests {
         assert!(
             state.tasks.contains_key(&task_id) && state.expires_at.contains_key(&task_id),
             "a false CAS must not use expiry cleanup to delete retained task state"
+        );
+        drop(state);
+        let empty_roots: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed empty roots response");
+        assert!(
+            !store
+                .replace_task_and_append_input_if_current(
+                    &stale,
+                    task.clone(),
+                    final_task_notification(&task),
+                    empty_roots,
+                )
+                .expect("stale append compare-and-swap returns false"),
+            "stale append compare-and-swap must preserve retained task state"
+        );
+        assert!(
+            !store
+                .replace_task_and_clear_input_if_current(
+                    &stale,
+                    task.clone(),
+                    final_task_notification(&task),
+                )
+                .expect("stale clear compare-and-swap returns false"),
+            "stale clear compare-and-swap must preserve retained task state"
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            final_tasks_match_exactly(
+                &task,
+                state.tasks.get(&task_id).expect("stale CAS retains task"),
+            )
+            .expect("compare retained task with original"),
+            "all stale replacement CAS variants retain the original task"
+        );
+        assert_eq!(
+            state.generations.get(&task_id),
+            Some(&current),
+            "all stale replacement CAS variants retain the current generation"
         );
     }
 
@@ -12184,6 +12283,398 @@ mod tests {
                 .is_some(),
             "the durable task mutation survives the contained emitter panic"
         );
+    }
+
+    #[test]
+    fn task_03_final_tasks_update_commits_unexpired_precommit_snapshot() {
+        let (store, runtime, task_id) =
+            final_update_precommit_fixture(StdDuration::from_millis(999));
+        let mut parameters = final_task_method_parameters(&task_id);
+        parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+
+        let response = dispatch_final_tasks_update(
+            &runtime,
+            &McpContext::new(Cx::for_testing(), 1),
+            parameters,
+        )
+        .expect("an unexpired precommit snapshot admits tasks/update");
+        assert_eq!(response["resultType"], "complete");
+
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(
+            state.tasks.get(&task_id),
+            Some(FinalTask::Working(_))
+        ));
+        assert!(state.generations.contains_key(&task_id));
+        assert!(
+            state
+                .accepted_inputs
+                .get(&task_id)
+                .is_some_and(|responses| { responses.contains_key("roots") })
+        );
+        assert!(matches!(
+            state.latest_notifications.get(&task_id),
+            Some(notification) if matches!(&notification.params.task, FinalTask::Working(_))
+        ));
+    }
+
+    #[test]
+    fn task_03_final_tasks_update_rejects_expired_precommit_snapshot() {
+        let (store, runtime, task_id) =
+            final_update_precommit_fixture(StdDuration::from_millis(1_000));
+        let mut parameters = final_task_method_parameters(&task_id);
+        parameters["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+
+        let error = dispatch_final_tasks_update(
+            &runtime,
+            &McpContext::new(Cx::for_testing(), 1),
+            parameters,
+        )
+        .expect_err("an expired precommit snapshot cannot mutate through tasks/update");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(error.data, None);
+        assert_eq!(
+            error.message,
+            "Task state changed before the transition could be recorded"
+        );
+
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.tasks.contains_key(&task_id));
+        assert!(!state.generations.contains_key(&task_id));
+        assert!(!state.accepted_inputs.contains_key(&task_id));
+        assert!(!state.latest_notifications.contains_key(&task_id));
+    }
+
+    #[test]
+    fn task_03_final_replacement_cas_preserves_live_snapshot() {
+        for (variant, target_name) in [
+            (0_u8, "task-replacement-live-direct"),
+            (1_u8, "task-replacement-live-append"),
+            (2_u8, "task-replacement-live-clear"),
+        ] {
+            let (store, now) = in_memory_store_with_test_clock(2);
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None)
+                    .expect("replacement fixture retention is valid"),
+                Arc::new(|_| {}),
+            );
+            let target = final_working_task_with_ttl(target_name, 1_000);
+            let target_id = target.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    target.clone(),
+                    final_task_notification(&target),
+                    final_test_work_descriptor(),
+                )
+                .expect("replacement target fixture is retained");
+            runtime
+                .require_input(&target_id, final_roots_request(), None)
+                .expect("replacement target enters input_required");
+            let sibling = final_working_task_with_ttl("task-replacement-live-sibling", 2_000);
+            let sibling_id = sibling.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    sibling.clone(),
+                    final_task_notification(&sibling),
+                    final_test_work_descriptor(),
+                )
+                .expect("replacement sibling fixture is retained");
+            runtime
+                .require_input(&sibling_id, final_roots_request(), None)
+                .expect("replacement sibling enters input_required");
+            let target_snapshot = store
+                .get_task_snapshot(&target_id)
+                .expect("live replacement snapshot is readable")
+                .expect("live replacement task is retained");
+            let sibling_snapshot = store
+                .get_task_snapshot(&sibling_id)
+                .expect("live replacement sibling snapshot is readable")
+                .expect("live replacement sibling is retained");
+            let sibling_notification = store
+                .latest_notification(&sibling_id)
+                .expect("live replacement sibling notification is retained");
+            let sibling_input = {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.accepted_inputs.get(&sibling_id).cloned()
+            };
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                StdDuration::from_millis(999);
+
+            let FinalTask::InputRequired {
+                base,
+                input_requests,
+            } = target_snapshot.task()
+            else {
+                unreachable!("replacement fixture awaits input");
+            };
+            let replacement = FinalTask::InputRequired {
+                base: transition_final_task_base(
+                    base.clone(),
+                    FinalTaskStatus::InputRequired,
+                    Some("replacement".to_owned()),
+                )
+                .expect("live replacement transition is structurally valid"),
+                input_requests: input_requests.clone(),
+            };
+            let expected_generation = {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state
+                    .next_generation
+                    .checked_add(1)
+                    .expect("live replacement generation remains representable")
+            };
+            let replacement_value =
+                serde_json::to_value(&replacement).expect("encode live replacement task");
+            let replacement_notification = final_task_notification(&replacement);
+            let replacement_notification_value = serde_json::to_value(&replacement_notification)
+                .expect("encode live replacement notification");
+            let append_input_responses: FinalTaskInputResponses =
+                serde_json::from_value(serde_json::json!({
+                    "roots": {"roots": []}
+                }))
+                .expect("live replacement input is valid");
+            let committed = match variant {
+                0 => FinalTaskStore::replace_task_if_current(
+                    &*store,
+                    &target_snapshot,
+                    replacement,
+                    replacement_notification,
+                )
+                .expect("live direct replacement CAS is readable"),
+                1 => FinalTaskStore::replace_task_and_append_input_if_current(
+                    &*store,
+                    &target_snapshot,
+                    replacement,
+                    replacement_notification,
+                    append_input_responses.clone(),
+                )
+                .expect("live append replacement CAS is readable"),
+                2 => FinalTaskStore::replace_task_and_clear_input_if_current(
+                    &*store,
+                    &target_snapshot,
+                    replacement,
+                    replacement_notification,
+                )
+                .expect("live clear replacement CAS is readable"),
+                _ => unreachable!("all replacement variants are covered"),
+            };
+            assert!(committed, "an unexpired replacement CAS commits");
+
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                state.generations.get(&target_id),
+                Some(&expected_generation)
+            );
+            assert_eq!(
+                serde_json::to_value(state.tasks.get(&target_id))
+                    .expect("encode committed replacement task"),
+                replacement_value
+            );
+            assert_eq!(
+                serde_json::to_value(state.latest_notifications.get(&target_id))
+                    .expect("encode committed replacement notification"),
+                replacement_notification_value
+            );
+            match variant {
+                0 | 2 => assert!(!state.accepted_inputs.contains_key(&target_id)),
+                1 => assert_eq!(
+                    serde_json::to_value(state.accepted_inputs.get(&target_id))
+                        .expect("encode appended replacement input"),
+                    serde_json::to_value(&append_input_responses)
+                        .expect("encode expected replacement input")
+                ),
+                _ => unreachable!("all replacement variants are covered"),
+            }
+            assert_eq!(
+                serde_json::to_value(state.tasks.get(&sibling_id))
+                    .expect("encode retained replacement sibling task"),
+                serde_json::to_value(sibling_snapshot.task())
+                    .expect("encode pre-expiry replacement sibling task")
+            );
+            assert_eq!(
+                state.generations.get(&sibling_id),
+                Some(&sibling_snapshot.generation())
+            );
+            assert_eq!(
+                serde_json::to_value(state.latest_notifications.get(&sibling_id))
+                    .expect("encode retained replacement sibling notification"),
+                serde_json::to_value(&sibling_notification)
+                    .expect("encode pre-expiry replacement sibling notification")
+            );
+            assert_eq!(
+                state.accepted_inputs.get(&sibling_id),
+                sibling_input.as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn task_03_final_replacement_cas_rejects_expired_snapshot() {
+        for (variant, target_name) in [
+            (0_u8, "task-replacement-expired-direct"),
+            (1_u8, "task-replacement-expired-append"),
+            (2_u8, "task-replacement-expired-clear"),
+        ] {
+            let (store, now) = in_memory_store_with_test_clock(2);
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None)
+                    .expect("replacement fixture retention is valid"),
+                Arc::new(|_| {}),
+            );
+            let target = final_working_task_with_ttl(target_name, 1_000);
+            let target_id = target.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    target.clone(),
+                    final_task_notification(&target),
+                    final_test_work_descriptor(),
+                )
+                .expect("replacement target fixture is retained");
+            runtime
+                .require_input(&target_id, final_roots_request(), None)
+                .expect("replacement target enters input_required");
+            let sibling = final_working_task_with_ttl("task-replacement-expired-sibling", 2_000);
+            let sibling_id = sibling.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    sibling.clone(),
+                    final_task_notification(&sibling),
+                    final_test_work_descriptor(),
+                )
+                .expect("replacement sibling fixture is retained");
+            runtime
+                .require_input(&sibling_id, final_roots_request(), None)
+                .expect("replacement sibling enters input_required");
+            let target_snapshot = store
+                .get_task_snapshot(&target_id)
+                .expect("expired replacement snapshot is readable before expiry")
+                .expect("expired replacement task is retained before expiry");
+            let sibling_snapshot = store
+                .get_task_snapshot(&sibling_id)
+                .expect("expired replacement sibling snapshot is readable")
+                .expect("expired replacement sibling is retained");
+            let sibling_notification = store
+                .latest_notification(&sibling_id)
+                .expect("expired replacement sibling notification is retained");
+            let sibling_input = {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.accepted_inputs.get(&sibling_id).cloned()
+            };
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_secs(1);
+
+            let FinalTask::InputRequired {
+                base,
+                input_requests,
+            } = target_snapshot.task()
+            else {
+                unreachable!("replacement fixture awaits input");
+            };
+            let replacement = FinalTask::InputRequired {
+                base: transition_final_task_base(
+                    base.clone(),
+                    FinalTaskStatus::InputRequired,
+                    Some("replacement".to_owned()),
+                )
+                .expect("expired replacement transition is structurally valid"),
+                input_requests: input_requests.clone(),
+            };
+            let next_generation_before = {
+                let state = store
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.next_generation
+            };
+            let replacement_notification = final_task_notification(&replacement);
+            let rejected = match variant {
+                0 => !FinalTaskStore::replace_task_if_current(
+                    &*store,
+                    &target_snapshot,
+                    replacement,
+                    replacement_notification,
+                )
+                .expect("expired direct replacement CAS is readable"),
+                1 => {
+                    let input_responses: FinalTaskInputResponses =
+                        serde_json::from_value(serde_json::json!({
+                            "roots": {"roots": []}
+                        }))
+                        .expect("expired replacement input is valid");
+                    !FinalTaskStore::replace_task_and_append_input_if_current(
+                        &*store,
+                        &target_snapshot,
+                        replacement,
+                        replacement_notification,
+                        input_responses,
+                    )
+                    .expect("expired append replacement CAS is readable")
+                }
+                2 => !FinalTaskStore::replace_task_and_clear_input_if_current(
+                    &*store,
+                    &target_snapshot,
+                    replacement,
+                    replacement_notification,
+                )
+                .expect("expired clear replacement CAS is readable"),
+                _ => unreachable!("all replacement variants are covered"),
+            };
+            assert!(rejected, "retention expiry fences every replacement CAS");
+
+            let state = store
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                state.next_generation, next_generation_before,
+                "expired replacement reclamation does not allocate a replacement generation"
+            );
+            assert!(!state.tasks.contains_key(&target_id));
+            assert!(!state.generations.contains_key(&target_id));
+            assert!(!state.accepted_inputs.contains_key(&target_id));
+            assert!(!state.latest_notifications.contains_key(&target_id));
+            assert_eq!(
+                serde_json::to_value(state.tasks.get(&sibling_id))
+                    .expect("encode retained replacement sibling task"),
+                serde_json::to_value(sibling_snapshot.task())
+                    .expect("encode pre-expiry replacement sibling task")
+            );
+            assert_eq!(
+                state.generations.get(&sibling_id),
+                Some(&sibling_snapshot.generation())
+            );
+            assert_eq!(
+                serde_json::to_value(state.latest_notifications.get(&sibling_id))
+                    .expect("encode retained replacement sibling notification"),
+                serde_json::to_value(&sibling_notification)
+                    .expect("encode pre-expiry replacement sibling notification")
+            );
+            assert_eq!(
+                state.accepted_inputs.get(&sibling_id),
+                sibling_input.as_ref()
+            );
+        }
     }
 
     #[test]

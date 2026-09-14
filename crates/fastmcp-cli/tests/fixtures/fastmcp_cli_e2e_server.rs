@@ -331,10 +331,9 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
                     .get_task(&self.task_id)?
                     .expect("task retained before listener admission");
                 assert!(matches!(task, Task::Working(_)));
-                let complete = std::fs::read_to_string(dir.join("watch_gap"))
-                    .expect("read runtime-selected gap scenario")
-                    == "complete";
-                let after = if complete {
+                let scenario = std::fs::read_to_string(dir.join("watch_gap"))
+                    .expect("read runtime-selected gap scenario");
+                let after = if scenario == "complete" {
                     let mut base = task.base().clone();
                     base.status = TaskStatus::Completed;
                     let completed = Task::Completed {
@@ -353,6 +352,19 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
                         }),
                     )?;
                     completed
+                } else if scenario == "changed" {
+                    let mut base = task.base().clone();
+                    base.status_message = Some("reconciled working snapshot".to_owned());
+                    let changed = Task::Working(base);
+                    self.store.replace_task(
+                        changed.clone(),
+                        TaskStatusNotification::new(TaskStatusNotificationParams {
+                            task: changed.clone(),
+                            meta: None,
+                            additional: std::collections::BTreeMap::new(),
+                        }),
+                    )?;
+                    changed
                 } else {
                     task
                 };

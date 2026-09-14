@@ -15001,9 +15001,9 @@ impl Server {
         );
 
         let shared_recv = shared.clone();
-        let shared_send = shared;
+        let shared_send = shared.clone();
         #[cfg(any(feature = "legacy-2024-11-05", test))]
-        self.run_loop_legacy(
+        let run_result = self.run_loop_returning_legacy(
             cx,
             move |cx| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
@@ -15012,13 +15012,50 @@ impl Server {
             label,
         );
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
-        std::process::exit(self.run_loop_pump(
+        let run_result = match Arc::new(self).run_loop_pump_with_policy(
+            cx,
             cx,
             move |cx, _worker_failed| shared_recv.recv(cx),
             move |cx, message| shared_send.send(cx, message),
             notification_sender,
             label,
-        ))
+            true,
+            Some(notification_failure),
+            true,
+            true,
+            None,
+            None,
+            None,
+            PumpIoMode::Unsplit,
+        ) {
+            0 => Ok(()),
+            _ => Err(server_run_error(
+                "transport",
+                "pump_failure",
+                "Server transport loop failed",
+            )),
+        };
+        let close_result = shared
+            .close()
+            .map_err(|error| transport_run_error("close", &error));
+        let result = match (run_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(run_error), Err(close_error)) => {
+                Err(combined_run_and_close_error(run_error, close_error))
+            }
+        };
+        let exit_code = match result {
+            Ok(()) => 0,
+            Err(error) => {
+                error!(
+                    target: targets::TRANSPORT,
+                    "Server transport terminated with error: {error:?}"
+                );
+                1
+            }
+        };
+        std::process::exit(exit_code)
     }
 
     /// Runs the server on a custom transport until clean closure, cancellation,
@@ -17798,386 +17835,6 @@ impl Server {
             stats.connection_closed();
         }
         exit_code
-    }
-
-    /// Legacy synchronous loop retained privately for differential tests.
-    #[cfg(any(feature = "legacy-2024-11-05", test))]
-    fn run_loop_legacy<R, S>(
-        self,
-        cx: &Cx,
-        mut recv: R,
-        send: S,
-        notification_sender: NotificationSender,
-        connection_failure: Option<Arc<AtomicBool>>,
-        transport_label: &'static str,
-    ) -> !
-    where
-        R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
-        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        let server = Arc::new(self);
-        let mut session = Session::new(server.info.clone(), server.capabilities.clone());
-        let legacy_binding = runtime_legacy_binding(session.id());
-        let mut legacy_adapter: Option<Legacy2024ServerAdapter<LiveLegacy2024RuntimeHandler<'_>>> =
-            None;
-        let legacy_active_request = Arc::new(Mutex::new(None));
-        let mut era_classifier =
-            StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
-        let mut negotiated_era = None;
-
-        // Keep response output and inbound pending-response routing connection-scoped.
-        let send = Arc::new(Mutex::new(send));
-        let background_send_failure = Arc::new(Mutex::new(None));
-        let pending_requests = server.new_pending_requests_for_connection();
-        let legacy_runtime = LiveLegacy2024ConnectionRuntime::new(
-            SessionState::new(),
-            Arc::clone(&notification_sender),
-            None,
-            server.logging.level,
-        );
-        let modern_connection = ModernConnection::new();
-
-        // Track connection opened
-        if let Some(ref stats) = server.stats {
-            stats.connection_opened();
-        }
-
-        // Render startup banner if enabled (respects both config and legacy env var)
-        if server.console_config.show_banner && !banner_suppressed() {
-            server.render_startup_banner(transport_label);
-        }
-
-        // Run startup hook
-        if !server.run_startup_hook() {
-            error!(target: targets::SERVER, "Startup hook failed, exiting");
-            server.graceful_shutdown(1);
-        }
-
-        // Create traffic renderer if enabled
-        let traffic_renderer = server.configured_traffic_renderer();
-
-        // Main request loop
-        loop {
-            if background_send_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-            {
-                error!(target: targets::TRANSPORT, "Background response send failed; terminating transport");
-                server.graceful_shutdown(1);
-            }
-            if connection_failure
-                .as_ref()
-                .is_some_and(|failed| failed.load(Ordering::Acquire))
-            {
-                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                server.graceful_shutdown(1);
-            }
-            // Check for cancellation
-            if cx.checkpoint().is_err() {
-                info!(target: targets::SERVER, "Cancellation requested, shutting down");
-                server.graceful_shutdown(0);
-            }
-
-            // Receive next message
-            let receive_result = recv(cx);
-            if background_send_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-            {
-                error!(target: targets::TRANSPORT, "Background response send failed; terminating transport");
-                server.graceful_shutdown(1);
-            }
-            if connection_failure
-                .as_ref()
-                .is_some_and(|failed| failed.load(Ordering::Acquire))
-            {
-                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                server.graceful_shutdown(1);
-            }
-            let message = match receive_result {
-                Ok(msg) => msg,
-                Err(TransportError::Closed) => {
-                    // Clean shutdown - track connection close
-                    server.graceful_shutdown(0);
-                }
-                Err(TransportError::Cancelled) => {
-                    info!(target: targets::SERVER, "Transport cancelled");
-                    server.graceful_shutdown(0);
-                }
-                Err(error) => match classify_receive_error(&error) {
-                    ReceiveErrorDisposition::ReplyWithParseError => {
-                        error!(target: targets::TRANSPORT, "Rejected malformed transport message");
-                        if send_uncorrelated_parse_error(&send, cx).is_err() {
-                            error!(target: targets::TRANSPORT, "Failed to send parse-error response; terminating transport");
-                            server.graceful_shutdown(1);
-                        }
-                        continue;
-                    }
-                    ReceiveErrorDisposition::ReplyWithInvalidRequest(request_id) => {
-                        error!(target: targets::TRANSPORT, "Rejected invalid JSON-RPC request");
-                        if send_invalid_request(&send, cx, request_id).is_err() {
-                            error!(target: targets::TRANSPORT, "Failed to send invalid-request response; terminating transport");
-                            server.graceful_shutdown(1);
-                        }
-                        continue;
-                    }
-                    ReceiveErrorDisposition::Terminate => {
-                        error!(target: targets::TRANSPORT, "Fatal transport receive failure; terminating transport");
-                        server.graceful_shutdown(1);
-                    }
-                },
-            };
-
-            // Log request traffic
-            if let Some(renderer) = &traffic_renderer {
-                if let JsonRpcMessage::Request(req) = &message {
-                    renderer.render_request(req, &server.console);
-                }
-            }
-
-            let start_time = Instant::now();
-
-            // Handle the message
-            let response_opt = match message {
-                JsonRpcMessage::Request(request) => {
-                    if request.validate().is_err() {
-                        if send_invalid_request(&send, cx, request.id).is_err() {
-                            server.graceful_shutdown(1);
-                        }
-                        continue;
-                    }
-                    // Track bytes received (approximate from serialized request size)
-                    if let Some(ref stats) = server.stats {
-                        // Estimate request size by serializing back to JSON
-                        // This is approximate but accurate enough for statistics
-                        if let Ok(json) = serde_json::to_string(&request) {
-                            stats.add_bytes_received(json.len() as u64 + 1); // +1 for newline
-                        }
-                    }
-                    let era = match negotiated_era {
-                        Some(ProtocolEra::Modern2026)
-                            if modern_protocol_version(&request)
-                                == Some(MODERN_PROTOCOL_VERSION) =>
-                        {
-                            ProtocolEra::Modern2026
-                        }
-                        Some(ProtocolEra::Legacy2024)
-                            if modern_protocol_version(&request).is_none()
-                                && (request.method != "initialize"
-                                    || is_exact_legacy_initialize(&request)) =>
-                        {
-                            ProtocolEra::Legacy2024
-                        }
-                        Some(_) => {
-                            if let Some(response) = protocol_era_refusal(&request)
-                                && let Err(send_error) = send
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
-                                    cx,
-                                    &JsonRpcMessage::Response(response),
-                                )
-                            {
-                                error!(
-                                    target: targets::TRANSPORT,
-                                    "Failed to send protocol-era refusal; terminating transport: {send_error}"
-                                );
-                            }
-                            server.graceful_shutdown(1);
-                        }
-                        None => {
-                            match era_classifier.classify_opening(stdio_opening_frame(&request)) {
-                                StdioEraDecision::Selected {
-                                    era: ProtocolEra::Modern2026,
-                                    modern_version: Some(ModernVersionSupport::Supported),
-                                } => {
-                                    negotiated_era = Some(ProtocolEra::Modern2026);
-                                    ProtocolEra::Modern2026
-                                }
-                                StdioEraDecision::Selected {
-                                    era: ProtocolEra::Legacy2024,
-                                    modern_version: None,
-                                } => {
-                                    negotiated_era = Some(ProtocolEra::Legacy2024);
-                                    ProtocolEra::Legacy2024
-                                }
-                                _ => {
-                                    if let Some(response) = protocol_era_refusal(&request)
-                                        && let Err(send_error) = send
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)(
-                                            cx,
-                                            &JsonRpcMessage::Response(response),
-                                        )
-                                    {
-                                        error!(
-                                            target: targets::TRANSPORT,
-                                            "Failed to send protocol-era refusal; terminating transport: {send_error}"
-                                        );
-                                    }
-                                    server.graceful_shutdown(1);
-                                }
-                            }
-                        }
-                    };
-
-                    if matches!(era, ProtocolEra::Modern2026) {
-                        // Stdio is a local trusted pipe with no transport-layer
-                        // authorization; dispatch carries no auth custody for it.
-                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
-                            cx.clone(),
-                            request_id_to_u64(request.id.as_ref()),
-                            InboundRequestTransport::Stdio,
-                            &modern_connection,
-                            TransportAuthorization::default(),
-                        );
-                        Self::dispatch_or_schedule_stdio_modern_request(
-                            Arc::clone(&server),
-                            cx,
-                            cx,
-                            session.id(),
-                            inbound,
-                            request,
-                            None,
-                            None,
-                            Arc::clone(&notification_sender),
-                            Arc::clone(&send),
-                            Arc::clone(&background_send_failure),
-                        )
-                        .map(HandledRequest::untracked)
-                    } else {
-                        let adapter = match legacy_adapter.as_mut() {
-                            Some(adapter) => adapter,
-                            None => {
-                                let adapter = server.install_legacy_2024_adapter(
-                                    legacy_binding,
-                                    LiveLegacy2024RuntimeHandler {
-                                        server: server.as_ref(),
-                                        cx: cx.clone(),
-                                        session_id: legacy_binding.generation(),
-                                        session_principal: session.principal_binding(),
-                                        runtime: legacy_runtime.clone(),
-                                        queue_state: None,
-                                        active_request: Arc::clone(&legacy_active_request),
-                                        connection_auth: None,
-                                    },
-                                );
-                                let Ok(adapter) = adapter else {
-                                    server.graceful_shutdown(1);
-                                };
-                                legacy_adapter.insert(adapter)
-                            }
-                        };
-                        let legacy_response = poll_on_cx(
-                            cx,
-                            legacy_adapter_response_async(adapter, legacy_binding, &request),
-                        );
-                        sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
-                        let active_request =
-                            take_live_legacy_active_request(&legacy_active_request);
-                        match legacy_response {
-                            Ok(response) => response.map(|response| {
-                                legacy_handled_response(response, active_request, cx)
-                            }),
-                            // Peer-fault rejections of id-less frames are
-                            // dropped rather than terminating the connection.
-                            Err(error)
-                                if matches!(error.code().as_i32(), Some(-32602..=-32600)) =>
-                            {
-                                debug!(
-                                    target: targets::SESSION,
-                                    "Dropped invalid exact-2024 notification; code={}",
-                                    error.code()
-                                );
-                                None
-                            }
-                            Err(_) => server.graceful_shutdown(1),
-                        }
-                    }
-                }
-                JsonRpcMessage::Response(response) => {
-                    if response.validate().is_err() {
-                        server.graceful_shutdown(1);
-                    }
-                    // Generic server-initiated requests retain their existing
-                    // pending-request ownership. Only an unmatched response
-                    // on an exact-2024 connection belongs to the legacy
-                    // adapter's reverse-request lifecycle.
-                    let disposition = pending_requests.route_response_with_disposition(&response);
-                    if matches!(
-                        disposition,
-                        bidirectional::PendingResponseDisposition::Delivered
-                    ) {
-                        debug!(target: targets::SERVER, "Routed response to pending request");
-                    } else if matches!(
-                        disposition,
-                        bidirectional::PendingResponseDisposition::Unmatched
-                    ) && matches!(negotiated_era, Some(ProtocolEra::Legacy2024))
-                    {
-                        let Some(adapter) = legacy_adapter.as_mut() else {
-                            server.graceful_shutdown(1);
-                        };
-                        if !legacy_adapter_accept_response(adapter, legacy_binding, &response) {
-                            server.graceful_shutdown(1);
-                        }
-                    } else if matches!(
-                        disposition,
-                        bidirectional::PendingResponseDisposition::Unmatched
-                    ) {
-                        let request_key = response.id.as_ref().map(request_id_log_key);
-                        debug!(
-                            target: targets::SERVER,
-                            "Received unexpected response (id_present={}, request_key={:016x})",
-                            response.id.is_some(),
-                            request_key.unwrap_or_default()
-                        );
-                    }
-                    continue;
-                }
-            };
-
-            if connection_failure
-                .as_ref()
-                .is_some_and(|failed| failed.load(Ordering::Acquire))
-            {
-                error!(target: targets::TRANSPORT, "Notification send failed; terminating transport");
-                server.graceful_shutdown(1);
-            }
-
-            let duration = start_time.elapsed();
-
-            if let Some(response) = response_opt {
-                let mut guard = match send.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        error!(
-                            target: targets::TRANSPORT,
-                            "Send channel lock poisoned; continuing with inner guard"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let send_result = response.send_with(&mut session, |response| {
-                    guard(cx, &JsonRpcMessage::Response(response.clone()))
-                });
-                drop(guard);
-                if let Ok(Some(response)) = &send_result {
-                    if let Some(renderer) = &traffic_renderer {
-                        renderer.render_response(response, Some(duration), &server.console);
-                    }
-                    if let Some(ref stats) = server.stats
-                        && let Ok(json) = serde_json::to_string(response)
-                    {
-                        stats.add_bytes_sent(json.len() as u64 + 1);
-                    }
-                }
-                if send_result.is_err() {
-                    error!(target: targets::TRANSPORT, "Failed to send response; terminating transport");
-                    server.graceful_shutdown(1);
-                }
-            }
-        }
     }
 
     /// Shared server loop for embedding/testing, returning on shutdown instead of exiting.
@@ -21649,7 +21306,7 @@ fn stable_hash_request_id(value: &str) -> u64 {
 }
 
 struct SharedTransport<T> {
-    inner: Arc<Mutex<T>>,
+    inner: Arc<Mutex<Option<T>>>,
 }
 
 struct SharedRecvHalf<R> {
@@ -21731,13 +21388,15 @@ impl<T> Clone for SharedTransport<T> {
 impl<T: Transport> SharedTransport<T> {
     fn new(transport: T) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(transport)),
+            inner: Arc::new(Mutex::new(Some(transport))),
         }
     }
 
     fn recv(&self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
-        guard.recv(cx)
+        guard
+            .as_mut()
+            .map_or(Err(TransportError::Closed), |transport| transport.recv(cx))
     }
 
     fn send(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
@@ -21751,12 +21410,22 @@ impl<T: Transport> SharedTransport<T> {
                 )));
             }
         };
-        guard.send(cx, message)
+        guard
+            .as_mut()
+            .map_or(Err(TransportError::Closed), |transport| {
+                transport.send(cx, message)
+            })
     }
 
     fn close(&self) -> Result<(), TransportError> {
-        let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
-        guard.close()
+        let transport = {
+            let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
+            guard.take()
+        };
+        let Some(mut transport) = transport else {
+            return Ok(());
+        };
+        transport.close()
     }
 }
 
@@ -31367,6 +31036,13 @@ mod lib_unit_tests {
         close_calls: Arc<AtomicUsize>,
     }
 
+    struct SharedTransportCountingTransport {
+        recv_calls: Arc<AtomicUsize>,
+        send_calls: Arc<AtomicUsize>,
+        close_calls: Arc<AtomicUsize>,
+        fail_close: bool,
+    }
+
     struct ProtocolPolicyProbeTransport {
         next: Option<JsonRpcMessage>,
         sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
@@ -35179,6 +34855,29 @@ mod lib_unit_tests {
                 Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "test returning-transport close failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Transport for SharedTransportCountingTransport {
+        fn send(&mut self, _cx: &Cx, _message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.send_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.recv_calls.fetch_add(1, Ordering::AcqRel);
+            Err(TransportError::Closed)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.close_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_close {
+                Err(TransportError::Io(std::io::Error::other(
+                    "counting transport close failure",
                 )))
             } else {
                 Ok(())
@@ -46185,6 +45884,86 @@ mod lib_unit_tests {
             error.data.as_ref().and_then(|data| data["kind"].as_str()),
             Some("io")
         );
+    }
+
+    #[test]
+    fn shared_transport_close_retires_io_once_positive() {
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let transport = SharedTransport::new(SharedTransportCountingTransport {
+            recv_calls: Arc::clone(&recv_calls),
+            send_calls: Arc::clone(&send_calls),
+            close_calls: Arc::clone(&close_calls),
+            fail_close: false,
+        });
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 1_i64));
+
+        assert!(transport.send(&Cx::for_testing(), &message).is_ok());
+        assert_eq!(send_calls.load(Ordering::Acquire), 1);
+        assert!(transport.close().is_ok());
+        assert!(matches!(
+            transport.send(&Cx::for_testing(), &message),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+        assert!(transport.close().is_ok());
+        assert_eq!(send_calls.load(Ordering::Acquire), 1);
+        assert_eq!(recv_calls.load(Ordering::Acquire), 0);
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+
+        let sibling_send_calls = Arc::new(AtomicUsize::new(0));
+        let sibling = SharedTransport::new(SharedTransportCountingTransport {
+            recv_calls: Arc::new(AtomicUsize::new(0)),
+            send_calls: Arc::clone(&sibling_send_calls),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+            fail_close: false,
+        });
+        assert!(sibling.send(&Cx::for_testing(), &message).is_ok());
+        assert_eq!(sibling_send_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn shared_transport_close_failure_keeps_io_retired_negative() {
+        let recv_calls = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let transport = SharedTransport::new(SharedTransportCountingTransport {
+            recv_calls: Arc::clone(&recv_calls),
+            send_calls: Arc::clone(&send_calls),
+            close_calls: Arc::clone(&close_calls),
+            fail_close: true,
+        });
+        let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 1_i64));
+
+        assert!(transport.send(&Cx::for_testing(), &message).is_ok());
+        assert_eq!(send_calls.load(Ordering::Acquire), 1);
+        assert!(transport.close().is_err());
+        assert!(matches!(
+            transport.send(&Cx::for_testing(), &message),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            transport.recv(&Cx::for_testing()),
+            Err(TransportError::Closed)
+        ));
+        assert!(transport.close().is_ok());
+        assert_eq!(send_calls.load(Ordering::Acquire), 1);
+        assert_eq!(recv_calls.load(Ordering::Acquire), 0);
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+
+        let sibling_send_calls = Arc::new(AtomicUsize::new(0));
+        let sibling = SharedTransport::new(SharedTransportCountingTransport {
+            recv_calls: Arc::new(AtomicUsize::new(0)),
+            send_calls: Arc::clone(&sibling_send_calls),
+            close_calls: Arc::new(AtomicUsize::new(0)),
+            fail_close: false,
+        });
+        assert!(sibling.send(&Cx::for_testing(), &message).is_ok());
+        assert_eq!(sibling_send_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

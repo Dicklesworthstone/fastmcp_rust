@@ -3787,4 +3787,81 @@ server.serve_forever()
     fn cli_02_b_stdio_watch_unexpired_before_acknowledgment() {
         check_watch_snapshot_admission_gap(false, false);
     }
+
+    fn check_nonterminal_reconciliation(http: bool, changed: bool) {
+        let fixture = TaskFixture::new(false);
+        std::fs::write(
+            fixture.root.join("watch_gap"),
+            if changed { "changed" } else { "hold" },
+        )
+        .unwrap();
+        let output = if http {
+            let (mut server, endpoint) = fixture.http();
+            let output = run_cli(&[
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--max-events",
+                "1",
+                "--timeout",
+                "2",
+            ]);
+            server.kill_and_reap().expect("HTTP server cleanup");
+            output
+        } else {
+            fixture.stdio("watch", &["--json", "--max-events", "1", "--timeout", "2"])
+        };
+        let events: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+        let admitted: Value =
+            serde_json::from_slice(&std::fs::read(fixture.root.join("watch_gap_state")).unwrap())
+                .unwrap();
+        if changed {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["event"], "task-updated");
+            assert_eq!(events[2]["data"], admitted);
+            assert_eq!(events[2]["data"]["status"], "working");
+            assert_ne!(events[2]["data"], fixture.task);
+            assert_eq!(
+                events[2]["data"]["statusMessage"],
+                "reconciled working snapshot"
+            );
+            assert_eq!(events[3]["event"], "watch-ended");
+            assert_eq!(events[3]["data"]["reason"], "max-events");
+            assert_eq!(events[3]["data"]["updates"], 1);
+        } else {
+            assert!(!output.status.success());
+            assert!(stderr_str(&output).contains("--timeout"));
+            assert_eq!(admitted, fixture.task);
+            assert_eq!(events.len(), 2);
+        }
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_emits_nonterminal_reconciled_update_before_acknowledgment() {
+        check_nonterminal_reconciliation(true, true);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_emits_nonterminal_reconciled_update_before_acknowledgment() {
+        check_nonterminal_reconciliation(false, true);
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_unchanged_reconciliation_emits_no_update() {
+        check_nonterminal_reconciliation(true, false);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_unchanged_reconciliation_emits_no_update() {
+        check_nonterminal_reconciliation(false, false);
+    }
 }

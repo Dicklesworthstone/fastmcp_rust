@@ -28,6 +28,8 @@ use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientProtocolPlan, ProtocolPolicy,
     RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy,
 };
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_core::{McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ProgressMarker, RequestId, ServerNotification,
     SubscriptionFilter,
@@ -423,6 +425,370 @@ fn http_03_b_runtime_planted_negative() {
             .expect("negative native HTTP server must join"),
         "server/discover",
     );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn begin_ready_legacy_sse(stream: &mut TcpStream, message_target: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .expect("write ready legacy SSE response head");
+    stream
+        .flush()
+        .expect("flush ready legacy SSE response head");
+    write_ready_legacy_sse_event(
+        stream,
+        &format!("event: endpoint\ndata: {message_target}\n\n"),
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn write_ready_legacy_sse_event(stream: &mut TcpStream, event: &str) {
+    let chunk = format!("{:X}\r\n{event}\r\n", event.len());
+    stream
+        .write_all(chunk.as_bytes())
+        .expect("write ready legacy SSE event");
+    stream.flush().expect("flush ready legacy SSE event");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn finish_ready_legacy_sse(stream: &mut TcpStream) {
+    stream
+        .write_all(b"0\r\n\r\n")
+        .expect("finish ready legacy SSE stream");
+    stream.flush().expect("flush ready legacy SSE stream");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn run_ready_legacy_public_local_cancellation(
+    cancel_first_request: bool,
+    stall_cancellation_control: bool,
+    stall_first_post: bool,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ready legacy cancellation peer");
+    let address = listener
+        .local_addr()
+        .expect("read ready legacy cancellation peer address");
+    let sse_target = format!("http://{address}/legacy-sse");
+    let message_target = format!("http://{address}/legacy-message");
+    let advertised_message_target = message_target.clone();
+    let (post_seen_tx, post_seen_rx) = mpsc::sync_channel::<()>(1);
+    let (caller_settled_tx, caller_settled_rx) = mpsc::sync_channel::<()>(1);
+    let server = thread::spawn(move || {
+        let mut sse = accept_bounded_stream(&listener);
+        let sse_request = read_request(&mut sse);
+        assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        begin_ready_legacy_sse(&mut sse, &advertised_message_target);
+
+        let mut initialize = accept_bounded_stream(&listener);
+        let initialize_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut initialize).body)
+                .expect("decode ready legacy initialize POST");
+        assert_eq!(initialize_body["id"], 1);
+        assert_eq!(initialize_body["method"], "initialize");
+        write_response(&mut initialize, 202, "application/json", b"");
+        write_ready_legacy_sse_event(
+            &mut sse,
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"ready-legacy-peer\",\"version\":\"1\"}}}\n\n",
+        );
+
+        let mut initialized = accept_bounded_stream(&listener);
+        let initialized_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut initialized).body)
+                .expect("decode ready legacy initialized notification");
+        assert_eq!(initialized_body["method"], "notifications/initialized");
+        assert!(initialized_body["id"].is_null());
+        write_response(&mut initialized, 202, "application/json", b"");
+
+        let mut first_request = accept_bounded_stream(&listener);
+        let first_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut first_request).body)
+                .expect("decode ready legacy first ping POST");
+        assert_eq!(first_body["id"], 2);
+        assert_eq!(first_body["method"], "ping");
+        assert!(
+            !stall_first_post || cancel_first_request,
+            "only cancellation exercises a deliberately pending POST"
+        );
+        if !stall_first_post {
+            write_response(&mut first_request, 202, "application/json", b"");
+            assert_connection_closed_by_client(&mut first_request);
+        }
+        post_seen_tx
+            .send(())
+            .expect("tell caller the first ping POST was observed");
+        if cancel_first_request {
+            if stall_first_post {
+                caller_settled_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("caller must settle the pending POST cancellation");
+                assert_connection_closed_by_client(&mut first_request);
+            } else {
+                let mut cancellation = accept_bounded_stream(&listener);
+                let cancellation_body: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut cancellation).body)
+                        .expect("decode ready legacy cancellation notification");
+                assert_eq!(cancellation_body["method"], "notifications/cancelled");
+                assert_eq!(cancellation_body["params"]["requestId"], 2);
+                if !stall_cancellation_control {
+                    write_response(&mut cancellation, 202, "application/json", b"");
+                }
+                caller_settled_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("caller must settle cancellation control before late response");
+                if stall_cancellation_control {
+                    assert_connection_closed_by_client(&mut cancellation);
+                }
+            }
+            write_ready_legacy_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"late\":true}}\n\n",
+            );
+        } else {
+            write_ready_legacy_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n",
+            );
+        }
+
+        let mut follow_up = accept_bounded_stream(&listener);
+        let follow_up_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut follow_up).body)
+                .expect("decode ready legacy fresh ping POST");
+        assert_eq!(follow_up_body["id"], 3);
+        assert_eq!(follow_up_body["method"], "ping");
+        write_response(&mut follow_up, 202, "application/json", b"");
+        write_ready_legacy_sse_event(
+            &mut sse,
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"fresh\":true}}\n\n",
+        );
+        finish_ready_legacy_sse(&mut sse);
+    });
+
+    let cancellation = McpRequestCancellation::new();
+    let cancel_for_thread = cancellation.clone();
+    let canceller = thread::spawn(move || {
+        post_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("peer must observe the first ping before cancellation");
+        if cancel_first_request {
+            assert!(cancel_for_thread.cancel());
+        } else {
+            assert!(!cancel_for_thread.is_cancel_requested());
+        }
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("ready legacy calls use the caller runtime Cx");
+        let mut client = fastmcp_client::HttpClient::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/unused-modern",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("ready legacy public client must complete initialization");
+        if cancel_first_request {
+            let started = Instant::now();
+            let error = client
+                .ping_with_cancellation(&cx, &cancellation)
+                .await
+                .expect_err("cancelled ready legacy ping must return typed cancellation");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "legacy cancellation control must settle before its late response: {:?}",
+                started.elapsed()
+            );
+            if stall_first_post {
+                assert!(matches!(
+                    error,
+                    fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Legacy(
+                        fastmcp_client::http_executor::LegacySseHttpClientError::Cancelled
+                    ))
+                ));
+            } else if stall_cancellation_control {
+                assert!(matches!(
+                    error,
+                    fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Legacy(
+                        fastmcp_client::http_executor::LegacySseHttpClientError::Executor(
+                            ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded)
+                        )
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Legacy(
+                        fastmcp_client::http_executor::LegacySseHttpClientError::Cancelled
+                    ))
+                ));
+            }
+            caller_settled_tx
+                .send(())
+                .expect("signal cancellation settlement to the peer");
+        } else {
+            client
+                .ping_with_cancellation(&cx, &cancellation)
+                .await
+                .expect("live request-local token must preserve the ready response");
+        }
+        client
+            .ping(&cx)
+            .await
+            .expect("fresh ping must reuse the ready legacy connection");
+    });
+
+    canceller
+        .join()
+        .expect("ready legacy cancellation controller joins");
+    server
+        .join()
+        .expect("ready legacy public cancellation peer joins");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn http_03_b_ready_legacy_public_local_cancellation_retires_late_response_positive() {
+    run_ready_legacy_public_local_cancellation(true, false, false);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn http_03_b_ready_legacy_public_local_cancellation_near_negative() {
+    run_ready_legacy_public_local_cancellation(false, false, false);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn http_03_b_ready_legacy_cancellation_control_stall_is_bounded() {
+    run_ready_legacy_public_local_cancellation(true, true, false);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn http_03_b_ready_legacy_pending_post_cancellation_retains_tombstone_positive() {
+    run_ready_legacy_public_local_cancellation(true, false, true);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn http_03_b_ready_legacy_precancelled_request_emits_no_post() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind pre-cancel legacy peer");
+    let address = listener.local_addr().expect("read pre-cancel peer address");
+    let sse_target = format!("http://{address}/legacy-sse");
+    let message_target = format!("http://{address}/legacy-message");
+    let advertised_message_target = message_target.clone();
+    let no_contact_observed = Arc::new(AtomicUsize::new(0));
+    let no_contact_for_server = Arc::clone(&no_contact_observed);
+    let server = thread::spawn(move || {
+        let mut sse = accept_bounded_stream(&listener);
+        let _ = read_request(&mut sse);
+        begin_ready_legacy_sse(&mut sse, &advertised_message_target);
+        let mut initialize = accept_bounded_stream(&listener);
+        let initialize_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut initialize).body)
+                .expect("decode pre-cancel initialize POST");
+        assert_eq!(initialize_body["id"], 1);
+        write_response(&mut initialize, 202, "application/json", b"");
+        write_ready_legacy_sse_event(
+            &mut sse,
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"pre-cancel-peer\",\"version\":\"1\"}}}\n\n",
+        );
+        let mut initialized = accept_bounded_stream(&listener);
+        let initialized_body: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut initialized).body)
+                .expect("decode pre-cancel initialized notification");
+        assert_eq!(initialized_body["method"], "notifications/initialized");
+        write_response(&mut initialized, 202, "application/json", b"");
+
+        listener
+            .set_nonblocking(true)
+            .expect("make pre-cancel listener nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            match listener.accept() {
+                Ok((_, peer)) => panic!("pre-cancelled request contacted peer {peer}"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("observe pre-cancelled request contact: {error}"),
+            }
+        }
+        no_contact_for_server.store(1, Ordering::Release);
+        listener
+            .set_nonblocking(false)
+            .expect("restore pre-cancel listener blocking mode");
+        let mut fresh = accept_bounded_stream(&listener);
+        let fresh_body: serde_json::Value = serde_json::from_slice(&read_request(&mut fresh).body)
+            .expect("decode fresh post after pre-cancel");
+        assert_eq!(fresh_body["id"], 2);
+        assert_eq!(fresh_body["method"], "ping");
+        write_response(&mut fresh, 202, "application/json", b"");
+        write_ready_legacy_sse_event(
+            &mut sse,
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"fresh\":true}}\n\n",
+        );
+        finish_ready_legacy_sse(&mut sse);
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("pre-cancel calls use the caller runtime Cx");
+        let mut client = fastmcp_client::HttpClient::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/unused-modern",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            client_info(),
+            ClientCapabilities::default(),
+        )
+        .await
+        .expect("pre-cancel public client must complete initialization");
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+        let error = client
+            .ping_with_cancellation(&cx, &cancellation)
+            .await
+            .expect_err("pre-cancelled request must be rejected before POST");
+        match error {
+            fastmcp_client::HttpClientError::CoreResult(error) => {
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            }
+            other => panic!("pre-cancelled request returned the wrong typed error: {other:?}"),
+        }
+        let no_contact_observed_by_peer = Arc::clone(&no_contact_observed);
+        let no_contact_deadline = Instant::now() + Duration::from_secs(1);
+        std::future::poll_fn(move |task_cx| {
+            if no_contact_observed_by_peer.load(Ordering::Acquire) == 1 {
+                std::task::Poll::Ready(())
+            } else {
+                assert!(
+                    Instant::now() < no_contact_deadline,
+                    "peer did not complete the bounded no-contact observation"
+                );
+                task_cx.waker().wake_by_ref();
+                std::thread::yield_now();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        client
+            .ping(&cx)
+            .await
+            .expect("fresh ping must succeed after a pre-cancelled request");
+    });
+    server.join().expect("pre-cancel legacy peer joins");
 }
 
 fn bearer_request(target: &str) -> fastmcp_client::http_executor::ModernHttpRequest {
