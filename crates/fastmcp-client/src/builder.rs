@@ -914,66 +914,67 @@ impl ClientBuilder {
         args: &[&str],
         cx: &Cx,
     ) -> McpResult<Client> {
-        // Reject unusable configuration once, before cancellation checks,
-        // retries, command resolution, or subprocess creation. In particular,
-        // auto-initialize must never return a live client that cannot issue its
-        // first protocol request.
-        let (retry_policy, retry_deadline) = self.validated_connection_retry_plan()?;
-        let mut last_error = None;
+        // Keep the retry and failed-client cleanup state out of callers' futures.
+        Box::pin(async move {
+            // Reject unusable configuration once, before cancellation checks,
+            // retries, command resolution, or subprocess creation. In particular,
+            // auto-initialize must never return a live client that cannot issue its
+            // first protocol request.
+            let (retry_policy, retry_deadline) = self.validated_connection_retry_plan()?;
+            let mut last_error = None;
 
-        for attempt in 0..retry_policy.max_attempts {
-            // Honor cancellation/budget before each attempt.
-            if cx.checkpoint().is_err() {
-                return Err(McpError::request_cancelled());
-            }
-            if retry_deadline.expired() {
-                return Err(Self::connection_retry_elapsed_error());
-            }
-
-            if attempt > 0 {
-                Self::wait_for_connection_retry(cx, retry_policy.retry_delay, retry_deadline)
-                    .await?;
-            }
-
-            #[cfg(unix)]
-            let attempt_result = self
-                .try_connect_yielding(command, args, cx, retry_deadline)
-                .await;
-            #[cfg(not(unix))]
-            let attempt_result = self.try_connect(command, args, cx, retry_deadline);
-            match attempt_result {
-                Ok(mut client) => {
-                    let operation_error = if cx.checkpoint().is_err() {
-                        Some(McpError::request_cancelled())
-                    } else if retry_deadline.expired() {
-                        Some(Self::connection_retry_elapsed_error())
-                    } else {
-                        client.set_request_timeout_policy(self.timeout_policy).err()
-                    };
-                    if let Some(error) = operation_error {
-                        // Only failed construction retains a client across an
-                        // await. Keep that state off every caller's future.
-                        let mut client = Box::new(client);
-                        return combine_operation_with_cleanup_async(
-                            Err(error),
-                            client.close_with_cx(cx),
-                        )
-                        .await;
-                    }
-                    return Ok(client);
+            for attempt in 0..retry_policy.max_attempts {
+                // Honor cancellation/budget before each attempt.
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
                 }
-                Err(error) if is_cleanup_unverified(&error) => return Err(error),
-                Err(e) => {
-                    last_error = Some(e);
-                    if retry_deadline.expired() {
-                        return Err(Self::connection_retry_elapsed_error());
+                if retry_deadline.expired() {
+                    return Err(Self::connection_retry_elapsed_error());
+                }
+
+                if attempt > 0 {
+                    Self::wait_for_connection_retry(cx, retry_policy.retry_delay, retry_deadline)
+                        .await?;
+                }
+
+                #[cfg(unix)]
+                let attempt_result = self
+                    .try_connect_yielding(command, args, cx, retry_deadline)
+                    .await;
+                #[cfg(not(unix))]
+                let attempt_result = self.try_connect(command, args, cx, retry_deadline);
+                match attempt_result {
+                    Ok(mut client) => {
+                        let operation_error = if cx.checkpoint().is_err() {
+                            Some(McpError::request_cancelled())
+                        } else if retry_deadline.expired() {
+                            Some(Self::connection_retry_elapsed_error())
+                        } else {
+                            client.set_request_timeout_policy(self.timeout_policy).err()
+                        };
+                        if let Some(error) = operation_error {
+                            return combine_operation_with_cleanup_async(
+                                Err(error),
+                                client.close_with_cx(cx),
+                            )
+                            .await;
+                        }
+                        return Ok(client);
+                    }
+                    Err(error) if is_cleanup_unverified(&error) => return Err(error),
+                    Err(e) => {
+                        last_error = Some(e);
+                        if retry_deadline.expired() {
+                            return Err(Self::connection_retry_elapsed_error());
+                        }
                     }
                 }
             }
-        }
 
-        // All attempts failed
-        Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
+            // All attempts failed
+            Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
+        })
+        .await
     }
 
     /// Performs the one bounded stdio attempt used by fixed-plan constructors.

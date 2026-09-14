@@ -31756,8 +31756,8 @@ if [ "$2" = 1 ]; then
     printf '%s\n' '{"jsonrpc":"2.0","id":41,"method":"sampling/createMessage","params":{"messages":[],"maxTokens":9}}'
 fi
 if [ "$1" = 0 ]; then exec sleep 6; fi
-IFS= read -r frame || exit 93
-[ "${#frame}" -gt 2097152 ] || exit 94
+frame_bytes=$(LC_ALL=C awk 'NR == 1 { print length($0); exit }') || exit 93
+[ "$frame_bytes" -gt 2097152 ] || exit 94
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"largeFrame":true}}'
 IFS= read -r follow_up || exit 95
 case "$follow_up" in *'"id":3'*) ;; *) exit 96;; esac
