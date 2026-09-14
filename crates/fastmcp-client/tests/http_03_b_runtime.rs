@@ -28,7 +28,9 @@ use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientProtocolPlan, ProtocolPolicy,
     RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy,
 };
-use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_core::McpErrorCode;
+use fastmcp_core::{McpError, McpRequestCancellation};
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ProgressMarker, RequestId, ServerNotification,
     SubscriptionFilter,
@@ -1195,6 +1197,249 @@ fn public_modern_builder(target: &str, timeout_policy: RequestTimeoutPolicy) -> 
             ProtocolPolicy::ModernOnly,
         ))
         .request_timeout_policy(timeout_policy)
+}
+
+fn aborted_notification_tools_list_response(id: u64, tool_name: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "resultType": "complete",
+            "tools": [{
+                "name": tool_name,
+                "inputSchema": {"type": "object"}
+            }],
+            "ttlMs": 60_000,
+            "cacheScope": "private"
+        }
+    }))
+    .expect("aborted-response tools/list fixture must serialize")
+}
+
+fn assert_tools_list_name(result: &fastmcp_protocol::CoreResult, expected: &str) {
+    assert!(matches!(
+        result,
+        fastmcp_protocol::CoreResult::Final(
+            fastmcp_protocol::FinalCoreResult::ToolsList { result, .. }
+        ) if result.payload.tools.len() == 1 && result.payload.tools[0].name == expected
+    ));
+}
+
+fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool) {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind aborted-response listener");
+    let address = listener
+        .local_addr()
+        .expect("read aborted-response listener address");
+    let target = format!("http://{address}/mcp");
+    let callback_started = Arc::new(AtomicUsize::new(0));
+    let callback_marker = Arc::clone(&callback_started);
+    let handlers = fastmcp_client::ReverseRequestHandlers::new()
+        .with_modern_sampling_create_message(move |_cx, _cancellation, _params| {
+            let callback_marker = Arc::clone(&callback_marker);
+            Box::pin(async move {
+                callback_marker.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            })
+        });
+    let (lookup_done_tx, lookup_done_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded_stream(&listener);
+        assert_final_metadata(&read_request(&mut probe), "server/discover");
+        write_response(
+            &mut probe,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"notification-peer","version":"1"}}}}"#,
+        );
+
+        let mut initial_list = accept_bounded_stream(&listener);
+        let initial_request = read_request(&mut initial_list);
+        assert_final_metadata(&initial_request, "tools/list");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&initial_request.body)
+                .expect("initial tools/list request must be JSON")["id"],
+            2
+        );
+        let initial = aborted_notification_tools_list_response(2, "cached-catalog");
+        write_response(&mut initial_list, 200, "application/json", &initial);
+
+        let mut aborted = accept_bounded_stream(&listener);
+        let aborted_request = read_request(&mut aborted);
+        assert_final_metadata(&aborted_request, "tools/call");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&aborted_request.body)
+                .expect("aborted tools/call request must be JSON")["id"],
+            3
+        );
+        begin_sse_response(&mut aborted);
+        if catalog_changed {
+            write_sse_event(
+                &mut aborted,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                    "params": {}
+                }),
+            )
+            .expect("catalog change must be flushed before the aborted close");
+        }
+        if drop_request {
+            // This callback follows the notification on the same stream. Its
+            // admission proves the earlier frame was consumed before drop.
+            write_sse_event(
+                &mut aborted,
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 99,
+                    "method": "sampling/createMessage",
+                    "params": {
+                        "_meta": {},
+                        "messages": [{"role": "user", "content": {"type": "text", "text": "wait"}}],
+                        "maxTokens": 8
+                    }
+                }),
+            )
+            .expect("write callback admission barrier");
+            assert_connection_closed_by_client(&mut aborted);
+        }
+        drop(aborted);
+
+        if catalog_changed {
+            let mut refreshed_list = accept_bounded_stream(&listener);
+            let refreshed_request = read_request(&mut refreshed_list);
+            assert_final_metadata(&refreshed_request, "tools/list");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&refreshed_request.body)
+                    .expect("refreshed tools/list request must be JSON")["id"],
+                4
+            );
+            let refreshed = aborted_notification_tools_list_response(4, "updated-catalog");
+            write_response(&mut refreshed_list, 200, "application/json", &refreshed);
+        } else {
+            lookup_done_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the cached lookup must finish without contacting the peer");
+            listener
+                .set_nonblocking(true)
+                .expect("negative listener must support bounded fresh-request observation");
+            match listener.accept() {
+                Ok(_) => panic!("an absent notification must not invalidate the tools/list cache"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("observe unexpected post-abort connection: {error}"),
+            }
+        }
+    });
+
+    runtime_block_on(async {
+        let cx = Cx::current().expect("caller runtime must install a current Cx");
+        let timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
+                .expect("aborted-response timeout policy must be valid");
+        let mut client = public_modern_builder(&target, timeout_policy)
+            .reverse_request_handlers(handlers)
+            .connect_http_client_with_cx(&cx)
+            .await
+            .expect("public HTTP client must connect through server/discover");
+
+        let seeded = client
+            .request_final_core(&cx, "tools/list", serde_json::json!({}))
+            .await
+            .expect("initial tools/list must seed the private cache");
+        assert_tools_list_name(&seeded, "cached-catalog");
+        assert_eq!(client.final_result_cache_stats().fills, 1);
+
+        if drop_request {
+            let mut request = std::pin::pin!(client.request_final_core(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "aborted-call", "arguments": {}}),
+            ));
+            poll_fn(|task_cx| {
+                assert!(
+                    request.as_mut().poll(task_cx).is_pending(),
+                    "barrier callback must keep the request pending"
+                );
+                if callback_started.load(Ordering::SeqCst) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            // Drop the actual request future, not just a Pin reference, before
+            // inspecting the client or issuing another request.
+        } else {
+            let error = client
+                .request_final_core(
+                    &cx,
+                    "tools/call",
+                    serde_json::json!({"name": "aborted-call", "arguments": {}}),
+                )
+                .await
+                .expect_err("response stream ending before its terminal must fail");
+            assert!(matches!(
+                error,
+                fastmcp_client::HttpClientError::Connection(
+                    ClientHttpConnectionError::UnexpectedResponseMessage {
+                        request_id: RequestId::Number(3)
+                    }
+                )
+            ));
+        }
+
+        let retained = client.take_final_server_notifications();
+        if catalog_changed {
+            assert!(matches!(
+                retained.as_slice(),
+                [ServerNotification::ToolsListChanged(Some(_))]
+            ));
+            assert_eq!(
+                serde_json::to_value(retained[0].encode().unwrap()).unwrap(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed", "params": {}})
+            );
+            let refreshed = client
+                .request_final_core(&cx, "tools/list", serde_json::json!({}))
+                .await
+                .expect("aborted catalog change must force a fresh tools/list");
+            assert_tools_list_name(&refreshed, "updated-catalog");
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            assert_eq!(client.final_result_cache_stats().fills, 2);
+            assert_eq!(client.final_result_cache_stats().invalidations, 1);
+        } else {
+            assert!(retained.is_empty());
+            let cached = client
+                .request_final_core(&cx, "tools/list", serde_json::json!({}))
+                .await
+                .expect("absent catalog change must preserve the private tools/list cache");
+            assert_tools_list_name(&cached, "cached-catalog");
+            assert_eq!(client.final_result_cache_stats().hits, 1);
+            assert_eq!(client.final_result_cache_stats().fills, 1);
+            assert_eq!(client.final_result_cache_stats().invalidations, 0);
+            lookup_done_tx
+                .send(())
+                .expect("finish the no-contact observation");
+        }
+    });
+
+    server
+        .join()
+        .expect("aborted-response HTTP peer must join without a stuck request");
+}
+
+#[test]
+fn http_03_b_notifications_survive_aborted_response_positive() {
+    for drop_request in [false, true] {
+        run_aborted_notification_cache_case(true, drop_request);
+    }
+}
+
+#[test]
+fn http_03_b_notifications_survive_aborted_response_planted_negative() {
+    for drop_request in [false, true] {
+        run_aborted_notification_cache_case(false, drop_request);
+    }
 }
 
 fn require_modern_response(

@@ -11847,17 +11847,21 @@ impl HttpClient {
         self.final_progress_notifications.drain(..).collect()
     }
 
-    fn retain_final_http_notifications(
-        &mut self,
-        server: Vec<ServerNotification>,
-        progress: Vec<FinalProgressNotificationParams>,
-    ) {
-        for notification in &server {
-            self.final_result_cache
-                .invalidate_notification(notification);
+    fn final_http_notification_observer<'a>(
+        cache: &'a mut FinalResultCache,
+        server: &'a mut VecDeque<ServerNotification>,
+        progress: &'a mut VecDeque<FinalProgressNotificationParams>,
+    ) -> impl FnMut(http_executor::ModernHttpRequestScopedNotification) + Send + 'a {
+        move |notification| match notification {
+            http_executor::ModernHttpRequestScopedNotification::Server(notification) => {
+                cache.invalidate_notification(&notification);
+                server.push_back(notification);
+            }
+            http_executor::ModernHttpRequestScopedNotification::Progress(notification) => {
+                progress.push_back(notification);
+            }
+            http_executor::ModernHttpRequestScopedNotification::Ignored => {}
         }
-        self.final_server_notifications.extend(server);
-        self.final_progress_notifications.extend(progress);
     }
 
     /// Consumes the high-level wrapper and returns its transport.
@@ -12040,37 +12044,44 @@ impl HttpClient {
             .map(|key| self.final_result_cache.begin_fetch(key.result_set()));
         let request_id = self.next_request_id()?;
         let client_extensions = self.final_core_client_extensions();
-        let response = match cancellation {
-            Some(cancellation) => {
-                self.connection
-                    .request_json_with_result_source_at_with_cancellation(
-                        cx,
-                        cancellation,
-                        method,
-                        core_parameters,
-                        request_id,
-                        DEFAULT_FINAL_CACHE_MAX_BYTES,
-                        client_extensions.as_ref(),
-                    )
-                    .await
-            }
-            None => {
-                self.connection
-                    .request_json_with_result_source_at(
-                        cx,
-                        method,
-                        core_parameters,
-                        request_id,
-                        DEFAULT_FINAL_CACHE_MAX_BYTES,
-                        client_extensions.as_ref(),
-                    )
-                    .await
+        let response = {
+            let mut observer = Self::final_http_notification_observer(
+                &mut self.final_result_cache,
+                &mut self.final_server_notifications,
+                &mut self.final_progress_notifications,
+            );
+            match cancellation {
+                Some(cancellation) => {
+                    self.connection
+                        .request_json_with_result_source_at_with_cancellation(
+                            cx,
+                            cancellation,
+                            method,
+                            core_parameters,
+                            request_id,
+                            DEFAULT_FINAL_CACHE_MAX_BYTES,
+                            client_extensions.as_ref(),
+                            Some(&mut observer),
+                        )
+                        .await
+                }
+                None => {
+                    self.connection
+                        .request_json_with_result_source_at(
+                            cx,
+                            method,
+                            core_parameters,
+                            request_id,
+                            DEFAULT_FINAL_CACHE_MAX_BYTES,
+                            client_extensions.as_ref(),
+                            Some(&mut observer),
+                        )
+                        .await
+                }
             }
         }
         .map_err(HttpClientError::Connection)?;
-        let (mut response, result_source, receipt, server_notifications, progress_notifications) =
-            response;
-        self.retain_final_http_notifications(server_notifications, progress_notifications);
+        let (mut response, result_source, receipt, _, _) = response;
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -12267,36 +12278,44 @@ impl HttpClient {
         let parameters = self.core_request_parameters(&serde_json::json!({}))?;
         let request_id = self.next_request_id()?;
         let client_extensions = self.final_core_client_extensions();
-        let response = match cancellation {
-            Some(cancellation) => {
-                self.connection
-                    .request_json_with_result_source_at_with_cancellation(
-                        cx,
-                        cancellation,
-                        "ping",
-                        parameters,
-                        request_id,
-                        DEFAULT_FINAL_CACHE_MAX_BYTES,
-                        client_extensions.as_ref(),
-                    )
-                    .await
-            }
-            None => {
-                self.connection
-                    .request_json_with_result_source_at(
-                        cx,
-                        "ping",
-                        parameters,
-                        request_id,
-                        DEFAULT_FINAL_CACHE_MAX_BYTES,
-                        client_extensions.as_ref(),
-                    )
-                    .await
+        let response = {
+            let mut observer = Self::final_http_notification_observer(
+                &mut self.final_result_cache,
+                &mut self.final_server_notifications,
+                &mut self.final_progress_notifications,
+            );
+            match cancellation {
+                Some(cancellation) => {
+                    self.connection
+                        .request_json_with_result_source_at_with_cancellation(
+                            cx,
+                            cancellation,
+                            "ping",
+                            parameters,
+                            request_id,
+                            DEFAULT_FINAL_CACHE_MAX_BYTES,
+                            client_extensions.as_ref(),
+                            Some(&mut observer),
+                        )
+                        .await
+                }
+                None => {
+                    self.connection
+                        .request_json_with_result_source_at(
+                            cx,
+                            "ping",
+                            parameters,
+                            request_id,
+                            DEFAULT_FINAL_CACHE_MAX_BYTES,
+                            client_extensions.as_ref(),
+                            Some(&mut observer),
+                        )
+                        .await
+                }
             }
         }
         .map_err(HttpClientError::Connection)?;
-        let (mut response, _, _, server_notifications, progress_notifications) = response;
-        self.retain_final_http_notifications(server_notifications, progress_notifications);
+        let (mut response, _, _, _, _) = response;
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -12886,19 +12905,25 @@ impl HttpClient {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let request_id = self.next_request_id()?;
-        let (mut response, result_source, _, server_notifications, progress_notifications) = self
-            .connection
-            .request_final_extension_json_with_result_source_at(
-                cx,
-                extension_id,
-                method,
-                parameters,
-                request_id,
-                DEFAULT_FINAL_CACHE_MAX_BYTES,
-            )
-            .await
-            .map_err(HttpClientError::Connection)?;
-        self.retain_final_http_notifications(server_notifications, progress_notifications);
+        let (mut response, result_source, _, _, _) = {
+            let mut observer = Self::final_http_notification_observer(
+                &mut self.final_result_cache,
+                &mut self.final_server_notifications,
+                &mut self.final_progress_notifications,
+            );
+            self.connection
+                .request_final_extension_json_with_result_source_at(
+                    cx,
+                    extension_id,
+                    method,
+                    parameters,
+                    request_id,
+                    DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    Some(&mut observer),
+                )
+                .await
+        }
+        .map_err(HttpClientError::Connection)?;
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -29640,6 +29665,7 @@ mod tests {
                 serde_json::json!({}),
                 RequestId::Number(2),
                 4_096,
+                None,
                 None,
             ))
             .expect("HTTP response retains its transport decode receipt");

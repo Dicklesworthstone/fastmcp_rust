@@ -91,11 +91,17 @@ fn is_modern_http_final_server_notification(request: &JsonRpcRequest) -> bool {
             .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
 }
 
-enum ModernHttpRequestScopedNotification {
+pub(crate) enum ModernHttpRequestScopedNotification {
     Server(ServerNotification),
     Progress(FinalProgressNotificationParams),
     Ignored,
 }
+
+/// Receives each strictly admitted notification before the owning response
+/// can fail or be dropped. The high-level client uses this to retain events
+/// and invalidate caches independently of terminal-response success.
+pub(crate) type ModernHttpNotificationObserver<'a> =
+    &'a mut (dyn FnMut(ModernHttpRequestScopedNotification) + Send + 'a);
 
 fn classify_modern_http_request_scoped_notification(
     request: &JsonRpcRequest,
@@ -4339,6 +4345,7 @@ impl ClientHttpConnection {
             request_id,
             maximum_response_bytes,
             None,
+            None,
         )
         .await
         .map(|(response, result_source, _, _, _)| (response, result_source))
@@ -4359,6 +4366,7 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        observer: Option<ModernHttpNotificationObserver<'_>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -4377,6 +4385,7 @@ impl ClientHttpConnection {
             request_id,
             maximum_response_bytes,
             client_extensions,
+            observer,
         )
         .await
     }
@@ -4396,6 +4405,7 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
+        observer: Option<ModernHttpNotificationObserver<'_>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -4416,6 +4426,7 @@ impl ClientHttpConnection {
             request_id,
             maximum_response_bytes,
             None,
+            observer,
         )
         .await
     }
@@ -4433,6 +4444,7 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        observer: Option<ModernHttpNotificationObserver<'_>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -4456,6 +4468,7 @@ impl ClientHttpConnection {
             request_id,
             maximum_response_bytes,
             client_extensions,
+            observer,
         )
         .await
     }
@@ -4469,6 +4482,7 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
         client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+        observer: Option<ModernHttpNotificationObserver<'_>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -4561,6 +4575,7 @@ impl ClientHttpConnection {
                             response,
                             request_id,
                             maximum_response_bytes,
+                            observer,
                         )
                         .await
                     }
@@ -4577,6 +4592,7 @@ impl ClientHttpConnection {
         response: ModernHttpResponseStream,
         request_id: RequestId,
         maximum_response_bytes: usize,
+        mut observer: Option<ModernHttpNotificationObserver<'_>>,
     ) -> Result<
         (
             JsonRpcResponse,
@@ -4676,7 +4692,7 @@ impl ClientHttpConnection {
                             },
                         );
                     }
-                    match classify_modern_http_request_scoped_notification(
+                    let notification = classify_modern_http_request_scoped_notification(
                         &request,
                         event.as_bytes(),
                     )
@@ -4684,7 +4700,15 @@ impl ClientHttpConnection {
                         ClientHttpConnectionError::UnexpectedResponseMessage {
                             request_id: request_id.clone(),
                         }
-                    })? {
+                    })?;
+                    if matches!(notification, ModernHttpRequestScopedNotification::Ignored) {
+                        continue;
+                    }
+                    if let Some(observer) = observer.as_mut() {
+                        observer(notification);
+                        continue;
+                    }
+                    match notification {
                         ModernHttpRequestScopedNotification::Server(notification) => {
                             server_notifications.push(notification);
                         }
