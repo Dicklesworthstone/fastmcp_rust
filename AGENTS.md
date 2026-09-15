@@ -12,6 +12,18 @@ Toolchain: pinned `nightly-2026-08-25` (rustc 1.100.0-nightly) with workspace `r
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
 
+## RULE 0.5: DSR ONLY — NEVER GITHUB ACTIONS (REPEATED VIOLATION, PERMANENT RULE)
+
+**This repository does NOT use GitHub Actions for CI, builds, tests, or releases. NEVER has as a matter of practice. NEVER will.**
+
+1. **NEVER modify, "fix", re-enable, add, or remove anything under `.github/workflows/`.** The checked-in workflow files are inert legacy surface. Touching them is a wasted-work violation no matter how red the Actions badge is.
+2. **NEVER diagnose, triage, or report GitHub Actions run failures as project work.** Actions redness is not a defect signal in this repo. Do not spend build minutes, tokens, or beads on it.
+3. **ALL build / test / release / release-qualification work runs through DSR** (`dsr` — Doodlestein Self-Releaser at `~/.local/bin/dsr`): `dsr quality`, `dsr build`, `dsr release`, `dsr fallback` (check → build → release), `dsr signing`, `dsr sbom`, `dsr slsa`. Use `dsr status` / `dsr health` / `dsr check` first; `-n` dry-runs, `-j` for JSON.
+4. Heavy compile offload still goes through **RCH** (`rch exec -- <cmd>`) per the build-first doctrine; DSR is the release/qualification pipeline around it.
+5. If Actions runs appear red or cancelled: **ignore them and say nothing about them.** They are not evidence of anything about this codebase.
+
+Violation history: 2026-09-15 an agent spent a full session modifying `ci.yml`/`modern-no-legacy.yml` and adding a retry workflow chasing Actions greenness. All of it was reverted. **Do not repeat this.**
+
 ---
 
 ## RULE NUMBER 1: NO FILE DELETION
