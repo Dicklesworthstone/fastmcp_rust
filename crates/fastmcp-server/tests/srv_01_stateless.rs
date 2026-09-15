@@ -1298,22 +1298,20 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                         return Poll::Pending;
                     }
                 }
-                Task::Completed { .. } => {
-                    if step == 2 {
-                        assert_eq!(
-                            emitted.load(Ordering::SeqCst),
-                            5,
-                            "completion must have emitted fifth notification"
-                        );
-                        assert_eq!(calls.load(Ordering::SeqCst), 3);
-                        assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
+                Task::Completed { .. } if step == 2 => {
+                    assert_eq!(
+                        emitted.load(Ordering::SeqCst),
+                        5,
+                        "completion must have emitted fifth notification"
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
 
-                        // Explicit caller cancellation to initiate owned natural service shutdown.
-                        cx.cancel_with(CancelKind::User, None);
-                        step = 3;
-                        task_cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
+                    // Explicit caller cancellation to initiate owned natural service shutdown.
+                    cx.cancel_with(CancelKind::User, None);
+                    step = 3;
+                    task_cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 _ => {}
             }

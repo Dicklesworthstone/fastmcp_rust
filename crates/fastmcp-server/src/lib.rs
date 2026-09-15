@@ -31912,6 +31912,145 @@ mod lib_unit_tests {
         });
     }
 
+    async fn auth_00_handle_mrtr_http_request(
+        cx: &Cx,
+        session: &mut ServerHttpSession,
+        request: HttpRequest,
+    ) -> JsonRpcResponse {
+        let response = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(5),
+            Box::pin(session.handle_async(cx, request)),
+        )
+        .await
+        .expect("MRTR owner lookup must finish before the harness deadline")
+        .expect("MRTR HTTP handling must succeed");
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("MRTR owner lookup must return immediate JSON");
+        };
+        assert_eq!(response.status, HttpStatus::OK);
+        serde_json::from_slice(&response.body).expect("MRTR response must be JSON-RPC")
+    }
+
+    fn auth_00_http_mrtr_cancelled_state_probe(foreign_owner: bool) {
+        run_live_http_test(move |cx| async move {
+            for state_only in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let endpoint = auth_00_mrtr_server(true, &calls)
+                    .into_http_endpoint("http://auth-owner.test")
+                    .unwrap();
+                let mut issuer = endpoint.open_session(&cx).unwrap();
+                let initial = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut issuer,
+                    modern_http_json_tool_request("live_http_mrtr", 1001)
+                        .with_header("authorization", "Bearer alpha"),
+                )
+                .await;
+                assert_eq!(initial.id, Some(1001_i64.into()));
+                assert!(initial.error.is_none());
+                let result = initial.result.as_ref().unwrap();
+                assert_eq!(result["resultType"], "input_required");
+                assert_eq!(result["inputRequests"]["roots"]["method"], "roots/list");
+                let state = result["requestState"].as_str().unwrap();
+                assert!(!state.is_empty());
+                assert_ne!(state, "handler-forged-state");
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+
+                // Cancel the real continuation owner, which is distinct from
+                // the already-finalized JSON-RPC request cancellation token.
+                issuer.modern_connection.disconnect();
+                let retry = |request_state: &str, bearer: &str, id: i64| {
+                    let mut request = modern_http_json_tool_request("live_http_mrtr", id)
+                        .with_header("authorization", format!("Bearer {bearer}"));
+                    let mut rpc: JsonRpcRequest = serde_json::from_slice(&request.body).unwrap();
+                    let params = rpc.params.as_mut().unwrap();
+                    params["requestState"] = serde_json::json!(request_state);
+                    if !state_only {
+                        params["inputResponses"] = serde_json::json!({
+                            "roots": bidirectional::MrtrInputResponse::roots(
+                                fastmcp_protocol::ListRootsResult::empty(),
+                            ).unwrap(),
+                        });
+                    }
+                    request.body = serde_json::to_vec(&rpc).unwrap();
+                    request
+                };
+                let bearer = if foreign_owner { "beta" } else { "alpha" };
+                let mut caller = endpoint.open_session(&cx).unwrap();
+                let observed =
+                    auth_00_handle_mrtr_http_request(&cx, &mut caller, retry(state, bearer, 1002))
+                        .await;
+                assert_eq!(observed.id, Some(1002_i64.into()));
+                assert!(observed.result.is_none());
+                let observed_error = observed.error.as_ref().unwrap();
+                assert_eq!(
+                    observed_error.code,
+                    if foreign_owner {
+                        McpErrorCode::InvalidParams.into()
+                    } else {
+                        McpErrorCode::RequestCancelled.into()
+                    }
+                );
+                let unknown = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut caller,
+                    retry("unknown", bearer, 1003),
+                )
+                .await;
+                assert_eq!(unknown.id, Some(1003_i64.into()));
+                assert!(unknown.result.is_none());
+                let unknown_error = unknown.error.as_ref().unwrap();
+                assert_eq!(unknown_error.code, McpErrorCode::InvalidParams.into());
+                if foreign_owner {
+                    assert_eq!(observed_error, unknown_error);
+                }
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+
+                let mut owner = endpoint.open_session(&cx).unwrap();
+                let retirement =
+                    auth_00_handle_mrtr_http_request(&cx, &mut owner, retry(state, "alpha", 1004))
+                        .await;
+                assert_eq!(retirement.id, Some(1004_i64.into()));
+                assert!(retirement.result.is_none());
+                assert_eq!(
+                    retirement.error.as_ref().unwrap().code,
+                    if foreign_owner {
+                        // The foreign lookup must not erase the cancelled
+                        // record before its rightful owner observes it.
+                        McpErrorCode::RequestCancelled.into()
+                    } else {
+                        McpErrorCode::InvalidParams.into()
+                    }
+                );
+                let repeated =
+                    auth_00_handle_mrtr_http_request(&cx, &mut owner, retry(state, "alpha", 1005))
+                        .await;
+                assert_eq!(repeated.id, Some(1005_i64.into()));
+                assert!(repeated.result.is_none());
+                assert_eq!(repeated.error.as_ref().unwrap(), unknown_error);
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+                assert!(cx.checkpoint().is_ok());
+                // Do not use active_len() here: it purges cancelled records
+                // and would erase the evidence before the authorized retry.
+                owner.close(&cx).await;
+                caller.close(&cx).await;
+                issuer.close(&cx).await;
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_cancelled_state_owner_retires_positive() {
+        auth_00_http_mrtr_cancelled_state_probe(false);
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_cancelled_state_foreign_owner_preserves_negative() {
+        auth_00_http_mrtr_cancelled_state_probe(true);
+    }
+
     async fn run_live_http_mrtr_retry(
         cx: &Cx,
         request_state_suffix: &str,

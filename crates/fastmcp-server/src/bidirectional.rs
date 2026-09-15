@@ -2062,6 +2062,9 @@ impl MrtrExchangeRegistry {
                 .get(request_state)
                 .cloned()
                 .ok_or_else(|| McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))?;
+            if exchange.binding.as_ref() != binding {
+                return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+            }
             if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
                 state.exchanges.remove(request_state);
                 return if exchange.owner_cancellation.is_cancel_requested() {
@@ -2069,9 +2072,6 @@ impl MrtrExchangeRegistry {
                 } else {
                     Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
                 };
-            }
-            if exchange.binding.as_ref() != binding {
-                return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
             }
             if binding.is_some_and(MrtrExchangeBinding::is_stateless)
                 && exchange.expected.has_elicitation()
@@ -2230,6 +2230,9 @@ impl MrtrExchangeRegistry {
         let Some(exchange) = state.exchanges.get(request_state).cloned() else {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         };
+        if exchange.binding.as_ref() != binding {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
         if now >= exchange.expires_at || exchange.owner_cancellation.is_cancel_requested() {
             state.exchanges.remove(request_state);
             return if exchange.owner_cancellation.is_cancel_requested() {
@@ -2237,9 +2240,6 @@ impl MrtrExchangeRegistry {
             } else {
                 Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
             };
-        }
-        if exchange.binding.as_ref() != binding {
-            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
         if binding.is_some_and(MrtrExchangeBinding::is_stateless)
             && exchange.expected.has_elicitation()
@@ -3189,6 +3189,149 @@ mod tests {
             Ok(MrtrRetry::Complete(_))
         ));
         assert_eq!(registry.active_len(), 0);
+    }
+
+    fn auth_00_expired_mrtr_owner_probe(foreign_owner: bool) {
+        let owner_binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "expired-owner-tool".to_owned(),
+            [41; 32],
+            [43; 32],
+            Some([47; 32]),
+        );
+        let mut caller_binding = owner_binding.clone();
+        if foreign_owner {
+            caller_binding.principal_digest = Some([53; 32]);
+        }
+        for state_only in [false, true] {
+            let registry = MrtrExchangeRegistry::new();
+            let cancellation = McpRequestCancellation::new();
+            let initial = registry
+                .issue_bound(
+                    cancellation.clone(),
+                    owner_binding.clone(),
+                    MrtrInputRequests::new([
+                        ("first".to_owned(), MrtrInputRequest::roots()),
+                        ("second".to_owned(), MrtrInputRequest::roots()),
+                    ])
+                    .unwrap(),
+                    Some("issuer-private-resume-state".to_owned()),
+                )
+                .expect("owner can issue a two-input exchange");
+            let first_response = BTreeMap::from([(
+                "first".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            let partial = registry
+                .accept_wire_bound(
+                    &mrtr_state_from_wire(&initial),
+                    &owner_binding,
+                    &first_response,
+                )
+                .expect("first accepted input issues a real partial successor");
+            let MrtrRetry::InputRequired(partial) = partial else {
+                panic!("one missing input must retain a successor");
+            };
+            let request_state = mrtr_state_from_wire(&partial);
+            let before = {
+                let mut state = registry.lock_state();
+                assert_eq!(state.exchanges.len(), 1);
+                assert!(!state.stateless_closed);
+                let exchange = state.exchanges.get_mut(&request_state).unwrap();
+                exchange.expires_at = Instant::now() - Duration::from_secs(1);
+                assert_eq!(exchange.round, 2);
+                assert_eq!(exchange.responses.len(), 1);
+                exchange.clone()
+            };
+            let response = BTreeMap::from([(
+                "second".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            let accept = |binding: &MrtrExchangeBinding| {
+                if state_only {
+                    registry.accept_state_only_bound(&request_state, binding)
+                } else {
+                    registry.accept_wire_bound(&request_state, binding, &response)
+                }
+            };
+            let rejected = accept(&caller_binding).expect_err("expired or foreign state rejects");
+            assert_eq!(rejected.code, McpErrorCode::InvalidParams);
+            assert_eq!(rejected.message, MRTR_REQUEST_STATE_ERROR);
+            let retained_owner = if foreign_owner {
+                let state = registry.lock_state();
+                assert_eq!(state.exchanges.len(), 1);
+                assert!(!state.stateless_closed);
+                let retained = state.exchanges.get(&request_state).unwrap();
+                assert_eq!(retained.expires_at, before.expires_at);
+                assert_eq!(retained.round, before.round);
+                assert_eq!(retained.total_input_requests, before.total_input_requests);
+                assert_eq!(retained.binding, before.binding);
+                assert_eq!(retained.expected.kinds, before.expected.kinds);
+                assert_eq!(
+                    serde_json::to_vec(&retained.requests).unwrap(),
+                    serde_json::to_vec(&before.requests).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_vec(&retained.responses).unwrap(),
+                    serde_json::to_vec(&before.responses).unwrap()
+                );
+                assert_eq!(
+                    retained
+                        .responses
+                        .entries
+                        .iter()
+                        .map(|(key, response)| (key, response.kind))
+                        .collect::<Vec<_>>(),
+                    before
+                        .responses
+                        .entries
+                        .iter()
+                        .map(|(key, response)| (key, response.kind))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(retained.responses.index, before.responses.index);
+                assert_eq!(
+                    retained
+                        .handler_request_state
+                        .as_ref()
+                        .map(|state| &state.0),
+                    before.handler_request_state.as_ref().map(|state| &state.0)
+                );
+                assert_eq!(
+                    retained.owner_cancellation.is_cancel_requested(),
+                    before.owner_cancellation.is_cancel_requested()
+                );
+                assert_eq!(
+                    retained.owner_cancellation.is_terminal(),
+                    before.owner_cancellation.is_terminal()
+                );
+                retained.owner_cancellation.clone()
+            } else {
+                assert!(registry.lock_state().exchanges.is_empty());
+                before.owner_cancellation.clone()
+            };
+            if foreign_owner {
+                let retired = accept(&owner_binding).expect_err("owner observes real expiry");
+                assert_eq!(retired.code, McpErrorCode::InvalidParams);
+                assert_eq!(retired.message, MRTR_REQUEST_STATE_ERROR);
+            }
+            assert!(registry.lock_state().exchanges.is_empty());
+            // After retirement, the preserved cancellation capability still
+            // aliases the issuer's authority; equal flags alone cannot prove it.
+            assert!(cancellation.cancel());
+            assert!(retained_owner.is_cancel_requested());
+            assert!(before.owner_cancellation.is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn auth_00_expired_mrtr_owner_retires_positive() {
+        auth_00_expired_mrtr_owner_probe(false);
+    }
+
+    #[test]
+    fn auth_00_expired_mrtr_foreign_owner_preserves_negative() {
+        auth_00_expired_mrtr_owner_probe(true);
     }
 
     #[test]
