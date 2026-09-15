@@ -917,6 +917,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     use std::task::Poll;
     use std::time::Duration;
 
+    use asupersync::CancelKind;
     use asupersync::runtime::RuntimeBuilder;
     use fastmcp_core::{McpError, McpErrorCode};
     use fastmcp_protocol::tasks_extension::{
@@ -925,8 +926,8 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     };
     use fastmcp_server::{
         ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig,
-        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-        InMemoryFinalTaskStore,
+        FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
 
     struct TwoRoundSupervisor {
@@ -935,6 +936,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         reused: bool,
         observed_rejection: Arc<Mutex<Option<McpError>>>,
         store: Arc<InMemoryFinalTaskStore>,
+        emitted: Arc<AtomicUsize>,
     }
 
     impl ApplicationTaskSupervisor for TwoRoundSupervisor {
@@ -984,6 +986,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     .store
                                     .latest_notification(&task_id)
                                     .expect("read pre-notification");
+                                let pre_emitted = self.emitted.load(Ordering::SeqCst);
+                                assert_eq!(
+                                    pre_emitted, 2,
+                                    "exactly 2 notifications emitted before duplicate attempt"
+                                );
 
                                 // Attempting to reuse roots_a must fail closed.
                                 let rejection = accepted
@@ -995,7 +1002,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     "Task input request keys cannot be reused"
                                 );
 
-                                // Invariance: task status, generation, and notification remain unchanged.
+                                // Invariance: task status, generation, notification, and emitted count remain unchanged.
                                 let post_snapshot = self
                                     .store
                                     .get_task_snapshot(&task_id)
@@ -1006,6 +1013,10 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     serde_json::to_value(pre_snapshot.task()).unwrap(),
                                     serde_json::to_value(post_snapshot.task()).unwrap()
                                 );
+                                assert_eq!(
+                                    pre_snapshot.authenticated_principal(),
+                                    post_snapshot.authenticated_principal()
+                                );
                                 let post_notification = self
                                     .store
                                     .latest_notification(&task_id)
@@ -1013,6 +1024,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                 assert_eq!(
                                     serde_json::to_value(&pre_notification).unwrap(),
                                     serde_json::to_value(&post_notification).unwrap()
+                                );
+                                assert_eq!(
+                                    self.emitted.load(Ordering::SeqCst),
+                                    pre_emitted,
+                                    "rejected duplicate input key reuse must not emit any notification"
                                 );
                                 *self.observed_rejection.lock().unwrap() = Some(rejection);
 
@@ -1094,6 +1110,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         reused,
         observed_rejection: Arc::clone(&observed_rejection),
         store: Arc::clone(&store),
+        emitted: Arc::clone(&emitted),
     });
     let mut runner = runtime
         .install_task_service(1, supervisor)
@@ -1115,52 +1132,137 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         let mut service = std::pin::pin!(runner.run_service(&cx));
         let mut observation_bound =
             std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(5)));
-        let mut step = 0;
-        let mut replay_tested = false;
+        let mut step = 0usize;
+        let mut replay_ticks = 0usize;
+        let mut baseline_snapshot: Option<FinalTaskSnapshot> = None;
+        let mut baseline_notification: Option<TaskStatusNotification> = None;
+        let mut baseline_emitted = 0usize;
 
         poll_fn(|task_cx| {
             if observation_bound.as_mut().poll(task_cx).is_ready() {
                 panic!("test timed out waiting for two-round progression");
             }
-            if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
-                panic!("service must remain ready while caller is live: {result:?}");
+            if step < 3 {
+                if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
+                    panic!("service must remain live and pending while caller is live: {result:?}");
+                }
+            } else {
+                if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
+                    assert!(
+                        result.is_ok(),
+                        "service natural shutdown must succeed: {result:?}"
+                    );
+                    return Poll::Ready(());
+                }
+                task_cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
 
             let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
             match current.task() {
                 Task::InputRequired { base: _, input_requests } => {
                     if step == 0 && input_requests.contains_key("roots_a") {
+                        assert_eq!(
+                            emitted.load(Ordering::SeqCst),
+                            1,
+                            "round 1 require_input must have emitted 1 notification"
+                        );
                         runtime
                             .update_task(&task_id, &roots_a_response)
                             .expect("round 1 input update succeeds");
+                        assert_eq!(
+                            emitted.load(Ordering::SeqCst),
+                            2,
+                            "round 1 update_task must have emitted second notification"
+                        );
                         step = 1;
                         task_cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
                     if step == 1 && input_requests.contains_key("roots_b") {
-                        if !reused && !replay_tested {
-                            // CRITICAL: Replaying round 1's response must not satisfy round 2.
-                            // The task must remain in InputRequired and supervisor must not resume.
-                            runtime
-                                .update_task(&task_id, &roots_a_response)
-                                .expect("replayed update ignored cleanly");
-                            let after_replay = store.get_task_snapshot(&task_id).unwrap().unwrap();
-                            assert!(
-                                matches!(after_replay.task(), Task::InputRequired { .. }),
-                                "replaying round 1 response must leave round 2 in InputRequired"
-                            );
+                        if !reused && replay_ticks < 4 {
+                            if replay_ticks == 0 {
+                                // Baseline before stale replay.
+                                let base_snap = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                                let base_notif = store
+                                    .latest_notification(&task_id)
+                                    .expect("read baseline notification");
+                                let base_emit = emitted.load(Ordering::SeqCst);
+                                assert_eq!(
+                                    base_emit, 3,
+                                    "must have emitted exactly 3 notifications before stale replay"
+                                );
+                                assert_eq!(
+                                    resumed_calls.load(Ordering::SeqCst),
+                                    1,
+                                    "supervisor must have resumed exactly once before stale replay"
+                                );
+                                baseline_snapshot = Some(base_snap);
+                                baseline_notification = Some(base_notif);
+                                baseline_emitted = base_emit;
+
+                                // Submit stale round 1 roots_a response.
+                                runtime
+                                    .update_task(&task_id, &roots_a_response)
+                                    .expect("replayed update ignored cleanly");
+                                replay_ticks = 1;
+                                task_cx.waker().wake_by_ref();
+                                return Poll::Pending;
+                            }
+
+                            // Ticks 1, 2, 3: poll service slice and assert full invariance.
+                            let base_snap = baseline_snapshot.as_ref().unwrap();
+                            let base_notif = baseline_notification.as_ref().unwrap();
+                            let current_snap = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                            let current_notif = store
+                                .latest_notification(&task_id)
+                                .expect("read current notification");
+
                             assert_eq!(
                                 resumed_calls.load(Ordering::SeqCst),
                                 1,
-                                "replayed response must not trigger supervisor resumption"
+                                "stale replay must not trigger supervisor resumption"
                             );
-                            replay_tested = true;
+                            assert_eq!(
+                                emitted.load(Ordering::SeqCst),
+                                baseline_emitted,
+                                "stale replay must not emit any notification"
+                            );
+                            assert_eq!(
+                                current_snap.generation(),
+                                base_snap.generation(),
+                                "stale replay must not advance generation"
+                            );
+                            assert_eq!(
+                                serde_json::to_value(current_snap.task()).unwrap(),
+                                serde_json::to_value(base_snap.task()).unwrap(),
+                                "stale replay must not mutate task state"
+                            );
+                            assert_eq!(
+                                current_snap.authenticated_principal(),
+                                base_snap.authenticated_principal(),
+                                "stale replay must not mutate authenticated principal"
+                            );
+                            assert_eq!(
+                                serde_json::to_value(&current_notif).unwrap(),
+                                serde_json::to_value(base_notif).unwrap(),
+                                "stale replay must not replace latest notification"
+                            );
+
+                            replay_ticks += 1;
                             task_cx.waker().wake_by_ref();
                             return Poll::Pending;
                         }
+
+                        // Replay slice verified (or in reused mode): submit fresh round 2 roots_b response.
                         runtime
                             .update_task(&task_id, &roots_b_response)
                             .expect("round 2 input update succeeds");
+                        assert_eq!(
+                            emitted.load(Ordering::SeqCst),
+                            4,
+                            "round 2 update_task must have emitted fourth notification"
+                        );
                         step = 2;
                         task_cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -1168,7 +1270,19 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                 }
                 Task::Completed { .. } => {
                     if step == 2 {
-                        return Poll::Ready(());
+                        assert_eq!(
+                            emitted.load(Ordering::SeqCst),
+                            5,
+                            "completion must have emitted fifth notification"
+                        );
+                        assert_eq!(calls.load(Ordering::SeqCst), 3);
+                        assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
+
+                        // Explicit caller cancellation to initiate owned natural service shutdown.
+                        cx.cancel_with(CancelKind::User, None);
+                        step = 3;
+                        task_cx.waker().wake_by_ref();
+                        return Poll::Pending;
                     }
                 }
                 _ => {}
@@ -1180,10 +1294,15 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
 
     assert!(
         !runtime.is_task_service_ready(),
-        "dropping the run revokes readiness"
+        "natural service shutdown revokes readiness"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        emitted.load(Ordering::SeqCst),
+        5,
+        "completed task must have emitted exactly 5 notifications in total"
+    );
     if reused {
         let rejection = observed_rejection
             .lock()
@@ -1195,6 +1314,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
             rejection.message,
             "Task input request keys cannot be reused"
         );
+    } else {
+        assert!(
+            observed_rejection.lock().unwrap().is_none(),
+            "fresh input keys must never produce a rejection"
+        );
     }
     let final_snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
     let value = serde_json::to_value(final_snapshot.task()).unwrap();
@@ -1203,7 +1327,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         value["result"]["content"][0]["text"],
         "two rounds completed successfully"
     );
-    let latest_notif = store.latest_notification(&task_id).unwrap().unwrap();
+    let latest_notif = store.latest_notification(&task_id).unwrap();
     assert_eq!(
         serde_json::to_value(&latest_notif.params.task).unwrap()["status"],
         "completed"
