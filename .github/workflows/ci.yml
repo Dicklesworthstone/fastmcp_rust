@@ -9,7 +9,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Main runs must complete: swarm push cadence was cancelling every run
+  # mid-flight (32/40 cancelled, 0 success on main). Branch runs still
+  # auto-supersede; main runs queue serially instead.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
