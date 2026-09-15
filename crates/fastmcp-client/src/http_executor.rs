@@ -2978,6 +2978,7 @@ pub struct ModernHttpClient {
     discovery_state: Arc<ModernHttpDiscoveryState>,
     executor: ModernHttpExecutor,
     reverse_request_handlers: ReverseRequestHandlers,
+    final_progress_notifications: Vec<FinalProgressNotificationParams>,
 }
 
 #[derive(Clone)]
@@ -3923,6 +3924,17 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Drains exact final progress notifications received during modern HTTP
+    /// request-scoped SSE processing when no external observer was bound.
+    #[must_use]
+    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+        match self {
+            Self::Modern(client) => client.take_final_progress_notifications(),
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => Vec::new(),
+        }
+    }
+
     /// Replaces the retained exact-2024 capability set before initialization.
     ///
     /// Auto negotiation intentionally discovers with the caller's ordinary
@@ -4713,6 +4725,15 @@ impl ClientHttpConnection {
                             server_notifications.push(notification);
                         }
                         ModernHttpRequestScopedNotification::Progress(progress) => {
+                            if let Self::Modern(client) = self {
+                                if client.final_progress_notifications.len()
+                                    < MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS
+                                {
+                                    client
+                                        .final_progress_notifications
+                                        .push(progress.clone());
+                                }
+                            }
                             progress_notifications.push(progress);
                         }
                         ModernHttpRequestScopedNotification::Ignored => {}
@@ -5972,6 +5993,7 @@ impl ModernHttpClient {
                         .with_timeout_policy(request_timeout_policy)
                         .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
+                    final_progress_notifications: Vec::new(),
                 }))
             }
             #[cfg(feature = "legacy-2024-11-05")]
@@ -6096,6 +6118,13 @@ impl ModernHttpClient {
         &self,
     ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
         self.discovery_state.negotiated_extensions.clone()
+    }
+
+    /// Drains exact final progress notifications received during request-scoped
+    /// SSE processing when no external observer was bound.
+    #[must_use]
+    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+        std::mem::take(&mut self.final_progress_notifications)
     }
 
     fn admit_final_extension_method(
@@ -9697,8 +9726,8 @@ mod tests {
     use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolEra};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY,
-        FinalCoreResult, JsonRpcRequest, JsonRpcResponse, RequestId, ServerNotification,
-        SubscriptionFilter,
+        FinalCoreResult, FinalCreateMessageResult, FinalProgressNotificationParams, JsonRpcRequest,
+        JsonRpcResponse, RequestId, ServerNotification, SubscriptionFilter,
     };
 
     #[cfg(feature = "apps")]
@@ -12262,14 +12291,51 @@ mod tests {
             .expect("missing-resultType modern server must join");
     }
 
-    #[test]
-    fn modern_http_rejects_forbidden_server_rpc_on_sse_before_callback_or_post() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InterleavedSseCase {
+        ForbiddenRpc,
+        ValidNotification,
+    }
+
+    fn run_modern_request_json_interleaved_sse_case(
+        case: InterleavedSseCase,
+    ) -> (
+        Result<JsonRpcResponse, ClientHttpConnectionError>,
+        usize,
+        Vec<FinalProgressNotificationParams>,
+    ) {
         let listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP reverse-sampling listener");
+            TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP interleaved SSE listener");
         let address = listener
             .local_addr()
-            .expect("read modern HTTP reverse-sampling address");
+            .expect("read modern HTTP interleaved SSE address");
         let modern_target = format!("http://{address}/mcp");
+
+        let callback_invocations = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::clone(&callback_invocations);
+        let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
+            move |_cx, _cancellation, params| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(params.max_tokens.to_string(), "8");
+                Box::pin(async move {
+                    Ok(FinalCreateMessageResult {
+                        content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                            fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                text: "sampled response".to_owned(),
+                                annotations: None,
+                                meta: None,
+                                additional: BTreeMap::new(),
+                            },
+                        ),
+                        model: "modern-sampling-model".to_owned(),
+                        role: fastmcp_protocol::Role::Assistant,
+                        stop_reason: None,
+                        meta: None,
+                    })
+                })
+            },
+        );
+
         let server = thread::spawn(move || {
             let (mut discovery, _) = listener.accept().expect("accept modern discovery");
             let discovery_request = read_request(&mut discovery);
@@ -12278,7 +12344,7 @@ mod tests {
                 &mut discovery,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-http-reverse","version":"1.0"}}}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-http-interleaved","version":"1.0"}}}}"#,
             );
 
             let (mut listed, _) = listener.accept().expect("accept modern tools/list");
@@ -12288,27 +12354,36 @@ mod tests {
                 .expect("tools/list is JSON-RPC");
             assert_eq!(list_body["method"], "tools/list");
             begin_chunked_sse(&mut listed);
-            // Server attempts forbidden independent reverse RPC on the request-scoped SSE stream.
-            write_chunked_sse_event(
-                &mut listed,
-                "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{\"_meta\":{},\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}],\"maxTokens\":8}}\n\n",
-            );
 
-            // Assert that the client closes the SSE stream upon receiving the forbidden RPC
-            // rather than dispatching a callback or initiating a reverse-response POST.
-            assert_sse_peer_closed(&mut listed);
+            match case {
+                InterleavedSseCase::ForbiddenRpc => {
+                    // Server attempts forbidden independent reverse RPC on the request-scoped SSE stream.
+                    write_chunked_sse_event(
+                        &mut listed,
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{\"_meta\":{},\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}],\"maxTokens\":8}}\n\n",
+                    );
+                    // Assert that the client immediately closes the SSE stream upon receiving the forbidden RPC
+                    // rather than dispatching a callback or initiating a reverse-response POST.
+                    assert_sse_peer_closed(&mut listed);
+                }
+                InterleavedSseCase::ValidNotification => {
+                    // Server emits a valid request-scoped progress notification.
+                    write_chunked_sse_event(
+                        &mut listed,
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"processing\"}}\n\n",
+                    );
+                    // Followed by the correlated terminal response.
+                    write_chunked_sse_event(
+                        &mut listed,
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n",
+                    );
+                    finish_chunked_sse(&mut listed);
+                }
+            }
+
+            listener
         });
 
-        let callback_invocations = Arc::new(AtomicUsize::new(0));
-        let invocations = Arc::clone(&callback_invocations);
-        let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
-            move |_cx, _cancellation, _params| {
-                invocations.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move {
-                    panic!("forbidden reverse callback must never be invoked on modern request_json");
-                })
-            },
-        );
         let cx = Cx::for_request();
         let mut connection = runtime_block_on(
             ClientBuilder::new()
@@ -12322,14 +12397,49 @@ mod tests {
                 .connect_http_with_cx(&cx),
         )
         .expect("modern HTTP connects with reverse sampling handlers");
-        let error = runtime_block_on(connection.request_json(
+
+        let response_result = runtime_block_on(connection.request_json(
             &cx,
             "tools/list",
-            serde_json::json!({}),
+            serde_json::json!({
+                "_meta": { "progressToken": 2 }
+            }),
             RequestId::Number(2),
             4_096,
-        ))
-        .expect_err("forbidden server RPC on SSE must be rejected");
+        ));
+
+        let progress_notifications = connection.take_final_progress_notifications();
+        let listener = server
+            .join()
+            .expect("modern HTTP interleaved SSE server must join");
+
+        // Assert that no pending connection attempts (e.g. queued reverse POSTs) arrive on the listener.
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
+        let poll_start = Instant::now();
+        while poll_start.elapsed() < Duration::from_millis(50) {
+            match listener.accept() {
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                }
+                Ok((_, peer)) => panic!("forbidden reverse POST connection accepted from {peer:?}"),
+                Err(other) => panic!("unexpected accept error: {other}"),
+            }
+        }
+
+        (
+            response_result,
+            callback_invocations.load(Ordering::SeqCst),
+            progress_notifications,
+        )
+    }
+
+    #[test]
+    fn modern_http_rejects_forbidden_server_rpc_on_sse_before_callback_or_post() {
+        let (result, callback_invocations, progress) =
+            run_modern_request_json_interleaved_sse_case(InterleavedSseCase::ForbiddenRpc);
+        let error = result.expect_err("forbidden server RPC on SSE must be rejected");
         assert!(matches!(
             error,
             ClientHttpConnectionError::UnexpectedResponseMessage {
@@ -12337,78 +12447,47 @@ mod tests {
             }
         ));
         assert_eq!(
-            callback_invocations.load(Ordering::SeqCst),
-            0,
-            "reverse callback must not be invoked"
+            callback_invocations, 0,
+            "reverse callback must not be invoked on forbidden server RPC"
         );
-        server
-            .join()
-            .expect("modern HTTP reverse-sampling server must join");
+        assert!(
+            progress.is_empty(),
+            "no progress notifications should be recorded on forbidden RPC rejection"
+        );
     }
 
     #[test]
     fn modern_http_preserves_valid_notification_and_terminal_result_on_sse() {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP valid notification listener");
-        let address = listener
-            .local_addr()
-            .expect("read modern HTTP valid notification address");
-        let modern_target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            let (mut discovery, _) = listener.accept().expect("accept modern discovery");
-            let discovery_request = read_request(&mut discovery);
-            assert!(discovery_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-            write_response(
-                &mut discovery,
-                200,
-                "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-http-notify","version":"1.0"}}}}"#,
-            );
-
-            let (mut listed, _) = listener.accept().expect("accept modern tools/list");
-            let list_request = read_request(&mut listed);
-            assert!(list_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-            let list_body = serde_json::from_slice::<serde_json::Value>(&list_request.body)
-                .expect("tools/list is JSON-RPC");
-            assert_eq!(list_body["method"], "tools/list");
-            begin_chunked_sse(&mut listed);
-            // Server emits a valid request-scoped progress notification.
-            write_chunked_sse_event(
-                &mut listed,
-                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"processing\"}}\n\n",
-            );
-            // Followed by the correlated terminal response.
-            write_chunked_sse_event(
-                &mut listed,
-                "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n",
-            );
-            finish_chunked_sse(&mut listed);
-        });
-
-        let cx = Cx::for_request();
-        let mut connection = runtime_block_on(
-            ClientBuilder::new()
-                .protocol_plan(plan(
-                    &modern_target,
-                    "http://127.0.0.1:9/legacy-sse",
-                    "http://127.0.0.1:9/legacy-message",
-                    ProtocolPolicy::ModernOnly,
-                ))
-                .connect_http_with_cx(&cx),
-        )
-        .expect("modern HTTP connects");
-        let response = runtime_block_on(connection.request_json(
-            &cx,
-            "tools/list",
-            serde_json::json!({}),
-            RequestId::Number(2),
-            4_096,
-        ))
-        .expect("tools/list completes when interleaved notifications are valid");
+        let (result, callback_invocations, progress) =
+            run_modern_request_json_interleaved_sse_case(InterleavedSseCase::ValidNotification);
+        let response =
+            result.expect("tools/list completes when interleaved notifications are valid");
         assert_eq!(response.id, Some(RequestId::Number(2)));
-        server
-            .join()
-            .expect("modern HTTP valid notification server must join");
+        let terminal = response
+            .result
+            .as_ref()
+            .expect("terminal response result is present");
+        assert_eq!(terminal["resultType"], "complete");
+        assert_eq!(terminal["tools"], serde_json::json!([]));
+        assert_eq!(terminal["ttlMs"], 0);
+        assert_eq!(terminal["cacheScope"], "private");
+
+        assert_eq!(
+            callback_invocations, 0,
+            "reverse callback must not be invoked during valid notification delivery"
+        );
+        assert_eq!(
+            progress.len(),
+            1,
+            "exactly one progress notification must be delivered"
+        );
+        assert_eq!(progress[0].progress_token, RequestId::Number(2));
+        assert_eq!(progress[0].progress.as_str(), "0.5");
+        assert_eq!(
+            progress[0].total.as_ref().map(|total| total.as_str()),
+            Some("1.0")
+        );
+        assert_eq!(progress[0].message.as_deref(), Some("processing"));
     }
 
     #[test]
