@@ -42,6 +42,7 @@
 //! use std::sync::Arc;
 //! use fastmcp_rust::oauth::{OAuthClient, OAuthServer, OAuthServerConfig};
 //! use fastmcp_rust::{modern::ServerBuilder, TokenAuthProvider};
+//! use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
 //!
 //! let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
 //!
@@ -55,11 +56,15 @@
 //! oauth.register_client(client)?;
 //!
 //! // Inside the application's async entry point, with its supplied `cx`.
-//! let verifier = oauth.token_verifier();
+//! let endpoint = CanonicalHttpUrl::parse("https://mcp.example/mcp")?;
+//! let resource = CanonicalResourceId::parse_for_endpoint(
+//!     endpoint.as_str(), &endpoint, CanonicalResourceIdPolicy::DEFAULT,
+//! )?;
+//! let verifier = oauth.token_verifier(resource);
 //! ServerBuilder::new("my-server", "1.0.0")
 //!     .auth_provider(TokenAuthProvider::new(verifier))
 //!     .build()
-//!     .run_stdio_with_cx(cx)
+//!     .run_http_with_cx(cx, "127.0.0.1:8080")
 //!     .await;
 //! ```
 
@@ -68,8 +73,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{
-    AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult, SecurityIdentifier,
-    Sha256Digest, draw_security_identifier, sha256_bounded,
+    AccessToken, AuthContext, CanonicalResourceId, McpContext, McpError, McpErrorCode, McpResult,
+    SecurityIdentifier, Sha256Digest, draw_security_identifier, sha256_bounded,
 };
 use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -3630,7 +3635,7 @@ impl OAuthServer {
         scopes: &[String],
         subject: Option<&str>,
     ) -> Result<TokenResponse, OAuthError> {
-        self.issue_tokens_with_draw(client_id, scopes, subject, draw_security_identifier)
+        self.issue_tokens_with_draw(client_id, scopes, None, subject, draw_security_identifier)
     }
 
     fn prepare_token_pair_with_draw<F, E>(
@@ -3732,6 +3737,7 @@ impl OAuthServer {
         &self,
         client_id: &str,
         scopes: &[String],
+        resource: Option<&str>,
         subject: Option<&str>,
         mut draw: F,
     ) -> Result<TokenResponse, OAuthError>
@@ -3739,6 +3745,7 @@ impl OAuthServer {
         F: FnMut() -> Result<SecurityIdentifier, E>,
         E: std::fmt::Display,
     {
+        validate_optional_authorization_resource(resource)?;
         validate_optional_authorization_subject(subject)?;
         let scopes = canonicalize_request_scopes(scopes)?;
         let (mut state, _) = self.state_for_mutation()?;
@@ -3765,7 +3772,7 @@ impl OAuthServer {
         let prepared = self.prepare_token_pair_with_draw(
             client_id,
             &scopes,
-            None,
+            resource,
             subject,
             registration_epoch,
             None,
@@ -3900,11 +3907,17 @@ impl OAuthServer {
     // MCP Integration
     // -------------------------------------------------------------------------
 
-    /// Creates a token verifier for use with MCP [`crate::auth::TokenAuthProvider`].
+    /// Creates a token verifier for one configured protected MCP resource.
+    ///
+    /// The expected resource must come from trusted deployment configuration,
+    /// not from a request header, parameter, or token claim. Tokens without
+    /// this exact audience are rejected before authentication facts are made
+    /// available to [`crate::auth::TokenAuthProvider`] consumers.
     #[must_use]
-    pub fn token_verifier(self: &Arc<Self>) -> OAuthTokenVerifier {
+    pub fn token_verifier(self: &Arc<Self>, resource: CanonicalResourceId) -> OAuthTokenVerifier {
         OAuthTokenVerifier {
             server: Arc::clone(self),
+            resource,
         }
     }
 
@@ -3967,6 +3980,7 @@ pub struct OAuthServerStats {
 /// with the MCP server's [`crate::auth::TokenAuthProvider`].
 pub struct OAuthTokenVerifier {
     server: Arc<OAuthServer>,
+    resource: CanonicalResourceId,
 }
 
 impl TokenVerifier for OAuthTokenVerifier {
@@ -3991,6 +4005,12 @@ impl TokenVerifier for OAuthTokenVerifier {
             .ok_or_else(|| {
                 McpError::new(McpErrorCode::ResourceForbidden, "invalid or expired token")
             })?;
+        if stored_token.resource.as_deref() != Some(self.resource.as_str()) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "token is not authorized for this resource",
+            ));
+        }
         let registration_epoch = stored_token.registration_epoch;
         let token_info = stored_token.metadata;
         let OAuthToken {
@@ -4739,6 +4759,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const TEST_MCP_RESOURCE: &str = "https://resource.example/api";
+
+    fn configured_resource(resource: &str) -> CanonicalResourceId {
+        let endpoint =
+            fastmcp_core::CanonicalHttpUrl::parse(resource).expect("trusted test endpoint");
+        CanonicalResourceId::parse_for_endpoint(
+            resource,
+            &endpoint,
+            fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+        )
+        .expect("trusted test resource")
+    }
+
     #[derive(Clone, Copy)]
     enum ApprovalTestMode {
         Exact,
@@ -5298,7 +5331,7 @@ mod tests {
             client_id: client_id.to_string(),
             redirect_uri: redirect_uri.to_string(),
             scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-            resource: None,
+            resource: Some(TEST_MCP_RESOURCE.to_string()),
             state: Some("oauth-test-state".to_string()),
             code_challenge,
             code_challenge_method: CodeChallengeMethod::S256,
@@ -5315,7 +5348,7 @@ mod tests {
                 code_verifier: Some(code_verifier),
                 refresh_token: None,
                 scopes: None,
-                resource: None,
+                resource: Some(TEST_MCP_RESOURCE.to_string()),
             })
             .expect("token exchange")
     }
@@ -5531,7 +5564,7 @@ mod tests {
         let refresh = issued.refresh_token.expect("refresh token");
 
         let auth = server
-            .token_verifier()
+            .token_verifier(configured_resource(RESOURCE))
             .verify(
                 &McpContext::new(asupersync::Cx::for_testing(), 1),
                 AuthRequest {
@@ -5572,7 +5605,7 @@ mod tests {
             Some(RESOURCE),
         );
         let rotated_auth = server
-            .token_verifier()
+            .token_verifier(configured_resource(RESOURCE))
             .verify(
                 &McpContext::new(asupersync::Cx::for_testing(), 1),
                 AuthRequest {
@@ -5855,7 +5888,7 @@ mod tests {
 
         // Verify token A with OAuthTokenVerifier
         let cx = McpContext::new(asupersync::Cx::for_testing(), 1);
-        let verifier = server.token_verifier();
+        let verifier = server.token_verifier(configured_resource(RESOURCE_A));
         let auth_a = verifier
             .verify(
                 &cx,
@@ -5917,7 +5950,8 @@ mod tests {
             ))
             .expect("exchange b");
 
-        let auth_b = verifier
+        let verifier_b = server.token_verifier(configured_resource(RESOURCE_B));
+        let auth_b = verifier_b
             .verify(
                 &cx,
                 AuthRequest {
@@ -5959,7 +5993,10 @@ mod tests {
                 &code_no_res,
             ))
             .expect("exchange no res");
-        let auth_no_res = verifier
+        let unbound_metadata = server
+            .validate_stored_access_token(&issued_no_res.access_token)
+            .expect("unbound token remains valid authorization-server metadata");
+        let unbound_error = verifier
             .verify(
                 &cx,
                 AuthRequest {
@@ -5973,7 +6010,21 @@ mod tests {
                     token: issued_no_res.access_token,
                 },
             )
-            .expect("verify token without resource");
+            .expect_err("an unbound token cannot authenticate the protected resource");
+        assert_eq!(unbound_error.code, McpErrorCode::ResourceForbidden);
+
+        // Preserve the owner-namespace isolation check for retained unbound
+        // metadata independently of admission, which now rejects that token.
+        let auth_no_res = AuthContext::with_subject("approved-subject").with_session_owner(
+            oauth_session_owner(
+                &server.config.issuer,
+                &unbound_metadata.client_id,
+                unbound_metadata.registration_epoch,
+                unbound_metadata.subject.as_deref(),
+                None,
+            )
+            .expect("unbound metadata has a distinct owner namespace"),
+        );
 
         let owner_no_res = auth_no_res.session_owner().expect("session owner no res");
         assert_ne!(owner_a, owner_no_res);
@@ -6008,6 +6059,305 @@ mod tests {
         assert!(!binding.verify_existing(fp_no_res));
         // Original binding remains uncorrupted after cross-resource rejections
         assert!(binding.bind_or_verify(fp_a));
+    }
+
+    struct AudienceAuthTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::ToolHandler for AudienceAuthTool {
+        fn definition(&self) -> fastmcp_protocol::Tool {
+            fastmcp_protocol::Tool {
+                name: "audience_auth".to_string(),
+                description: Some("Returns admitted authentication facts".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<fastmcp_protocol::Content>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let auth = ctx
+                .auth()
+                .expect("authenticated handler must receive facts");
+            Ok(vec![fastmcp_protocol::Content::text(
+                serde_json::to_string(&auth).expect("safe auth facts serialize"),
+            )])
+        }
+    }
+
+    struct AudienceMiddleware {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl crate::middleware::Middleware for AudienceMiddleware {
+        fn on_request(
+            &self,
+            _ctx: &McpContext,
+            _request: &fastmcp_protocol::JsonRpcRequest,
+        ) -> McpResult<crate::middleware::MiddlewareDecision> {
+            self.events.lock().unwrap().push("request");
+            Ok(crate::middleware::MiddlewareDecision::Continue)
+        }
+
+        fn on_response(
+            &self,
+            _ctx: &McpContext,
+            _request: &fastmcp_protocol::JsonRpcRequest,
+            response: serde_json::Value,
+        ) -> McpResult<serde_json::Value> {
+            self.events.lock().unwrap().push("response");
+            Ok(response)
+        }
+
+        fn on_error(
+            &self,
+            _ctx: &McpContext,
+            _request: &fastmcp_protocol::JsonRpcRequest,
+            error: McpError,
+        ) -> McpError {
+            self.events.lock().unwrap().push("error");
+            error
+        }
+    }
+
+    fn audience_http_request(token: &str, request_id: i64) -> fastmcp_transport::HttpRequest {
+        let request = fastmcp_protocol::JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "audience_auth",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            request_id,
+        );
+        fastmcp_transport::HttpRequest::new(fastmcp_transport::HttpMethod::Post, "/api")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json")
+            .with_header("mcp-protocol-version", "2026-07-28")
+            .with_header("mcp-method", "tools/call")
+            .with_header("mcp-name", "audience_auth")
+            .with_header("authorization", format!("Bearer {token}"))
+            .with_body(serde_json::to_vec(&request).expect("valid public HTTP request"))
+    }
+
+    fn assert_retained_token_unchanged(before: &StoredOAuthToken, after: &StoredOAuthToken) {
+        assert_eq!(after.token, before.token);
+        assert_eq!(after.token_type, before.token_type);
+        assert_eq!(after.client_id, before.client_id);
+        assert_eq!(after.scopes, before.scopes);
+        assert_eq!(after.resource, before.resource);
+        assert_eq!(after.issued_at, before.issued_at);
+        assert_eq!(after.expires_at, before.expires_at);
+        assert_eq!(after.subject, before.subject);
+        assert_eq!(after.is_refresh_token, before.is_refresh_token);
+        assert_eq!(after.grant_id, before.grant_id);
+        assert_eq!(after.registration_epoch, before.registration_epoch);
+        assert_eq!(after.family_expires_at, before.family_expires_at);
+    }
+
+    fn assert_fresh_http_resource_admission(token_resource: Option<&str>) {
+        let approval = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let oauth = Arc::new(server_with_counting_approval(Arc::clone(&approval)));
+        oauth
+            .register_client(
+                OAuthClient::builder("audience-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("valid client"),
+            )
+            .expect("client registered");
+        let issue = |resource: Option<&str>| {
+            let request = AuthorizationRequest {
+                scopes: vec!["read".to_string()],
+                resource: resource.map(str::to_string),
+                ..bounded_authorization_request("audience-client")
+            };
+            let (code, _) = oauth.authorize(&request).expect("explicit approval");
+            let exchange = TokenRequest {
+                resource: resource.map(str::to_string),
+                ..bounded_code_exchange_request("audience-client", &code)
+            };
+            oauth.token(&exchange).expect("actual PKCE token exchange")
+        };
+        let issued = issue(token_resource);
+        let matching = issue(Some(TEST_MCP_RESOURCE));
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 2);
+        let before = oauth
+            .validate_stored_access_token(&issued.access_token)
+            .expect("the presented token is valid at its issuer");
+        let refresh_digest = refresh_token_digest(issued.refresh_token.as_ref().unwrap());
+        let before_refresh = oauth.state.read().unwrap().refresh_tokens[&refresh_digest].clone();
+        let before_stats = oauth.stats();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let endpoint = crate::Server::new("audience-admission", "1.0.0")
+            .protocol_policy(crate::ProtocolPolicy::ModernOnly)
+            .expect("modern policy")
+            .http_config(crate::HttpServerConfig::new().mcp_path("/api"))
+            .auth_provider(crate::TokenAuthProvider::new(
+                oauth.token_verifier(configured_resource(TEST_MCP_RESOURCE)),
+            ))
+            .tool(AudienceAuthTool {
+                calls: Arc::clone(&calls),
+            })
+            .middleware(AudienceMiddleware {
+                events: Arc::clone(&events),
+            })
+            // This test build also carries an unused exact-legacy endpoint,
+            // whose POST sink accepts only a plain-HTTP origin. The modern
+            // protected resource above is trusted HTTPS deployment policy;
+            // this direct handler test does not model its TLS connection.
+            .build_http_endpoint("http://resource.example")
+            .expect("real public HTTP endpoint");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("test reactor"))
+            .blocking_threads(2, 8)
+            .build()
+            .expect("caller-owned runtime");
+        runtime.block_on(async {
+            let cx = asupersync::Cx::current().expect("runtime context");
+            let mut session = endpoint
+                .open_session(&cx)
+                .expect("fresh public HTTP session");
+            let response = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(5),
+                Box::pin(session.handle_async(&cx, audience_http_request(&issued.access_token, 1))),
+            )
+            .await
+            .expect("HTTP admission must finish within the test deadline")
+            .expect("HTTP admission result");
+            let crate::ServerHttpEndpointResponse::Immediate(response) = response else {
+                panic!("JSON request must produce one immediate HTTP response");
+            };
+            if token_resource == Some(TEST_MCP_RESOURCE) {
+                assert_audience_http_success(&response, &issued.access_token, 1);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(*events.lock().unwrap(), ["request", "response"]);
+            } else {
+                assert_eq!(response.status, fastmcp_transport::HttpStatus::UNAUTHORIZED);
+                assert_eq!(
+                    response.headers.get("www-authenticate").map(String::as_str),
+                    Some("Bearer"),
+                );
+                assert!(response.body.is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(events.lock().unwrap().is_empty());
+            }
+            assert_oauth_stats_unchanged(&before_stats, &oauth.stats());
+            assert_retained_token_unchanged(
+                &before,
+                &oauth
+                    .validate_stored_access_token(&issued.access_token)
+                    .expect("denial does not revoke token"),
+            );
+            assert_retained_token_unchanged(
+                &before_refresh,
+                &oauth.state.read().unwrap().refresh_tokens[&refresh_digest],
+            );
+            if let Some(resource) = token_resource {
+                // This fixture's separately configured matching consumer can
+                // still verify the same token after the HTTP audience check.
+                let auth = oauth
+                    .token_verifier(configured_resource(resource))
+                    .verify(
+                        &McpContext::new(cx.clone(), 3),
+                        AuthRequest {
+                            method: "tools/call",
+                            params: None,
+                            transport_authorization: None,
+                            request_id: 3,
+                        },
+                        &AccessToken {
+                            scheme: "Bearer".to_string(),
+                            token: issued.access_token.clone(),
+                        },
+                    )
+                    .expect("the token remains usable by its matching resource");
+                assert_eq!(auth.claims.as_ref().unwrap()["resource"], resource);
+            }
+
+            // The same session remains usable by an audience-matching token.
+            // In the negative this is its first admitted principal.
+            let recovered = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(5),
+                Box::pin(
+                    session.handle_async(&cx, audience_http_request(&matching.access_token, 2)),
+                ),
+            )
+            .await
+            .expect("matching request must finish within the test deadline")
+            .expect("matching request after the initial result");
+            let crate::ServerHttpEndpointResponse::Immediate(recovered) = recovered else {
+                panic!("matching JSON response must be immediate");
+            };
+            assert_audience_http_success(&recovered, &matching.access_token, 2);
+            let expected_calls = if token_resource == Some(TEST_MCP_RESOURCE) {
+                2
+            } else {
+                1
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(events.lock().unwrap().len(), expected_calls * 2);
+            assert_oauth_stats_unchanged(&before_stats, &oauth.stats());
+            session.close(&cx).await;
+        });
+    }
+
+    fn assert_audience_http_success(
+        response: &fastmcp_transport::HttpResponse,
+        raw_token: &str,
+        request_id: i64,
+    ) {
+        assert_eq!(response.status, fastmcp_transport::HttpStatus::OK);
+        let rpc: fastmcp_protocol::JsonRpcResponse =
+            serde_json::from_slice(&response.body).expect("complete JSON-RPC response");
+        assert_eq!(rpc.id, Some(fastmcp_protocol::RequestId::from(request_id)));
+        assert!(rpc.error.is_none());
+        let result = rpc.result.expect("tool result");
+        assert_eq!(
+            result["content"].as_array().expect("content array").len(),
+            1
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("auth JSON text");
+        let auth: serde_json::Value = serde_json::from_str(text).expect("safe handler auth facts");
+        assert_eq!(auth["subject"], "approved-subject");
+        assert_eq!(auth["scopes"], serde_json::json!(["read"]));
+        assert_eq!(auth["claims"]["resource"], TEST_MCP_RESOURCE);
+        assert_eq!(auth["claims"]["client_id"], "audience-client");
+        assert!(!text.contains(raw_token));
+        assert!(auth.get("token").is_none());
+    }
+
+    #[test]
+    fn auth_01_a_matching_resource_dispatches_fresh_http() {
+        assert_fresh_http_resource_admission(Some(TEST_MCP_RESOURCE));
+    }
+
+    #[test]
+    fn auth_01_a_foreign_resource_rejects_before_fresh_http_dispatch() {
+        assert_fresh_http_resource_admission(Some("https://foreign.example/api"));
+    }
+
+    #[test]
+    fn auth_01_a_unbound_resource_rejects_before_fresh_http_dispatch() {
+        assert_fresh_http_resource_admission(None);
     }
 
     fn bounded_refresh_request(client_id: &str, refresh_token: &str) -> TokenRequest {
@@ -6900,7 +7250,7 @@ mod tests {
         let draws = std::cell::Cell::new(0);
 
         let error = server
-            .issue_tokens_with_draw("c1", &[], Some(""), || {
+            .issue_tokens_with_draw("c1", &[], None, Some(""), || {
                 draws.set(draws.get() + 1);
                 draw_security_identifier().map_err(|_| "unexpected RNG failure")
             })
@@ -7064,7 +7414,7 @@ mod tests {
             .unwrap();
         let draw_calls = std::cell::Cell::new(0);
 
-        let result = server.issue_tokens_with_draw("client", &[], None, || {
+        let result = server.issue_tokens_with_draw("client", &[], None, None, || {
             let call = draw_calls.get() + 1;
             draw_calls.set(call);
             if call == 1 {
@@ -7091,7 +7441,7 @@ mod tests {
         let final_draw_completed = std::cell::Cell::new(None);
 
         let response = server
-            .issue_tokens_with_draw("client", &[], None, || {
+            .issue_tokens_with_draw("client", &[], None, None, || {
                 let call = draw_calls.get() + 1;
                 draw_calls.set(call);
                 let identifier = draw_security_identifier()
@@ -7333,7 +7683,7 @@ mod tests {
         );
 
         // Create verifier
-        let verifier = server.token_verifier();
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let cx = asupersync::Cx::for_testing();
         let mcp_ctx = McpContext::new(cx, 1);
         let auth_request = AuthRequest {
@@ -9507,7 +9857,7 @@ mod tests {
             "user42",
         );
 
-        let verifier = server.token_verifier();
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let cx = asupersync::Cx::for_testing();
         let mcp_ctx = McpContext::new(cx, 1);
         let auth_request = AuthRequest {
@@ -9535,8 +9885,16 @@ mod tests {
         server
             .register_client(bounded_test_client("service-client"))
             .unwrap();
-        let token_resp = server.issue_tokens("service-client", &[], None).unwrap();
-        let verifier = server.token_verifier();
+        let token_resp = server
+            .issue_tokens_with_draw(
+                "service-client",
+                &[],
+                Some(TEST_MCP_RESOURCE),
+                None,
+                draw_security_identifier,
+            )
+            .unwrap();
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let cx = asupersync::Cx::for_testing();
         let mcp_ctx = McpContext::new(cx, 1);
         let auth = verifier
@@ -9690,7 +10048,15 @@ mod tests {
     fn refresh_preserves_owner_and_absolute_family_deadline() {
         let server = Arc::new(OAuthServer::with_defaults());
         server.register_client(bounded_test_client("c1")).unwrap();
-        let initial = server.issue_tokens("c1", &[], Some("subject")).unwrap();
+        let initial = server
+            .issue_tokens_with_draw(
+                "c1",
+                &[],
+                Some(TEST_MCP_RESOURCE),
+                Some("subject"),
+                draw_security_identifier,
+            )
+            .unwrap();
         let first_refresh = initial.refresh_token.expect("initial refresh token");
         let family_expires_at = server
             .state
@@ -9707,7 +10073,7 @@ mod tests {
             transport_authorization: None,
             request_id: 1,
         };
-        let verifier = server.token_verifier();
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let initial_auth = verifier
             .verify(
                 &cx,
@@ -9810,8 +10176,16 @@ mod tests {
         server
             .register_client(bounded_test_client("service-client"))
             .unwrap();
-        let old = server.issue_tokens("service-client", &[], None).unwrap();
-        let verifier = server.token_verifier();
+        let old = server
+            .issue_tokens_with_draw(
+                "service-client",
+                &[],
+                Some(TEST_MCP_RESOURCE),
+                None,
+                draw_security_identifier,
+            )
+            .unwrap();
+        let verifier = server.token_verifier(configured_resource(TEST_MCP_RESOURCE));
         let cx = McpContext::new(asupersync::Cx::for_testing(), 1);
         let request = AuthRequest {
             method: "test",
@@ -9834,7 +10208,15 @@ mod tests {
         server
             .register_client(bounded_test_client("service-client"))
             .unwrap();
-        let fresh = server.issue_tokens("service-client", &[], None).unwrap();
+        let fresh = server
+            .issue_tokens_with_draw(
+                "service-client",
+                &[],
+                Some(TEST_MCP_RESOURCE),
+                None,
+                draw_security_identifier,
+            )
+            .unwrap();
         let fresh_auth = verifier
             .verify(
                 &cx,
@@ -10024,7 +10406,15 @@ mod tests {
             .build()
             .unwrap();
         server.register_client(client).unwrap();
-        let initial = server.issue_tokens("c1", &[], Some("subject")).unwrap();
+        let initial = server
+            .issue_tokens_with_draw(
+                "c1",
+                &[],
+                Some(TEST_MCP_RESOURCE),
+                Some("subject"),
+                draw_security_identifier,
+            )
+            .unwrap();
         let refresh = initial.refresh_token.expect("refresh token");
 
         let mut request = bounded_refresh_request("c1", &refresh);
@@ -10033,7 +10423,7 @@ mod tests {
             .token(&request)
             .expect("valid client authentication must rotate the refresh grant");
         let auth = server
-            .token_verifier()
+            .token_verifier(configured_resource(TEST_MCP_RESOURCE))
             .verify(
                 &McpContext::new(asupersync::Cx::for_testing(), 1),
                 AuthRequest {
