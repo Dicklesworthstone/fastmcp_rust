@@ -330,7 +330,9 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
                 std::fs::write(dir.join("watch_gap_reads"), reads.to_string())
                     .expect("retain real task read count");
                 if reads == 1 {
-                    if let Ok(delay_str) = std::fs::read_to_string(dir.join("initial_read_delay_ms")) {
+                    if let Ok(delay_str) =
+                        std::fs::read_to_string(dir.join("initial_read_delay_ms"))
+                    {
                         if let Ok(ms) = delay_str.trim().parse::<u64>() {
                             std::thread::sleep(std::time::Duration::from_millis(ms));
                         }
@@ -339,8 +341,11 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
                 let mut first = self.first_read_instant.lock().unwrap();
                 if let Some(first_instant) = *first {
                     let elapsed_ms = first_instant.elapsed().as_millis();
-                    std::fs::write(dir.join("watch_gap_read_interval_ms"), elapsed_ms.to_string())
-                        .expect("retain real task read interval");
+                    std::fs::write(
+                        dir.join("watch_gap_read_interval_ms"),
+                        elapsed_ms.to_string(),
+                    )
+                    .expect("retain real task read interval");
                 } else {
                     *first = Some(std::time::Instant::now());
                 }

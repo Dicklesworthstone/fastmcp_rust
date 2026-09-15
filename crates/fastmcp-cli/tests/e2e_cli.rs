@@ -3190,6 +3190,178 @@ exec "$@"
         assert_task_input_response_id_admission(true);
     }
 
+    #[cfg(target_os = "linux")]
+    fn assert_task_input_file_lease_admission(write_lease: bool) {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        const LEASE_HOLDER: &str = r"
+import fcntl, json, os, pathlib, signal, sys
+root = pathlib.Path(sys.argv[1])
+fd = os.open(root / 'leased-input-canary.json', os.O_RDONLY | os.O_CLOEXEC)
+def lease_break(signum, frame):
+    (root / 'lease-break.json').write_text(json.dumps({
+        'pid': os.getpid(), 'sigio': signum == signal.SIGIO
+    }))
+signal.signal(signal.SIGIO, lease_break)
+kind = fcntl.F_WRLCK if sys.argv[2] == 'write' else fcntl.F_RDLCK
+fcntl.fcntl(fd, fcntl.F_SETLEASE, kind)
+observed = fcntl.fcntl(fd, fcntl.F_GETLEASE)
+assert observed == kind
+metadata = os.fstat(fd)
+(root / 'lease-ready.json').write_text(json.dumps({
+    'pid': os.getpid(), 'readLease': observed == fcntl.F_RDLCK,
+    'writeLease': observed == fcntl.F_WRLCK,
+    'inode': metadata.st_ino, 'device': metadata.st_dev,
+    'breakSeconds': int(pathlib.Path('/proc/sys/fs/lease-break-time').read_text()),
+    'ready': True
+}))
+assert sys.stdin.buffer.readline() == b'release\n'
+fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+assert fcntl.fcntl(fd, fcntl.F_GETLEASE) == fcntl.F_UNLCK
+os.close(fd)
+(root / 'lease-released').write_text('released')
+";
+
+        let fixture = TaskFixture::new(true);
+        let task_path = fixture.root.join("task.json");
+        let original_task_bytes = std::fs::read(&task_path).unwrap();
+        let changed_path = fixture.root.join("changed.json");
+        let input = fixture.root.join("leased-input-canary.json");
+        let responses = r#"{"roots":{"roots":[{"uri":"file:///leased-input-content-canary"}]}}"#;
+        std::fs::write(&input, responses).unwrap();
+        let input_metadata = std::fs::metadata(&input).unwrap();
+        let (mut server, endpoint) = fixture.http();
+        let get_args = [
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ];
+        let before = run_cli(&get_args);
+        assert_eq!(document(&before)["data"], fixture.task);
+        assert!(!changed_path.exists());
+
+        // Both cases lease the same regular JSON input. Only the kernel lease
+        // kind changes: a read lease permits our read; a write lease conflicts.
+        let mut helper_command = Command::new("python3");
+        helper_command
+            .arg("-c")
+            .arg(LEASE_HOLDER)
+            .arg(fixture.root.as_ref())
+            .arg(if write_lease { "write" } else { "read" })
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(fixture.root.join("lease.stderr")).unwrap());
+        let mut holder = ProcessGroupGuard::spawn(&mut helper_command);
+        let mut release = holder.child_mut().stdin.take().unwrap();
+        let ready_path = fixture.root.join("lease-ready.json");
+        wait_for_file(&ready_path, "\"ready\": true");
+        let ready: Value = serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+        assert_eq!(ready["pid"], holder.child_mut().id());
+        assert_eq!(ready["readLease"], !write_lease);
+        assert_eq!(ready["writeLease"], write_lease);
+        assert_eq!(ready["inode"], input_metadata.ino());
+        assert_eq!(ready["device"], input_metadata.dev());
+        assert!(
+            ready["breakSeconds"].as_u64().unwrap() >= 10,
+            "kernel lease must outlive the CLI guard; unavailable lease proof is a failure"
+        );
+        assert!(!holder.child_is_zombie("lease holder must remain alive").unwrap());
+
+        let update_command = || {
+            let mut command = Command::new(get_binary_path());
+            command
+                .args([
+                    "tasks",
+                    "update",
+                    fixture.id(),
+                    "--http-url",
+                    &endpoint,
+                    "--json",
+                    "--timeout",
+                    "1",
+                    "--input-file",
+                ])
+                .arg(&input);
+            command
+        };
+        let assert_working = || {
+            let after = run_cli(&get_args);
+            let task = document(&after)["data"].clone();
+            assert_eq!(task["taskId"], fixture.task["taskId"]);
+            assert_eq!(task["status"], "working");
+            assert!(task.get("inputRequests").is_none());
+            let changed: Value =
+                serde_json::from_slice(&std::fs::read(&changed_path).unwrap()).unwrap();
+            assert_eq!(changed, task);
+        };
+        // A guard timeout returns Err after cleanup and cannot pass this test.
+        // The independent lease holder is still alive and unreleased when the
+        // actual CLI exits; releasing it cannot manufacture bounded success.
+        let output = run_with_deadline(update_command(), Duration::from_secs(3))
+            .expect("Tasks input admission must exit naturally while the lease remains held");
+        assert!(!holder.child_is_zombie("lease holder outlives CLI exit").unwrap());
+        assert!(!fixture.root.join("lease-released").exists());
+        let break_path = fixture.root.join("lease-break.json");
+        if write_lease {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let stderr = stderr_str(&output);
+            assert!(stderr.contains("--input-file must be a readable regular JSON"));
+            assert!(!stderr.contains("leased-input-canary"));
+            assert!(!stderr.contains("leased-input-content-canary"));
+            wait_for_file(&break_path, "\"sigio\": true");
+            let notification: Value =
+                serde_json::from_slice(&std::fs::read(&break_path).unwrap()).unwrap();
+            assert_eq!(notification["pid"], holder.child_mut().id());
+            assert_eq!(notification["sigio"], true);
+            let after = run_cli(&get_args);
+            assert_eq!(document(&after)["data"], fixture.task);
+            assert_eq!(after.stdout, before.stdout);
+            assert_eq!(std::fs::read(&task_path).unwrap(), original_task_bytes);
+            assert!(!changed_path.exists());
+        } else {
+            assert_eq!(document(&output)["event"], "update-acknowledged");
+            assert!(!break_path.exists(), "read-open must not break a read lease");
+            assert_working();
+        }
+
+        release.write_all(b"release\n").unwrap();
+        drop(release);
+        let status = holder
+            .wait_until(Duration::from_secs(3))
+            .expect("lease holder must release and exit normally");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(fixture.root.join("lease-released")).unwrap(),
+            b"released"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), responses.as_bytes());
+        if write_lease {
+            // The rejected attempt leaves the same real task and input usable.
+            let retry = run_with_deadline(update_command(), Duration::from_secs(3))
+                .expect("same valid input must succeed after explicit lease release");
+            assert_eq!(document(&retry)["event"], "update-acknowledged");
+            assert_working();
+        }
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_02_b_update_read_leased_input_succeeds() {
+        assert_task_input_file_lease_admission(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_02_b_update_write_leased_input_rejects_without_mutation() {
+        assert_task_input_file_lease_admission(true);
+    }
+
     fn assert_task_stdout_deadline(drain_stdout: bool) {
         let mut fixture = TaskFixture::new_with_status("completed");
         let message = "x".repeat(512 * 1024);
@@ -4265,9 +4437,10 @@ exec "$@"
             let interval_str =
                 std::fs::read_to_string(fixture.root.join("watch_gap_read_interval_ms")).unwrap();
             let elapsed_ms: u64 = interval_str.parse().expect("valid interval integer");
-            // Clock/timing assertion: server recorded at least 1400ms between reads.
+            // Both observations use the server's monotonic clock. Scheduling
+            // can make the second read later, but cannot justify an early read.
             assert!(
-                elapsed_ms >= 1400,
+                elapsed_ms >= poll_interval_ms,
                 "reconciliation poll occurred too early: elapsed={elapsed_ms}ms, minimum={poll_interval_ms}ms"
             );
             assert_eq!(events.len(), 4);
@@ -4375,7 +4548,7 @@ exec "$@"
                 std::fs::read_to_string(fixture.root.join("watch_gap_read_interval_ms")).unwrap();
             let elapsed_ms: u64 = interval_str.parse().expect("valid interval integer");
             assert!(
-                elapsed_ms >= 550,
+                elapsed_ms >= poll_interval_ms,
                 "reconciliation poll occurred too early: elapsed={elapsed_ms}ms, minimum={poll_interval_ms}ms"
             );
             assert_eq!(events.len(), 4);
