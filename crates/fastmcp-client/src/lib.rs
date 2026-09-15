@@ -15892,6 +15892,17 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         let (result, diagnostic) = decoded.map_err(|error| self.terminate_connection(error))?;
+        #[cfg(feature = "tasks")]
+        if !execution.allow_tasks
+            && matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+            )
+        {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "Undeclared tools/call peer task result rejected",
+            )));
+        }
         if !cancelled {
             for notification in stream {
                 if let Err(error) = self.retain_stream_notification(&notification) {
@@ -17086,6 +17097,17 @@ impl Client {
             received.raw_result.as_deref(),
         )
         .map_err(|error| self.terminate_connection(error))?;
+        #[cfg(feature = "tasks")]
+        if !advertise_tasks
+            && matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+            )
+        {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "Undeclared tools/call peer task result rejected",
+            )));
+        }
         self.last_core_result_receipt = Some(received.receipt);
         if let Some(diagnostic) = ttl_diagnostic {
             self.retain_final_cache_ttl_diagnostic(diagnostic);
@@ -17713,6 +17735,17 @@ impl Client {
             received.raw_result.as_deref(),
         )
         .map_err(|error| self.terminate_connection(error))?;
+        #[cfg(feature = "tasks")]
+        if !declare_tasks
+            && matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+            )
+        {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "Undeclared tools/call peer task result rejected",
+            )));
+        }
         self.last_core_result_receipt = Some(received.receipt);
         if let Some(diagnostic) = ttl_diagnostic {
             self.retain_final_cache_ttl_diagnostic(diagnostic);
@@ -17762,6 +17795,15 @@ impl Client {
             received.raw_result.as_deref(),
         )
         .map_err(|error| self.terminate_connection(error))?;
+        #[cfg(feature = "tasks")]
+        if matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+        ) {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "Undeclared tools/call peer task result rejected",
+            )));
+        }
         self.last_core_result_receipt = Some(received.receipt);
         if let Some(diagnostic) = ttl_diagnostic {
             self.retain_final_cache_ttl_diagnostic(diagnostic);
@@ -22194,6 +22236,15 @@ impl Client {
             received.raw_result.as_deref(),
         )
         .map_err(|error| self.terminate_connection(error))?;
+        #[cfg(feature = "tasks")]
+        if matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+        ) {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "Undeclared tools/call peer task result rejected",
+            )));
+        }
         self.last_core_result_receipt = Some(received.receipt);
         if let Some(diagnostic) = diagnostic {
             self.retain_final_cache_ttl_diagnostic(diagnostic);
@@ -39052,6 +39103,123 @@ exec sleep 5
             .expect_err("one changed result discriminator must fail the connection closed");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(!client.is_initialized());
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_task_01_b_stdio_linkage(task_declared: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let mut work = root.spawn(move |connection_cx| async move {
+                let subject = format!("task-01-b-{}", std::process::id());
+                let task_payload = serde_json::json!({
+                    "resultType": "task",
+                    "taskId": subject,
+                    "status": "working",
+                    "createdAt": "2026-07-28T12:00:00.000Z",
+                    "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                    "ttlMs": null
+                });
+                let discovery = modern_tasks_discovery_response("creation-peer", serde_json::json!({}));
+                let response = format!(r#"{{"jsonrpc":"2.0","id":2,"result":{task_payload}}}"#);
+                let script = r#"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+printf '%s\n' "$1"
+IFS= read -r call || exit 92
+case "$call" in *'"method":"tools/call"'*'"id":2'*) ;; *) exit 93;; esac
+case "$call" in *'"name":"durable-tool"'*) ;; *) exit 94;; esac
+case "$call" in *"$3"*) ;; *) exit 95;; esac
+if [ "$4" = "true" ]; then
+    case "$call" in *'"extensions":{"io.modelcontextprotocol/tasks":{}}'*) ;; *) exit 96;; esac
+else
+    case "$call" in *'io.modelcontextprotocol/tasks'*) exit 97;; esac
+fi
+printf '%s\n' "$2"
+if [ "$4" = "false" ]; then
+    if IFS= read -r follow_up; then
+        exit 98
+    fi
+    exit 0
+fi
+exec sleep 2
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
+                    )
+                    .max_retries(0)
+                    .connect_stdio_with_cx(
+                        "sh",
+                        &[
+                            "-c",
+                            script,
+                            "creation-peer",
+                            &discovery,
+                            &response,
+                            &subject,
+                            if task_declared { "true" } else { "false" },
+                        ],
+                        &connection_cx,
+                    )
+                    .await
+                    .unwrap();
+
+                let caller_cx = Cx::for_request();
+                let cancellation = McpRequestCancellation::new();
+
+                if task_declared {
+                    let outcome = client
+                        .call_tool_final_outcome_with_cx(
+                            &caller_cx,
+                            &cancellation,
+                            "durable-tool",
+                            serde_json::json!({"subject": subject}),
+                        )
+                        .await
+                        .unwrap();
+                    match outcome {
+                        FinalToolCallOutcome::Task(created) => {
+                            assert_eq!(created.task.base().task_id.as_str(), subject);
+                            assert!(matches!(created.task, fastmcp_protocol::tasks_extension::Task::Working(_)));
+                        }
+                        other => panic!("expected FinalToolCallOutcome::Task, got {other:?}"),
+                    }
+                    client.close_with_cx(&connection_cx).await.unwrap();
+                    assert!(client.child.is_none());
+                } else {
+                    let error = client
+                        .call_tool_with_cx(
+                            &caller_cx,
+                            &cancellation,
+                            "durable-tool",
+                            serde_json::json!({"subject": subject}),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert!(!client.is_initialized());
+                    assert!(client.child.is_none());
+                }
+            });
+            work.join(&root).await.unwrap();
+        });
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn task_01_b_positive() {
+        assert_task_01_b_stdio_linkage(true);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn task_01_b_planted_negative() {
+        assert_task_01_b_stdio_linkage(false);
     }
 
     #[cfg(unix)]

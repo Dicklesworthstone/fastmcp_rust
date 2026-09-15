@@ -4718,53 +4718,14 @@ impl ClientHttpConnection {
                         ModernHttpRequestScopedNotification::Ignored => {}
                     }
                 }
-                JsonRpcMessage::Request(server_request) => {
-                    interleaved_control_frames = interleaved_control_frames.checked_add(1).ok_or(
-                        ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
-                            limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
-                        },
-                    )?;
-                    if interleaved_control_frames > MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES {
-                        return Err(
-                            ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
-                                limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
-                            },
-                        );
-                    }
-                    let callback_cancellation = ReverseRequestCancellation::new();
-                    let callback_token = callback_cancellation.clone();
-                    let callback = modern_http_server_request_response(
-                        cx,
-                        &client.reverse_request_handlers,
-                        &server_request,
-                        callback_token.clone(),
-                    );
-                    // Keep callback execution and its reply inside the original
-                    // request's cancellation and response deadline. Dropping a
-                    // pending callback must also notify retained callback tokens.
-                    let mut callback = std::pin::pin!(callback);
-                    let _callback_owner = HttpReverseCallbackOwner(callback_cancellation);
-                    let Some(JsonRpcMessage::Response(reverse_response)) =
-                        poll_http_response_operation(
-                            cx,
-                            cancellation,
-                            &mut stream,
-                            callback.as_mut(),
-                        )
-                        .await?
-                    else {
-                        return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
-                            request_id,
-                        });
-                    };
-                    // Recheck the original request before starting the reply POST,
-                    // including when the callback cancelled during its final poll.
-                    let mut post =
-                        std::pin::pin!(client.post_jsonrpc_response(cx, &reverse_response));
-                    poll_http_response_operation(cx, cancellation, &mut stream, post.as_mut())
-                        .await?
-                        .map_err(ClientHttpConnectionError::Modern)?;
-                    callback_token.record_response_sent();
+                JsonRpcMessage::Request(_server_request) => {
+                    // Under modern MCP HTTP (HTTP03), request-scoped SSE response streams
+                    // reject independent server JSON-RPC requests before callback execution
+                    // or reply POST. Reverse operations (sampling, elicitation, roots) are
+                    // negotiated via MRTR rather than interleaved server-initiated RPCs.
+                    return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
+                        request_id,
+                    });
                 }
             }
         }
@@ -12302,7 +12263,7 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_answers_sampling_reverse_request_on_sse_and_completes_tools_list() {
+    fn modern_http_rejects_forbidden_server_rpc_on_sse_before_callback_or_post() {
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP reverse-sampling listener");
         let address = listener
@@ -12327,55 +12288,24 @@ mod tests {
                 .expect("tools/list is JSON-RPC");
             assert_eq!(list_body["method"], "tools/list");
             begin_chunked_sse(&mut listed);
+            // Server attempts forbidden independent reverse RPC on the request-scoped SSE stream.
             write_chunked_sse_event(
                 &mut listed,
                 "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{\"_meta\":{},\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}],\"maxTokens\":8}}\n\n",
             );
 
-            let (mut reverse, _) = listener
-                .accept()
-                .expect("accept modern reverse-response POST");
-            let reverse_request = read_request(&mut reverse);
-            assert!(reverse_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-            assert!(
-                !reverse_request.head.contains("Mcp-Method:"),
-                "reverse-response POST must omit Mcp-Method: {}",
-                reverse_request.head
-            );
-            let reverse_body = serde_json::from_slice::<serde_json::Value>(&reverse_request.body)
-                .expect("reverse response is JSON-RPC");
-            assert_eq!(reverse_body["id"], 99);
-            assert_eq!(
-                reverse_body["result"]["model"],
-                serde_json::json!("modern-http-model")
-            );
-            write_response(&mut reverse, 202, "application/json", b"");
-
-            write_chunked_sse_event(
-                &mut listed,
-                "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n",
-            );
-            finish_chunked_sse(&mut listed);
+            // Assert that the client closes the SSE stream upon receiving the forbidden RPC
+            // rather than dispatching a callback or initiating a reverse-response POST.
+            assert_sse_peer_closed(&mut listed);
         });
 
+        let callback_invocations = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::clone(&callback_invocations);
         let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
-            |_cx, _cancellation, params| {
+            move |_cx, _cancellation, _params| {
+                invocations.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
-                    assert_eq!(params.max_tokens.to_string(), "8");
-                    Ok(fastmcp_protocol::FinalCreateMessageResult {
-                        content: fastmcp_protocol::FinalSamplingMessageContent::Block(
-                            fastmcp_protocol::common_types::SamplingContentBlock::Text {
-                                text: "sampled".to_owned(),
-                                annotations: None,
-                                meta: None,
-                                additional: std::collections::BTreeMap::new(),
-                            },
-                        ),
-                        model: "modern-http-model".to_owned(),
-                        role: fastmcp_protocol::Role::Assistant,
-                        stop_reason: None,
-                        meta: None,
-                    })
+                    panic!("forbidden reverse callback must never be invoked on modern request_json");
                 })
             },
         );
@@ -12392,6 +12322,81 @@ mod tests {
                 .connect_http_with_cx(&cx),
         )
         .expect("modern HTTP connects with reverse sampling handlers");
+        let error = runtime_block_on(connection.request_json(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect_err("forbidden server RPC on SSE must be rejected");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::UnexpectedResponseMessage {
+                request_id: RequestId::Number(2)
+            }
+        ));
+        assert_eq!(
+            callback_invocations.load(Ordering::SeqCst),
+            0,
+            "reverse callback must not be invoked"
+        );
+        server
+            .join()
+            .expect("modern HTTP reverse-sampling server must join");
+    }
+
+    #[test]
+    fn modern_http_preserves_valid_notification_and_terminal_result_on_sse() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP valid notification listener");
+        let address = listener
+            .local_addr()
+            .expect("read modern HTTP valid notification address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept modern discovery");
+            let discovery_request = read_request(&mut discovery);
+            assert!(discovery_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-http-notify","version":"1.0"}}}}"#,
+            );
+
+            let (mut listed, _) = listener.accept().expect("accept modern tools/list");
+            let list_request = read_request(&mut listed);
+            assert!(list_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            let list_body = serde_json::from_slice::<serde_json::Value>(&list_request.body)
+                .expect("tools/list is JSON-RPC");
+            assert_eq!(list_body["method"], "tools/list");
+            begin_chunked_sse(&mut listed);
+            // Server emits a valid request-scoped progress notification.
+            write_chunked_sse_event(
+                &mut listed,
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"processing\"}}\n\n",
+            );
+            // Followed by the correlated terminal response.
+            write_chunked_sse_event(
+                &mut listed,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n",
+            );
+            finish_chunked_sse(&mut listed);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern HTTP connects");
         let response = runtime_block_on(connection.request_json(
             &cx,
             "tools/list",
@@ -12399,11 +12404,11 @@ mod tests {
             RequestId::Number(2),
             4_096,
         ))
-        .expect("tools/list completes after modern HTTP sampling is answered");
+        .expect("tools/list completes when interleaved notifications are valid");
         assert_eq!(response.id, Some(RequestId::Number(2)));
         server
             .join()
-            .expect("modern HTTP reverse-sampling server must join");
+            .expect("modern HTTP valid notification server must join");
     }
 
     #[test]
