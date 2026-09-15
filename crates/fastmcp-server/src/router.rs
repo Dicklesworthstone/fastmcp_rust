@@ -717,14 +717,17 @@ fn final_mrtr_binding(
         session_partition
     };
     let principal_digest = if is_stateless {
-        // Cross-POST state requires a provider-scoped owner. A display subject
-        // or an anonymous AuthContext hash is not durable identity authority.
-        // Keep ordinary complete requests usable without this MRTR authority;
-        // the registry gates issuance and retries before accessing state.
-        request_ctx
-            .auth()
-            .and_then(|auth| auth.session_owner())
-            .map(|owner| *owner.as_bytes())
+        // Cross-POST state requires a provider-scoped owner when authentication
+        // is present. A display subject or an anonymous AuthContext hash is not
+        // durable identity authority; require verified owner authority before
+        // allocating or accessing state. For unauthenticated ingress on servers
+        // without an auth provider, bind to a consistent unauthenticated MRTR
+        // principal partition digest.
+        if let Some(auth) = request_ctx.auth() {
+            auth.session_owner().map(|owner| *owner.as_bytes())
+        } else {
+            Some(mrtr_digest(&"fastmcp-mrtr-unauthenticated-principal-v1")?)
+        }
     } else {
         request_ctx
             .auth()
