@@ -5956,45 +5956,78 @@ fn read_task_inputs(path: &Path) -> McpResult<fastmcp_protocol::TaskInputRespons
 }
 
 #[cfg(feature = "tasks")]
-struct TaskOutput {
-    json: bool,
-    #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct TaskCommandBudget {
+    started: std::time::Instant,
+    timeout: std::time::Duration,
     deadline: std::time::Instant,
 }
 
 #[cfg(feature = "tasks")]
-impl TaskOutput {
+impl TaskCommandBudget {
     fn new(connection: &TaskConnection) -> McpResult<Self> {
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(connection.timeout);
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or_else(|| fastmcp_core::McpError::invalid_params("task command timeout is out of range"))?;
         Ok(Self {
-            json: connection.json,
-            #[cfg(unix)]
-            deadline: std::time::Instant::now()
-                .checked_add(std::time::Duration::from_secs(connection.timeout))
-                .ok_or_else(|| {
-                    fastmcp_core::McpError::invalid_params("task output deadline is out of range")
-                })?,
+            started,
+            timeout,
+            deadline,
         })
     }
 
+    fn remaining(&self) -> McpResult<std::time::Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| *remaining >= std::time::Duration::from_millis(1))
+            .ok_or_else(|| {
+                fastmcp_core::McpError::internal_error(
+                    "task watch reached --timeout; task completion is unknown",
+                )
+            })
+    }
+
+    fn started(&self) -> std::time::Instant {
+        self.started
+    }
+
+    fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+}
+
+#[cfg(feature = "tasks")]
+struct TaskOutput {
+    json: bool,
+    budget: TaskCommandBudget,
+}
+
+#[cfg(feature = "tasks")]
+impl TaskOutput {
+    fn new(connection: &TaskConnection, budget: TaskCommandBudget) -> Self {
+        Self {
+            json: connection.json,
+            budget,
+        }
+    }
+
     fn write_event<T: Serialize>(&self, cx: &Cx, event: &str, data: &T) -> McpResult<()> {
+        cx.checkpoint()
+            .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+        let timed_out = || {
+            fastmcp_core::McpError::internal_error(
+                "task output reached --timeout; command output is incomplete",
+            )
+        };
+        let remaining = self.budget.remaining().map_err(|_| timed_out())?;
         #[cfg(unix)]
         {
-            cx.checkpoint()
-                .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
             let mut bytes = Vec::new();
             write_task_event_to(&mut bytes, self.json, event, data)?;
             cx.checkpoint()
                 .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
-            let timed_out = || {
-                fastmcp_core::McpError::internal_error(
-                    "task output reached --timeout; command output is incomplete",
-                )
-            };
-            let remaining = self
-                .deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(timed_out)?;
             // Commit the exact encoded event with the original command's
             // remaining budget. Cancellation during this synchronous commit
             // is observed afterward; ordinary Unix pipes/sockets cannot hold
@@ -6013,11 +6046,10 @@ impl TaskOutput {
         }
         #[cfg(not(unix))]
         {
-            // The public bounded stdout API is Unix-only. Keep this existing
-            // path explicit; cross-platform bounded output remains unverified.
-            let _ = cx;
             let stdout = io::stdout();
-            write_task_event_to(&mut stdout.lock(), self.json, event, data)
+            write_task_event_to(&mut stdout.lock(), self.json, event, data)?;
+            cx.checkpoint()
+                .map_err(|_| fastmcp_core::McpError::request_cancelled())
         }
     }
 }
@@ -6205,13 +6237,14 @@ fn task_poll_delay(
 #[cfg(feature = "tasks")]
 async fn wait_for_task_poll_delay(
     cx: &Cx,
-    connection: &TaskConnection,
-    started: std::time::Instant,
+    budget: TaskCommandBudget,
     delay: std::time::Duration,
 ) -> McpResult<()> {
-    let remaining = remaining_task_watch_time(connection, started)?;
+    let remaining = budget.remaining()?;
     if delay >= remaining {
         asupersync::time::sleep(cx.now(), remaining).await;
+        cx.checkpoint()
+            .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
         return Err(fastmcp_core::McpError::internal_error(
             "task watch reached --timeout; task completion is unknown",
         ));
@@ -6225,25 +6258,37 @@ async fn wait_for_task_poll_delay(
 #[cfg(all(not(unix), feature = "tasks"))]
 fn wait_for_task_poll_delay_sync(
     cx: &Cx,
-    connection: &TaskConnection,
-    started: std::time::Instant,
+    budget: TaskCommandBudget,
     delay: std::time::Duration,
 ) -> McpResult<()> {
-    let remaining = remaining_task_watch_time(connection, started)?;
+    let remaining = budget.remaining()?;
+    let sleep_duration = if delay >= remaining {
+        remaining
+    } else {
+        delay
+    };
+    let sleep_started = std::time::Instant::now();
+    const CHUNK: std::time::Duration = std::time::Duration::from_millis(20);
+    while sleep_started.elapsed() < sleep_duration {
+        cx.checkpoint()
+            .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+        let chunk_remaining = sleep_duration - sleep_started.elapsed();
+        let step = chunk_remaining.min(CHUNK);
+        std::thread::sleep(step);
+    }
+    cx.checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
     if delay >= remaining {
-        std::thread::sleep(remaining);
         return Err(fastmcp_core::McpError::internal_error(
             "task watch reached --timeout; task completion is unknown",
         ));
     }
-    std::thread::sleep(delay);
-    cx.checkpoint()
-        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
     Ok(())
 }
 
 #[cfg(feature = "tasks")]
 async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) -> McpResult<()> {
+    let budget = TaskCommandBudget::new(connection)?;
     use fastmcp_protocol::tasks_extension::TaskId;
     let task_id = TaskId::parse(action.task_id()).map_err(|_| {
         fastmcp_core::McpError::invalid_params(
@@ -6255,13 +6300,13 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             "tasks requires exactly one of --server or --http-url",
         ));
     }
-    let output = TaskOutput::new(connection)?;
+    let output = TaskOutput::new(connection, budget);
     let inputs = match action {
         TaskAction::Update { input_file, .. } => Some(read_task_inputs(input_file)?),
         _ => None,
     };
     if let Some(server) = &connection.server {
-        let duration = std::time::Duration::from_secs(connection.timeout);
+        let duration = budget.remaining()?;
         let args = connection
             .server_arg
             .iter()
@@ -6283,6 +6328,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
                 &mut client,
                 connection,
                 &output,
+                budget,
                 action,
                 task_id,
                 inputs,
@@ -6303,6 +6349,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
                         &mut client,
                         &connection,
                         &output,
+                        budget,
                         &action,
                         task_id,
                         inputs,
@@ -6321,10 +6368,11 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             })?
         }
     } else {
+        let remaining = budget.remaining()?;
         asupersync::time::timeout(
             cx.now(),
-            std::time::Duration::from_secs(connection.timeout),
-            Box::pin(run_http_task(cx, connection, &output, action, task_id, inputs)),
+            remaining,
+            Box::pin(run_http_task(cx, connection, &output, budget, action, task_id, inputs)),
         ).await.map_err(|_| fastmcp_core::McpError::internal_error(
             "Tasks HTTP operation reached --timeout; the request stream was closed; task completion is unknown",
         ))?
@@ -6337,21 +6385,34 @@ fn run_stdio_task(
     client: &mut Client,
     connection: &TaskConnection,
     output: &TaskOutput,
+    budget: TaskCommandBudget,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
 ) -> McpResult<()> {
     let cancellation = fastmcp_core::McpRequestCancellation::new();
     if matches!(action, TaskAction::Cancel { .. }) {
+        let remaining = budget.remaining()?;
+        client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+            remaining, remaining,
+        )?)?;
         let result = client.cancel_task_final_with_cancellation(cx, &cancellation, task_id)?;
         return output.write_event(cx, "cancellation-acknowledged", &result);
     }
+    let remaining = budget.remaining()?;
+    client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+        remaining, remaining,
+    )?)?;
     let task = client
         .get_task_final_with_cancellation(cx, &cancellation, task_id.clone())?
         .task;
     match action {
         TaskAction::Get { .. } => output.write_event(cx, "snapshot", &task),
         TaskAction::Update { .. } => {
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                remaining, remaining,
+            )?)?;
             let result = client.update_task_final_with_cancellation(
                 cx,
                 &cancellation,
@@ -6374,12 +6435,17 @@ fn run_stdio_task(
             let mut filter = fastmcp_protocol::SubscriptionFilter::default();
             fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
                 .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                remaining, remaining,
+            )?)?;
             client.open_final_task_subscription_listener(filter)?;
             let outcome = watch_stdio_task(
                 cx,
                 client,
                 connection,
                 output,
+                budget,
                 &task_id,
                 &task,
                 *max_events,
@@ -6399,17 +6465,26 @@ async fn run_yielding_stdio_task(
     client: &mut Client,
     connection: &TaskConnection,
     output: &TaskOutput,
+    budget: TaskCommandBudget,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
 ) -> McpResult<()> {
     let cancellation = fastmcp_core::McpRequestCancellation::new();
     if matches!(action, TaskAction::Cancel { .. }) {
+        let remaining = budget.remaining()?;
+        client.set_request_timeout_policy(
+            fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+        )?;
         let result = client
             .cancel_task_final_with_cx(cx, &cancellation, task_id)
             .await?;
         return output.write_event(cx, "cancellation-acknowledged", &result);
     }
+    let remaining = budget.remaining()?;
+    client.set_request_timeout_policy(
+        fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+    )?;
     let task = client
         .get_task_final_with_cx(cx, &cancellation, task_id.clone())
         .await?
@@ -6418,6 +6493,10 @@ async fn run_yielding_stdio_task(
     match action {
         TaskAction::Get { .. } => output.write_event(cx, "snapshot", &task),
         TaskAction::Update { .. } => {
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(
+                fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+            )?;
             let result = client
                 .update_task_final_with_cx(
                     cx,
@@ -6446,9 +6525,11 @@ async fn run_yielding_stdio_task(
             // caller-owned future, with a yield between bounded receive turns.
             cx.checkpoint()
                 .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
-            // Start the watch bound before the listener's own request timers,
-            // so an expiring listener cannot outrun the CLI timeout diagnostic.
-            let started = std::time::Instant::now();
+            // Use original command budget rather than resetting the clock here!
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(
+                fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+            )?;
             client.open_final_task_subscription_listener(filter)?;
             let mut updates = 0;
             let mut reconnect_ack_pending = false;
@@ -6461,10 +6542,10 @@ async fn run_yielding_stdio_task(
                         client,
                         connection,
                         output,
+                        budget,
                         &task_id,
                         *max_events,
                         &cancellation,
-                        started,
                         &mut updates,
                         &mut latest_task,
                         &mut last_poll,
@@ -6476,11 +6557,11 @@ async fn run_yielding_stdio_task(
                                 last_poll,
                                 latest_task.base().poll_interval_ms.as_ref(),
                             )? {
-                                wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                                wait_for_task_poll_delay(cx, budget, delay).await?;
                             }
                             // The subscription is now admitted. A fresh read
                             // covers a terminal transition before its admission.
-                            let remaining = remaining_task_watch_time(connection, started)?;
+                            let remaining = budget.remaining()?;
                             client.set_request_timeout_policy(
                                 fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
                             )?;
@@ -6489,7 +6570,7 @@ async fn run_yielding_stdio_task(
                                 .await?
                                 .task;
                             last_poll = std::time::Instant::now();
-                            remaining_task_watch_time(connection, started)?;
+                            budget.remaining()?;
                             let reconnect_acknowledged = reconnect_ack_pending && !reconnect;
                             if reconnect_acknowledged {
                                 output.write_event(
@@ -6530,6 +6611,10 @@ async fn run_yielding_stdio_task(
                                         "invalid task watch filter during reconnect",
                                     )
                                 })?;
+                                let remaining = budget.remaining()?;
+                                client.set_request_timeout_policy(
+                                    fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?,
+                                )?;
                                 client
                                     .open_final_task_subscription_listener(filter)?;
                                 reconnect_ack_pending = true;
@@ -6556,12 +6641,12 @@ fn watch_stdio_task(
     client: &mut Client,
     connection: &TaskConnection,
     output: &TaskOutput,
+    budget: TaskCommandBudget,
     task_id: &fastmcp_protocol::tasks_extension::TaskId,
     initial_task: &fastmcp_protocol::tasks_extension::Task,
     max_events: u64,
     cancellation: &fastmcp_core::McpRequestCancellation,
 ) -> McpResult<()> {
-    let started = std::time::Instant::now();
     let mut last_poll = std::time::Instant::now();
     let mut updates = 0;
     let mut reconnects = 0;
@@ -6573,10 +6658,10 @@ fn watch_stdio_task(
             client,
             connection,
             output,
+            budget,
             task_id,
             max_events,
             cancellation,
-            started,
             &mut updates,
             &mut latest_task,
             &mut last_poll,
@@ -6588,9 +6673,9 @@ fn watch_stdio_task(
                     last_poll,
                     latest_task.base().poll_interval_ms.as_ref(),
                 )? {
-                    wait_for_task_poll_delay_sync(cx, connection, started, delay)?;
+                    wait_for_task_poll_delay_sync(cx, budget, delay)?;
                 }
-                let remaining = remaining_task_watch_time(connection, started)?;
+                let remaining = budget.remaining()?;
                 client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                     remaining, remaining,
                 )?)?;
@@ -6598,7 +6683,7 @@ fn watch_stdio_task(
                     .get_task_final_with_cancellation(cx, cancellation, task_id.clone())?
                     .task;
                 last_poll = std::time::Instant::now();
-                remaining_task_watch_time(connection, started)?;
+                budget.remaining()?;
                 let reconnect_acknowledged = reconnect_ack_pending && !reconnect;
                 if reconnect_acknowledged {
                     output.write_event(
@@ -6636,6 +6721,10 @@ fn watch_stdio_task(
                                 "invalid task watch filter during reconnect",
                             )
                         })?;
+                    let remaining = budget.remaining()?;
+                    client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                        remaining, remaining,
+                    )?)?;
                     client.open_final_task_subscription_listener(filter)?;
                     reconnect_ack_pending = true;
                 }
@@ -6650,28 +6739,23 @@ fn poll_stdio_task_watch(
     client: &mut Client,
     connection: &TaskConnection,
     output: &TaskOutput,
+    budget: TaskCommandBudget,
     task_id: &fastmcp_protocol::tasks_extension::TaskId,
     max_events: u64,
     cancellation: &fastmcp_core::McpRequestCancellation,
-    started: std::time::Instant,
     updates: &mut u64,
     latest_task: &mut fastmcp_protocol::tasks_extension::Task,
     last_poll: &mut std::time::Instant,
 ) -> McpResult<TaskWatchStep> {
     use fastmcp_client::StdioTaskSubscriptionEvent;
-    let timeout = std::time::Duration::from_secs(connection.timeout);
-    let event = if started.elapsed() < timeout {
+    let event = if budget.remaining().is_ok() {
         client.try_next_final_task_subscription_event(cx, cancellation)
     } else {
         Ok(None)
     };
-    // A bounded receive may itself cross the watch deadline. Apply that
+    // A bounded receive may itself cross the command deadline. Apply that
     // deadline before interpreting either its event or its request error.
-    if started.elapsed() >= timeout {
-        return Err(fastmcp_core::McpError::internal_error(
-            "task watch reached --timeout; task completion is unknown",
-        ));
-    }
+    budget.remaining()?;
     match event? {
         None => {}
         Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
@@ -6718,12 +6802,12 @@ async fn run_http_task(
     cx: &Cx,
     connection: &TaskConnection,
     output: &TaskOutput,
+    budget: TaskCommandBudget,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
 ) -> McpResult<()> {
-    let started = std::time::Instant::now();
-    let remaining = remaining_task_watch_time(connection, started)?;
+    let remaining = budget.remaining()?;
     let request_timeout_policy = fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)?;
     let error = |error: fastmcp_client::HttpClientError| {
         fastmcp_core::McpError::internal_error(error.to_string())
@@ -6748,6 +6832,10 @@ async fn run_http_task(
     match action {
         TaskAction::Get { .. } => output.write_event(cx, "snapshot", handle.task()),
         TaskAction::Update { .. } => {
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(
+                fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining).map_err(error)?,
+            );
             let result = handle
                 .resume_input(
                     cx,
@@ -6775,6 +6863,10 @@ async fn run_http_task(
             let mut filter = fastmcp_protocol::SubscriptionFilter::default();
             fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
                 .map_err(|_| fastmcp_core::McpError::invalid_params("invalid task watch filter"))?;
+            let remaining = budget.remaining()?;
+            client.set_request_timeout_policy(
+                fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining).map_err(error)?,
+            );
             client
                 .open_final_task_subscription_listener(cx, filter, limits)
                 .await
@@ -6784,6 +6876,7 @@ async fn run_http_task(
             let mut reconnect_ack_pending = false;
             let mut latest_task = handle.task().clone();
             loop {
+                budget.remaining()?;
                 let event = client
                     .next_final_task_subscription_event(cx)
                     .await
@@ -6799,10 +6892,16 @@ async fn run_http_task(
                             last_poll,
                             latest_task.base().poll_interval_ms.as_ref(),
                         )? {
-                            wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                            wait_for_task_poll_delay(cx, budget, delay).await?;
                         }
+                        let remaining = budget.remaining()?;
+                        client.set_request_timeout_policy(
+                            fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)
+                                .map_err(error)?,
+                        );
                         let task = handle.poll(cx, &mut client).await.map_err(error)?.clone();
                         last_poll = std::time::Instant::now();
+                        budget.remaining()?;
                         let reconnect_acknowledged = reconnect_ack_pending;
                         if reconnect_acknowledged {
                             output.write_event(
@@ -6859,10 +6958,16 @@ async fn run_http_task(
                             last_poll,
                             latest_task.base().poll_interval_ms.as_ref(),
                         )? {
-                            wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                            wait_for_task_poll_delay(cx, budget, delay).await?;
                         }
+                        let remaining = budget.remaining()?;
+                        client.set_request_timeout_policy(
+                            fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)
+                                .map_err(error)?,
+                        );
                         let task = handle.poll(cx, &mut client).await.map_err(error)?.clone();
                         last_poll = std::time::Instant::now();
+                        budget.remaining()?;
                         if reconcile_task_snapshot(
                             cx,
                             output,
@@ -6897,6 +7002,11 @@ async fn run_http_task(
                                         "invalid CLI SSE bounds during reconnect",
                                     )
                                 })?;
+                        let remaining = budget.remaining()?;
+                        client.set_request_timeout_policy(
+                            fastmcp_client::RequestTimeoutPolicy::new(remaining, remaining)
+                                .map_err(error)?,
+                        );
                         client
                             .open_final_task_subscription_listener(cx, filter, limits)
                             .await
