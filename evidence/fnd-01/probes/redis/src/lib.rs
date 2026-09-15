@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use redis::{acl::AclInfo, ConnectionAddr, Script};
+use redis::{ConnectionAddr, Script, acl::AclInfo};
 
 /// Exercise the `script` feature and its `sha1_smol` edge without I/O.
 pub fn script_sha1(source: &str) -> String {
@@ -332,12 +332,7 @@ mod tests {
             }
             Ok(rebound)
         };
-        let rebound_probe = rebind_field(
-            probe,
-            &old_bytes,
-            &new_bytes,
-            "manifest_bytes mirror",
-        )?;
+        let rebound_probe = rebind_field(probe, &old_bytes, &new_bytes, "manifest_bytes mirror")?;
         let rebound_probe = rebind_field(
             &rebound_probe,
             &old_hash,
@@ -2678,16 +2673,18 @@ mod tests {
             "  \"tests::fnd_01_state_capability_dependencies_planted_negative\",,\n",
             "]",
         );
-        double_terminal_comma.state = double_terminal_comma.state.replacen(
-            test_ids_tail,
-            double_comma_tail,
-            1,
-        );
+        double_terminal_comma.state =
+            double_terminal_comma
+                .state
+                .replacen(test_ids_tail, double_comma_tail, 1);
         double_terminal_comma
             .rebind_expected_domain_digest()
             .expect("double-comma expected digest must be derived");
         assert_eq!(changed_input_count(&baseline, &double_terminal_comma), 1);
-        assert_eq!(semantic_input_change_count(&baseline, &double_terminal_comma), 0);
+        assert_eq!(
+            semantic_input_change_count(&baseline, &double_terminal_comma),
+            0
+        );
         assert_eq!(
             validate_full(&double_terminal_comma),
             Err(StructuredEvidenceError::MalformedField {
@@ -2710,7 +2707,9 @@ mod tests {
             ),
             (
                 "duplicate dependency key",
-                format!("{REDIS_FEATURE_LINE}\nredis={{version=\"=1.4.1\",default-features=false,features=[\"acl\",\"script\"]}}"),
+                format!(
+                    "{REDIS_FEATURE_LINE}\nredis={{version=\"=1.4.1\",default-features=false,features=[\"acl\",\"script\"]}}"
+                ),
                 StructuredEvidenceError::UnexpectedValue {
                     subject: "redis manifest",
                     field: "duplicate TOML key",
@@ -2736,14 +2735,12 @@ mod tests {
             ),
             (
                 "alias dependency key",
-                REDIS_FEATURE_LINE.replacen(
-                    "redis =",
-                    "alias =",
-                    1,
-                ).replace(
-                    "version = \"=1.4.1\"",
-                    "package = \"redis\", version = \"=1.4.1\"",
-                ),
+                REDIS_FEATURE_LINE
+                    .replacen("redis =", "alias =", 1)
+                    .replace(
+                        "version = \"=1.4.1\"",
+                        "package = \"redis\", version = \"=1.4.1\"",
+                    ),
                 StructuredEvidenceError::UnexpectedValue {
                     subject: "redis manifest",
                     field: "dependency key set",
@@ -2756,11 +2753,14 @@ mod tests {
             malformed.redis_manifest = malformed
                 .redis_manifest
                 .replace(REDIS_FEATURE_LINE, &replacement);
-            malformed.state = rebind_redis_manifest_mirror(&malformed.state, &malformed.redis_manifest)
-                .unwrap_or_else(|error| panic!("{label}: mirror rebind failed: {error:?}"));
+            malformed.state =
+                rebind_redis_manifest_mirror(&malformed.state, &malformed.redis_manifest)
+                    .unwrap_or_else(|error| panic!("{label}: mirror rebind failed: {error:?}"));
             malformed
                 .rebind_expected_domain_digest()
-                .unwrap_or_else(|error| panic!("{label}: expected digest rebind failed: {error:?}"));
+                .unwrap_or_else(|error| {
+                    panic!("{label}: expected digest rebind failed: {error:?}")
+                });
             assert_eq!(
                 validate_full(&malformed),
                 Err(expected),
