@@ -1551,6 +1551,12 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// and the immutable task identity and retention fields from its prior
 /// generation. Atomic operations returning `false` must leave all of those
 /// retained values unchanged.
+///
+/// Every store must atomically retain a bounded lifetime history of issued
+/// input-request keys. A replacement may retain a currently outstanding key,
+/// but must reject reissuing a satisfied key before changing task, generation,
+/// notification, input, or dispatch-lease state. This history survives recovery
+/// and terminal transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
     /// Durably records a newly created task and its status notification.
     fn create_task(
@@ -2151,6 +2157,12 @@ impl FinalTaskSnapshot {
 /// bound also caps the store's notification memory.
 pub const DEFAULT_IN_MEMORY_FINAL_TASKS: usize = 1_024;
 
+/// Maximum lifetime input-request keys retained for one process-local task.
+pub const MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS: usize = 1_024;
+/// Maximum summed UTF-8 key bytes in one process-local task's lifetime history.
+/// The independent key-count bound also bounds collection overhead.
+pub const MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES: usize = 64 * 1_024;
+
 /// Bounded process-local [`FinalTaskStore`] for embeddings and development.
 ///
 /// This store retains the current task, its latest typed status notification,
@@ -2158,6 +2170,10 @@ pub const DEFAULT_IN_MEMORY_FINAL_TASKS: usize = 1_024;
 /// tasks are reclaimed before every operation. It deliberately provides no
 /// restart recovery or multi-process durability; production deployments that
 /// need either property must supply their own [`FinalTaskStore`].
+/// Each task also retains its issued input keys up to
+/// [`MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS`] and
+/// [`MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES`]. A new input round exceeding
+/// either bound is rejected without changing that task.
 pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -2174,10 +2190,59 @@ struct InMemoryFinalTaskState {
     work_descriptors: BTreeMap<FinalTaskId, FinalTaskWorkDescriptor>,
     initial_work: BTreeMap<FinalTaskId, FinalTaskWorkDescriptor>,
     accepted_inputs: BTreeMap<FinalTaskId, FinalTaskInputResponses>,
+    input_key_history: BTreeMap<FinalTaskId, InMemoryFinalTaskInputKeyHistory>,
     handoff_leases: BTreeMap<FinalTaskId, InMemoryFinalTaskHandoffLease>,
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
+}
+
+#[derive(Clone, Default)]
+struct InMemoryFinalTaskInputKeyHistory {
+    keys: BTreeSet<String>,
+    key_bytes: usize,
+}
+
+/// Stages only bounded key history; the caller commits it under the same lock
+/// as the task transition. Rejection leaves the existing history untouched.
+fn prepare_in_memory_final_task_input_key_history(
+    history: Option<&InMemoryFinalTaskInputKeyHistory>,
+    current: Option<&FinalTask>,
+    replacement: &FinalTask,
+) -> McpResult<Option<InMemoryFinalTaskInputKeyHistory>> {
+    let FinalTask::InputRequired { input_requests, .. } = replacement else {
+        return Ok(None);
+    };
+    let outstanding = match current {
+        Some(FinalTask::InputRequired { input_requests, .. }) => Some(input_requests),
+        _ => None,
+    };
+    let mut next = history.cloned().unwrap_or_default();
+    for key in input_requests.keys() {
+        if outstanding.is_some_and(|requests| requests.contains_key(key)) {
+            continue;
+        }
+        if next.keys.contains(key) {
+            return Err(McpError::invalid_params(
+                "Task input request keys cannot be reused",
+            ));
+        }
+        let key_bytes = next
+            .key_bytes
+            .checked_add(key.len())
+            .filter(|bytes| *bytes <= MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES)
+            .ok_or_else(|| {
+                McpError::invalid_params("Task input request key history byte limit exceeded")
+            })?;
+        if next.keys.len() >= MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS {
+            return Err(McpError::invalid_params(
+                "Task input request key history count limit exceeded",
+            ));
+        }
+        next.keys.insert(key.clone());
+        next.key_bytes = key_bytes;
+    }
+    Ok(Some(next))
 }
 
 /// A durable handoff claim in the process-local store.
@@ -2348,7 +2413,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "In-memory final task store capacity reached",
             ));
         }
+        let input_key_history = prepare_in_memory_final_task_input_key_history(None, None, &task)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
+        if let Some(history) = input_key_history {
+            state.input_key_history.insert(task_id.clone(), history);
+        }
         state
             .latest_notifications
             .insert(task_id.clone(), notification);
@@ -3553,7 +3622,15 @@ fn replace_in_memory_final_task(
         .get(&task_id)
         .ok_or_else(|| McpError::invalid_params("Task not found"))?;
     validate_final_task_transition(current, &task)?;
+    let input_key_history = prepare_in_memory_final_task_input_key_history(
+        state.input_key_history.get(&task_id),
+        Some(current),
+        &task,
+    )?;
     let generation = next_in_memory_final_task_generation(state)?;
+    if let Some(history) = input_key_history {
+        state.input_key_history.insert(task_id.clone(), history);
+    }
     let working = matches!(&task, FinalTask::Working(_));
     let terminal = matches!(
         &task,
@@ -3656,6 +3733,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         state.work_descriptors.remove(&task_id);
         state.initial_work.remove(&task_id);
         state.accepted_inputs.remove(&task_id);
+        state.input_key_history.remove(&task_id);
         state.handoff_leases.remove(&task_id);
         state.cancellation_requests.remove(&task_id);
         state.latest_notifications.remove(&task_id);
@@ -4750,7 +4828,11 @@ impl FinalTaskRuntime {
         task_id: &FinalTaskId,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskInitialWork>> {
-        let current = self.load_task_snapshot(task_id)?;
+        // Wakeups are advisory: retention may remove a task after its ID was
+        // queued. Its absence must not stop recovery of other durable work.
+        let Some(current) = self.load_optional_task_snapshot(task_id)? else {
+            return Ok(None);
+        };
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         let claim = self
@@ -4767,7 +4849,9 @@ impl FinalTaskRuntime {
         task_id: &FinalTaskId,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskAcceptedInput>> {
-        let current = self.load_task_snapshot(task_id)?;
+        let Some(current) = self.load_optional_task_snapshot(task_id)? else {
+            return Ok(None);
+        };
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         let claim = self
@@ -7020,6 +7104,39 @@ mod tests {
     struct CancellingAfterInitialHandoffsFinalTaskSupervisor {
         started: Arc<AtomicUsize>,
         cancel_after: usize,
+    }
+
+    struct RecordingQueuedWakeupSupervisor {
+        started: Arc<Mutex<Vec<FinalTaskId>>>,
+    }
+
+    impl ApplicationTaskSupervisor for RecordingQueuedWakeupSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                    return Err(McpError::internal_error(
+                        "queued wakeup supervisor expected initial work",
+                    ));
+                };
+                self.started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(initial.task_id().clone());
+                let result = serde_json::from_value(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": initial.work_descriptor().as_value()["label"]
+                    }]
+                }))
+                .expect("the queued task label forms a typed text result");
+                initial.complete_task(result, None)?;
+                Ok(())
+            })
+        }
     }
 
     struct RecordingRecoveryOrderFinalTaskSupervisor {
@@ -11122,6 +11239,119 @@ mod tests {
         }
     }
 
+    fn assert_queued_wakeup_progress(elapsed_ms: u64, first_should_execute: bool) {
+        let (store, now) = in_memory_store_with_test_clock(2);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(1_000, None).expect("finite retention policy is valid"),
+            Arc::new(|_| {}),
+        );
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = runtime
+            .install_task_service(
+                2,
+                Arc::new(RecordingQueuedWakeupSupervisor {
+                    started: Arc::clone(&started),
+                }),
+            )
+            .expect("install caller-owned queued wakeup service");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned runtime builds");
+        application_runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime supplies service context");
+            let mut service = Box::pin(runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                Future::poll(service.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ));
+            let first = runtime
+                .create_task_with_work(
+                    FinalTaskWorkDescriptor::new(serde_json::json!({"label": "first"}))
+                        .expect("first work descriptor is valid"),
+                    None,
+                )
+                .expect("ready service accepts first task")
+                .task
+                .base()
+                .task_id
+                .clone();
+            *now.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) +=
+                StdDuration::from_millis(elapsed_ms);
+            let second = runtime
+                .create_task_with_work(
+                    FinalTaskWorkDescriptor::new(serde_json::json!({"label": "second"}))
+                        .expect("second work descriptor is valid"),
+                    None,
+                )
+                .expect("ready service accepts second task before dequeuing the first wakeup")
+                .task
+                .base()
+                .task_id
+                .clone();
+            assert!(matches!(
+                Future::poll(service.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ));
+            assert!(
+                runtime.is_task_service_ready(),
+                "processing advisory wakeups preserves the live service generation"
+            );
+            let expected = if first_should_execute {
+                vec![first.clone(), second.clone()]
+            } else {
+                vec![second.clone()]
+            };
+            assert_eq!(
+                *started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                expected,
+                "every retained task executes once; expired work never reaches the supervisor"
+            );
+            for (task_id, label) in [(&first, "first"), (&second, "second")] {
+                if task_id == &first && !first_should_execute {
+                    assert!(
+                        store
+                            .get_task(task_id)
+                            .expect("expired task lookup succeeds")
+                            .is_none()
+                    );
+                    continue;
+                }
+                let task = runtime
+                    .get_task(task_id)
+                    .expect("completed task is readable")
+                    .task;
+                let FinalTask::Completed { result, .. } = task else {
+                    panic!("retained queued task did not commit its fenced completion");
+                };
+                assert_eq!(
+                    serde_json::to_value(result).expect("completed result serializes")["content"],
+                    serde_json::json!([{"type": "text", "text": label}])
+                );
+            }
+            cx.cancel_with(CancelKind::User, None);
+            assert!(matches!(
+                Future::poll(service.as_mut(), &mut context),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert!(!runtime.is_task_service_ready());
+        });
+    }
+
+    #[test]
+    fn task_03_final_expired_queued_wakeup_preserves_service_progress() {
+        assert_queued_wakeup_progress(1_000, false);
+    }
+
+    #[test]
+    fn task_03_final_unexpired_queued_wakeup_preserves_service_progress() {
+        assert_queued_wakeup_progress(999, true);
+    }
+
     #[test]
     fn task_03_final_service_runner_recovers_after_dispatch_lease_expiry_without_event() {
         let (inner_store, now) = in_memory_store_with_test_clock(1);
@@ -11955,6 +12185,270 @@ mod tests {
             "refused elections cannot change the retained task"
         );
         assert_eq!(store.task_count(), 1);
+    }
+
+    fn final_input_task_with_keys(working: &FinalTask, keys: &[String]) -> FinalTask {
+        let mut base = working.base().clone();
+        base.status = FinalTaskStatus::InputRequired;
+        let roots = final_roots_request().into_values().next().unwrap();
+        FinalTask::InputRequired {
+            base,
+            input_requests: keys.iter().map(|key| (key.clone(), roots.clone())).collect(),
+        }
+    }
+
+    fn input_key_store_snapshot(
+        store: &InMemoryFinalTaskStore,
+        task_id: &FinalTaskId,
+    ) -> serde_json::Value {
+        let state = store.state.lock().unwrap();
+        serde_json::json!({
+            "task": state.tasks.get(task_id),
+            "generation": state.generations.get(task_id),
+            "next_generation": state.next_generation,
+            "notification": state.latest_notifications.get(task_id),
+            "accepted_inputs": state.accepted_inputs.get(task_id),
+            "history": state.input_key_history.get(task_id)
+                .map(|history| (&history.keys, history.key_bytes)),
+            "lease": state.handoff_leases.get(task_id).map(|lease| (
+                lease.generation, &lease.owner_id, lease.dispatch_elected, lease.dispatch_fence,
+            )),
+            "next_dispatch_fence": state.next_dispatch_fence,
+            "cancelled": state.cancellation_requests.contains(task_id),
+            "principal": state.authenticated_principals.get(task_id)
+                .map(|principal| principal.as_bytes()),
+            "task_count": state.tasks.len(),
+        })
+    }
+
+    fn assert_input_key_history_limit(count_limit: bool, over_limit: bool) {
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-key-history-bound");
+        let task_id = working.base().task_id.clone();
+        store
+            .create_task(working.clone(), final_task_notification(&working))
+            .unwrap();
+        let earlier_keys: Vec<String> = if count_limit {
+            (0..MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS - 1)
+                .map(|index| format!("earlier-{index}"))
+                .collect()
+        } else {
+            vec!["a".repeat(MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES - 1)]
+        };
+        // Each real store transition obeys the per-map ceiling. History must
+        // accumulate across complete rounds rather than reset with the map.
+        for keys in earlier_keys.chunks(fastmcp_protocol::MAX_TASK_INPUT_MAP_ENTRIES) {
+            let input = final_input_task_with_keys(&working, keys);
+            store
+                .replace_task(input.clone(), final_task_notification(&input))
+                .unwrap();
+            store
+                .replace_task(working.clone(), final_task_notification(&working))
+                .unwrap();
+        }
+        let before = input_key_store_snapshot(&store, &task_id);
+        let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let keys = if over_limit {
+            vec!["b".to_owned(), "c".to_owned()]
+        } else {
+            vec!["b".to_owned()]
+        };
+        let proposed = final_input_task_with_keys(&working, &keys);
+        let result = store.replace_task_if_current(
+            &current,
+            proposed.clone(),
+            final_task_notification(&proposed),
+        );
+        if over_limit {
+            let error = result.expect_err("one extra key must exceed the selected lifetime bound");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                if count_limit {
+                    "Task input request key history count limit exceeded"
+                } else {
+                    "Task input request key history byte limit exceeded"
+                }
+            );
+            assert_eq!(input_key_store_snapshot(&store, &task_id), before);
+            // The refused write did not consume a generation or the room for
+            // the exact-boundary request under the same expected snapshot.
+            let admitted = final_input_task_with_keys(&working, &["b".to_owned()]);
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &current,
+                        admitted.clone(),
+                        final_task_notification(&admitted),
+                    )
+                    .unwrap()
+            );
+        } else {
+            assert!(result.expect("the exact lifetime boundary must remain usable"));
+        }
+        let after = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let expected = final_input_task_with_keys(&working, &["b".to_owned()]);
+        assert_ne!(after.generation(), current.generation());
+        assert_eq!(
+            serde_json::to_value(after.task()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id).unwrap()).unwrap(),
+            serde_json::to_value(final_task_notification(&expected)).unwrap(),
+        );
+        let state = store.state.lock().unwrap();
+        let history = state.input_key_history.get(&task_id).unwrap();
+        let mut expected_keys: BTreeSet<String> = earlier_keys.into_iter().collect();
+        expected_keys.insert("b".to_owned());
+        assert_eq!(history.keys, expected_keys);
+        if count_limit {
+            assert_eq!(history.keys.len(), MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS);
+        } else {
+            assert_eq!(history.key_bytes, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES);
+        }
+    }
+
+    #[test]
+    fn task_02_b_input_key_count_at_limit_is_accepted() {
+        assert_input_key_history_limit(true, false);
+    }
+
+    #[test]
+    fn task_02_b_input_key_count_over_limit_is_atomic() {
+        assert_input_key_history_limit(true, true);
+    }
+
+    #[test]
+    fn task_02_b_input_key_bytes_at_limit_are_accepted() {
+        assert_input_key_history_limit(false, false);
+    }
+
+    #[test]
+    fn task_02_b_input_key_bytes_over_limit_is_atomic() {
+        assert_input_key_history_limit(false, true);
+    }
+
+    fn assert_input_key_create_byte_limit(over_limit: bool) {
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-key-create-bound");
+        let task_id = working.base().task_id.clone();
+        let before = input_key_store_snapshot(&store, &task_id);
+        let key = "a".repeat(MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES + usize::from(over_limit));
+        let input = final_input_task_with_keys(&working, &[key]);
+        let result = store.create_task(input.clone(), final_task_notification(&input));
+        if over_limit {
+            let error = result.expect_err("oversized initial history must not create a task");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                "Task input request key history byte limit exceeded"
+            );
+            assert_eq!(input_key_store_snapshot(&store, &task_id), before);
+            let admitted = final_input_task_with_keys(
+                &working,
+                &["a".repeat(MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES)],
+            );
+            store
+                .create_task(admitted.clone(), final_task_notification(&admitted))
+                .unwrap();
+        } else {
+            result.expect("exact-boundary initial input history remains creatable");
+        }
+        let state = store.state.lock().unwrap();
+        let history = state.input_key_history.get(&task_id).unwrap();
+        assert_eq!(history.keys.len(), 1);
+        assert_eq!(history.key_bytes, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.generations.get(&task_id), Some(&1));
+        assert_eq!(
+            history.keys.first().unwrap().len(),
+            MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES
+        );
+    }
+
+    #[test]
+    fn task_02_b_input_key_create_at_byte_limit_is_retained() {
+        assert_input_key_create_byte_limit(false);
+    }
+
+    #[test]
+    fn task_02_b_input_key_create_over_byte_limit_is_atomic() {
+        assert_input_key_create_byte_limit(true);
+    }
+
+    #[test]
+    fn task_02_b_input_key_history_survives_until_expiry() {
+        let (store, now) = in_memory_store_with_test_clock(1);
+        let working = final_working_task_with_ttl("task-key-history-expiry", 1_000);
+        let task_id = working.base().task_id.clone();
+        let keys = ["roots-a".to_owned(), "roots-b".to_owned()];
+        let input = final_input_task_with_keys(&working, &keys);
+        store
+            .create_task(input.clone(), final_task_notification(&input))
+            .unwrap();
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let first_response =
+            serde_json::from_value(serde_json::json!({"roots-a": {"roots": []}})).unwrap();
+        runtime.update_task(&task_id, &first_response).unwrap();
+        let before = input_key_store_snapshot(&store, &task_id);
+        let partial = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let error = store
+            .replace_task_if_current(&partial, input.clone(), final_task_notification(&input))
+            .expect_err("a satisfied key cannot reappear beside a still-outstanding key");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Task input request keys cannot be reused");
+        assert_eq!(input_key_store_snapshot(&store, &task_id), before);
+        drop(runtime);
+        let recovered = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let second_response =
+            serde_json::from_value(serde_json::json!({"roots-b": {"roots": []}})).unwrap();
+        recovered.update_task(&task_id, &second_response).unwrap();
+        let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let before = input_key_store_snapshot(&store, &task_id);
+        let error = store
+            .replace_task_if_current(&current, input.clone(), final_task_notification(&input))
+            .expect_err("recreating a runtime cannot reset the retained store key history");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Task input request keys cannot be reused");
+        assert_eq!(input_key_store_snapshot(&store, &task_id), before);
+        let mut terminal_base = working.base().clone();
+        terminal_base.status = FinalTaskStatus::Cancelled;
+        let terminal = FinalTask::Cancelled(terminal_base);
+        store
+            .replace_task(terminal.clone(), final_task_notification(&terminal))
+            .unwrap();
+        let history_keys = || {
+            store
+                .state
+                .lock()
+                .unwrap()
+                .input_key_history
+                .get(&task_id)
+                .map(|history| history.keys.clone())
+        };
+        assert_eq!(history_keys(), Some(keys.iter().cloned().collect()));
+        {
+            let mut clock = now.lock().unwrap();
+            *clock = clock.checked_add(StdDuration::from_millis(999)).unwrap();
+        }
+        assert!(store.get_task(&task_id).unwrap().is_some());
+        assert!(
+            history_keys().is_some(),
+            "terminal history stays until actual expiry"
+        );
+        {
+            let mut clock = now.lock().unwrap();
+            *clock = clock.checked_add(StdDuration::from_millis(1)).unwrap();
+        }
+        assert!(store.get_task(&task_id).unwrap().is_none());
+        assert!(history_keys().is_none());
+        // A new record after reclamation has a new lifetime, not a stale key
+        // tombstone inherited from the prior task with this store-level ID.
+        store
+            .create_task(input.clone(), final_task_notification(&input))
+            .unwrap();
+        assert_eq!(history_keys(), Some(keys.into_iter().collect()));
     }
 
     #[test]

@@ -883,3 +883,329 @@ fn assert_task_service_recovers_without_new_event(expired: bool) {
         );
     }
 }
+
+#[cfg(feature = "tasks")]
+#[test]
+fn task_service_fresh_input_key_completes_second_round() {
+    assert_task_service_two_round_input_keys(false);
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn task_service_reused_input_key_rejects_without_transition() {
+    assert_task_service_two_round_input_keys(true);
+}
+
+/// Validates multi-round task input lifecycle and cross-round key uniqueness.
+///
+/// When `reused` is false, round 1 requests `roots_a` and round 2 requests fresh
+/// `roots_b`. Replaying round 1's `roots_a` response during round 2 must be ignored
+/// by the outstanding-key filter, leaving the task in `InputRequired` without
+/// triggering a premature resumption. Only the fresh `roots_b` response returns the
+/// task to `Working` and completes it.
+///
+/// When `reused` is true, round 2 attempts to reuse `roots_a`. The store must
+/// reject the transition with an invalid parameter error, leaving task status,
+/// generation, and latest notification unmutated. The same authorized handoff must
+/// then successfully issue fresh `roots_b` and complete, proving the rejection did
+/// not invalidate the handoff authority or fence.
+#[cfg(feature = "tasks")]
+fn assert_task_service_two_round_input_keys(reused: bool) {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fastmcp_core::{McpError, McpErrorCode};
+    use fastmcp_protocol::tasks_extension::{
+        FinalTaskCallToolResult, Task, TaskInputRequests, TaskInputResponses,
+        TaskStatusNotification, TaskStatusNotificationParams,
+    };
+    use fastmcp_server::{
+        ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        InMemoryFinalTaskStore,
+    };
+
+    struct TwoRoundSupervisor {
+        calls: Arc<AtomicUsize>,
+        resumed_calls: Arc<AtomicUsize>,
+        reused: bool,
+        observed_rejection: Arc<Mutex<Option<McpError>>>,
+        store: Arc<InMemoryFinalTaskStore>,
+    }
+
+    impl ApplicationTaskSupervisor for TwoRoundSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                cx.checkpoint()
+                    .expect("caller-owned supervisor remains live");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        let roots_a: TaskInputRequests = serde_json::from_value(serde_json::json!({
+                            "roots_a": {"method": "roots/list"}
+                        }))
+                        .expect("valid roots_a request");
+                        initial
+                            .require_input(roots_a, Some("awaiting roots_a".to_owned()))
+                            .expect("initial require_input enters input_required");
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        let resumptions = self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+                        if resumptions == 0 {
+                            assert!(
+                                accepted.input_responses().contains_key("roots_a"),
+                                "first resumption must carry roots_a input response"
+                            );
+                            let roots_a: TaskInputRequests = serde_json::from_value(serde_json::json!({
+                                "roots_a": {"method": "roots/list"}
+                            }))
+                            .expect("valid roots_a request");
+                            let roots_b: TaskInputRequests = serde_json::from_value(serde_json::json!({
+                                "roots_b": {"method": "roots/list"}
+                            }))
+                            .expect("valid roots_b request");
+
+                            if self.reused {
+                                let task_id = accepted.task_id().clone();
+                                let pre_snapshot = self
+                                    .store
+                                    .get_task_snapshot(&task_id)
+                                    .expect("read pre-snapshot")
+                                    .expect("task exists");
+                                let pre_notification = self
+                                    .store
+                                    .latest_notification(&task_id)
+                                    .expect("read pre-notification");
+
+                                // Attempting to reuse roots_a must fail closed.
+                                let rejection = accepted
+                                    .require_input(roots_a, Some("attempt reused roots_a".to_owned()))
+                                    .expect_err("reusing input key across rounds must reject");
+                                assert_eq!(rejection.code, McpErrorCode::InvalidParams);
+                                assert_eq!(
+                                    rejection.message,
+                                    "Task input request keys cannot be reused"
+                                );
+
+                                // Invariance: task status, generation, and notification remain unchanged.
+                                let post_snapshot = self
+                                    .store
+                                    .get_task_snapshot(&task_id)
+                                    .expect("read post-snapshot")
+                                    .expect("task exists");
+                                assert_eq!(pre_snapshot.generation(), post_snapshot.generation());
+                                assert_eq!(
+                                    serde_json::to_value(pre_snapshot.task()).unwrap(),
+                                    serde_json::to_value(post_snapshot.task()).unwrap()
+                                );
+                                let post_notification = self
+                                    .store
+                                    .latest_notification(&task_id)
+                                    .expect("read post-notification");
+                                assert_eq!(
+                                    serde_json::to_value(&pre_notification).unwrap(),
+                                    serde_json::to_value(&post_notification).unwrap()
+                                );
+                                *self.observed_rejection.lock().unwrap() = Some(rejection);
+
+                                // Same authorized handoff issues fresh roots_b successfully.
+                                accepted
+                                    .require_input(
+                                        roots_b,
+                                        Some("awaiting roots_b after rejected duplicate".to_owned()),
+                                    )
+                                    .expect("fresh key under same handoff must succeed");
+                            } else {
+                                accepted
+                                    .require_input(roots_b, Some("awaiting roots_b".to_owned()))
+                                    .expect("fresh key roots_b must succeed");
+                            }
+                        } else if resumptions == 1 {
+                            assert!(
+                                accepted.input_responses().contains_key("roots_b"),
+                                "second resumption must carry roots_b input response"
+                            );
+                            let result: FinalTaskCallToolResult = serde_json::from_value(serde_json::json!({
+                                "content": [{"type": "text", "text": "two rounds completed successfully"}]
+                            }))
+                            .expect("valid completed tool result");
+                            accepted
+                                .complete_task(result, Some("completed two rounds".to_owned()))
+                                .expect("terminal complete_task must succeed");
+                        } else {
+                            panic!("unexpected extra resumption: {resumptions}");
+                        }
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    let store = Arc::new(InMemoryFinalTaskStore::new(4).expect("bounded store"));
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "taskId": "two-round-input-task", "status": "working",
+        "createdAt": "2026-07-28T12:00:00.000Z",
+        "lastUpdatedAt": "2026-07-28T12:00:00.000Z", "ttlMs": 60000
+    }))
+    .expect("valid task");
+    let task_id = task.base().task_id.clone();
+    let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
+        task: task.clone(),
+        meta: None,
+        additional: std::collections::BTreeMap::default(),
+    });
+    store
+        .create_task_with_work(
+            task.clone(),
+            notification.clone(),
+            FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "two-round-test"}))
+                .expect("bounded work descriptor"),
+        )
+        .expect("initial task-with-work created");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resumed_calls = Arc::new(AtomicUsize::new(0));
+    let observed_rejection = Arc::new(Mutex::new(None));
+    let emitted = Arc::new(AtomicUsize::new(0));
+
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(60000, None).unwrap(),
+        {
+            let emitted = Arc::clone(&emitted);
+            Arc::new(move |_| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+    );
+
+    let supervisor = Arc::new(TwoRoundSupervisor {
+        calls: Arc::clone(&calls),
+        resumed_calls: Arc::clone(&resumed_calls),
+        reused,
+        observed_rejection: Arc::clone(&observed_rejection),
+        store: Arc::clone(&store),
+    });
+    let mut runner = runtime
+        .install_task_service(1, supervisor)
+        .expect("install task service");
+
+    let roots_a_response: TaskInputResponses = serde_json::from_value(serde_json::json!({
+        "roots_a": {"roots": [{"uri": "file:///first-round", "name": "first-round"}]}
+    }))
+    .expect("valid roots_a response");
+
+    let roots_b_response: TaskInputResponses = serde_json::from_value(serde_json::json!({
+        "roots_b": {"roots": [{"uri": "file:///second-round", "name": "second-round"}]}
+    }))
+    .expect("valid roots_b response");
+
+    let application = RuntimeBuilder::current_thread().build().unwrap();
+    application.block_on(async {
+        let cx = Cx::current().expect("application-owned runtime context");
+        let mut service = std::pin::pin!(runner.run_service(&cx));
+        let mut observation_bound =
+            std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(5)));
+        let mut step = 0;
+        let mut replay_tested = false;
+
+        poll_fn(|task_cx| {
+            if observation_bound.as_mut().poll(task_cx).is_ready() {
+                panic!("test timed out waiting for two-round progression");
+            }
+            if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
+                panic!("service must remain ready while caller is live: {result:?}");
+            }
+
+            let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            match current.task() {
+                Task::InputRequired { base: _, input_requests } => {
+                    if step == 0 && input_requests.contains_key("roots_a") {
+                        runtime
+                            .update_task(&task_id, &roots_a_response)
+                            .expect("round 1 input update succeeds");
+                        step = 1;
+                        task_cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    if step == 1 && input_requests.contains_key("roots_b") {
+                        if !reused && !replay_tested {
+                            // CRITICAL: Replaying round 1's response must not satisfy round 2.
+                            // The task must remain in InputRequired and supervisor must not resume.
+                            runtime
+                                .update_task(&task_id, &roots_a_response)
+                                .expect("replayed update ignored cleanly");
+                            let after_replay = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                            assert!(
+                                matches!(after_replay.task(), Task::InputRequired { .. }),
+                                "replaying round 1 response must leave round 2 in InputRequired"
+                            );
+                            assert_eq!(
+                                resumed_calls.load(Ordering::SeqCst),
+                                1,
+                                "replayed response must not trigger supervisor resumption"
+                            );
+                            replay_tested = true;
+                            task_cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        runtime
+                            .update_task(&task_id, &roots_b_response)
+                            .expect("round 2 input update succeeds");
+                        step = 2;
+                        task_cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+                Task::Completed { .. } => {
+                    if step == 2 {
+                        return Poll::Ready(());
+                    }
+                }
+                _ => {}
+            }
+            Poll::Pending
+        })
+        .await;
+    });
+
+    assert!(
+        !runtime.is_task_service_ready(),
+        "dropping the run revokes readiness"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
+    if reused {
+        let rejection = observed_rejection
+            .lock()
+            .unwrap()
+            .take()
+            .expect("reused input key must have produced McpError::invalid_params");
+        assert_eq!(rejection.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            rejection.message,
+            "Task input request keys cannot be reused"
+        );
+    }
+    let final_snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+    let value = serde_json::to_value(final_snapshot.task()).unwrap();
+    assert_eq!(value["status"], "completed");
+    assert_eq!(
+        value["result"]["content"][0]["text"],
+        "two rounds completed successfully"
+    );
+    let latest_notif = store.latest_notification(&task_id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&latest_notif.params.task).unwrap()["status"],
+        "completed"
+    );
+}
