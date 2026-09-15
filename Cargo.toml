@@ -97,7 +97,7 @@ cap-fs-ext = { version = "=4.0.3", default-features = false, features = ["std"] 
 regex = { version = "=1.13.1" }
 
 # CLI argument parsing
-clap = { version = "=4.6.6", features = ["derive", "env", "wrap_help"] }
+clap = { version = "=4.6.7", features = ["derive", "env", "wrap_help"] }
 
 # Testing
 trybuild = { version = "=1.0.121", default-features = false }

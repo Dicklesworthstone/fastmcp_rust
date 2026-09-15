@@ -1,5 +1,58 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-09-15 | **Project:** fastmcp_rust | **Language:** Rust
+
+## Current upgrade run
+
+A fresh currency sweep of all 29 exact direct registry pins (root and member
+manifests) against the crates.io API found 27 already at latest stable and
+advanced two. Registry build metadata suffixes are ignored when comparing
+versions: `serde_yaml 0.9.34+deprecated` and `toml 1.1.6+spec-1.1.0` are the
+current stable versions. Internal path dependencies and the dated nightly
+toolchain remain outside dependency upgrades.
+
+| Dependency | Current | Target | Status |
+|---|---|---|---|
+| clap | 4.6.6 | 4.6.7 | Passed: scoped locked `cargo check -p fastmcp-cli` on the RCH lane, exit 0 |
+| html5ever | 0.40.0 | 0.40.1 | Passed: scoped locked `cargo check` of both optional Apps graphs (`fastmcp-client` and `fastmcp-server`, `--no-default-features --features apps`) on the RCH lane, exit 0 |
+
+### clap 4.6.6 -> 4.6.7
+
+Released 2026-09-14. Purely additive: one new derive attribute,
+`#[command(defer = <bool>)]`, opting in to lazy subcommand initialisation.
+No existing API, default, or derive behavior changes. The lockfile also moves
+`clap_builder` and `clap_derive` to 4.6.7. The CLI argument surface is
+unchanged; the scoped check compiles the shipped CLI crate against the new
+pin (RCH, `cargo check --locked -p fastmcp-cli`, exit 0).
+
+### html5ever 0.40.0 -> 0.40.1
+
+Released 2026-09-14. Patch release with two fixes: preserve non-NBSP UTF-8
+bytes during HTML serialization, and compare prefix and local name when
+looking for duplicate attributes. html5ever remains an optional Apps-graph
+dependency; no FastMCP production code calls its parser. Both optional Apps
+graphs compile under the new pin (RCH, `cargo check --locked` with
+`--no-default-features --features apps` for `fastmcp-client` and
+`fastmcp-server`, both exit 0). Per the standing boundary, a compile earns no
+parser or sanitizer runtime-behavior claim.
+
+## Skipped
+
+- The other 27 exact direct pins are at latest stable as of the 2026-09-15 sweep.
+- frankensqlite / fsqlite and frankensearch remain absent; no FastMCP code consumes them.
+
+## Verification boundary
+
+- The scoped RCH checks above are intermediate worker evidence bound to this
+  working revision, not the final workspace batch. The revision-bound workspace
+  all-target check, strict Clippy, formatting, focused tests, and banned-runtime
+  graph inspection remain with the designated batch-verification lane.
+- The frozen FND-01 evidence continues to bind its original dependency snapshot
+  and is excluded from this sweep; its hashes are not rewritten around upgrades.
+- No aggregate MCP 2026-07-28 conformance, maturity, or release-readiness claim.
+
+---
+
 **Date:** 2026-09-12 | **Project:** fastmcp_rust | **Language:** Rust
 
 ## Current upgrade run
