@@ -1710,13 +1710,14 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
         let request = read_request(&mut stream);
         assert_subscription_request(&request, &server_filter);
         begin_sse_response(&mut stream);
-        thread::sleep(Duration::from_millis(90));
         write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
             .expect("write subscription acknowledgement");
-        thread::sleep(Duration::from_millis(90));
-        write_sse_event(&mut stream, &subscription_tools_changed_event())
-            .expect("write accepted tools event");
-        thread::sleep(Duration::from_millis(90));
+        for _ in 0..4 {
+            thread::sleep(Duration::from_millis(100));
+            write_sse_event(&mut stream, &subscription_tools_changed_event())
+                .expect("write accepted tools event");
+        }
+        thread::sleep(Duration::from_millis(100));
         write_sse_event(&mut stream, &subscription_terminal_event())
             .expect("write subscription terminal");
     });
@@ -1724,7 +1725,7 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
     runtime_block_on(async {
         let cx = Cx::current().expect("caller runtime must install a current Cx");
         let policy =
-            SubscriptionTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(350), Duration::from_secs(2))
                 .expect("subscription positive policy must be valid");
         let connection = public_subscription_builder(&target, policy)
             .connect_http_with_cx(&cx)
@@ -1750,17 +1751,19 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
             ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }
                 if accepted_filter == filter
         ));
-        let event = listener
-            .next_event(&cx)
-            .await
-            .expect("accepted event must be admitted")
-            .expect("accepted event must be present");
-        assert!(matches!(
-            event,
-            ModernHttpSubscriptionListenEvent::Notification(ServerNotification::ToolsListChanged(
-                _
-            ))
-        ));
+        for _ in 0..4 {
+            let event = listener
+                .next_event(&cx)
+                .await
+                .expect("accepted event must be admitted")
+                .expect("accepted event must be present");
+            assert!(matches!(
+                event,
+                ModernHttpSubscriptionListenEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                )
+            ));
+        }
         let terminal = listener
             .next_event(&cx)
             .await
@@ -1849,8 +1852,8 @@ fn http_03_b_subscription_valid_comments_refresh_idle_but_absolute_expires_negat
         begin_sse_response(&mut stream);
         write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
             .expect("write comment acknowledgement");
-        for index in 0..10 {
-            thread::sleep(Duration::from_millis(35));
+        for index in 0..20 {
+            thread::sleep(Duration::from_millis(15));
             if write_sse_comment(&mut stream, &format!("bounded-{index}")).is_err() {
                 return;
             }
@@ -1860,7 +1863,7 @@ fn http_03_b_subscription_valid_comments_refresh_idle_but_absolute_expires_negat
     runtime_block_on(async {
         let cx = Cx::current().expect("caller runtime must install a current Cx");
         let policy =
-            SubscriptionTimeoutPolicy::new(Duration::from_millis(150), Duration::from_millis(300))
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(260))
                 .expect("comment policy must be valid");
         let connection = public_subscription_builder(&target, policy)
             .connect_http_with_cx(&cx)
