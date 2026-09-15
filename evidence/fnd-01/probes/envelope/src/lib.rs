@@ -7,8 +7,8 @@
 #![forbid(unsafe_code)]
 
 use chacha20poly1305::{
-    aead::{AeadInPlace, KeyInit},
     Key, XChaCha20Poly1305, XNonce,
+    aead::{AeadInPlace, KeyInit},
 };
 
 pub const KEY_BYTES: usize = 32;
@@ -48,7 +48,7 @@ pub fn open_in_place(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_in_place, seal_in_place, KEY_BYTES, NONCE_BYTES, TAG_BYTES};
+    use super::{KEY_BYTES, NONCE_BYTES, TAG_BYTES, open_in_place, seal_in_place};
 
     #[test]
     fn caller_supplied_key_and_nonce_round_trip() {

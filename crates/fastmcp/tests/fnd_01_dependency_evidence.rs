@@ -15,7 +15,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 909064;
 const FROZEN_POLICY_SHA256: &str =
-    "9c77c7f8977b17aad215ba9071f254cfe6ab3a62c96cb31a481eb83d84ea861e";
+    "2dd01e16b1967275003e75e74ad04cb7151edcfc3a1693f70cffafe7dd26e3a6";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -21213,7 +21213,7 @@ activate = 1\n";
         ("serialization", "bd-mcp-2026-07-28-support-ahet.1.7", 2, 64518, "46dd698e88b6a243aaad0efcd41dc1411efd1f65c0b4d529decaf611896576d0"),
         ("jose", "bd-mcp-2026-07-28-support-ahet.1.11", 4, 11_442, "6a5f5d57a771c6a49b418093f8161d0c5cee74cfe708293edc6bcae99d62b0a7"),
         ("media", "bd-mcp-2026-07-28-support-ahet.1.12", 10, 564_545, "65d85e80198986f5cd4b19ca8fbe2550c624fcc8a5404d64e67b52801c6c9ecd"),
-        ("state", "bd-mcp-2026-07-28-support-ahet.1.13", 10, 229_952, "021ee4219bce508e0a050a5c090372071fba5bacb97bd74483d1b334c86f93fd"),
+        ("state", "bd-mcp-2026-07-28-support-ahet.1.13", 10, 229_952, "d43b82d03e4ba7e1905df0f468b6121a7c6b8e6a7df7745286820973a7607e4d"),
     ];
 
     const SOURCE_ARCHIVES: &[(&str, &str, &str, usize, u64, &str)] = &[

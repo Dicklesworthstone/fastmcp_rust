@@ -153,7 +153,7 @@ record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file
 domain_prefix = "none"
 file_count = 71
 total_bytes = 3024852
-sha256 = "f61f9ae0fe7d620dd695b98f6afeaf9274be8033614a4f9268fc682aeaf0cd25"
+sha256 = "02d1fbc87224f77a44f24d1564a068785b531a0a78d936a93313d0112fcd77f9"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5685,7 +5685,7 @@ id = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 file_count = 10
 total_bytes = 229952
-tree_sha256 = "021ee4219bce508e0a050a5c090372071fba5bacb97bd74483d1b334c86f93fd"
+tree_sha256 = "d43b82d03e4ba7e1905df0f468b6121a7c6b8e6a7df7745286820973a7607e4d"
 
 [[negative_family]]
 id = "sdk.catalog"
@@ -6510,7 +6510,7 @@ family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/probes/envelope/src/lib.rs"
 byte_length = 2757
-sha256 = "8b245c7428f0041d65ec38592aaf6d5d2dcf1cde57e0426c1d95c250e9ab78b1"
+sha256 = "4343ae7c129178847961719cef4ae4b8c3107b9fc4184d78a83668555ae95f58"
 parse_kind = "utf8_text"
 observation_kind = "local_file"
 bytes_available = true
@@ -6810,7 +6810,7 @@ family = "state"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.13"
 path = "evidence/fnd-01/state-capability-dependencies.toml"
 byte_length = 82343
-sha256 = "9b73cadd74953142686ae7bfad3afe0a3a57edcd67b75de57eee84348c3bd2ab"
+sha256 = "7ba430470fd9282ad7c84a108fbc008e21a94478c12906e18397cff71c2320e0"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true

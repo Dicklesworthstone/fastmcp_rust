@@ -47,7 +47,7 @@ mod tests {
     const CAPABILITY_FS_SOURCE: &str = include_str!("../../capability-fs/src/lib.rs");
     const REDIS_FEATURE_LINE: &str = "redis = { version = \"=1.4.1\", default-features = false, features = [\"acl\", \"script\"] }";
     const FROZEN_INPUTS_DIGEST: &str =
-        "166511cfae5c5dd9073c6123c98fd83b8cadf2481c400b5150709129844866d1";
+        "0e29be0a8ee87d34f0f4b2e1b9ac211887abcab372d37f9dc1c1d920eec69796";
     fn validate_packages_absent(
         subject: &'static str,
         lock: &str,
