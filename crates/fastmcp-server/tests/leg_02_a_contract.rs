@@ -432,7 +432,7 @@ fn leg_02_a_planted_negative() {
     let before_digest = before.canonical_digest();
     let receipt = adapter.installed_receipt().canonical_bytes();
     let mut wrong_era = initialize();
-    wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
+    wrong_era["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2026-07-28");
     let response = adapter
         .receive(binding(), wrong_era)
         .expect("invalid request IDs still receive JSON-RPC errors");
@@ -442,7 +442,7 @@ fn leg_02_a_planted_negative() {
             "jsonrpc": "2.0", "id": 1,
             "error": {
                 "code": -32600,
-                "message": "initialize protocolVersion must be exact MCP 2024-11-05",
+                "message": "invalid exact MCP 2024-11-05 envelope",
             },
         }))
     );
