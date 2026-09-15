@@ -34,7 +34,7 @@ use fastmcp_protocol::{
     CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations,
 };
 
-use crate::bidirectional::MrtrCompletedInputs;
+use crate::bidirectional::{MrtrCompletedInputs, MrtrContinuationPolicy};
 use crate::handler::{
     BoxFuture, BoxedToolHandler, FinalToolOutcome, FinalToolSchemaAuthority, ToolErrorKind,
     ToolHandler, UpstreamFinalToolSchemaRegistration,
@@ -331,6 +331,10 @@ impl ToolHandler for TransformedTool {
 
     fn declares_final_mrtr(&self) -> bool {
         self.parent.declares_final_mrtr()
+    }
+
+    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
+        self.parent.final_mrtr_policy()
     }
 
     fn timeout(&self) -> Option<Duration> {

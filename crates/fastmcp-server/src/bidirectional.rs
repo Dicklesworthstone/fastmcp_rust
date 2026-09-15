@@ -122,6 +122,28 @@ const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its r
 const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
 
 /// The immutable request facts a router binds to one opaque MRTR state.
+/// Sealed MRTR continuation eligibility policy.
+///
+/// Classifies whether an operation permits multi-round continuations across
+/// stateless HTTP ingress without an authenticated principal identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MrtrContinuationPolicy {
+    /// Private operation (safe default). Requires a verified authenticated
+    /// principal for stateless continuation issuance and retries. Anonymous
+    /// ingress fails closed before exchange registry allocation.
+    #[default]
+    Private,
+}
+
+impl MrtrContinuationPolicy {
+    /// Returns whether this policy requires private authenticated continuation.
+    #[must_use]
+    pub const fn is_private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+}
+
+/// A router-admitted operation identity used to bind MRTR retry exchanges.
 ///
 /// This is deliberately server-local: it is never serialized and prevents a
 /// state minted for one modern operation from resuming another operation that
@@ -134,6 +156,7 @@ pub(crate) struct MrtrExchangeBinding {
     session_partition: [u8; 32],
     principal_digest: Option<[u8; 32]>,
     is_stateless: bool,
+    policy: MrtrContinuationPolicy,
 }
 
 impl MrtrExchangeBinding {
@@ -146,6 +169,26 @@ impl MrtrExchangeBinding {
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
     ) -> Self {
+        Self::with_policy(
+            method,
+            target,
+            arguments_digest,
+            session_partition,
+            principal_digest,
+            MrtrContinuationPolicy::Private,
+        )
+    }
+
+    /// Captures the router-admitted operation identity with an explicit continuation policy.
+    #[must_use]
+    pub(crate) fn with_policy(
+        method: &'static str,
+        target: String,
+        arguments_digest: [u8; 32],
+        session_partition: [u8; 32],
+        principal_digest: Option<[u8; 32]>,
+        policy: MrtrContinuationPolicy,
+    ) -> Self {
         Self {
             method,
             target,
@@ -153,6 +196,7 @@ impl MrtrExchangeBinding {
             session_partition,
             principal_digest,
             is_stateless: false,
+            policy,
         }
     }
 
@@ -165,6 +209,26 @@ impl MrtrExchangeBinding {
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
     ) -> Self {
+        Self::stateless_with_policy(
+            method,
+            target,
+            arguments_digest,
+            session_partition,
+            principal_digest,
+            MrtrContinuationPolicy::Private,
+        )
+    }
+
+    /// Captures the operation identity for an ephemeral stateless HTTP retry with an explicit policy.
+    #[must_use]
+    pub(crate) fn stateless_with_policy(
+        method: &'static str,
+        target: String,
+        arguments_digest: [u8; 32],
+        session_partition: [u8; 32],
+        principal_digest: Option<[u8; 32]>,
+        policy: MrtrContinuationPolicy,
+    ) -> Self {
         Self {
             method,
             target,
@@ -172,12 +236,18 @@ impl MrtrExchangeBinding {
             session_partition,
             principal_digest,
             is_stateless: true,
+            policy,
         }
     }
 
     #[must_use]
     pub(crate) fn is_stateless(&self) -> bool {
         self.is_stateless
+    }
+
+    #[must_use]
+    pub(crate) fn policy(&self) -> MrtrContinuationPolicy {
+        self.policy
     }
 }
 const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
