@@ -24,63 +24,16 @@ pub const MAX_ACCESS_SCHEME_BYTES: usize = 64;
 const MAX_AUTHORIZATION_VALUE_BYTES: usize = MAX_ACCESS_SCHEME_BYTES + 1 + MAX_ACCESS_TOKEN_BYTES;
 
 /// Parsed access token (scheme + token value).
+///
+/// Raw credentials deliberately do not implement serde's serialization or
+/// deserialization traits. Use the explicit parsers at credential admission;
+/// pass sanitized [`AuthContext`] facts to diagnostics and application code.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AccessToken {
     /// Token scheme (e.g., "Bearer").
     pub scheme: String,
     /// Raw token value.
     pub token: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename = "AccessToken")]
-struct AccessTokenWireRef<'a> {
-    scheme: &'a str,
-    token: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(rename = "AccessToken")]
-struct AccessTokenWire {
-    scheme: String,
-    token: String,
-}
-
-impl Serialize for AccessToken {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if !Self::parts_are_canonical(&self.scheme, &self.token) {
-            return Err(<S::Error as serde::ser::Error>::custom(
-                "access token fields are not canonical",
-            ));
-        }
-
-        AccessTokenWireRef {
-            scheme: &self.scheme,
-            token: &self.token,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for AccessToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = AccessTokenWire::deserialize(deserializer)?;
-        if !Self::parts_are_canonical(&wire.scheme, &wire.token) {
-            return Err(<D::Error as serde::de::Error>::custom(
-                "access token fields are not canonical",
-            ));
-        }
-        Ok(Self {
-            scheme: wire.scheme,
-            token: wire.token,
-        })
-    }
 }
 
 impl fmt::Debug for AccessToken {
@@ -188,10 +141,6 @@ impl AccessToken {
         })
     }
 
-    fn parts_are_canonical(scheme: &str, token: &str) -> bool {
-        scheme == scheme.trim() && token == token.trim() && Self::parts_are_valid(scheme, token)
-    }
-
     fn parts_are_valid(scheme: &str, token: &str) -> bool {
         Self::is_valid_http_scheme(scheme)
             && !token.is_empty()
@@ -272,177 +221,30 @@ impl AccessToken {
 mod tests {
     use super::{AccessToken, AuthContext, Sha256Digest};
 
-    type ImpossibleName = serde::ser::Impossible<&'static str, std::fmt::Error>;
-
-    struct StructNameSerializer;
-
-    struct StructNameState(&'static str);
-
-    impl serde::ser::SerializeStruct for StructNameState {
-        type Ok = &'static str;
-        type Error = std::fmt::Error;
-
-        fn serialize_field<T>(&mut self, _key: &'static str, _value: &T) -> Result<(), Self::Error>
-        where
-            T: ?Sized + serde::Serialize,
-        {
-            Ok(())
+    #[test]
+    fn auth_01_a_token_is_not_serializable() {
+        // A Serialize implementation introduces a second candidate for `_`
+        // below, making this compile-time assertion fail with an ambiguity.
+        trait AmbiguousIfSerialize<A> {
+            fn check() {}
         }
+        impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+        impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<u8> for T {}
 
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(self.0)
-        }
-    }
-
-    macro_rules! reject_scalar_serializers {
-        ($($method:ident($value:ty)),+ $(,)?) => {
-            $(
-                fn $method(self, _value: $value) -> Result<Self::Ok, Self::Error> {
-                    Err(std::fmt::Error)
-                }
-            )+
-        };
-    }
-
-    impl serde::Serializer for StructNameSerializer {
-        type Ok = &'static str;
-        type Error = std::fmt::Error;
-        type SerializeSeq = ImpossibleName;
-        type SerializeTuple = ImpossibleName;
-        type SerializeTupleStruct = ImpossibleName;
-        type SerializeTupleVariant = ImpossibleName;
-        type SerializeMap = ImpossibleName;
-        type SerializeStruct = StructNameState;
-        type SerializeStructVariant = ImpossibleName;
-
-        reject_scalar_serializers! {
-            serialize_bool(bool),
-            serialize_i8(i8),
-            serialize_i16(i16),
-            serialize_i32(i32),
-            serialize_i64(i64),
-            serialize_i128(i128),
-            serialize_u8(u8),
-            serialize_u16(u16),
-            serialize_u32(u32),
-            serialize_u64(u64),
-            serialize_u128(u128),
-            serialize_f32(f32),
-            serialize_f64(f64),
-            serialize_char(char),
-            serialize_str(&str),
-            serialize_bytes(&[u8]),
-            serialize_unit_struct(&'static str),
-        }
-
-        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_some<T>(self, _value: &T) -> Result<Self::Ok, Self::Error>
-        where
-            T: ?Sized + serde::Serialize,
-        {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_unit_variant(
-            self,
-            _name: &'static str,
-            _variant_index: u32,
-            _variant: &'static str,
-        ) -> Result<Self::Ok, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_newtype_struct<T>(
-            self,
-            _name: &'static str,
-            _value: &T,
-        ) -> Result<Self::Ok, Self::Error>
-        where
-            T: ?Sized + serde::Serialize,
-        {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_newtype_variant<T>(
-            self,
-            _name: &'static str,
-            _variant_index: u32,
-            _variant: &'static str,
-            _value: &T,
-        ) -> Result<Self::Ok, Self::Error>
-        where
-            T: ?Sized + serde::Serialize,
-        {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_tuple_struct(
-            self,
-            _name: &'static str,
-            _len: usize,
-        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_tuple_variant(
-            self,
-            _name: &'static str,
-            _variant_index: u32,
-            _variant: &'static str,
-            _len: usize,
-        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-            Err(std::fmt::Error)
-        }
-
-        fn serialize_struct(
-            self,
-            name: &'static str,
-            _len: usize,
-        ) -> Result<Self::SerializeStruct, Self::Error> {
-            Ok(StructNameState(name))
-        }
-
-        fn serialize_struct_variant(
-            self,
-            _name: &'static str,
-            _variant_index: u32,
-            _variant: &'static str,
-            _len: usize,
-        ) -> Result<Self::SerializeStructVariant, Self::Error> {
-            Err(std::fmt::Error)
-        }
+        let _ = <AccessToken as AmbiguousIfSerialize<_>>::check;
+        let _ = <AuthContext as AmbiguousIfSerialize<u8>>::check;
     }
 
     #[test]
-    fn access_token_serializes_with_stable_public_struct_name() {
-        let token = AccessToken {
-            scheme: "Bearer".to_string(),
-            token: "secret".to_string(),
-        };
+    fn auth_01_a_token_is_not_deserializable() {
+        trait AmbiguousIfDeserialize<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDeserialize<()> for T {}
+        impl<T: serde::Deserialize<'static>> AmbiguousIfDeserialize<u8> for T {}
 
-        let name = serde::Serialize::serialize(&token, StructNameSerializer)
-            .expect("valid access token must serialize as a struct");
-
-        assert_eq!(name, "AccessToken");
+        let _ = <AccessToken as AmbiguousIfDeserialize<_>>::check;
+        let _ = <AuthContext as AmbiguousIfDeserialize<u8>>::check;
     }
 
     #[test]
@@ -716,106 +518,36 @@ mod tests {
     }
 
     #[test]
-    fn access_token_serde_roundtrip() {
-        let token = AccessToken {
-            scheme: "Custom".to_string(),
-            token: "xyz".to_string(),
-        };
-        let json = serde_json::to_string(&token).expect("serialize");
-        let deserialized: AccessToken = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(deserialized, token);
+    fn access_token_from_parts_preserves_bounded_credentials() {
+        let token = AccessToken::from_parts("Custom", "xyz").expect("valid credential");
+        assert_eq!(token.scheme, "Custom");
+        assert_eq!(token.token, "xyz");
+        assert_eq!(AccessToken::from_parts(" Custom ", " xyz "), Some(token));
+
+        let exact_scheme = "s".repeat(super::MAX_ACCESS_SCHEME_BYTES);
+        let exact_token = "x".repeat(super::MAX_ACCESS_TOKEN_BYTES);
+        let decoded = AccessToken::from_parts(&exact_scheme, &exact_token)
+            .expect("exact scheme and token byte maxima must be admitted");
+        assert_eq!(decoded.scheme.len(), super::MAX_ACCESS_SCHEME_BYTES);
+        assert_eq!(decoded.token.len(), super::MAX_ACCESS_TOKEN_BYTES);
+        assert!(AccessToken::from_parts(&format!("{exact_scheme}s"), &exact_token).is_none());
+        assert!(AccessToken::from_parts(&exact_scheme, &format!("{exact_token}x")).is_none());
     }
 
     #[test]
-    fn access_token_serde_rejects_oversized_or_noncanonical_fields() {
-        let exact_scheme = "s".repeat(super::MAX_ACCESS_SCHEME_BYTES);
-        let exact_token = "x".repeat(super::MAX_ACCESS_TOKEN_BYTES);
-        let exact = serde_json::json!({"scheme": exact_scheme, "token": exact_token});
-        let decoded = serde_json::from_value::<AccessToken>(exact)
-            .expect("exact scheme and token byte maxima must deserialize");
-        assert_eq!(decoded.scheme.len(), super::MAX_ACCESS_SCHEME_BYTES);
-        assert_eq!(decoded.token.len(), super::MAX_ACCESS_TOKEN_BYTES);
-        assert!(serde_json::to_value(&decoded).is_ok());
-
-        for encoded in [
-            serde_json::json!({
-                "scheme": "s".repeat(super::MAX_ACCESS_SCHEME_BYTES + 1),
-                "token": "secret"
-            }),
-            serde_json::json!({
-                "scheme": "Bearer",
-                "token": "x".repeat(super::MAX_ACCESS_TOKEN_BYTES + 1)
-            }),
-            serde_json::json!({"scheme": " Bearer", "token": "secret"}),
-            serde_json::json!({"scheme": "Bearer ", "token": "secret"}),
-            serde_json::json!({"scheme": "Bear\u{0}er", "token": "secret"}),
-            serde_json::json!({"scheme": "Bear\u{1f}er", "token": "secret"}),
-            serde_json::json!({"scheme": "Bear\u{7f}er", "token": "secret"}),
-            serde_json::json!({"scheme": "Bea(rer", "token": "secret"}),
-            serde_json::json!({"scheme": "Bearer", "token": " secret"}),
-            serde_json::json!({"scheme": "Bearer", "token": "secret "}),
-            serde_json::json!({"scheme": "Bearer", "token": "sec\u{0}ret"}),
-            serde_json::json!({"scheme": "Bearer", "token": "sec\u{1f}ret"}),
-            serde_json::json!({"scheme": "Bearer", "token": "sec\u{7f}ret"}),
+    fn access_token_from_parts_rejects_invalid_credentials() {
+        for invalid_scheme in [
+            "",
+            "Bear er",
+            "Bea(rer",
+            "Bear\0er",
+            "Bear\u{1f}er",
+            "Bear\u{7f}er",
         ] {
-            assert!(serde_json::from_value::<AccessToken>(encoded).is_err());
+            assert!(AccessToken::from_parts(invalid_scheme, "secret").is_none());
         }
-
-        for invalid in [
-            AccessToken {
-                scheme: "s".repeat(super::MAX_ACCESS_SCHEME_BYTES + 1),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bea(rer".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: " Bearer".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer ".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bear\0er".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bear\u{1f}er".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bear\u{7f}er".to_string(),
-                token: "secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: " secret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: "secret ".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: "sec\0ret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: "sec\u{1f}ret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: "sec\u{7f}ret".to_string(),
-            },
-            AccessToken {
-                scheme: "Bearer".to_string(),
-                token: "x".repeat(super::MAX_ACCESS_TOKEN_BYTES + 1),
-            },
-        ] {
-            assert!(serde_json::to_value(invalid).is_err());
+        for invalid_token in ["", "sec ret", "sec\0ret", "sec\u{1f}ret", "sec\u{7f}ret"] {
+            assert!(AccessToken::from_parts("Bearer", invalid_token).is_none());
         }
     }
 }
