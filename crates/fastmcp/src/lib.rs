@@ -13589,7 +13589,7 @@ mod tests {
             limits
                 .configured_units(ProtocolLimit::MetadataEntries)
                 .expect("countable"),
-            DEFAULT_METADATA_MAX_ENTRIES
+            usize::from(DEFAULT_METADATA_MAX_ENTRIES)
         );
 
         let pre_auth_key =
@@ -13603,17 +13603,21 @@ mod tests {
             "org.fastmcp.provider",
             1,
             "https://auth.example.test",
-            "sha256:abcd1234ef01",
+            "mcp://servers/main",
+            "tenant-1",
+            "subject-user-42",
         )
         .expect("verified security facts admit");
         let verified_partition = AdmissionPartition::verified(verified_key);
         assert!(verified_partition.is_verified());
         assert!(!verified_partition.is_pre_auth());
 
-        let flow_key = AuthorizationFlowQuotaKey::from_listener_and_source(
-            "mcp.example.test",
-            "tcp:203.0.113.8",
-            "flow-99",
+        let flow_key = AuthorizationFlowQuotaKey::from_configured_flow(
+            "https://auth.example.test",
+            "mcp://servers/main",
+            "client-reg-1",
+            "redirect-loopback",
+            "auth-profile-modern",
         )
         .expect("flow key admits");
         let flow_partition = AdmissionPartition::authorization_flow(flow_key);
