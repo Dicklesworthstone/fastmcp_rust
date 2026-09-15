@@ -881,7 +881,10 @@ fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, SocketAddr, &str
 }
 
 /// Outgoing HTTP response.
-#[derive(Debug, Clone)]
+///
+/// Diagnostics expose only status and sizes because headers and bodies may
+/// contain OAuth codes, bearer credentials, or cookies.
+#[derive(Clone)]
 pub struct HttpResponse {
     /// HTTP status code.
     pub status: HttpStatus,
@@ -889,6 +892,17 @@ pub struct HttpResponse {
     pub headers: HashMap<String, String>,
     /// Response body.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 const JSON_ENCODING_ERROR_BODY: &[u8] =
@@ -8329,6 +8343,83 @@ Content-Length: {}\r\n\
             0,
             "the duplicate singleton leaves downstream dispatch state unchanged"
         );
+    }
+
+    fn http_response_diagnostic_fixture(value: &str) -> HttpResponse {
+        HttpResponse::ok()
+            .with_header(
+                "location",
+                format!("https://client.example/callback?code={value}"),
+            )
+            .with_header("set-cookie", format!("session={value}; HttpOnly; Secure"))
+            .with_json(&serde_json::json!({
+                "access_token": value,
+                "refresh_token": format!("{value}-refresh")
+            }))
+    }
+
+    fn assert_http_response_diagnostics_preserve_wire(value: &str) {
+        const PUBLIC_VALUE: &str = "public-value-0123456789";
+        assert_eq!(value.len(), PUBLIC_VALUE.len());
+        let response = http_response_diagnostic_fixture(value);
+        let public_response = http_response_diagnostic_fixture(PUBLIC_VALUE);
+        let original = response.clone();
+        let normal = format!("{response:?}");
+        let pretty = format!("{response:#?}");
+
+        assert_eq!(response.body.len(), public_response.body.len());
+        assert_eq!(response.headers.len(), public_response.headers.len());
+        assert_eq!(normal, format!("{public_response:?}"));
+        assert_eq!(pretty, format!("{public_response:#?}"));
+        for diagnostic in [&normal, &pretty] {
+            assert!(diagnostic.contains("HttpResponse"));
+            assert!(diagnostic.contains("status: HttpStatus"));
+            assert!(diagnostic.contains("200"));
+            assert!(diagnostic.contains("header_count: 3"));
+            assert!(diagnostic.contains(&format!("body_bytes: {}", response.body.len())));
+            assert!(!diagnostic.contains(value));
+            for header_value in response.headers.values() {
+                assert!(!diagnostic.contains(header_value));
+            }
+            assert!(!diagnostic.contains(&format!("{:?}", response.body)));
+            assert!(!diagnostic.contains(&format!("{:#?}", response.body)));
+        }
+
+        let mut transport = HttpTransport::new(Cursor::new(Vec::<u8>::new()), Vec::new());
+        transport
+            .write_response(&response)
+            .expect("the public writer preserves admitted response contents");
+        let wire = String::from_utf8(transport.writer)
+            .expect("ASCII headers and the JSON body remain valid UTF-8");
+        let (head, body) = wire
+            .split_once("\r\n\r\n")
+            .expect("the actual writer separates headers from the body");
+        let mut lines = head.split("\r\n");
+        assert_eq!(lines.next(), Some("HTTP/1.1 200 OK"));
+        let headers: HashMap<String, String> = lines
+            .map(|line| {
+                let (name, value) = line.split_once(": ").expect("valid written header");
+                (name.to_owned(), value.to_owned())
+            })
+            .collect();
+        let mut expected_headers = original.headers.clone();
+        expected_headers.insert("content-length".to_owned(), original.body.len().to_string());
+        assert_eq!(headers, expected_headers);
+        assert_eq!(body.as_bytes(), original.body.as_slice());
+        assert_eq!(response.status, original.status);
+        assert_eq!(response.headers, original.headers);
+        assert_eq!(response.body, original.body);
+    }
+
+    #[test]
+    fn auth_01_http_response_public_values_remain_writable() {
+        assert_http_response_diagnostics_preserve_wire("public-value-0123456789");
+    }
+
+    #[test]
+    fn auth_01_http_response_credential_values_are_not_diagnostics() {
+        // Only the equally sized header/body values change from the public case.
+        assert_http_response_diagnostics_preserve_wire("secret-value-9876543210");
     }
 
     #[test]
