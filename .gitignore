@@ -96,3 +96,12 @@ beads_compliance_audit/
 # Local campaign/canary audit dumps and Python bytecode.
 .tmp_audit/
 __pycache__/
+
+# === agent ephemeral residue 2026-09-15 ===
+# Per-host gate/verify wrappers dropped at the repo root; never product source.
+/.gate_*.sh
+/.verify_*.sh
+.beads/*.lock
+.beads/*-fsqlite-ns-gate
+.beads/*-fsqlite-ns-use
+.beads-recovery-*/
