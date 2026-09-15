@@ -260,7 +260,10 @@ fn install_task_fixture(
             .expect("seed real task store");
     }
     let state_output = std::env::args().nth(2);
-    let error_output = state_output.clone();
+    // Peer-error observations must not overwrite the task-transition evidence.
+    let error_output = state_output
+        .as_ref()
+        .map(|path| std::path::Path::new(path).with_extension("error.json"));
     let runtime = FinalTaskRuntime::new(
         store.clone(),
         FinalTaskRuntimeConfig::new(60_000, Some(100)).expect("task retention policy"),
@@ -292,6 +295,7 @@ fn install_task_fixture(
             store,
             task_id,
             reads: std::sync::atomic::AtomicUsize::new(0),
+            first_read_instant: std::sync::Mutex::new(None),
         })
         .mask_error_details(false);
     (builder, runner)
@@ -299,11 +303,12 @@ fn install_task_fixture(
 
 #[cfg(feature = "tasks")]
 struct TaskErrorExitData {
-    error_output: Option<String>,
+    error_output: Option<std::path::PathBuf>,
     watch_gap: Option<std::path::PathBuf>,
     store: std::sync::Arc<fastmcp_rust::InMemoryFinalTaskStore>,
     task_id: fastmcp_rust::FinalTaskId,
     reads: std::sync::atomic::AtomicUsize,
+    first_read_instant: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[cfg(feature = "tasks")]
@@ -324,6 +329,14 @@ impl fastmcp_rust::Middleware for TaskErrorExitData {
                 let reads = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
                 std::fs::write(dir.join("watch_gap_reads"), reads.to_string())
                     .expect("retain real task read count");
+                let mut first = self.first_read_instant.lock().unwrap();
+                if let Some(first_instant) = *first {
+                    let elapsed_ms = first_instant.elapsed().as_millis();
+                    std::fs::write(dir.join("watch_gap_read_interval_ms"), elapsed_ms.to_string())
+                        .expect("retain real task read interval");
+                } else {
+                    *first = Some(std::time::Instant::now());
+                }
             } else if request.method == "subscriptions/listen" {
                 assert_eq!(self.reads.load(Ordering::SeqCst), 1);
                 let task = self

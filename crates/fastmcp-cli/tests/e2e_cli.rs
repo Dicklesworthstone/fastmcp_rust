@@ -2972,6 +2972,331 @@ server.serve_forever()
         assert!(changed.get("inputRequests").is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    fn assert_stdio_task_descendant_cleanup(wrong_task: bool) {
+        const WRAPPER: &str = r#"
+set -eu
+/bin/sh -c '
+trap "" HUP INT TERM
+printf "%s\n" "$$" > "$1"
+while :; do /bin/sleep 3600; done
+' fastmcp-task-descendant "$1" >"$1.stdout" 2>"$1.stderr" &
+while [ ! -f "$2" ]; do /bin/sleep 0.01; done
+shift 2
+exec "$@"
+"#;
+        let fixture = TaskFixture::new(true);
+        let task_path = fixture.root.join("task.json");
+        let original = std::fs::read(&task_path).unwrap();
+        let changed_path = fixture.root.join("changed.json");
+        let input = fixture.root.join("input.json");
+        std::fs::write(&input, r#"{"roots":{"roots":[]}}"#).unwrap();
+        let descendant_path = fixture.root.join("descendant.pid");
+        let release_path = fixture.root.join("release-server");
+        let stdout_path = fixture.root.join("update.stdout");
+        let stderr_path = fixture.root.join("update.stderr");
+        // Only the requested ID changes. Both invocations launch the same
+        // real framework server and answer the same pending roots request.
+        let requested_id = if wrong_task {
+            format!("{}-unknown", fixture.id())
+        } else {
+            fixture.id().to_owned()
+        };
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "tasks",
+            "update",
+            &requested_id,
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+            "--server",
+            "/bin/sh",
+        ]);
+        for argument in [
+            "-c",
+            WRAPPER,
+            "fastmcp-task-wrapper",
+            descendant_path.to_str().unwrap(),
+            release_path.to_str().unwrap(),
+            env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server"),
+            task_path.to_str().unwrap(),
+            changed_path.to_str().unwrap(),
+        ] {
+            command.arg("--server-arg").arg(argument);
+        }
+        command
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        let mut process = ProcessGroupGuard::spawn(&mut command);
+        wait_for_file(&descendant_path, "\n");
+        let descendant_pid = std::fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let (state, descendant_group) = read_linux_process_state_and_group(descendant_pid)
+            .expect("inspect descendant before server initialization")
+            .expect("descendant must be present before server initialization");
+        assert!(!matches!(state, 'Z' | 'X' | 'x'));
+        assert_eq!(std::fs::read(&task_path).unwrap(), original);
+        assert!(!changed_path.exists());
+        std::fs::write(&release_path, b"start").unwrap();
+
+        // Keep the exact CLI child unreaped while inspecting its descendant.
+        // wait_until and kill_and_reap stop the harness group and could hide
+        // the production leak if called before this liveness assertion.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !process
+            .child_is_zombie("inspect CLI before descendant cleanup assertion")
+            .unwrap()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Tasks update failed to exit: {}",
+                std::fs::read_to_string(&stderr_path).unwrap()
+            );
+            std::thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        let descendant = read_linux_process_state_and_group(descendant_pid)
+            .expect("inspect descendant after CLI exit and before harness cleanup");
+        assert!(
+            descendant.is_none_or(|(state, _)| matches!(state, 'Z' | 'X' | 'x')),
+            "Tasks update exited with descendant {descendant_pid} still live: {descendant:?}"
+        );
+        assert!(
+            !process_group_has_live_member(descendant_group)
+                .expect("inspect entire descendant group before harness cleanup"),
+            "Tasks update exited with live members in descendant group {descendant_group}"
+        );
+        let status = process
+            .kill_and_reap()
+            .expect("cleanup and reap CLI after independent liveness assertion")
+            .expect("exited CLI must return its status");
+        let output = Output {
+            status,
+            stdout: std::fs::read(&stdout_path).unwrap(),
+            stderr: std::fs::read(&stderr_path).unwrap(),
+        };
+        if wrong_task {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(stderr_str(&output).contains("Task not found"));
+            assert!(
+                !stderr_str(&output).contains("client cleanup also failed:"),
+                "wrong-task rejection reported unverified cleanup: {}",
+                stderr_str(&output)
+            );
+            assert_eq!(std::fs::read(&task_path).unwrap(), original);
+            assert!(!changed_path.exists());
+            let peer_error: Value = serde_json::from_slice(
+                &std::fs::read(changed_path.with_extension("error.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(peer_error["message"], "Task not found");
+            assert_eq!(peer_error["data"]["exit_code"], 0);
+        } else {
+            assert_eq!(document(&output)["event"], "update-acknowledged");
+            let changed: Value =
+                serde_json::from_slice(&std::fs::read(&changed_path).unwrap()).unwrap();
+            assert_eq!(changed["taskId"], fixture.task["taskId"]);
+            assert_eq!(changed["status"], "working");
+            assert!(changed.get("inputRequests").is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_02_b_stdio_update_stops_descendants_before_success() {
+        assert_stdio_task_descendant_cleanup(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_02_b_stdio_wrong_task_stops_descendants_without_mutation() {
+        assert_stdio_task_descendant_cleanup(true);
+    }
+
+    fn assert_task_input_response_id_admission(duplicate: bool) {
+        let fixture = TaskFixture::new(true);
+        let task_path = fixture.root.join("task.json");
+        let task_bytes = std::fs::read(&task_path).unwrap();
+        let changed_path = fixture.root.join("changed.json");
+        let input = fixture.root.join("input.json");
+        // Change only duplicate membership; both copies contain the exact
+        // same valid response to the fixture's outstanding roots request.
+        let responses = if duplicate {
+            r#"{"roots":{"roots":[]},"roots":{"roots":[]}}"#
+        } else {
+            r#"{"roots":{"roots":[]}}"#
+        };
+        std::fs::write(&input, responses).unwrap();
+        let (mut process, endpoint) = fixture.http();
+        let get_args = [
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ];
+        let before = run_cli(&get_args);
+        assert_eq!(document(&before)["data"], fixture.task);
+        assert!(!changed_path.exists());
+        let output = run_cli(&[
+            "tasks",
+            "update",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+            "--input-file",
+            input.to_str().unwrap(),
+        ]);
+        let after = run_cli(&get_args);
+        let after_task = document(&after)["data"].clone();
+        if duplicate {
+            assert!(
+                !output.status.success(),
+                "duplicate response ID was admitted"
+            );
+            assert!(output.stdout.is_empty());
+            assert!(stderr_str(&output).contains("--input-file must be a readable regular JSON"));
+            assert!(!stderr_str(&output).contains(responses));
+            assert!(!stderr_str(&output).contains(input.to_str().unwrap()));
+            assert_eq!(after_task, fixture.task);
+            assert_eq!(after.stdout, before.stdout);
+            assert_eq!(std::fs::read(&task_path).unwrap(), task_bytes);
+            assert!(!changed_path.exists());
+        } else {
+            assert_eq!(document(&output)["event"], "update-acknowledged");
+            assert_eq!(after_task["taskId"], fixture.task["taskId"]);
+            assert_eq!(after_task["status"], "working");
+            assert!(after_task.get("inputRequests").is_none());
+            let changed: Value =
+                serde_json::from_slice(&std::fs::read(&changed_path).unwrap()).unwrap();
+            assert_eq!(changed, after_task);
+        }
+        process.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_update_unique_response_id_succeeds() {
+        assert_task_input_response_id_admission(false);
+    }
+
+    #[test]
+    fn cli_02_b_update_duplicate_response_id_rejects_without_mutation() {
+        assert_task_input_response_id_admission(true);
+    }
+
+    fn assert_task_stdout_deadline(drain_stdout: bool) {
+        let mut fixture = TaskFixture::new_with_status("completed");
+        let message = "x".repeat(512 * 1024);
+        fixture.task["statusMessage"] = json!(message);
+        let task_path = fixture.root.join("task.json");
+        let task_bytes = serde_json::to_vec(&fixture.task).unwrap();
+        std::fs::write(&task_path, &task_bytes).unwrap();
+        let (mut server, endpoint) = fixture.http();
+        let get_args = [
+            "tasks",
+            "get",
+            fixture.id(),
+            "--http-url",
+            &endpoint,
+            "--json",
+        ];
+        let before = run_cli(&get_args);
+        assert_eq!(document(&before)["data"], fixture.task);
+        let mut command = Command::new(get_binary_path());
+        command
+            .args([
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--timeout",
+                "2",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut watch = ProcessGroupGuard::spawn(&mut command);
+        let mut unread_stdout = Some(watch.child_mut().stdout.take().unwrap());
+        // The only changed dimension is whether the same stdout pipe is
+        // drained while the CLI runs. Retain the negative's read end open.
+        let stdout_capture = if drain_stdout {
+            unread_stdout.take().map(capture_pipe)
+        } else {
+            None
+        };
+        let stderr_capture = capture_pipe(watch.child_mut().stderr.take().unwrap());
+        let wait_result = watch.wait_until(Duration::from_secs(8));
+        let elapsed = started.elapsed();
+        let stdout_capture =
+            stdout_capture.unwrap_or_else(|| capture_pipe(unread_stdout.take().unwrap()));
+        let (stdout, stdout_error) =
+            finish_capture(stdout_capture, "stdout", CAPTURE_DRAIN_DEADLINE);
+        let (stderr, stderr_error) =
+            finish_capture(stderr_capture, "stderr", CAPTURE_DRAIN_DEADLINE);
+        assert!(stdout_error.is_none(), "{stdout_error:?}");
+        assert!(stderr_error.is_none(), "{stderr_error:?}");
+        let status = wait_result.unwrap_or_else(|timeout| {
+            panic!(
+                "task watch exceeded its output deadline: {timeout:?}; captured_stdout={} bytes; stderr={}",
+                stdout.len(),
+                String::from_utf8_lossy(&stderr)
+            )
+        });
+        let output = Output {
+            status,
+            stdout,
+            stderr,
+        };
+        assert!(elapsed < Duration::from_secs(8));
+        if drain_stdout {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            let rows = stdout_str(&output)
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["event"], "snapshot");
+            assert_eq!(rows[0]["data"], fixture.task);
+            assert_eq!(rows[0]["data"]["statusMessage"], message);
+            assert_eq!(rows[1]["event"], "watch-ended");
+            assert_eq!(rows[1]["data"]["reason"], "task-terminal");
+            assert_eq!(rows[1]["data"]["updates"], 0);
+        } else {
+            assert!(!output.status.success());
+            assert!(stderr_str(&output).contains("task output reached --timeout"));
+            // A committed prefix smaller than the payload, followed by the
+            // output-specific timeout, proves this open pipe actually filled.
+            assert!(output.stdout.starts_with(br#"{"event":"snapshot""#));
+            assert!(output.stdout.len() < message.len());
+            assert!(!output.stdout.contains(&b'\n'));
+            assert!(!stdout_str(&output).contains("watch-ended"));
+        }
+        let after = run_cli(&get_args);
+        assert_eq!(document(&after)["data"], fixture.task);
+        assert_eq!(after.stdout, before.stdout);
+        assert_eq!(std::fs::read(&task_path).unwrap(), task_bytes);
+        assert!(!fixture.root.join("changed.json").exists());
+        server.kill_and_reap().expect("HTTP server cleanup");
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_drained_stdout_preserves_large_terminal_snapshot() {
+        assert_task_stdout_deadline(true);
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_unread_stdout_exits_within_deadline() {
+        assert_task_stdout_deadline(false);
+    }
+
     #[test]
     fn cli_02_a_completed_result_json_preserves_numeric_values() {
         let fixture = TaskFixture::new(false);
@@ -3397,21 +3722,29 @@ server.serve_forever()
     #[test]
     fn cli_02_b_peer_error_data_cannot_forge_cli_success() {
         let fixture = TaskFixture::new(false);
+        let original = std::fs::read(fixture.root.join("task.json")).unwrap();
         assert_eq!(
             document(&fixture.stdio("get", &["--json"]))["data"],
             fixture.task
         );
         let wrong_id = format!("{}-wrong", fixture.id());
         let output = fixture.stdio_for(&wrong_id, "get", &["--json"]);
-        let peer_error: Value =
-            serde_json::from_slice(&std::fs::read(fixture.root.join("changed.json")).unwrap())
-                .unwrap();
+        let peer_error: Value = serde_json::from_slice(
+            &std::fs::read(fixture.root.join("changed.error.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(peer_error["message"], "Task not found");
         assert_eq!(peer_error["data"]["exit_code"], 0);
         assert!(
             !output.status.success(),
             "a failed RPC remains a failed CLI command despite peer exit_code=0"
         );
         assert!(output.stdout.is_empty());
+        assert_eq!(
+            std::fs::read(fixture.root.join("task.json")).unwrap(),
+            original
+        );
+        assert!(!fixture.root.join("changed.json").exists());
     }
 
     #[test]
@@ -3863,5 +4196,110 @@ server.serve_forever()
     #[test]
     fn cli_02_b_stdio_watch_unchanged_reconciliation_emits_no_update() {
         check_nonterminal_reconciliation(false, false);
+    }
+
+    fn check_watch_poll_interval(http: bool, short_budget: bool) {
+        let mut fixture = TaskFixture::new(false);
+        // Server declares a minimum poll interval of 1500ms.
+        let poll_interval_ms = 1500u64;
+        fixture.task["pollIntervalMs"] = json!(poll_interval_ms);
+        let task_bytes = serde_json::to_vec(&fixture.task).unwrap();
+        std::fs::write(fixture.root.join("task.json"), &task_bytes).unwrap();
+        std::fs::write(fixture.root.join("watch_gap"), "complete").unwrap();
+
+        // Positive test gives sufficient budget (--timeout 4) to honor the 1500ms interval.
+        // Near-identical negative test gives a short budget (--timeout 1) differing only
+        // in budget duration; since 1s < 1500ms, delay >= remaining, so the CLI must not poll early.
+        let timeout_str = if short_budget { "1" } else { "4" };
+        let output = if http {
+            let (mut server, endpoint) = fixture.http();
+            let output = run_cli(&[
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--timeout",
+                timeout_str,
+            ]);
+            server.kill_and_reap().expect("HTTP server cleanup");
+            output
+        } else {
+            fixture.stdio("watch", &["--json", "--timeout", timeout_str])
+        };
+
+        let events: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.len() >= 2, "{}", stderr_str(&output));
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"], fixture.task);
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+
+        if short_budget {
+            assert!(
+                !output.status.success(),
+                "short budget must exit with failure instead of early poll"
+            );
+            assert!(stderr_str(&output).contains("--timeout"));
+            // Exactly 1 read: the initial snapshot read only. Zero premature reconciliation poll!
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("watch_gap_reads")).unwrap(),
+                "1",
+                "watch must not poll early when timeout expires before pollIntervalMs"
+            );
+            assert!(
+                !fixture.root.join("watch_gap_read_interval_ms").exists(),
+                "no reconciliation read must be issued within short budget"
+            );
+            assert_eq!(events.len(), 2, "no update or terminal event emitted");
+        } else {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("watch_gap_reads")).unwrap(),
+                "2",
+                "watch must reconcile through a second tasks/get after interval elapses"
+            );
+            let interval_str =
+                std::fs::read_to_string(fixture.root.join("watch_gap_read_interval_ms")).unwrap();
+            let elapsed_ms: u64 = interval_str.parse().expect("valid interval integer");
+            // Clock/timing assertion: server recorded at least 1400ms between reads.
+            assert!(
+                elapsed_ms >= 1400,
+                "reconciliation poll occurred too early: elapsed={elapsed_ms}ms, minimum={poll_interval_ms}ms"
+            );
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["event"], "task-updated");
+            assert_eq!(events[2]["data"]["status"], "completed");
+            assert_eq!(
+                events[2]["data"]["result"]["content"][0]["text"],
+                "completed before listen"
+            );
+            assert_eq!(events[3]["event"], "watch-ended");
+            assert_eq!(events[3]["data"]["reason"], "task-terminal");
+            assert_eq!(events[3]["data"]["updates"], 1);
+        }
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_honors_poll_interval_before_reconciliation() {
+        check_watch_poll_interval(true, false);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_honors_poll_interval_before_reconciliation() {
+        check_watch_poll_interval(false, false);
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_short_budget_does_not_poll_early() {
+        check_watch_poll_interval(true, true);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_short_budget_does_not_poll_early() {
+        check_watch_poll_interval(false, true);
     }
 }

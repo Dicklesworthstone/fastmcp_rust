@@ -5947,14 +5947,79 @@ fn read_task_inputs(path: &Path) -> McpResult<fastmcp_protocol::TaskInputRespons
     if bytes.len() > MAX_INPUT_BYTES as usize {
         return Err(invalid());
     }
+    // Validate the original object before map deserialization can collapse
+    // duplicate response IDs or nested members into a different task update.
+    fastmcp_protocol::admit_raw_jsonrpc_document(&bytes, MAX_INPUT_BYTES as usize)
+        .map_err(|_| invalid())?;
     // Do not echo parser errors: embedded input responses can contain secrets.
     serde_json::from_slice(&bytes).map_err(|_| invalid())
 }
 
 #[cfg(feature = "tasks")]
-fn write_task_event<T: Serialize>(json: bool, event: &str, data: &T) -> McpResult<()> {
-    let stdout = io::stdout();
-    write_task_event_to(&mut stdout.lock(), json, event, data)
+struct TaskOutput {
+    json: bool,
+    #[cfg(unix)]
+    deadline: std::time::Instant,
+}
+
+#[cfg(feature = "tasks")]
+impl TaskOutput {
+    fn new(connection: &TaskConnection) -> McpResult<Self> {
+        Ok(Self {
+            json: connection.json,
+            #[cfg(unix)]
+            deadline: std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(connection.timeout))
+                .ok_or_else(|| {
+                    fastmcp_core::McpError::invalid_params("task output deadline is out of range")
+                })?,
+        })
+    }
+
+    fn write_event<T: Serialize>(&self, cx: &Cx, event: &str, data: &T) -> McpResult<()> {
+        #[cfg(unix)]
+        {
+            cx.checkpoint()
+                .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+            let mut bytes = Vec::new();
+            write_task_event_to(&mut bytes, self.json, event, data)?;
+            cx.checkpoint()
+                .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+            let timed_out = || {
+                fastmcp_core::McpError::internal_error(
+                    "task output reached --timeout; command output is incomplete",
+                )
+            };
+            let remaining = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(timed_out)?;
+            // Commit the exact encoded event with the original command's
+            // remaining budget. Cancellation during this synchronous commit
+            // is observed afterward; ordinary Unix pipes/sockets cannot hold
+            // it beyond the deadline. Regular-file/device bounds differ.
+            fastmcp_transport::AsyncStdout::new()
+                .write_all_bounded(&bytes, remaining)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        timed_out()
+                    } else {
+                        fastmcp_core::McpError::internal_error("could not write task output")
+                    }
+                })?;
+            cx.checkpoint()
+                .map_err(|_| fastmcp_core::McpError::request_cancelled())
+        }
+        #[cfg(not(unix))]
+        {
+            // The public bounded stdout API is Unix-only. Keep this existing
+            // path explicit; cross-platform bounded output remains unverified.
+            let _ = cx;
+            let stdout = io::stdout();
+            write_task_event_to(&mut stdout.lock(), self.json, event, data)
+        }
+    }
 }
 
 #[cfg(feature = "tasks")]
@@ -6069,7 +6134,8 @@ fn validate_task_watch_acknowledgement(
 
 #[cfg(feature = "tasks")]
 fn reconcile_task_snapshot(
-    connection: &TaskConnection,
+    cx: &Cx,
+    output: &TaskOutput,
     previous: &fastmcp_protocol::tasks_extension::Task,
     task: &fastmcp_protocol::tasks_extension::Task,
     updates: &mut u64,
@@ -6082,19 +6148,19 @@ fn reconcile_task_snapshot(
     if previous == current {
         return Ok(false);
     }
-    write_task_event(connection.json, "task-updated", task)?;
+    output.write_event(cx, "task-updated", task)?;
     *updates += 1;
     if is_terminal_task_status(task.base().status) {
-        write_task_event(
-            connection.json,
+        output.write_event(
+            cx,
             "watch-ended",
             &serde_json::json!({"reason": "task-terminal", "updates": updates}),
         )?;
         return Ok(true);
     }
     if *updates >= max_events {
-        write_task_event(
-            connection.json,
+        output.write_event(
+            cx,
             "watch-ended",
             &serde_json::json!({"reason": "max-events", "updates": updates}),
         )?;
@@ -6119,6 +6185,64 @@ fn remaining_task_watch_time(
 }
 
 #[cfg(feature = "tasks")]
+fn task_poll_delay(
+    last_poll: std::time::Instant,
+    poll_interval_ms: Option<&fastmcp_protocol::tasks_extension::TaskDuration>,
+) -> McpResult<Option<std::time::Duration>> {
+    if let Some(poll_interval) = poll_interval_ms {
+        let millis = poll_interval
+            .try_as_millis()
+            .map_err(|_| fastmcp_core::McpError::invalid_params("invalid pollIntervalMs"))?;
+        let min_delay = std::time::Duration::from_millis(millis);
+        let elapsed = last_poll.elapsed();
+        if elapsed < min_delay {
+            return Ok(Some(min_delay - elapsed));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "tasks")]
+async fn wait_for_task_poll_delay(
+    cx: &Cx,
+    connection: &TaskConnection,
+    started: std::time::Instant,
+    delay: std::time::Duration,
+) -> McpResult<()> {
+    let remaining = remaining_task_watch_time(connection, started)?;
+    if delay >= remaining {
+        asupersync::time::sleep(cx.now(), remaining).await;
+        return Err(fastmcp_core::McpError::internal_error(
+            "task watch reached --timeout; task completion is unknown",
+        ));
+    }
+    asupersync::time::sleep(cx.now(), delay).await;
+    cx.checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "tasks"))]
+fn wait_for_task_poll_delay_sync(
+    cx: &Cx,
+    connection: &TaskConnection,
+    started: std::time::Instant,
+    delay: std::time::Duration,
+) -> McpResult<()> {
+    let remaining = remaining_task_watch_time(connection, started)?;
+    if delay >= remaining {
+        std::thread::sleep(remaining);
+        return Err(fastmcp_core::McpError::internal_error(
+            "task watch reached --timeout; task completion is unknown",
+        ));
+    }
+    std::thread::sleep(delay);
+    cx.checkpoint()
+        .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+    Ok(())
+}
+
+#[cfg(feature = "tasks")]
 async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) -> McpResult<()> {
     use fastmcp_protocol::tasks_extension::TaskId;
     let task_id = TaskId::parse(action.task_id()).map_err(|_| {
@@ -6131,6 +6255,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             "tasks requires exactly one of --server or --http-url",
         ));
     }
+    let output = TaskOutput::new(connection)?;
     let inputs = match action {
         TaskAction::Update { input_file, .. } => Some(read_task_inputs(input_file)?),
         _ => None,
@@ -6146,12 +6271,23 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             .request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                 duration, duration,
             )?)
+            // Tasks owns this server launch, including workers it starts in
+            // the same Unix process group, through success and failure cleanup.
+            .owned_process_group(cfg!(unix))
             .connect_stdio_with_cx(server, &args, cx)
             .await?;
         #[cfg(unix)]
         {
-            let outcome =
-                run_yielding_stdio_task(cx, &mut client, connection, action, task_id, inputs).await;
+            let outcome = run_yielding_stdio_task(
+                cx,
+                &mut client,
+                connection,
+                &output,
+                action,
+                task_id,
+                inputs,
+            )
+            .await;
             finish_inspect_acquisition_async(outcome, client.close_with_cx(cx)).await
         }
         #[cfg(not(unix))]
@@ -6166,6 +6302,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
                         &worker_cx,
                         &mut client,
                         &connection,
+                        &output,
                         &action,
                         task_id,
                         inputs,
@@ -6187,7 +6324,7 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
         asupersync::time::timeout(
             cx.now(),
             std::time::Duration::from_secs(connection.timeout),
-            Box::pin(run_http_task(cx, connection, action, task_id, inputs)),
+            Box::pin(run_http_task(cx, connection, &output, action, task_id, inputs)),
         ).await.map_err(|_| fastmcp_core::McpError::internal_error(
             "Tasks HTTP operation reached --timeout; the request stream was closed; task completion is unknown",
         ))?
@@ -6199,6 +6336,7 @@ fn run_stdio_task(
     cx: &Cx,
     client: &mut Client,
     connection: &TaskConnection,
+    output: &TaskOutput,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
@@ -6206,13 +6344,13 @@ fn run_stdio_task(
     let cancellation = fastmcp_core::McpRequestCancellation::new();
     if matches!(action, TaskAction::Cancel { .. }) {
         let result = client.cancel_task_final_with_cancellation(cx, &cancellation, task_id)?;
-        return write_task_event(connection.json, "cancellation-acknowledged", &result);
+        return output.write_event(cx, "cancellation-acknowledged", &result);
     }
     let task = client
         .get_task_final_with_cancellation(cx, &cancellation, task_id.clone())?
         .task;
     match action {
-        TaskAction::Get { .. } => write_task_event(connection.json, "snapshot", &task),
+        TaskAction::Get { .. } => output.write_event(cx, "snapshot", &task),
         TaskAction::Update { .. } => {
             let result = client.update_task_final_with_cancellation(
                 cx,
@@ -6222,13 +6360,13 @@ fn run_stdio_task(
                     fastmcp_core::McpError::invalid_params("missing input responses")
                 })?,
             )?;
-            write_task_event(connection.json, "update-acknowledged", &result)
+            output.write_event(cx, "update-acknowledged", &result)
         }
         TaskAction::Watch { max_events, .. } => {
-            write_task_event(connection.json, "snapshot", &task)?;
+            output.write_event(cx, "snapshot", &task)?;
             if is_terminal_task_status(task.base().status) {
-                return write_task_event(
-                    connection.json,
+                return output.write_event(
+                    cx,
                     "watch-ended",
                     &serde_json::json!({"reason": "task-terminal", "updates": 0}),
                 );
@@ -6241,6 +6379,7 @@ fn run_stdio_task(
                 cx,
                 client,
                 connection,
+                output,
                 &task_id,
                 &task,
                 *max_events,
@@ -6259,6 +6398,7 @@ async fn run_yielding_stdio_task(
     cx: &Cx,
     client: &mut Client,
     connection: &TaskConnection,
+    output: &TaskOutput,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
@@ -6268,14 +6408,15 @@ async fn run_yielding_stdio_task(
         let result = client
             .cancel_task_final_with_cx(cx, &cancellation, task_id)
             .await?;
-        return write_task_event(connection.json, "cancellation-acknowledged", &result);
+        return output.write_event(cx, "cancellation-acknowledged", &result);
     }
     let task = client
         .get_task_final_with_cx(cx, &cancellation, task_id.clone())
         .await?
         .task;
+    let mut last_poll = std::time::Instant::now();
     match action {
-        TaskAction::Get { .. } => write_task_event(connection.json, "snapshot", &task),
+        TaskAction::Get { .. } => output.write_event(cx, "snapshot", &task),
         TaskAction::Update { .. } => {
             let result = client
                 .update_task_final_with_cx(
@@ -6287,13 +6428,13 @@ async fn run_yielding_stdio_task(
                     })?,
                 )
                 .await?;
-            write_task_event(connection.json, "update-acknowledged", &result)
+            output.write_event(cx, "update-acknowledged", &result)
         }
         TaskAction::Watch { max_events, .. } => {
-            write_task_event(connection.json, "snapshot", &task)?;
+            output.write_event(cx, "snapshot", &task)?;
             if is_terminal_task_status(task.base().status) {
-                return write_task_event(
-                    connection.json,
+                return output.write_event(
+                    cx,
                     "watch-ended",
                     &serde_json::json!({"reason": "task-terminal", "updates": 0}),
                 );
@@ -6319,16 +6460,24 @@ async fn run_yielding_stdio_task(
                         cx,
                         client,
                         connection,
+                        output,
                         &task_id,
                         *max_events,
                         &cancellation,
                         started,
                         &mut updates,
                         &mut latest_task,
+                        &mut last_poll,
                     )? {
                         TaskWatchStep::Pending => asupersync::runtime::yield_now().await,
                         TaskWatchStep::Finished => break Ok(()),
                         TaskWatchStep::Reconcile { reconnect } => {
+                            if let Some(delay) = task_poll_delay(
+                                last_poll,
+                                latest_task.base().poll_interval_ms.as_ref(),
+                            )? {
+                                wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                            }
                             // The subscription is now admitted. A fresh read
                             // covers a terminal transition before its admission.
                             let remaining = remaining_task_watch_time(connection, started)?;
@@ -6339,11 +6488,12 @@ async fn run_yielding_stdio_task(
                                 .get_task_final_with_cx(cx, &cancellation, task_id.clone())
                                 .await?
                                 .task;
+                            last_poll = std::time::Instant::now();
                             remaining_task_watch_time(connection, started)?;
                             let reconnect_acknowledged = reconnect_ack_pending && !reconnect;
                             if reconnect_acknowledged {
-                                write_task_event(
-                                    connection.json,
+                                output.write_event(
+                                    cx,
                                     "watch-reconnected",
                                     &serde_json::json!({
                                         "attempt": reconnects,
@@ -6353,7 +6503,8 @@ async fn run_yielding_stdio_task(
                                 reconnect_ack_pending = false;
                             }
                             if reconcile_task_snapshot(
-                                connection,
+                                cx,
+                                output,
                                 &latest_task,
                                 &task,
                                 &mut updates,
@@ -6404,12 +6555,14 @@ fn watch_stdio_task(
     cx: &Cx,
     client: &mut Client,
     connection: &TaskConnection,
+    output: &TaskOutput,
     task_id: &fastmcp_protocol::tasks_extension::TaskId,
     initial_task: &fastmcp_protocol::tasks_extension::Task,
     max_events: u64,
     cancellation: &fastmcp_core::McpRequestCancellation,
 ) -> McpResult<()> {
     let started = std::time::Instant::now();
+    let mut last_poll = std::time::Instant::now();
     let mut updates = 0;
     let mut reconnects = 0;
     let mut reconnect_ack_pending = false;
@@ -6419,16 +6572,24 @@ fn watch_stdio_task(
             cx,
             client,
             connection,
+            output,
             task_id,
             max_events,
             cancellation,
             started,
             &mut updates,
             &mut latest_task,
+            &mut last_poll,
         )? {
             TaskWatchStep::Pending => {}
             TaskWatchStep::Finished => return Ok(()),
             TaskWatchStep::Reconcile { reconnect } => {
+                if let Some(delay) = task_poll_delay(
+                    last_poll,
+                    latest_task.base().poll_interval_ms.as_ref(),
+                )? {
+                    wait_for_task_poll_delay_sync(cx, connection, started, delay)?;
+                }
                 let remaining = remaining_task_watch_time(connection, started)?;
                 client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
                     remaining, remaining,
@@ -6436,11 +6597,12 @@ fn watch_stdio_task(
                 let task = client
                     .get_task_final_with_cancellation(cx, cancellation, task_id.clone())?
                     .task;
+                last_poll = std::time::Instant::now();
                 remaining_task_watch_time(connection, started)?;
                 let reconnect_acknowledged = reconnect_ack_pending && !reconnect;
                 if reconnect_acknowledged {
-                    write_task_event(
-                        connection.json,
+                    output.write_event(
+                        cx,
                         "watch-reconnected",
                         &serde_json::json!({
                             "attempt": reconnects,
@@ -6450,7 +6612,8 @@ fn watch_stdio_task(
                     reconnect_ack_pending = false;
                 }
                 if reconcile_task_snapshot(
-                    connection,
+                    cx,
+                    output,
                     &latest_task,
                     &task,
                     &mut updates,
@@ -6486,12 +6649,14 @@ fn poll_stdio_task_watch(
     cx: &Cx,
     client: &mut Client,
     connection: &TaskConnection,
+    output: &TaskOutput,
     task_id: &fastmcp_protocol::tasks_extension::TaskId,
     max_events: u64,
     cancellation: &fastmcp_core::McpRequestCancellation,
     started: std::time::Instant,
     updates: &mut u64,
     latest_task: &mut fastmcp_protocol::tasks_extension::Task,
+    last_poll: &mut std::time::Instant,
 ) -> McpResult<TaskWatchStep> {
     use fastmcp_client::StdioTaskSubscriptionEvent;
     let timeout = std::time::Duration::from_secs(connection.timeout);
@@ -6511,7 +6676,7 @@ fn poll_stdio_task_watch(
         None => {}
         Some(StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
             validate_task_watch_acknowledgement(&filter, task_id)?;
-            write_task_event(connection.json, "watch-acknowledged", &filter)?;
+            output.write_event(cx, "watch-acknowledged", &filter)?;
             return Ok(TaskWatchStep::Reconcile { reconnect: false });
         }
         Some(StdioTaskSubscriptionEvent::Notification(notification)) => {
@@ -6520,20 +6685,21 @@ fn poll_stdio_task_watch(
                     "task watch returned a different task ID",
                 ));
             }
-            write_task_event(connection.json, "task-updated", &notification.params.task)?;
+            output.write_event(cx, "task-updated", &notification.params.task)?;
             *updates += 1;
             *latest_task = notification.params.task.clone();
+            *last_poll = std::time::Instant::now();
             if is_terminal_task_status(notification.params.task.base().status) {
-                write_task_event(
-                    connection.json,
+                output.write_event(
+                    cx,
                     "watch-ended",
                     &serde_json::json!({"reason": "task-terminal", "updates": updates}),
                 )?;
                 return Ok(TaskWatchStep::Finished);
             }
             if *updates >= max_events {
-                write_task_event(
-                    connection.json,
+                output.write_event(
+                    cx,
                     "watch-ended",
                     &serde_json::json!({"reason": "max-events", "updates": updates}),
                 )?;
@@ -6551,6 +6717,7 @@ fn poll_stdio_task_watch(
 async fn run_http_task(
     cx: &Cx,
     connection: &TaskConnection,
+    output: &TaskOutput,
     action: &TaskAction,
     task_id: fastmcp_protocol::tasks_extension::TaskId,
     inputs: Option<fastmcp_protocol::TaskInputResponses>,
@@ -6574,11 +6741,12 @@ async fn run_http_task(
         .map_err(error)?;
     if matches!(action, TaskAction::Cancel { .. }) {
         let result = client.cancel_final_task(cx, task_id).await.map_err(error)?;
-        return write_task_event(connection.json, "cancellation-acknowledged", &result);
+        return output.write_event(cx, "cancellation-acknowledged", &result);
     }
     let mut handle = client.attach_final_task(cx, task_id).await.map_err(error)?;
+    let mut last_poll = std::time::Instant::now();
     match action {
-        TaskAction::Get { .. } => write_task_event(connection.json, "snapshot", handle.task()),
+        TaskAction::Get { .. } => output.write_event(cx, "snapshot", handle.task()),
         TaskAction::Update { .. } => {
             let result = handle
                 .resume_input(
@@ -6590,13 +6758,13 @@ async fn run_http_task(
                 )
                 .await
                 .map_err(error)?;
-            write_task_event(connection.json, "update-acknowledged", &result)
+            output.write_event(cx, "update-acknowledged", &result)
         }
         TaskAction::Watch { max_events, .. } => {
-            write_task_event(connection.json, "snapshot", handle.task())?;
+            output.write_event(cx, "snapshot", handle.task())?;
             if is_terminal_task_status(handle.task().base().status) {
-                return write_task_event(
-                    connection.json,
+                return output.write_event(
+                    cx,
                     "watch-ended",
                     &serde_json::json!({"reason": "task-terminal", "updates": 0}),
                 );
@@ -6623,15 +6791,22 @@ async fn run_http_task(
                 match event {
                     fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(filter) => {
                         validate_task_watch_acknowledgement(&filter, &task_id)?;
-                        write_task_event(connection.json, "watch-acknowledged", &filter)?;
+                        output.write_event(cx, "watch-acknowledged", &filter)?;
                         // Retain the listener while reconciling the snapshot:
                         // transitions before admission are visible to this read,
                         // and later transitions remain queued on the same stream.
+                        if let Some(delay) = task_poll_delay(
+                            last_poll,
+                            latest_task.base().poll_interval_ms.as_ref(),
+                        )? {
+                            wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                        }
                         let task = handle.poll(cx, &mut client).await.map_err(error)?.clone();
+                        last_poll = std::time::Instant::now();
                         let reconnect_acknowledged = reconnect_ack_pending;
                         if reconnect_acknowledged {
-                            write_task_event(
-                                connection.json,
+                            output.write_event(
+                                cx,
                                 "watch-reconnected",
                                 &serde_json::json!({
                                     "attempt": reconnects,
@@ -6641,7 +6816,8 @@ async fn run_http_task(
                             reconnect_ack_pending = false;
                         }
                         if reconcile_task_snapshot(
-                            connection,
+                            cx,
+                            output,
                             &latest_task,
                             &task,
                             &mut updates,
@@ -6657,16 +6833,13 @@ async fn run_http_task(
                                 "task watch returned a different task ID",
                             ));
                         }
-                        write_task_event(
-                            connection.json,
-                            "task-updated",
-                            &notification.params.task,
-                        )?;
+                        output.write_event(cx, "task-updated", &notification.params.task)?;
                         updates += 1;
                         latest_task = notification.params.task.clone();
+                        last_poll = std::time::Instant::now();
                         if is_terminal_task_status(notification.params.task.base().status) {
-                            return write_task_event(
-                                connection.json,
+                            return output.write_event(
+                                cx,
                                 "watch-ended",
                                 &serde_json::json!({"reason": "task-terminal", "updates": updates}),
                             );
@@ -6674,17 +6847,25 @@ async fn run_http_task(
                         if updates >= *max_events {
                             // Dropping the client closes its listen response
                             // without cancelling the task.
-                            return write_task_event(
-                                connection.json,
+                            return output.write_event(
+                                cx,
                                 "watch-ended",
                                 &serde_json::json!({"reason": "max-events", "updates": updates}),
                             );
                         }
                     }
                     fastmcp_client::StdioTaskSubscriptionEvent::Terminal => {
+                        if let Some(delay) = task_poll_delay(
+                            last_poll,
+                            latest_task.base().poll_interval_ms.as_ref(),
+                        )? {
+                            wait_for_task_poll_delay(cx, connection, started, delay).await?;
+                        }
                         let task = handle.poll(cx, &mut client).await.map_err(error)?.clone();
+                        last_poll = std::time::Instant::now();
                         if reconcile_task_snapshot(
-                            connection,
+                            cx,
+                            output,
                             &latest_task,
                             &task,
                             &mut updates,
@@ -12537,8 +12718,9 @@ IFS= read -r end
                 }).unwrap();
                 let task_id = TaskId::parse(subject.clone()).unwrap();
                 let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, bearer_token_file: None, json: true, timeout: 5 };
+                let output = TaskOutput::new(&connection).unwrap();
                 let action = TaskAction::Watch { task_id: subject.clone(), max_events: 1 };
-                let outcome = run_yielding_stdio_task(&cx, &mut client, &connection, &action, task_id.clone(), None).await;
+                let outcome = run_yielding_stdio_task(&cx, &mut client, &connection, &output, &action, task_id.clone(), None).await;
                 if cancel {
                     assert_eq!(outcome.unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);
                 } else { outcome.unwrap(); }
@@ -12570,6 +12752,64 @@ IFS= read -r end
             // recovery assertions and completed explicit connection cleanup.
             assert!(completed.load(Ordering::SeqCst));
             root.checkpoint().unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn cli_task_poll_delay_receipt_relative_replacement_and_clearing() {
+        use fastmcp_protocol::tasks_extension::TaskDuration;
+        let now = std::time::Instant::now();
+        // 1. Unset pollIntervalMs returns None.
+        assert_eq!(task_poll_delay(now, None).unwrap(), None);
+
+        // 2. Advertised 1000ms with fresh receipt returns remaining delay.
+        let interval_1000 = TaskDuration(1000);
+        let delay = task_poll_delay(now, Some(&interval_1000)).unwrap();
+        assert!(delay.is_some());
+        let delay_ms = delay.unwrap().as_millis();
+        assert!(delay_ms <= 1000 && delay_ms >= 900);
+
+        // 3. Elapsed receipt >= advertised returns None.
+        let old = now.checked_sub(std::time::Duration::from_millis(1500)).unwrap();
+        assert_eq!(task_poll_delay(old, Some(&interval_1000)).unwrap(), None);
+
+        // 4. Replacement on new snapshot: smaller interval replaces prior.
+        let interval_500 = TaskDuration(500);
+        let recent = now.checked_sub(std::time::Duration::from_millis(200)).unwrap();
+        let replaced_delay = task_poll_delay(recent, Some(&interval_500)).unwrap();
+        assert!(replaced_delay.is_some());
+        let replaced_ms = replaced_delay.unwrap().as_millis();
+        assert!(replaced_ms <= 300 && replaced_ms >= 200);
+
+        // 5. Clearing on new snapshot: None clears delay regardless of elapsed time.
+        assert_eq!(task_poll_delay(recent, None).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn cli_wait_for_task_poll_delay_short_budget_does_not_poll_early() {
+        let runtime = build_cli_runtime().expect("CLI runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("ambient Cx");
+            let connection = TaskConnection {
+                server: None,
+                server_arg: Vec::new(),
+                http_url: Some("http://127.0.0.1:8080".to_owned()),
+                bearer_token_file: None,
+                json: true,
+                timeout: 1,
+            };
+            let started = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(50))
+                .unwrap();
+            let delay = std::time::Duration::from_millis(2000);
+            let outcome = wait_for_task_poll_delay(&cx, &connection, started, delay).await;
+            let err = outcome.unwrap_err();
+            assert!(
+                err.message.contains("task watch reached --timeout"),
+                "unexpected error: {err}"
+            );
         });
     }
 
