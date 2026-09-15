@@ -735,6 +735,18 @@ fn final_mrtr_binding(
             })
             .transpose()?
     };
+    // Stable ownership survives token rotation, but it does not authorize a
+    // continuation under changed grants. Scope grants form a set: ordering
+    // and duplicates do not change authorization. Hash only verified facts,
+    // separately from both owner identity and the operation arguments.
+    let auth = request_ctx.auth();
+    let mut grants: Vec<&str> = auth
+        .as_ref()
+        .map(|auth| auth.scopes.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    grants.sort_unstable();
+    grants.dedup();
+    let verified_grants_digest = mrtr_digest(&("fastmcp-mrtr-verified-grants-v1", grants))?;
     let binding = if is_stateless {
         MrtrExchangeBinding::stateless(
             method,
@@ -742,6 +754,7 @@ fn final_mrtr_binding(
             mrtr_digest(arguments)?,
             session_partition,
             principal_digest,
+            verified_grants_digest,
         )
     } else {
         MrtrExchangeBinding::new(
@@ -750,6 +763,7 @@ fn final_mrtr_binding(
             mrtr_digest(arguments)?,
             session_partition,
             principal_digest,
+            verified_grants_digest,
         )
     };
     Ok(Some(binding))

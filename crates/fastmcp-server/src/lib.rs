@@ -32051,6 +32051,239 @@ mod lib_unit_tests {
         auth_00_http_mrtr_cancelled_state_probe(true);
     }
 
+    struct Auth00GrantMrtrTool {
+        calls: Arc<AtomicUsize>,
+        state_only: bool,
+    }
+
+    impl ToolHandler for Auth00GrantMrtrTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "auth_00_grant_mrtr".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            if !ctx
+                .auth()
+                .is_some_and(|auth| auth.scopes.iter().any(|scope| scope == "private:read"))
+            {
+                return Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "The private read grant is required",
+                ));
+            }
+            let subject = arguments["subject"]
+                .as_str()
+                .ok_or_else(|| McpError::invalid_params("A subject is required"))?;
+            Ok(vec![Content::text(subject)])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a bidirectional::MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                let result = (|| {
+                    let content = self.call(ctx, arguments)?;
+                    let Some(inputs) = resume_inputs else {
+                        let requests = if self.state_only {
+                            None
+                        } else {
+                            live_http_mrtr_input_required().input_requests().cloned()
+                        };
+                        return Ok(FinalToolOutcome::InputRequired(
+                            fastmcp_protocol::InputRequiredResult::new(
+                                requests,
+                                Some("grant-bound-private-state".to_owned()),
+                                fastmcp_protocol::ResultMeta::empty(),
+                            )
+                            .expect("real state-only or roots continuation"),
+                        ));
+                    };
+                    assert_eq!(
+                        inputs.handler_request_state(),
+                        Some("grant-bound-private-state"),
+                    );
+                    if self.state_only {
+                        assert!(inputs.responses().is_empty());
+                    } else {
+                        assert_eq!(inputs.responses().len(), 1);
+                        assert_eq!(
+                            serde_json::to_value(
+                                inputs.roots("roots")?.expect("admitted roots input"),
+                            )
+                            .expect("roots response serializes"),
+                            serde_json::json!({"roots": []}),
+                        );
+                    }
+                    crate::handler::promote_legacy_tool_content(content)
+                        .map(FinalToolOutcome::Complete)
+                })();
+                result.map_or_else(asupersync::Outcome::Err, asupersync::Outcome::Ok)
+            })
+        }
+    }
+
+    fn auth_00_http_mrtr_grant_snapshot_probe(reduced_grants: bool) {
+        run_live_http_test(move |cx| async move {
+            for state_only in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owner = fastmcp_core::sha256_bounded(b"grant-snapshot-owner", 32).unwrap();
+                let mut initial_auth =
+                    AuthContext::with_subject("same-owner").with_session_owner(owner);
+                initial_auth.scopes = vec!["private:read".to_owned(), "public:list".to_owned()];
+                let mut retry_auth = initial_auth.clone();
+                // Both tests rotate alpha to beta. Only the required grant
+                // differs; reordering and duplicate grants remain equivalent.
+                retry_auth.scopes = vec!["public:list".to_owned(), "public:list".to_owned()];
+                if !reduced_grants {
+                    retry_auth.scopes.push("private:read".to_owned());
+                }
+                let provider = TokenAuthProvider::new(
+                    StaticTokenVerifier::new([("alpha", initial_auth), ("beta", retry_auth)])
+                        .expect("real same-owner token registrations"),
+                );
+                let endpoint = Server::new("auth-00-grants", "1.0.0")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .auth_provider(provider)
+                    .tool(Auth00GrantMrtrTool {
+                        calls: Arc::clone(&calls),
+                        state_only,
+                    })
+                    .build_http_endpoint("http://auth-grants.test")
+                    .unwrap();
+                let subject = format!("private-result-{}-{state_only}", cx.now().as_nanos());
+                let request = |request_state: Option<&str>, bearer: &str, id: i64| {
+                    let mut request = modern_http_json_tool_request("auth_00_grant_mrtr", id)
+                        .with_header("authorization", format!("Bearer {bearer}"));
+                    let mut rpc: JsonRpcRequest = serde_json::from_slice(&request.body).unwrap();
+                    let params = rpc.params.as_mut().unwrap();
+                    params["arguments"] = serde_json::json!({"subject": subject});
+                    if let Some(state) = request_state {
+                        params["requestState"] = serde_json::json!(state);
+                        if !state_only {
+                            params["inputResponses"] = serde_json::json!({
+                                "roots": bidirectional::MrtrInputResponse::roots(
+                                    fastmcp_protocol::ListRootsResult::empty(),
+                                ).unwrap(),
+                            });
+                        }
+                    }
+                    request.body = serde_json::to_vec(&rpc).unwrap();
+                    request
+                };
+                let mut issuer = endpoint.open_session(&cx).unwrap();
+                let initial = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut issuer,
+                    request(None, "alpha", 1011),
+                )
+                .await;
+                assert_eq!(initial.id, Some(1011_i64.into()));
+                assert!(initial.error.is_none());
+                let initial_result = initial.result.as_ref().unwrap();
+                assert_eq!(initial_result["resultType"], "input_required");
+                if state_only {
+                    assert!(initial_result.get("inputRequests").is_none());
+                } else {
+                    assert_eq!(
+                        initial_result["inputRequests"],
+                        serde_json::json!({"roots": {"method": "roots/list"}}),
+                    );
+                }
+                let state = initial_result["requestState"].as_str().unwrap();
+                assert!(!state.is_empty());
+                assert_ne!(state, "grant-bound-private-state");
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+                issuer.close(&cx).await;
+
+                let mut caller = endpoint.open_session(&cx).unwrap();
+                let retry = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut caller,
+                    request(Some(state), "beta", 1012),
+                )
+                .await;
+                assert_eq!(retry.id, Some(1012_i64.into()));
+                let unknown = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut caller,
+                    request(Some("unknown"), "beta", 1013),
+                )
+                .await;
+                assert_eq!(unknown.id, Some(1013_i64.into()));
+                assert!(unknown.result.is_none());
+                let unknown_error = unknown.error.as_ref().unwrap();
+                assert_eq!(unknown_error.code, McpErrorCode::InvalidParams.into());
+                let completed = if reduced_grants {
+                    assert!(retry.result.is_none());
+                    assert_eq!(retry.error.as_ref().unwrap(), unknown_error);
+                    assert_eq!(calls.load(Ordering::Acquire), 1);
+                    let mut rightful = endpoint.open_session(&cx).unwrap();
+                    let response = auth_00_handle_mrtr_http_request(
+                        &cx,
+                        &mut rightful,
+                        request(Some(state), "alpha", 1014),
+                    )
+                    .await;
+                    assert_eq!(response.id, Some(1014_i64.into()));
+                    rightful.close(&cx).await;
+                    response
+                } else {
+                    retry
+                };
+                assert!(completed.error.is_none());
+                let result = completed.result.as_ref().unwrap();
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(
+                    result["content"],
+                    serde_json::json!([{"type": "text", "text": subject}]),
+                );
+                assert_eq!(calls.load(Ordering::Acquire), 2);
+                let replay = auth_00_handle_mrtr_http_request(
+                    &cx,
+                    &mut caller,
+                    request(Some(state), "beta", 1015),
+                )
+                .await;
+                assert_eq!(replay.id, Some(1015_i64.into()));
+                assert!(replay.result.is_none());
+                assert_eq!(replay.error.as_ref().unwrap(), unknown_error);
+                assert_eq!(calls.load(Ordering::Acquire), 2);
+                assert!(cx.checkpoint().is_ok());
+                caller.close(&cx).await;
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_unchanged_grants_rotation_completes_positive() {
+        auth_00_http_mrtr_grant_snapshot_probe(false);
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_reduced_grants_preserve_state_negative() {
+        auth_00_http_mrtr_grant_snapshot_probe(true);
+    }
+
     async fn run_live_http_mrtr_retry(
         cx: &Cx,
         request_state_suffix: &str,

@@ -1148,7 +1148,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     let application = RuntimeBuilder::current_thread().build().unwrap();
     application.block_on(async {
         let cx = Cx::current().expect("application-owned runtime context");
-        let mut service = std::pin::pin!(runner.run_service(&cx));
+        // Sleep also completes on ambient cancellation. Give the service its
+        // own runtime-backed cancellation context so its normal shutdown cannot
+        // complete the independent observation timer before five seconds.
+        let service_cx = application.request_cx_with_budget(cx.budget());
+        let mut service = std::pin::pin!(runner.run_service(&service_cx));
         let mut observation_bound =
             std::pin::pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(5)));
         let mut step = 0usize;
@@ -1167,6 +1171,10 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                     "service exited before completed-task cancellation: {result:?}"
                 );
                 result.expect("caller cancellation must join the service successfully");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "the observation parent remains live after the service joins"
+                );
                 return Poll::Ready(());
             }
             if step == 3 {
@@ -1308,7 +1316,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                     assert_eq!(resumed_calls.load(Ordering::SeqCst), 2);
 
                     // Explicit caller cancellation to initiate owned natural service shutdown.
-                    cx.cancel_with(CancelKind::User, None);
+                    service_cx.cancel_with(CancelKind::User, None);
+                    assert!(
+                        cx.checkpoint().is_ok(),
+                        "service cancellation must not cancel the observation parent"
+                    );
                     step = 3;
                     task_cx.waker().wake_by_ref();
                     return Poll::Pending;

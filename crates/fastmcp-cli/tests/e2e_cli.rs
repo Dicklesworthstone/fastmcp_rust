@@ -1957,10 +1957,23 @@ fn cli_02_a_planted_negative() {
         assert!(!stderr_str(&output).contains("unsafe"));
     }
     for removed in ["list", "submit", "result", "stats"] {
-        let output = run_cli(&["tasks", removed]);
+        let mut command = Command::new(get_binary_path());
+        command
+            .args(["tasks", removed, "--help"])
+            .env("FASTMCP_CHECK_FOR_UPDATES", "0")
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("FORCE_COLOR");
+        let output = run_command(command);
         assert!(
             !output.status.success(),
-            "removed custom task command: {removed}"
+            "removed custom task command: {removed}; stderr: {}",
+            stderr_str(&output)
+        );
+        assert!(
+            stderr_str(&output).contains(&format!("unrecognized subcommand '{removed}'")),
+            "removed spelling must fail command recognition: {removed}; stderr: {}",
+            stderr_str(&output)
         );
     }
 }
@@ -4489,8 +4502,8 @@ os.close(fd)
 
     fn check_watch_slow_initial_get(http: bool, short_budget: bool) {
         let mut fixture = TaskFixture::new(false);
-        // Server declares a minimum poll interval of 600ms.
-        let poll_interval_ms = 600u64;
+        // Server declares a minimum poll interval of 1500ms.
+        let poll_interval_ms = 1500u64;
         fixture.task["pollIntervalMs"] = json!(poll_interval_ms);
         let task_bytes = serde_json::to_vec(&fixture.task).unwrap();
         std::fs::write(fixture.root.join("task.json"), &task_bytes).unwrap();
@@ -4498,12 +4511,13 @@ os.close(fd)
         // Server delays the initial tasks/get response by 600ms.
         std::fs::write(fixture.root.join("initial_read_delay_ms"), "600").unwrap();
 
-        // With --timeout 1 (1000ms), 600ms is consumed by the initial read.
-        // The remaining 400ms is less than the required 600ms poll interval,
-        // so the CLI must time out without issuing a second tasks/get.
-        // With --timeout 4 (4000ms), sufficient budget remains, so the second
-        // tasks/get is issued after honoring the 600ms interval.
-        let timeout_str = if short_budget { "1" } else { "4" };
+        // Even with zero startup cost, 600ms for the initial read plus the
+        // receipt-relative 1500ms poll interval exceeds --timeout 2 (2000ms).
+        // This leaves up to 1400ms for startup and listener admission while
+        // still forbidding a second tasks/get under the original deadline.
+        // With --timeout 4 (4000ms), the same sequence leaves up to 1900ms
+        // for startup and overhead before the required second read.
+        let timeout_str = if short_budget { "2" } else { "4" };
         let output = if http {
             let (mut server, endpoint) = fixture.http();
             let output = run_cli(&[

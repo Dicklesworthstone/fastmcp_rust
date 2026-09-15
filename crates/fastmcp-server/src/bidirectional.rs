@@ -133,6 +133,7 @@ pub(crate) struct MrtrExchangeBinding {
     arguments_digest: [u8; 32],
     session_partition: [u8; 32],
     principal_digest: Option<[u8; 32]>,
+    verified_grants_digest: [u8; 32],
     is_stateless: bool,
 }
 
@@ -145,6 +146,7 @@ impl MrtrExchangeBinding {
         arguments_digest: [u8; 32],
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
+        verified_grants_digest: [u8; 32],
     ) -> Self {
         Self {
             method,
@@ -152,6 +154,7 @@ impl MrtrExchangeBinding {
             arguments_digest,
             session_partition,
             principal_digest,
+            verified_grants_digest,
             is_stateless: false,
         }
     }
@@ -164,6 +167,7 @@ impl MrtrExchangeBinding {
         arguments_digest: [u8; 32],
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
+        verified_grants_digest: [u8; 32],
     ) -> Self {
         Self {
             method,
@@ -171,6 +175,7 @@ impl MrtrExchangeBinding {
             arguments_digest,
             session_partition,
             principal_digest,
+            verified_grants_digest,
             is_stateless: true,
         }
     }
@@ -2943,6 +2948,7 @@ mod tests {
             [3; 32],
             [4; 32],
             None,
+            [5; 32],
         );
         let required = registry
             .issue_bound(
@@ -3000,6 +3006,7 @@ mod tests {
             [1; 32],
             [2; 32],
             Some([3; 32]),
+            [5; 32],
         );
         let stateless = registry
             .issue_bound(
@@ -3017,6 +3024,7 @@ mod tests {
             [3; 32],
             [4; 32],
             None,
+            [5; 32],
         );
         let durable = registry
             .issue_bound(
@@ -3082,6 +3090,7 @@ mod tests {
             [11; 32],
             [13; 32],
             Some([17; 32]),
+            [19; 32],
         );
         let ownerless_binding = MrtrExchangeBinding::stateless(
             "tools/call",
@@ -3089,6 +3098,7 @@ mod tests {
             [11; 32],
             [13; 32],
             None,
+            [19; 32],
         );
         let response = BTreeMap::from([(
             "roots".to_owned(),
@@ -3152,6 +3162,7 @@ mod tests {
             [23; 32],
             [29; 32],
             Some([31; 32]),
+            [37; 32],
         );
         let required = registry
             .issue_bound(
@@ -3169,6 +3180,7 @@ mod tests {
             [23; 32],
             [29; 32],
             Some([31; 32]),
+            [37; 32],
         );
         let response = BTreeMap::from([(
             "roots".to_owned(),
@@ -3198,6 +3210,7 @@ mod tests {
             [41; 32],
             [43; 32],
             Some([47; 32]),
+            [59; 32],
         );
         let mut caller_binding = owner_binding.clone();
         if foreign_owner {
@@ -3343,6 +3356,7 @@ mod tests {
             [7; 32],
             [9; 32],
             None,
+            [11; 32],
         );
         let required = registry
             .issue_bound(
@@ -3387,6 +3401,7 @@ mod tests {
             [7; 32],
             [9; 32],
             None,
+            [11; 32],
         );
         let mut foreign = binding.clone();
         foreign.session_partition = [10; 32];
@@ -3506,6 +3521,7 @@ mod tests {
             [17; 32],
             [19; 32],
             Some([23; 32]),
+            [29; 32],
         );
         let input_requests = || {
             MrtrInputRequests::new([(

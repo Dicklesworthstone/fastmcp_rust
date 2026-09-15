@@ -12279,11 +12279,12 @@ mod tests {
             panic!("expected the typed final tools/list result");
         };
         assert!(diagnostic.is_none());
-        let terminal = serde_json::to_value(result).expect("serialize exact typed terminal result");
-        assert_eq!(terminal["resultType"], "complete");
-        assert_eq!(terminal["tools"], serde_json::json!([]));
-        assert_eq!(terminal["ttlMs"], 0);
-        assert_eq!(terminal["cacheScope"], "private");
+        assert!(result.payload.tools.is_empty());
+        assert_eq!(result.payload.ttl_ms.as_str(), "0");
+        assert_eq!(
+            result.payload.cache_scope,
+            fastmcp_protocol::CacheScope::Private
+        );
 
         assert_eq!(
             callback_invocations, 0,
@@ -12294,7 +12295,10 @@ mod tests {
             1,
             "exactly one progress notification must be delivered"
         );
-        assert_eq!(progress[0].progress_token, RequestId::Number(2));
+        assert_eq!(
+            progress[0].progress_token,
+            fastmcp_protocol::ProgressMarker::from(2_i64)
+        );
         assert_eq!(progress[0].progress.as_str(), "0.5");
         assert_eq!(
             progress[0].total.as_ref().map(|total| total.as_str()),

@@ -12512,7 +12512,7 @@ IFS= read -r end
                         let ctx = McpContext::with_progress(cx.clone(), 891,
                             ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
                             .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities);
-                        let exchange_binding = MrtrExchangeBinding::new("tools/call", subject.clone(), [7;32], [9;32], None);
+                        let exchange_binding = MrtrExchangeBinding::new("tools/call", subject.clone(), [7;32], [9;32], None, [11;32]);
                         let mut resumes = Vec::new();
                         #[cfg(feature = "tasks")]
                         let before = proxy.final_task_registry_snapshot_for_test().unwrap();
@@ -12872,7 +12872,7 @@ IFS= read -r end
                             ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
                             .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities)
                             .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "17"));
-                        let exchange_binding = MrtrExchangeBinding::new(method, target.clone(), [8;32], [10;32], None);
+                        let exchange_binding = MrtrExchangeBinding::new(method, target.clone(), [8;32], [10;32], None, [12;32]);
                         let mut resumes = Vec::new();
                         let exposed_uri = format!("tenant/remote/{target}");
                         let uri_params = UriParams::from([("subject".to_owned(), subject.clone())]);
@@ -13929,8 +13929,14 @@ IFS= read -r end
                 let capture = Arc::new(ExactProgressCapture::default());
                 let cancellation = McpRequestCancellation::new();
                 let registry = MrtrExchangeRegistry::new();
-                let binding =
-                    MrtrExchangeBinding::new(method, target.clone(), [3; 32], [4; 32], None);
+                let binding = MrtrExchangeBinding::new(
+                    method,
+                    target.clone(),
+                    [3; 32],
+                    [4; 32],
+                    None,
+                    [5; 32],
+                );
                 runtime.block_on(async {
                     let mut resumes = Vec::new();
                     let mut expected_tasks = serde_json::Map::new();

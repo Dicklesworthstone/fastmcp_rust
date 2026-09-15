@@ -436,11 +436,21 @@ fn http_03_b_runtime_planted_negative() {
     );
 }
 
-fn modern_async_reverse_callback_result() -> fastmcp_protocol::FinalCreateMessageResult {
+fn runtime_mrtr_challenge() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("runtime challenge clock must follow the Unix epoch")
+        .as_nanos();
+    format!("http-03-challenge-{}-{nonce}", std::process::id())
+}
+
+fn modern_async_reverse_callback_result(
+    challenge: &str,
+) -> fastmcp_protocol::FinalCreateMessageResult {
     fastmcp_protocol::FinalCreateMessageResult {
         content: fastmcp_protocol::FinalSamplingMessageContent::Block(
             fastmcp_protocol::common_types::SamplingContentBlock::Text {
-                text: "sampled on the caller runtime".to_owned(),
+                text: format!("sampled on the caller runtime: {challenge}"),
                 annotations: None,
                 meta: None,
                 additional: std::collections::BTreeMap::new(),
@@ -471,6 +481,9 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
         .local_addr()
         .expect("read modern async reverse callback address");
     let target = format!("http://{address}/mcp");
+    let challenge = runtime_mrtr_challenge();
+    let server_challenge = challenge.clone();
+    let callback_challenge = challenge.clone();
     let (callback_started_tx, callback_started_rx) = mpsc::sync_channel(1);
     let callback_token = Arc::new(std::sync::Mutex::new(None));
     let callback_token_for_handler = Arc::clone(&callback_token);
@@ -492,7 +505,7 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
         assert_eq!(initial_body["params"]["name"], "async-callback-tool");
         assert_eq!(
             initial_body["params"]["arguments"],
-            serde_json::json!({"subject": "http-03-mrtr"})
+            serde_json::json!({"subject": server_challenge})
         );
         begin_sse_response(&mut request);
         write_sse_event(
@@ -508,13 +521,13 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                             "params": {
                                 "messages": [{
                                     "role": "user",
-                                    "content": {"type": "text", "text": "hello"}
+                                    "content": {"type": "text", "text": server_challenge}
                                 }],
                                 "maxTokens": 8
                             }
                         }
                     },
-                    "requestState": "async-callback-state"
+                    "requestState": format!("async-callback-state-{server_challenge}")
                 }
             }),
         )
@@ -548,7 +561,10 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
             retry_body["params"]["arguments"],
             initial_body["params"]["arguments"]
         );
-        assert_eq!(retry_body["params"]["requestState"], "async-callback-state");
+        assert_eq!(
+            retry_body["params"]["requestState"],
+            format!("async-callback-state-{server_challenge}")
+        );
         assert_eq!(
             retry_body["params"]["inputResponses"]
                 .as_object()
@@ -561,7 +577,10 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
             serde_json::json!({
                 "role": "assistant",
                 "model": "caller-runtime-handler",
-                "content": {"type": "text", "text": "sampled on the caller runtime"}
+                "content": {
+                    "type": "text",
+                    "text": format!("sampled on the caller runtime: {server_challenge}")
+                }
             })
         );
         begin_sse_response(&mut retry);
@@ -594,7 +613,15 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 "id": 3,
                 "result": {
                     "resultType": "complete",
-                    "content": [{"type": "text", "text": "MRTR completed"}]
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "MRTR completed: {}",
+                            retry_body["params"]["inputResponses"]["sampling"]["content"]["text"]
+                                .as_str()
+                                .expect("the observed sampling response contains text")
+                        )
+                    }]
                 }
             }),
         )
@@ -607,8 +634,16 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
         .with_modern_sampling_create_message(move |callback_cx, cancellation, params| {
             let callback_started_tx = callback_started_tx.clone();
             let callback_token_for_handler = Arc::clone(&callback_token_for_handler);
+            let callback_challenge = callback_challenge.clone();
             Box::pin(async move {
                 assert_eq!(params.max_tokens.to_string(), "8");
+                assert_eq!(
+                    serde_json::to_value(&params.messages).expect("typed sampling messages encode"),
+                    serde_json::json!([{
+                        "role": "user",
+                        "content": {"type": "text", "text": callback_challenge}
+                    }])
+                );
                 callback_token_for_handler
                     .lock()
                     .expect("callback token lock")
@@ -633,7 +668,7 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 if callback_error {
                     Err(McpError::invalid_params("async callback rejected"))
                 } else {
-                    Ok(modern_async_reverse_callback_result())
+                    Ok(modern_async_reverse_callback_result(&callback_challenge))
                 }
             })
         });
@@ -672,7 +707,7 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 &request_cx,
                 &cancellation,
                 "async-callback-tool",
-                serde_json::json!({"subject": "http-03-mrtr"}),
+                serde_json::json!({"subject": challenge}),
             )
             .await;
         if cancel_callback {
@@ -712,7 +747,10 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&completed.encode().unwrap()).unwrap()
                     ["content"],
-                serde_json::json!([{"type": "text", "text": "MRTR completed"}])
+                serde_json::json!([{
+                    "type": "text",
+                    "text": format!("MRTR completed: sampled on the caller runtime: {challenge}")
+                }])
             );
         }
         assert_eq!(
@@ -1290,15 +1328,27 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
         .local_addr()
         .expect("read aborted-response listener address");
     let target = format!("http://{address}/mcp");
+    let challenge = runtime_mrtr_challenge();
+    let server_challenge = challenge.clone();
+    let callback_challenge = challenge.clone();
     let callback_started = Arc::new(AtomicUsize::new(0));
     let callback_marker = Arc::clone(&callback_started);
     let callback_token = Arc::new(std::sync::Mutex::new(None));
     let callback_token_for_handler = Arc::clone(&callback_token);
     let handlers = fastmcp_client::ReverseRequestHandlers::new()
-        .with_modern_sampling_create_message(move |_cx, cancellation, _params| {
+        .with_modern_sampling_create_message(move |_cx, cancellation, params| {
             let callback_marker = Arc::clone(&callback_marker);
             let callback_token_for_handler = Arc::clone(&callback_token_for_handler);
+            let callback_challenge = callback_challenge.clone();
             Box::pin(async move {
+                assert_eq!(params.max_tokens.to_string(), "8");
+                assert_eq!(
+                    serde_json::to_value(&params.messages).expect("typed sampling messages encode"),
+                    serde_json::json!([{
+                        "role": "user",
+                        "content": {"type": "text", "text": callback_challenge}
+                    }])
+                );
                 callback_token_for_handler
                     .lock()
                     .expect("callback token lock")
@@ -1332,10 +1382,12 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
         let mut aborted = accept_bounded_stream(&listener);
         let aborted_request = read_request(&mut aborted);
         assert_final_metadata(&aborted_request, "tools/call");
+        let aborted_body: serde_json::Value = serde_json::from_slice(&aborted_request.body)
+            .expect("aborted tools/call request must be JSON");
+        assert_eq!(aborted_body["id"], 3);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&aborted_request.body)
-                .expect("aborted tools/call request must be JSON")["id"],
-            3
+            aborted_body["params"]["arguments"],
+            serde_json::json!({"subject": server_challenge})
         );
         begin_sse_response(&mut aborted);
         if catalog_changed {
@@ -1363,12 +1415,12 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
                             "sampling": {
                                 "method": "sampling/createMessage",
                                 "params": {
-                                    "messages": [{"role": "user", "content": {"type": "text", "text": "wait"}}],
+                                    "messages": [{"role": "user", "content": {"type": "text", "text": server_challenge}}],
                                     "maxTokens": 8
                                 }
                             }
                         },
-                        "requestState": "notification-before-drop"
+                        "requestState": format!("notification-before-drop-{server_challenge}")
                     }
                 }),
             )
@@ -1422,8 +1474,11 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
         assert_eq!(client.final_result_cache_stats().fills, 1);
 
         if drop_request {
-            let mut request =
-                std::pin::pin!(client.call_tool(&cx, "aborted-call", serde_json::json!({}),));
+            let mut request = std::pin::pin!(client.call_tool(
+                &cx,
+                "aborted-call",
+                serde_json::json!({"subject": challenge}),
+            ));
             poll_fn(|task_cx| {
                 assert!(
                     request.as_mut().poll(task_cx).is_pending(),
@@ -1443,7 +1498,10 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
                 .request_final_core(
                     &cx,
                     "tools/call",
-                    serde_json::json!({"name": "aborted-call", "arguments": {}}),
+                    serde_json::json!({
+                        "name": "aborted-call",
+                        "arguments": {"subject": challenge}
+                    }),
                 )
                 .await
                 .expect_err("response stream ending before its terminal must fail");
@@ -3410,14 +3468,27 @@ mod authenticated_tls {
             "authenticated_tls::http_03_b_authenticated_reverse_response_positive",
             true,
             |target, token, log| {
+                let challenge = runtime_mrtr_challenge();
+                let callback_challenge = challenge.clone();
                 let handlers = fastmcp_client::ReverseRequestHandlers::new()
-                    .with_modern_sampling_create_message(|_cx, _cancellation, params| {
+                    .with_modern_sampling_create_message(move |_cx, _cancellation, params| {
+                        let callback_challenge = callback_challenge.clone();
                         Box::pin(async move {
                             assert_eq!(params.max_tokens.to_string(), "8");
+                            assert_eq!(
+                                serde_json::to_value(&params.messages)
+                                    .expect("typed TLS sampling messages encode"),
+                                serde_json::json!([{
+                                    "role": "user",
+                                    "content": {"type": "text", "text": callback_challenge}
+                                }])
+                            );
                             Ok(fastmcp_protocol::FinalCreateMessageResult {
                                 content: fastmcp_protocol::FinalSamplingMessageContent::Block(
                                     fastmcp_protocol::common_types::SamplingContentBlock::Text {
-                                        text: "sampled over authenticated TLS".to_owned(),
+                                        text: format!(
+                                            "sampled over authenticated TLS: {callback_challenge}"
+                                        ),
                                         annotations: None,
                                         meta: None,
                                         additional: std::collections::BTreeMap::new(),
@@ -3434,7 +3505,7 @@ mod authenticated_tls {
                 let result = runtime_block_on(client.call_tool(
                     &Cx::for_request(),
                     "authenticated-callback",
-                    serde_json::json!({"subject": "authenticated-mrtr"}),
+                    serde_json::json!({"subject": challenge}),
                 ))
                 .unwrap();
                 assert!(matches!(
@@ -3445,7 +3516,10 @@ mod authenticated_tls {
                 ));
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&result.encode().unwrap()).unwrap()["content"],
-                    serde_json::json!([{"type": "text", "text": "authenticated MRTR completed"}])
+                    serde_json::json!([{
+                        "type": "text",
+                        "text": format!("authenticated MRTR completed: sampled over authenticated TLS: {challenge}")
+                    }])
                 );
                 let rows = observations(log);
                 assert_eq!(rows.len(), 3);
@@ -3461,11 +3535,18 @@ mod authenticated_tls {
                 let retry: serde_json::Value =
                     serde_json::from_str(rows[2]["body"].as_str().unwrap()).unwrap();
                 assert_eq!(initial["id"], 2);
+                assert_eq!(
+                    initial["params"]["arguments"],
+                    serde_json::json!({"subject": challenge})
+                );
                 assert!(initial["params"].get("inputResponses").is_none());
                 assert_eq!(retry["id"], 3);
                 assert_eq!(retry["params"]["name"], initial["params"]["name"]);
                 assert_eq!(retry["params"]["arguments"], initial["params"]["arguments"]);
-                assert_eq!(retry["params"]["requestState"], "authenticated-mrtr-state");
+                assert_eq!(
+                    retry["params"]["requestState"],
+                    format!("authenticated-mrtr-state-{challenge}")
+                );
                 let input_responses = retry["params"]["inputResponses"]
                     .as_object()
                     .expect("authenticated MRTR retry must contain the response map");
@@ -3481,7 +3562,10 @@ mod authenticated_tls {
                     serde_json::json!({
                         "role": "assistant",
                         "model": "http-03-authenticated-handler",
-                        "content": {"type": "text", "text": "sampled over authenticated TLS"}
+                        "content": {
+                            "type": "text",
+                            "text": format!("sampled over authenticated TLS: {challenge}")
+                        }
                     })
                 );
             },
@@ -3771,15 +3855,19 @@ class Peer(http.server.BaseHTTPRequestHandler):
             assert self.headers.get('Mcp-Method') == 'tools/call'
             assert self.headers.get('Mcp-Name') == 'authenticated-callback'
             assert request['params']['name'] == 'authenticated-callback'
-            assert request['params']['arguments'] == {'subject':'authenticated-mrtr'}
+            subject = request['params']['arguments']['subject']
+            assert isinstance(subject, str) and subject.startswith('http-03-challenge-')
+            assert request['params']['arguments'] == {'subject':subject}
             if 'inputResponses' not in request['params']:
                 assert identifier == 2
-                result = {'resultType':'input_required','inputRequests':{'sampling':{'method':'sampling/createMessage','params':{'messages':[{'role':'user','content':{'type':'text','text':'hello'}}],'maxTokens':8}}},'requestState':'authenticated-mrtr-state'}
+                result = {'resultType':'input_required','inputRequests':{'sampling':{'method':'sampling/createMessage','params':{'messages':[{'role':'user','content':{'type':'text','text':subject}}],'maxTokens':8}}},'requestState':'authenticated-mrtr-state-'+subject}
                 self.respond(200, 'text/event-stream', ('data: '+json.dumps({'jsonrpc':'2.0','id':identifier,'result':result})+'\n\n').encode())
                 return
-            assert identifier == 3 and request['params']['requestState'] == 'authenticated-mrtr-state'
+            assert identifier == 3 and request['params']['requestState'] == 'authenticated-mrtr-state-'+subject
             assert request['params']['inputResponses']['sampling']['model'] == 'http-03-authenticated-handler'
-            result = {'resultType':'complete','content':[{'type':'text','text':'authenticated MRTR completed'}]}
+            sampled = request['params']['inputResponses']['sampling']['content']['text']
+            assert sampled == 'sampled over authenticated TLS: '+subject
+            result = {'resultType':'complete','content':[{'type':'text','text':'authenticated MRTR completed: '+sampled}]}
         elif method == 'subscriptions/listen':
             meta = {'io.modelcontextprotocol/subscriptionId':identifier}
             ack = {'jsonrpc':'2.0','method':'notifications/subscriptions/acknowledged','params':{'_meta':meta,'notifications':request['params']['notifications']}}
