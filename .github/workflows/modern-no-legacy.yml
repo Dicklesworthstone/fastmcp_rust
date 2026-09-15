@@ -25,18 +25,15 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Same main-branch protection as ci.yml: push churn cancelled every run.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Cap rustc parallelism: full-graph cold builds on the hosted runner were
-  # repeatedly killed mid-compile at high memory pressure, which also meant
-  # the cache-save step never ran and every attempt rebuilt from zero.
-  CARGO_BUILD_JOBS: "2"
+
 jobs:
   production-graph:
     runs-on: ubuntu-latest

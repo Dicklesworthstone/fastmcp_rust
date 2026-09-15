@@ -9,10 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Main runs must complete: swarm push cadence was cancelling every run
-  # mid-flight (32/40 cancelled, 0 success on main). Branch runs still
-  # auto-supersede; main runs queue serially instead.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -20,10 +17,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Cap rustc parallelism: cold full-graph builds repeatedly killed the
-  # hosted runner mid-compile, and each death also skipped the rust-cache
-  # save, forcing another full cold build next run.
-  CARGO_BUILD_JOBS: "2"
 
 jobs:
   lint:
