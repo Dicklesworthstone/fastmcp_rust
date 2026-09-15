@@ -182,6 +182,11 @@ pub mod limits {
             /// The bound whose counter would have wrapped.
             limit: ProtocolLimit,
         },
+        /// The selected row is a `Duration`, not a usize charge counter.
+        NotCountable {
+            /// The duration-valued catalog row.
+            limit: ProtocolLimit,
+        },
     }
 
     impl fmt::Display for ProtocolLimitsError {
@@ -206,6 +211,10 @@ pub mod limits {
                 Self::ChargeOverflow { limit } => {
                     write!(formatter, "{limit} charge overflowed the counter width")
                 }
+                Self::NotCountable { limit } => write!(
+                    formatter,
+                    "{limit} is a duration row and cannot be projected into usize"
+                ),
             }
         }
     }
@@ -359,43 +368,55 @@ pub mod limits {
             self.clone()
         }
 
-        /// Documented hard ceiling for one catalog row.
-        #[must_use]
-        pub const fn hard_ceiling(limit: ProtocolLimit) -> usize {
+        /// Documented hard ceiling for one countable catalog row.
+        ///
+        /// Wall-clock rows stay on [`Duration`] and are not narrowed through
+        /// `as_nanos() as usize`.
+        pub const fn hard_ceiling(limit: ProtocolLimit) -> Result<usize, ProtocolLimitsError> {
             match limit {
-                ProtocolLimit::LogicalExchangeRounds => HARD_LOGICAL_EXCHANGE_MAX_ROUNDS as usize,
+                ProtocolLimit::LogicalExchangeRounds => {
+                    Ok(HARD_LOGICAL_EXCHANGE_MAX_ROUNDS as usize)
+                }
                 ProtocolLimit::LogicalExchangeInputsPerRound => {
-                    HARD_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND as usize
+                    Ok(HARD_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND as usize)
                 }
-                ProtocolLimit::LogicalExchangeInputs => HARD_LOGICAL_EXCHANGE_MAX_INPUTS as usize,
-                ProtocolLimit::LogicalExchangeStateBytes => HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES,
+                ProtocolLimit::LogicalExchangeInputs => {
+                    Ok(HARD_LOGICAL_EXCHANGE_MAX_INPUTS as usize)
+                }
+                ProtocolLimit::LogicalExchangeStateBytes => {
+                    Ok(HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES)
+                }
                 ProtocolLimit::LogicalExchangeWallClock => {
-                    HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK.as_nanos() as usize
+                    Err(ProtocolLimitsError::NotCountable { limit })
                 }
-                ProtocolLimit::JsonRpcBodyBytes => HARD_JSON_RPC_MAX_BODY_BYTES,
-                ProtocolLimit::MetadataEntries => HARD_METADATA_MAX_ENTRIES as usize,
-                ProtocolLimit::MetadataBytes => HARD_METADATA_MAX_BYTES,
-                ProtocolLimit::UriBytes => HARD_URI_MAX_BYTES,
-                ProtocolLimit::CancellationReasonBytes => HARD_CANCELLATION_REASON_MAX_BYTES,
-                ProtocolLimit::CursorBytes => HARD_CURSOR_MAX_BYTES,
+                ProtocolLimit::JsonRpcBodyBytes => Ok(HARD_JSON_RPC_MAX_BODY_BYTES),
+                ProtocolLimit::MetadataEntries => Ok(HARD_METADATA_MAX_ENTRIES as usize),
+                ProtocolLimit::MetadataBytes => Ok(HARD_METADATA_MAX_BYTES),
+                ProtocolLimit::UriBytes => Ok(HARD_URI_MAX_BYTES),
+                ProtocolLimit::CancellationReasonBytes => Ok(HARD_CANCELLATION_REASON_MAX_BYTES),
+                ProtocolLimit::CursorBytes => Ok(HARD_CURSOR_MAX_BYTES),
             }
         }
 
-        /// Configured units for one row on this snapshot.
-        #[must_use]
-        pub const fn configured_units(&self, limit: ProtocolLimit) -> usize {
+        /// Configured units for one countable catalog row on this snapshot.
+        pub const fn configured_units(
+            &self,
+            limit: ProtocolLimit,
+        ) -> Result<usize, ProtocolLimitsError> {
             match limit {
-                ProtocolLimit::LogicalExchangeRounds => self.rounds as usize,
-                ProtocolLimit::LogicalExchangeInputsPerRound => self.inputs_per_round as usize,
-                ProtocolLimit::LogicalExchangeInputs => self.inputs as usize,
-                ProtocolLimit::LogicalExchangeStateBytes => self.state_bytes,
-                ProtocolLimit::LogicalExchangeWallClock => self.wall_clock.as_nanos() as usize,
-                ProtocolLimit::JsonRpcBodyBytes => self.json_rpc_body_bytes,
-                ProtocolLimit::MetadataEntries => self.metadata_entries as usize,
-                ProtocolLimit::MetadataBytes => self.metadata_bytes,
-                ProtocolLimit::UriBytes => self.uri_bytes,
-                ProtocolLimit::CancellationReasonBytes => self.cancellation_reason_bytes,
-                ProtocolLimit::CursorBytes => self.cursor_bytes,
+                ProtocolLimit::LogicalExchangeRounds => Ok(self.rounds as usize),
+                ProtocolLimit::LogicalExchangeInputsPerRound => Ok(self.inputs_per_round as usize),
+                ProtocolLimit::LogicalExchangeInputs => Ok(self.inputs as usize),
+                ProtocolLimit::LogicalExchangeStateBytes => Ok(self.state_bytes),
+                ProtocolLimit::LogicalExchangeWallClock => {
+                    Err(ProtocolLimitsError::NotCountable { limit })
+                }
+                ProtocolLimit::JsonRpcBodyBytes => Ok(self.json_rpc_body_bytes),
+                ProtocolLimit::MetadataEntries => Ok(self.metadata_entries as usize),
+                ProtocolLimit::MetadataBytes => Ok(self.metadata_bytes),
+                ProtocolLimit::UriBytes => Ok(self.uri_bytes),
+                ProtocolLimit::CancellationReasonBytes => Ok(self.cancellation_reason_bytes),
+                ProtocolLimit::CursorBytes => Ok(self.cursor_bytes),
             }
         }
 
@@ -409,7 +430,7 @@ pub mod limits {
             current: usize,
             additional: usize,
         ) -> Result<usize, ProtocolLimitsError> {
-            let ceiling = self.configured_units(limit);
+            let ceiling = self.configured_units(limit)?;
             let Some(requested) = current.checked_add(additional) else {
                 return Err(ProtocolLimitsError::ChargeOverflow { limit });
             };
@@ -842,8 +863,29 @@ pub mod limits {
     }
 
     impl QuotaPartitionKey {
-        pub(crate) fn from_verified_partition_digest(digest: [u8; 32]) -> Self {
-            Self { digest }
+        /// Public producer from verified security facts, not request identifiers.
+        ///
+        /// AUTH-00 later supplies these fields from provider output. A token
+        /// claim or raw request identifier still cannot use this path.
+        pub fn from_verified_security_facts(
+            provider: &str,
+            configuration_generation: u64,
+            issuer: &str,
+            canonical_resource: &str,
+            tenant: &str,
+            subject: &str,
+        ) -> Result<Self, SealedAdmissionKeyError> {
+            Ok(Self {
+                digest: opaque_admission_digest(&[
+                    b"verified-quota-partition-v1",
+                    require_admission_field(provider)?,
+                    &configuration_generation.to_be_bytes(),
+                    require_admission_field(issuer)?,
+                    require_admission_field(canonical_resource)?,
+                    require_admission_field(tenant)?,
+                    require_admission_field(subject)?,
+                ]),
+            })
         }
 
         /// Request-supplied identifiers never mint a verified key.
@@ -1063,7 +1105,7 @@ pub mod limits {
         release_count: usize,
         next_id: u64,
         reservations: HashMap<u64, ReservationRecord>,
-        admission_order: Vec<OccupancyKey>,
+        admission_count: usize,
     }
 
     /// Process-wide plus per-partition admission controller.
@@ -1125,7 +1167,7 @@ pub mod limits {
                     release_count: 0,
                     next_id: 1,
                     reservations: HashMap::new(),
-                    admission_order: Vec::new(),
+                    admission_count: 0,
                 })),
             })
         }
@@ -1164,10 +1206,16 @@ pub mod limits {
             lock_admission(&self.inner).release_count
         }
 
-        /// Successful reserve order, one entry per admitted reservation.
+        /// Successful reserve count. Historical keys are not retained.
         #[must_use]
         pub fn admission_count(&self) -> usize {
-            lock_admission(&self.inner).admission_order.len()
+            lock_admission(&self.inner).admission_count
+        }
+
+        /// Currently live (held or committed, not yet released) reservations.
+        #[must_use]
+        pub fn live_reservation_count(&self) -> usize {
+            lock_admission(&self.inner).reservations.len()
         }
 
         /// Reserves `units` against `partition` and the global ceiling.
@@ -1238,7 +1286,7 @@ pub mod limits {
                     deadline,
                 },
             );
-            state.admission_order.push(key);
+            state.admission_count = state.admission_count.saturating_add(1);
             drop(state);
             Ok(AdmissionReservation {
                 inner: Arc::clone(&self.inner),
@@ -1342,7 +1390,6 @@ pub mod limits {
                         let units = record.units;
                         let key = record.key;
                         let was_committed = record.lifecycle == ReservationLifecycle::Committed;
-                        record.lifecycle = ReservationLifecycle::Released;
                         Some((units, key, was_committed))
                     }
                 }
@@ -1351,6 +1398,7 @@ pub mod limits {
                 self.live = false;
                 return Ok(());
             };
+            state.reservations.remove(&self.id);
             let partition_in_use = state.partition_in_use.get(&key).copied().unwrap_or(0);
             state.global_in_use = state.global_in_use.saturating_sub(units);
             let remaining = partition_in_use.saturating_sub(units);
@@ -2262,8 +2310,14 @@ fn limit_01_a_positive() {
         crate::PROTOCOL_LIMITS_INITIAL_GENERATION
     );
     for (limit, default, ceiling) in limit_01_a_bound_rows() {
-        assert_eq!(snapshot.configured_units(limit), default);
-        assert_eq!(crate::ProtocolLimits::hard_ceiling(limit), ceiling);
+        assert_eq!(
+            snapshot.configured_units(limit).expect("countable row"),
+            default
+        );
+        assert_eq!(
+            crate::ProtocolLimits::hard_ceiling(limit).expect("countable row"),
+            ceiling
+        );
         let at_ceiling = crate::ProtocolLimits::builder()
             .json_rpc_max_body_bytes(if limit == crate::ProtocolLimit::JsonRpcBodyBytes {
                 ceiling
@@ -2299,7 +2353,10 @@ fn limit_01_a_positive() {
             })
             .build()
             .expect("hard ceiling must admit");
-        assert_eq!(at_ceiling.configured_units(limit), ceiling);
+        assert_eq!(
+            at_ceiling.configured_units(limit).expect("countable row"),
+            ceiling
+        );
         assert_eq!(
             snapshot
                 .try_charge(limit, default - 1, 1)
@@ -2311,6 +2368,19 @@ fn limit_01_a_positive() {
             default
         );
     }
+
+    assert_eq!(
+        crate::ProtocolLimits::hard_ceiling(crate::ProtocolLimit::LogicalExchangeWallClock),
+        Err(crate::ProtocolLimitsError::NotCountable {
+            limit: crate::ProtocolLimit::LogicalExchangeWallClock,
+        })
+    );
+    assert_eq!(
+        snapshot.configured_units(crate::ProtocolLimit::LogicalExchangeWallClock),
+        Err(crate::ProtocolLimitsError::NotCountable {
+            limit: crate::ProtocolLimit::LogicalExchangeWallClock,
+        })
+    );
 
     let later = crate::ProtocolLimits::try_new(
         crate::HARD_JSON_RPC_MAX_BODY_BYTES,
@@ -2334,7 +2404,15 @@ fn limit_01_a_positive() {
     assert!(pre_auth.is_pre_auth());
     assert!(!pre_auth.is_verified());
     let verified = crate::AdmissionPartition::verified(
-        crate::QuotaPartitionKey::from_verified_partition_digest([0x11; 32]),
+        crate::QuotaPartitionKey::from_verified_security_facts(
+            "static-token",
+            1,
+            "https://issuer.example.test",
+            "https://mcp.example.test/mcp",
+            "tenant-a",
+            "subject-a",
+        )
+        .expect("verified security facts mint a partition key"),
     );
     assert!(verified.is_verified());
     let flow = crate::AdmissionPartition::authorization_flow(
@@ -2367,7 +2445,7 @@ fn limit_01_a_planted_negative() {
     let snapshot_before = limits.snapshot();
     let mut admitted = 0_usize;
     let planted = crate::ProtocolLimit::MetadataEntries;
-    let ceiling = limits.configured_units(planted);
+    let ceiling = limits.configured_units(planted).expect("countable row");
     let refused = limits
         .try_charge(planted, ceiling, 1)
         .expect_err("N+1 must refuse");
@@ -2532,6 +2610,21 @@ fn limit_01_b_positive() {
     assert_eq!(peer.global_in_use(), 1);
     assert_eq!(peer.admission_count(), 2);
     right_hold.release().expect("right release");
+    assert_eq!(peer.live_reservation_count(), 0);
+
+    let leak_probe =
+        crate::AdmissionController::with_capacity(snapshot.snapshot(), 1).expect("capacity one");
+    let leak_partition = limit_01_b_partition("tcp:203.0.113.12");
+    for cycle in 0..64 {
+        let mut reservation = leak_probe
+            .reserve(leak_partition.clone(), 1)
+            .expect("capacity-one cycle admits");
+        assert_eq!(leak_probe.live_reservation_count(), 1);
+        reservation.release().expect("capacity-one cycle releases");
+        assert_eq!(leak_probe.live_reservation_count(), 0);
+        assert_eq!(leak_probe.global_in_use(), 0);
+        assert_eq!(leak_probe.release_count(), cycle + 1);
+    }
 }
 
 /// LIMIT-01 B planted negative: one-variable N+1 and second release leave counters unchanged.
@@ -2566,6 +2659,7 @@ fn limit_01_b_planted_negative() {
     assert_eq!(controller.committed_work(), before_committed);
     assert_eq!(controller.release_count(), before_releases);
     assert_eq!(controller.admission_count(), before_admitted);
+    assert_eq!(controller.live_reservation_count(), 1);
 
     left_hold.release().expect("first release");
     let after_first = (
@@ -2573,7 +2667,10 @@ fn limit_01_b_planted_negative() {
         controller.partition_in_use(&left),
         controller.committed_work(),
         controller.release_count(),
+        controller.live_reservation_count(),
+        controller.admission_count(),
     );
+    assert_eq!(after_first.4, 0, "a released reservation is not retained");
     assert_eq!(
         left_hold
             .release()
@@ -2586,6 +2683,8 @@ fn limit_01_b_planted_negative() {
             controller.partition_in_use(&left),
             controller.committed_work(),
             controller.release_count(),
+            controller.live_reservation_count(),
+            controller.admission_count(),
         ),
         after_first
     );
