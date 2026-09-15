@@ -92,3 +92,7 @@ beads_compliance_audit/
 
 # Accidental empty sibling-repo placeholder dropped at the repo root.
 /rich_rust
+
+# Local campaign/canary audit dumps and Python bytecode.
+.tmp_audit/
+__pycache__/
