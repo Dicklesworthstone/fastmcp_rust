@@ -6255,7 +6255,7 @@ async fn wait_for_task_poll_delay(
     Ok(())
 }
 
-#[cfg(all(not(unix), feature = "tasks"))]
+#[cfg(all(any(not(unix), test), feature = "tasks"))]
 fn wait_for_task_poll_delay_sync(
     cx: &Cx,
     budget: TaskCommandBudget,
@@ -6272,7 +6272,10 @@ fn wait_for_task_poll_delay_sync(
     while sleep_started.elapsed() < sleep_duration {
         cx.checkpoint()
             .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
-        let chunk_remaining = sleep_duration - sleep_started.elapsed();
+        let chunk_remaining = sleep_duration.saturating_sub(sleep_started.elapsed());
+        if chunk_remaining.is_zero() {
+            break;
+        }
         let step = chunk_remaining.min(CHUNK);
         std::thread::sleep(step);
     }
@@ -12828,9 +12831,10 @@ IFS= read -r end
                 }).unwrap();
                 let task_id = TaskId::parse(subject.clone()).unwrap();
                 let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, bearer_token_file: None, json: true, timeout: 5 };
-                let output = TaskOutput::new(&connection).unwrap();
+                let budget = TaskCommandBudget::new(&connection).unwrap();
+                let output = TaskOutput::new(&connection, budget);
                 let action = TaskAction::Watch { task_id: subject.clone(), max_events: 1 };
-                let outcome = run_yielding_stdio_task(&cx, &mut client, &connection, &output, &action, task_id.clone(), None).await;
+                let outcome = run_yielding_stdio_task(&cx, &mut client, &connection, &output, budget, &action, task_id.clone(), None).await;
                 if cancel {
                     assert_eq!(outcome.unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);
                 } else { outcome.unwrap(); }
@@ -12910,16 +12914,47 @@ IFS= read -r end
                 json: true,
                 timeout: 1,
             };
-            let started = std::time::Instant::now()
+            let mut budget = TaskCommandBudget::new(&connection).unwrap();
+            budget.started = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(50))
                 .unwrap();
+            budget.deadline = budget.started + budget.timeout;
             let delay = std::time::Duration::from_millis(2000);
-            let outcome = wait_for_task_poll_delay(&cx, &connection, started, delay).await;
+            let outcome = wait_for_task_poll_delay(&cx, budget, delay).await;
             let err = outcome.unwrap_err();
             assert!(
                 err.message.contains("task watch reached --timeout"),
                 "unexpected error: {err}"
             );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn cli_wait_for_task_poll_delay_sync_bounded_cancellation() {
+        let runtime = build_cli_runtime().expect("CLI runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("ambient Cx");
+            let connection = TaskConnection {
+                server: None,
+                server_arg: Vec::new(),
+                http_url: Some("http://127.0.0.1:8080".to_owned()),
+                bearer_token_file: None,
+                json: true,
+                timeout: 10,
+            };
+            let budget = TaskCommandBudget::new(&connection).unwrap();
+            cx.set_cancel_requested(true);
+            let start = std::time::Instant::now();
+            let delay = std::time::Duration::from_millis(5000);
+            let outcome = wait_for_task_poll_delay_sync(&cx, budget, delay);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(100),
+                "cancellation must abort wait_for_task_poll_delay_sync promptly, took {elapsed:?}"
+            );
+            let err = outcome.unwrap_err();
+            assert_eq!(err.code, fastmcp_core::McpErrorCode::RequestCancelled);
         });
     }
 

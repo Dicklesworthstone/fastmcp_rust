@@ -4302,4 +4302,112 @@ exec "$@"
     fn cli_02_b_stdio_watch_short_budget_does_not_poll_early() {
         check_watch_poll_interval(false, true);
     }
+
+    fn check_watch_slow_initial_get(http: bool, short_budget: bool) {
+        let mut fixture = TaskFixture::new(false);
+        // Server declares a minimum poll interval of 600ms.
+        let poll_interval_ms = 600u64;
+        fixture.task["pollIntervalMs"] = json!(poll_interval_ms);
+        let task_bytes = serde_json::to_vec(&fixture.task).unwrap();
+        std::fs::write(fixture.root.join("task.json"), &task_bytes).unwrap();
+        std::fs::write(fixture.root.join("watch_gap"), "complete").unwrap();
+        // Server delays the initial tasks/get response by 600ms.
+        std::fs::write(fixture.root.join("initial_read_delay_ms"), "600").unwrap();
+
+        // With --timeout 1 (1000ms), 600ms is consumed by the initial read.
+        // The remaining 400ms is less than the required 600ms poll interval,
+        // so the CLI must time out without issuing a second tasks/get.
+        // With --timeout 4 (4000ms), sufficient budget remains, so the second
+        // tasks/get is issued after honoring the 600ms interval.
+        let timeout_str = if short_budget { "1" } else { "4" };
+        let output = if http {
+            let (mut server, endpoint) = fixture.http();
+            let output = run_cli(&[
+                "tasks",
+                "watch",
+                fixture.id(),
+                "--http-url",
+                &endpoint,
+                "--json",
+                "--timeout",
+                timeout_str,
+            ]);
+            server.kill_and_reap().expect("HTTP server cleanup");
+            output
+        } else {
+            fixture.stdio("watch", &["--json", "--timeout", timeout_str])
+        };
+
+        let events: Vec<Value> = stdout_str(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.len() >= 2, "{}", stderr_str(&output));
+        assert_eq!(events[0]["event"], "snapshot");
+        assert_eq!(events[0]["data"], fixture.task);
+        assert_eq!(events[1]["event"], "watch-acknowledged");
+
+        if short_budget {
+            assert!(
+                !output.status.success(),
+                "short budget after slow initial get must exit with failure instead of early poll"
+            );
+            assert!(stderr_str(&output).contains("--timeout"));
+            // Exactly 1 read: the initial snapshot read only. Zero premature reconciliation poll!
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("watch_gap_reads")).unwrap(),
+                "1",
+                "watch must not poll when slow initial get leaves insufficient budget for pollIntervalMs"
+            );
+            assert!(
+                !fixture.root.join("watch_gap_read_interval_ms").exists(),
+                "no reconciliation read must be issued after slow initial get under short budget"
+            );
+            assert_eq!(events.len(), 2, "no update or terminal event emitted");
+        } else {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("watch_gap_reads")).unwrap(),
+                "2",
+                "watch must reconcile through a second tasks/get after interval elapses"
+            );
+            let interval_str =
+                std::fs::read_to_string(fixture.root.join("watch_gap_read_interval_ms")).unwrap();
+            let elapsed_ms: u64 = interval_str.parse().expect("valid interval integer");
+            assert!(
+                elapsed_ms >= 550,
+                "reconciliation poll occurred too early: elapsed={elapsed_ms}ms, minimum={poll_interval_ms}ms"
+            );
+            assert_eq!(events.len(), 4);
+            assert_eq!(events[2]["event"], "task-updated");
+            assert_eq!(events[2]["data"]["status"], "completed");
+            assert_eq!(
+                events[2]["data"]["result"]["content"][0]["text"],
+                "completed before listen"
+            );
+            assert_eq!(events[3]["event"], "watch-ended");
+            assert_eq!(events[3]["data"]["reason"], "task-terminal");
+            assert_eq!(events[3]["data"]["updates"], 1);
+        }
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_slow_initial_get_honors_budget() {
+        check_watch_slow_initial_get(true, false);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_slow_initial_get_honors_budget() {
+        check_watch_slow_initial_get(false, false);
+    }
+
+    #[test]
+    fn cli_02_b_http_watch_slow_initial_get_does_not_poll_early() {
+        check_watch_slow_initial_get(true, true);
+    }
+
+    #[test]
+    fn cli_02_b_stdio_watch_slow_initial_get_does_not_poll_early() {
+        check_watch_slow_initial_get(false, true);
+    }
 }
