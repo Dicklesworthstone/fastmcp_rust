@@ -54418,6 +54418,471 @@ original = "value"
         );
     }
 
+    // ── FND-01 state-capability candidate qualification (ahet.1.13) ────────
+    //
+    // The frozen artifact `evidence/fnd-01/state-capability-dependencies.toml`
+    // records, per its own `[rematerialized_hard_gate]` section, exactly two
+    // required test identities. The positive consumes the immutable
+    // manifest/lock/source bundle and exact-checks the recorded identities;
+    // the planted negative changes exactly one Redis direct feature
+    // (`tokio-comp`) in the parsed document and requires the typed
+    // forbidden-feature rejection at the same validator, a bundle-digest
+    // change, and fresh reacceptance of the unmodified baseline. The probe
+    // files are loaded from the repository worktree and byte/digest-bound to
+    // the manifest's own recorded `sha256` values; no policy edit is needed.
+
+    const STATE_CAPABILITY_MANIFEST_PATH: &str = "evidence/fnd-01/state-capability-dependencies.toml";
+
+    const STATE_CAPABILITY_PROBE_FILES: &[(&str, &str)] = &[
+        ("envelope", "evidence/fnd-01/probes/envelope/Cargo.toml"),
+        ("envelope", "evidence/fnd-01/probes/envelope/src/lib.rs"),
+        ("envelope", "evidence/fnd-01/probes/envelope/Cargo.lock"),
+        ("capability_fs", "evidence/fnd-01/probes/capability-fs/Cargo.toml"),
+        ("capability_fs", "evidence/fnd-01/probes/capability-fs/src/lib.rs"),
+        ("capability_fs", "evidence/fnd-01/probes/capability-fs/Cargo.lock"),
+        ("redis", "evidence/fnd-01/probes/redis/Cargo.toml"),
+        ("redis", "evidence/fnd-01/probes/redis/src/lib.rs"),
+        ("redis", "evidence/fnd-01/probes/redis/Cargo.lock"),
+    ];
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct StateCapabilityProbeFile {
+        candidate: &'static str,
+        path: &'static str,
+        bytes: Vec<u8>,
+        sha256: String,
+    }
+
+    #[derive(Clone)]
+    struct StateCapabilityBundle {
+        document: toml::Value,
+        probes: Vec<StateCapabilityProbeFile>,
+    }
+
+    fn state_capability_test_sources() -> (PathBuf, Vec<LoadedFile>) {
+        let root = repository_root();
+        let (policy, _) = read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let files = load_sources(&root, &policy).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        validate_source_tree(&files, &policy).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        (root, files)
+    }
+
+    fn state_capability_probe_files(root: &Path) -> VResult<Vec<StateCapabilityProbeFile>> {
+        STATE_CAPABILITY_PROBE_FILES
+            .iter()
+            .map(|(candidate, relative)| {
+                let candidate = *candidate;
+                let relative = *relative;
+                let bytes = std::fs::read(root.join(relative))
+                    .map_err(|_| Diagnostic::error("E_STATE_CAPABILITY_PROBE_READ", "state-capability probe loader").at(relative))?;
+                let sha256 = lower_hex(&sha256(&bytes));
+                Ok(StateCapabilityProbeFile { candidate, path: relative, bytes, sha256 })
+            })
+            .collect()
+    }
+
+    fn state_capability_bundle(root: &Path, files: &[LoadedFile]) -> VResult<StateCapabilityBundle> {
+        let document = parse_source_toml(files, STATE_CAPABILITY_MANIFEST_PATH)?;
+        let probes = state_capability_probe_files(root)?;
+        Ok(StateCapabilityBundle { document, probes })
+    }
+
+    fn state_capability_input_digest(document: &toml::Value, probes: &[StateCapabilityProbeFile]) -> VResult<String> {
+        let mut observation = ObservationEncoder::new(8 * 1024 * 1024, "state capability inputs")?;
+        observation.extend(b"FND01STATECAPINPUTSv1\0")?;
+        encode_toml_observation(Some(document), &mut observation)?;
+        for probe in probes {
+            observation.sized_u32(probe.path.as_bytes())?;
+            observation.sized_u32(&probe.bytes)?;
+        }
+        Ok(lower_hex(&sha256(&observation.bytes)))
+    }
+
+    fn state_capability_string_rows<'a>(document: &'a toml::Value, pointer: &str, subject: &str) -> VResult<Vec<&'a str>> {
+        pointer_get(document, pointer, subject)?
+            .as_array()
+            .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", subject).at(pointer))?
+            .iter()
+            .map(|row| row.as_str().ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", subject).at(pointer)))
+            .collect()
+    }
+
+    fn state_capability_probe_binding(
+        document: &toml::Value,
+        probes: &[StateCapabilityProbeFile],
+        candidate: &str,
+        role: &str,
+    ) -> VResult<()> {
+        let path_pointer = format!("/probe/{candidate}/{role}_path");
+        let recorded_path = pointer_get(document, &path_pointer, SUBJECT_STATE_CAPABILITY)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROBE_BINDING", SUBJECT_STATE_CAPABILITY).at(&path_pointer))?
+            .to_owned();
+        let recorded_bytes = pointer_get(document, &format!("/probe/{candidate}/{role}_bytes"), SUBJECT_STATE_CAPABILITY)?
+            .as_integer()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROBE_BINDING", SUBJECT_STATE_CAPABILITY).at(&path_pointer))?;
+        let recorded_sha256 = pointer_get(document, &format!("/probe/{candidate}/{role}_sha256"), SUBJECT_STATE_CAPABILITY)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROBE_BINDING", SUBJECT_STATE_CAPABILITY).at(&path_pointer))?;
+        let probe = probes
+            .iter()
+            .find(|probe| probe.path == recorded_path)
+            .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROBE_BINDING", SUBJECT_STATE_CAPABILITY).at(&recorded_path))?;
+        if probe.candidate != candidate
+            || probe.bytes.len() != recorded_bytes
+            || probe.sha256 != recorded_sha256
+            || lower_hex(&sha256(&probe.bytes)) != recorded_sha256
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_PROBE_BINDING", SUBJECT_STATE_CAPABILITY).at(&recorded_path));
+        }
+        Ok(())
+    }
+
+    const SUBJECT_STATE_CAPABILITY: &str = "state-capability-dependencies";
+
+    fn validate_state_capability_bundle(bundle: &StateCapabilityBundle) -> VResult<String> {
+        const EXPECTED_TEST_IDS: [&str; 2] = [
+            "tests::fnd_01_state_capability_dependencies_positive",
+            "tests::fnd_01_state_capability_dependencies_planted_negative",
+        ];
+        const EXPECTED_TARGETS: [&str; 5] = [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ];
+        const EXPECTED_PROHIBITED_PACKAGES: [&str; 10] = [
+            "tokio", "smol", "async-std", "rand", "rand_core", "getrandom", "native-tls", "rustls", "hyper", "reqwest",
+        ];
+        const EXPECTED_CRATES: [(&str, &str, &str, &[&str], &str); 4] = [
+            (
+                "chacha20poly1305",
+                "=0.11.0",
+                "Apache-2.0 OR MIT",
+                &["alloc", "zeroize"],
+                "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb",
+            ),
+            ("cap-std", "=4.0.2", "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", &[], "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"),
+            (
+                "cap-fs-ext",
+                "=4.0.2",
+                "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+                &["std"],
+                "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b",
+            ),
+            ("redis", "=1.4.1", "BSD-3-Clause", &["acl", "script"], "b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a"),
+        ];
+        let document = &bundle.document;
+
+        // Frozen manifest identity and the exact hard-gate test contract.
+        if pointer_get(document, "/format_version", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(1)
+            || pointer_get(document, "/evidence_id", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("FND-01/state-capability-dependencies")
+            || pointer_get(document, "/bead_id", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("bd-mcp-2026-07-28-support-ahet.1.13")
+            || pointer_get(document, "/recorded_by", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("CopperGlacier")
+            || pointer_get(document, "/retrieval_mode", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("offline local cache only")
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_IDENTITY", SUBJECT_STATE_CAPABILITY).at("manifest identity"));
+        }
+        if pointer_get(document, "/rematerialized_hard_gate/owner", SUBJECT_STATE_CAPABILITY)?.as_str()
+            != Some("bd-mcp-2026-07-28-support-ahet.1.13")
+            || pointer_get(document, "/rematerialized_hard_gate/test_source", SUBJECT_STATE_CAPABILITY)?.as_str()
+                != Some("evidence/fnd-01/probes/redis/src/lib.rs")
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_HARD_GATE", SUBJECT_STATE_CAPABILITY).at("rematerialized hard gate identity"));
+        }
+        let recorded_test_ids = state_capability_string_rows(document, "/rematerialized_hard_gate/test_ids", SUBJECT_STATE_CAPABILITY)?;
+        if recorded_test_ids.len() != EXPECTED_TEST_IDS.len()
+            || recorded_test_ids.iter().zip(EXPECTED_TEST_IDS).any(|(recorded, expected)| *recorded != expected)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_HARD_GATE", SUBJECT_STATE_CAPABILITY).at("required test ids"));
+        }
+
+        // Frozen toolchain identity is self-consistent with its named authority.
+        for (field, expected) in [
+            ("channel", "nightly-2026-07-11"),
+            ("rustc", "rustc 1.99.0-nightly (375b1431b 2026-07-10)"),
+            ("cargo", "cargo 1.99.0-nightly (59800466c 2026-07-07)"),
+            ("host", "aarch64-apple-darwin"),
+        ] {
+            if pointer_get(document, &format!("/toolchain/{field}"), SUBJECT_STATE_CAPABILITY)?.as_str() != Some(expected) {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_TOOLCHAIN", SUBJECT_STATE_CAPABILITY).at(field));
+            }
+        }
+        if pointer_get(document, "/toolchain/authority", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("evidence/fnd-01/toolchain-asupersync.toml")
+            || pointer_get(document, "/toolchain/commands_executed_for_this_child", SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(false)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_TOOLCHAIN", SUBJECT_STATE_CAPABILITY).at("toolchain authority"));
+        }
+
+        // Complete recorded advisory snapshot with an empty ignore list.
+        if pointer_get(document, "/advisory_snapshot/worktree_clean", SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(true)
+            || pointer_get(document, "/advisory_snapshot/advisory_count_from_frozen_fnd01_evidence", SUBJECT_STATE_CAPABILITY)?.as_integer()
+                != Some(1173)
+            || pointer_get(document, "/advisory_snapshot/ignore_list", SUBJECT_STATE_CAPABILITY)?
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+            || state_capability_string_rows(document, "/advisory_snapshot/known_relevant_record_hashes", SUBJECT_STATE_CAPABILITY)?.len() != 3
+            || state_capability_string_rows(document, "/advisory_snapshot/known_relevant_records", SUBJECT_STATE_CAPABILITY)?.len() != 3
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_ADVISORY", SUBJECT_STATE_CAPABILITY).at("advisory snapshot"));
+        }
+
+        // Frozen policy boundary: exact target union and prohibited package set.
+        let supported_targets = state_capability_string_rows(document, "/policy/supported_targets", SUBJECT_STATE_CAPABILITY)?;
+        if supported_targets.len() != EXPECTED_TARGETS.len()
+            || supported_targets.iter().zip(EXPECTED_TARGETS).any(|(recorded, expected)| *recorded != expected)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_POLICY", SUBJECT_STATE_CAPABILITY).at("supported targets"));
+        }
+        let prohibited_packages = state_capability_string_rows(document, "/policy/prohibited_active_packages", SUBJECT_STATE_CAPABILITY)?;
+        if prohibited_packages.len() != EXPECTED_PROHIBITED_PACKAGES.len()
+            || prohibited_packages.iter().zip(EXPECTED_PROHIBITED_PACKAGES).any(|(recorded, expected)| *recorded != expected)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_POLICY", SUBJECT_STATE_CAPABILITY).at("prohibited packages"));
+        }
+        if state_capability_string_rows(document, "/policy/semantic_owners", SUBJECT_STATE_CAPABILITY)?.len() != 3 {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_POLICY", SUBJECT_STATE_CAPABILITY).at("semantic owners"));
+        }
+
+        // Exact per-candidate selection tuples for all four recorded crates.
+        for (name, requirement, license, requested, checksum) in EXPECTED_CRATES {
+            let base = format!("/crate/name={name}");
+            if pointer_get(document, &format!("{base}/requirement"), name)?.as_str() != Some(requirement)
+                || pointer_get(document, &format!("{base}/default_features"), name)?.as_bool() != Some(false)
+                || pointer_get(document, &format!("{base}/yanked"), name)?.as_bool() != Some(false)
+                || pointer_get(document, &format!("{base}/license"), name)?.as_str() != Some(license)
+                || pointer_get(document, &format!("{base}/checksum_sha256"), name)?.as_str() != Some(checksum)
+            {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_ROOT_SELECTION", name));
+            }
+            let recorded_requested = string_array(document, &format!("{base}/requested_features"), name)?;
+            let allowed = string_array(document, &format!("{base}/allowed_features"), name)?;
+            // The literal allowed-feature gate runs FIRST so any planted
+            // non-allowed feature produces the typed forbidden-feature
+            // rejection rather than a generic selection mismatch.
+            for feature in &recorded_requested {
+                if !allowed.contains(feature) {
+                    return Err(Diagnostic::error("E_STATE_CAPABILITY_FORBIDDEN_FEATURE", SUBJECT_STATE_CAPABILITY)
+                        .at(&format!("crate[name={name}].requested_features/feature={feature}")));
+                }
+            }
+            if recorded_requested.len() != requested.len()
+                || recorded_requested.iter().zip(requested).any(|(recorded, expected)| recorded != expected)
+            {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_ROOT_SELECTION", name).at("requested features"));
+            }
+            let prohibited_features = string_array(document, &format!("{base}/prohibited_features"), name)?;
+            if prohibited_features.iter().any(|feature| recorded_requested.contains(feature)) {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_FORBIDDEN_FEATURE", SUBJECT_STATE_CAPABILITY)
+                    .at(&format!("crate[name={name}].requested_features/prohibited")));
+            }
+            if name == "redis" && prohibited_features.len() != 33 {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_ROOT_SELECTION", name).at("prohibited features"));
+            }
+        }
+
+        // Probe bundles: recorded path/byte/digest bindings against worktree bytes.
+        for (candidate, _probe, identity_rows, license_row) in [
+            (
+                "envelope",
+                "envelope",
+                [
+                    "chacha20poly1305 0.11.0 9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb",
+                    "zeroize 1.9.0 e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e",
+                    "fastmcp-fnd01-envelope-probe 0.0.0 path",
+                ],
+                "chacha20poly1305 0.11.0 | Apache-2.0 OR MIT | 1.85",
+            ),
+            (
+                "capability_fs",
+                "capability-fs",
+                [
+                    "cap-std 4.0.2 7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608",
+                    "rustix 1.1.4 b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190",
+                    "fastmcp-fnd01-capability-fs-probe 0.0.0 path",
+                ],
+                "rustix 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1.63",
+            ),
+            (
+                "redis",
+                "redis",
+                [
+                    "redis 1.4.1 b0b9503711b03773e43b31668c7b5bd279ee7cd9b7d18cff7c23a42cc1d08e5a",
+                    "sha1_smol 1.0.1 bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d",
+                    "fastmcp-fnd01-redis-probe 0.0.0 path",
+                ],
+                "redis 1.4.1 | BSD-3-Clause | 1.88",
+            ),
+        ] {
+            for role in ["manifest", "source", "lock"] {
+                state_capability_probe_binding(document, &bundle.probes, candidate, role)?;
+            }
+            let package_count = pointer_get(document, &format!("/probe/{candidate}/package_count"), SUBJECT_STATE_CAPABILITY)?
+                .as_integer()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(candidate))?;
+            let registry_package_count = pointer_get(document, &format!("/probe/{candidate}/registry_package_count"), SUBJECT_STATE_CAPABILITY)?
+                .as_integer()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(candidate))?;
+            if package_count != registry_package_count + 1
+                || pointer_get(document, &format!("/probe/{candidate}/lock_version"), SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(4)
+                || pointer_get(document, &format!("/probe/{candidate}/all_archives_present"), SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(true)
+                || pointer_get(document, &format!("/probe/{candidate}/all_archive_checksums_match"), SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(true)
+            {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(candidate));
+            }
+            let projection = state_capability_string_rows(document, &format!("/probe/{candidate}/package_projection"), SUBJECT_STATE_CAPABILITY)?;
+            if projection.len() != package_count || !projection.windows(2).all(|pair| pair[0] <= pair[1]) {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(&format!("/probe/{candidate}/package_projection")));
+            }
+            for identity in identity_rows {
+                if !projection.contains(&identity) {
+                    return Err(Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(&format!("/probe/{candidate}/package_projection")));
+                }
+            }
+            let license_rows = state_capability_string_rows(document, &format!("/probe/{candidate}/license_msrv_projection"), SUBJECT_STATE_CAPABILITY)?;
+            if license_rows.len() != registry_package_count || !license_rows.contains(&license_row) {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_PROJECTION", SUBJECT_STATE_CAPABILITY).at(&format!("/probe/{candidate}/license_msrv_projection")));
+            }
+        }
+
+        // Target rows, build scripts, findings, TCB gate, negative evidence, bounds.
+        for section_pointer in [
+            "/target_projection",
+            "/build_script",
+            "/source_finding",
+            "/xc20p_tcb_path",
+            "/negative_evidence",
+        ] {
+            if pointer_get(document, section_pointer, SUBJECT_STATE_CAPABILITY)?.as_array().is_none() {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_SECTION", SUBJECT_STATE_CAPABILITY).at(section_pointer));
+            }
+        }
+        if pointer_get(document, "/negative_evidence/id=NEG-REDIS-FEATURE-TOKIO-COMP/mutation", SUBJECT_STATE_CAPABILITY)?.as_str()
+            != Some("add redis/tokio-comp to the otherwise exact acl,script feature request")
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_SECTION", SUBJECT_STATE_CAPABILITY).at("negative_evidence/id=NEG-REDIS-FEATURE-TOKIO-COMP"));
+        }
+        if pointer_get(document, "/xc20p_tcb_gate/source_finding_path_count", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(12)
+            || pointer_get(document, "/xc20p_tcb_gate/tcb_table_path_count", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(14)
+            || pointer_get(document, "/xc20p_tcb_gate/inventory_unique_path_count", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(26)
+            || pointer_get(document, "/xc20p_tcb_assertion/assertion_passed", SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(true)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_TCB_GATE", SUBJECT_STATE_CAPABILITY).at("xc20p tcb assertion"));
+        }
+        if pointer_get(document, "/bounds/envelope/key_bytes", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(32)
+            || pointer_get(document, "/bounds/envelope/nonce_bytes", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(24)
+            || pointer_get(document, "/bounds/envelope/tag_bytes", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(16)
+            || pointer_get(document, "/bounds/envelope/block_bytes", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(64)
+            || pointer_get(document, "/bounds/redis/recursion_depth_constant", SUBJECT_STATE_CAPABILITY)?.as_integer() != Some(100)
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_BOUNDS", SUBJECT_STATE_CAPABILITY).at("recorded bounds"));
+        }
+
+        // The frozen gate ledger: every recorded flag must hold its frozen value.
+        for (flag, expected) in [
+            ("direct_archive_checksums_verified", true),
+            ("direct_index_records_verified", true),
+            ("direct_license_files_verified", true),
+            ("direct_vcs_info_verified", true),
+            ("upstream_tags_verified", false),
+            ("isolated_lock_toml_parsed", true),
+            ("isolated_lock_archives_present", true),
+            ("isolated_lock_archive_checksums_verified", true),
+            ("cargo_lock_regeneration_verified", false),
+            ("canonical_normal_build_graphs_captured", false),
+            ("canonical_feature_graphs_captured", false),
+            ("canonical_dev_graphs_captured", false),
+            ("target_compilation_verified", false),
+            ("full_transitive_license_files_verified", false),
+            ("full_cfg_reachable_unsafe_ffi_panic_inventory_verified", false),
+            ("advisory_locks_audited", false),
+            ("constant_time_targets_verified", false),
+            ("xc20p_application_bounds_verified", false),
+            ("capability_filesystem_semantics_supported", false),
+            ("bounded_redis_connector", false),
+            ("bounded_redis_parser", false),
+            ("redis_peer_identity_proven", false),
+            ("redis_profile_supported", false),
+            ("workspace_manifests_integrated", false),
+            ("workspace_lock_integrated", false),
+            ("rch_compile_verified", false),
+        ] {
+            if pointer_get(document, &format!("/gate/{flag}"), SUBJECT_STATE_CAPABILITY)?.as_bool() != Some(expected) {
+                return Err(Diagnostic::error("E_STATE_CAPABILITY_GATE", SUBJECT_STATE_CAPABILITY).at(flag));
+            }
+        }
+        if pointer_get(document, "/handoff/integration_owner", SUBJECT_STATE_CAPABILITY)?.as_str() != Some("bd-mcp-2026-07-28-support-ahet.1.1")
+            || pointer_get(document, "/handoff/receipt_attestation_owner", SUBJECT_STATE_CAPABILITY)?.as_str()
+                != Some("bd-mcp-2026-07-28-support-ahet.1.15")
+        {
+            return Err(Diagnostic::error("E_STATE_CAPABILITY_HANDOFF", SUBJECT_STATE_CAPABILITY).at("handoff owners"));
+        }
+        state_capability_input_digest(document, &bundle.probes)
+    }
+
+    #[test]
+    fn fnd_01_state_capability_dependencies_positive() {
+        const EXPECTED_STATE_CAPABILITY_INPUT_DIGEST: &str =
+            "1a6b51356e4603ac1361c9bf2369c45e9d363c8ce3e5b973662a860eaa834675";
+        let (root, files) = state_capability_test_sources();
+        let bundle = state_capability_bundle(&root, &files).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let accepted = validate_state_capability_bundle(&bundle).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_eq!(bundle.probes.len(), 9);
+        assert_eq!(accepted, EXPECTED_STATE_CAPABILITY_INPUT_DIGEST);
+    }
+
+    #[test]
+    fn fnd_01_state_capability_dependencies_planted_negative() {
+        let (root, files) = state_capability_test_sources();
+        let bundle = state_capability_bundle(&root, &files).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let baseline_digest = validate_state_capability_bundle(&bundle).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        let baseline_document = bundle.document.clone();
+        let baseline_probes = bundle.probes.clone();
+
+        // The plant adds exactly one forbidden Redis direct feature to the
+        // parsed manifest, leaving every recorded binding untouched.
+        let mut planted = bundle.clone();
+        let requested = pointer_get_mut(
+            &mut planted.document,
+            "/crate/name=redis/requested_features",
+            "state capability planted negative",
+        )
+        .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))
+        .as_array_mut()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}",
+                Diagnostic::error("E_STATE_CAPABILITY_PLANT", "state capability planted negative")
+                    .at("/crate/name=redis/requested_features")
+                    .stable()
+            )
+        });
+        requested.push(toml::Value::String("tokio-comp".to_owned()));
+        let planted_error = validate_state_capability_bundle(&planted)
+            .expect_err("one forbidden redis feature must fail at the literal allowed-feature gate");
+        assert_eq!(
+            planted_error.stable(),
+            "FND01|Error|E_STATE_CAPABILITY_FORBIDDEN_FEATURE|state-capability-dependencies|crate[name=redis].requested_features/feature=tokio-comp",
+        );
+        let planted_digest =
+            state_capability_input_digest(&planted.document, &planted.probes).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+        assert_ne!(planted_digest, baseline_digest, "the plant must change the domain-separated bundle digest");
+        assert_eq!(planted.probes, baseline_probes, "no probe state may change beyond the parsed manifest");
+
+        // Fresh reacceptance of the unmodified baseline.
+        let mut restored = planted;
+        restored.document = baseline_document;
+        assert_eq!(restored.probes, baseline_probes);
+        assert_eq!(
+            validate_state_capability_bundle(&restored).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
+            baseline_digest,
+        );
+    }
+
     fn admitted_core_conformance_test_inputs() -> (Vec<LoadedFile>, [u8; 32]) {
         let root = repository_root();
         let (policy, _) = read_policy(&root).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
