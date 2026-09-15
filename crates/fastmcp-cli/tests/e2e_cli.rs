@@ -3269,7 +3269,11 @@ os.close(fd)
             ready["breakSeconds"].as_u64().unwrap() >= 10,
             "kernel lease must outlive the CLI guard; unavailable lease proof is a failure"
         );
-        assert!(!holder.child_is_zombie("lease holder must remain alive").unwrap());
+        assert!(
+            !holder
+                .child_is_zombie("lease holder must remain alive")
+                .unwrap()
+        );
 
         let update_command = || {
             let mut command = Command::new(get_binary_path());
@@ -3303,7 +3307,11 @@ os.close(fd)
         // actual CLI exits; releasing it cannot manufacture bounded success.
         let output = run_with_deadline(update_command(), Duration::from_secs(3))
             .expect("Tasks input admission must exit naturally while the lease remains held");
-        assert!(!holder.child_is_zombie("lease holder outlives CLI exit").unwrap());
+        assert!(
+            !holder
+                .child_is_zombie("lease holder outlives CLI exit")
+                .unwrap()
+        );
         assert!(!fixture.root.join("lease-released").exists());
         let break_path = fixture.root.join("lease-break.json");
         if write_lease {
@@ -3325,7 +3333,10 @@ os.close(fd)
             assert!(!changed_path.exists());
         } else {
             assert_eq!(document(&output)["event"], "update-acknowledged");
-            assert!(!break_path.exists(), "read-open must not break a read lease");
+            assert!(
+                !break_path.exists(),
+                "read-open must not break a read lease"
+            );
             assert_working();
         }
 

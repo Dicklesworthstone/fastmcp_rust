@@ -6318,16 +6318,9 @@ async fn cmd_tasks(cx: &Cx, connection: &TaskConnection, action: &TaskAction) ->
             .await?;
         #[cfg(unix)]
         {
-            let outcome = run_yielding_stdio_task(
-                cx,
-                &mut client,
-                &output,
-                budget,
-                action,
-                task_id,
-                inputs,
-            )
-            .await;
+            let outcome =
+                run_yielding_stdio_task(cx, &mut client, &output, budget, action, task_id, inputs)
+                    .await;
             finish_inspect_acquisition_async(outcome, client.close_with_cx(cx)).await
         }
         #[cfg(not(unix))]
