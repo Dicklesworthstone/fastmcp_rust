@@ -562,9 +562,16 @@ impl TokenAuthProvider {
 
 impl AuthProvider for TokenAuthProvider {
     fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext> {
-        let access = request
-            .access_token()
-            .ok_or_else(|| self.missing_token_error.clone())?;
+        let access = match admitted_access_token(request) {
+            Ok(Some(token)) => token,
+            Ok(None) => return Err(self.missing_token_error.clone()),
+            Err(CredentialSourceError::Multiple) => {
+                return Err(auth_error("Multiple conflicting credential sources"));
+            }
+            Err(CredentialSourceError::Malformed) => {
+                return Err(auth_error("Invalid access token"));
+            }
+        };
         self.verifier.verify(ctx, request, &access)
     }
 }
@@ -2457,5 +2464,228 @@ mod tests {
         let mut stripped = Some(params.clone());
         strip_recognized_access_credentials(&mut stripped);
         assert_eq!(stripped, Some(params));
+    }
+
+    #[test]
+    fn token_auth_provider_distinguishes_multiple_and_malformed_from_missing() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        });
+
+        // 1. Positive: valid token proceeds to verifier
+        let req_valid = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: Some("Bearer valid-token"),
+            request_id: 1,
+        };
+        let auth = provider
+            .authenticate(&ctx(), req_valid)
+            .expect("valid credential succeeds");
+        assert_eq!(auth.subject.as_deref(), Some("alice"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2. Near-identical negative: absent credential returns default missing_token_error
+        let req_absent = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_absent = provider
+            .authenticate(&ctx(), req_absent)
+            .expect_err("absent credential returns default missing error");
+        assert_eq!(err_absent.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_absent.message, "Missing access token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 3. Near-identical negative: malformed native credential returns "Invalid access token"
+        let req_malformed_native = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: Some("Bearer "),
+            request_id: 1,
+        };
+        let err_malformed = provider
+            .authenticate(&ctx(), req_malformed_native)
+            .expect_err("malformed native credential must be rejected without verifier");
+        assert_eq!(err_malformed.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_malformed.message, "Invalid access token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 4. Near-identical negative: multiple conflicting credentials (native + in-band)
+        let params_in_band = serde_json::json!({
+            "headers": {
+                "Authorization": "Bearer valid-token"
+            }
+        });
+        let req_multiple = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_in_band),
+            transport_authorization: Some("Bearer valid-token"),
+            request_id: 1,
+        };
+        let err_multiple = provider
+            .authenticate(&ctx(), req_multiple)
+            .expect_err("multiple conflicting credentials must be rejected without verifier");
+        assert_eq!(err_multiple.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_multiple.message, "Multiple conflicting credential sources");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 5. Near-identical negative: malformed in-band credential
+        let params_malformed = serde_json::json!({
+            "headers": {
+                "Authorization": "Bearer "
+            }
+        });
+        let req_malformed_in_band = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_malformed),
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_malformed_in_band = provider
+            .authenticate(&ctx(), req_malformed_in_band)
+            .expect_err("malformed in-band credential must be rejected without verifier");
+        assert_eq!(err_malformed_in_band.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_malformed_in_band.message, "Invalid access token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 6. Near-identical negative: duplicate in-band case-variant headers
+        let params_duplicate_headers = serde_json::json!({
+            "headers": {
+                "authorization": "Bearer valid-token",
+                "Authorization": "Bearer valid-token"
+            }
+        });
+        let req_duplicate_headers = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_duplicate_headers),
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_duplicate = provider
+            .authenticate(&ctx(), req_duplicate_headers)
+            .expect_err("duplicate in-band header credentials must be rejected without verifier");
+        assert_eq!(err_duplicate.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_duplicate.message, "Multiple conflicting credential sources");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn token_auth_provider_preserves_custom_missing_error_only_when_empty() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier =
+            StaticTokenVerifier::new([("valid-token", AuthContext::with_subject("alice"))])
+                .expect("valid verifier configuration");
+        let provider = TokenAuthProvider::new(CountingVerifier {
+            inner: verifier,
+            calls: Arc::clone(&calls),
+        })
+        .with_missing_token_error(auth_error("custom-missing-token"));
+
+        // 1. Positive: valid token proceeds to verifier
+        let req_valid = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: Some("Bearer valid-token"),
+            request_id: 1,
+        };
+        let auth = provider
+            .authenticate(&ctx(), req_valid)
+            .expect("valid credential succeeds");
+        assert_eq!(auth.subject.as_deref(), Some("alice"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2. Near-identical negative: absent credential preserves custom missing_token_error
+        let req_absent = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_absent = provider
+            .authenticate(&ctx(), req_absent)
+            .expect_err("absent credential returns custom missing error");
+        assert_eq!(err_absent.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_absent.message, "custom-missing-token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 3. Near-identical negative: malformed native credential returns "Invalid access token" (not custom missing)
+        let req_malformed_native = AuthRequest {
+            method: "tools/call",
+            params: None,
+            transport_authorization: Some("Bearer "),
+            request_id: 1,
+        };
+        let err_malformed = provider
+            .authenticate(&ctx(), req_malformed_native)
+            .expect_err("malformed native credential must be rejected without verifier");
+        assert_eq!(err_malformed.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_malformed.message, "Invalid access token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 4. Near-identical negative: multiple conflicting credentials (native + in-band) (not custom missing)
+        let params_in_band = serde_json::json!({
+            "headers": {
+                "Authorization": "Bearer valid-token"
+            }
+        });
+        let req_multiple = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_in_band),
+            transport_authorization: Some("Bearer valid-token"),
+            request_id: 1,
+        };
+        let err_multiple = provider
+            .authenticate(&ctx(), req_multiple)
+            .expect_err("multiple conflicting credentials must be rejected without verifier");
+        assert_eq!(err_multiple.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_multiple.message, "Multiple conflicting credential sources");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 5. Near-identical negative: malformed in-band credential (not custom missing)
+        let params_malformed = serde_json::json!({
+            "headers": {
+                "Authorization": "Bearer "
+            }
+        });
+        let req_malformed_in_band = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_malformed),
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_malformed_in_band = provider
+            .authenticate(&ctx(), req_malformed_in_band)
+            .expect_err("malformed in-band credential must be rejected without verifier");
+        assert_eq!(err_malformed_in_band.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_malformed_in_band.message, "Invalid access token");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 6. Near-identical negative: duplicate in-band case-variant headers (not custom missing)
+        let params_duplicate_headers = serde_json::json!({
+            "headers": {
+                "authorization": "Bearer valid-token",
+                "Authorization": "Bearer valid-token"
+            }
+        });
+        let req_duplicate_headers = AuthRequest {
+            method: "tools/call",
+            params: Some(&params_duplicate_headers),
+            transport_authorization: None,
+            request_id: 1,
+        };
+        let err_duplicate = provider
+            .authenticate(&ctx(), req_duplicate_headers)
+            .expect_err("duplicate in-band header credentials must be rejected without verifier");
+        assert_eq!(err_duplicate.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(err_duplicate.message, "Multiple conflicting credential sources");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
