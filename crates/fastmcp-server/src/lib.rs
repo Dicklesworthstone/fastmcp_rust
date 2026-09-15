@@ -1988,16 +1988,6 @@ fn validate_final_core_middleware_metadata_seal(
     Ok(())
 }
 
-fn is_exact_legacy_initialize(request: &JsonRpcRequest) -> bool {
-    request.method == "initialize"
-        && request
-            .params
-            .as_ref()
-            .and_then(|params| params.get("protocolVersion"))
-            .and_then(serde_json::Value::as_str)
-            == Some(LEGACY_PROTOCOL_VERSION)
-}
-
 fn stdio_opening_frame(request: &JsonRpcRequest) -> StdioOpeningFrame {
     if let Some(protocol_version) = modern_protocol_version(request) {
         return if request.method == "initialize" {
@@ -2015,7 +2005,8 @@ fn stdio_opening_frame(request: &JsonRpcRequest) -> StdioOpeningFrame {
         return StdioOpeningFrame::Notification;
     }
 
-    if is_exact_legacy_initialize(request) {
+    // Initialize proposes a version; the adapter negotiates our supported version.
+    if request.method == "initialize" {
         StdioOpeningFrame::LegacyInitialize
     } else {
         StdioOpeningFrame::RequestWithoutModernMetadata
@@ -15157,10 +15148,7 @@ impl Server {
                                 }
                             }
                             Some(ProtocolEra::Legacy2024) => {
-                                if modern_protocol_version(&request).is_some()
-                                    || (request.method == "initialize"
-                                        && !is_exact_legacy_initialize(&request))
-                                {
+                                if modern_protocol_version(&request).is_some() {
                                     if let Some(response) = protocol_era_refusal(&request) {
                                         let _ = send
                                             .lock()
@@ -15997,9 +15985,7 @@ impl Server {
                             ProtocolEra::Modern2026
                         }
                         Some(ProtocolEra::Legacy2024)
-                            if modern_protocol_version(&request).is_none()
-                                && (request.method != "initialize"
-                                    || is_exact_legacy_initialize(&request)) =>
+                            if modern_protocol_version(&request).is_none() =>
                         {
                             ProtocolEra::Legacy2024
                         }
@@ -16398,9 +16384,7 @@ impl Server {
                             ProtocolEra::Modern2026
                         }
                         Some(ProtocolEra::Legacy2024)
-                            if modern_protocol_version(&request).is_none()
-                                && (request.method != "initialize"
-                                    || is_exact_legacy_initialize(&request)) =>
+                            if modern_protocol_version(&request).is_none() =>
                         {
                             ProtocolEra::Legacy2024
                         }
@@ -32721,6 +32705,69 @@ mod lib_unit_tests {
         assert_eq!(response.id, Some(905_i64.into()));
         assert!(response.error.is_none());
         assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn returning_transport_negotiates_initialize_proposals_before_tools_list() {
+        for proposal in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01"] {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut initialize = exact_legacy_initialize_request(711, serde_json::json!("1.0.0"));
+            let JsonRpcMessage::Request(request) = &mut initialize else {
+                panic!("initialize fixture must be a request");
+            };
+            request.params.as_mut().expect("initialize params")["protocolVersion"] =
+                serde_json::json!(proposal);
+            Server::new("proposal-negotiation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto policy")
+                .tool(LiveLegacyRuntimeConnectionTool)
+                .build()
+                .run_transport_returning_with_cx(
+                    &Cx::for_testing(),
+                    ProtocolPolicyScriptTransport {
+                        inbound: std::collections::VecDeque::from([
+                            initialize,
+                            JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/initialized",
+                                None,
+                            )),
+                            JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "tools/list",
+                                None,
+                                712_i64,
+                            )),
+                        ]),
+                        sent: Arc::clone(&sent),
+                        receive_calls: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+                .expect("proposal must negotiate and retain a usable session");
+            let sent = sent.lock().expect("sent messages");
+            let responses: Vec<_> = sent
+                .iter()
+                .filter_map(|message| match message {
+                    JsonRpcMessage::Response(response) => Some(response),
+                    JsonRpcMessage::Request(_) => None,
+                })
+                .collect();
+            assert_eq!(responses.len(), 2, "{proposal}");
+            assert!(
+                responses.iter().all(|response| response.error.is_none()),
+                "{responses:?}"
+            );
+            assert_eq!(
+                responses[0].result.as_ref().expect("initialize result")["protocolVersion"],
+                "2024-11-05"
+            );
+            let tools = responses[1].result.as_ref().expect("tools result")["tools"]
+                .as_array()
+                .expect("tools array");
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool["name"] == "live_legacy_runtime_connection_tool")
+            );
+        }
     }
 
     #[test]

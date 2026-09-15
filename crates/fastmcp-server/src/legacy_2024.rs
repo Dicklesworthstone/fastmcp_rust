@@ -1005,18 +1005,13 @@ where
                 .ok_or(Legacy2024AdapterError::invalid_params(
                     "initialize requires exact 2024 object params",
                 ))?;
-        if params.get("protocolVersion")
-            != Some(&Value::String(
-                LEGACY_2024_11_05_PROTOCOL_VERSION.to_owned(),
-            ))
-        {
-            // A different protocol era is an envelope-class rejection, in
-            // line with the frozen taxonomy where every initialize
-            // era-security failure stays -32600.
-            return Err(Legacy2024AdapterError::invalid_request(
-                "initialize protocolVersion must be exact MCP 2024-11-05",
+        if !params.get("protocolVersion").is_some_and(Value::is_string) {
+            return Err(Legacy2024AdapterError::invalid_params(
+                "initialize protocolVersion must be a string",
             ));
         }
+        // Unsupported proposals negotiate our version in initialize_result.
+        // Reserved modern metadata is rejected separately, before mutation.
         let client_capabilities =
             params
                 .get("capabilities")
@@ -1846,18 +1841,74 @@ mod tests {
     }
 
     #[test]
-    fn first_wire_rejections_preserve_adapter_state() {
+    fn initialize_negotiates_proposals_and_keeps_legacy_session_operational() {
+        for proposal in ["2024-11-05", "2025-03-26", "2025-06-18", "2099-01-01"] {
+            let mut adapter = adapter();
+            let mut request = initialize();
+            request["params"]["protocolVersion"] = json!(proposal);
+            let Legacy2024Outbound::Response(response) = adapter
+                .receive(binding(), request)
+                .expect("initialize response")
+            else {
+                panic!("initialize must return a response");
+            };
+            assert_eq!(
+                response["result"]["protocolVersion"], "2024-11-05",
+                "{proposal}"
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            adapter
+                .receive(
+                    binding(),
+                    json!({"jsonrpc": "2.0", "method": NOTIFICATIONS_INITIALIZED}),
+                )
+                .expect("negotiated session must become operational");
+            assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
+            let Legacy2024Outbound::Response(response) = adapter
+                .receive(
+                    binding(),
+                    json!({"jsonrpc": "2.0", "id": 2, "method": TOOLS_LIST}),
+                )
+                .expect("tools/list response")
+            else {
+                panic!("tools/list must return a response");
+            };
+            assert_eq!(response["result"]["handled"], TOOLS_LIST);
+            assert_eq!(adapter.handler.methods, [TOOLS_LIST]);
+            let before = adapter.snapshot();
+            let Legacy2024Outbound::Response(response) = adapter
+                .receive(binding(), json!({
+                    "jsonrpc": "2.0", "id": 3, "method": TOOLS_LIST,
+                    "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
+                })).expect("mixed-era error")
+            else { panic!("mixed-era request must return a response"); };
+            assert_eq!(response["error"]["code"], -32602);
+            assert_eq!(
+                response["error"]["message"],
+                "invalid exact MCP 2024-11-05 parameters"
+            );
+            assert_eq!(adapter.snapshot(), before);
+            assert_eq!(adapter.handler.methods, [TOOLS_LIST]);
+        }
+    }
+
+    #[test]
+    fn malformed_initialize_version_preserves_adapter_state() {
         let binding = binding();
         let mut adapter = adapter();
         let before = adapter.snapshot();
 
-        let mut wrong_era = initialize();
-        wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
-        let response = adapter.receive(binding, wrong_era).unwrap();
+        let mut malformed = initialize();
+        malformed["params"]["protocolVersion"] = json!(2025);
+        let response = adapter.receive(binding, malformed).unwrap();
         let Legacy2024Outbound::Response(response) = response else {
             panic!("invalid initialize request must receive a JSON-RPC error response");
         };
         assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(
+            response["error"]["message"],
+            "invalid exact MCP 2024-11-05 envelope"
+        );
         assert_eq!(adapter.snapshot(), before);
         assert_eq!(adapter.handler.methods.len(), 0);
     }
