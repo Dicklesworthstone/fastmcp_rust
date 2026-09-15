@@ -122,28 +122,6 @@ const MRTR_RESPONSE_KIND_ERROR: &str = "MRTR input response does not match its r
 const MRTR_ROUND_LIMIT_ERROR: &str = "MRTR exchange limit reached";
 
 /// The immutable request facts a router binds to one opaque MRTR state.
-/// Sealed MRTR continuation eligibility policy.
-///
-/// Classifies whether an operation permits multi-round continuations across
-/// stateless HTTP ingress without an authenticated principal identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MrtrContinuationPolicy {
-    /// Private operation (safe default). Requires a verified authenticated
-    /// principal for stateless continuation issuance and retries. Anonymous
-    /// ingress fails closed before exchange registry allocation.
-    #[default]
-    Private,
-}
-
-impl MrtrContinuationPolicy {
-    /// Returns whether this policy requires private authenticated continuation.
-    #[must_use]
-    pub const fn is_private(self) -> bool {
-        matches!(self, Self::Private)
-    }
-}
-
-/// A router-admitted operation identity used to bind MRTR retry exchanges.
 ///
 /// This is deliberately server-local: it is never serialized and prevents a
 /// state minted for one modern operation from resuming another operation that
@@ -156,7 +134,6 @@ pub(crate) struct MrtrExchangeBinding {
     session_partition: [u8; 32],
     principal_digest: Option<[u8; 32]>,
     is_stateless: bool,
-    policy: MrtrContinuationPolicy,
 }
 
 impl MrtrExchangeBinding {
@@ -169,26 +146,6 @@ impl MrtrExchangeBinding {
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
     ) -> Self {
-        Self::with_policy(
-            method,
-            target,
-            arguments_digest,
-            session_partition,
-            principal_digest,
-            MrtrContinuationPolicy::Private,
-        )
-    }
-
-    /// Captures the router-admitted operation identity with an explicit continuation policy.
-    #[must_use]
-    pub(crate) fn with_policy(
-        method: &'static str,
-        target: String,
-        arguments_digest: [u8; 32],
-        session_partition: [u8; 32],
-        principal_digest: Option<[u8; 32]>,
-        policy: MrtrContinuationPolicy,
-    ) -> Self {
         Self {
             method,
             target,
@@ -196,7 +153,6 @@ impl MrtrExchangeBinding {
             session_partition,
             principal_digest,
             is_stateless: false,
-            policy,
         }
     }
 
@@ -209,26 +165,6 @@ impl MrtrExchangeBinding {
         session_partition: [u8; 32],
         principal_digest: Option<[u8; 32]>,
     ) -> Self {
-        Self::stateless_with_policy(
-            method,
-            target,
-            arguments_digest,
-            session_partition,
-            principal_digest,
-            MrtrContinuationPolicy::Private,
-        )
-    }
-
-    /// Captures the operation identity for an ephemeral stateless HTTP retry with an explicit policy.
-    #[must_use]
-    pub(crate) fn stateless_with_policy(
-        method: &'static str,
-        target: String,
-        arguments_digest: [u8; 32],
-        session_partition: [u8; 32],
-        principal_digest: Option<[u8; 32]>,
-        policy: MrtrContinuationPolicy,
-    ) -> Self {
         Self {
             method,
             target,
@@ -236,18 +172,12 @@ impl MrtrExchangeBinding {
             session_partition,
             principal_digest,
             is_stateless: true,
-            policy,
         }
     }
 
     #[must_use]
     pub(crate) fn is_stateless(&self) -> bool {
         self.is_stateless
-    }
-
-    #[must_use]
-    pub(crate) fn policy(&self) -> MrtrContinuationPolicy {
-        self.policy
     }
 }
 const LEGACY_INPUT_RETRY_ERROR: &str = "MCP 2024-11-05 does not support input retries";
@@ -2113,6 +2043,10 @@ impl MrtrExchangeRegistry {
     where
         I: IntoIterator<Item = (&'a String, &'a serde_json::Value)>,
     {
+        if binding.is_some_and(|binding| binding.is_stateless && binding.principal_digest.is_none())
+        {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
         if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
@@ -2213,6 +2147,14 @@ impl MrtrExchangeRegistry {
         handler_request_state: Option<String>,
         now: Instant,
     ) -> McpResult<MrtrInputRequired> {
+        // This registry retains private, one-use state even for stateless
+        // HTTP. Require verified owner authority before cleanup or allocation.
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding.is_stateless && binding.principal_digest.is_none())
+        {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
         if owner_cancellation.is_cancel_requested() {
             return Err(McpError::request_cancelled());
         }
@@ -2273,6 +2215,10 @@ impl MrtrExchangeRegistry {
         state_only_retry: bool,
         now: Instant,
     ) -> McpResult<MrtrRetry> {
+        if binding.is_some_and(|binding| binding.is_stateless && binding.principal_digest.is_none())
+        {
+            return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+        }
         if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
@@ -3053,7 +2999,7 @@ mod tests {
             "stateless-tool".to_owned(),
             [1; 32],
             [2; 32],
-            None,
+            Some([3; 32]),
         );
         let stateless = registry
             .issue_bound(
@@ -3129,6 +3075,75 @@ mod tests {
     }
 
     #[test]
+    fn auth_00_ownerless_http_retry_rejects_before_expired_state_lookup() {
+        let owner_binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "owner-bound-tool".to_owned(),
+            [11; 32],
+            [13; 32],
+            Some([17; 32]),
+        );
+        let ownerless_binding = MrtrExchangeBinding::stateless(
+            "tools/call",
+            "owner-bound-tool".to_owned(),
+            [11; 32],
+            [13; 32],
+            None,
+        );
+        let response = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::to_value(mrtr_roots_response()).expect("roots response must encode"),
+        )]);
+
+        for state_only in [false, true] {
+            let registry = MrtrExchangeRegistry::new();
+            let required = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    owner_binding.clone(),
+                    MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+                        .expect("unique input map"),
+                    None,
+                )
+                .expect("trusted owner can issue private HTTP state");
+            let request_state = mrtr_state_from_wire(&required);
+            let expires_at = Instant::now() - Duration::from_secs(1);
+            registry
+                .lock_state()
+                .exchanges
+                .get_mut(&request_state)
+                .expect("issued exchange")
+                .expires_at = expires_at;
+            let accept = |binding: &MrtrExchangeBinding| {
+                if state_only {
+                    registry.accept_state_only_bound(&request_state, binding)
+                } else {
+                    registry.accept_wire_bound(&request_state, binding, &response)
+                }
+            };
+
+            let denied = accept(&ownerless_binding)
+                .expect_err("ownerless admission must precede either lookup entry point");
+            assert_eq!(denied.code, McpErrorCode::InvalidParams);
+            {
+                // active_len() purges expired entries; inspect authoritative
+                // storage directly so the observation cannot mutate the oracle.
+                let state = registry.lock_state();
+                assert_eq!(state.exchanges.len(), 1);
+                let retained = state.exchanges.get(&request_state).unwrap();
+                assert_eq!(retained.expires_at, expires_at);
+                assert_eq!(retained.binding.as_ref(), Some(&owner_binding));
+                assert!(retained.responses.is_empty());
+            }
+            // Changing only the owner authority reaches the ordinary expiry
+            // lookup and removes the same expired state in both entry points.
+            let expired = accept(&owner_binding).expect_err("expired state must reject");
+            assert_eq!(expired.code, McpErrorCode::InvalidParams);
+            assert!(registry.lock_state().exchanges.is_empty());
+        }
+    }
+
+    #[test]
     fn stateless_mrtr_method_binding_rejects_without_consuming_state() {
         let registry = MrtrExchangeRegistry::new();
         let binding = MrtrExchangeBinding::stateless(
@@ -3136,7 +3151,7 @@ mod tests {
             "bound-target".to_owned(),
             [23; 32],
             [29; 32],
-            None,
+            Some([31; 32]),
         );
         let required = registry
             .issue_bound(
@@ -3153,7 +3168,7 @@ mod tests {
             "bound-target".to_owned(),
             [23; 32],
             [29; 32],
-            None,
+            Some([31; 32]),
         );
         let response = BTreeMap::from([(
             "roots".to_owned(),
@@ -3347,7 +3362,7 @@ mod tests {
             "elicitation-tool".to_owned(),
             [17; 32],
             [19; 32],
-            None,
+            Some([23; 32]),
         );
         let input_requests = || {
             MrtrInputRequests::new([(

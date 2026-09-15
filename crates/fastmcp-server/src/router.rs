@@ -716,14 +716,25 @@ fn final_mrtr_binding(
     } else {
         session_partition
     };
-    let principal_digest = request_ctx
-        .auth()
-        .map(|auth| {
-            auth.session_owner()
-                .map(|owner| Ok(*owner.as_bytes()))
-                .unwrap_or_else(|| mrtr_digest(&auth))
-        })
-        .transpose()?;
+    let principal_digest = if is_stateless {
+        // Cross-POST state requires a provider-scoped owner. A display subject
+        // or an anonymous AuthContext hash is not durable identity authority.
+        // Keep ordinary complete requests usable without this MRTR authority;
+        // the registry gates issuance and retries before accessing state.
+        request_ctx
+            .auth()
+            .and_then(|auth| auth.session_owner())
+            .map(|owner| *owner.as_bytes())
+    } else {
+        request_ctx
+            .auth()
+            .map(|auth| {
+                auth.session_owner()
+                    .map(|owner| Ok(*owner.as_bytes()))
+                    .unwrap_or_else(|| mrtr_digest(&auth))
+            })
+            .transpose()?
+    };
     let binding = if is_stateless {
         MrtrExchangeBinding::stateless(
             method,

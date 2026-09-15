@@ -39,8 +39,7 @@ use fastmcp_protocol::{
     ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
 };
 
-use crate::bidirectional::{MrtrCompletedInputs, MrtrContinuationPolicy};
-pub use crate::bidirectional::MrtrContinuationPolicy;
+use crate::bidirectional::MrtrCompletedInputs;
 #[cfg(feature = "proxy")]
 use crate::proxy::ProxyClient;
 #[cfg(feature = "tasks")]
@@ -1771,13 +1770,6 @@ pub trait ToolHandler: Send + Sync {
         false
     }
 
-    /// Returns the MRTR continuation eligibility policy for this tool.
-    ///
-    /// Sealed at admission. Defaults to `MrtrContinuationPolicy::Private`.
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        MrtrContinuationPolicy::Private
-    }
-
     /// Calls the tool through the final complete, input-required, or task-creation surface.
     ///
     /// Existing handlers remain complete-only. A task-capable handler
@@ -1901,13 +1893,6 @@ pub trait ResourceHandler: Send + Sync {
     /// partition.
     fn declares_final_mrtr(&self) -> bool {
         false
-    }
-
-    /// Returns the MRTR continuation eligibility policy for this resource.
-    ///
-    /// Sealed at admission. Defaults to `MrtrContinuationPolicy::Private`.
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        MrtrContinuationPolicy::Private
     }
 
     /// Returns the resource template definition, if this resource uses a URI template.
@@ -2315,13 +2300,6 @@ pub trait PromptHandler: Send + Sync {
     /// partition.
     fn declares_final_mrtr(&self) -> bool {
         false
-    }
-
-    /// Returns the MRTR continuation eligibility policy for this prompt.
-    ///
-    /// Sealed at admission. Defaults to `MrtrContinuationPolicy::Private`.
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        MrtrContinuationPolicy::Private
     }
 
     /// Returns an exact final prompt catalog definition, when this handler
@@ -3046,10 +3024,6 @@ impl ToolHandler for MountedToolHandler {
         self.inner.declares_final_mrtr()
     }
 
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        self.inner.final_mrtr_policy()
-    }
-
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
     }
@@ -3344,10 +3318,6 @@ impl ResourceHandler for MountedResourceHandler {
 
     fn declares_final_mrtr(&self) -> bool {
         self.inner.declares_final_mrtr()
-    }
-
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        self.inner.final_mrtr_policy()
     }
 
     fn template(&self) -> Option<ResourceTemplate> {
@@ -3706,10 +3676,6 @@ impl PromptHandler for MountedPromptHandler {
 
     fn declares_final_mrtr(&self) -> bool {
         self.inner.declares_final_mrtr()
-    }
-
-    fn final_mrtr_policy(&self) -> MrtrContinuationPolicy {
-        self.inner.final_mrtr_policy()
     }
 
     fn final_title(&self) -> Option<&str> {

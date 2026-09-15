@@ -2534,7 +2534,10 @@ mod tests {
             .authenticate(&ctx(), req_multiple)
             .expect_err("multiple conflicting credentials must be rejected without verifier");
         assert_eq!(err_multiple.code, McpErrorCode::ResourceForbidden);
-        assert_eq!(err_multiple.message, "Multiple conflicting credential sources");
+        assert_eq!(
+            err_multiple.message,
+            "Multiple conflicting credential sources"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // 5. Near-identical negative: malformed in-band credential
@@ -2573,7 +2576,10 @@ mod tests {
             .authenticate(&ctx(), req_duplicate_headers)
             .expect_err("duplicate in-band header credentials must be rejected without verifier");
         assert_eq!(err_duplicate.code, McpErrorCode::ResourceForbidden);
-        assert_eq!(err_duplicate.message, "Multiple conflicting credential sources");
+        assert_eq!(
+            err_duplicate.message,
+            "Multiple conflicting credential sources"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -2646,7 +2652,10 @@ mod tests {
             .authenticate(&ctx(), req_multiple)
             .expect_err("multiple conflicting credentials must be rejected without verifier");
         assert_eq!(err_multiple.code, McpErrorCode::ResourceForbidden);
-        assert_eq!(err_multiple.message, "Multiple conflicting credential sources");
+        assert_eq!(
+            err_multiple.message,
+            "Multiple conflicting credential sources"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // 5. Near-identical negative: malformed in-band credential (not custom missing)
@@ -2685,7 +2694,10 @@ mod tests {
             .authenticate(&ctx(), req_duplicate_headers)
             .expect_err("duplicate in-band header credentials must be rejected without verifier");
         assert_eq!(err_duplicate.code, McpErrorCode::ResourceForbidden);
-        assert_eq!(err_duplicate.message, "Multiple conflicting credential sources");
+        assert_eq!(
+            err_duplicate.message,
+            "Multiple conflicting credential sources"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
