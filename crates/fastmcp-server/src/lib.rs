@@ -16148,6 +16148,16 @@ impl Server {
                     break;
                 }
             };
+            // A request child can fail its write while ingress is blocked.
+            // Recheck before authenticating or admitting the returned frame.
+            if worker_failed.load(Ordering::Acquire)
+                || connection_failure
+                    .as_ref()
+                    .is_some_and(|failed| failed.load(Ordering::Acquire))
+            {
+                exit_code = 1;
+                break;
+            }
             let JsonRpcMessage::Request(request) = message else {
                 continue;
             };
@@ -17402,6 +17412,8 @@ impl Server {
                                             let notification_cx = request_cx.clone();
                                             let notification_cancellation =
                                                 request_cancellation.clone();
+                                            let notification_failed =
+                                                Arc::clone(&reservation.failed);
                                             #[cfg(test)]
                                             let notification_request_id =
                                                 request_id_to_u64(request.id.as_ref());
@@ -17433,6 +17445,10 @@ impl Server {
                                                         )
                                                         .is_err()
                                                     {
+                                                        // A later successful cancellation response
+                                                        // must not erase this failed notification.
+                                                        notification_failed
+                                                            .store(true, Ordering::Release);
                                                         notification_cancellation.cancel();
                                                     }
                                                 },
@@ -45323,6 +45339,210 @@ mod lib_unit_tests {
         assert_eq!(responses.response_count(905), 1);
         assert_eq!(responses.response_count(1200), 0);
         assert_eq!(responses.response_count(1201), 0);
+    }
+
+    #[test]
+    fn split_returning_modern_progress_write_success_quiesces() {
+        split_returning_modern_progress_write_case(false);
+    }
+
+    #[test]
+    fn split_returning_modern_progress_write_failure_survives_successful_terminal_write() {
+        split_returning_modern_progress_write_case(true);
+    }
+
+    fn split_returning_modern_progress_write_case(fail_progress_write: bool) {
+        const REQUEST_ID: i64 = 1210;
+
+        #[derive(Default)]
+        struct Probe {
+            control: Arc<LiveModernControl>,
+            responses: Arc<LiveModernResponses>,
+            receive_waiting: BoundedTestSignal,
+            progress_attempted: BoundedTestSignal,
+            progress_attempts: AtomicUsize,
+            receive_calls: AtomicUsize,
+            closed_after_terminal: AtomicUsize,
+            timeout_returns: AtomicUsize,
+            receive_closes: AtomicUsize,
+            send_closes: AtomicUsize,
+        }
+
+        struct ProgressWriteRecv {
+            probe: Arc<Probe>,
+        }
+
+        impl TransportRecvHalf for ProgressWriteRecv {
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                match self.probe.receive_calls.fetch_add(1, Ordering::AcqRel) {
+                    0 => Ok(modern_discovery_opening_request()),
+                    1 => {
+                        if !self
+                            .probe
+                            .responses
+                            .wait_for_responses(&[905], Duration::from_secs(2))
+                        {
+                            self.probe.timeout_returns.fetch_add(1, Ordering::AcqRel);
+                            return Err(TransportError::Timeout);
+                        }
+                        Ok(modern_controlled_tool_progress_request(REQUEST_ID))
+                    }
+                    2 => {
+                        // Keep the receive operation open until both the progress
+                        // attempt and the terminal write finish. This exercises
+                        // the failure latch even when EOF wins the next observation.
+                        self.probe.receive_waiting.raise();
+                        if !self.probe.progress_attempted.wait(Duration::from_secs(2)) {
+                            self.probe.control.release_all();
+                            self.probe.timeout_returns.fetch_add(1, Ordering::AcqRel);
+                            return Err(TransportError::Timeout);
+                        }
+                        self.probe.control.release(REQUEST_ID as u64);
+                        if self
+                            .probe
+                            .responses
+                            .wait_for_responses(&[REQUEST_ID], Duration::from_secs(2))
+                        {
+                            self.probe
+                                .closed_after_terminal
+                                .fetch_add(1, Ordering::AcqRel);
+                            Err(TransportError::Closed)
+                        } else {
+                            self.probe.timeout_returns.fetch_add(1, Ordering::AcqRel);
+                            Err(TransportError::Timeout)
+                        }
+                    }
+                    _ => Err(TransportError::Closed),
+                }
+            }
+
+            fn close(&mut self) -> Result<(), TransportError> {
+                self.probe.receive_closes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+
+        struct ProgressWriteSend {
+            probe: Arc<Probe>,
+            fail_progress_write: bool,
+        }
+
+        impl TransportSendHalf for ProgressWriteSend {
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                if matches!(message, JsonRpcMessage::Request(notification)
+                    if notification.method == "notifications/progress")
+                {
+                    if !self.probe.receive_waiting.wait(Duration::from_secs(2)) {
+                        self.probe.timeout_returns.fetch_add(1, Ordering::AcqRel);
+                        return Err(TransportError::Timeout);
+                    }
+                    self.probe.progress_attempts.fetch_add(1, Ordering::AcqRel);
+                    self.probe.progress_attempted.raise();
+                    // The sole changed input between the paired cases is the
+                    // result of this progress write. All responses still succeed.
+                    if self.fail_progress_write {
+                        return Err(TransportError::Io(std::io::Error::other(
+                            "progress write failed",
+                        )));
+                    }
+                }
+                self.probe.responses.record(message.clone());
+                Ok(())
+            }
+
+            fn close(&mut self) -> Result<(), TransportError> {
+                self.probe.send_closes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+
+        let probe = Arc::new(Probe::default());
+        let server = Server::new("split-progress-write", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto must be available to this test build")
+            .tool(LiveModernControlledTool {
+                control: Arc::clone(&probe.control),
+            })
+            .build();
+        let active_requests = Arc::clone(&server.active_requests);
+        let result = run_live_split_transport(
+            Duration::from_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS),
+            server,
+            ProgressWriteRecv {
+                probe: Arc::clone(&probe),
+            },
+            ProgressWriteSend {
+                probe: Arc::clone(&probe),
+                fail_progress_write,
+            },
+        );
+
+        assert_eq!(probe.receive_calls.load(Ordering::Acquire), 3);
+        assert_eq!(
+            probe.closed_after_terminal.load(Ordering::Acquire),
+            1,
+            "receive must return clean EOF only after observing the terminal write"
+        );
+        assert_eq!(
+            probe.timeout_returns.load(Ordering::Acquire),
+            0,
+            "a fixture timeout must never substitute for the notification failure"
+        );
+        assert_eq!(probe.progress_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(probe.responses.response_count(905), 1);
+        assert_eq!(probe.responses.response_count(REQUEST_ID), 1);
+        assert_eq!(probe.receive_closes.load(Ordering::Acquire), 1);
+        assert_eq!(probe.send_closes.load(Ordering::Acquire), 1);
+        assert!(probe.control.has_started(REQUEST_ID as u64));
+        assert_eq!(
+            probe
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active,
+            0,
+            "handler cleanup must finish before the returning runner settles"
+        );
+        assert!(
+            active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the runner must retire every request owner"
+        );
+        let progress_writes = probe
+            .responses
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(message, JsonRpcMessage::Request(notification)
+                if notification.method == "notifications/progress")
+            })
+            .count();
+        let terminal = probe
+            .responses
+            .response(REQUEST_ID)
+            .expect("the terminal response write succeeds in both cases");
+        if fail_progress_write {
+            assert_eq!(progress_writes, 0);
+            assert!(terminal.result.is_none());
+            assert_eq!(
+                terminal.error.and_then(|error| error.code.as_i32()),
+                Some(i32::from(McpErrorCode::RequestCancelled))
+            );
+            let error = result.expect_err(
+                "a successful cancellation response cannot erase the progress-write failure",
+            );
+            assert!(error.contains("Server transport loop failed"), "{error}");
+        } else {
+            assert_eq!(progress_writes, 1);
+            assert!(terminal.error.is_none());
+            let result_body = terminal.result.expect("successful tool result");
+            assert_eq!(result_body["resultType"], "complete");
+            assert_eq!(result_body["content"][0]["text"], "modern request 1210");
+            result.expect("successful progress and response writes must quiesce cleanly");
+        }
     }
 
     #[test]
