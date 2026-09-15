@@ -173,13 +173,6 @@ fn assert_final_metadata(request: &CapturedHttpRequest, expected_method: &str) {
     );
 }
 
-fn http_header_present(head: &str, expected_name: &str) -> bool {
-    head.lines().any(|line| {
-        line.split_once(':')
-            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(expected_name))
-    })
-}
-
 fn http_header_equals(head: &str, expected_name: &str, expected_value: &str) -> bool {
     head.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
@@ -3477,7 +3470,10 @@ mod authenticated_tls {
                     .as_object()
                     .expect("authenticated MRTR retry must contain the response map");
                 assert_eq!(
-                    input_responses.keys().map(String::as_str).collect::<Vec<_>>(),
+                    input_responses
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
                     ["sampling"]
                 );
                 assert_eq!(
