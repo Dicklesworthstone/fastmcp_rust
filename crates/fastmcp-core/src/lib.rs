@@ -55,9 +55,10 @@ pub mod uri;
 
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.
 pub mod limits {
+    use std::collections::HashMap;
     use std::fmt;
     use std::sync::{Arc, Mutex, MutexGuard};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use asupersync::Time;
 
@@ -948,6 +949,430 @@ pub mod limits {
         pub const fn is_verified(&self) -> bool {
             matches!(self, Self::Verified(_))
         }
+
+        fn occupancy_key(&self) -> OccupancyKey {
+            match self {
+                Self::PreAuth(key) => OccupancyKey::PreAuth(*key.as_bytes()),
+                Self::Verified(key) => OccupancyKey::Verified(*key.as_bytes()),
+                Self::AuthorizationFlow(key) => OccupancyKey::AuthorizationFlow(*key.as_bytes()),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum OccupancyKey {
+        PreAuth([u8; 32]),
+        Verified([u8; 32]),
+        AuthorizationFlow([u8; 32]),
+    }
+
+    /// Refusal from [`AdmissionController`] reserve/commit/release.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AdmissionError {
+        /// A reserve requested zero units.
+        ZeroUnits,
+        /// A constructor received a zero global or partition capacity.
+        ZeroCapacity,
+        /// The next reserve would exceed the controller-wide capacity.
+        GlobalCapacityExceeded {
+            /// Units requested by this reserve.
+            requested: usize,
+            /// Current global occupancy.
+            in_use: usize,
+            /// Configured global ceiling.
+            limit: usize,
+        },
+        /// The next reserve would exceed that partition's capacity.
+        PartitionCapacityExceeded {
+            /// Units requested by this reserve.
+            requested: usize,
+            /// Current occupancy of the requested partition.
+            in_use: usize,
+            /// Configured per-partition ceiling.
+            limit: usize,
+        },
+        /// Commit or release ran against a reservation that is not held.
+        ReservationNotHeld,
+        /// A second commit or release was attempted after settlement.
+        AlreadySettled,
+        /// Commit ran after the reservation deadline.
+        DeadlineExceeded,
+        /// Occupancy arithmetic overflowed `usize`.
+        ArithmeticOverflow,
+    }
+
+    impl fmt::Display for AdmissionError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ZeroUnits => {
+                    formatter.write_str("admission reserve requires a positive unit count")
+                }
+                Self::ZeroCapacity => {
+                    formatter.write_str("admission controller capacity must be positive")
+                }
+                Self::GlobalCapacityExceeded {
+                    requested,
+                    in_use,
+                    limit,
+                } => write!(
+                    formatter,
+                    "global admission capacity {limit} exceeded (in_use {in_use}, requested {requested})"
+                ),
+                Self::PartitionCapacityExceeded {
+                    requested,
+                    in_use,
+                    limit,
+                } => write!(
+                    formatter,
+                    "partition admission capacity {limit} exceeded (in_use {in_use}, requested {requested})"
+                ),
+                Self::ReservationNotHeld => {
+                    formatter.write_str("admission reservation is not held")
+                }
+                Self::AlreadySettled => {
+                    formatter.write_str("admission reservation already settled")
+                }
+                Self::DeadlineExceeded => {
+                    formatter.write_str("admission reservation deadline exceeded")
+                }
+                Self::ArithmeticOverflow => formatter.write_str("admission occupancy overflowed"),
+            }
+        }
+    }
+
+    impl std::error::Error for AdmissionError {}
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReservationLifecycle {
+        Held,
+        Committed,
+        Released,
+    }
+
+    struct ReservationRecord {
+        units: usize,
+        key: OccupancyKey,
+        lifecycle: ReservationLifecycle,
+        deadline: Option<Instant>,
+    }
+
+    struct AdmissionState {
+        global_in_use: usize,
+        partition_in_use: HashMap<OccupancyKey, usize>,
+        committed_work: usize,
+        release_count: usize,
+        next_id: u64,
+        reservations: HashMap<u64, ReservationRecord>,
+        admission_order: Vec<OccupancyKey>,
+    }
+
+    /// Process-wide plus per-partition admission controller.
+    ///
+    /// Capacities are taken from an immutable [`ProtocolLimits`] snapshot and
+    /// cannot grow after construction. Every failed reserve, commit, or release
+    /// leaves occupancy counters unchanged.
+    #[derive(Clone)]
+    pub struct AdmissionController {
+        snapshot: ProtocolLimits,
+        global_limit: usize,
+        partition_limit: usize,
+        inner: Arc<Mutex<AdmissionState>>,
+    }
+
+    impl fmt::Debug for AdmissionController {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("AdmissionController")
+                .field("generation", &self.snapshot.generation())
+                .field("global_limit", &self.global_limit)
+                .field("partition_limit", &self.partition_limit)
+                .finish_non_exhaustive()
+        }
+    }
+
+    fn lock_admission(state: &Mutex<AdmissionState>) -> MutexGuard<'_, AdmissionState> {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    impl AdmissionController {
+        /// Builds a controller whose global and partition ceilings equal `capacity`.
+        pub fn with_capacity(
+            snapshot: ProtocolLimits,
+            capacity: usize,
+        ) -> Result<Self, AdmissionError> {
+            Self::with_capacities(snapshot, capacity, capacity)
+        }
+
+        /// Builds a controller with independent global and per-partition ceilings.
+        pub fn with_capacities(
+            snapshot: ProtocolLimits,
+            global_limit: usize,
+            partition_limit: usize,
+        ) -> Result<Self, AdmissionError> {
+            if global_limit == 0 || partition_limit == 0 {
+                return Err(AdmissionError::ZeroCapacity);
+            }
+            Ok(Self {
+                snapshot,
+                global_limit,
+                partition_limit,
+                inner: Arc::new(Mutex::new(AdmissionState {
+                    global_in_use: 0,
+                    partition_in_use: HashMap::new(),
+                    committed_work: 0,
+                    release_count: 0,
+                    next_id: 1,
+                    reservations: HashMap::new(),
+                    admission_order: Vec::new(),
+                })),
+            })
+        }
+
+        /// Returns the immutable limits snapshot captured at construction.
+        #[must_use]
+        pub const fn limits(&self) -> &ProtocolLimits {
+            &self.snapshot
+        }
+
+        /// Current global occupancy.
+        #[must_use]
+        pub fn global_in_use(&self) -> usize {
+            lock_admission(&self.inner).global_in_use
+        }
+
+        /// Current occupancy of one partition.
+        #[must_use]
+        pub fn partition_in_use(&self, partition: &AdmissionPartition) -> usize {
+            lock_admission(&self.inner)
+                .partition_in_use
+                .get(&partition.occupancy_key())
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// Units whose reservations have committed and not yet released.
+        #[must_use]
+        pub fn committed_work(&self) -> usize {
+            lock_admission(&self.inner).committed_work
+        }
+
+        /// Number of occupancy-releasing settlements (release, cancel, or drop).
+        #[must_use]
+        pub fn release_count(&self) -> usize {
+            lock_admission(&self.inner).release_count
+        }
+
+        /// Successful reserve order, one entry per admitted reservation.
+        #[must_use]
+        pub fn admission_count(&self) -> usize {
+            lock_admission(&self.inner).admission_order.len()
+        }
+
+        /// Reserves `units` against `partition` and the global ceiling.
+        pub fn reserve(
+            &self,
+            partition: AdmissionPartition,
+            units: usize,
+        ) -> Result<AdmissionReservation, AdmissionError> {
+            self.reserve_until(partition, units, None)
+        }
+
+        /// Reserves `units` that must commit before `deadline`.
+        pub fn reserve_with_deadline(
+            &self,
+            partition: AdmissionPartition,
+            units: usize,
+            deadline: Instant,
+        ) -> Result<AdmissionReservation, AdmissionError> {
+            self.reserve_until(partition, units, Some(deadline))
+        }
+
+        fn reserve_until(
+            &self,
+            partition: AdmissionPartition,
+            units: usize,
+            deadline: Option<Instant>,
+        ) -> Result<AdmissionReservation, AdmissionError> {
+            if units == 0 {
+                return Err(AdmissionError::ZeroUnits);
+            }
+            let key = partition.occupancy_key();
+            let mut state = lock_admission(&self.inner);
+            let partition_in_use = state.partition_in_use.get(&key).copied().unwrap_or(0);
+            let next_global = state
+                .global_in_use
+                .checked_add(units)
+                .ok_or(AdmissionError::ArithmeticOverflow)?;
+            let next_partition = partition_in_use
+                .checked_add(units)
+                .ok_or(AdmissionError::ArithmeticOverflow)?;
+            if next_global > self.global_limit {
+                return Err(AdmissionError::GlobalCapacityExceeded {
+                    requested: units,
+                    in_use: state.global_in_use,
+                    limit: self.global_limit,
+                });
+            }
+            if next_partition > self.partition_limit {
+                return Err(AdmissionError::PartitionCapacityExceeded {
+                    requested: units,
+                    in_use: partition_in_use,
+                    limit: self.partition_limit,
+                });
+            }
+            let id = state.next_id;
+            state.next_id = state
+                .next_id
+                .checked_add(1)
+                .ok_or(AdmissionError::ArithmeticOverflow)?;
+            state.global_in_use = next_global;
+            state.partition_in_use.insert(key, next_partition);
+            state.reservations.insert(
+                id,
+                ReservationRecord {
+                    units,
+                    key,
+                    lifecycle: ReservationLifecycle::Held,
+                    deadline,
+                },
+            );
+            state.admission_order.push(key);
+            drop(state);
+            Ok(AdmissionReservation {
+                inner: Arc::clone(&self.inner),
+                id,
+                live: true,
+            })
+        }
+    }
+
+    /// One live occupancy charge returned by [`AdmissionController::reserve`].
+    pub struct AdmissionReservation {
+        inner: Arc<Mutex<AdmissionState>>,
+        id: u64,
+        live: bool,
+    }
+
+    impl fmt::Debug for AdmissionReservation {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("AdmissionReservation")
+                .field("id", &self.id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl AdmissionReservation {
+        /// Transfers a held charge into committed work without duplicating occupancy.
+        pub fn commit(&mut self) -> Result<(), AdmissionError> {
+            if !self.live {
+                return Err(AdmissionError::AlreadySettled);
+            }
+            let mut state = lock_admission(&self.inner);
+            let units = {
+                let record = state
+                    .reservations
+                    .get_mut(&self.id)
+                    .ok_or(AdmissionError::ReservationNotHeld)?;
+                match record.lifecycle {
+                    ReservationLifecycle::Released | ReservationLifecycle::Committed => {
+                        return Err(AdmissionError::AlreadySettled);
+                    }
+                    ReservationLifecycle::Held => {}
+                }
+                if record
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(AdmissionError::DeadlineExceeded);
+                }
+                record.units
+            };
+            let next_committed = state
+                .committed_work
+                .checked_add(units)
+                .ok_or(AdmissionError::ArithmeticOverflow)?;
+            if let Some(record) = state.reservations.get_mut(&self.id) {
+                record.lifecycle = ReservationLifecycle::Committed;
+            }
+            state.committed_work = next_committed;
+            Ok(())
+        }
+
+        /// Releases occupancy exactly once.
+        pub fn release(&mut self) -> Result<(), AdmissionError> {
+            self.settle(ReservationLifecycle::Released, true)
+        }
+
+        /// Cancels a held reservation. Identical occupancy effect to [`Self::release`].
+        pub fn cancel(&mut self) -> Result<(), AdmissionError> {
+            self.release()
+        }
+
+        fn settle(
+            &mut self,
+            target: ReservationLifecycle,
+            report_already_settled: bool,
+        ) -> Result<(), AdmissionError> {
+            if !self.live {
+                return if report_already_settled {
+                    Err(AdmissionError::AlreadySettled)
+                } else {
+                    Ok(())
+                };
+            }
+            let mut state = lock_admission(&self.inner);
+            let settled = {
+                let Some(record) = state.reservations.get_mut(&self.id) else {
+                    self.live = false;
+                    return Err(AdmissionError::ReservationNotHeld);
+                };
+                match record.lifecycle {
+                    ReservationLifecycle::Released => {
+                        self.live = false;
+                        return if report_already_settled {
+                            Err(AdmissionError::AlreadySettled)
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    ReservationLifecycle::Held | ReservationLifecycle::Committed => {
+                        let units = record.units;
+                        let key = record.key;
+                        let was_committed = record.lifecycle == ReservationLifecycle::Committed;
+                        record.lifecycle = ReservationLifecycle::Released;
+                        Some((units, key, was_committed))
+                    }
+                }
+            };
+            let Some((units, key, was_committed)) = settled else {
+                self.live = false;
+                return Ok(());
+            };
+            let partition_in_use = state.partition_in_use.get(&key).copied().unwrap_or(0);
+            state.global_in_use = state.global_in_use.saturating_sub(units);
+            let remaining = partition_in_use.saturating_sub(units);
+            if remaining == 0 {
+                state.partition_in_use.remove(&key);
+            } else {
+                state.partition_in_use.insert(key, remaining);
+            }
+            if was_committed {
+                state.committed_work = state.committed_work.saturating_sub(units);
+            }
+            state.release_count = state.release_count.saturating_add(1);
+            self.live = false;
+            let _ = target;
+            Ok(())
+        }
+    }
+
+    impl Drop for AdmissionReservation {
+        fn drop(&mut self) {
+            let _ = self.settle(ReservationLifecycle::Released, false);
+        }
     }
 
     /// A resource whose cumulative logical-exchange accounting overflowed.
@@ -1747,8 +2172,9 @@ pub use error::{
     McpError, McpErrorCode, McpOutcome, McpResult, OutcomeExt, ResultExt, cancelled, err, ok,
 };
 pub use limits::{
-    AdmissionPartition, AuthorizationFlowQuotaKey, DEFAULT_CANCELLATION_REASON_MAX_BYTES,
-    DEFAULT_CURSOR_MAX_BYTES, DEFAULT_JSON_RPC_MAX_BODY_BYTES, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
+    AdmissionController, AdmissionError, AdmissionPartition, AdmissionReservation,
+    AuthorizationFlowQuotaKey, DEFAULT_CANCELLATION_REASON_MAX_BYTES, DEFAULT_CURSOR_MAX_BYTES,
+    DEFAULT_JSON_RPC_MAX_BODY_BYTES, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS,
     DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND, DEFAULT_LOGICAL_EXCHANGE_MAX_ROUNDS,
     DEFAULT_LOGICAL_EXCHANGE_MAX_STATE_BYTES, DEFAULT_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
     DEFAULT_METADATA_MAX_BYTES, DEFAULT_METADATA_MAX_ENTRIES, DEFAULT_URI_MAX_BYTES,
@@ -1995,4 +2421,172 @@ fn limit_01_a_planted_negative() {
     assert!(partition_before.is_pre_auth());
     assert!(!partition_before.is_verified());
     assert_eq!(limits.snapshot(), snapshot_before);
+}
+
+#[cfg(test)]
+fn limit_01_b_limits() -> crate::ProtocolLimits {
+    crate::ProtocolLimits::try_new(
+        crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+        crate::DEFAULT_METADATA_MAX_ENTRIES,
+        crate::DEFAULT_METADATA_MAX_BYTES,
+        crate::DEFAULT_URI_MAX_BYTES,
+        crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
+        crate::DEFAULT_CURSOR_MAX_BYTES,
+    )
+    .expect("documented defaults must admit")
+}
+
+#[cfg(test)]
+fn limit_01_b_partition(source: &str) -> crate::AdmissionPartition {
+    crate::AdmissionPartition::pre_auth(
+        crate::PreAuthSourceBucketKey::from_listener_and_source("mcp.example.test", source)
+            .expect("transport-observed source is admitted"),
+    )
+}
+
+/// LIMIT-01 B positive: reserve N-1/N, commit/release lifecycle, two-partition fairness.
+#[cfg(test)]
+#[test]
+fn limit_01_b_positive() {
+    const N: usize = 4;
+    let snapshot = limit_01_b_limits();
+    let controller =
+        crate::AdmissionController::with_capacity(snapshot.snapshot(), N).expect("capacity N");
+    let partition = limit_01_b_partition("tcp:203.0.113.8");
+
+    let mut held_n_minus_one = controller
+        .reserve(partition.clone(), N - 1)
+        .expect("N-1 admits");
+    assert_eq!(controller.global_in_use(), N - 1);
+    assert_eq!(controller.partition_in_use(&partition), N - 1);
+    held_n_minus_one.release().expect("release N-1");
+    assert_eq!(controller.global_in_use(), 0);
+    assert_eq!(controller.release_count(), 1);
+
+    let mut held_n = controller.reserve(partition.clone(), N).expect("N admits");
+    assert_eq!(controller.global_in_use(), N);
+    assert_eq!(
+        controller
+            .reserve(partition.clone(), 1)
+            .expect_err("N+1 global"),
+        crate::AdmissionError::GlobalCapacityExceeded {
+            requested: 1,
+            in_use: N,
+            limit: N,
+        }
+    );
+    assert_eq!(controller.global_in_use(), N);
+    held_n.commit().expect("commit transfers occupancy");
+    assert_eq!(controller.global_in_use(), N);
+    assert_eq!(controller.committed_work(), N);
+    held_n.release().expect("release committed work");
+    assert_eq!(controller.global_in_use(), 0);
+    assert_eq!(controller.committed_work(), 0);
+    assert_eq!(controller.release_count(), 2);
+
+    {
+        let _dropped = controller
+            .reserve(partition.clone(), 1)
+            .expect("drop path admits");
+        assert_eq!(controller.global_in_use(), 1);
+    }
+    assert_eq!(controller.global_in_use(), 0);
+    assert_eq!(controller.release_count(), 3);
+
+    let mut expired = controller
+        .reserve_with_deadline(partition.clone(), 1, std::time::Instant::now())
+        .expect("deadline reserve still holds occupancy");
+    assert_eq!(
+        expired.commit().expect_err("expired commit rejects"),
+        crate::AdmissionError::DeadlineExceeded
+    );
+    assert_eq!(controller.global_in_use(), 1);
+    assert_eq!(controller.committed_work(), 0);
+    expired.release().expect("release after commit-reject");
+    assert_eq!(controller.global_in_use(), 0);
+
+    let peer = crate::AdmissionController::with_capacities(snapshot.snapshot(), 2, 2)
+        .expect("fairness capacities");
+    let left = limit_01_b_partition("tcp:203.0.113.10");
+    let right = limit_01_b_partition("tcp:203.0.113.11");
+    let mut left_hold = peer
+        .reserve(left.clone(), 2)
+        .expect("left saturates global");
+    assert_eq!(
+        peer.reserve(right.clone(), 1)
+            .expect_err("saturated global rejects the other partition"),
+        crate::AdmissionError::GlobalCapacityExceeded {
+            requested: 1,
+            in_use: 2,
+            limit: 2,
+        }
+    );
+    assert_eq!(peer.partition_in_use(&right), 0);
+    assert_eq!(peer.partition_in_use(&left), 2);
+    left_hold.release().expect("left release frees global");
+    let mut right_hold = peer
+        .reserve(right.clone(), 1)
+        .expect("release admits only the eligible other partition");
+    assert_eq!(peer.partition_in_use(&left), 0);
+    assert_eq!(peer.partition_in_use(&right), 1);
+    assert_eq!(peer.global_in_use(), 1);
+    assert_eq!(peer.admission_count(), 2);
+    right_hold.release().expect("right release");
+}
+
+/// LIMIT-01 B planted negative: one-variable N+1 and second release leave counters unchanged.
+#[cfg(test)]
+#[test]
+fn limit_01_b_planted_negative() {
+    let snapshot = limit_01_b_limits();
+    let controller =
+        crate::AdmissionController::with_capacities(snapshot.snapshot(), 2, 2).expect("capacities");
+    let left = limit_01_b_partition("tcp:203.0.113.10");
+    let right = limit_01_b_partition("tcp:203.0.113.11");
+    let mut left_hold = controller.reserve(left.clone(), 1).expect("left holds 1");
+    let before_global = controller.global_in_use();
+    let before_left = controller.partition_in_use(&left);
+    let before_right = controller.partition_in_use(&right);
+    let before_committed = controller.committed_work();
+    let before_releases = controller.release_count();
+    let before_admitted = controller.admission_count();
+    assert_eq!(
+        controller
+            .reserve(right.clone(), 3)
+            .expect_err("partition N+1 rejects"),
+        crate::AdmissionError::PartitionCapacityExceeded {
+            requested: 3,
+            in_use: 0,
+            limit: 2,
+        }
+    );
+    assert_eq!(controller.global_in_use(), before_global);
+    assert_eq!(controller.partition_in_use(&left), before_left);
+    assert_eq!(controller.partition_in_use(&right), before_right);
+    assert_eq!(controller.committed_work(), before_committed);
+    assert_eq!(controller.release_count(), before_releases);
+    assert_eq!(controller.admission_count(), before_admitted);
+
+    left_hold.release().expect("first release");
+    let after_first = (
+        controller.global_in_use(),
+        controller.partition_in_use(&left),
+        controller.committed_work(),
+        controller.release_count(),
+    );
+    assert_eq!(
+        left_hold
+            .release()
+            .expect_err("second release is already settled"),
+        crate::AdmissionError::AlreadySettled
+    );
+    assert_eq!(
+        (
+            controller.global_in_use(),
+            controller.partition_in_use(&left),
+            controller.committed_work(),
+            controller.release_count(),
+        ),
+        after_first
+    );
 }
