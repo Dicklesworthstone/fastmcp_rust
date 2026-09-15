@@ -31709,6 +31709,209 @@ mod lib_unit_tests {
             .with_body(serde_json::to_vec(&request).expect("modern tool request must encode"))
     }
 
+    fn auth_00_mrtr_provider(stable_owner: bool) -> TokenAuthProvider {
+        let contexts = ["alpha", "beta"].map(|token| {
+            let mut auth = AuthContext::with_subject(token);
+            if stable_owner {
+                auth = auth.with_session_owner(
+                    fastmcp_core::sha256_bounded(token.as_bytes(), 32)
+                        .expect("bounded configured owner"),
+                );
+            }
+            (token, auth)
+        });
+        TokenAuthProvider::new(
+            StaticTokenVerifier::new(contexts).expect("valid static token registration"),
+        )
+    }
+
+    async fn auth_00_mrtr_http_call(
+        cx: &Cx,
+        endpoint: &ServerHttpEndpoint,
+        state: Option<&str>,
+        id: i64,
+    ) -> JsonRpcResponse {
+        let mut request = modern_http_json_tool_request("live_http_mrtr", id)
+            .with_header("authorization", "Bearer alpha");
+        if let Some(state) = state {
+            let mut rpc: JsonRpcRequest = serde_json::from_slice(&request.body).unwrap();
+            let params = rpc.params.as_mut().unwrap();
+            params["requestState"] = serde_json::json!(state);
+            params["inputResponses"] = serde_json::json!({
+                "roots": bidirectional::MrtrInputResponse::roots(
+                    fastmcp_protocol::ListRootsResult::empty(),
+                ).expect("valid roots response"),
+            });
+            request.body = serde_json::to_vec(&rpc).unwrap();
+        }
+        let mut session = endpoint.open_session(cx).expect("fresh HTTP session");
+        let response = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(5),
+            Box::pin(session.handle_async(cx, request)),
+        )
+        .await
+        .expect("MRTR HTTP handling must finish before the harness deadline")
+        .expect("HTTP handling result");
+        session.close(cx).await;
+        let ServerHttpEndpointResponse::Immediate(response) = response else {
+            panic!("ordinary MRTR request must return an immediate JSON response");
+        };
+        assert_eq!(response.status, HttpStatus::OK);
+        let response: JsonRpcResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.id, Some(id.into()));
+        response
+    }
+
+    fn auth_00_mrtr_server(stable_owner: bool, calls: &Arc<AtomicUsize>) -> Server {
+        Server::new("auth-00-mrtr-owner", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("modern policy")
+            .auth_provider(auth_00_mrtr_provider(stable_owner))
+            .tool(LiveHttpMrtrTool {
+                name: "live_http_mrtr",
+                calls: Arc::clone(calls),
+            })
+            .build()
+    }
+
+    fn assert_auth_00_mrtr_complete(response: &JsonRpcResponse) {
+        assert!(response.error.is_none());
+        let result = response.result.as_ref().expect("completed MRTR result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["content"],
+            serde_json::json!([{"type": "text", "text": "live HTTP MRTR resumed"}]),
+        );
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_stable_owner_completes_two_rounds() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let endpoint = auth_00_mrtr_server(true, &calls)
+                .into_http_endpoint("http://auth-owner.test")
+                .unwrap();
+            let initial = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
+            assert!(initial.error.is_none());
+            let result = initial.result.as_ref().unwrap();
+            assert_eq!(result["resultType"], "input_required");
+            assert_eq!(result["inputRequests"]["roots"]["method"], "roots/list");
+            let state = result["requestState"].as_str().unwrap();
+            assert!(!state.is_empty());
+            assert_ne!(state, "handler-forged-state");
+            assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 1);
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            let retry = auth_00_mrtr_http_call(&cx, &endpoint, Some(state), 982).await;
+            assert_auth_00_mrtr_complete(&retry);
+            assert_eq!(calls.load(Ordering::Acquire), 2);
+            assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_subject_without_owner_rejects_without_allocating() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            // Same valid credential, subject, request and handler as the
+            // positive; only the provider's stable owner is absent.
+            let endpoint = auth_00_mrtr_server(false, &calls)
+                .into_http_endpoint("http://auth-owner.test")
+                .unwrap();
+            let response = auth_00_mrtr_http_call(&cx, &endpoint, None, 981).await;
+            assert!(response.result.is_none());
+            let error = response.error.as_ref().expect("owner admission rejection");
+            assert_eq!(error.code, McpErrorCode::InvalidParams.into());
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_ownerless_leaked_handle_preserves_owner_state() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let owner_server = auth_00_mrtr_server(true, &calls);
+            let mut ownerless_server = auth_00_mrtr_server(false, &calls);
+            // Both public endpoints use the same real exchange registry.
+            // Independent registries would reject even without owner checks.
+            ownerless_server.router = Arc::clone(&owner_server.router);
+            let owner = owner_server
+                .into_http_endpoint("http://auth-owner.test")
+                .unwrap();
+            let ownerless = ownerless_server
+                .into_http_endpoint("http://auth-owner.test")
+                .unwrap();
+            let initial = auth_00_mrtr_http_call(&cx, &owner, None, 991).await;
+            assert!(initial.error.is_none());
+            let state = initial.result.as_ref().unwrap()["requestState"]
+                .as_str()
+                .unwrap();
+            assert_eq!(owner.server.router.test_active_mrtr_exchange_count(), 1);
+            let denied = auth_00_mrtr_http_call(&cx, &ownerless, Some(state), 992).await;
+            let unknown = auth_00_mrtr_http_call(&cx, &ownerless, Some("unknown"), 993).await;
+            assert!(denied.result.is_none());
+            assert!(unknown.result.is_none());
+            let denied_error = denied.error.as_ref().unwrap();
+            assert_eq!(denied_error.code, McpErrorCode::InvalidParams.into());
+            assert_eq!(denied_error, unknown.error.as_ref().unwrap());
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert_eq!(owner.server.router.test_active_mrtr_exchange_count(), 1);
+            let retry = auth_00_mrtr_http_call(&cx, &owner, Some(state), 994).await;
+            assert_auth_00_mrtr_complete(&retry);
+            assert_eq!(calls.load(Ordering::Acquire), 2);
+            assert_eq!(owner.server.router.test_active_mrtr_exchange_count(), 0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn auth_00_http_mrtr_anonymous_complete_remains_available() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let endpoint = Server::new("auth-00-anonymous-complete", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build_http_endpoint("http://auth-owner.test")
+                .unwrap();
+            let request = modern_http_json_tool_request("modern_http_auth_counter", 995);
+            let mut session = endpoint.open_session(&cx).unwrap();
+            let response = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(5),
+                Box::pin(session.handle_async(&cx, request)),
+            )
+            .await
+            .expect("anonymous complete call must finish before the harness deadline")
+            .unwrap();
+            session.close(&cx).await;
+            let ServerHttpEndpointResponse::Immediate(response) = response else {
+                panic!("anonymous complete call must return JSON");
+            };
+            assert_eq!(response.status, HttpStatus::OK);
+            let rpc: JsonRpcResponse = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(rpc.id, Some(995_i64.into()));
+            assert!(rpc.error.is_none());
+            let result = rpc.result.as_ref().unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(
+                result["content"],
+                serde_json::json!([{
+                    "type": "text",
+                    "text": "authenticated modern HTTP dispatch",
+                }]),
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 1);
+            assert_eq!(endpoint.server.router.test_active_mrtr_exchange_count(), 0);
+            Ok(())
+        });
+    }
+
     async fn run_live_http_mrtr_retry(
         cx: &Cx,
         request_state_suffix: &str,
@@ -31717,6 +31920,7 @@ mod lib_unit_tests {
         let bound = Server::new("live-http-mrtr-retry", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
+            .auth_provider(auth_00_mrtr_provider(true))
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(&calls),
@@ -31759,6 +31963,7 @@ mod lib_unit_tests {
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("Mcp-Name", "live_http_mrtr"),
+                                ("Authorization", "Bearer alpha"),
                             ],
                         ),
                     )
@@ -31809,6 +32014,7 @@ mod lib_unit_tests {
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("Mcp-Name", "live_http_mrtr"),
+                                ("Authorization", "Bearer alpha"),
                             ],
                         ),
                     )
@@ -31845,6 +32051,7 @@ mod lib_unit_tests {
         let bound = Server::new("live-http-public-final-sampling", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
+            .auth_provider(auth_00_mrtr_provider(true))
             .tool(PublicFinalSamplingTool {
                 calls: Arc::clone(&calls),
             })
@@ -31884,6 +32091,7 @@ mod lib_unit_tests {
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("Mcp-Name", "public-final-sampling"),
+                                ("Authorization", "Bearer alpha"),
                             ],
                         ),
                     )
@@ -37663,6 +37871,7 @@ mod lib_unit_tests {
             let bound = Server::new("live-http-stateless-sse", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
+                .auth_provider(auth_00_mrtr_provider(true))
                 .tool(LiveHttpMrtrTool {
                     name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
@@ -37703,6 +37912,7 @@ mod lib_unit_tests {
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("Mcp-Name", "live_http_mrtr"),
+                                ("Authorization", "Bearer alpha"),
                             ],
                         ),
                     )
@@ -39375,7 +39585,7 @@ mod lib_unit_tests {
                 || calls != 2
             {
                 return Err(format!(
-                    "an anonymous bound stateless retry did not resume exactly once (retry={retry:?}, calls={calls})"
+                    "an owner-bound stateless retry did not resume exactly once (retry={retry:?}, calls={calls})"
                 ));
             }
             Ok(())
@@ -39416,6 +39626,7 @@ mod lib_unit_tests {
             let bound = Server::new("live-http-mrtr-wrong-kind", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
+                .auth_provider(auth_00_mrtr_provider(true))
                 .tool(LiveHttpMrtrTool {
                     name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
@@ -39458,6 +39669,7 @@ mod lib_unit_tests {
                                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                     ("Mcp-Method", "tools/call"),
                                     ("Mcp-Name", "live_http_mrtr"),
+                                    ("Authorization", "Bearer alpha"),
                                 ],
                             ),
                         )
@@ -39522,6 +39734,7 @@ mod lib_unit_tests {
                                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                     ("Mcp-Method", "tools/call"),
                                     ("Mcp-Name", "live_http_mrtr"),
+                                    ("Authorization", "Bearer alpha"),
                                 ],
                             ),
                         )
@@ -39574,6 +39787,7 @@ mod lib_unit_tests {
                                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                     ("Mcp-Method", "tools/call"),
                                     ("Mcp-Name", "live_http_mrtr"),
+                                    ("Authorization", "Bearer alpha"),
                                 ],
                             ),
                         )
@@ -39652,6 +39866,7 @@ mod lib_unit_tests {
             let bound = Server::new("live-http-mrtr-shutdown", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
+                .auth_provider(auth_00_mrtr_provider(true))
                 .tool(LiveHttpMrtrTool {
                     name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
@@ -39695,6 +39910,7 @@ mod lib_unit_tests {
                                     ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                     ("Mcp-Method", "tools/call"),
                                     ("Mcp-Name", "live_http_mrtr"),
+                                    ("Authorization", "Bearer alpha"),
                                 ],
                             ),
                         )
@@ -39739,6 +39955,7 @@ mod lib_unit_tests {
                 .with_header("accept", "application/json")
                 .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                 .with_header("mcp-method", "tools/call")
+                .with_header("authorization", "Bearer alpha")
                 .with_body(
                     serde_json::to_vec(&JsonRpcRequest::new(
                         "tools/call",
@@ -39785,6 +40002,7 @@ mod lib_unit_tests {
             let bound = Server::new("live-http-stateless-sse-reject", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
+                .auth_provider(auth_00_mrtr_provider(true))
                 .tool(LiveHttpMrtrTool {
                     name: "live_http_mrtr",
                     calls: Arc::clone(&calls),
@@ -39825,6 +40043,7 @@ mod lib_unit_tests {
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
                                 ("Mcp-Name", "live_http_mrtr"),
+                                ("Authorization", "Bearer alpha"),
                                 ("MCP-Session-Id", "obsolete-modern-session"),
                             ],
                         ),
@@ -50577,7 +50796,7 @@ mod lib_unit_tests {
         let endpoint = Server::new("modern-http-mrtr-stateless-resume", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
-            .auth_provider(ModernHttpAuthProvider)
+            .auth_provider(auth_00_mrtr_provider(true))
             .tool(LiveHttpMrtrTool {
                 name: "live_http_mrtr",
                 calls: Arc::clone(&calls),
@@ -50815,6 +51034,7 @@ mod lib_unit_tests {
         let endpoint = Server::new("modern-http-stateless-elicitation", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
             .expect("ModernOnly must be available to this test build")
+            .auth_provider(auth_00_mrtr_provider(true))
             .tool(PublicFinalElicitationTool {
                 name: "stateless-form-elicitation",
                 mode: PublicFinalElicitationMode::Form,
@@ -50850,6 +51070,7 @@ mod lib_unit_tests {
                 .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
                 .with_header("mcp-method", "tools/call")
                 .with_header("mcp-name", "stateless-form-elicitation")
+                .with_header("authorization", "Bearer alpha")
                 .with_body(serde_json::to_vec(&request).expect("elicitation request must encode"))
         };
 
