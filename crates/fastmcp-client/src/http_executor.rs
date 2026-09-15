@@ -51,11 +51,9 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
-    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, ElicitRequestParams, ElicitResult,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalCreateMessageParams,
-    FinalCreateMessageResult, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
-    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCoreResult, FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -2978,7 +2976,6 @@ pub struct ModernHttpClient {
     discovery_state: Arc<ModernHttpDiscoveryState>,
     executor: ModernHttpExecutor,
     reverse_request_handlers: ReverseRequestHandlers,
-    final_progress_notifications: Vec<FinalProgressNotificationParams>,
 }
 
 #[derive(Clone)]
@@ -3924,17 +3921,6 @@ impl ClientHttpConnection {
         }
     }
 
-    /// Drains exact final progress notifications received during modern HTTP
-    /// request-scoped SSE processing when no external observer was bound.
-    #[must_use]
-    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
-        match self {
-            Self::Modern(client) => client.take_final_progress_notifications(),
-            #[cfg(feature = "legacy-2024-11-05")]
-            Self::LegacySse(_) => Vec::new(),
-        }
-    }
-
     /// Replaces the retained exact-2024 capability set before initialization.
     ///
     /// Auto negotiation intentionally discovers with the caller's ordinary
@@ -4581,7 +4567,7 @@ impl ClientHttpConnection {
                             })
                     }
                     ModernHttpResponseKind::Sse => {
-                        self.drain_modern_sse_json_response(
+                        Self::drain_modern_sse_json_response(
                             cx,
                             cancellation,
                             response,
@@ -4598,7 +4584,6 @@ impl ClientHttpConnection {
     }
 
     async fn drain_modern_sse_json_response(
-        &mut self,
         cx: &Cx,
         cancellation: Option<&McpRequestCancellation>,
         response: ModernHttpResponseStream,
@@ -4615,15 +4600,6 @@ impl ClientHttpConnection {
         ),
         ClientHttpConnectionError,
     > {
-        let client = match self {
-            Self::Modern(client) => client,
-            #[cfg(feature = "legacy-2024-11-05")]
-            Self::LegacySse(_) => {
-                return Err(ClientHttpConnectionError::ExpectedJsonResponse {
-                    actual: ModernHttpResponseKind::Sse,
-                });
-            }
-        };
         let limits = SseLimits::new(
             maximum_response_bytes.max(1_024),
             maximum_response_bytes.max(4_096),
@@ -4725,15 +4701,6 @@ impl ClientHttpConnection {
                             server_notifications.push(notification);
                         }
                         ModernHttpRequestScopedNotification::Progress(progress) => {
-                            if let Self::Modern(client) = self {
-                                if client.final_progress_notifications.len()
-                                    < MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS
-                                {
-                                    client
-                                        .final_progress_notifications
-                                        .push(progress.clone());
-                                }
-                            }
                             progress_notifications.push(progress);
                         }
                         ModernHttpRequestScopedNotification::Ignored => {}
@@ -5314,153 +5281,6 @@ fn admit_modern_json_response_body(
     Ok((response, result_source, receipt))
 }
 
-/// Answers one modern server-initiated request received on a request-owned SSE
-/// body by invoking the matching typed reverse handler.
-async fn modern_http_server_request_response(
-    cx: &Cx,
-    handlers: &ReverseRequestHandlers,
-    request: &JsonRpcRequest,
-    cancellation: ReverseRequestCancellation,
-) -> Option<JsonRpcMessage> {
-    let request_id = request.id.clone()?;
-    if request.method.starts_with("notifications/") {
-        return crate::invalid_notification_request_response(request);
-    }
-    if request.method == "ping" {
-        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
-            request_id,
-            serde_json::json!({}),
-        )));
-    }
-    match request.method.as_str() {
-        "sampling/createMessage" => {
-            let Some(handler) = handlers.modern_sampling_create_message.as_ref() else {
-                return crate::method_not_found_response(request);
-            };
-            let result =
-                match crate::decode_reverse_request_params::<FinalCreateMessageParams>(request) {
-                    Ok(params) => {
-                        invoke_http_reverse_handler(cx, handler, cancellation, params).await
-                    }
-                    Err(error) => Err(error),
-                };
-            Some(crate::reverse_request_response::<FinalCreateMessageResult>(
-                request_id, result,
-            ))
-        }
-        "roots/list" => {
-            let Some(handler) = handlers.modern_roots_list.as_ref() else {
-                return crate::method_not_found_response(request);
-            };
-            let result =
-                match crate::decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request)
-                {
-                    Ok(params) => {
-                        invoke_http_reverse_handler(cx, handler, cancellation, params).await
-                    }
-                    Err(error) => Err(error),
-                };
-            Some(crate::reverse_request_response::<
-                FinalEmbeddedRootsListResult,
-            >(request_id, result))
-        }
-        "elicitation/create" => {
-            let Some(handler) = handlers.modern_elicitation_create.as_ref() else {
-                return crate::method_not_found_response(request);
-            };
-            let result = match crate::decode_reverse_request_params::<ElicitRequestParams>(request)
-            {
-                Ok(params) => invoke_http_reverse_handler(cx, handler, cancellation, params).await,
-                Err(error) => Err(error),
-            };
-            Some(crate::reverse_request_response::<ElicitResult>(
-                request_id, result,
-            ))
-        }
-        _ => crate::method_not_found_response(request),
-    }
-}
-
-struct HttpReverseCallbackOwner(ReverseRequestCancellation);
-
-impl Drop for HttpReverseCallbackOwner {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-/// Await callback work or its reply while the owning SSE response continues
-/// enforcing its original idle/absolute deadline and cancellation sources.
-async fn poll_http_response_operation<F: Future>(
-    cx: &Cx,
-    cancellation: Option<&McpRequestCancellation>,
-    stream: &mut ModernHttpSseResponseStream,
-    mut operation: Pin<&mut F>,
-) -> Result<F::Output, ClientHttpConnectionError> {
-    let error = |error| ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error));
-    let (_ambient_sender, mut ambient_receiver) = oneshot::channel::<()>();
-    let mut ambient_cancelled = std::pin::pin!(ambient_receiver.recv(cx));
-    let mut locally_cancelled = std::pin::pin!(async {
-        if let Some(cancellation) = cancellation {
-            cancellation.cancelled().await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    });
-    poll_fn(|task_cx| {
-        check_modern_http_context(cx).map_err(error)?;
-        if ambient_cancelled.as_mut().poll(task_cx).is_ready()
-            || locally_cancelled.as_mut().poll(task_cx).is_ready()
-        {
-            return Poll::Ready(Err(error(ModernHttpExecutorError::Cancelled)));
-        }
-        let Some(response) = &mut stream.response else {
-            return Poll::Ready(Err(error(ModernHttpExecutorError::SseStreamClosed)));
-        };
-        response.body.deadline.constrain_to(cx);
-        response.body.deadline.poll(task_cx).map_err(error)?;
-        let result = operation.as_mut().poll(task_cx);
-        check_modern_http_context(cx).map_err(error)?;
-        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-            return Poll::Ready(Err(error(ModernHttpExecutorError::Cancelled)));
-        }
-        response.body.deadline.check().map_err(error)?;
-        result.map(Ok)
-    })
-    .await
-}
-
-/// Poll callbacks on the caller runtime, catching both construction and poll
-/// panics without introducing a nested runtime or detaching their work.
-async fn invoke_http_reverse_handler<P, R>(
-    cx: &Cx,
-    handler: &Arc<
-        dyn for<'callback> Fn(
-                &'callback Cx,
-                ReverseRequestCancellation,
-                P,
-            ) -> crate::ReverseRequestFuture<'callback, R>
-            + Send
-            + Sync,
-    >,
-    cancellation: ReverseRequestCancellation,
-    params: P,
-) -> McpResult<R> {
-    cancellation.checkpoint()?;
-    let mut callback = crate::catch_client_callback_unwind(|| handler(cx, cancellation, params))
-        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?;
-    poll_fn(|task_cx| {
-        crate::catch_client_callback_unwind(|| callback.as_mut().poll(task_cx)).unwrap_or_else(
-            |_| {
-                Poll::Ready(Err(McpError::internal_error(
-                    "Client reverse request handler failed",
-                )))
-            },
-        )
-    })
-    .await
-}
-
 fn reject_final_only_legacy_request_metadata(
     parameters: &serde_json::Value,
 ) -> Result<(), ClientHttpConnectionError> {
@@ -5993,7 +5813,6 @@ impl ModernHttpClient {
                         .with_timeout_policy(request_timeout_policy)
                         .with_subscription_timeout_policy(subscription_timeout_policy),
                     reverse_request_handlers: ReverseRequestHandlers::new(),
-                    final_progress_notifications: Vec::new(),
                 }))
             }
             #[cfg(feature = "legacy-2024-11-05")]
@@ -6118,13 +5937,6 @@ impl ModernHttpClient {
         &self,
     ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
         self.discovery_state.negotiated_extensions.clone()
-    }
-
-    /// Drains exact final progress notifications received during request-scoped
-    /// SSE processing when no external observer was bound.
-    #[must_use]
-    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
-        std::mem::take(&mut self.final_progress_notifications)
     }
 
     fn admit_final_extension_method(
@@ -12300,7 +12112,7 @@ mod tests {
     fn run_modern_request_json_interleaved_sse_case(
         case: InterleavedSseCase,
     ) -> (
-        Result<JsonRpcResponse, ClientHttpConnectionError>,
+        Result<CoreResult, crate::HttpClientError>,
         usize,
         Vec<FinalProgressNotificationParams>,
     ) {
@@ -12353,6 +12165,7 @@ mod tests {
             let list_body = serde_json::from_slice::<serde_json::Value>(&list_request.body)
                 .expect("tools/list is JSON-RPC");
             assert_eq!(list_body["method"], "tools/list");
+            assert_eq!(list_body["id"], 2);
             begin_chunked_sse(&mut listed);
 
             match case {
@@ -12385,7 +12198,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let mut connection = runtime_block_on(
+        let mut client = runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(plan(
                     &modern_target,
@@ -12394,21 +12207,19 @@ mod tests {
                     ProtocolPolicy::ModernOnly,
                 ))
                 .reverse_request_handlers(handlers)
-                .connect_http_with_cx(&cx),
+                .connect_http_client_with_cx(&cx),
         )
         .expect("modern HTTP connects with reverse sampling handlers");
 
-        let response_result = runtime_block_on(connection.request_json(
+        let response_result = runtime_block_on(client.request_final_core(
             &cx,
             "tools/list",
             serde_json::json!({
                 "_meta": { "progressToken": 2 }
             }),
-            RequestId::Number(2),
-            4_096,
         ));
 
-        let progress_notifications = connection.take_final_progress_notifications();
+        let progress_notifications = client.take_final_progress_notifications();
         let listener = server
             .join()
             .expect("modern HTTP interleaved SSE server must join");
@@ -12442,9 +12253,11 @@ mod tests {
         let error = result.expect_err("forbidden server RPC on SSE must be rejected");
         assert!(matches!(
             error,
-            ClientHttpConnectionError::UnexpectedResponseMessage {
-                request_id: RequestId::Number(2)
-            }
+            crate::HttpClientError::Connection(
+                ClientHttpConnectionError::UnexpectedResponseMessage {
+                    request_id: RequestId::Number(2)
+                }
+            )
         ));
         assert_eq!(
             callback_invocations, 0,
@@ -12462,11 +12275,11 @@ mod tests {
             run_modern_request_json_interleaved_sse_case(InterleavedSseCase::ValidNotification);
         let response =
             result.expect("tools/list completes when interleaved notifications are valid");
-        assert_eq!(response.id, Some(RequestId::Number(2)));
-        let terminal = response
-            .result
-            .as_ref()
-            .expect("terminal response result is present");
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, diagnostic }) = response else {
+            panic!("expected the typed final tools/list result");
+        };
+        assert!(diagnostic.is_none());
+        let terminal = serde_json::to_value(result).expect("serialize exact typed terminal result");
         assert_eq!(terminal["resultType"], "complete");
         assert_eq!(terminal["tools"], serde_json::json!([]));
         assert_eq!(terminal["ttlMs"], 0);

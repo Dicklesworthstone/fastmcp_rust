@@ -493,89 +493,121 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
 
         let mut request = accept_bounded_stream(&listener);
         let request_body = read_request(&mut request);
-        assert_final_metadata(&request_body, "tools/list");
-        begin_sse_response(&mut request);
-        write_sse_event(
-            &mut request,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 99,
-                "method": "sampling/createMessage",
-                "params": {
-                    "_meta": {},
-                    "messages": [{
-                        "role": "user",
-                        "content": {"type": "text", "text": "hello"}
-                    }],
-                    "maxTokens": 8
-                }
-            }),
-        )
-        .expect("write async reverse request");
-
-        if cancel_callback || idle_timeout {
-            assert_connection_closed_by_client(&mut request);
-            listener
-                .set_nonblocking(true)
-                .expect("bound cancellation peer observation");
-            let deadline = Instant::now() + Duration::from_millis(100);
-            loop {
-                match listener.accept() {
-                    Ok((_, peer)) => panic!(
-                        "retired callback must not post a response after stream close: {peer}"
-                    ),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("observe callback response connection: {error}"),
-                }
-            }
-            return;
-        }
-
-        let mut reverse = accept_bounded_stream(&listener);
-        let reverse_request = read_request(&mut reverse);
-        assert!(reverse_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
-        assert!(http_header_equals(
-            &reverse_request.head,
-            "MCP-Protocol-Version",
-            "2026-07-28"
-        ));
-        assert!(
-            !http_header_present(&reverse_request.head, "Mcp-Method"),
-            "reverse response POST must not carry a client method header"
+        assert_final_metadata(&request_body, "tools/call");
+        let initial_body: serde_json::Value = serde_json::from_slice(&request_body.body).unwrap();
+        assert_eq!(initial_body["id"], 2);
+        assert_eq!(initial_body["params"]["name"], "async-callback-tool");
+        assert_eq!(
+            initial_body["params"]["arguments"],
+            serde_json::json!({"subject": "http-03-mrtr"})
         );
-        let reverse_body: serde_json::Value =
-            serde_json::from_slice(&reverse_request.body).expect("reverse response is JSON-RPC");
-        assert_eq!(reverse_body["id"], 99);
-        if callback_error {
-            assert_eq!(reverse_body["error"]["code"], -32602);
-            assert_eq!(reverse_body["error"]["message"], "async callback rejected");
-        } else {
-            assert_eq!(reverse_body["result"]["model"], "caller-runtime-handler");
-            assert_eq!(
-                reverse_body["result"]["content"]["text"],
-                "sampled on the caller runtime"
-            );
-        }
-        write_response(&mut reverse, 202, "application/json", b"");
+        begin_sse_response(&mut request);
         write_sse_event(
             &mut request,
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 2,
                 "result": {
-                    "resultType": "complete",
-                    "tools": [],
-                    "ttlMs": 0,
-                    "cacheScope": "private"
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        "sampling": {
+                            "method": "sampling/createMessage",
+                            "params": {
+                                "messages": [{
+                                    "role": "user",
+                                    "content": {"type": "text", "text": "hello"}
+                                }],
+                                "maxTokens": 8
+                            }
+                        }
+                    },
+                    "requestState": "async-callback-state"
                 }
             }),
         )
-        .expect("write tools/list terminal response");
+        .expect("write MRTR input-required result");
+        assert_connection_closed_by_client(&mut request);
+
+        if cancel_callback || callback_error {
+            // The caller will inspect this listener after the rejected or
+            // cancelled operation has returned, before fixture cleanup.
+            return listener;
+        }
+
+        let mut retry = accept_bounded_stream(&listener);
+        let retry_request = read_request(&mut retry);
+        assert_final_metadata(&retry_request, "tools/call");
+        assert!(retry_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+        assert!(http_header_equals(
+            &retry_request.head,
+            "MCP-Protocol-Version",
+            "2026-07-28"
+        ));
+        assert!(
+            http_header_equals(&retry_request.head, "Mcp-Method", "tools/call"),
+            "MRTR responses belong to a fresh original-method request"
+        );
+        let retry_body: serde_json::Value =
+            serde_json::from_slice(&retry_request.body).expect("MRTR retry is JSON-RPC");
+        assert_eq!(retry_body["id"], 3);
+        assert_eq!(retry_body["params"]["name"], initial_body["params"]["name"]);
+        assert_eq!(
+            retry_body["params"]["arguments"],
+            initial_body["params"]["arguments"]
+        );
+        assert_eq!(retry_body["params"]["requestState"], "async-callback-state");
+        assert_eq!(
+            retry_body["params"]["inputResponses"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            retry_body["params"]["inputResponses"]["sampling"],
+            serde_json::json!({
+                "role": "assistant",
+                "model": "caller-runtime-handler",
+                "content": {"type": "text", "text": "sampled on the caller runtime"}
+            })
+        );
+        begin_sse_response(&mut retry);
+        if idle_timeout {
+            // The callback has completed. HTTP idle governs this live retry
+            // body, not the local callback after the InputRequired terminal.
+            // Give the peer an independent observation margin beyond the
+            // client's one-second idle deadline; peer timeout is still red.
+            retry
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("bound peer observation after client idle expiry");
+            let mut byte = [0_u8; 1];
+            match retry.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) => {}
+                result => panic!("idle-expired client must close the retry socket: {result:?}"),
+            }
+            return listener;
+        }
+        write_sse_event(
+            &mut retry,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "MRTR completed"}]
+                }
+            }),
+        )
+        .expect("write tools/call terminal response");
+        assert_connection_closed_by_client(&mut retry);
+        listener
     });
 
     let handlers = fastmcp_client::ReverseRequestHandlers::new()
@@ -591,7 +623,7 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 callback_started_tx
                     .send(())
                     .expect("caller must observe callback admission");
-                if cancel_callback || idle_timeout {
+                if cancel_callback {
                     std::future::pending::<()>().await;
                     unreachable!("retired callback must not complete normally");
                 }
@@ -618,7 +650,7 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
     let callback_controller = thread::spawn(move || {
         callback_started_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("server-initiated callback must start");
+            .expect("the MRTR sampling callback must start");
         if cancel_callback {
             assert!(cancellation_for_thread.cancel());
         } else {
@@ -643,18 +675,30 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
         .await
         .expect("modern public HTTP client must connect");
         let result = client
-            .list_tools_with_cancellation(&request_cx, &cancellation, None)
+            .call_tool_with_cancellation(
+                &request_cx,
+                &cancellation,
+                "async-callback-tool",
+                serde_json::json!({"subject": "http-03-mrtr"}),
+            )
             .await;
         if cancel_callback {
             let error = result.expect_err("cancelled callback must return a typed cancellation");
             assert!(matches!(
                 error,
-                fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Modern(
-                    ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
-                ))
+                fastmcp_client::HttpClientError::CoreResult(ref error)
+                    if error.code == fastmcp_core::McpErrorCode::RequestCancelled
+            ));
+        } else if callback_error {
+            let error = result.expect_err("a rejected MRTR callback must return its typed error");
+            assert!(matches!(
+                error,
+                fastmcp_client::HttpClientError::CoreResult(ref error)
+                    if error.code == fastmcp_core::McpErrorCode::InvalidParams
+                        && error.message == "async callback rejected"
             ));
         } else if idle_timeout {
-            let error = result.expect_err("pending callback must preserve the idle deadline");
+            let error = result.expect_err("the live MRTR retry must preserve its idle deadline");
             assert!(matches!(
                 error,
                 fastmcp_client::HttpClientError::Connection(ClientHttpConnectionError::Modern(
@@ -664,13 +708,19 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 ))
             ));
         } else {
-            let listed = result.expect("callback response must not prevent the terminal result");
+            let completed =
+                result.expect("MRTR callback and retry must produce the terminal result");
             assert!(matches!(
-                listed,
+                &completed,
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ToolsList { .. }
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
                 )
             ));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&completed.encode().unwrap()).unwrap()
+                    ["content"],
+                serde_json::json!([{"type": "text", "text": "MRTR completed"}])
+            );
         }
         assert_eq!(
             callback_token
@@ -679,8 +729,8 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
                 .as_ref()
                 .expect("callback must retain its cancellation token")
                 .is_cancel_requested(),
-            cancel_callback || idle_timeout,
-            "only abandoned callbacks must be cancelled"
+            cancel_callback || callback_error,
+            "only unaccepted callbacks are cancelled; retry idle does not cancel a completed callback"
         );
         assert!(
             request_cx.checkpoint().is_ok(),
@@ -691,9 +741,22 @@ fn run_modern_async_reverse_callback_case(case: AsyncReverseCallbackCase) {
     callback_controller
         .join()
         .expect("callback cancellation controller must join");
-    server
+    let listener = server
         .join()
         .expect("modern async reverse callback peer must join");
+    listener
+        .set_nonblocking(true)
+        .expect("observe unexpected MRTR retry connections");
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((_, peer)) => panic!("completed or abandoned operation made an extra POST: {peer}"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("observe MRTR listener after operation completion: {error}"),
+        }
+    }
 }
 
 #[test]
@@ -1236,10 +1299,17 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
     let target = format!("http://{address}/mcp");
     let callback_started = Arc::new(AtomicUsize::new(0));
     let callback_marker = Arc::clone(&callback_started);
+    let callback_token = Arc::new(std::sync::Mutex::new(None));
+    let callback_token_for_handler = Arc::clone(&callback_token);
     let handlers = fastmcp_client::ReverseRequestHandlers::new()
-        .with_modern_sampling_create_message(move |_cx, _cancellation, _params| {
+        .with_modern_sampling_create_message(move |_cx, cancellation, _params| {
             let callback_marker = Arc::clone(&callback_marker);
+            let callback_token_for_handler = Arc::clone(&callback_token_for_handler);
             Box::pin(async move {
+                callback_token_for_handler
+                    .lock()
+                    .expect("callback token lock")
+                    .replace(cancellation);
                 callback_marker.fetch_add(1, Ordering::SeqCst);
                 std::future::pending().await
             })
@@ -1287,17 +1357,25 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
             .expect("catalog change must be flushed before the aborted close");
         }
         if drop_request {
-            // This callback follows the notification on the same stream. Its
-            // admission proves the earlier frame was consumed before drop.
+            // The MRTR terminal follows the notification on the same stream.
+            // Its local callback proves the earlier frame was consumed before
+            // dropping the still-pending public call operation.
             write_sse_event(
                 &mut aborted,
                 &serde_json::json!({
-                    "jsonrpc": "2.0", "id": 99,
-                    "method": "sampling/createMessage",
-                    "params": {
-                        "_meta": {},
-                        "messages": [{"role": "user", "content": {"type": "text", "text": "wait"}}],
-                        "maxTokens": 8
+                    "jsonrpc": "2.0", "id": 3,
+                    "result": {
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "sampling": {
+                                "method": "sampling/createMessage",
+                                "params": {
+                                    "messages": [{"role": "user", "content": {"type": "text", "text": "wait"}}],
+                                    "maxTokens": 8
+                                }
+                            }
+                        },
+                        "requestState": "notification-before-drop"
                     }
                 }),
             )
@@ -1351,11 +1429,8 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
         assert_eq!(client.final_result_cache_stats().fills, 1);
 
         if drop_request {
-            let mut request = std::pin::pin!(client.request_final_core(
-                &cx,
-                "tools/call",
-                serde_json::json!({"name": "aborted-call", "arguments": {}}),
-            ));
+            let mut request =
+                std::pin::pin!(client.call_tool(&cx, "aborted-call", serde_json::json!({}),));
             poll_fn(|task_cx| {
                 assert!(
                     request.as_mut().poll(task_cx).is_pending(),
@@ -1387,6 +1462,19 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
                     }
                 )
             ));
+        }
+
+        if drop_request {
+            assert_eq!(callback_started.load(Ordering::SeqCst), 1);
+            assert!(
+                callback_token
+                    .lock()
+                    .expect("callback token lock")
+                    .as_ref()
+                    .expect("the admitted MRTR callback retains its token")
+                    .is_cancel_requested(),
+                "dropping the public call must cancel its pending MRTR callback"
+            );
         }
 
         let retained = client.take_final_server_notifications();
@@ -3350,25 +3438,55 @@ mod authenticated_tls {
                         })
                     });
                 let mut client = connect_with_handlers(target, token, handlers).unwrap();
-                let tools = runtime_block_on(client.list_tools(&Cx::for_request(), None)).unwrap();
-                assert!(matches!(tools,
+                let result = runtime_block_on(client.call_tool(
+                    &Cx::for_request(),
+                    "authenticated-callback",
+                    serde_json::json!({"subject": "authenticated-mrtr"}),
+                ))
+                .unwrap();
+                assert!(matches!(
+                    &result,
                     fastmcp_protocol::CoreResult::Final(
-                        fastmcp_protocol::FinalCoreResult::ToolsList { result, .. }
-                    ) if result.payload.tools.is_empty()
+                        fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    )
                 ));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&result.encode().unwrap()).unwrap()["content"],
+                    serde_json::json!([{"type": "text", "text": "authenticated MRTR completed"}])
+                );
                 let rows = observations(log);
                 assert_eq!(rows.len(), 3);
                 assert_eq!(rows[0]["method"], "server/discover");
-                assert_eq!(rows[1]["method"], "tools/list");
-                assert_eq!(rows[2]["method"], "response");
-                assert!(rows.iter().all(|row| row["authorized"] == true));
-                let response: serde_json::Value =
+                assert_eq!(rows[1]["method"], "tools/call");
+                assert_eq!(rows[2]["method"], "tools/call");
+                assert!(
+                    rows.iter()
+                        .all(|row| row["authorized"] == true && row["target"] == "/mcp")
+                );
+                let initial: serde_json::Value =
+                    serde_json::from_str(rows[1]["body"].as_str().unwrap()).unwrap();
+                let retry: serde_json::Value =
                     serde_json::from_str(rows[2]["body"].as_str().unwrap()).unwrap();
-                assert_eq!(response["id"], 99);
-                assert_eq!(response["result"]["model"], "http-03-authenticated-handler");
+                assert_eq!(initial["id"], 2);
+                assert!(initial["params"].get("inputResponses").is_none());
+                assert_eq!(retry["id"], 3);
+                assert_eq!(retry["params"]["name"], initial["params"]["name"]);
+                assert_eq!(retry["params"]["arguments"], initial["params"]["arguments"]);
+                assert_eq!(retry["params"]["requestState"], "authenticated-mrtr-state");
+                let input_responses = retry["params"]["inputResponses"]
+                    .as_object()
+                    .expect("authenticated MRTR retry must contain the response map");
                 assert_eq!(
-                    response["result"]["content"]["text"],
-                    "sampled over authenticated TLS"
+                    input_responses.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["sampling"]
+                );
+                assert_eq!(
+                    input_responses["sampling"],
+                    serde_json::json!({
+                        "role": "assistant",
+                        "model": "http-03-authenticated-handler",
+                        "content": {"type": "text", "text": "sampled over authenticated TLS"}
+                    })
                 );
             },
         );
@@ -3652,15 +3770,20 @@ class Peer(http.server.BaseHTTPRequestHandler):
         elif method == 'ping':
             result = {'resultType':'complete'}
         elif method == 'tools/list':
-            reverse = {'jsonrpc':'2.0','id':99,'method':'sampling/createMessage','params':{'_meta':{},'messages':[{'role':'user','content':{'type':'text','text':'hello'}}],'maxTokens':8}}
-            terminal = {'jsonrpc':'2.0','id':identifier,'result':{'resultType':'complete','tools':[],'ttlMs':0,'cacheScope':'private'}}
-            self.respond(200, 'text/event-stream', ''.join('data: '+json.dumps(x)+'\n\n' for x in [reverse,terminal]).encode())
-            return
-        elif method is None:
-            assert identifier == 99 and request['result']['model'] == 'http-03-authenticated-handler'
-            assert self.headers.get('Mcp-Method') is None and self.headers.get('Mcp-Name') is None
-            self.respond(202, 'application/json', b'')
-            return
+            result = {'resultType':'complete','tools':[],'ttlMs':0,'cacheScope':'private'}
+        elif method == 'tools/call':
+            assert self.headers.get('Mcp-Method') == 'tools/call'
+            assert self.headers.get('Mcp-Name') == 'authenticated-callback'
+            assert request['params']['name'] == 'authenticated-callback'
+            assert request['params']['arguments'] == {'subject':'authenticated-mrtr'}
+            if 'inputResponses' not in request['params']:
+                assert identifier == 2
+                result = {'resultType':'input_required','inputRequests':{'sampling':{'method':'sampling/createMessage','params':{'messages':[{'role':'user','content':{'type':'text','text':'hello'}}],'maxTokens':8}}},'requestState':'authenticated-mrtr-state'}
+                self.respond(200, 'text/event-stream', ('data: '+json.dumps({'jsonrpc':'2.0','id':identifier,'result':result})+'\n\n').encode())
+                return
+            assert identifier == 3 and request['params']['requestState'] == 'authenticated-mrtr-state'
+            assert request['params']['inputResponses']['sampling']['model'] == 'http-03-authenticated-handler'
+            result = {'resultType':'complete','content':[{'type':'text','text':'authenticated MRTR completed'}]}
         elif method == 'subscriptions/listen':
             meta = {'io.modelcontextprotocol/subscriptionId':identifier}
             ack = {'jsonrpc':'2.0','method':'notifications/subscriptions/acknowledged','params':{'_meta':meta,'notifications':request['params']['notifications']}}
