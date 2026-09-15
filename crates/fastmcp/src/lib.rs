@@ -13564,4 +13564,187 @@ mod tests {
                 if header.reason() == modern::HeaderMismatchReason::HeaderBodyVersionMismatch
         ));
     }
+
+    #[test]
+    fn limit_01_integration_positive() {
+        use super::{
+            AdmissionController, AdmissionPartition, AuthorizationFlowQuotaKey,
+            DEFAULT_CANCELLATION_REASON_MAX_BYTES, DEFAULT_CURSOR_MAX_BYTES,
+            DEFAULT_JSON_RPC_MAX_BODY_BYTES, DEFAULT_METADATA_MAX_BYTES,
+            DEFAULT_METADATA_MAX_ENTRIES, DEFAULT_URI_MAX_BYTES, PreAuthSourceBucketKey,
+            ProtocolLimit, ProtocolLimits, QuotaPartitionKey,
+        };
+
+        let limits = ProtocolLimits::builder()
+            .json_rpc_max_body_bytes(DEFAULT_JSON_RPC_MAX_BODY_BYTES)
+            .metadata_max_entries(DEFAULT_METADATA_MAX_ENTRIES)
+            .metadata_max_bytes(DEFAULT_METADATA_MAX_BYTES)
+            .uri_max_bytes(DEFAULT_URI_MAX_BYTES)
+            .cancellation_reason_max_bytes(DEFAULT_CANCELLATION_REASON_MAX_BYTES)
+            .cursor_max_bytes(DEFAULT_CURSOR_MAX_BYTES)
+            .build()
+            .expect("public builder must admit documented limits");
+
+        assert_eq!(
+            limits
+                .configured_units(ProtocolLimit::MetadataEntries)
+                .expect("countable"),
+            DEFAULT_METADATA_MAX_ENTRIES
+        );
+
+        let pre_auth_key =
+            PreAuthSourceBucketKey::from_listener_and_source("mcp.example.test", "tcp:203.0.113.8")
+                .expect("pre-auth source bucket admits");
+        let pre_auth_partition = AdmissionPartition::pre_auth(pre_auth_key);
+        assert!(pre_auth_partition.is_pre_auth());
+        assert!(!pre_auth_partition.is_verified());
+
+        let verified_key = QuotaPartitionKey::from_verified_security_facts(
+            "org.fastmcp.provider",
+            1,
+            "https://auth.example.test",
+            "sha256:abcd1234ef01",
+        )
+        .expect("verified security facts admit");
+        let verified_partition = AdmissionPartition::verified(verified_key);
+        assert!(verified_partition.is_verified());
+        assert!(!verified_partition.is_pre_auth());
+
+        let flow_key = AuthorizationFlowQuotaKey::from_listener_and_source(
+            "mcp.example.test",
+            "tcp:203.0.113.8",
+            "flow-99",
+        )
+        .expect("flow key admits");
+        let flow_partition = AdmissionPartition::authorization_flow(flow_key);
+        assert!(!flow_partition.is_verified());
+        assert!(!flow_partition.is_pre_auth());
+
+        const CAPACITY: usize = 4;
+        let controller = AdmissionController::with_capacities(limits.snapshot(), CAPACITY, 2)
+            .expect("controller admits capacities");
+
+        let mut reservation = controller
+            .reserve(pre_auth_partition.clone(), 2)
+            .expect("pre-auth reserve admits");
+        assert_eq!(controller.global_in_use(), 2);
+        assert_eq!(controller.partition_in_use(&pre_auth_partition), 2);
+
+        reservation.commit().expect("commit succeeds");
+        assert_eq!(controller.committed_work(), 2);
+        assert_eq!(controller.global_in_use(), 2);
+
+        reservation.release().expect("release succeeds");
+        assert_eq!(controller.global_in_use(), 0);
+        assert_eq!(controller.committed_work(), 0);
+        assert_eq!(controller.release_count(), 1);
+        assert_eq!(controller.live_reservation_count(), 0);
+    }
+
+    #[test]
+    fn limit_01_integration_planted_negative() {
+        use super::{
+            AdmissionController, AdmissionError, AdmissionPartition,
+            DEFAULT_CANCELLATION_REASON_MAX_BYTES, DEFAULT_CURSOR_MAX_BYTES,
+            DEFAULT_JSON_RPC_MAX_BODY_BYTES, DEFAULT_METADATA_MAX_BYTES,
+            DEFAULT_METADATA_MAX_ENTRIES, DEFAULT_URI_MAX_BYTES, HARD_METADATA_MAX_ENTRIES,
+            PreAuthSourceBucketKey, ProtocolLimit, ProtocolLimits, QuotaPartitionKey,
+            SealedAdmissionKeyError,
+        };
+
+        let limits = ProtocolLimits::builder()
+            .json_rpc_max_body_bytes(DEFAULT_JSON_RPC_MAX_BODY_BYTES)
+            .metadata_max_entries(DEFAULT_METADATA_MAX_ENTRIES)
+            .metadata_max_bytes(DEFAULT_METADATA_MAX_BYTES)
+            .uri_max_bytes(DEFAULT_URI_MAX_BYTES)
+            .cancellation_reason_max_bytes(DEFAULT_CANCELLATION_REASON_MAX_BYTES)
+            .cursor_max_bytes(DEFAULT_CURSOR_MAX_BYTES)
+            .build()
+            .expect("public builder must admit documented limits");
+
+        let over_ceiling = ProtocolLimits::builder()
+            .metadata_max_entries(HARD_METADATA_MAX_ENTRIES + 1)
+            .build()
+            .expect_err("exceeding hard ceiling must be rejected");
+        assert!(matches!(
+            over_ceiling,
+            super::ProtocolLimitsError::ExceedsHardCeiling {
+                limit: ProtocolLimit::MetadataEntries
+            }
+        ));
+
+        assert_eq!(
+            QuotaPartitionKey::try_from_request_identifier("untrusted-caller-req-id"),
+            Err(SealedAdmissionKeyError::RequestSuppliedIdentifier)
+        );
+        assert_eq!(
+            AdmissionPartition::try_from_request_identifier("untrusted-caller-req-id"),
+            Err(SealedAdmissionKeyError::RequestSuppliedIdentifier)
+        );
+
+        const CAPACITY: usize = 4;
+        let controller = AdmissionController::with_capacities(limits.snapshot(), CAPACITY, 2)
+            .expect("controller admits capacities");
+        let pre_auth_key =
+            PreAuthSourceBucketKey::from_listener_and_source("mcp.example.test", "tcp:203.0.113.8")
+                .expect("pre-auth source bucket admits");
+        let pre_auth_partition = AdmissionPartition::pre_auth(pre_auth_key);
+
+        let mut held = controller
+            .reserve(pre_auth_partition.clone(), 1)
+            .expect("valid reservation admits");
+        let before_global = controller.global_in_use();
+        let before_partition = controller.partition_in_use(&pre_auth_partition);
+        let before_committed = controller.committed_work();
+        let before_releases = controller.release_count();
+        let before_admissions = controller.admission_count();
+
+        let refusal = controller
+            .reserve(pre_auth_partition.clone(), 2)
+            .expect_err("over-partition reservation must refuse");
+        assert_eq!(
+            refusal,
+            AdmissionError::PartitionCapacityExceeded {
+                requested: 2,
+                in_use: 1,
+                limit: 2,
+            }
+        );
+
+        assert_eq!(controller.global_in_use(), before_global);
+        assert_eq!(
+            controller.partition_in_use(&pre_auth_partition),
+            before_partition
+        );
+        assert_eq!(controller.committed_work(), before_committed);
+        assert_eq!(controller.release_count(), before_releases);
+        assert_eq!(controller.admission_count(), before_admissions);
+
+        held.release().expect("first release succeeds");
+        let after_release_state = (
+            controller.global_in_use(),
+            controller.partition_in_use(&pre_auth_partition),
+            controller.committed_work(),
+            controller.release_count(),
+            controller.live_reservation_count(),
+            controller.admission_count(),
+        );
+        assert_eq!(after_release_state.4, 0);
+
+        assert_eq!(
+            held.release().expect_err("second release must fail"),
+            AdmissionError::AlreadySettled
+        );
+        assert_eq!(
+            (
+                controller.global_in_use(),
+                controller.partition_in_use(&pre_auth_partition),
+                controller.committed_work(),
+                controller.release_count(),
+                controller.live_reservation_count(),
+                controller.admission_count(),
+            ),
+            after_release_state
+        );
+    }
 }
