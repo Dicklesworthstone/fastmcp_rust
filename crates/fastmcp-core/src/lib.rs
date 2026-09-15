@@ -1208,18 +1208,18 @@ pub mod limits {
             let next_partition = partition_in_use
                 .checked_add(units)
                 .ok_or(AdmissionError::ArithmeticOverflow)?;
-            if next_global > self.global_limit {
-                return Err(AdmissionError::GlobalCapacityExceeded {
-                    requested: units,
-                    in_use: state.global_in_use,
-                    limit: self.global_limit,
-                });
-            }
             if next_partition > self.partition_limit {
                 return Err(AdmissionError::PartitionCapacityExceeded {
                     requested: units,
                     in_use: partition_in_use,
                     limit: self.partition_limit,
+                });
+            }
+            if next_global > self.global_limit {
+                return Err(AdmissionError::GlobalCapacityExceeded {
+                    requested: units,
+                    in_use: state.global_in_use,
+                    limit: self.global_limit,
                 });
             }
             let id = state.next_id;
@@ -2468,8 +2468,8 @@ fn limit_01_b_positive() {
     assert_eq!(
         controller
             .reserve(partition.clone(), 1)
-            .expect_err("N+1 global"),
-        crate::AdmissionError::GlobalCapacityExceeded {
+            .expect_err("N+1 partition"),
+        crate::AdmissionError::PartitionCapacityExceeded {
             requested: 1,
             in_use: N,
             limit: N,
@@ -2540,7 +2540,7 @@ fn limit_01_b_positive() {
 fn limit_01_b_planted_negative() {
     let snapshot = limit_01_b_limits();
     let controller =
-        crate::AdmissionController::with_capacities(snapshot.snapshot(), 2, 2).expect("capacities");
+        crate::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2).expect("capacities");
     let left = limit_01_b_partition("tcp:203.0.113.10");
     let right = limit_01_b_partition("tcp:203.0.113.11");
     let mut left_hold = controller.reserve(left.clone(), 1).expect("left holds 1");
