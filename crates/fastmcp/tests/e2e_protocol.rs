@@ -466,6 +466,7 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
 
 #[test]
 fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
+    use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
     use fastmcp_rust::oauth::{
         AuthorizationApprovalBackend, AuthorizationApprovalDisposition,
         AuthorizationApprovalGeneration, AuthorizationApprovalRequest, AuthorizationRequest,
@@ -473,6 +474,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     };
 
     const CLIENT_SECRET: &str = "e2e-approval-client-secret-canary";
+    const RESOURCE: &str = "https://mcp.example/api";
     struct E2eApprovalBackend(std::sync::Mutex<Option<String>>);
     impl AuthorizationApprovalBackend for E2eApprovalBackend {
         fn generation(&self) -> AuthorizationApprovalGeneration {
@@ -518,7 +520,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
         client_id: "test-client".to_string(),
         redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
         scopes: vec!["read".to_string()],
-        resource: None,
+        resource: Some(RESOURCE.to_string()),
         state: None,
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
         code_challenge_method: CodeChallengeMethod::S256,
@@ -543,7 +545,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             code_verifier: Some(code_verifier.to_string()),
             refresh_token: None,
             scopes: None,
-            resource: None,
+            resource: Some(RESOURCE.to_string()),
         })
         .unwrap();
 
@@ -560,7 +562,14 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     let access = token_response.access_token.clone();
     let refresh = token_response.refresh_token.clone().expect("refresh token");
 
-    let provider = TokenAuthProvider::new(oauth.token_verifier());
+    let endpoint = CanonicalHttpUrl::parse(RESOURCE).expect("trusted resource endpoint");
+    let resource = CanonicalResourceId::parse_for_endpoint(
+        RESOURCE,
+        &endpoint,
+        CanonicalResourceIdPolicy::DEFAULT,
+    )
+    .expect("trusted protected resource");
+    let provider = TokenAuthProvider::new(oauth.token_verifier(resource));
     let mut mcp_client = setup_auth_server_and_client(provider, "e2e-auth-oauth");
     mcp_client.initialize().unwrap();
 
