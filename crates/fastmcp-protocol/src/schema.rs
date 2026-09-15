@@ -6762,12 +6762,15 @@ mod tests {
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
             "type": ["string", "number"]
         });
-        let schema =
-            admit_final_schema(accepted).expect("unique type array entries admit");
+        let schema = admit_final_schema(accepted).expect("unique type array entries admit");
         let str_instance = json!("hello");
         let num_instance = json!(42);
-        schema.validate(&str_instance).expect("string instance matches union type");
-        schema.validate(&num_instance).expect("number instance matches union type");
+        schema
+            .validate(&str_instance)
+            .expect("string instance matches union type");
+        schema
+            .validate(&num_instance)
+            .expect("number instance matches union type");
     }
 
     #[test]
@@ -6778,8 +6781,7 @@ mod tests {
         });
         let mut planted = accepted;
         planted["type"] = json!(["string", "number", "string"]);
-        let error =
-            admit_final_schema(planted).expect_err("duplicate type array entries reject");
+        let error = admit_final_schema(planted).expect_err("duplicate type array entries reject");
         assert_eq!(error.path(), "$.type");
         assert_eq!(error.reason(), "type array entries must be unique");
     }
@@ -6798,15 +6800,28 @@ mod tests {
                 "string"
             ]
         });
-        let schema =
-            admit_final_schema(accepted).expect("seven unique primitive types admit");
-        schema.validate(&json!([1, 2])).expect("array instance validates");
-        schema.validate(&json!(true)).expect("boolean instance validates");
-        schema.validate(&json!(42)).expect("integer instance validates");
-        schema.validate(&json!(null)).expect("null instance validates");
-        schema.validate(&json!(1.5)).expect("number instance validates");
-        schema.validate(&json!({"k": "v"})).expect("object instance validates");
-        schema.validate(&json!("text")).expect("string instance validates");
+        let schema = admit_final_schema(accepted).expect("seven unique primitive types admit");
+        schema
+            .validate(&json!([1, 2]))
+            .expect("array instance validates");
+        schema
+            .validate(&json!(true))
+            .expect("boolean instance validates");
+        schema
+            .validate(&json!(42))
+            .expect("integer instance validates");
+        schema
+            .validate(&json!(null))
+            .expect("null instance validates");
+        schema
+            .validate(&json!(1.5))
+            .expect("number instance validates");
+        schema
+            .validate(&json!({"k": "v"}))
+            .expect("object instance validates");
+        schema
+            .validate(&json!("text"))
+            .expect("string instance validates");
     }
 
     #[test]
@@ -6824,8 +6839,7 @@ mod tests {
                 "string"
             ]
         });
-        let error =
-            admit_final_schema(planted).expect_err("eighth duplicate element rejects");
+        let error = admit_final_schema(planted).expect_err("eighth duplicate element rejects");
         assert_eq!(error.path(), "$.type");
         assert_eq!(error.reason(), "type array entries must be unique");
     }
@@ -6841,13 +6855,14 @@ mod tests {
             },
             "required": ["name", "age"]
         });
-        let schema =
-            admit_final_schema(accepted).expect("unique required array entries admit");
+        let schema = admit_final_schema(accepted).expect("unique required array entries admit");
         let instance = json!({
             "name": "Alice",
             "age": 30
         });
-        schema.validate(&instance).expect("unique required fields validate");
+        schema
+            .validate(&instance)
+            .expect("unique required fields validate");
     }
 
     #[test]
@@ -6863,8 +6878,7 @@ mod tests {
         });
         let mut planted = accepted;
         planted["required"] = json!(["name", "age", "name"]);
-        let error =
-            admit_final_schema(planted).expect_err("duplicate required entries reject");
+        let error = admit_final_schema(planted).expect_err("duplicate required entries reject");
         assert_eq!(error.path(), "$.required");
         assert_eq!(error.reason(), "required entries must be unique");
     }
@@ -6883,14 +6897,15 @@ mod tests {
                 "billing": ["street", "zip"]
             }
         });
-        let schema =
-            admit_final_schema(accepted).expect("unique dependentRequired entries admit");
+        let schema = admit_final_schema(accepted).expect("unique dependentRequired entries admit");
         let instance = json!({
             "billing": "enabled",
             "street": "123 Main St",
             "zip": "12345"
         });
-        schema.validate(&instance).expect("unique dependent requirements validate");
+        schema
+            .validate(&instance)
+            .expect("unique dependent requirements validate");
     }
 
     #[test]
@@ -6909,8 +6924,7 @@ mod tests {
         });
         let mut planted = accepted;
         planted["dependentRequired"]["billing"] = json!(["street", "zip", "street"]);
-        let error =
-            admit_final_schema(planted).expect_err("duplicate dependentRequired rejects");
+        let error = admit_final_schema(planted).expect_err("duplicate dependentRequired rejects");
         assert_eq!(error.path(), "$.dependentRequired");
         assert_eq!(
             error.reason(),
