@@ -1240,20 +1240,35 @@ fn validate_unique_local_resource_ids(
 }
 
 fn validate_schema_type(value: &Value, path: &str) -> Result<(), SchemaAdmissionError> {
-    let valid_type = |type_name: &str| {
-        matches!(
-            type_name,
-            "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
-        )
+    let type_bit = |type_name: &str| match type_name {
+        "array" => Some(1u8 << 0),
+        "boolean" => Some(1u8 << 1),
+        "integer" => Some(1u8 << 2),
+        "null" => Some(1u8 << 3),
+        "number" => Some(1u8 << 4),
+        "object" => Some(1u8 << 5),
+        "string" => Some(1u8 << 6),
+        _ => None,
     };
     match value {
-        Value::String(type_name) if valid_type(type_name) => Ok(()),
-        Value::Array(types)
-            if !types.is_empty()
-                && types
-                    .iter()
-                    .all(|type_name| type_name.as_str().is_some_and(valid_type)) =>
-        {
+        Value::String(type_name) if type_bit(type_name).is_some() => Ok(()),
+        Value::Array(types) if !types.is_empty() => {
+            let mut seen_mask = 0u8;
+            for item in types {
+                let bit = item.as_str().and_then(type_bit).ok_or_else(|| {
+                    SchemaAdmissionError::new(
+                        path,
+                        "type must contain only JSON Schema primitive type names",
+                    )
+                })?;
+                if (seen_mask & bit) != 0 {
+                    return Err(SchemaAdmissionError::new(
+                        path,
+                        "type array entries must be unique",
+                    ));
+                }
+                seen_mask |= bit;
+            }
             Ok(())
         }
         _ => Err(SchemaAdmissionError::new(
@@ -1316,15 +1331,26 @@ fn validate_string_array_keyword(
                     "dependentRequired exceeds validation work budget",
                 ));
             }
-            if members.iter().any(|member| {
-                member
-                    .as_str()
-                    .is_none_or(|member| member.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES)
-            }) {
-                return Err(SchemaAdmissionError::new(
-                    format!("{path}.{keyword}"),
-                    "dependentRequired values must be bounded strings",
-                ));
+            let mut seen = HashSet::with_capacity(members.len());
+            for member in members {
+                let Some(member_str) = member.as_str() else {
+                    return Err(SchemaAdmissionError::new(
+                        format!("{path}.{keyword}"),
+                        "dependentRequired values must be bounded strings",
+                    ));
+                };
+                if member_str.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+                    return Err(SchemaAdmissionError::new(
+                        format!("{path}.{keyword}"),
+                        "dependentRequired values must be bounded strings",
+                    ));
+                }
+                if !seen.insert(member_str) {
+                    return Err(SchemaAdmissionError::new(
+                        format!("{path}.{keyword}"),
+                        "dependentRequired array entries must be unique",
+                    ));
+                }
             }
         }
         return Ok(());
@@ -1341,15 +1367,26 @@ fn validate_string_array_keyword(
             "required exceeds entry limit",
         ));
     }
-    if members.iter().any(|member| {
-        member
-            .as_str()
-            .is_none_or(|member| member.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES)
-    }) {
-        return Err(SchemaAdmissionError::new(
-            format!("{path}.{keyword}"),
-            "schema string-array keyword must contain bounded strings",
-        ));
+    let mut seen = HashSet::with_capacity(members.len());
+    for member in members {
+        let Some(member_str) = member.as_str() else {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "schema string-array keyword must contain bounded strings",
+            ));
+        };
+        if member_str.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "schema string-array keyword must contain bounded strings",
+            ));
+        }
+        if !seen.insert(member_str) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "required entries must be unique",
+            ));
+        }
     }
     Ok(())
 }
@@ -6717,6 +6754,168 @@ mod tests {
             MAX_PATTERN_BYTES
         );
         assert_eq!(instance, json!("a".repeat(MAX_PATTERN_BYTES)));
+    }
+
+    #[test]
+    fn admitted_schema_type_uniqueness_positive() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": ["string", "number"]
+        });
+        let schema =
+            admit_final_schema(accepted).expect("unique type array entries admit");
+        let str_instance = json!("hello");
+        let num_instance = json!(42);
+        schema.validate(&str_instance).expect("string instance matches union type");
+        schema.validate(&num_instance).expect("number instance matches union type");
+    }
+
+    #[test]
+    fn admitted_schema_type_duplicate_planted_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": ["string", "number"]
+        });
+        let mut planted = accepted;
+        planted["type"] = json!(["string", "number", "string"]);
+        let error =
+            admit_final_schema(planted).expect_err("duplicate type array entries reject");
+        assert_eq!(error.path(), "$.type");
+        assert_eq!(error.reason(), "type array entries must be unique");
+    }
+
+    #[test]
+    fn admitted_schema_type_seven_primitives_boundary_positive() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": [
+                "array",
+                "boolean",
+                "integer",
+                "null",
+                "number",
+                "object",
+                "string"
+            ]
+        });
+        let schema =
+            admit_final_schema(accepted).expect("seven unique primitive types admit");
+        schema.validate(&json!([1, 2])).expect("array instance validates");
+        schema.validate(&json!(true)).expect("boolean instance validates");
+        schema.validate(&json!(42)).expect("integer instance validates");
+        schema.validate(&json!(null)).expect("null instance validates");
+        schema.validate(&json!(1.5)).expect("number instance validates");
+        schema.validate(&json!({"k": "v"})).expect("object instance validates");
+        schema.validate(&json!("text")).expect("string instance validates");
+    }
+
+    #[test]
+    fn admitted_schema_type_eighth_element_boundary_negative() {
+        let planted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": [
+                "array",
+                "boolean",
+                "integer",
+                "null",
+                "number",
+                "object",
+                "string",
+                "string"
+            ]
+        });
+        let error =
+            admit_final_schema(planted).expect_err("eighth duplicate element rejects");
+        assert_eq!(error.path(), "$.type");
+        assert_eq!(error.reason(), "type array entries must be unique");
+    }
+
+    #[test]
+    fn admitted_schema_required_uniqueness_positive() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+        let schema =
+            admit_final_schema(accepted).expect("unique required array entries admit");
+        let instance = json!({
+            "name": "Alice",
+            "age": 30
+        });
+        schema.validate(&instance).expect("unique required fields validate");
+    }
+
+    #[test]
+    fn admitted_schema_required_duplicate_planted_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"}
+            },
+            "required": ["name", "age"]
+        });
+        let mut planted = accepted;
+        planted["required"] = json!(["name", "age", "name"]);
+        let error =
+            admit_final_schema(planted).expect_err("duplicate required entries reject");
+        assert_eq!(error.path(), "$.required");
+        assert_eq!(error.reason(), "required entries must be unique");
+    }
+
+    #[test]
+    fn admitted_schema_dependent_required_uniqueness_positive() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "billing": {"type": "string"},
+                "street": {"type": "string"},
+                "zip": {"type": "string"}
+            },
+            "dependentRequired": {
+                "billing": ["street", "zip"]
+            }
+        });
+        let schema =
+            admit_final_schema(accepted).expect("unique dependentRequired entries admit");
+        let instance = json!({
+            "billing": "enabled",
+            "street": "123 Main St",
+            "zip": "12345"
+        });
+        schema.validate(&instance).expect("unique dependent requirements validate");
+    }
+
+    #[test]
+    fn admitted_schema_dependent_required_duplicate_planted_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "properties": {
+                "billing": {"type": "string"},
+                "street": {"type": "string"},
+                "zip": {"type": "string"}
+            },
+            "dependentRequired": {
+                "billing": ["street", "zip"]
+            }
+        });
+        let mut planted = accepted;
+        planted["dependentRequired"]["billing"] = json!(["street", "zip", "street"]);
+        let error =
+            admit_final_schema(planted).expect_err("duplicate dependentRequired rejects");
+        assert_eq!(error.path(), "$.dependentRequired");
+        assert_eq!(
+            error.reason(),
+            "dependentRequired array entries must be unique"
+        );
     }
 
     #[test]
