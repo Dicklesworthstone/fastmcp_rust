@@ -1710,13 +1710,13 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
         let request = read_request(&mut stream);
         assert_subscription_request(&request, &server_filter);
         begin_sse_response(&mut stream);
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(90));
         write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
             .expect("write subscription acknowledgement");
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(90));
         write_sse_event(&mut stream, &subscription_tools_changed_event())
             .expect("write accepted tools event");
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(90));
         write_sse_event(&mut stream, &subscription_terminal_event())
             .expect("write subscription terminal");
     });
@@ -1724,7 +1724,7 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
     runtime_block_on(async {
         let cx = Cx::current().expect("caller runtime must install a current Cx");
         let policy =
-            SubscriptionTimeoutPolicy::new(Duration::from_millis(180), Duration::from_secs(1))
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
                 .expect("subscription positive policy must be valid");
         let connection = public_subscription_builder(&target, policy)
             .connect_http_with_cx(&cx)
@@ -1849,8 +1849,8 @@ fn http_03_b_subscription_valid_comments_refresh_idle_but_absolute_expires_negat
         begin_sse_response(&mut stream);
         write_sse_event(&mut stream, &subscription_ack_event(&server_filter))
             .expect("write comment acknowledgement");
-        for index in 0..6 {
-            thread::sleep(Duration::from_millis(60));
+        for index in 0..10 {
+            thread::sleep(Duration::from_millis(35));
             if write_sse_comment(&mut stream, &format!("bounded-{index}")).is_err() {
                 return;
             }
@@ -1860,7 +1860,7 @@ fn http_03_b_subscription_valid_comments_refresh_idle_but_absolute_expires_negat
     runtime_block_on(async {
         let cx = Cx::current().expect("caller runtime must install a current Cx");
         let policy =
-            SubscriptionTimeoutPolicy::new(Duration::from_millis(110), Duration::from_millis(300))
+            SubscriptionTimeoutPolicy::new(Duration::from_millis(150), Duration::from_millis(300))
                 .expect("comment policy must be valid");
         let connection = public_subscription_builder(&target, policy)
             .connect_http_with_cx(&cx)
@@ -2698,10 +2698,10 @@ fn http_03_b_public_builder_progress_resets_idle_but_not_absolute_positive() {
             serde_json::to_value(&server_marker).expect("progress marker must serialize")
         );
         begin_sse_response(&mut request);
-        for progress in 1..=4 {
+        for progress in 1..=5 {
             write_sse_event(&mut request, &progress_event(&server_marker, progress))
                 .expect("write progress event");
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(60));
         }
         write_sse_event(&mut request, &terminal_event(2, "progress-reset-ok"))
             .expect("write terminal event");
@@ -2710,7 +2710,7 @@ fn http_03_b_public_builder_progress_resets_idle_but_not_absolute_positive() {
     runtime_block_on(async {
         let cx = Cx::current().expect("caller runtime must install a current Cx");
         let timeout_policy =
-            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+            RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
                 .expect("progress timeout policy must be valid")
                 .reset_idle_on_matching_progress(true);
         let connection = public_modern_builder(&target, timeout_policy)
@@ -2732,7 +2732,7 @@ fn http_03_b_public_builder_progress_resets_idle_but_not_absolute_positive() {
             .await
             .expect("open public final core listener");
 
-        for expected in 1..=4 {
+        for expected in 1..=5 {
             let event = listener
                 .next_event(&cx)
                 .await

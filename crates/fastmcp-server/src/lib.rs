@@ -163,6 +163,7 @@ pub use tasks::{
     FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
 };
 #[cfg(all(test, feature = "tasks"))]
 pub(crate) use tasks::{SharedTaskManager, TaskManager};
