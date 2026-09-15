@@ -15893,7 +15893,18 @@ impl Client {
         }
         let (result, diagnostic) = decoded.map_err(|error| self.terminate_connection(error))?;
         #[cfg(feature = "tasks")]
-        if !execution.allow_tasks
+        let tasks_admitted = execution.allow_tasks
+            && self
+                .server_discovery()
+                .map_or(false, |discovery| {
+                    admit_final_tasks_result_discriminator(
+                        discovery,
+                        OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+                    )
+                    .is_ok()
+                });
+        #[cfg(feature = "tasks")]
+        if !tasks_admitted
             && matches!(
                 result,
                 CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
@@ -16663,6 +16674,30 @@ impl Client {
         Ok(params)
     }
 
+    /// Verifies whether the request parameters explicitly declare the Tasks
+    /// client extension and the retained server discovery admits the official
+    /// Tasks result discriminator.
+    #[cfg(feature = "tasks")]
+    fn is_tasks_declared_and_negotiated(&self, params: &serde_json::Value) -> bool {
+        let has_declaration = params
+            .get("_meta")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|caps| caps.get("extensions"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|exts| exts.get(fastmcp_protocol::TASKS_EXTENSION))
+            .map_or(false, |val| val == &serde_json::json!({}));
+        if !has_declaration {
+            return false;
+        }
+        let Some(discovery) = self.server_discovery() else {
+            return false;
+        };
+        admit_final_tasks_result_discriminator(discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)
+            .is_ok()
+    }
+
     /// Admits one official final Tasks method through bilateral empty-settings
     /// negotiation before allocating a request ID or writing to the peer.
     #[cfg(feature = "tasks")]
@@ -17082,6 +17117,9 @@ impl Client {
                 )
             })?;
 
+        #[cfg(feature = "tasks")]
+        let tasks_declared = self.is_tasks_declared_and_negotiated(&params_value);
+
         self.last_core_result_receipt = None;
         let received = self.send_prepared_request_with_request_cancellation(
             cx,
@@ -17098,7 +17136,7 @@ impl Client {
         )
         .map_err(|error| self.terminate_connection(error))?;
         #[cfg(feature = "tasks")]
-        if !advertise_tasks
+        if !tasks_declared
             && matches!(
                 result,
                 CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
@@ -17727,6 +17765,8 @@ impl Client {
                     "Method has no parameter object in the negotiated protocol era",
                 )
             })?;
+        #[cfg(feature = "tasks")]
+        let tasks_declared = self.is_tasks_declared_and_negotiated(&params_value);
         self.last_core_result_receipt = None;
         let received = self.send_prepared_request(method, params_value)?;
         let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
@@ -17736,7 +17776,7 @@ impl Client {
         )
         .map_err(|error| self.terminate_connection(error))?;
         #[cfg(feature = "tasks")]
-        if !declare_tasks
+        if !tasks_declared
             && matches!(
                 result,
                 CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
@@ -17766,7 +17806,9 @@ impl Client {
         method: &str,
         params_value: serde_json::Value,
     ) -> McpResult<CoreResult> {
-        let params_value = self.prepare_request_parameters(params_value)?;
+        let mut params_value = self.prepare_request_parameters(params_value)?;
+        #[cfg(feature = "tasks")]
+        remove_tasks_client_extension(&mut params_value);
         let core_request = self
             .prepared_core_request(method, &params_value)?
             .ok_or_else(|| {
@@ -39106,7 +39148,18 @@ exec sleep 5
     }
 
     #[cfg(all(unix, feature = "tasks"))]
-    fn assert_task_01_b_stdio_linkage(task_declared: bool) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Task01BEntrypoint {
+        DeclaredOutcome,
+        UndeclaredCallToolWithCx,
+        UndeclaredYieldingFinalMrtr,
+        UndeclaredCallToolWithCancellation,
+        UndeclaredCallToolTyped,
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn assert_task_01_b_stdio_linkage(entrypoint: Task01BEntrypoint) {
+        let task_declared = matches!(entrypoint, Task01BEntrypoint::DeclaredOutcome);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(0, 0)
             .build()
@@ -39114,7 +39167,7 @@ exec sleep 5
         runtime.block_on(async move {
             let root = Cx::current().unwrap();
             let mut work = root.spawn(move |connection_cx| async move {
-                let subject = format!("task-01-b-{}", std::process::id());
+                let subject = format!("task-01-b-{}-{:?}", std::process::id(), entrypoint);
                 let task_payload = serde_json::json!({
                     "resultType": "task",
                     "taskId": subject,
@@ -39125,11 +39178,20 @@ exec sleep 5
                 });
                 let discovery = modern_tasks_discovery_response("creation-peer", serde_json::json!({}));
                 let response = format!(r#"{{"jsonrpc":"2.0","id":2,"result":{task_payload}}}"#);
+                let log_path = format!(
+                    "/Volumes/USBNVME16TB/temp_agent_space/task_01_b_{}_{:?}.log",
+                    std::process::id(),
+                    entrypoint,
+                );
+                let _ = std::fs::write(&log_path, "");
                 let script = r#"
+LOG="$5"
 IFS= read -r first || exit 90
+printf '%s\n' "$first" >> "$LOG"
 case "$first" in *'"id":1'*) ;; *) exit 91;; esac
 printf '%s\n' "$1"
 IFS= read -r call || exit 92
+printf '%s\n' "$call" >> "$LOG"
 case "$call" in *'"method":"tools/call"'*'"id":2'*) ;; *) exit 93;; esac
 case "$call" in *'"name":"durable-tool"'*) ;; *) exit 94;; esac
 case "$call" in *"$3"*) ;; *) exit 95;; esac
@@ -39140,9 +39202,9 @@ else
 fi
 printf '%s\n' "$2"
 if [ "$4" = "false" ]; then
-    if IFS= read -r follow_up; then
-        exit 98
-    fi
+    while IFS= read -r follow_up; do
+        printf '%s\n' "$follow_up" >> "$LOG"
+    done
     exit 0
 fi
 exec sleep 2
@@ -39163,6 +39225,7 @@ exec sleep 2
                             &response,
                             &subject,
                             if task_declared { "true" } else { "false" },
+                            &log_path,
                         ],
                         &connection_cx,
                     )
@@ -39172,40 +39235,186 @@ exec sleep 2
                 let caller_cx = Cx::for_request();
                 let cancellation = McpRequestCancellation::new();
 
-                if task_declared {
-                    let outcome = client
-                        .call_tool_final_outcome_with_cx(
-                            &caller_cx,
-                            &cancellation,
-                            "durable-tool",
-                            serde_json::json!({"subject": subject}),
-                        )
-                        .await
-                        .unwrap();
-                    match outcome {
-                        FinalToolCallOutcome::Task(created) => {
-                            assert_eq!(created.task.base().task_id.as_str(), subject);
-                            assert!(matches!(created.task, fastmcp_protocol::tasks_extension::Task::Working(_)));
+                match entrypoint {
+                    Task01BEntrypoint::DeclaredOutcome => {
+                        let outcome = client
+                            .call_tool_final_outcome_with_cx(
+                                &caller_cx,
+                                &cancellation,
+                                "durable-tool",
+                                serde_json::json!({"subject": subject}),
+                            )
+                            .await
+                            .unwrap();
+                        match outcome {
+                            FinalToolCallOutcome::Task(created) => {
+                                assert_eq!(created.task.base().task_id.as_str(), subject);
+                                assert!(matches!(created.task, fastmcp_protocol::tasks_extension::Task::Working(_)));
+                            }
+                            other => panic!("expected FinalToolCallOutcome::Task, got {other:?}"),
                         }
-                        other => panic!("expected FinalToolCallOutcome::Task, got {other:?}"),
+                        client.close_with_cx(&connection_cx).await.unwrap();
+                        assert!(client.child.is_none());
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                        assert!(client.pending_process_cleanup_error.is_none());
+                        assert!(client.transport_is_closed());
+
+                        let log_content =
+                            std::fs::read_to_string(&log_path).expect("peer log must be readable");
+                        let recorded_lines: Vec<&str> =
+                            log_content.lines().filter(|l| !l.trim().is_empty()).collect();
+                        assert_eq!(
+                            recorded_lines.len(),
+                            2,
+                            "peer must receive exactly initialize and tools/call; log: {log_content}"
+                        );
+                        assert!(recorded_lines[0].contains("\"id\":1") && recorded_lines[0].contains("initialize"));
+                        assert!(recorded_lines[1].contains("\"id\":2") && recorded_lines[1].contains("tools/call"));
+                        assert!(
+                            recorded_lines[1]
+                                .contains("\"extensions\":{\"io.modelcontextprotocol/tasks\":{}}"),
+                            "positive call must declare Tasks extension in _meta"
+                        );
                     }
-                    client.close_with_cx(&connection_cx).await.unwrap();
-                    assert!(client.child.is_none());
-                } else {
-                    let error = client
-                        .call_tool_with_cx(
-                            &caller_cx,
-                            &cancellation,
-                            "durable-tool",
-                            serde_json::json!({"subject": subject}),
-                        )
-                        .await
-                        .unwrap_err();
-                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                    assert!(!client.is_initialized());
-                    assert!(client.child.is_none());
+                    Task01BEntrypoint::UndeclaredCallToolWithCx => {
+                        let error = client
+                            .call_tool_with_cx(
+                                &caller_cx,
+                                &cancellation,
+                                "durable-tool",
+                                serde_json::json!({"subject": subject}),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(!client.is_initialized());
+                        assert!(client.child.is_none());
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                        assert!(client.pending_process_cleanup_error.is_none());
+                        assert!(client.transport_is_closed());
+
+                        let log_content =
+                            std::fs::read_to_string(&log_path).expect("peer log must be readable");
+                        let recorded_lines: Vec<&str> =
+                            log_content.lines().filter(|l| !l.trim().is_empty()).collect();
+                        assert_eq!(
+                            recorded_lines.len(),
+                            2,
+                            "peer must receive exactly initialize and tools/call, zero follow-up lines; log: {log_content}"
+                        );
+                        assert!(recorded_lines[0].contains("\"id\":1") && recorded_lines[0].contains("initialize"));
+                        assert!(recorded_lines[1].contains("\"id\":2") && recorded_lines[1].contains("tools/call"));
+                        assert!(
+                            !recorded_lines[1].contains("io.modelcontextprotocol/tasks"),
+                            "undeclared call must not declare Tasks extension in _meta"
+                        );
+                    }
+                    Task01BEntrypoint::UndeclaredYieldingFinalMrtr => {
+                        let mut execution = client
+                            .start_yielding_final_mrtr_request(
+                                &caller_cx,
+                                "tools/call",
+                                serde_json::json!({"name": "durable-tool", "arguments": {"subject": subject}}),
+                                false,
+                            )
+                            .unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        let error = loop {
+                            match client.try_take_yielding_final_mrtr_response(&mut execution, false) {
+                                Ok(Some(_)) => panic!("expected undeclared task to be rejected"),
+                                Ok(None) => {
+                                    assert!(Instant::now() < deadline, "timed out waiting for yielding response");
+                                    client.drive_yielding_stdio_slice().unwrap();
+                                    asupersync::runtime::yield_now().await;
+                                }
+                                Err(err) => break err,
+                            }
+                        };
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(!client.is_initialized());
+                        assert!(client.child.is_none());
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                        assert!(client.pending_process_cleanup_error.is_none());
+                        assert!(client.transport_is_closed());
+
+                        let log_content =
+                            std::fs::read_to_string(&log_path).expect("peer log must be readable");
+                        let recorded_lines: Vec<&str> =
+                            log_content.lines().filter(|l| !l.trim().is_empty()).collect();
+                        assert_eq!(
+                            recorded_lines.len(),
+                            2,
+                            "peer must receive exactly initialize and tools/call, zero follow-up lines; log: {log_content}"
+                        );
+                        assert!(recorded_lines[0].contains("\"id\":1") && recorded_lines[0].contains("initialize"));
+                        assert!(recorded_lines[1].contains("\"id\":2") && recorded_lines[1].contains("tools/call"));
+                        assert!(
+                            !recorded_lines[1].contains("io.modelcontextprotocol/tasks"),
+                            "undeclared yielding MRTR call must not declare Tasks extension"
+                        );
+                    }
+                    Task01BEntrypoint::UndeclaredCallToolWithCancellation => {
+                        let error = client
+                            .call_tool_with_cancellation(
+                                &caller_cx,
+                                &cancellation,
+                                "durable-tool",
+                                serde_json::json!({"subject": subject}),
+                            )
+                            .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(!client.is_initialized());
+                        assert!(client.child.is_none());
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                        assert!(client.pending_process_cleanup_error.is_none());
+                        assert!(client.transport_is_closed());
+
+                        let log_content =
+                            std::fs::read_to_string(&log_path).expect("peer log must be readable");
+                        let recorded_lines: Vec<&str> =
+                            log_content.lines().filter(|l| !l.trim().is_empty()).collect();
+                        assert_eq!(
+                            recorded_lines.len(),
+                            2,
+                            "peer must receive exactly initialize and tools/call, zero follow-up lines; log: {log_content}"
+                        );
+                        assert!(recorded_lines[0].contains("\"id\":1") && recorded_lines[0].contains("initialize"));
+                        assert!(recorded_lines[1].contains("\"id\":2") && recorded_lines[1].contains("tools/call"));
+                        assert!(
+                            !recorded_lines[1].contains("io.modelcontextprotocol/tasks"),
+                            "call_tool_with_cancellation must not declare Tasks extension"
+                        );
+                    }
+                    Task01BEntrypoint::UndeclaredCallToolTyped => {
+                        let error = client
+                            .call_tool_typed("durable-tool", serde_json::json!({"subject": subject}))
+                            .unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(!client.is_initialized());
+                        assert!(client.child.is_none());
+                        assert_eq!(client.child_cleanup_phase, ClientChildCleanupPhase::Complete);
+                        assert!(client.pending_process_cleanup_error.is_none());
+                        assert!(client.transport_is_closed());
+
+                        let log_content =
+                            std::fs::read_to_string(&log_path).expect("peer log must be readable");
+                        let recorded_lines: Vec<&str> =
+                            log_content.lines().filter(|l| !l.trim().is_empty()).collect();
+                        assert_eq!(
+                            recorded_lines.len(),
+                            2,
+                            "peer must receive exactly initialize and tools/call, zero follow-up lines; log: {log_content}"
+                        );
+                        assert!(recorded_lines[0].contains("\"id\":1") && recorded_lines[0].contains("initialize"));
+                        assert!(recorded_lines[1].contains("\"id\":2") && recorded_lines[1].contains("tools/call"));
+                        assert!(
+                            !recorded_lines[1].contains("io.modelcontextprotocol/tasks"),
+                            "call_tool_typed must not declare Tasks extension"
+                        );
+                    }
                 }
-            });
+            })
+            .expect("task spawns");
             work.join(&root).await.unwrap();
         });
     }
@@ -39213,13 +39422,25 @@ exec sleep 2
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn task_01_b_positive() {
-        assert_task_01_b_stdio_linkage(true);
+        assert_task_01_b_stdio_linkage(Task01BEntrypoint::DeclaredOutcome);
     }
 
     #[cfg(all(unix, feature = "tasks"))]
     #[test]
     fn task_01_b_planted_negative() {
-        assert_task_01_b_stdio_linkage(false);
+        // Covers 4 public undeclared entrypoints across stdio client request paths:
+        // 1. async request_core_with_cx
+        // 2. yielding try_take_yielding_final_mrtr_response
+        // 3. sync request_core_with_cancellation_policy
+        // 4. sync send_typed_core_request_with_tasks
+        //
+        // Note: The internal MRTR retry helper (send_typed_core_request_with_cx_until)
+        // strips Tasks extension before commit; lower-level multi-turn MRTR continuations
+        // and full bilateral negotiation matrices remain unverified on this slice.
+        assert_task_01_b_stdio_linkage(Task01BEntrypoint::UndeclaredCallToolWithCx);
+        assert_task_01_b_stdio_linkage(Task01BEntrypoint::UndeclaredYieldingFinalMrtr);
+        assert_task_01_b_stdio_linkage(Task01BEntrypoint::UndeclaredCallToolWithCancellation);
+        assert_task_01_b_stdio_linkage(Task01BEntrypoint::UndeclaredCallToolTyped);
     }
 
     #[cfg(unix)]
