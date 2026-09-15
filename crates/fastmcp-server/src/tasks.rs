@@ -1553,10 +1553,11 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// retained values unchanged.
 ///
 /// Every store must atomically retain a bounded lifetime history of issued
-/// input-request keys. A replacement may retain a currently outstanding key,
-/// but must reject reissuing a satisfied key before changing task, generation,
-/// notification, input, or dispatch-lease state. This history survives recovery
-/// and terminal transitions and is removed only when the task is reclaimed.
+/// input-request keys. A replacement may retain a currently outstanding key
+/// only with its identical typed descriptor, and must reject reissuing a
+/// satisfied key before changing task, generation, notification, input, or
+/// dispatch-lease state. This history survives recovery and terminal
+/// transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
     /// Durably records a newly created task and its status notification.
     fn create_task(
@@ -2218,8 +2219,23 @@ fn prepare_in_memory_final_task_input_key_history(
         _ => None,
     };
     let mut next = history.cloned().unwrap_or_default();
-    for key in input_requests.keys() {
-        if outstanding.is_some_and(|requests| requests.contains_key(key)) {
+    for (key, request) in input_requests {
+        if let Some(existing) = outstanding.and_then(|requests| requests.get(key)) {
+            let existing = serde_json::to_value(existing).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Could not encode outstanding final task input request for comparison: {error}"
+                ))
+            })?;
+            let replacement = serde_json::to_value(request).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Could not encode replacement final task input request for comparison: {error}"
+                ))
+            })?;
+            if existing != replacement {
+                return Err(McpError::invalid_params(
+                    "Task input request keys cannot be reused",
+                ));
+            }
             continue;
         }
         if next.keys.contains(key) {
@@ -12193,7 +12209,10 @@ mod tests {
         let roots = final_roots_request().into_values().next().unwrap();
         FinalTask::InputRequired {
             base,
-            input_requests: keys.iter().map(|key| (key.clone(), roots.clone())).collect(),
+            input_requests: keys
+                .iter()
+                .map(|key| (key.clone(), roots.clone()))
+                .collect(),
         }
     }
 
@@ -12449,6 +12468,395 @@ mod tests {
             .create_task(input.clone(), final_task_notification(&input))
             .unwrap();
         assert_eq!(history_keys(), Some(keys.into_iter().collect()));
+    }
+
+    fn assert_outstanding_input_schema_identity(change_schema: bool) {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let working = final_working_task_without_ttl("task-outstanding-schema-identity");
+        let task_id = working.base().task_id.clone();
+        let mut base = working.base().clone();
+        base.status = FinalTaskStatus::InputRequired;
+        let requests = serde_json::from_value(serde_json::json!({
+            "roots": {"method": "roots/list"},
+            "form": {
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "form",
+                    "message": "Enter the answer",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"]
+                    }
+                }
+            }
+        }))
+        .expect("both initial embedded requests are admitted");
+        let initial = FinalTask::InputRequired {
+            base,
+            input_requests: requests,
+        };
+        store
+            .create_task(initial.clone(), final_task_notification(&initial))
+            .unwrap();
+        let first = serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        runtime.update_task(&task_id, &first).unwrap();
+        let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let original = current.task().clone();
+        let before = input_key_store_snapshot(&store, &task_id);
+        assert_eq!(
+            before["accepted_inputs"],
+            serde_json::to_value(&first).unwrap()
+        );
+        let mut proposed = original.clone();
+        let FinalTask::InputRequired { input_requests, .. } = &mut proposed else {
+            panic!("partial acceptance must retain the outstanding form request");
+        };
+        assert_eq!(input_requests.len(), 1);
+        if change_schema {
+            let descriptor = input_requests.get_mut("form").unwrap();
+            let mut value = serde_json::to_value(&*descriptor).unwrap();
+            value["params"]["requestedSchema"]["properties"]["answer"]["type"] =
+                serde_json::json!("integer");
+            *descriptor = serde_json::from_value(value).expect("changed schema remains admitted");
+        }
+        let result = store.replace_task_and_append_input_if_current(
+            &current,
+            proposed.clone(),
+            final_task_notification(&proposed),
+            BTreeMap::new(),
+        );
+        if change_schema {
+            let error = result.expect_err("same-kind schema changes must not retarget a key");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "Task input request keys cannot be reused");
+            assert_eq!(input_key_store_snapshot(&store, &task_id), before);
+            assert!(
+                store
+                    .replace_task_and_append_input_if_current(
+                        &current,
+                        original.clone(),
+                        final_task_notification(&original),
+                        BTreeMap::new(),
+                    )
+                    .expect("the identical descriptor can retry under the same generation")
+            );
+        } else {
+            assert!(result.expect("an identical outstanding descriptor remains valid"));
+        }
+        let after = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert_ne!(after.generation(), current.generation());
+        assert_eq!(
+            serde_json::to_value(after.task()).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id).unwrap()).unwrap(),
+            serde_json::to_value(final_task_notification(&original)).unwrap()
+        );
+        assert_eq!(
+            input_key_store_snapshot(&store, &task_id)["accepted_inputs"],
+            before["accepted_inputs"]
+        );
+        let second = serde_json::from_value(serde_json::json!({
+            "form": {"action": "accept", "content": {"answer": "original answer"}}
+        }))
+        .unwrap();
+        runtime.update_task(&task_id, &second).unwrap();
+        let completed_input = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(matches!(completed_input.task(), FinalTask::Working(_)));
+        let retained = input_key_store_snapshot(&store, &task_id);
+        assert_eq!(
+            retained["accepted_inputs"],
+            serde_json::json!({
+                "roots": {"roots": []},
+                "form": {"action": "accept", "content": {"answer": "original answer"}}
+            })
+        );
+        assert_eq!(
+            retained["history"],
+            serde_json::json!([["form", "roots"], 9])
+        );
+        assert_eq!(
+            retained["notification"],
+            serde_json::to_value(final_task_notification(completed_input.task())).unwrap()
+        );
+    }
+
+    #[test]
+    fn task_02_b_input_key_history_rejects_changing_kind_of_outstanding_key() {
+        assert_outstanding_input_schema_identity(true);
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-key-history-change-kind");
+        let task_id = working.base().task_id.clone();
+        let mut base = working.base().clone();
+        base.status = FinalTaskStatus::InputRequired;
+
+        let mut roots_requests = FinalTaskInputRequests::new();
+        roots_requests.insert(
+            "query".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed roots input request"),
+        );
+        let initial_input = FinalTask::InputRequired {
+            base: base.clone(),
+            input_requests: roots_requests,
+        };
+        store
+            .create_task(
+                initial_input.clone(),
+                final_task_notification(&initial_input),
+            )
+            .expect("initial input task creates");
+
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("read task snapshot")
+            .expect("snapshot exists");
+        let before_store_state = input_key_store_snapshot(&store, &task_id);
+
+        // Attempt 1: Change key "query" from Roots to Sampling.
+        let mut sampling_requests = FinalTaskInputRequests::new();
+        sampling_requests.insert(
+            "query".to_owned(),
+            serde_json::from_value(serde_json::json!({
+                "method": "sampling/createMessage",
+                "params": {
+                    "messages": [],
+                    "maxTokens": 16
+                }
+            }))
+            .expect("typed sampling input request"),
+        );
+        let sampling_replacement = FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base.clone(),
+                FinalTaskStatus::InputRequired,
+                Some("attempt kind change to sampling".to_owned()),
+            )
+            .expect("base transition is valid"),
+            input_requests: sampling_requests,
+        };
+        let sampling_error = store
+            .replace_task_if_current(
+                &snapshot,
+                sampling_replacement.clone(),
+                final_task_notification(&sampling_replacement),
+            )
+            .expect_err(
+                "reusing an outstanding input key with a different response kind must fail",
+            );
+        assert_eq!(
+            sampling_error.code,
+            fastmcp_core::McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            sampling_error.message,
+            "Task input request keys cannot be reused"
+        );
+
+        // Invariance: store snapshot, generation, task, notification unchanged.
+        assert_eq!(
+            input_key_store_snapshot(&store, &task_id),
+            before_store_state
+        );
+        let current_snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("read current snapshot")
+            .expect("task remains present");
+        assert_eq!(current_snapshot.generation(), snapshot.generation());
+        assert_eq!(
+            serde_json::to_value(current_snapshot.task()).expect("serialize current task"),
+            serde_json::to_value(snapshot.task()).expect("serialize snapshot task")
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id).unwrap())
+                .expect("serialize notification"),
+            serde_json::to_value(final_task_notification(snapshot.task()))
+                .expect("serialize expected notification")
+        );
+
+        // Attempt 2: Change key "query" from Roots to URL Elicitation.
+        let mut elicitation_requests = FinalTaskInputRequests::new();
+        elicitation_requests.insert(
+            "query".to_owned(),
+            serde_json::from_value(serde_json::json!({
+                "method": "elicitation/create",
+                "params": {
+                    "mode": "url",
+                    "message": "please visit url",
+                    "url": "https://example.com/auth"
+                }
+            }))
+            .expect("typed elicitation input request"),
+        );
+        let elicitation_replacement = FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base,
+                FinalTaskStatus::InputRequired,
+                Some("attempt kind change to elicitation".to_owned()),
+            )
+            .expect("base transition is valid"),
+            input_requests: elicitation_requests,
+        };
+        let elicitation_error = store
+            .replace_task_if_current(
+                &snapshot,
+                elicitation_replacement.clone(),
+                final_task_notification(&elicitation_replacement),
+            )
+            .expect_err(
+                "reusing an outstanding input key with elicitation response kind must fail",
+            );
+        assert_eq!(
+            elicitation_error.code,
+            fastmcp_core::McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            elicitation_error.message,
+            "Task input request keys cannot be reused"
+        );
+
+        // Invariance remains intact after second rejected attempt.
+        assert_eq!(
+            input_key_store_snapshot(&store, &task_id),
+            before_store_state
+        );
+    }
+
+    #[test]
+    fn task_02_b_input_key_history_retains_unmodified_outstanding_keys() {
+        assert_outstanding_input_schema_identity(false);
+        let store = InMemoryFinalTaskStore::default();
+        let working = final_working_task_without_ttl("task-key-history-retain-matching");
+        let task_id = working.base().task_id.clone();
+        let mut base = working.base().clone();
+        base.status = FinalTaskStatus::InputRequired;
+
+        let mut initial_requests = FinalTaskInputRequests::new();
+        initial_requests.insert(
+            "query".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed roots input request"),
+        );
+        let initial_input = FinalTask::InputRequired {
+            base: base.clone(),
+            input_requests: initial_requests.clone(),
+        };
+        store
+            .create_task(
+                initial_input.clone(),
+                final_task_notification(&initial_input),
+            )
+            .expect("initial input task creates");
+
+        let snapshot = store
+            .get_task_snapshot(&task_id)
+            .expect("snapshot is readable")
+            .expect("snapshot exists");
+
+        // Verify initial history accounting
+        {
+            let state = store.state.lock().unwrap();
+            let history = state
+                .input_key_history
+                .get(&task_id)
+                .expect("history exists");
+            assert_eq!(history.keys.len(), 1);
+            assert!(history.keys.contains("query"));
+            assert_eq!(history.key_bytes, "query".len());
+        }
+
+        // Retain "query" alone with matching kind (Roots)
+        let replacement_same = FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base.clone(),
+                FinalTaskStatus::InputRequired,
+                Some("retaining query with matching kind".to_owned()),
+            )
+            .expect("base transition is valid"),
+            input_requests: initial_requests.clone(),
+        };
+        assert!(
+            store
+                .replace_task_if_current(
+                    &snapshot,
+                    replacement_same.clone(),
+                    final_task_notification(&replacement_same),
+                )
+                .expect("replace with matching kind succeeds")
+        );
+        let snapshot_2 = store
+            .get_task_snapshot(&task_id)
+            .expect("snapshot is readable")
+            .expect("snapshot exists");
+        assert_ne!(snapshot_2.generation(), snapshot.generation());
+        assert_eq!(
+            serde_json::to_value(snapshot_2.task()).unwrap(),
+            serde_json::to_value(&replacement_same).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id).unwrap()).unwrap(),
+            serde_json::to_value(final_task_notification(&replacement_same)).unwrap()
+        );
+        {
+            let state = store.state.lock().unwrap();
+            let history = state
+                .input_key_history
+                .get(&task_id)
+                .expect("history exists");
+            assert_eq!(history.keys.len(), 1);
+            assert_eq!(history.key_bytes, "query".len());
+        }
+
+        // Replace task retaining "query" with matching kind (Roots) and adding new key "query-2"
+        let mut updated_requests = initial_requests;
+        updated_requests.insert(
+            "query-2".to_owned(),
+            serde_json::from_value(serde_json::json!({"method": "roots/list"}))
+                .expect("typed roots input request"),
+        );
+        let replacement_extended = FinalTask::InputRequired {
+            base: transition_final_task_base(
+                base,
+                FinalTaskStatus::InputRequired,
+                Some("retaining query and adding query-2".to_owned()),
+            )
+            .expect("base transition is valid"),
+            input_requests: updated_requests,
+        };
+        assert!(
+            store
+                .replace_task_if_current(
+                    &snapshot_2,
+                    replacement_extended.clone(),
+                    final_task_notification(&replacement_extended),
+                )
+                .expect("replace with matching kind and new key succeeds")
+        );
+        let snapshot_3 = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert_ne!(snapshot_3.generation(), snapshot_2.generation());
+        assert_eq!(
+            serde_json::to_value(snapshot_3.task()).unwrap(),
+            serde_json::to_value(&replacement_extended).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.latest_notification(&task_id).unwrap()).unwrap(),
+            serde_json::to_value(final_task_notification(&replacement_extended)).unwrap()
+        );
+
+        // Verify that "query" was NOT double-counted in key_bytes and both keys are recorded
+        let state = store.state.lock().unwrap();
+        let history = state
+            .input_key_history
+            .get(&task_id)
+            .expect("history exists");
+        assert_eq!(history.keys.len(), 2);
+        assert!(history.keys.contains("query"));
+        assert!(history.keys.contains("query-2"));
+        // "query".len() is 5, "query-2".len() is 7. If double-counted, it would be 5 + 5 + 7 = 17.
+        assert_eq!(history.key_bytes, "query".len() + "query-2".len());
     }
 
     #[test]

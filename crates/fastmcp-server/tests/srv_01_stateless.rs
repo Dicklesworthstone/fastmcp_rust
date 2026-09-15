@@ -921,13 +921,13 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     use asupersync::runtime::RuntimeBuilder;
     use fastmcp_core::{McpError, McpErrorCode};
     use fastmcp_protocol::tasks_extension::{
-        FinalTaskCallToolResult, Task, TaskInputRequests, TaskInputResponses,
+        FinalTaskCallToolResult, Task, TaskInputRequests, TaskInputResponses, TaskStatus,
         TaskStatusNotification, TaskStatusNotificationParams,
     };
     use fastmcp_server::{
-        ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig,
-        FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
-        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
 
     struct TwoRoundSupervisor {
@@ -951,10 +951,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 match handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => {
-                        let roots_a: TaskInputRequests = serde_json::from_value(serde_json::json!({
-                            "roots_a": {"method": "roots/list"}
-                        }))
-                        .expect("valid roots_a request");
+                        let roots_a: TaskInputRequests =
+                            serde_json::from_value(serde_json::json!({
+                                "roots_a": {"method": "roots/list"}
+                            }))
+                            .expect("valid roots_a request");
                         initial
                             .require_input(roots_a, Some("awaiting roots_a".to_owned()))
                             .expect("initial require_input enters input_required");
@@ -962,18 +963,26 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                     FinalTaskSupervisorHandoff::Resumed(accepted) => {
                         let resumptions = self.resumed_calls.fetch_add(1, Ordering::SeqCst);
                         if resumptions == 0 {
-                            assert!(
-                                accepted.input_responses().contains_key("roots_a"),
-                                "first resumption must carry roots_a input response"
+                            assert_eq!(
+                                serde_json::to_value(accepted.input_responses()).unwrap(),
+                                serde_json::json!({
+                                    "roots_a": {"roots": [{
+                                        "uri": "file:///first-round",
+                                        "name": "first-round"
+                                    }]}
+                                }),
+                                "first resumption must carry exactly the accepted roots_a response"
                             );
-                            let roots_a: TaskInputRequests = serde_json::from_value(serde_json::json!({
-                                "roots_a": {"method": "roots/list"}
-                            }))
-                            .expect("valid roots_a request");
-                            let roots_b: TaskInputRequests = serde_json::from_value(serde_json::json!({
-                                "roots_b": {"method": "roots/list"}
-                            }))
-                            .expect("valid roots_b request");
+                            let roots_a: TaskInputRequests =
+                                serde_json::from_value(serde_json::json!({
+                                    "roots_a": {"method": "roots/list"}
+                                }))
+                                .expect("valid roots_a request");
+                            let roots_b: TaskInputRequests =
+                                serde_json::from_value(serde_json::json!({
+                                    "roots_b": {"method": "roots/list"}
+                                }))
+                                .expect("valid roots_b request");
 
                             if self.reused {
                                 let task_id = accepted.task_id().clone();
@@ -987,6 +996,8 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     .latest_notification(&task_id)
                                     .expect("read pre-notification");
                                 let pre_emitted = self.emitted.load(Ordering::SeqCst);
+                                let pre_calls = self.calls.load(Ordering::SeqCst);
+                                let pre_resumed = self.resumed_calls.load(Ordering::SeqCst);
                                 assert_eq!(
                                     pre_emitted, 2,
                                     "exactly 2 notifications emitted before duplicate attempt"
@@ -994,7 +1005,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
 
                                 // Attempting to reuse roots_a must fail closed.
                                 let rejection = accepted
-                                    .require_input(roots_a, Some("attempt reused roots_a".to_owned()))
+                                    .require_input(roots_a, Some("awaiting next roots".to_owned()))
                                     .expect_err("reusing input key across rounds must reject");
                                 assert_eq!(rejection.code, McpErrorCode::InvalidParams);
                                 assert_eq!(
@@ -1002,7 +1013,8 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     "Task input request keys cannot be reused"
                                 );
 
-                                // Invariance: task status, generation, notification, and emitted count remain unchanged.
+                                // Rejection preserves the complete public task,
+                                // generation, notification, and emitted count.
                                 let post_snapshot = self
                                     .store
                                     .get_task_snapshot(&task_id)
@@ -1030,24 +1042,25 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     pre_emitted,
                                     "rejected duplicate input key reuse must not emit any notification"
                                 );
+                                assert_eq!(self.calls.load(Ordering::SeqCst), pre_calls);
+                                assert_eq!(self.resumed_calls.load(Ordering::SeqCst), pre_resumed);
                                 *self.observed_rejection.lock().unwrap() = Some(rejection);
-
-                                // Same authorized handoff issues fresh roots_b successfully.
-                                accepted
-                                    .require_input(
-                                        roots_b,
-                                        Some("awaiting roots_b after rejected duplicate".to_owned()),
-                                    )
-                                    .expect("fresh key under same handoff must succeed");
-                            } else {
-                                accepted
-                                    .require_input(roots_b, Some("awaiting roots_b".to_owned()))
-                                    .expect("fresh key roots_b must succeed");
                             }
+                            // Both cases use the same handoff and fresh descriptor;
+                            // only the preceding duplicate attempt differs.
+                            accepted
+                                .require_input(roots_b, Some("awaiting next roots".to_owned()))
+                                .expect("fresh key under the same handoff must succeed");
                         } else if resumptions == 1 {
-                            assert!(
-                                accepted.input_responses().contains_key("roots_b"),
-                                "second resumption must carry roots_b input response"
+                            assert_eq!(
+                                serde_json::to_value(accepted.input_responses()).unwrap(),
+                                serde_json::json!({
+                                    "roots_b": {"roots": [{
+                                        "uri": "file:///second-round",
+                                        "name": "second-round"
+                                    }]}
+                                }),
+                                "second resumption must carry exactly roots_b, with no stale roots_a"
                             );
                             let result: FinalTaskCallToolResult = serde_json::from_value(serde_json::json!({
                                 "content": [{"type": "text", "text": "two rounds completed successfully"}]
@@ -1092,13 +1105,19 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     let resumed_calls = Arc::new(AtomicUsize::new(0));
     let observed_rejection = Arc::new(Mutex::new(None));
     let emitted = Arc::new(AtomicUsize::new(0));
+    let emitted_statuses = Arc::new(Mutex::new(Vec::new()));
 
     let runtime = FinalTaskRuntime::new(
         store.clone(),
         FinalTaskRuntimeConfig::new(60000, None).unwrap(),
         {
             let emitted = Arc::clone(&emitted);
-            Arc::new(move |_| {
+            let emitted_statuses = Arc::clone(&emitted_statuses);
+            Arc::new(move |notification: TaskStatusNotification| {
+                emitted_statuses
+                    .lock()
+                    .unwrap()
+                    .push(notification.params.task.base().status);
                 emitted.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -1142,26 +1161,26 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
             if observation_bound.as_mut().poll(task_cx).is_ready() {
                 panic!("test timed out waiting for two-round progression");
             }
-            if step < 3 {
-                if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
-                    panic!("service must remain live and pending while caller is live: {result:?}");
-                }
-            } else {
-                if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
-                    assert!(
-                        result.is_ok(),
-                        "service natural shutdown must succeed: {result:?}"
-                    );
-                    return Poll::Ready(());
-                }
-                task_cx.waker().wake_by_ref();
+            if let Poll::Ready(result) = service.as_mut().poll(task_cx) {
+                assert_eq!(
+                    step, 3,
+                    "service exited before completed-task cancellation: {result:?}"
+                );
+                result.expect("caller cancellation must join the service successfully");
+                return Poll::Ready(());
+            }
+            if step == 3 {
                 return Poll::Pending;
             }
 
             let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
             match current.task() {
-                Task::InputRequired { base: _, input_requests } => {
+                Task::InputRequired { input_requests, .. } => {
                     if step == 0 && input_requests.contains_key("roots_a") {
+                        assert_eq!(
+                            serde_json::to_value(input_requests).unwrap(),
+                            serde_json::json!({"roots_a": {"method": "roots/list"}})
+                        );
                         assert_eq!(
                             emitted.load(Ordering::SeqCst),
                             1,
@@ -1180,7 +1199,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                         return Poll::Pending;
                     }
                     if step == 1 && input_requests.contains_key("roots_b") {
-                        if !reused && replay_ticks < 4 {
+                        assert_eq!(
+                            serde_json::to_value(input_requests).unwrap(),
+                            serde_json::json!({"roots_b": {"method": "roots/list"}})
+                        );
+                        if replay_ticks < 4 {
                             if replay_ticks == 0 {
                                 // Baseline before stale replay.
                                 let base_snap = store.get_task_snapshot(&task_id).unwrap().unwrap();
@@ -1197,6 +1220,7 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                     1,
                                     "supervisor must have resumed exactly once before stale replay"
                                 );
+                                assert_eq!(calls.load(Ordering::SeqCst), 2);
                                 baseline_snapshot = Some(base_snap);
                                 baseline_notification = Some(base_notif);
                                 baseline_emitted = base_emit;
@@ -1222,6 +1246,11 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                                 resumed_calls.load(Ordering::SeqCst),
                                 1,
                                 "stale replay must not trigger supervisor resumption"
+                            );
+                            assert_eq!(
+                                calls.load(Ordering::SeqCst),
+                                2,
+                                "stale replay must not trigger any supervisor callback"
                             );
                             assert_eq!(
                                 emitted.load(Ordering::SeqCst),
@@ -1254,7 +1283,8 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
                             return Poll::Pending;
                         }
 
-                        // Replay slice verified (or in reused mode): submit fresh round 2 roots_b response.
+                        // Both cases polled the real runner after stale replay
+                        // before submitting the fresh round 2 response.
                         runtime
                             .update_task(&task_id, &roots_b_response)
                             .expect("round 2 input update succeeds");
@@ -1303,6 +1333,17 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
         5,
         "completed task must have emitted exactly 5 notifications in total"
     );
+    assert_eq!(
+        *emitted_statuses.lock().unwrap(),
+        vec![
+            TaskStatus::InputRequired,
+            TaskStatus::Working,
+            TaskStatus::InputRequired,
+            TaskStatus::Working,
+            TaskStatus::Completed,
+        ],
+        "direct store creation predates the observer; only five real transitions emit"
+    );
     if reused {
         let rejection = observed_rejection
             .lock()
@@ -1329,7 +1370,8 @@ fn assert_task_service_two_round_input_keys(reused: bool) {
     );
     let latest_notif = store.latest_notification(&task_id).unwrap();
     assert_eq!(
-        serde_json::to_value(&latest_notif.params.task).unwrap()["status"],
-        "completed"
+        serde_json::to_value(&latest_notif.params.task).unwrap(),
+        value,
+        "the latest notification must retain the exact completed task"
     );
 }
