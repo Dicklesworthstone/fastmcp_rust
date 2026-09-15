@@ -1924,7 +1924,11 @@ mod tests {
             else {
                 panic!("mixed-era request must return a response");
             };
-            assert_eq!(response["error"]["code"], -32600);
+            assert_eq!(response["error"]["code"], -32602);
+            assert_eq!(
+                response["error"]["message"],
+                "invalid exact MCP 2024-11-05 parameters"
+            );
             assert_eq!(adapter.snapshot(), before);
             assert_eq!(adapter.handler.methods, [TOOLS_LIST]);
         }
@@ -1942,7 +1946,11 @@ mod tests {
         let Legacy2024Outbound::Response(response) = response else {
             panic!("invalid initialize request must receive a JSON-RPC error response");
         };
-        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(
+            response["error"]["message"],
+            "invalid exact MCP 2024-11-05 envelope"
+        );
         assert_eq!(adapter.snapshot(), before);
         assert_eq!(adapter.handler.methods.len(), 0);
     }
