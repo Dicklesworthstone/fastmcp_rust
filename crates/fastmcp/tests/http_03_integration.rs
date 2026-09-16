@@ -34,8 +34,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fastmcp_rust::asupersync::Cx;
-use fastmcp_rust::asupersync::runtime::RuntimeBuilder;
+// The caller-owned runtime comes from the `asupersync` dev-dependency directly,
+// never through `fastmcp_rust::asupersync`: that facade re-export is gated behind
+// the `testing-lab` feature, so reaching it would drag `asupersync/test-internals`
+// into this target's graph and force a `required-features` stanza. The AC requires
+// this target to be auto-discovered under the DEFAULT facade feature set, and
+// `cfg(test)`-only or lab-only behaviour cannot prove shipped behaviour (PL-3).
+// Every sibling target does the same; see `tests/e2e_stress.rs:18`.
+use asupersync::Cx;
+use asupersync::runtime::RuntimeBuilder;
 use fastmcp_rust::client::http_executor::{
     HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreEvent,
     ModernHttpFinalCoreListenError, http_03_a_manifest_digest, http_03_b_manifest_digest,
