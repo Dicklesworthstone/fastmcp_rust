@@ -1111,6 +1111,69 @@ impl JoinReceipt {
     }
 }
 
+/// What each registered predicate actually exercises, keyed by case ID.
+///
+/// # Why this exists
+///
+/// The floor gate cannot catch a semantic mismatch. A producer that derives its
+/// `floor=N` values from *this* evaluator's observation counts - which is exactly
+/// what was asked for and supplied - will produce floors that match perfectly
+/// even if it has assigned completely different behaviour to those case IDs. The
+/// gate would then confirm the numbers while the receipt mislabels what was
+/// proved, which is laundered evidence of precisely the kind this join exists to
+/// prevent.
+///
+/// So each predicate declares the subject it observes, and the join refuses to
+/// run a predicate under a case name that means something else.
+const PREDICATE_SUBJECTS: &[(&str, &str)] = &[
+    ("HTTP-03.01", "post-route"),
+    ("HTTP-03.02", "request-content-type"),
+    ("HTTP-03.03", "request-accept-two-ranges"),
+    ("HTTP-03.04", "request-accept-encoding-identity"),
+    ("HTTP-03.05", "protocol-version-header"),
+    ("HTTP-03.06", "method-mirror-header"),
+    ("HTTP-03.07", "name-header"),
+    ("HTTP-03.08", "request-body-stamping"),
+    ("HTTP-03.09", "immediate-json-lane"),
+    ("HTTP-03.10", "request-scoped-sse-lane"),
+    ("HTTP-03.11", "response-content-encoding"),
+    ("HTTP-03.12", "bounded-sse-parse"),
+    ("HTTP-03.13", "terminal-outcome-and-stream-close"),
+    ("HTTP-03.14", "one-shot-discover-probe"),
+    ("HTTP-03.15", "modern-era-selection"),
+    ("HTTP-03.16", "discovery-frame-per-instance"),
+    ("HTTP-03.17", "bearer-bound-https-target"),
+    ("HTTP-03.18", "bearer-not-forwarded-cross-target"),
+    ("HTTP-03.19", "bearer-never-cleartext"),
+    ("HTTP-03.20", "bearer-token-bytes"),
+    ("HTTP-03.21", "credential-redaction"),
+    ("HTTP-03.22", "redirect-rejected-no-replay"),
+    ("HTTP-03.23", "endpoint-instance-partition"),
+    ("HTTP-03.24", "security-partition-identity"),
+    ("HTTP-03.25", "configuration-generation-identity"),
+    ("HTTP-03.26", "no-downgrade-status-body-matrix"),
+];
+
+/// Refuses to evaluate a case whose producer-declared name does not match the
+/// subject this evaluator's predicate for that ID actually observes.
+fn assert_predicate_matches_declared_case(case: &ManifestCase) {
+    let expected = PREDICATE_SUBJECTS
+        .iter()
+        .find(|(id, _)| *id == case.id)
+        .map(|(_, subject)| *subject)
+        .unwrap_or_else(|| panic!("no registered predicate subject for {}", case.id));
+    assert_eq!(
+        case.name, expected,
+        "SEMANTIC MISMATCH on {}: the producer manifest declares this case as `{}`, but this \
+         join's predicate for that ID observes `{}`. The floor gate cannot catch this - the \
+         producer took its floor from this evaluator's own observation counts, so the numbers \
+         agree while the meanings do not. Running anyway would record a receipt claiming `{}` \
+         was proved when it was never exercised. Either the producer renumbers, or this join \
+         grows a predicate for `{}`; nothing may be recorded until one of those happens.",
+        case.id, case.name, expected, case.name, case.name
+    );
+}
+
 /// Evaluates the full ordered join. `plant_case_11` changes exactly one
 /// variable across the whole evaluation.
 fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
@@ -1120,6 +1183,7 @@ fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
 
     let mut cases = Vec::with_capacity(manifest.cases.len());
     for declared in &manifest.cases {
+        assert_predicate_matches_declared_case(declared);
         let mut builder = CaseBuilder::new();
         match declared.id.as_str() {
             "HTTP-03.01" => case_post_route(&mut builder, &wire),

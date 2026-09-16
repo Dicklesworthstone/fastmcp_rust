@@ -157,12 +157,48 @@ mod trust_std {
     const MAX_ABSOLUTE_PATH_BYTES: usize = 4096;
     const MAX_ABSOLUTE_PATH_COMPONENT_BYTES: usize = 255;
     const MAX_ABSOLUTE_PATH_DEPTH: usize = 64;
+    /// Entries that may vanish between `read_dir` and their stat, per directory.
+    ///
+    /// A DESIGN LIMIT, not a measurement: nothing in the repository can make it
+    /// wrong, so it does not rot. It exists so that tolerating the unavoidable
+    /// enumerate-then-unlink race cannot degrade into silently scanning nothing.
+    const MAX_VANISHED_SCAN_ENTRIES: usize = 64;
     const MAX_RELATIVE_PATH_BYTES: usize = 240;
     const MAX_RELATIVE_PATH_COMPONENT_BYTES: usize = 100;
     const MAX_RELATIVE_PATH_DEPTH: usize = 8;
 
     pub const AUTHORING_PATHS: [&str; 3] = ["evidence/fnd-01/dependency-verification.toml", "crates/fastmcp/tests/fnd_01_dependency_evidence.rs", "crates/fastmcp/examples/fnd_01_evidence_harness.rs"];
     const AUTHORING_LIMITS: [u64; 3] = [MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, MAX_HARNESS_BYTES];
+
+    /// Stable diagnostic raised when the policy's declared authoring set and
+    /// the verifier's bound [`AUTHORING_PATHS`] disagree.
+    pub const E_AUTHORING_ORDERED_PATHS: &str = "E_AUTHORING_ORDERED_PATHS";
+
+    /// Fails closed unless `declared` equals [`AUTHORING_PATHS`] exactly: same
+    /// element count, same order, same bytes.
+    ///
+    /// `declared` is taken as a parameter rather than re-read inside, so that a
+    /// caller can present a mutated declaration. An equality check that derived
+    /// both sides from [`AUTHORING_PATHS`] would be anchored to the constant
+    /// under test and could never fail (RH-5); the compiled constant is the
+    /// expectation here, and the policy's declaration is the input.
+    pub fn admit_authoring_ordered_paths(declared: &[String]) -> TrustResult<()> {
+        if declared.len() != AUTHORING_PATHS.len() {
+            return Err(TrustError::new(
+                E_AUTHORING_ORDERED_PATHS,
+                format!("policy declares {} authoring paths, verifier binds {}", declared.len(), AUTHORING_PATHS.len()),
+            ));
+        }
+        for (index, (declared_path, bound_path)) in declared.iter().zip(AUTHORING_PATHS.iter().copied()).enumerate() {
+            if declared_path.as_str() != bound_path {
+                return Err(TrustError::new(
+                    E_AUTHORING_ORDERED_PATHS,
+                    format!("ordered_paths[{index}]: policy declares {declared_path:?}, verifier binds {bound_path:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
     pub const INTEGRATION_SEAL_PATHS: [&str; 5] = [
         "Cargo.lock",
         "evidence/fnd-01/integration/source-snapshot.toml",
@@ -1562,6 +1598,8 @@ mod trust_std {
             return Err(TrustError::new("E_SPACE_FILE_TYPE", format!("{subject}: {} is not a no-follow directory", current.display())));
         }
         let before = linux_identity(&before_metadata, subject)?;
+        // Bounded per directory: see the NotFound arm on the per-entry stat.
+        let mut vanished_entries = 0_usize;
         for entry in fs::read_dir(current).map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", current.display())))? {
             let entry = entry.map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", current.display())))?;
             let name = entry.file_name().into_string().map_err(|_| TrustError::new("E_SPACE_ROOT", format!("{subject}: non-UTF-8 filesystem entry")))?;
@@ -1569,7 +1607,41 @@ mod trust_std {
                 return Err(TrustError::new("E_SPACE_ROOT", format!("{subject}: invalid filesystem entry {name:?}")));
             }
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", path.display())))?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // The entry was enumerated by `read_dir` and then unlinked
+                // before it could be stat'd. That is a race against the
+                // filesystem, not a scan failure, and it is unavoidable for any
+                // directory whose contents can change - `/proc/self/fd` merely
+                // makes it reproducible, because a descriptor closing between
+                // the listing and the stat removes its symlink.
+                //
+                // Only a VANISHED entry is benign. An entry that still exists
+                // but cannot be read - EACCES, EIO, ELOOP - is a genuine scan
+                // failure and still fails closed below, so this does not make
+                // the scanner blanket-tolerant of unreadable entries. That is
+                // the same distinction `resolve_missing_root_ancestor` already
+                // draws for a missing root; this applies it one level deeper.
+                //
+                // Vanishes are bounded so a pathologically churning directory
+                // cannot silently reduce this to scanning nothing.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    vanished_entries = vanished_entries.saturating_add(1);
+                    if vanished_entries > MAX_VANISHED_SCAN_ENTRIES {
+                        return Err(TrustError::new(
+                            "E_SPACE_SCAN",
+                            format!(
+                                "{subject}: {vanished_entries} entries vanished while enumerating {}",
+                                current.display()
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", path.display())));
+                }
+            };
             let file_type = metadata.file_type();
             *usage = usage.checked_projected(FilesystemUsage { entry_count: 1, regular_file_bytes: 0 }, cap, subject)?;
             if file_type.is_symlink() {
@@ -2504,7 +2576,21 @@ mod trust_std {
             return Err(TrustError::new("E_FILE_BOUND", format!("{subject}: {} > {maximum_bytes}", pre_metadata.len())));
         }
         if expected.is_some_and(|binding| binding.byte_length != pre_metadata.len()) {
-            return Err(TrustError::new("E_FILE_LENGTH", format!("{subject}: marker length mismatch")));
+            // "marker length mismatch" told the reader that two numbers differed without
+            // telling them either number, and this refusal propagates upward wrapped as a
+            // higher-level code - so the reader meets it far from here with no way to
+            // recover the values short of reading this function. Where the marker's drift
+            // is itself the subject of a re-attest decision, expected-vs-actual is the
+            // difference between a decision that can be made and one that cannot.
+            //
+            // `expected` is Copy and the guard already proved it Some; the placeholder arm
+            // is unreachable and is written as text rather than a sentinel number so it can
+            // never be mistaken for a real recorded length.
+            let recorded = expected.map_or_else(|| "<unbound>".to_owned(), |binding| binding.byte_length.to_string());
+            return Err(TrustError::new(
+                "E_FILE_LENGTH",
+                format!("{subject}: marker length mismatch: contract {recorded}, on disk {}", pre_metadata.len()),
+            ));
         }
 
         hook.at(SnapshotStage::PreOpen, &path)?;
@@ -20377,6 +20463,19 @@ mod ordinary {
     const POLICY_SCHEMA_VERSION: u32 = 2;
     const RECEIPT_SCHEMA_VERSION: u32 = 2;
     const EXPECTED_SOURCE_FILES: usize = 71;
+    /// Aggregate byte length of the `EXPECTED_SOURCE_FILES` recorded inputs.
+    ///
+    /// This is a MEASUREMENT of mutable repository content, not a declared
+    /// design limit, so any byte that changes in any recorded source input
+    /// invalidates it. It is named rather than written inline at its one
+    /// comparison site precisely because it has rotted once already: the
+    /// cascade at `152a030b` rustfmt'd a probe (+47 bytes), updated the
+    /// evidence document and its row, and walked past the bare literal in the
+    /// verifier, leaving `3024805` against a document declaring `3024852`
+    /// until `1cbb77a2`. Six sibling measurements below were named and
+    /// survived the same cascade. Keep every measurement named and treat this
+    /// block as the cascade checklist.
+    const EXPECTED_SOURCE_INPUT_TOTAL_BYTES: u64 = 3_024_852;
     const EXPECTED_NEGATIVES: usize = 188;
     const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
     const MUTATION_RECIPE_CANONICAL_SHA256: &str = "609f0ce94ad6403a3324f1afd705f641573469a833fd3271e84b0647e86f2f5a";
@@ -20422,8 +20521,16 @@ mod ordinary {
     const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
     const HARD_MAX_POLICY_BYTES: u64 = 4 * 1024 * 1024;
     const MAX_CAMPAIGN_ISSUES_JSONL_BYTES: usize = 32 * 1024 * 1024;
-    const CAMPAIGN_PROOF_FIELD_COUNT: usize = 580;
-    const CAMPAIGN_PROOF_FIELD_SHA256: &str = "6940feeb5211f2aa35c64178b6cb376cb3d26b8ad4d5043bbefb10d16ca8c3d8";
+    // The frozen contract fixture the reality proofs evaluate. It deliberately
+    // does NOT measure `.beads/issues.jsonl`: that file is campaign-mutable, and
+    // the extractor skips any bead whose status is `closed` or `tombstone`, so a
+    // constant measuring it is a function of which beads happen to be closed and
+    // moves on every close, reopen and tombstone. Under the campaign rule that a
+    // frozen constant measuring mutable content will rot, these two describe a
+    // checked-in fixture instead, which cannot.
+    const CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD: &str = "fnd01-fixture-contract-bead";
+    const CAMPAIGN_PROOF_FIXTURE_CLOSED_BEAD: &str = "fnd01-fixture-closed-bead";
+    const CAMPAIGN_PROOF_FIXTURE_UNCONTRACTED_BEAD: &str = "fnd01-fixture-uncontracted-bead";
     const CAMPAIGN_PROOF_CONTROL_BEAD: &str = "bd-rebase-proof-toolchain-vjd8z";
     const CAMPAIGN_PROOF_NEGATIVE_MARKER: &str = "REALITY-PROOF-NEGATIVE:";
     const CAMPAIGN_PROOF_CHECKLIST_PREFIXES: [&str; 3] = ["- [ ] ", "- [x] ", "- [X] "];
@@ -20462,7 +20569,19 @@ mod ordinary {
     const ACQUISITION_SPARSE_CONFIG_PATH: &str = "registry/index/index.crates.io-1949cf8c6b5b557f/config.json";
     const BOOTSTRAP_MANIFEST_BYTES: u64 = 7_329;
     const BOOTSTRAP_MANIFEST_SHA256: &str = "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
-    const SOURCE_TREE_SHA256: &str = "e9b5deb6d83e3a26b872a1c91074a1021337c3daa66e6beea06cff84bb9b98d0";
+    /// FND01TREEv1 digest over the `EXPECTED_SOURCE_FILES` recorded inputs.
+    ///
+    /// MEASUREMENT of mutable repository content, so it rots whenever any
+    /// recorded source input changes by a byte; keep it on the cascade
+    /// checklist beside `EXPECTED_SOURCE_INPUT_TOTAL_BYTES`. Recomputed from
+    /// disk on 2026-09-16 using this document's own declared encoding —
+    /// records sorted by ascending raw path bytes, each
+    /// `u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)`,
+    /// no domain prefix — over all 71 inputs. That computation reproduces the
+    /// value below and the value the evidence document declares, while the
+    /// previous constant `e9b5deb6…` reproduced neither.
+    const SOURCE_TREE_SHA256: &str =
+        "55894c036799775f108593af84d8bd8ed9971e6ec77df54e901d9aabb9c47f45";
     const NEGATIVE_INVENTORY_SHA256: &str = "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
     const POLICY_OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.14";
@@ -23988,6 +24107,42 @@ activate = 1\n";
         toml::from_str(text).map_err(|_| Diagnostic::error("E_TOML_SCHEMA", subject).at("strict typed parse"))
     }
 
+    /// Decodes `[authoring_closure_contract] ordered_paths` from the policy.
+    ///
+    /// This is the row the authoring closure preimage is *defined* over, and
+    /// until it was consumed here it had zero readers anywhere in the
+    /// workspace: the authoritative input set was declared twice, once in the
+    /// policy and once as the compiled `trust_std::AUTHORING_PATHS`, with
+    /// nothing reconciling the two copies.
+    ///
+    /// It deliberately uses `parse_toml_strict`, the same reader `read_policy`
+    /// uses for this document. The canonical-envelope reader in `trust_std`
+    /// exists for machine-generated receipts and refuses a leading comment by
+    /// design; `dependency-verification.toml` is hand-authored and opens with a
+    /// comment header, so it is not in that file class. The strict receipt
+    /// reader is left untouched rather than relaxed to admit comments.
+    fn declared_authoring_ordered_paths(policy_bytes: &[u8]) -> VResult<Vec<String>> {
+        let relative = "evidence/fnd-01/dependency-verification.toml";
+        let document: toml::Value = parse_toml_strict(policy_bytes, relative)?;
+        let contract = document
+            .get("authoring_closure_contract")
+            .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("authoring_closure_contract"))?;
+        let rows = contract
+            .get("ordered_paths")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths"))?;
+        if rows.is_empty() {
+            return Err(Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths is empty"));
+        }
+        rows.iter()
+            .map(|row| {
+                row.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths element is not a string"))
+            })
+            .collect()
+    }
+
     fn parse_toml_document(text: &str, subject: &str) -> VResult<toml::Value> {
         toml::from_str(text).map_err(|_| Diagnostic::error("E_TOML_SYNTAX", subject))
     }
@@ -25849,27 +26004,57 @@ activate = 1\n";
     }
 
     fn validate_policy_shape(policy: &Policy) -> VResult<()> {
-        if policy.format != "fastmcp-fnd-01-dependency-verification-v2"
-            || policy.schema_version != POLICY_SCHEMA_VERSION
-            || policy.policy_id != "FND-01/dependency-verification"
-            || policy.protocol_version != "2026-07-28"
-            || policy.recorded_on != "2026-07-30"
-            || policy.hash_algorithm != "sha256"
-            || policy.authoring_bead != POLICY_OWNER
-            || policy.integration_producer_bead != INTEGRATION_PRODUCER
-            || policy.final_attester_bead != FINAL_ATTESTER
-            || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3024805
-            || policy.negative_case_count != EXPECTED_NEGATIVES
-            || policy.derived_output_count != EXPECTED_RECEIPTS
-            || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
-            || policy.derived_binary_count != EXPECTED_RECEIPT_BINARIES
-            || policy.derived_direct_parent_edge_count != EXPECTED_DIRECT_PARENT_EDGES
-            || !policy.deny_unknown_policy_fields
-            || !policy.deny_unknown_receipt_fields
-            || policy.aggregate_support_claimed
-        {
-            return Err(Diagnostic::error("E_POLICY_IDENTITY", &policy.policy_id).at("format/version/identity/cardinality"));
+        // Nineteen clauses fused by `||` produced one refusal reading
+        // "format/version/identity/cardinality" - four category words for nineteen
+        // distinct facts, so a reader still had to open this file to learn which one
+        // moved. The chain below holds exactly the same nineteen clauses in the same
+        // order, with no second predicate list to drift out of step, and names the
+        // divergent field plus both sides. Six of these compare a frozen MEASUREMENT
+        // of mutable content; those are precisely the ones that rot, and precisely the
+        // ones whose two sides a reader needs to see.
+        let identity_divergence: Option<String> = if policy.format != "fastmcp-fnd-01-dependency-verification-v2" {
+            Some(format!("format: document {}, contract fastmcp-fnd-01-dependency-verification-v2", policy.format))
+        } else if policy.schema_version != POLICY_SCHEMA_VERSION {
+            Some(format!("schema_version: document {}, contract {POLICY_SCHEMA_VERSION}", policy.schema_version))
+        } else if policy.policy_id != "FND-01/dependency-verification" {
+            Some(format!("policy_id: document {}, contract FND-01/dependency-verification", policy.policy_id))
+        } else if policy.protocol_version != "2026-07-28" {
+            Some(format!("protocol_version: document {}, contract 2026-07-28", policy.protocol_version))
+        } else if policy.recorded_on != "2026-07-30" {
+            Some(format!("recorded_on: document {}, contract 2026-07-30", policy.recorded_on))
+        } else if policy.hash_algorithm != "sha256" {
+            Some(format!("hash_algorithm: document {}, contract sha256", policy.hash_algorithm))
+        } else if policy.authoring_bead != POLICY_OWNER {
+            Some(format!("authoring_bead: document {}, contract {POLICY_OWNER}", policy.authoring_bead))
+        } else if policy.integration_producer_bead != INTEGRATION_PRODUCER {
+            Some(format!("integration_producer_bead: document {}, contract {INTEGRATION_PRODUCER}", policy.integration_producer_bead))
+        } else if policy.final_attester_bead != FINAL_ATTESTER {
+            Some(format!("final_attester_bead: document {}, contract {FINAL_ATTESTER}", policy.final_attester_bead))
+        } else if policy.source_input_count != EXPECTED_SOURCE_FILES {
+            Some(format!("source_input_count: document {}, contract {EXPECTED_SOURCE_FILES}", policy.source_input_count))
+        } else if policy.source_input_total_bytes != EXPECTED_SOURCE_INPUT_TOTAL_BYTES {
+            Some(format!("source_input_total_bytes: document {}, contract {EXPECTED_SOURCE_INPUT_TOTAL_BYTES}", policy.source_input_total_bytes))
+        } else if policy.negative_case_count != EXPECTED_NEGATIVES {
+            Some(format!("negative_case_count: document {}, contract {EXPECTED_NEGATIVES}", policy.negative_case_count))
+        } else if policy.derived_output_count != EXPECTED_RECEIPTS {
+            Some(format!("derived_output_count: document {}, contract {EXPECTED_RECEIPTS}", policy.derived_output_count))
+        } else if policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS {
+            Some(format!("derived_toml_count: document {}, contract {EXPECTED_RECEIPT_TOMLS}", policy.derived_toml_count))
+        } else if policy.derived_binary_count != EXPECTED_RECEIPT_BINARIES {
+            Some(format!("derived_binary_count: document {}, contract {EXPECTED_RECEIPT_BINARIES}", policy.derived_binary_count))
+        } else if policy.derived_direct_parent_edge_count != EXPECTED_DIRECT_PARENT_EDGES {
+            Some(format!("derived_direct_parent_edge_count: document {}, contract {EXPECTED_DIRECT_PARENT_EDGES}", policy.derived_direct_parent_edge_count))
+        } else if !policy.deny_unknown_policy_fields {
+            Some("deny_unknown_policy_fields: document false, contract requires true".to_owned())
+        } else if !policy.deny_unknown_receipt_fields {
+            Some("deny_unknown_receipt_fields: document false, contract requires true".to_owned())
+        } else if policy.aggregate_support_claimed {
+            Some("aggregate_support_claimed: document true, contract requires false".to_owned())
+        } else {
+            None
+        };
+        if let Some(divergence) = identity_divergence {
+            return Err(Diagnostic::error("E_POLICY_IDENTITY", &policy.policy_id).at(divergence));
         }
         if policy.paths.repository_root_resolution
             != "ordinary no-argument read-only verifier mode uses compile-time CARGO_MANIFEST_DIR for crates/fastmcp followed by exactly two parent() operations and never reads current_dir. Produce, Attest, Gate, and ordinary same-PID handoff role entry instead require argv[2] literal dot, call current_dir exactly once, and validate that absolute physical no-symlink directory as the remote synchronized repository root; PWD, canonicalization, environment-selected roots, and ancestor discovery are forbidden in every mode"
@@ -26006,28 +26191,55 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_POLICY_BOUNDS", &policy.policy_id));
         }
-        if policy.source_tree.format != "FND01TREEv1"
-            || policy.source_tree.path_scope != "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
-            || policy.source_tree.ordering != "ascending raw path bytes"
-            || policy.source_tree.record_encoding != "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
-            || policy.source_tree.domain_prefix != "none"
-            || policy.source_tree.file_count != EXPECTED_SOURCE_FILES
-            || policy.source_tree.total_bytes != policy.source_input_total_bytes
-            || policy.source_tree.sha256 != SOURCE_TREE_SHA256
-            || !string_sequence_is(
-                &policy.source_tree.excluded_exact_paths,
-                &[
-                    "evidence/fnd-01/dependency-verification.toml",
-                    "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
-                    "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
-                    "evidence/fnd-01/final-attestation.toml",
-                    "evidence/fnd-01/vendor/apps/whatwg-html-source",
-                ],
-            )
-            || policy.source_tree.excluded_exact_directory != "evidence/fnd-01/integration"
-            || policy.source_tree.wildcard_exclusions_allowed
+        // An `||` chain can only report THAT something diverged, never WHICH
+        // clause did. This gate previously failed closed with an empty detail
+        // field, so acting on it required reading this source - the same tax
+        // that let these contracts rot unnoticed. The `else if` chain below
+        // holds exactly the same clauses in the same order and additionally
+        // names the first one that diverged, with no second list to drift out
+        // of step with the first.
+        let source_tree_divergence: Option<&'static str> = if policy.source_tree.format
+            != "FND01TREEv1"
         {
-            return Err(Diagnostic::error("E_SOURCE_TREE_CONTRACT", &policy.policy_id));
+            Some("source_tree.format")
+        } else if policy.source_tree.path_scope
+            != "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
+        {
+            Some("source_tree.path_scope")
+        } else if policy.source_tree.ordering != "ascending raw path bytes" {
+            Some("source_tree.ordering")
+        } else if policy.source_tree.record_encoding
+            != "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
+        {
+            Some("source_tree.record_encoding")
+        } else if policy.source_tree.domain_prefix != "none" {
+            Some("source_tree.domain_prefix")
+        } else if policy.source_tree.file_count != EXPECTED_SOURCE_FILES {
+            Some("source_tree.file_count")
+        } else if policy.source_tree.total_bytes != policy.source_input_total_bytes {
+            Some("source_tree.total_bytes")
+        } else if policy.source_tree.sha256 != SOURCE_TREE_SHA256 {
+            Some("source_tree.sha256")
+        } else if !string_sequence_is(
+            &policy.source_tree.excluded_exact_paths,
+            &[
+                "evidence/fnd-01/dependency-verification.toml",
+                "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
+                "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
+                "evidence/fnd-01/final-attestation.toml",
+                "evidence/fnd-01/vendor/apps/whatwg-html-source",
+            ],
+        ) {
+            Some("source_tree.excluded_exact_paths")
+        } else if policy.source_tree.excluded_exact_directory != "evidence/fnd-01/integration" {
+            Some("source_tree.excluded_exact_directory")
+        } else if policy.source_tree.wildcard_exclusions_allowed {
+            Some("source_tree.wildcard_exclusions_allowed")
+        } else {
+            None
+        };
+        if let Some(field) = source_tree_divergence {
+            return Err(Diagnostic::error("E_SOURCE_TREE_CONTRACT", &policy.policy_id).at(field));
         }
         validate_sha256(&policy.source_tree.sha256, "source tree SHA-256")?;
         if !policy.source_input_contract.all_rows_bytes_available
@@ -31335,18 +31547,54 @@ activate = 1\n";
         let table = value.as_table().ok_or_else(|| Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at("root declaration must be an inline/table declaration"))?;
         let expected_fields = ["default-features", "features", "optional", "version"].into_iter().collect::<BTreeSet<_>>();
         let actual_fields = table.keys().map(String::as_str).collect::<BTreeSet<_>>();
-        if actual_fields != expected_fields
-            || table.get("version").and_then(toml::Value::as_str) != Some(rule.version.as_str())
-            || table.get("default-features").and_then(toml::Value::as_bool)
-                != match rule.declaration_default_features.as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                }
-            || string_array_value(table.get("features"), subject, "features")? != rule.declaration_features
-            || table.get("optional").and_then(toml::Value::as_bool) != Some(rule.optional)
+        // An `||` chain can only report THAT the declaration diverged, never WHICH clause
+        // did, and `.at(&rule.id)` named only the rule - so acting on a refusal meant
+        // reading this source, the same tax that let these contracts rot unnoticed. The
+        // chain below holds exactly the same five clauses in the same order, with no second
+        // predicate list to drift out of step with the first, and additionally names the
+        // divergent field and both sides of it.
+        //
+        // `string_array_value` is deliberately still evaluated lazily, in clause-4 position:
+        // hoisting it above the chain would run its `?` even when clauses 1-3 diverge, which
+        // would change which diagnostic a caller sees. Order here is behaviour, not style.
+        let declaration_divergence: Option<String> = if actual_fields != expected_fields {
+            let missing = expected_fields.difference(&actual_fields).copied().collect::<Vec<_>>();
+            let unexpected = actual_fields.difference(&expected_fields).copied().collect::<Vec<_>>();
+            Some(format!("declaration field set: missing {missing:?}, unexpected {unexpected:?}"))
+        } else if table.get("version").and_then(toml::Value::as_str) != Some(rule.version.as_str()) {
+            Some(format!(
+                "version: contract {}, manifest {}",
+                rule.version,
+                table.get("version").and_then(toml::Value::as_str).unwrap_or("<absent>")
+            ))
+        } else if table.get("default-features").and_then(toml::Value::as_bool)
+            != match rule.declaration_default_features.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
         {
-            return Err(Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at(&rule.id));
+            Some(format!(
+                "default-features: contract {}, manifest {:?}",
+                rule.declaration_default_features,
+                table.get("default-features").and_then(toml::Value::as_bool)
+            ))
+        } else {
+            let manifest_features = string_array_value(table.get("features"), subject, "features")?;
+            if manifest_features != rule.declaration_features {
+                Some(format!("features: contract {:?}, manifest {manifest_features:?}", rule.declaration_features))
+            } else if table.get("optional").and_then(toml::Value::as_bool) != Some(rule.optional) {
+                Some(format!(
+                    "optional: contract {}, manifest {:?}",
+                    rule.optional,
+                    table.get("optional").and_then(toml::Value::as_bool)
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(divergence) = declaration_divergence {
+            return Err(Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at(format!("{}: {divergence}", rule.id)));
         }
         effective_dependency_declaration(value, subject)
     }
@@ -49970,24 +50218,53 @@ activate = 1\n";
         }
         for (file, (id, path, kind, bytes, digest)) in actual.iter().zip(TOOLCHAIN_SOURCE_INPUTS) {
             let contract = &file.contract;
-            if contract.id != id
-                || contract.path != path
-                || contract.family != "toolchain"
-                || contract.owner_bead != OWNER
-                || contract.parse_kind != kind
-                || contract.observation_kind != ObservationKind::LocalFile
-                || contract.byte_length != bytes
-                || contract.sha256 != digest
-                || !contract.bytes_available
-                || contract.rehash_mode != "exact_local"
-                || contract.claim_ceiling != "local-byte-proof"
-                || !contract.required
-                || !contract.source_tree_member
-                || file.bytes.len() as u64 != bytes
-                || file.digest != sha256(&file.bytes)
-                || lower_hex(&file.digest) != digest
-            {
-                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at(path));
+            // Sixteen clauses fused by `||` behind an `.at(path)` that looks informative:
+            // it named WHICH FILE diverged but never WHICH OF SIXTEEN properties, so
+            // "byte_length drifted" and "the bytes on disk no longer hash to the recorded
+            // digest" were the same output. The chain below holds exactly the same sixteen
+            // clauses in the same order and keeps the path, adding only the property and
+            // both sides.
+            let file_divergence: Option<String> = if contract.id != id {
+                Some(format!("id: document {}, contract {id}", contract.id))
+            } else if contract.path != path {
+                Some(format!("path: document {}, contract {path}", contract.path))
+            } else if contract.family != "toolchain" {
+                Some(format!("family: document {}, contract toolchain", contract.family))
+            } else if contract.owner_bead != OWNER {
+                Some(format!("owner_bead: document {}, contract {OWNER}", contract.owner_bead))
+            } else if contract.parse_kind != kind {
+                Some(format!("parse_kind: document {:?}, contract {kind:?}", contract.parse_kind))
+            } else if contract.observation_kind != ObservationKind::LocalFile {
+                Some(format!("observation_kind: document {:?}, contract LocalFile", contract.observation_kind))
+            } else if contract.byte_length != bytes {
+                Some(format!("byte_length: document {}, contract {bytes}", contract.byte_length))
+            } else if contract.sha256 != digest {
+                Some(format!("sha256: document {}, contract {digest}", contract.sha256))
+            } else if !contract.bytes_available {
+                Some("bytes_available: document false, contract requires true".to_owned())
+            } else if contract.rehash_mode != "exact_local" {
+                Some(format!("rehash_mode: document {}, contract exact_local", contract.rehash_mode))
+            } else if contract.claim_ceiling != "local-byte-proof" {
+                Some(format!("claim_ceiling: document {}, contract local-byte-proof", contract.claim_ceiling))
+            } else if !contract.required {
+                Some("required: document false, contract requires true".to_owned())
+            } else if !contract.source_tree_member {
+                Some("source_tree_member: document false, contract requires true".to_owned())
+            } else if file.bytes.len() as u64 != bytes {
+                Some(format!("on-disk length: observed {}, contract {bytes}", file.bytes.len()))
+            } else if file.digest != sha256(&file.bytes) {
+                Some(format!(
+                    "on-disk digest: recorded {}, recomputed {}",
+                    lower_hex(&file.digest),
+                    lower_hex(&sha256(&file.bytes))
+                ))
+            } else if lower_hex(&file.digest) != digest {
+                Some(format!("on-disk digest: observed {}, contract {digest}", lower_hex(&file.digest)))
+            } else {
+                None
+            };
+            if let Some(divergence) = file_divergence {
+                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at(format!("{path}: {divergence}")));
             }
         }
         let (tree, bytes) = source_tree_digest_refs(&actual)?;
@@ -50453,6 +50730,16 @@ activate = 1\n";
         }
 
         validate_media_dependency_bundle(&media_dependency_bundle(files)?, files, policy)?;
+
+        // The state-capability bundle is admitted through the same ordinary
+        // verifier path as the media bundle above, not only by its own two
+        // tests. A validator reachable solely from the tests that assert it
+        // proves the test build rather than the verifier's admitted-source
+        // decision, which is what bd-mcp-2026-07-28-support-ahet.1.13's
+        // acceptance means by the "ordinary run_verifier proof". The bundle is
+        // built from the same `root` and `files` the tests use, so this adds no
+        // new source authority.
+        validate_state_capability_bundle(&state_capability_bundle(root, files)?)?;
 
         let auth = parse_source_toml(files, "evidence/fnd-01/auth-standards.toml")?;
         validate_auth_sources(&auth)?;
@@ -51155,8 +51442,47 @@ activate = 1\n";
         }
     }
 
-    fn campaign_issues_jsonl_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(".beads/issues.jsonl")
+    /// Builds the frozen campaign-contract fixture the reality proofs evaluate.
+    ///
+    /// This replaces a live read of `.beads/issues.jsonl`. It is strictly more
+    /// discriminating than that read was: the live file proved only that
+    /// whatever beads happened to be open hashed to some value, whereas this
+    /// fixture exercises each distinct extractor path by construction -
+    /// the control bead's positive and planted-negative lines, one ordinary
+    /// contributing contract, a `closed` bead that must be skipped, and an open
+    /// bead carrying no toolchain predicate that must contribute nothing.
+    ///
+    /// The closed bead deliberately names a superseded toolchain: if the skip
+    /// rule ever broke, this fixture fails loudly instead of silently counting
+    /// an extra field.
+    fn campaign_proof_contract_fixture(identity: &CampaignProofIdentity) -> Vec<u8> {
+        let negative_toolchains = [identity.toolchain.as_str(), SUPERSEDED_CAMPAIGN_TOOLCHAINS[0], SUPERSEDED_CAMPAIGN_TOOLCHAINS[1]];
+        let mut fixture = campaign_proof_control_fixture(identity, "open", "- [ ] ", CAMPAIGN_PROOF_NEGATIVE_MARKER, negative_toolchains, 1);
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(
+            CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD,
+            "open",
+            &format!("- [ ] Proof configuration is frozen in the batch receipt: toolchain {}; workspace target and platform", identity.toolchain),
+        ));
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(
+            CAMPAIGN_PROOF_FIXTURE_CLOSED_BEAD,
+            "closed",
+            &format!("- [x] Proof configuration used {} historically", SUPERSEDED_CAMPAIGN_TOOLCHAINS[0]),
+        ));
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(CAMPAIGN_PROOF_FIXTURE_UNCONTRACTED_BEAD, "open", "- [ ] This acceptance row declares no toolchain predicate at all"));
+        fixture
+    }
+
+    /// The exact field set the fixture must yield: the control bead and the one
+    /// ordinary contributing contract. The closed bead is skipped by status and
+    /// the uncontracted bead contributes no predicate, so neither appears.
+    ///
+    /// Written out explicitly rather than derived from the fixture, so the
+    /// expectation cannot drift with the subject it checks (RH-5).
+    fn campaign_proof_expected_fixture_fields() -> BTreeSet<String> {
+        let mut fields = BTreeSet::new();
+        assert!(fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
+        assert!(fields.insert(CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD.to_owned()));
+        fields
     }
 
     fn campaign_proof_issue_fixture(id: &str, status: &str, acceptance: &str) -> Vec<u8> {
@@ -51187,23 +51513,38 @@ activate = 1\n";
         let identity = canonical_campaign_proof_identity().verified();
         assert_eq!(identity.toolchain, "nightly-2026-08-25");
         assert_eq!(identity.rust_version, "1.100");
-        let live_path = campaign_issues_jsonl_path();
-        let issues = fs::read(&live_path).expect("read live campaign issues JSONL");
+        // The subject is a frozen fixture, not `.beads/issues.jsonl`. The live
+        // file is campaign-mutable and the extractor skips closed and tombstone
+        // beads, so evaluating it made this proof a function of which beads were
+        // closed at the moment it ran - it moved on every close, reopen and
+        // tombstone, and could not be attributed to any source commit.
+        //
+        // The property the test exists to prove is preserved and sharpened:
+        // `identity` is still read live from the checked-in pin below, and the
+        // fixture's contracts are still required to agree with it.
+        let expected_fields = campaign_proof_expected_fixture_fields();
+        let expected_field_sha256 = campaign_proof_field_sha256(&expected_fields);
+        let contracts = campaign_proof_contract_fixture(&identity);
         let inventory = validate_campaign_executable_toolchain_contracts(
-            &issues,
+            &contracts,
             &identity,
             ExpectedCampaignProofInventory {
-                field_count: CAMPAIGN_PROOF_FIELD_COUNT,
-                current_predicates: CAMPAIGN_PROOF_FIELD_COUNT,
+                field_count: expected_fields.len(),
+                current_predicates: expected_fields.len(),
                 planted_negative_fields: 1,
-                field_sha256: CAMPAIGN_PROOF_FIELD_SHA256,
+                field_sha256: &expected_field_sha256,
             },
         )
         .verified();
-        assert_eq!(inventory.fields.len(), CAMPAIGN_PROOF_FIELD_COUNT);
-        assert_eq!(inventory.current_predicates, CAMPAIGN_PROOF_FIELD_COUNT);
+        assert_eq!(inventory.fields, expected_fields, "only the control bead and the contributing contract may yield fields");
+        assert_eq!(inventory.current_predicates, expected_fields.len());
         assert_eq!(inventory.planted_negative_fields, 1);
-        assert_eq!(inventory.field_sha256, CAMPAIGN_PROOF_FIELD_SHA256);
+        assert_eq!(inventory.field_sha256, expected_field_sha256);
+
+        // The validator must not mutate its input. Proved against the fixture
+        // itself, which is the actual claim - the previous live re-read only
+        // showed that a read-only test had not written to the tracker.
+        assert_eq!(contracts, campaign_proof_contract_fixture(&identity), "contract evaluation must not mutate its input");
 
         let mut control_fields = BTreeSet::new();
         assert!(control_fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
@@ -51223,7 +51564,6 @@ activate = 1\n";
                 lifecycle_inventory = Some(observed);
             }
         }
-        assert_eq!(fs::read(live_path).expect("read live campaign state after lifecycle positives"), issues, "positive lifecycle evaluation must not mutate live state");
     }
 
     #[test]
@@ -51243,8 +51583,7 @@ activate = 1\n";
         )
         .verified();
 
-        let live_path = campaign_issues_jsonl_path();
-        let live_before = fs::read(&live_path).expect("read live campaign state before negatives");
+        let fixture_before = fixture.clone();
         for stale in SUPERSEDED_CAMPAIGN_TOOLCHAINS {
             let negative = fixture.replacen(&identity.toolchain, stale, 1);
             assert_eq!(negative.matches(stale).count(), 1);
@@ -51300,8 +51639,7 @@ activate = 1\n";
         assert_eq!(duplicate_error.code, "E_CAMPAIGN_PROOF_INVENTORY");
         assert_eq!(duplicate_error.subject, ".beads/issues.jsonl");
 
-        let live_after = fs::read(live_path).expect("read live campaign state after negatives");
-        assert_eq!(live_after, live_before, "negative evaluation must not mutate live state");
+        assert_eq!(fixture, fixture_before, "negative evaluation must not mutate its input");
     }
 
     #[test]
@@ -53229,8 +53567,8 @@ dependency_kinds = ["build", "normal"]
     #[test]
     fn authoring_closure_marker_round_trip() {
         use super::trust_std::{
-            AUTHORING_PATHS, AuthoringMarker, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, authoring_closure_preimage, encode_lower_hex, integration_seal_preimage, parse_authoring_marker,
-            parse_integration_seal,
+            AUTHORING_PATHS, AuthoringMarker, E_AUTHORING_ORDERED_PATHS, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, admit_authoring_ordered_paths, authoring_closure_preimage, encode_lower_hex,
+            integration_seal_preimage, parse_authoring_marker, parse_integration_seal,
         };
 
         let root = repository_root();
@@ -53265,6 +53603,57 @@ dependency_kinds = ["build", "normal"]
             ),
             "live marker must use the exact canonical grammar",
         );
+
+        // ------------------------------------------------------------------
+        // The policy's own declaration of the authoritative input set is read
+        // and enforced here. Before this it had zero readers in the workspace:
+        // `ordered_paths` and the compiled `AUTHORING_PATHS` declared the same
+        // three inputs independently, agreeing by care rather than by
+        // construction, so a divergence would have left this very test green
+        // while the policy named a different set than the one being frozen.
+        // ------------------------------------------------------------------
+        let policy_bytes = fs::read(root.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}"));
+        let declared_paths = declared_authoring_ordered_paths(&policy_bytes).unwrap_or_else(|diagnostic| panic!("policy must declare [authoring_closure_contract] ordered_paths: {}", diagnostic.stable()));
+        admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
+
+        // Planted negatives. The changed variable is one element of a COPY of
+        // the policy's declaration; `AUTHORING_PATHS` is never mutated, so a
+        // refusal cannot come from moving the expectation (RH-5).
+        let mut drifted_bytes = declared_paths.clone();
+        drifted_bytes[1].push_str(".bak");
+        assert_eq!(
+            admit_authoring_ordered_paths(&drifted_bytes).expect_err("a single changed path byte must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path byte drift",
+        );
+
+        let mut reordered = declared_paths.clone();
+        reordered.swap(0, 2);
+        assert_eq!(
+            admit_authoring_ordered_paths(&reordered).expect_err("a reordered declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path order drift",
+        );
+
+        let mut shortened = declared_paths.clone();
+        shortened.pop();
+        assert_eq!(
+            admit_authoring_ordered_paths(&shortened).expect_err("a short declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path count drift",
+        );
+
+        let mut extended = declared_paths.clone();
+        extended.push(AUTHORING_PATHS[0].to_owned());
+        assert_eq!(
+            admit_authoring_ordered_paths(&extended).expect_err("a long declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path surplus drift",
+        );
+
+        // Restored: the unmutated declaration is accepted again, so the four
+        // refusals above came from the mutation and not from a poisoned check.
+        admit_authoring_ordered_paths(&declared_paths).expect("the unmutated declaration must be accepted again");
 
         let mut marker = AuthoringMarker {
             policy: FileBinding { byte_length: 11, sha256: super::trust_std::sha256(b"policy").expect("frozen policy test hash") },
@@ -53530,11 +53919,20 @@ dependency_kinds = ["build", "normal"]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn authoring_freeze_rejects_owned_path_drift() {
-        use super::trust_std::{AUTHORING_PATHS, FileBinding, MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, SnapshotStage, TrustError, checked_snapshot_set_with_hook};
+        use super::trust_std::{
+            AUTHORING_PATHS, FileBinding, MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, SnapshotStage, TrustError, admit_authoring_ordered_paths, checked_snapshot_set_with_hook,
+        };
         use std::fs::OpenOptions;
 
         let repository = repository_root();
         let limits = [MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, MAX_HARNESS_BYTES];
+
+        // The set this test drifts is the set the policy declares. Enforce that
+        // agreement before exercising byte drift, so this test cannot pass by
+        // guarding a different three files than the policy names.
+        let declared_paths = declared_authoring_ordered_paths(&fs::read(repository.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}")))
+            .unwrap_or_else(|diagnostic| panic!("policy must declare ordered_paths: {}", diagnostic.stable()));
+        admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
         let copy_authoring_set = |namespace: &str| {
             let root = super::fresh_test_root(namespace);
             let mut expected = [FileBinding { byte_length: 0, sha256: [0; 32] }; 3];
@@ -56621,14 +57019,17 @@ original = "value"
         for (path, source) in &inventory.rust_sources {
             for (api, references) in STATE_PARTITION_RNG_SEALED_APIS.into_iter().zip(source.reference_counts.sealed_apis) {
                 if references != 0 && !state_partition_rng_sealed_api_is_allowlisted(path, api) {
-                    return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(path));
+                    // Naming the path alone forces the reader to re-derive WHICH of the five
+                    // sealed draws the file touched - a blame trace, on a 3.9MB source. `api`
+                    // is already bound by the enclosing loop; this only spends it.
+                    return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(format!("{path}: {api}")));
                 }
             }
         }
         for api in STATE_PARTITION_RNG_SEALED_APIS {
             let expected_references = usize::from(api == "draw_security_identifier");
             if state_partition_rng_sealed_api_reference_count(&state.tokens, api) != expected_references {
-                return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at("crates/fastmcp-core/src/state.rs"));
+                return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(format!("crates/fastmcp-core/src/state.rs: {api}")));
             }
         }
         for api in STATE_PARTITION_RNG_SEALED_APIS {
@@ -57341,7 +57742,16 @@ original = "value"
             state_partition_rng_replace_rust_source_text(sealed_api_state, sealed_api_state_text, api).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             assert_eq!(state_partition_rng_other_input_digest(&sealed_api_planted), baseline_other_input_digest, "{api} plant must not alter any non-state inventory input");
             let sealed_api_error = validate_state_partition_rng_seam(&sealed_api_planted).expect_err("each unallowlisted sealed API reference must fail closed");
-            assert_eq!(sealed_api_error.stable(), "FND01|Error|E_STATE_PARTITION_RNG_SEALED_API_OWNER|state-partition-rng|crates/fastmcp-core/src/state.rs", "{api}");
+            // Before the diagnostic named the API, all five plants expected one identical
+            // string and `{api}` was only a failure label - so this loop proved the gate
+            // fires without proving it fires for the RIGHT sealed draw, and would still
+            // have passed had the gate collapsed to a single hardcoded refusal. Binding the
+            // expectation to `api` makes each of the five rows distinguishable.
+            assert_eq!(
+                sealed_api_error.stable(),
+                format!("FND01|Error|E_STATE_PARTITION_RNG_SEALED_API_OWNER|state-partition-rng|crates/fastmcp-core/src/state.rs: {api}"),
+                "{api}"
+            );
             assert_fresh_baseline();
         }
 

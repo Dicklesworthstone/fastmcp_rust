@@ -341,40 +341,56 @@ fn http_03_b_planted_negative() {
     }
 }
 
-async fn execute_positive(cx: &Cx, case: ManifestCase) {
+/// One dispatched case body, erased onto the heap.
+///
+/// Every arm of the dispatchers below is boxed rather than awaited inline. An
+/// `async fn` containing a thirteen-arm match over thirteen distinct `.await`
+/// arms composes ONE state machine whose size is the sum of every arm's
+/// future — each of which here owns a `Peer`, request/response buffers and a
+/// nested `pair()` of two more futures. That aggregate overflowed the libtest
+/// thread's stack and aborted the process with SIGABRT, which produces no
+/// result row at all: `http_03_b_positive` crashed rather than failed.
+///
+/// Boxing keeps the match's own frame at one pointer and puts each arm's state
+/// machine on the heap, so the frame no longer grows when a case is added.
+/// Raising the stack would hide the same blowup and let it return silently with
+/// the next arm.
+type CaseFuture<'a> = std::pin::Pin<Box<dyn Future<Output = ()> + 'a>>;
+
+fn execute_positive(cx: &Cx, case: ManifestCase) -> CaseFuture<'_> {
     match case.group {
-        "HTTP-03.14" => positive_14_cancellation_closes_response(cx).await,
-        "HTTP-03.15" => positive_15_response_deadline(cx).await,
-        "HTTP-03.16" => positive_16_no_retry_no_replay(cx).await,
-        "HTTP-03.17" => positive_17_authorization_redaction(),
-        "HTTP-03.18" => positive_18_https_only_bearer_attachment(),
-        "HTTP-03.19" => positive_19_redirect_no_follow(cx).await,
-        "HTTP-03.20" => positive_20_discover_preclassification_frame(cx).await,
-        "HTTP-03.21" => positive_21_fresh_probe_identity(),
-        "HTTP-03.22" => positive_22_endpoint_key_partition(),
-        "HTTP-03.23" => positive_23_activation_proof_notification(cx).await,
-        "HTTP-03.24" => positive_24_independent_server_request(cx).await,
-        "HTTP-03.25" => positive_25_no_resumption_state(cx).await,
-        "HTTP-03.26" => positive_26_observation_table(cx).await,
+        "HTTP-03.14" => Box::pin(positive_14_cancellation_closes_response(cx)),
+        "HTTP-03.15" => Box::pin(positive_15_response_deadline(cx)),
+        "HTTP-03.16" => Box::pin(positive_16_no_retry_no_replay(cx)),
+        "HTTP-03.17" => Box::pin(async { positive_17_authorization_redaction() }),
+        "HTTP-03.18" => Box::pin(async { positive_18_https_only_bearer_attachment() }),
+        "HTTP-03.19" => Box::pin(positive_19_redirect_no_follow(cx)),
+        "HTTP-03.20" => Box::pin(positive_20_discover_preclassification_frame(cx)),
+        "HTTP-03.21" => Box::pin(async { positive_21_fresh_probe_identity() }),
+        "HTTP-03.22" => Box::pin(async { positive_22_endpoint_key_partition() }),
+        "HTTP-03.23" => Box::pin(positive_23_activation_proof_notification(cx)),
+        "HTTP-03.24" => Box::pin(positive_24_independent_server_request(cx)),
+        "HTTP-03.25" => Box::pin(positive_25_no_resumption_state(cx)),
+        "HTTP-03.26" => Box::pin(positive_26_observation_table(cx)),
         group => panic!("positive case {group} is not mapped to an executable body"),
     }
 }
 
-async fn execute_negative(cx: &Cx, case: ManifestCase) {
+fn execute_negative(cx: &Cx, case: ManifestCase) -> CaseFuture<'_> {
     match case.group {
-        "HTTP-03.14" => negative_14_precancelled_dispatch(cx).await,
-        "HTTP-03.15" => negative_15_stalled_peer(cx).await,
-        "HTTP-03.16" => negative_16_midexchange_close(cx).await,
-        "HTTP-03.17" => negative_17_header_hostile_token(),
-        "HTTP-03.18" => negative_18_cleartext_resource(),
-        "HTTP-03.19" => negative_19_redirect_with_location(cx).await,
-        "HTTP-03.20" => negative_20_unrecognized_probe_body(),
-        "HTTP-03.21" => negative_21_second_probe_refused(),
-        "HTTP-03.22" => negative_22_one_key_field_differs(),
-        "HTTP-03.23" => negative_23_acknowledgement_with_content_type(cx).await,
-        "HTTP-03.24" => negative_24_duplicate_response_header(cx).await,
-        "HTTP-03.25" => negative_25_resumption_state_offered(cx).await,
-        "HTTP-03.26" => negative_26_legacy_only_probe_forbidden(),
+        "HTTP-03.14" => Box::pin(negative_14_precancelled_dispatch(cx)),
+        "HTTP-03.15" => Box::pin(negative_15_stalled_peer(cx)),
+        "HTTP-03.16" => Box::pin(negative_16_midexchange_close(cx)),
+        "HTTP-03.17" => Box::pin(async { negative_17_header_hostile_token() }),
+        "HTTP-03.18" => Box::pin(async { negative_18_cleartext_resource() }),
+        "HTTP-03.19" => Box::pin(negative_19_redirect_with_location(cx)),
+        "HTTP-03.20" => Box::pin(async { negative_20_unrecognized_probe_body() }),
+        "HTTP-03.21" => Box::pin(async { negative_21_second_probe_refused() }),
+        "HTTP-03.22" => Box::pin(async { negative_22_one_key_field_differs() }),
+        "HTTP-03.23" => Box::pin(negative_23_acknowledgement_with_content_type(cx)),
+        "HTTP-03.24" => Box::pin(negative_24_duplicate_response_header(cx)),
+        "HTTP-03.25" => Box::pin(negative_25_resumption_state_offered(cx)),
+        "HTTP-03.26" => Box::pin(async { negative_26_legacy_only_probe_forbidden() }),
         group => panic!("negative case {group} is not mapped to an executable body"),
     }
 }
@@ -382,6 +398,21 @@ async fn execute_negative(cx: &Cx, case: ManifestCase) {
 // ---------------------------------------------------------------------------
 // Loopback fixture
 // ---------------------------------------------------------------------------
+
+/// Per-case wall-clock ceiling.
+///
+/// This is deliberately not a generous "surely nothing takes this long" bound.
+/// Since each case gets its own runtime, the ceiling is paid **per case**, not
+/// per test: thirteen cases at a two-minute ceiling would let one target alone
+/// consume 1560s of a 1800s wave budget shared by 46 targets, so a single stuck
+/// case starves every other target instead of failing loudly.
+///
+/// Every case here is loopback and settles well under a second. The longest
+/// *intentional* wait in the whole target is the 1.5s peer stall in
+/// `negative_15_stalled_peer`, so twenty seconds leaves more than tenfold
+/// headroom over anything a healthy case does while capping the target at
+/// roughly 260s per test.
+const CASE_CEILING_NANOS: u64 = 20_000_000_000;
 
 /// Runs one case body on a real reactor under a bounded wall-clock ceiling.
 fn run(future: impl Future<Output = ()>) {
@@ -391,9 +422,12 @@ fn run(future: impl Future<Output = ()>) {
         .expect("the loopback runtime must build")
         .block_on(async {
             let cx = Cx::current().expect("block_on must install a current Cx");
-            asupersync::time::timeout_at(cx.now().saturating_add_nanos(120_000_000_000), future)
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(CASE_CEILING_NANOS), future)
                 .await
-                .expect("every HTTP-03 B case must settle within two minutes");
+                .expect(
+                    "every HTTP-03 B case must settle within its per-case ceiling; a case that \
+                     exceeds it is stuck, not slow, because all of them are loopback",
+                );
         });
 }
 

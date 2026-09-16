@@ -161,6 +161,11 @@ impl SubcaseOutcome {
     }
 
     /// Panics with the recorded failure when the subcase did not pass.
+    ///
+    /// `#[track_caller]` so the panic names the subcase entry point rather
+    /// than this helper; fifteen tests routing through one panic site would
+    /// otherwise all report the same line.
+    #[track_caller]
     fn assert_passed(&self) {
         assert!(
             self.passed,
