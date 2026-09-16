@@ -79,6 +79,32 @@ const CANONICAL_BASES: [(&str, &str); 4] = [
     ("error", CANONICAL_ERROR),
 ];
 
+// MEMBER ORDER: these bases are safe only because this target never encodes.
+//
+// Two deterministic orderings coexist in one JSON-RPC frame. A typed struct
+// with `#[derive(Serialize)]` emits in DECLARATION order, while an untyped
+// `serde_json::Value` map emits ALPHABETICALLY, because `preserve_order` is off
+// and `Map` is a `BTreeMap`. `params` and `result` contents are `Value` maps;
+// the envelopes are typed structs.
+//
+// The declaration orders are not the ones a hand-written fixture reaches for.
+// `id` is declared LAST in both envelopes, not second:
+//   JsonRpcRequest  { jsonrpc, method, params, id }   jsonrpc.rs:893-915
+//   JsonRpcResponse { jsonrpc, result, error, id }    jsonrpc.rs:1224-1232
+//   JsonRpcError    { code, message, data }           jsonrpc.rs:1012-1021
+//
+// Three of the four bases above put `id` second and so do NOT match declaration
+// order; only `notification` does. That is harmless here and only here: this
+// target is decode-only. It calls `admit_raw_jsonrpc_document` and
+// `decode_strict_jsonrpc_message` and never re-emits a frame, and member order
+// is irrelevant to decoding, so the divergence is unobservable by construction.
+//
+// It stops being unobservable the moment anyone adds an encoder — a byte-exact
+// round-trip assertion, a re-serialized expected value, a golden comparison.
+// Three of these four bases would then fail, and per the TST-01 A finding that
+// failure surfaces only on first execution. Add an encoder here and you must
+// re-order these literals to declaration order first.
+
 // ---------------------------------------------------------------------------
 // Refusal vocabulary
 // ---------------------------------------------------------------------------
