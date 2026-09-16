@@ -1,4 +1,4 @@
-//! Bounded OAuth discovery for preregistered native public clients (AUTH-03).
+//! Bounded OAuth discovery for native public clients (AUTH-03).
 //!
 //! Starting from a configured HTTPS MCP resource, fetch RFC 9728 protected
 //! resource metadata, select an explicitly trusted issuer in LOCAL preference
@@ -8,8 +8,10 @@
 //! Trust is never bootstrapped from peer URLs alone. The host must configure
 //! the resource and issuer allowlist; cross-origin authorization/token endpoints
 //! require an additional explicit origin grant. This is not arbitrary-issuer
-//! discovery, DNS/IP pinning, dynamic registration, signed-metadata verification,
-//! or OIDC identity authentication. OpenID locations supply OAuth metadata only.
+//! discovery, DNS/IP pinning, signed-metadata verification, or OIDC identity
+//! authentication. OpenID locations supply OAuth metadata only. Preregistered
+//! discovery never registers a client; the separate [`registration`] API owns
+//! explicit, single-attempt native-client registration.
 //! No discovery result is persistently cached and no credential is sent on GET.
 
 use std::collections::BTreeSet;
@@ -29,6 +31,9 @@ use serde::{Deserialize, Deserializer};
 
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+
+/// Explicit RFC 7591 native-public-client registration after trusted discovery.
+pub mod registration;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
@@ -109,6 +114,7 @@ impl TrustedOAuthIssuer {
     /// Allows a separately hosted login/token service. Pass an origin URL with
     /// path `/` and no query, fragment or credentials. It is never derived from
     /// the downloaded metadata. At most eight additional origins are admitted.
+    /// This does not authorize cross-origin client registration writes.
     pub fn with_endpoint_origin(mut self, origin: CanonicalHttpUrl) -> Result<Self, OAuthDiscoveryError> {
         validate_https(&origin).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
         let origin_text = origin_of(&origin);
@@ -123,7 +129,8 @@ impl TrustedOAuthIssuer {
     }
 
     /// Adds a private root for this issuer's metadata and subsequent token
-    /// exchanges. It does not grant resource-metadata or MCP-resource trust.
+    /// exchanges. Explicit registration also uses this selected issuer trust.
+    /// It does not grant resource-metadata or MCP-resource trust.
     pub fn with_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthDiscoveryError> {
         admit_root(&mut self.roots, root)?;
         Ok(self)
@@ -146,7 +153,9 @@ impl TrustedOAuthIssuer {
 pub struct OAuthDiscoveryPlan {
     resource: CanonicalHttpUrl,
     issuers: Vec<TrustedOAuthIssuer>,
-    client_id: String,
+    // None is internal to the explicit registration owner. A public discovery
+    // plan always has a real preregistered identity; no placeholder ID is sent.
+    client_id: Option<String>,
     scopes: Vec<String>,
     resource_roots: Vec<Certificate>,
     timeout: Duration,
@@ -157,6 +166,15 @@ impl OAuthDiscoveryPlan {
         resource: CanonicalHttpUrl,
         issuers: Vec<TrustedOAuthIssuer>,
         client_id: impl Into<String>,
+        scopes: Vec<String>,
+    ) -> Result<Self, OAuthDiscoveryError> {
+        Self::with_client_id(resource, issuers, Some(client_id.into()), scopes)
+    }
+
+    fn with_client_id(
+        resource: CanonicalHttpUrl,
+        issuers: Vec<TrustedOAuthIssuer>,
+        client_id: Option<String>,
         scopes: Vec<String>,
     ) -> Result<Self, OAuthDiscoveryError> {
         validate_https(&resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
@@ -173,9 +191,9 @@ impl OAuthDiscoveryPlan {
                 return Err(OAuthDiscoveryError::InvalidPolicy);
             }
         }
-        let client_id = client_id.into();
-        if client_id.is_empty() || client_id.len() > 1024 || client_id.chars().any(char::is_control)
-            || scopes.len() > 32 || scopes.iter().map(String::len).sum::<usize>() > 4096
+        if client_id.as_ref().is_some_and(|id| {
+            id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control)
+        }) || scopes.len() > 32 || scopes.iter().map(String::len).sum::<usize>() > 4096
         {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
@@ -214,7 +232,23 @@ impl OAuthDiscoveryPlan {
     /// mismatch, TLS failure, redirects, 401/403, or 5xx terminate discovery.
     /// An invalid selected issuer never causes a switch to a lower-priority one.
     pub async fn discover(&self, cx: &Cx) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        if self.client_id.is_none() {
+            return Err(OAuthDiscoveryError::InvalidPolicy);
+        }
         let deadline = discovery_deadline(cx, self.timeout)?;
+        let (issuer, body) = self.discover_issuer_document(cx, deadline).await?;
+        let configuration = self.admit_issuer(issuer, &body)?;
+        check_context(cx, deadline)?;
+        Ok(configuration)
+    }
+
+    // Registration and preregistered discovery share the same bounded fetch,
+    // local issuer selection and terminal-versus-fallback decisions.
+    async fn discover_issuer_document(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+    ) -> Result<(&TrustedOAuthIssuer, Vec<u8>), OAuthDiscoveryError> {
         let resource_url = resource_metadata_url(&self.resource)?;
         let body = fetch_metadata(cx, deadline, &resource_url, &self.resource_roots)
             .await?.ok_or(OAuthDiscoveryError::MetadataNotFound)?;
@@ -222,9 +256,8 @@ impl OAuthDiscoveryPlan {
         for location in issuer_metadata_urls(&issuer.url)? {
             check_context(cx, deadline)?;
             if let Some(body) = fetch_metadata(cx, deadline, &location, &issuer.roots).await? {
-                let configuration = self.admit_issuer(issuer, &body)?;
                 check_context(cx, deadline)?;
-                return Ok(configuration);
+                return Ok((issuer, body));
             }
         }
         Err(OAuthDiscoveryError::MetadataNotFound)
@@ -280,6 +313,38 @@ impl OAuthDiscoveryPlan {
         issuer: &TrustedOAuthIssuer,
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        let (authorization, token) = self.admit_issuer_endpoints(issuer, body)?;
+        self.configure_client(
+            issuer, authorization, token,
+            self.client_id.as_deref().ok_or(OAuthDiscoveryError::InvalidPolicy)?,
+        )
+    }
+
+    fn configure_client(
+        &self,
+        issuer: &TrustedOAuthIssuer,
+        authorization: CanonicalHttpUrl,
+        token: CanonicalHttpUrl,
+        client_id: &str,
+    ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        let mut configuration = OAuthClientConfiguration::from_trusted_endpoints(
+            issuer.identifier.clone(), authorization, token, self.resource.clone(),
+            client_id, self.scopes.clone(),
+        ).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+        for root in &issuer.roots {
+            configuration = configuration.with_extra_root_certificate(root.clone())
+                .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        }
+        Ok(configuration)
+    }
+
+    // Validate the COMPLETE flow before a registration POST is permitted,
+    // even though the client identity does not exist yet.
+    fn admit_issuer_endpoints(
+        &self,
+        issuer: &TrustedOAuthIssuer,
+        body: &[u8],
+    ) -> Result<(CanonicalHttpUrl, CanonicalHttpUrl), OAuthDiscoveryError> {
         let metadata: IssuerMetadata = decode_metadata(body)?;
         if metadata.signed_metadata.is_some() {
             return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
@@ -310,17 +375,7 @@ impl OAuthDiscoveryPlan {
             return Err(OAuthDiscoveryError::ResourceMismatch);
         }
         admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
-        let authorization = issuer.endpoint(&metadata.authorization_endpoint)?;
-        let token = issuer.endpoint(&metadata.token_endpoint)?;
-        let mut configuration = OAuthClientConfiguration::from_trusted_endpoints(
-            issuer.identifier.clone(), authorization, token, self.resource.clone(),
-            self.client_id.clone(), self.scopes.clone(),
-        ).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
-        for root in &issuer.roots {
-            configuration = configuration.with_extra_root_certificate(root.clone())
-                .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
-        }
-        Ok(configuration)
+        Ok((issuer.endpoint(&metadata.authorization_endpoint)?, issuer.endpoint(&metadata.token_endpoint)?))
     }
 }
 

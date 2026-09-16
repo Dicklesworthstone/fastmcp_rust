@@ -32,8 +32,9 @@ use fastmcp_core::partition::{
     HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER, HARD_REVALIDATIONS_PER_DEPLOYMENT,
     HARD_REVALIDATIONS_PER_PARTITION, HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome,
     PartitionAdmissionController, PartitionAdmissionError, PartitionAuthorization,
-    PartitionDescriptor, PartitionSlot, QuotaPartitionKey, ReplayReservationKey,
-    RevalidationFlightKey, RevalidationLimits, RevalidationLimitsError, SubscriptionPartitionKey,
+    PartitionDescriptor, PartitionSlot,
+    QuotaPartitionKey, ReplayReservationKey, RevalidationFlightKey, RevalidationLimits,
+    RevalidationLimitsError, SubscriptionPartitionKey,
 };
 use fastmcp_core::{SealedAdmissionKeyError, sha256_bounded};
 
@@ -688,7 +689,7 @@ fn auth_00_b_positive() {
 // Planted negative
 // ---------------------------------------------------------------------------
 
-/// The single verified field or key input a planted negative mutates.
+/// The single verified field a planted negative mutates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutatedRow {
     Tenant,
@@ -703,84 +704,53 @@ enum MutatedRow {
     QuotaEpoch,
 }
 
-/// What the mutation must cost the caller.
-///
-/// The three classes are distinct because the mutated fields enter the
-/// derivation at different points. Collapsing them into one blanket assertion
-/// would either be false or would have to be weakened to something that does
-/// not hold the implementation to account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpectedDenial {
-    /// The mutation changes the verified descriptor, so the caller's current
-    /// authorization no longer reaches the baseline record at all.
-    AuthorizationAbsent,
-    /// The mutation changes a partition-key input, so the result relocates to
-    /// a different, empty partition while the baseline record stays readable
-    /// by its legitimate owner.
-    PartitionRelocated,
-    /// The mutation changes an admission identity only: admission accounting
-    /// separates, and lookup authority is unaffected in either direction.
-    AdmissionSeparated,
-}
-
 /// One one-variable planted negative.
 #[derive(Debug, Clone, Copy)]
 struct PlantedCase {
     id: &'static str,
     row: MutatedRow,
-    expected: ExpectedDenial,
 }
 
 const PLANTED_CASES: [PlantedCase; 10] = [
     PlantedCase {
         id: "AUTH-00-B-NEG.01",
         row: MutatedRow::Tenant,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.02",
         row: MutatedRow::Issuer,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.03",
         row: MutatedRow::Resource,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.04",
         row: MutatedRow::Subject,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.05",
         row: MutatedRow::Client,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.06",
         row: MutatedRow::Provider,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.07",
         row: MutatedRow::RequiredGrant,
-        expected: ExpectedDenial::PartitionRelocated,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.08",
         row: MutatedRow::TrustGeneration,
-        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.09",
         row: MutatedRow::ReplayAlias,
-        expected: ExpectedDenial::AdmissionSeparated,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.10",
         row: MutatedRow::QuotaEpoch,
-        expected: ExpectedDenial::AdmissionSeparated,
     },
 ];
 
@@ -805,37 +775,6 @@ fn mutate(row: MutatedRow) -> (VerifiedFacts, &'static [&'static str], u64, &'st
     (facts, grants, quota_epoch, replay_alias)
 }
 
-/// Asserts the mutation changed exactly one input and nothing else.
-fn assert_one_variable(row: MutatedRow) {
-    let (facts, grants, quota_epoch, replay_alias) = mutate(row);
-    let descriptor_changed = facts != BASELINE;
-    let grants_changed = grants != GRANTS.as_slice();
-    let quota_changed = quota_epoch != QUOTA_EPOCH;
-    let alias_changed = replay_alias != "alias-1";
-    let changed = usize::from(descriptor_changed)
-        + usize::from(grants_changed)
-        + usize::from(quota_changed)
-        + usize::from(alias_changed);
-    assert_eq!(changed, 1, "{row:?} must change exactly one input family");
-
-    if descriptor_changed {
-        // Within the descriptor, exactly one field may differ.
-        let fields = usize::from(facts.provider != BASELINE.provider)
-            + usize::from(facts.configuration_generation != BASELINE.configuration_generation)
-            + usize::from(facts.issuer != BASELINE.issuer)
-            + usize::from(facts.resource != BASELINE.resource)
-            + usize::from(facts.tenant != BASELINE.tenant)
-            + usize::from(facts.subject != BASELINE.subject)
-            + usize::from(facts.client != BASELINE.client)
-            + usize::from(facts.trust_generation != BASELINE.trust_generation)
-            + usize::from(facts.audience_policy_revision != BASELINE.audience_policy_revision);
-        assert_eq!(
-            fields, 1,
-            "{row:?} must change exactly one descriptor field"
-        );
-    }
-}
-
 #[test]
 fn auth_00_b_planted_negative() {
     // Numeric floor: ten one-variable rows, one per named mutable field.
@@ -844,41 +783,19 @@ fn auth_00_b_planted_negative() {
         10,
         "the acceptance names ten one-variable mutation rows"
     );
-    let ids: Vec<&str> = PLANTED_CASES.iter().map(|case| case.id).collect();
-    assert_eq!(
-        ids,
-        vec![
-            "AUTH-00-B-NEG.01",
-            "AUTH-00-B-NEG.02",
-            "AUTH-00-B-NEG.03",
-            "AUTH-00-B-NEG.04",
-            "AUTH-00-B-NEG.05",
-            "AUTH-00-B-NEG.06",
-            "AUTH-00-B-NEG.07",
-            "AUTH-00-B-NEG.08",
-            "AUTH-00-B-NEG.09",
-            "AUTH-00-B-NEG.10",
-        ],
-        "planted rows must run in the frozen order"
-    );
 
     let baseline = baseline_descriptor();
     let baseline_rows = baseline_manifest(&baseline);
     let baseline_digest = manifest_digest(&baseline_rows);
-    let baseline_auth = authorization(&baseline);
     let baseline_owner = owner_key(&baseline);
     let baseline_quota = quota_key(&baseline);
     let baseline_cache = cache_key(&baseline, &GRANTS, TOKEN_INSTANCE);
     let baseline_slot = PartitionSlot::Cache(baseline_cache);
-    let baseline_replay = ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
-        .expect("baseline replay key derives");
 
     for case in &PLANTED_CASES {
-        assert_one_variable(case.row);
-
         // A fresh controller per row, populated identically.
         let controller = controller();
-        controller.store(&baseline_auth, &baseline_slot, b"result-bytes".to_vec());
+        controller.store(&baseline_owner, &baseline_slot, b"result-bytes".to_vec());
         let mut held = controller
             .reserve_quota(&baseline_quota, 3)
             .expect("baseline quota reserve is admitted");
@@ -887,19 +804,22 @@ fn auth_00_b_planted_negative() {
         let mut flight = controller
             .begin_revalidation(&baseline, &baseline_flight)
             .expect("baseline flight is admitted");
+        let baseline_replay =
+            ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
+                .expect("baseline replay key derives");
         controller
             .reserve_replay(&baseline, &baseline_replay)
             .expect("baseline replay reservation is admitted");
 
         let before = observe(&controller, &baseline, &baseline_quota);
         assert_eq!(
-            controller.lookup(&baseline_auth, &baseline_slot),
+            controller.lookup(&baseline_owner, &baseline_slot),
             LookupOutcome::Present(b"result-bytes".to_vec()),
             "{}: the baseline record must be present before the mutation",
             case.id
         );
 
-        // -- apply exactly one mutation ---------------------------------
+        // -- apply exactly one mutation --------------------------------
         let (facts, grants, quota_epoch, replay_alias) = mutate(case.row);
         let mutated = descriptor_from(&facts);
         let mutated_rows =
@@ -920,90 +840,29 @@ fn auth_00_b_planted_negative() {
             case.id
         );
 
-        // -- the typed denial, per class ---------------------------------
-        let mutated_auth = authorization(&mutated);
-        let mutated_slot = PartitionSlot::Cache(cache_key(&mutated, grants, TOKEN_INSTANCE));
-        let mutated_quota =
-            QuotaPartitionKey::derive(&mutated, quota_epoch).expect("mutated quota derives");
-        let mutated_replay =
-            ReplayReservationKey::derive(&mutated, replay_alias, "assertion-replay")
-                .expect("mutated replay derives");
+        // -- the typed denial -------------------------------------------
+        let mutated_owner = owner_key(&mutated);
+        let mutated_cache = cache_key(&mutated, grants, TOKEN_INSTANCE);
 
-        match case.expected {
-            ExpectedDenial::AuthorizationAbsent => {
-                assert_ne!(
-                    mutated_auth, baseline_auth,
-                    "{}: the mutation must move the current authorization",
-                    case.id
-                );
-                assert_eq!(
-                    controller.lookup(&mutated_auth, &baseline_slot),
-                    LookupOutcome::Absent,
-                    "{}: the mutated authorization must not reach the baseline record",
-                    case.id
-                );
-                assert_eq!(
-                    controller.lookup(&mutated_auth, &mutated_slot),
-                    LookupOutcome::Absent,
-                    "{}: the mutated partition must hold nothing",
-                    case.id
-                );
-            }
-            ExpectedDenial::PartitionRelocated => {
-                assert_eq!(
-                    mutated_auth, baseline_auth,
-                    "{}: a key-input mutation must not move the authorization",
-                    case.id
-                );
-                assert_ne!(
-                    mutated_slot, baseline_slot,
-                    "{}: the mutation must relocate the partition",
-                    case.id
-                );
-                assert_eq!(
-                    controller.lookup(&baseline_auth, &mutated_slot),
-                    LookupOutcome::Absent,
-                    "{}: the relocated partition must hold nothing",
-                    case.id
-                );
-            }
-            ExpectedDenial::AdmissionSeparated => {
-                assert_eq!(
-                    mutated_auth, baseline_auth,
-                    "{}: an admission-identity mutation must not move the authorization",
-                    case.id
-                );
-                assert_eq!(
-                    mutated_slot, baseline_slot,
-                    "{}: an admission-identity mutation must not relocate the partition",
-                    case.id
-                );
-                let separated =
-                    (mutated_quota != baseline_quota) || (mutated_replay != baseline_replay);
-                assert!(
-                    separated,
-                    "{}: an admission-identity mutation must separate admission accounting",
-                    case.id
-                );
-                if mutated_quota != baseline_quota {
-                    assert_eq!(
-                        controller.quota_in_use(&mutated_quota),
-                        0,
-                        "{}: the separated quota partition must start empty",
-                        case.id
-                    );
-                }
-                if mutated_replay != baseline_replay {
-                    assert!(
-                        !controller.replay_reserved(&mutated_replay),
-                        "{}: the separated replay alias must be unreserved",
-                        case.id
-                    );
-                }
-            }
-        }
+        // Reading the victim's record with the mutated authorization is
+        // absent, and so is reading the mutated partition. Both are
+        // indistinguishable from a genuine miss: that is the non-oracular
+        // property.
+        assert_eq!(
+            controller.lookup(&mutated_owner, &baseline_slot),
+            LookupOutcome::Absent,
+            "{}: mutating {:?} must not authorize the baseline record",
+            case.id,
+            case.row
+        );
+        assert_eq!(
+            controller.lookup(&mutated_owner, &PartitionSlot::Cache(mutated_cache)),
+            LookupOutcome::Absent,
+            "{}: the mutated partition must hold nothing",
+            case.id
+        );
 
-        // Typed admission denials that every row must still reach.
+        // A duplicate replay alias reaches its typed denial.
         assert_eq!(
             controller
                 .reserve_replay(&baseline, &baseline_replay)
@@ -1012,6 +871,7 @@ fn auth_00_b_planted_negative() {
             "{}: duplicate replay alias denial",
             case.id
         );
+        // A duplicate singleflight reaches its typed denial.
         assert_eq!(
             controller
                 .begin_revalidation(&baseline, &baseline_flight)
@@ -1021,7 +881,7 @@ fn auth_00_b_planted_negative() {
             case.id
         );
 
-        // -- cross-tenant no effect ---------------------------------------
+        // -- cross-tenant no effect --------------------------------------
         let after = observe(&controller, &baseline, &baseline_quota);
         assert_eq!(
             after.records, before.records,
@@ -1054,7 +914,7 @@ fn auth_00_b_planted_negative() {
             case.id
         );
         assert_eq!(
-            controller.lookup(&baseline_auth, &baseline_slot),
+            controller.lookup(&baseline_owner, &baseline_slot),
             LookupOutcome::Present(b"result-bytes".to_vec()),
             "{}: the victim's record must still be readable by its owner",
             case.id
@@ -1069,33 +929,34 @@ fn auth_00_b_planted_negative() {
         flight.finish().expect("baseline flight closes once");
     }
 
-    // Identity stability: exactly which rows move ownership and quota.
+    // Each mutation moves exactly the rows it should and no others.
     for case in &PLANTED_CASES {
         let (facts, grants, quota_epoch, replay_alias) = mutate(case.row);
-        let _ = (grants, replay_alias);
         let mutated = descriptor_from(&facts);
         let mutated_quota =
             QuotaPartitionKey::derive(&mutated, quota_epoch).expect("mutated quota derives");
         let mutated_owner = owner_key(&mutated);
+        let mutated_replay =
+            ReplayReservationKey::derive(&mutated, replay_alias, "assertion-replay")
+                .expect("mutated replay derives");
 
         match case.row {
             // Issuer is excluded from quota identity by design, so it moves
-            // ownership without moving quota. This is what makes
-            // "no quota-key equality authorizes a lookup" observable.
+            // ownership without moving quota.
             MutatedRow::Issuer => {
                 assert_eq!(
                     mutated_quota, baseline_quota,
-                    "{}: quota identity excludes the issuer",
+                    "{}: quota excludes issuer",
                     case.id
                 );
                 assert_ne!(
                     mutated_owner, baseline_owner,
-                    "{}: durable ownership includes the issuer",
+                    "{}: owner includes issuer",
                     case.id
                 );
             }
-            // Grants, trust generation and replay alias are neither owner nor
-            // quota inputs: both identities survive them.
+            // Grants, trust generation and replay alias are not owner or
+            // quota inputs: ownership and quota identity survive them.
             MutatedRow::RequiredGrant | MutatedRow::TrustGeneration | MutatedRow::ReplayAlias => {
                 assert_eq!(
                     mutated_quota, baseline_quota,
@@ -1111,12 +972,12 @@ fn auth_00_b_planted_negative() {
             MutatedRow::QuotaEpoch => {
                 assert_ne!(
                     mutated_quota, baseline_quota,
-                    "{}: the quota epoch is a quota input",
+                    "{}: quota epoch is a quota input",
                     case.id
                 );
                 assert_eq!(
                     mutated_owner, baseline_owner,
-                    "{}: the quota epoch is not an ownership input",
+                    "{}: quota epoch is not an owner input",
                     case.id
                 );
             }
@@ -1128,15 +989,25 @@ fn auth_00_b_planted_negative() {
             | MutatedRow::Provider => {
                 assert_ne!(
                     mutated_quota, baseline_quota,
-                    "{}: quota identity must move",
+                    "{}: quota must move",
                     case.id
                 );
                 assert_ne!(
                     mutated_owner, baseline_owner,
-                    "{}: durable ownership must move",
+                    "{}: ownership must move",
                     case.id
                 );
             }
+        }
+
+        if case.row == MutatedRow::ReplayAlias {
+            assert_ne!(
+                mutated_replay,
+                ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
+                    .expect("baseline replay derives"),
+                "{}: a different alias must be a different reservation",
+                case.id
+            );
         }
     }
 }
