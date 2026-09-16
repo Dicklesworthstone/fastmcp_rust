@@ -54,6 +54,15 @@ const SECRET_FINGERPRINT_INPUT_LIMIT_BYTES: usize = 64 * 1024;
 /// Domain separator, so a fingerprint can never collide with another MAC use.
 const SECRET_FINGERPRINT_DOMAIN: &[u8] = b"auth-00-secret-fingerprint-v1";
 
+/// Projected audience-policy revision for a mutual-TLS binding.
+///
+/// Reserved at the top of the `u64` range so a real policy revision, which
+/// counts up from zero, can never collide with it.
+pub const NON_OAUTH_MUTUAL_TLS_POLICY_SENTINEL: u64 = u64::MAX;
+
+/// Projected audience-policy revision for a static-credential binding.
+pub const NON_OAUTH_STATIC_CREDENTIAL_POLICY_SENTINEL: u64 = u64::MAX - 1;
+
 /// Default maximum staleness for a revalidated authorization.
 pub const DEFAULT_MAXIMUM_STALENESS: Duration = Duration::from_secs(30);
 
@@ -639,6 +648,29 @@ impl VerifiedIngressAuthentication {
     pub const fn trust_generation(&self) -> u64 {
         self.trust_generation
     }
+
+    /// The audience-policy revision to project into an admission descriptor.
+    ///
+    /// OAuth bindings project their real revision. Non-OAuth bindings have no
+    /// revision, and projecting a shared `0` for all of them would let a
+    /// provider that authenticates the same subject by both mutual TLS and a
+    /// static credential derive **one** partition for two genuinely different
+    /// authentication paths. Each non-OAuth variant therefore projects its own
+    /// reserved sentinel, drawn from the top of the range so it cannot be
+    /// reached by a real policy revision counting up from zero.
+    #[must_use]
+    const fn projected_audience_policy_revision(&self) -> u64 {
+        match &self.verified_audience_binding {
+            VerifiedAudienceBinding::OAuth {
+                audience_policy_revision,
+                ..
+            } => *audience_policy_revision,
+            VerifiedAudienceBinding::MutualTlsPeer => NON_OAUTH_MUTUAL_TLS_POLICY_SENTINEL,
+            VerifiedAudienceBinding::StaticCredential => {
+                NON_OAUTH_STATIC_CREDENTIAL_POLICY_SENTINEL
+            }
+        }
+    }
 }
 
 impl fmt::Debug for VerifiedIngressAuthentication {
@@ -691,4 +723,278 @@ pub struct VerifiedIdentityFacts<'a> {
     pub auth_policy_revision: u64,
     /// Trust generation.
     pub trust_generation: u64,
+}
+
+// ===========================================================================
+// Security partition descriptor
+// ===========================================================================
+
+/// The immutable verified descriptor every partition key is derived from.
+///
+/// Derived **only** from [`VerifiedIngressAuthentication`] — there is no
+/// constructor taking loose strings, so a descriptor cannot be assembled from
+/// request fields or self-reported claims. Its identity digest binds all
+/// twelve verified identity facts, including the audience binding and policy
+/// identity, so two principals differing in any one of them are different
+/// partitions.
+///
+/// This is AUTH-00 A's type. [`crate::partition::PartitionDescriptor`] is
+/// AUTH-00 B's admission input; [`Self::to_partition_descriptor`] is the
+/// production path between them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecurityPartitionDescriptor {
+    facts: VerifiedIngressAuthentication,
+    identity: [u8; 32],
+}
+
+impl SecurityPartitionDescriptor {
+    /// Derives the descriptor from verified ingress authentication.
+    #[must_use]
+    pub fn from_verified_ingress(facts: &VerifiedIngressAuthentication) -> Self {
+        // Length-prefixed, domain-separated, and inclusive of every identity
+        // fact. Omitting a field here would silently merge two principals that
+        // differ only in that field into one partition.
+        let mut parts: Vec<Vec<u8>> = vec![
+            b"auth-00-security-partition-descriptor-v1".to_vec(),
+            facts.provider.as_bytes().to_vec(),
+            facts.configuration_generation.to_be_bytes().to_vec(),
+            facts.issuer.as_bytes().to_vec(),
+            facts.canonical_resource.as_bytes().to_vec(),
+            facts.tenant.as_bytes().to_vec(),
+            facts.subject_or_principal.as_bytes().to_vec(),
+            facts.authorized_party_or_client.as_bytes().to_vec(),
+            facts.auth_policy_revision.to_be_bytes().to_vec(),
+            facts.trust_generation.to_be_bytes().to_vec(),
+        ];
+        parts.extend(facts.verified_audience_binding.canonical_parts());
+        // Claims are already sorted and deduplicated at fact construction.
+        parts.push((facts.verified_claims.len() as u64).to_be_bytes().to_vec());
+        for (name, value) in &facts.verified_claims {
+            parts.push(name.as_bytes().to_vec());
+            parts.push(value.as_bytes().to_vec());
+        }
+
+        let borrowed: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        Self {
+            facts: facts.clone(),
+            identity: crate::limits::opaque_admission_digest(&borrowed),
+        }
+    }
+
+    /// The verified facts this descriptor was derived from.
+    #[must_use]
+    pub const fn verified_ingress(&self) -> &VerifiedIngressAuthentication {
+        &self.facts
+    }
+
+    /// The opaque identity digest binding every verified fact.
+    #[must_use]
+    pub const fn identity(&self) -> &[u8; 32] {
+        &self.identity
+    }
+
+    /// Projects this descriptor onto AUTH-00 B's admission input.
+    ///
+    /// AUTH-00 B derives partition keys from a nine-field subset; this is a
+    /// projection of the twelve verified facts, so nothing is invented and the
+    /// discarded fields (audience binding, policy identity, claims) remain
+    /// bound in [`Self::identity`] for any caller that needs full identity.
+    ///
+    /// This is the only production path from verified ingress to an admission
+    /// descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::limits::SealedAdmissionKeyError`] when a verified
+    /// field is outside the sealed-key bound.
+    pub fn to_partition_descriptor(
+        &self,
+    ) -> Result<crate::partition::PartitionDescriptor, crate::limits::SealedAdmissionKeyError> {
+        crate::partition::PartitionDescriptor::from_verified_facts(
+            &self.facts.provider,
+            self.facts.configuration_generation,
+            &self.facts.issuer,
+            &self.facts.canonical_resource,
+            &self.facts.tenant,
+            &self.facts.subject_or_principal,
+            &self.facts.authorized_party_or_client,
+            self.facts.trust_generation,
+            self.facts.projected_audience_policy_revision(),
+        )
+    }
+}
+
+impl fmt::Debug for SecurityPartitionDescriptor {
+    /// Redacts every identity field; shows nothing but the type.
+    ///
+    /// Matches the redaction posture of AUTH-00 B's `PartitionDescriptor`, so
+    /// neither side of the seam is the weak one.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecurityPartitionDescriptor")
+            .finish_non_exhaustive()
+    }
+}
+
+// ===========================================================================
+// Rotation and revalidation facts
+// ===========================================================================
+
+/// A provider-owned reference that names a credential without carrying one.
+///
+/// The provider chooses the reference; the framework only compares and digests
+/// it. It must not be a bearer value, and the type gives no way to recover one
+/// — there is no accessor returning the raw reference, only its fingerprint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SealedProviderReference {
+    fingerprint: SecretFingerprint,
+}
+
+impl SealedProviderReference {
+    /// Seals a provider reference behind its fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SecretFingerprint::derive`] failures.
+    pub fn seal(
+        key_id: &str,
+        generation: u64,
+        key: &HmacSha256Key,
+        reference: &[u8],
+    ) -> Result<Self, IngressFactsError> {
+        Ok(Self {
+            fingerprint: SecretFingerprint::derive(key_id, generation, key, reference)?,
+        })
+    }
+
+    /// The fingerprint naming this reference.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &SecretFingerprint {
+        &self.fingerprint
+    }
+}
+
+impl fmt::Debug for SealedProviderReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedProviderReference")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Rotation and revalidation facts for an authorization that outlives ingress.
+///
+/// Deliberately not `Serialize`: a persisted revalidation fact is a stale
+/// assertion the moment it is written, and the one legitimate durable form is
+/// AUTH-00's separate durable-execution authorization, not this.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizationRotationFacts {
+    provider_reference: SealedProviderReference,
+    token_instance: SealedProviderReference,
+    required_grants: Vec<String>,
+    trust_generation: u64,
+    expiry: Duration,
+    maximum_staleness: MaximumStaleness,
+    dispatch: RevalidationDispatch,
+}
+
+impl AuthorizationRotationFacts {
+    /// Records the rotation and revalidation state of one authorization.
+    ///
+    /// Required grants are sorted and deduplicated so an equal grant set
+    /// compares and digests equal regardless of the order it arrived in.
+    #[must_use]
+    pub fn new(
+        provider_reference: SealedProviderReference,
+        token_instance: SealedProviderReference,
+        required_grants: &[&str],
+        trust_generation: u64,
+        expiry: Duration,
+        maximum_staleness: MaximumStaleness,
+        dispatch: RevalidationDispatch,
+    ) -> Self {
+        let mut grants: Vec<String> = required_grants
+            .iter()
+            .map(|grant| (*grant).to_owned())
+            .collect();
+        grants.sort();
+        grants.dedup();
+        Self {
+            provider_reference,
+            token_instance,
+            required_grants: grants,
+            trust_generation,
+            expiry,
+            maximum_staleness,
+            dispatch,
+        }
+    }
+
+    /// The sealed provider reference.
+    #[must_use]
+    pub const fn provider_reference(&self) -> &SealedProviderReference {
+        &self.provider_reference
+    }
+
+    /// The sealed token instance reference.
+    #[must_use]
+    pub const fn token_instance(&self) -> &SealedProviderReference {
+        &self.token_instance
+    }
+
+    /// The required grants, in deterministic order.
+    #[must_use]
+    pub fn required_grants(&self) -> &[String] {
+        &self.required_grants
+    }
+
+    /// The trust generation these facts were captured under.
+    #[must_use]
+    pub const fn trust_generation(&self) -> u64 {
+        self.trust_generation
+    }
+
+    /// Time remaining before the authorization expires.
+    #[must_use]
+    pub const fn expiry(&self) -> Duration {
+        self.expiry
+    }
+
+    /// The configured maximum staleness bound.
+    #[must_use]
+    pub const fn maximum_staleness(&self) -> MaximumStaleness {
+        self.maximum_staleness
+    }
+
+    /// Whether the last revalidation attempt reached the provider.
+    #[must_use]
+    pub const fn dispatch(&self) -> RevalidationDispatch {
+        self.dispatch
+    }
+
+    /// Whether these facts may still be relied on after `elapsed`.
+    ///
+    /// Fails closed on [`RevalidationDispatch::Unknown`]: an attempt that may
+    /// or may not have reached the provider has not established freshness, and
+    /// treating it as if it had is how a revoked authorization keeps working.
+    #[must_use]
+    pub fn is_fresh_after(&self, elapsed: Duration) -> bool {
+        match self.dispatch {
+            RevalidationDispatch::Dispatched => elapsed <= self.maximum_staleness.bound(),
+            RevalidationDispatch::NotDispatched | RevalidationDispatch::Unknown => false,
+        }
+    }
+}
+
+impl fmt::Debug for AuthorizationRotationFacts {
+    /// Shows generations, counts and dispatch; never a reference or grant.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizationRotationFacts")
+            .field("trust_generation", &self.trust_generation)
+            .field("required_grant_count", &self.required_grants.len())
+            .field("maximum_staleness", &self.maximum_staleness)
+            .field("dispatch", &self.dispatch)
+            .finish_non_exhaustive()
+    }
 }
