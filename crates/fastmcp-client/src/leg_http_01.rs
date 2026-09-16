@@ -196,9 +196,23 @@ impl ObservedLimit {
     /// # Panics
     ///
     /// Panics when `accepted >= refused`, which would mean the probe observed
-    /// the transport both admitting and refusing the same size.
+    /// the transport both admitting and refusing the same size, and when
+    /// `accepted == 0`.
+    ///
+    /// A zero `accepted` is not a small bound, it is the **absence of a
+    /// measurement**: the probe never saw the transport admit anything, so the
+    /// only number it carries is whatever size happened to be tried first. Any
+    /// ratio derived from that describes the probe's starting point rather than
+    /// the transport, and a [`LimitConflict`] built on it would put an artifact
+    /// into the record as though it were evidence. Refusing it here makes a
+    /// vacuous measurement unrepresentable rather than merely discouraged.
     #[must_use]
     pub fn new(accepted: u64, refused: u64) -> Self {
+        assert!(
+            accepted > 0,
+            "an observed boundary needs at least one admitted size; accepted == 0 means the \
+             probe measured nothing, and {refused} is only the size it happened to try first"
+        );
         assert!(
             accepted < refused,
             "an observed boundary needs accepted < refused, got {accepted} and {refused}"
