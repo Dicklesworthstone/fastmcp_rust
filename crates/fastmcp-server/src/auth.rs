@@ -2982,9 +2982,15 @@ mod tests {
             assert!(!error.message.contains(new));
             assert_eq!(registry_snapshot(&verifier), before);
         }
-        verifier.expire_token_at("alpha-secret", Instant::now()).unwrap();
+        verifier
+            .expire_token_at("alpha-secret", Instant::now())
+            .unwrap();
         let expired = registry_snapshot(&verifier);
-        assert!(verifier.rotate_token("alpha-secret", "fresh-secret").is_err());
+        assert!(
+            verifier
+                .rotate_token("alpha-secret", "fresh-secret")
+                .is_err()
+        );
         assert_eq!(registry_snapshot(&verifier), expired);
         let provider = TokenAuthProvider::new(verifier);
         assert!(authenticate_header(&provider, "Bearer alpha-secret").is_err());
@@ -2994,8 +3000,9 @@ mod tests {
 
     #[test]
     fn static_token_replacement_refusals_preserve_every_active_entry() {
-        let verifier = StaticTokenVerifier::new([("existing-secret", AuthContext::with_subject("owner"))])
-            .unwrap();
+        let verifier =
+            StaticTokenVerifier::new([("existing-secret", AuthContext::with_subject("owner"))])
+                .unwrap();
         let before = registry_snapshot(&verifier);
         for replacement in [
             vec![],
@@ -3031,7 +3038,9 @@ mod tests {
         let provider = TokenAuthProvider::new(verifier.clone());
         let mut revised = AuthContext::with_subject("owner");
         revised.scopes = vec!["read".to_owned()];
-        verifier.expire_token_at("retained-secret", Instant::now()).unwrap();
+        verifier
+            .expire_token_at("retained-secret", Instant::now())
+            .unwrap();
         verifier
             .replace_tokens([
                 ("retained-secret", revised.clone()),
@@ -3048,11 +3057,16 @@ mod tests {
 
     #[test]
     fn static_token_expiry_is_inclusive_monotonic_and_cannot_be_extended() {
-        let verifier = StaticTokenVerifier::new([("expiring-secret", AuthContext::with_subject("owner"))])
-            .unwrap();
+        let verifier =
+            StaticTokenVerifier::new([("expiring-secret", AuthContext::with_subject("owner"))])
+                .unwrap();
         let token = AccessToken::parse("Bearer expiring-secret").unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(3_600);
-        assert!(verifier.expire_token_at("expiring-secret", deadline).unwrap());
+        assert!(
+            verifier
+                .expire_token_at("expiring-secret", deadline)
+                .unwrap()
+        );
         assert!(
             verifier
                 .verify_with_clock(&token, || deadline - std::time::Duration::from_nanos(1))
@@ -3065,18 +3079,31 @@ mod tests {
                 .is_err()
         );
         let before = registry_snapshot(&verifier);
-        assert!(verifier
-            .expire_token_at("expiring-secret", deadline + std::time::Duration::from_secs(1))
-            .unwrap());
+        assert!(
+            verifier
+                .expire_token_at(
+                    "expiring-secret",
+                    deadline + std::time::Duration::from_secs(1)
+                )
+                .unwrap()
+        );
         assert_eq!(registry_snapshot(&verifier), before);
-        assert!(!verifier.expire_token_at("unknown-secret", deadline).unwrap());
+        assert!(
+            !verifier
+                .expire_token_at("unknown-secret", deadline)
+                .unwrap()
+        );
         assert_eq!(registry_snapshot(&verifier), before);
 
         let provider = TokenAuthProvider::new(verifier.clone());
         assert!(authenticate_header(&provider, "Bearer expiring-secret").is_ok());
-        verifier.expire_token_at("expiring-secret", Instant::now()).unwrap();
+        verifier
+            .expire_token_at("expiring-secret", Instant::now())
+            .unwrap();
         assert!(authenticate_header(&provider, "Bearer expiring-secret").is_err());
-        verifier.expire_token_at("expiring-secret", deadline).unwrap();
+        verifier
+            .expire_token_at("expiring-secret", deadline)
+            .unwrap();
         assert!(authenticate_header(&provider, "Bearer expiring-secret").is_err());
     }
 
@@ -3101,7 +3128,9 @@ mod tests {
         assert_eq!(verifier.revoke_all().unwrap(), 1);
         assert_eq!(verifier.revoke_all().unwrap(), 0);
         assert!(authenticate_header(&provider, "Bearer second-secret").is_err());
-        verifier.replace_tokens([("fresh-secret", AuthContext::with_subject("fresh"))]).unwrap();
+        verifier
+            .replace_tokens([("fresh-secret", AuthContext::with_subject("fresh"))])
+            .unwrap();
         assert!(authenticate_header(&provider, "Bearer fresh-secret").is_ok());
         assert!(authenticate_header(&provider, "Bearer first-secret").is_err());
     }
@@ -3109,15 +3138,23 @@ mod tests {
     #[test]
     fn static_token_rotation_works_at_the_registry_capacity_limit() {
         let verifier = StaticTokenVerifier::new((0..MAX_STATIC_TOKEN_ENTRIES).map(|index| {
-            (format!("secret-{index}"), AuthContext::with_subject(format!("owner-{index}")))
+            (
+                format!("secret-{index}"),
+                AuthContext::with_subject(format!("owner-{index}")),
+            )
         }))
         .unwrap();
         let provider = TokenAuthProvider::new(verifier.clone());
-        verifier.rotate_token("secret-0", "replacement-secret").unwrap();
+        verifier
+            .rotate_token("secret-0", "replacement-secret")
+            .unwrap();
         assert_eq!(registry_snapshot(&verifier).len(), MAX_STATIC_TOKEN_ENTRIES);
         assert!(authenticate_header(&provider, "Bearer secret-0").is_err());
         assert_eq!(
-            authenticate_header(&provider, "Bearer replacement-secret").unwrap().subject.as_deref(),
+            authenticate_header(&provider, "Bearer replacement-secret")
+                .unwrap()
+                .subject
+                .as_deref(),
             Some("owner-0")
         );
         assert!(authenticate_header(&provider, "Bearer secret-1").is_ok());
@@ -3125,8 +3162,9 @@ mod tests {
 
     #[test]
     fn poisoned_static_token_registry_fails_closed_without_repair_or_secret_leak() {
-        let verifier = StaticTokenVerifier::new([("poison-secret", AuthContext::with_subject("owner"))])
-            .unwrap();
+        let verifier =
+            StaticTokenVerifier::new([("poison-secret", AuthContext::with_subject("owner"))])
+                .unwrap();
         let provider = TokenAuthProvider::new(verifier.clone());
         assert!(authenticate_header(&provider, "Bearer poison-secret").is_ok());
         let planted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3139,9 +3177,21 @@ mod tests {
         assert!(!error.message.contains("poison-secret"));
         assert!(verifier.revoke_token("poison-secret").is_err());
         assert!(verifier.revoke_all().is_err());
-        assert!(verifier.expire_token_at("poison-secret", Instant::now()).is_err());
-        assert!(verifier.rotate_token("poison-secret", "new-secret").is_err());
-        assert!(verifier.replace_tokens([("new-secret", AuthContext::with_subject("owner"))]).is_err());
+        assert!(
+            verifier
+                .expire_token_at("poison-secret", Instant::now())
+                .is_err()
+        );
+        assert!(
+            verifier
+                .rotate_token("poison-secret", "new-secret")
+                .is_err()
+        );
+        assert!(
+            verifier
+                .replace_tokens([("new-secret", AuthContext::with_subject("owner"))])
+                .is_err()
+        );
         assert!(authenticate_header(&provider, "Bearer new-secret").is_err());
         let debug = format!("{verifier:?}");
         assert!(!debug.contains("poison-secret"));

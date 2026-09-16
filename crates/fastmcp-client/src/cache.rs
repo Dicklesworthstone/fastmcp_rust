@@ -1097,10 +1097,17 @@ mod tests {
         assert!(cache.entries.is_empty());
         let current = cache.begin_fetch(cache_key.result_set());
         assert_eq!(
-            cache.insert_if_current(cache_key.clone(), current, tools_result(100, "private", None)),
+            cache.insert_if_current(
+                cache_key.clone(),
+                current,
+                tools_result(100, "private", None)
+            ),
             FinalCacheInsert::Stored
         );
-        assert!(matches!(cache.lookup(&cache_key), FinalCacheLookup::Fresh(_)));
+        assert!(matches!(
+            cache.lookup(&cache_key),
+            FinalCacheLookup::Fresh(_)
+        ));
     }
 
     #[test]
@@ -1137,12 +1144,19 @@ mod tests {
         }
         let current = cache.begin_fetch(cache_key.result_set());
         assert_eq!(
-            cache.insert_if_current(cache_key.clone(), current, tools_result(100, "private", None)),
+            cache.insert_if_current(
+                cache_key.clone(),
+                current,
+                tools_result(100, "private", None)
+            ),
             FinalCacheInsert::Stored
         );
         cache.set_enabled(true);
         assert_eq!(cache.begin_fetch(cache_key.result_set()), current);
-        assert!(matches!(cache.lookup(&cache_key), FinalCacheLookup::Fresh(_)));
+        assert!(matches!(
+            cache.lookup(&cache_key),
+            FinalCacheLookup::Fresh(_)
+        ));
     }
 
     #[test]
@@ -1171,7 +1185,9 @@ mod tests {
     fn saturated_result_set_revision_rotates_epoch_without_accepting_old_fills() {
         let mut cache = FinalResultCache::default();
         let cache_key = key("credential-a", None);
-        cache.generations.insert(FinalCacheGenerationSet::Tools, u64::MAX);
+        cache
+            .generations
+            .insert(FinalCacheGenerationSet::Tools, u64::MAX);
         let old = cache.begin_fetch(cache_key.result_set());
         cache.invalidate_result_set(cache_key.result_set());
         assert!(cache.is_enabled());
