@@ -606,10 +606,20 @@ fn auth_00_a_positive() {
         authentication,
         "the descriptor must carry the admitted facts, not a separately assembled copy"
     );
+    // Determinism, proven across two *independent* ingress runs rather than by
+    // recomputing the same call on the same value. Recomputation only catches
+    // nondeterminism inside one invocation; running ingress again proves the
+    // identity is a function of the verified facts themselves, which is what
+    // this row claims. It is also what would catch a regression in claim-order
+    // normalization, since two runs could otherwise order claims differently.
+    let independent =
+        run_ingress(Planted::None).expect("a second independent ingress admits identically");
     assert_eq!(
-        *SecurityPartitionDescriptor::from_verified_ingress(authentication).identity(),
+        *SecurityPartitionDescriptor::from_verified_ingress(independent.authentication())
+            .identity(),
         *descriptor.identity(),
-        "descriptor identity must be a deterministic function of the verified facts"
+        "descriptor identity must be a deterministic function of the verified facts, \
+         equal across independent ingress runs"
     );
 
     // --- Row (3): secret fingerprint, and the frozen numeric floors ----------
