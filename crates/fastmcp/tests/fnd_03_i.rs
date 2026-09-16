@@ -70,7 +70,10 @@ fn fnd_03_i_positive() {
     {
         let legacy_builder =
             fastmcp_rust::legacy_2024::ServerBuilder::new("fnd03-i-legacy", "1.0.0");
-        assert_eq!(legacy_builder.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(
+            legacy_builder.protocol_policy(),
+            fastmcp_rust::legacy_2024::ProtocolPolicy::LegacyOnly
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -191,7 +194,10 @@ fn fnd_03_i_planted_negative() {
     // Unchanged state after rejection: the accepted parse, the pinned facade
     // policies, and the configurable builder's selection are all exactly as
     // they were before the refusal.
-    assert_eq!(ProtocolVersion::parse(MODERN_PROTOCOL_VERSION), Ok(accepted));
+    assert_eq!(
+        ProtocolVersion::parse(MODERN_PROTOCOL_VERSION),
+        Ok(accepted)
+    );
     assert_eq!(auto_builder.protocol_policy(), ProtocolPolicy::Auto);
     assert_eq!(builder.configured_protocol_policy(), initial_policy);
 
