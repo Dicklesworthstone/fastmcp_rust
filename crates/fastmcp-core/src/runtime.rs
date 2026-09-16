@@ -1,10 +1,32 @@
 //! Minimal runtime helpers for FastMCP.
 //!
-//! This module provides a small `block_on` utility used by macros to
-//! execute async handlers in a sync context without adding new deps, and
-//! the [`ProcessGenerationGuard`] that every process-local protector, handle
-//! store, limiter, and supervisor must be bound to before it becomes usable
-//! (FND-04).
+//! This module provides the [`ProcessGenerationGuard`] that every
+//! process-local protector, handle store, limiter, and supervisor must be
+//! bound to before it becomes usable (FND-04), and a small `block_on` bridge.
+//!
+//! # Status of the `block_on` bridge
+//!
+//! This helper was introduced for the `#[tool]`/`#[resource]`/`#[prompt]`
+//! macros, and that is no longer what it is. The macros expand to a directly
+//! awaited handler future and assert as much:
+//! `crates/fastmcp-macros/src/lib.rs` requires that no expansion contains
+//! `block_on` or a `runtime::` path. The FastMCP CLI drives its own explicit
+//! top-level runtime and asserts that production never reaches
+//! `fastmcp_core::runtime::block_on`.
+//!
+//! What remains is a thread-local blocking bridge still exported
+//! unconditionally from this library's public API — `pub mod runtime` plus
+//! `pub use runtime::block_on` in `lib.rs`, neither `cfg(test)`-gated — in a
+//! crate whose stated premise is that FastMCP never creates its own runtime.
+//! FND-04 requires that production `block_on`, out-of-band `Cx` construction,
+//! and private runtimes be non-exported and test-only, or have their
+//! production reachability removed. That has not happened yet, and
+//! `FND-04-B-07 production-deny-inventory` in
+//! `crates/fastmcp/tests/fnd_04_runtime_conformance.rs` measures the gap
+//! rather than asserting it away. The remaining consumers are cross-crate
+//! test modules (for example `fastmcp-protocol`'s `jose.rs`), so gating the
+//! export is a cross-crate change tracked separately; it is deliberately not
+//! attempted here.
 //!
 //! The runtime is configured with a platform I/O reactor (epoll on Linux,
 //! kqueue on macOS, IOCP on Windows) so that async network I/O works

@@ -1345,6 +1345,23 @@ fn collect_deny_inventory() -> Vec<DenyHit> {
                 }
             }
 
+            if !is_application_boundary
+                && ((trimmed.starts_with("pub use") && trimmed.contains("block_on"))
+                    || trimmed.starts_with("pub fn block_on")
+                    || trimmed.starts_with("pub mod runtime;"))
+            {
+                // A library that exports a blocking bridge has published a way
+                // to create and enter a runtime, whatever its callers do with
+                // it. That is the reachability FND-04 is about, and it is not
+                // measured by counting call sites.
+                hits.push(DenyHit {
+                    dimension: "public-runtime-bridge-export",
+                    file: path.clone(),
+                    line: line_number,
+                    text: trimmed.to_owned(),
+                });
+            }
+
             if trimmed.contains("Cx::for_testing")
                 || trimmed.contains("Cx::detached_cancel_context")
             {
@@ -1384,6 +1401,7 @@ fn subcase_07_production_deny_inventory() -> SubcaseOutcome {
         "private-runtime",
         "private-thread",
         "production-block-on",
+        "public-runtime-bridge-export",
         "test-internals",
     ] {
         let found = per_dimension.get(dimension).map_or(0, Vec::len);
@@ -1404,9 +1422,32 @@ fn subcase_07_production_deny_inventory() -> SubcaseOutcome {
             );
         }
     }
+    // The blocking bridge's reachability through the shipped public surface,
+    // stated directly rather than left to be inferred from a site count.
+    let core_lib = read_workspace_file("crates/fastmcp-core/src/lib.rs");
+    let core_shipped = strip_cfg_test_modules(&core_lib);
+    let exports_block_on = core_shipped.contains("pub use runtime::block_on;");
+    let runtime_module_public = core_shipped.contains("pub mod runtime;");
+
     outcome
         .observe("total_denied_sites", hits.len())
+        .observe("core_exports_block_on_unconditionally", exports_block_on)
+        .observe("core_runtime_module_public", runtime_module_public)
+        .observe(
+            "blocking_bridge_reaches_shipped_public_surface",
+            exports_block_on || runtime_module_public,
+        )
         .observe("sample", sample.trim_end_matches(" | "));
+
+    outcome.require(
+        !(exports_block_on || runtime_module_public),
+        "fastmcp-core must not publish a blocking runtime bridge on its shipped public surface; \
+         `pub mod runtime;` and `pub use runtime::block_on;` in crates/fastmcp-core/src/lib.rs \
+         are both unconditional, so a downstream consumer can create and enter a runtime through \
+         a library whose premise is that FastMCP never creates its own. The macros no longer \
+         expand to it and the CLI asserts production never reaches it, so the export is now \
+         reachability without a production consumer",
+    );
 
     outcome.require(
         hits.is_empty(),
