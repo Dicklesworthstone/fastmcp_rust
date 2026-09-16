@@ -136,6 +136,12 @@ fn read_uri(handler: &FilesystemResourceHandler, uri: &str) -> Result<String, Mc
 }
 
 /// Asserts that a refusal is the stable path rejection and leaks nothing.
+///
+/// `#[track_caller]` so a failure reports the CASE that failed rather than
+/// this helper's own line. Without it every one of the planted cases panics at
+/// the same location, and a panic line read as a defect location sends the
+/// reader to the wrong code.
+#[track_caller]
 fn assert_path_rejected(label: &str, error: &McpError, requested: &str) {
     let rendered = error.to_string();
     assert!(
@@ -213,7 +219,12 @@ fn fnd_07_a_positive() {
     let overlong = format!("file:///{}", "a".repeat(MAX_RELATIVE_PATH_BYTES + 1));
     let bounded = read_uri(&provider, &overlong).expect_err("an overlong request must be refused");
     assert_path_rejected("overlong request", &bounded, "");
-    assert_eq!(MAX_RELATIVE_PATH_BYTES, 4096);
+    // No `assert_eq!(MAX_RELATIVE_PATH_BYTES, 4096)` here: that compares this
+    // file's own constant with its own value and cannot fail. The production
+    // bound is private, so there is nothing to compare it against. The refusal
+    // above is what actually binds it — if the shipped limit were raised, the
+    // request built from this constant would stop being overlong and this case
+    // would fail.
 
     // --- Dependency divergence, recorded --------------------------------------
     //
