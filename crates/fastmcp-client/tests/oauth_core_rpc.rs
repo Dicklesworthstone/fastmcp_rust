@@ -305,7 +305,7 @@ fn run(case: Case) {
                     let application = async {
                         let mut call = session.request_core(&cx, core("tools/call", json!({"name":"echo","arguments":{"text":"hello"}})), RequestId::Number(41), ManagedCoreLimits::default()).await.unwrap();
                         first_changed(&mut call, &cx).await;
-                        release_tx.send(()).unwrap();
+                        release_tx.send(&cx, ()).unwrap();
                         let Some(ManagedCoreEvent::Notification(notification)) = call.next_event(&cx).await.unwrap() else { panic!("progress expected") };
                         assert!(matches!(*notification, ServerNotification::Progress(_)));
                         let Some(ManagedCoreEvent::Result(result)) = call.next_event(&cx).await.unwrap() else { panic!("typed result expected") };
