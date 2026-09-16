@@ -2576,7 +2576,21 @@ mod trust_std {
             return Err(TrustError::new("E_FILE_BOUND", format!("{subject}: {} > {maximum_bytes}", pre_metadata.len())));
         }
         if expected.is_some_and(|binding| binding.byte_length != pre_metadata.len()) {
-            return Err(TrustError::new("E_FILE_LENGTH", format!("{subject}: marker length mismatch")));
+            // "marker length mismatch" told the reader that two numbers differed without
+            // telling them either number, and this refusal propagates upward wrapped as a
+            // higher-level code - so the reader meets it far from here with no way to
+            // recover the values short of reading this function. Where the marker's drift
+            // is itself the subject of a re-attest decision, expected-vs-actual is the
+            // difference between a decision that can be made and one that cannot.
+            //
+            // `expected` is Copy and the guard already proved it Some; the placeholder arm
+            // is unreachable and is written as text rather than a sentinel number so it can
+            // never be mistaken for a real recorded length.
+            let recorded = expected.map_or_else(|| "<unbound>".to_owned(), |binding| binding.byte_length.to_string());
+            return Err(TrustError::new(
+                "E_FILE_LENGTH",
+                format!("{subject}: marker length mismatch: contract {recorded}, on disk {}", pre_metadata.len()),
+            ));
         }
 
         hook.at(SnapshotStage::PreOpen, &path)?;
