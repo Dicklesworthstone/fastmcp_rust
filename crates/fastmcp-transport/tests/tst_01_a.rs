@@ -48,7 +48,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fastmcp_protocol::jsonrpc::{JsonRpcMessage, RequestId};
+use fastmcp_protocol::{JsonRpcMessage, RequestId};
 use fastmcp_transport::{Codec, CodecError, InvalidMessageKind};
 use serde_json::Value;
 
