@@ -10358,6 +10358,8 @@ pub mod legacy_2024 {
 }
 
 // REL-QUAR-00 release-quarantine evidence surface
+/// FND-01 A closed-child source-freeze enforcement.
+pub mod evidence_binding;
 pub mod release_quarantine;
 
 // Testing helpers are opt-in and do not widen the production facade.
