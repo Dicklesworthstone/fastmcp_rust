@@ -37,6 +37,9 @@ use super::managed::{
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
 
+/// Explicit host-driven, bounded input-required continuation operations.
+pub mod interaction;
+
 /// Independent request, frame, cumulative payload, notification and time bounds.
 /// Native HTTP/SSE bounds continue to apply and may be tighter than these limits.
 #[derive(Clone, Copy, Debug)]
