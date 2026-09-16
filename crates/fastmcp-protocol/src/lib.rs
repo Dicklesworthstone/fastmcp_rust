@@ -191,15 +191,21 @@ fn fnd_03_era_classification_planted_negative() {
     protocol_policy::tests::fnd_03_era_classification_planted_negative();
 }
 
+// These two deliberately do NOT carry the frozen FND-03 B acceptance IDs. A
+// `cfg(test)` function cannot prove shipped behavior (PL-3), and a frozen ID
+// must resolve to exactly one definition workspace-wide (PL-1) so that
+// `cargo test ... <id> -- --exact` discovers exactly one test. The frozen
+// `fnd_03_b_positive` / `fnd_03_b_planted_negative` pair lives in the external
+// public-surface consumer at `crates/fastmcp-protocol/tests/fnd_03_b.rs`.
 #[cfg(test)]
 #[test]
-fn fnd_03_b_positive() {
+fn fnd_03_b_unit_positive() {
     protocol_policy::tests::fnd_03_era_classification_positive();
 }
 
 #[cfg(test)]
 #[test]
-fn fnd_03_b_planted_negative() {
+fn fnd_03_b_unit_planted_negative() {
     protocol_policy::tests::fnd_03_era_classification_planted_negative();
 }
 
