@@ -31,7 +31,8 @@ use fastmcp_core::partition::{
     DEFAULT_REVALIDATIONS_PER_PROVIDER, DurableOwnerKey, HARD_ATTEMPTS_PER_MINUTE_PER_PARTITION,
     HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER, HARD_REVALIDATIONS_PER_DEPLOYMENT,
     HARD_REVALIDATIONS_PER_PARTITION, HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome,
-    PartitionAdmissionController, PartitionAdmissionError, PartitionDescriptor, PartitionSlot,
+    PartitionAdmissionController, PartitionAdmissionError, PartitionAuthorization,
+    PartitionDescriptor, PartitionSlot,
     QuotaPartitionKey, ReplayReservationKey, RevalidationFlightKey, RevalidationLimits,
     RevalidationLimitsError, SubscriptionPartitionKey,
 };
@@ -149,6 +150,10 @@ fn credential_key(descriptor: &PartitionDescriptor, token: &str) -> CredentialSt
 
 fn owner_key(descriptor: &PartitionDescriptor) -> DurableOwnerKey {
     DurableOwnerKey::derive(descriptor, OWNERSHIP_EPOCH).expect("durable owner derives")
+}
+
+fn authorization(descriptor: &PartitionDescriptor) -> PartitionAuthorization {
+    PartitionAuthorization::current(descriptor, &owner_key(descriptor))
 }
 
 fn quota_key(descriptor: &PartitionDescriptor) -> QuotaPartitionKey {
@@ -509,29 +514,53 @@ fn auth_00_b_positive() {
 
     // -- Admission and lookup ---------------------------------------------
     let controller = controller();
-    let owner = owner_key(&descriptor);
+    let auth = authorization(&descriptor);
     let quota = quota_key(&descriptor);
     let slot = PartitionSlot::Cache(baseline_cache);
 
     assert_eq!(controller.record_count(), 0);
     assert!(
         controller
-            .store(&owner, &slot, b"result-bytes".to_vec())
+            .store(&auth, &slot, b"result-bytes".to_vec())
             .is_none()
     );
     assert_eq!(controller.record_count(), 1);
     assert_eq!(
-        controller.lookup(&owner, &slot),
+        controller.lookup(&auth, &slot),
         LookupOutcome::Present(b"result-bytes".to_vec()),
         "the owning principal must read its own record"
+    );
+
+    // Ordinary token rotation and scope churn do not move the authorization,
+    // because neither is a descriptor field.
+    assert_eq!(
+        auth,
+        PartitionAuthorization::current(&descriptor, &owner_key(&descriptor)),
+        "authorization derivation is deterministic"
+    );
+    // A trust-generation bump relocates every record the principal could
+    // previously reach.
+    let bumped_trust = descriptor_from(&VerifiedFacts {
+        trust_generation: TRUST_GENERATION + 1,
+        ..BASELINE
+    });
+    assert_eq!(
+        owner_key(&bumped_trust),
+        owner_key(&descriptor),
+        "a trust-generation bump must not move durable ownership"
+    );
+    assert_eq!(
+        controller.lookup(&authorization(&bumped_trust), &slot),
+        LookupOutcome::Absent,
+        "a trust-generation bump must relocate the reachable partition"
     );
 
     // The same partition key presented by a different durable owner — the
     // leaked-key case — is absent, and nothing changes.
     let before_foreign = observe(&controller, &descriptor, &quota);
-    let foreign_owner = owner_key(&other_issuer);
+    let foreign_auth = authorization(&other_issuer);
     assert_eq!(
-        controller.lookup(&foreign_owner, &slot),
+        controller.lookup(&foreign_auth, &slot),
         LookupOutcome::Absent,
         "holding another principal's partition key must not authorize a lookup"
     );
@@ -552,7 +581,7 @@ fn auth_00_b_positive() {
         "the shared quota identity shares admission accounting"
     );
     assert_eq!(
-        controller.lookup(&foreign_owner, &slot),
+        controller.lookup(&foreign_auth, &slot),
         LookupOutcome::Absent,
         "holding the same quota identity must not authorize a lookup"
     );
