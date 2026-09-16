@@ -241,7 +241,6 @@ impl ManagedSubscription {
         ).await?.map_err(admission_error)?.ok_or(ManagedSubscriptionError::MissingTerminal)?;
         let record = match record {
             ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } => {
-                self.accepted_filter = Some(accepted_filter.clone());
                 ManagedSubscriptionEvent::Acknowledged { accepted_filter }
             }
             ModernHttpSubscriptionListenEvent::Notification(notification) => {
@@ -261,6 +260,11 @@ impl ManagedSubscription {
         }
         if cx.now() >= self.deadline {
             return Err(OAuthSessionError::TimedOut.into());
+        }
+        // Publication follows the final lifetime checks. A decoded ACK that
+        // loses to cancellation/expiry must not become caller-visible state.
+        if let ManagedSubscriptionEvent::Acknowledged { accepted_filter } = &record {
+            self.accepted_filter = Some(accepted_filter.clone());
         }
         self.records += 1;
         if matches!(record, ManagedSubscriptionEvent::Terminal { .. }) {
@@ -348,14 +352,14 @@ mod tests {
 
     #[test]
     fn prepared_subscription_preserves_correlation_metadata_and_core_filter() {
-        let request = request(json!({"tools/list_changed": true}), json!({}));
+        let request = request(json!({"toolsListChanged": true}), json!({}));
         let (wire, filter) = prepare("https://mcp.example/mcp", request, &RequestId::Number(0), ManagedSubscriptionLimits::default()).unwrap();
         assert_eq!(filter.tools_list_changed, Some(true));
         assert!(filter.additional.is_empty());
         let value: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
         assert_eq!(value["id"], 0);
         assert_eq!(value["method"], "subscriptions/listen");
-        assert_eq!(value["params"]["notifications"]["tools/list_changed"], true);
+        assert_eq!(value["params"]["notifications"]["toolsListChanged"], true);
         assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Method" && value == "subscriptions/listen"));
         assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("last-event-id")));
     }
@@ -363,10 +367,20 @@ mod tests {
     #[test]
     fn core_subscription_rejects_unnegotiated_extensions_before_dispatch() {
         for (filter, extensions) in [
-            (json!({"tools/list_changed": true, "taskIds": ["private-task"]}), json!({})),
-            (json!({"tools/list_changed": true}), json!({"io.modelcontextprotocol/tasks": {}})),
+            (json!({"toolsListChanged": true, "taskIds": ["private-task"]}), json!({})),
+            (json!({"toolsListChanged": true}), json!({"io.modelcontextprotocol/tasks": {}})),
+            (json!({"tools/list_changed": true}), json!({})),
         ] {
             assert!(matches!(prepare("https://mcp.example/mcp", request(filter, extensions), &RequestId::Number(1), ManagedSubscriptionLimits::default()), Err(ManagedSubscriptionError::UnsupportedExtension)));
+        }
+    }
+
+    #[test]
+    fn filter_presence_is_preserved_without_inventing_subscription_authority() {
+        for filter in [json!({}), json!({"toolsListChanged": false}), json!({"resourceSubscriptions": []})] {
+            let (wire, _) = prepare("https://mcp.example/mcp", request(filter.clone(), json!({})), &RequestId::Number(1), ManagedSubscriptionLimits::default()).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
+            assert_eq!(value["params"]["notifications"], filter);
         }
     }
 
@@ -392,7 +406,7 @@ mod tests {
             assert!(ManagedSubscriptionLimits::new(request, frame, records, timeout).is_err());
         }
         let error = admission_error(ModernHttpSubscriptionListenError::RemoteError {
-            code: JsonInteger::from(-32603), message: "peer-secret-canary".to_owned(),
+            code: JsonInteger::from(-32603_i64), message: "peer-secret-canary".to_owned(),
         });
         assert!(!format!("{error:?} {error}").contains("peer-secret-canary"));
     }
