@@ -615,8 +615,15 @@ fn auth_00_a_positive() {
     // --- Row (3): secret fingerprint, and the frozen numeric floors ----------
     assert_eq!(fingerprint.key_id(), FINGERPRINT_KEY_ID);
     assert_eq!(fingerprint.generation(), FINGERPRINT_GENERATION);
-    assert_eq!(fingerprint.tag().len(), SECRET_FINGERPRINT_TAG_BYTES);
-    assert_eq!(SECRET_FINGERPRINT_TAG_BYTES, HMAC_SHA256_TAG_BYTES);
+    // Floors are anchored to literals, never to the constant or type that
+    // defines them. `tag()` returns `&[u8; SECRET_FINGERPRINT_TAG_BYTES]`, so
+    // asserting its `len()` against that same constant restates the type
+    // instead of testing it, and `SECRET_FINGERPRINT_TAG_BYTES` is *defined as*
+    // `HMAC_SHA256_TAG_BYTES`. Both held for a 16-byte MAC. The frozen floor is
+    // 32 bytes, so 32 is what each one is checked against.
+    assert_eq!(fingerprint.tag().len(), 32);
+    assert_eq!(SECRET_FINGERPRINT_TAG_BYTES, 32);
+    assert_eq!(HMAC_SHA256_TAG_BYTES, 32);
     assert_eq!(HMAC_SHA256_KEY_BYTES, 32);
     assert_eq!(SECRET_FINGERPRINT_KEY_ID_MIN_BYTES, 1);
     assert_eq!(SECRET_FINGERPRINT_KEY_ID_MAX_BYTES, 128);
