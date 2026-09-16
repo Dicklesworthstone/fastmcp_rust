@@ -20505,7 +20505,19 @@ mod ordinary {
     const ACQUISITION_SPARSE_CONFIG_PATH: &str = "registry/index/index.crates.io-1949cf8c6b5b557f/config.json";
     const BOOTSTRAP_MANIFEST_BYTES: u64 = 7_329;
     const BOOTSTRAP_MANIFEST_SHA256: &str = "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
-    const SOURCE_TREE_SHA256: &str = "e9b5deb6d83e3a26b872a1c91074a1021337c3daa66e6beea06cff84bb9b98d0";
+    /// FND01TREEv1 digest over the `EXPECTED_SOURCE_FILES` recorded inputs.
+    ///
+    /// MEASUREMENT of mutable repository content, so it rots whenever any
+    /// recorded source input changes by a byte; keep it on the cascade
+    /// checklist beside `EXPECTED_SOURCE_INPUT_TOTAL_BYTES`. Recomputed from
+    /// disk on 2026-09-16 using this document's own declared encoding —
+    /// records sorted by ascending raw path bytes, each
+    /// `u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)`,
+    /// no domain prefix — over all 71 inputs. That computation reproduces the
+    /// value below and the value the evidence document declares, while the
+    /// previous constant `e9b5deb6…` reproduced neither.
+    const SOURCE_TREE_SHA256: &str =
+        "55894c036799775f108593af84d8bd8ed9971e6ec77df54e901d9aabb9c47f45";
     const NEGATIVE_INVENTORY_SHA256: &str = "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
     const POLICY_OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.14";
@@ -26085,28 +26097,55 @@ activate = 1\n";
         {
             return Err(Diagnostic::error("E_POLICY_BOUNDS", &policy.policy_id));
         }
-        if policy.source_tree.format != "FND01TREEv1"
-            || policy.source_tree.path_scope != "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
-            || policy.source_tree.ordering != "ascending raw path bytes"
-            || policy.source_tree.record_encoding != "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
-            || policy.source_tree.domain_prefix != "none"
-            || policy.source_tree.file_count != EXPECTED_SOURCE_FILES
-            || policy.source_tree.total_bytes != policy.source_input_total_bytes
-            || policy.source_tree.sha256 != SOURCE_TREE_SHA256
-            || !string_sequence_is(
-                &policy.source_tree.excluded_exact_paths,
-                &[
-                    "evidence/fnd-01/dependency-verification.toml",
-                    "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
-                    "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
-                    "evidence/fnd-01/final-attestation.toml",
-                    "evidence/fnd-01/vendor/apps/whatwg-html-source",
-                ],
-            )
-            || policy.source_tree.excluded_exact_directory != "evidence/fnd-01/integration"
-            || policy.source_tree.wildcard_exclusions_allowed
+        // An `||` chain can only report THAT something diverged, never WHICH
+        // clause did. This gate previously failed closed with an empty detail
+        // field, so acting on it required reading this source - the same tax
+        // that let these contracts rot unnoticed. The `else if` chain below
+        // holds exactly the same clauses in the same order and additionally
+        // names the first one that diverged, with no second list to drift out
+        // of step with the first.
+        let source_tree_divergence: Option<&'static str> = if policy.source_tree.format
+            != "FND01TREEv1"
         {
-            return Err(Diagnostic::error("E_SOURCE_TREE_CONTRACT", &policy.policy_id));
+            Some("source_tree.format")
+        } else if policy.source_tree.path_scope
+            != "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
+        {
+            Some("source_tree.path_scope")
+        } else if policy.source_tree.ordering != "ascending raw path bytes" {
+            Some("source_tree.ordering")
+        } else if policy.source_tree.record_encoding
+            != "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
+        {
+            Some("source_tree.record_encoding")
+        } else if policy.source_tree.domain_prefix != "none" {
+            Some("source_tree.domain_prefix")
+        } else if policy.source_tree.file_count != EXPECTED_SOURCE_FILES {
+            Some("source_tree.file_count")
+        } else if policy.source_tree.total_bytes != policy.source_input_total_bytes {
+            Some("source_tree.total_bytes")
+        } else if policy.source_tree.sha256 != SOURCE_TREE_SHA256 {
+            Some("source_tree.sha256")
+        } else if !string_sequence_is(
+            &policy.source_tree.excluded_exact_paths,
+            &[
+                "evidence/fnd-01/dependency-verification.toml",
+                "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
+                "crates/fastmcp/examples/fnd_01_evidence_harness.rs",
+                "evidence/fnd-01/final-attestation.toml",
+                "evidence/fnd-01/vendor/apps/whatwg-html-source",
+            ],
+        ) {
+            Some("source_tree.excluded_exact_paths")
+        } else if policy.source_tree.excluded_exact_directory != "evidence/fnd-01/integration" {
+            Some("source_tree.excluded_exact_directory")
+        } else if policy.source_tree.wildcard_exclusions_allowed {
+            Some("source_tree.wildcard_exclusions_allowed")
+        } else {
+            None
+        };
+        if let Some(field) = source_tree_divergence {
+            return Err(Diagnostic::error("E_SOURCE_TREE_CONTRACT", &policy.policy_id).at(field));
         }
         validate_sha256(&policy.source_tree.sha256, "source tree SHA-256")?;
         if !policy.source_input_contract.all_rows_bytes_available
