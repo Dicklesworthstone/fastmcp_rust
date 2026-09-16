@@ -82,10 +82,18 @@ fn fnd_01_a_closed_child_binding_positive() {
         .evaluate(&bytes)
         .expect("the subject is inside the hashing bound");
 
-    // The binding holds, and every observed field says why.
-    assert!(outcome.is_bound(), "a live-computed binding must hold");
-    assert!(outcome.length_matches());
-    assert!(outcome.digest_matches());
+    // CONTROL, not a discriminator. `live_sha256_hex` calls the same
+    // `sha256_bounded` the module calls, so this can only ever observe
+    // `sha256_bounded(x) == sha256_bounded(x)`. It is here to pin the shape of
+    // an accepting outcome, and it must not be cited as proof of enforcement.
+    // The discriminators in this file are the same-length mutation below and
+    // the one-character digest flip in the planted negative.
+    assert!(
+        outcome.is_bound(),
+        "CONTROL: a live-computed binding must hold"
+    );
+    assert!(outcome.length_matches(), "CONTROL");
+    assert!(outcome.digest_matches(), "CONTROL");
     assert_eq!(outcome.drift(), BindingDrift::Bound);
     assert!(BindingDrift::Bound.is_bound());
     assert_eq!(outcome.declared_byte_length(), bytes.len());
@@ -246,5 +254,108 @@ fn fnd_01_a_closed_child_binding_planted_negative() {
     assert_eq!(
         reaccepted.evaluate(&bytes).expect("re-evaluates"),
         control_outcome
+    );
+}
+
+/// The declared closed-child bindings, parsed from the evidence document.
+struct DeclaredRow {
+    path: String,
+    owner_scope: String,
+    byte_length: usize,
+    sha256: String,
+}
+
+/// Parses every `[[closed_child_binding]]` row exactly as recorded.
+///
+/// Recorded values are used verbatim. Nothing here recomputes a digest or a
+/// length: the recorded pair *is* the subject under test.
+fn declared_closed_child_bindings() -> Vec<DeclaredRow> {
+    let document =
+        fs::read_to_string(workspace_root().join("evidence/fnd-01/dependency-verification.toml"))
+            .expect("the FND-01 evidence document is readable");
+    let parsed: toml::Value = document
+        .parse()
+        .expect("the FND-01 evidence document parses as TOML");
+    let rows = parsed
+        .get("closed_child_binding")
+        .and_then(toml::Value::as_array)
+        .expect("the evidence document declares a closed_child_binding array");
+
+    rows.iter()
+        .map(|row| {
+            let field = |name: &str| {
+                row.get(name)
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_else(|| panic!("closed_child_binding.{name} is a string"))
+                    .to_owned()
+            };
+            let byte_length = row
+                .get("byte_length")
+                .and_then(toml::Value::as_integer)
+                .expect("closed_child_binding.byte_length is an integer");
+            DeclaredRow {
+                path: field("path"),
+                owner_scope: field("owner_scope"),
+                byte_length: usize::try_from(byte_length)
+                    .expect("closed_child_binding.byte_length is non-negative"),
+                sha256: field("sha256"),
+            }
+        })
+        .collect()
+}
+
+/// Evaluates the **recorded** bindings against the bytes they claim to bind.
+///
+/// This is the case the module exists for. Every value compared here is read
+/// from the evidence document as written; none is recomputed. A zero-row parse
+/// fails rather than passing vacuously, because a check that silently examines
+/// nothing is the exact defect this capability was added to remove.
+///
+/// This test is expected to FAIL while the recorded bindings are drifted. That
+/// red is the mechanical proof of the drift, and it is the correct result. It
+/// must not be inverted to `!is_bound()`, ignored, feature-gated, or repaired
+/// by regenerating the recorded values.
+#[test]
+fn fnd_01_a_recorded_closed_child_bindings_hold() {
+    let declared = declared_closed_child_bindings();
+    assert!(
+        !declared.is_empty(),
+        "the evidence document must declare at least one closed-child binding; \
+         an empty parse would let this check pass while examining nothing"
+    );
+
+    let mut drifted = Vec::new();
+    for row in &declared {
+        let binding =
+            ClosedChildBinding::declare(&row.path, &row.owner_scope, row.byte_length, &row.sha256)
+                .unwrap_or_else(|error| panic!("{}: malformed declaration: {error}", row.path));
+
+        let actual = fs::read(workspace_root().join(&row.path))
+            .unwrap_or_else(|error| panic!("{}: bound source unreadable: {error}", row.path));
+
+        let outcome = binding
+            .evaluate(&actual)
+            .unwrap_or_else(|error| panic!("{}: {error}", row.path));
+
+        if !outcome.is_bound() {
+            drifted.push(format!(
+                "{} [{}] {:?}: recorded {} bytes / {}, actual {} bytes / {}",
+                row.path,
+                row.owner_scope,
+                outcome.drift(),
+                binding.byte_length(),
+                binding.sha256(),
+                outcome.actual_byte_length(),
+                outcome.actual_sha256(),
+            ));
+        }
+    }
+
+    assert!(
+        drifted.is_empty(),
+        "{} of {} recorded closed-child bindings no longer bind the files they name:\n{}",
+        drifted.len(),
+        declared.len(),
+        drifted.join("\n"),
     );
 }
