@@ -3,6 +3,10 @@ use super::*;
 use std::cell::Cell;
 use fastmcp_client::http_auth::rpc::interaction::ManagedInputReply;
 
+#[cfg(feature = "tasks")]
+#[path = "tasks.rs"]
+mod tasks;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
