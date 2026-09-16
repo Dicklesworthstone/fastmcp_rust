@@ -26,6 +26,8 @@ pub mod discovery;
 pub mod managed;
 /// Interactive native-public-client authorization with a caller-owned runtime.
 pub mod oauth;
+/// Typed core MCP calls over managed OAuth, with incremental notifications.
+pub mod rpc;
 
 pub use fastmcp_core::CanonicalHttpUrl;
 
