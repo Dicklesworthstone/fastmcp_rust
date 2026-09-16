@@ -206,6 +206,58 @@ pub fn http_03_a_manifest_digest() -> Sha256Digest {
     .expect("the fixed HTTP-03 A manifest is within its exact byte bound")
 }
 
+/// The canonical `http_03_evaluator_manifest_v1` rows owned by HTTP-03
+/// implementation B: ordered groups `HTTP-03.14` through `HTTP-03.26`.
+///
+/// This is an executable acceptance input, not a hash of this source file. It
+/// is LF-canonical and LF-terminated, carries no CR, no blank line, and no
+/// trailing whitespace, and its four header rows bind the producer revision,
+/// the producer tree, and the shipped public entrypoint the slice is proved
+/// through. The two object names record the revision these rows were frozen
+/// against; they are historical and are not asserted to remain reachable.
+/// Each case row is exactly `<id> <name> floor=<N>`, where `floor` is the
+/// minimum number of observations an integrating evaluator must actually
+/// perform for that case. Raising a floor here raises what integration
+/// demands; reordering, omitting, or renaming a row changes
+/// [`http_03_b_manifest_digest`] and fails the join.
+///
+/// The `A` half (`HTTP-03.01`..`HTTP-03.13`) is owned by the HTTP-03 A slice
+/// and is deliberately not declared here.
+pub const HTTP_03_B_EVALUATOR_MANIFEST_V1: &str = concat!(
+    "HTTP-03-B evaluator manifest v1\n",
+    "producer-revision b0127edfd58b4c733179baa3a50aae2000fe67aa\n",
+    "producer-tree 739c05242c7e8f59db1a85a3be76bd9d6aafbbcb\n",
+    "entrypoint fastmcp_client::ClientBuilder::connect_http_with_cx\n",
+    "HTTP-03.14 caller-cancellation-response-close floor=5\n",
+    "HTTP-03.15 deadline-and-disconnect-races floor=4\n",
+    "HTTP-03.16 uncertain-dispatch-no-retry floor=4\n",
+    "HTTP-03.17 authorization-redaction floor=3\n",
+    "HTTP-03.18 https-only-bearer-attachment floor=3\n",
+    "HTTP-03.19 redirect-no-follow-no-replay floor=4\n",
+    "HTTP-03.20 discover-preclassification-frame floor=3\n",
+    "HTTP-03.21 fresh-probe-identity-after-authorization floor=7\n",
+    "HTTP-03.22 endpoint-instance-key-partition floor=6\n",
+    "HTTP-03.23 extension-activation-proof-notification floor=4\n",
+    "HTTP-03.24 independent-server-request-rejection floor=2\n",
+    "HTTP-03.25 no-event-id-retry-resumption-state floor=2\n",
+    "HTTP-03.26 modern-observation-table-and-no-downgrade floor=11\n",
+);
+
+/// Returns the canonical HTTP-03 B evaluator manifest digest.
+///
+/// The digest binds the exact published bytes of
+/// [`HTTP_03_B_EVALUATOR_MANIFEST_V1`]. An integrating consumer recomputes it
+/// over those same bytes, so a digest that no longer reproduces means the
+/// producer's two published halves have drifted apart.
+#[must_use]
+pub fn http_03_b_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        HTTP_03_B_EVALUATOR_MANIFEST_V1.as_bytes(),
+        MAX_HTTP_03_MANIFEST_BYTES,
+    )
+    .expect("the fixed HTTP-03 B manifest is within its exact byte bound")
+}
+
 /// Maximum response bytes retained while classifying a disposable modern probe.
 pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
 
