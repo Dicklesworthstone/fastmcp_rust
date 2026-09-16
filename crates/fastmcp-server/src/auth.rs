@@ -2245,10 +2245,18 @@ mod tests {
         assert!(req.params.is_some());
     }
 
-    // ── AUTH-01 Implementation A tests ──────────────────────────────
+    // ── AUTH-01 Implementation A unit coverage ──────────────────────
+    //
+    // These exercise credential-source admission against crate internals.
+    // They deliberately do NOT carry the frozen AUTH-01 A acceptance IDs:
+    // a `cfg(test)` module cannot prove shipped behavior (PL-3), and the
+    // frozen IDs must resolve to exactly one location workspace-wide (PL-1).
+    // The frozen `auth_01_a_positive` / `auth_01_a_planted_negative` pair
+    // lives in the external public-surface consumer at
+    // `crates/fastmcp-server/tests/auth_01_a.rs`.
 
     #[test]
-    fn auth_01_a_positive() {
+    fn auth_01_a_unit_positive() {
         let verifier =
             StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
                 .expect("valid verifier configuration");
@@ -2286,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_01_a_planted_negative() {
+    fn auth_01_a_unit_planted_negative() {
         let verifier =
             StaticTokenVerifier::new([("valid-token-123", AuthContext::with_subject("alice"))])
                 .expect("valid verifier configuration");
