@@ -91,6 +91,7 @@ let _ = Client::sse_with_cx;
 )]
 pub mod http_executor;
 pub mod leg_neg;
+pub mod leg_neg_stdio;
 #[cfg(feature = "apps")]
 pub mod mcp_apps;
 pub mod mcp_config;
@@ -176,6 +177,11 @@ pub use mcp_apps::{
 pub use leg_neg::{
     FallbackDecision, FallbackState, HttpFallbackCoordinator, HttpFallbackError, LegacyGetPermit,
     ModernProbeObservation,
+};
+pub use leg_neg_stdio::{
+    CredentialBoundary, LEG_NEG_01_A_EVALUATOR_MANIFEST_V1, StdioClassificationCase,
+    StdioClassificationRecord, StdioFirstWireSignal, TraceOutcome, case_input_digest,
+    evaluate_stdio_case, leg_neg_01_a_manifest_digest,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
