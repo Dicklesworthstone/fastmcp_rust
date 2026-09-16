@@ -1352,9 +1352,58 @@ mod tests {
                 }
             })).await.unwrap();
             drop(login);
-            assert!(within(&cx, deadline, async {
-                TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)
-            }).await.is_err());
+
+            // Prove the bound callback listener is CLOSED, not merely that its
+            // port is unreachable. Those are different claims.
+            //
+            // This probe used to assert `TcpStream::connect(address).is_err()`.
+            // A successful connect proves only that *somebody* is listening on
+            // that port, never that *our* listener is. This is a lib unit test
+            // sharing one binary with ~800 others, ~100 of which bind ephemeral
+            // loopback ports in parallel, so the port `drop(login)` just freed can
+            // be handed straight to a concurrent test and satisfy the connect
+            // against a listener that has nothing to do with OAuth. That is how
+            // this assertion failed the first time the suite ever ran it.
+            //
+            // Binding the same address inverts the evidence. A successful bind
+            // proves NOBODY is listening, which is direct proof the descriptor was
+            // closed, and it reclaims the port so no concurrent test can occupy it
+            // mid-observation. The leak this test exists to catch still fails here
+            // and fails harder: a retained listener makes the bind fail
+            // deterministically with `AddrInUse` instead of leaving the outcome to
+            // whichever process wins a port race.
+            //
+            // DO NOT add `SO_REUSEADDR` or `SO_REUSEPORT` to this bind.
+            // `SO_REUSEADDR` only permits rebinding a port left in `TIME_WAIT` by
+            // an already-closed socket; it does NOT permit two live listeners on
+            // one port, and that refusal is the entire mechanism of this probe.
+            // `SO_REUSEPORT` does permit exactly that, so setting it would let a
+            // leaked listener coexist with the probe bind and silently turn this
+            // proof into a no-op.
+            //
+            // No sleep, no retry, no timing tolerance. The close is synchronous:
+            // the listener is a local of the dropped `authorize` future, asupersync's
+            // `TcpListener` has no `Drop` of its own, and its `std::net::TcpListener`
+            // closes the descriptor in `Drop`. There is nothing to wait for, and a
+            // tolerance here would hide precisely the leak being tested.
+            let reclaimed = within(&cx, deadline, async {
+                Ok(TcpListener::bind(address).await.map_err(|error| error.kind()))
+            })
+            .await
+            .expect("the bind probe must resolve within the operation deadline");
+            match reclaimed {
+                Ok(listener) => drop(listener),
+                Err(std::io::ErrorKind::AddrInUse) => panic!(
+                    "{address} is still bound after the login future was dropped. \
+                     Either the callback listener leaked - the defect this test exists \
+                     to catch - or a concurrent test took the port between the drop and \
+                     this bind. Re-run this test alone with --exact to separate them."
+                ),
+                Err(kind) => panic!(
+                    "the bind probe for {address} is INCONCLUSIVE ({kind:?}); it proves \
+                     neither closure nor a leak and must not be read as either"
+                ),
+            }
         });
     }
 
