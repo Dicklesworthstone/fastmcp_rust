@@ -29,15 +29,16 @@ use fastmcp_core::ingress::{
     VerifiedIngressAuthentication,
 };
 use fastmcp_core::partition::{
-    ATTEMPT_RATE_WINDOW, CachePartitionKey, ContinuationPartitionKey, CredentialStoreKey,
-    DEFAULT_ATTEMPTS_PER_MINUTE_PER_PARTITION, DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER,
-    DEFAULT_REVALIDATIONS_PER_DEPLOYMENT, DEFAULT_REVALIDATIONS_PER_PARTITION,
-    DEFAULT_REVALIDATIONS_PER_PROVIDER, DurableOwnerKey, HARD_ATTEMPTS_PER_MINUTE_PER_PARTITION,
-    HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER, HARD_REVALIDATIONS_PER_DEPLOYMENT,
-    HARD_REVALIDATIONS_PER_PARTITION, HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome,
-    PartitionAdmissionController, PartitionAdmissionError, PartitionAuthorization,
-    PartitionDescriptor, PartitionSlot, QuotaPartitionKey, ReplayReservationKey,
-    RevalidationFlightKey, RevalidationLimits, RevalidationLimitsError, SubscriptionPartitionKey,
+    ATTEMPT_RATE_WINDOW, AUDIENCE_BINDING_MAX_BYTES, CachePartitionKey, ContinuationPartitionKey,
+    CredentialStoreKey, DEFAULT_ATTEMPTS_PER_MINUTE_PER_PARTITION,
+    DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER, DEFAULT_REVALIDATIONS_PER_DEPLOYMENT,
+    DEFAULT_REVALIDATIONS_PER_PARTITION, DEFAULT_REVALIDATIONS_PER_PROVIDER, DurableOwnerKey,
+    HARD_ATTEMPTS_PER_MINUTE_PER_PARTITION, HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER,
+    HARD_REVALIDATIONS_PER_DEPLOYMENT, HARD_REVALIDATIONS_PER_PARTITION,
+    HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome, PartitionAdmissionController,
+    PartitionAdmissionError, PartitionAuthorization, PartitionDescriptor, PartitionSlot,
+    QuotaPartitionKey, ReplayReservationKey, RevalidationFlightKey, RevalidationLimits,
+    RevalidationLimitsError, SubscriptionPartitionKey,
 };
 use fastmcp_core::{SealedAdmissionKeyError, sha256_bounded};
 
@@ -445,10 +446,7 @@ fn auth_00_b_positive() {
     assert_eq!(descriptor.client(), CLIENT);
     assert_eq!(descriptor.canonical_resource(), RESOURCE);
     assert_eq!(descriptor.trust_generation(), TRUST_GENERATION);
-    assert_eq!(
-        descriptor.audience_policy_revision(),
-        AUDIENCE_POLICY_REVISION
-    );
+    assert_eq!(descriptor.auth_policy_revision(), AUTH_POLICY_REVISION);
     // Identity fields are redacted from Debug.
     let rendered = format!("{descriptor:?}");
     for secret in [PROVIDER, ISSUER, TENANT, SUBJECT, CLIENT, RESOURCE] {
@@ -598,6 +596,45 @@ fn auth_00_b_positive() {
         "a trust-generation bump must relocate the reachable partition"
     );
 
+    // Revising the authorization policy must do the same. Before the audience
+    // binding became a descriptor field, `auth_policy_revision` was dropped at
+    // the projection, so records admitted under a superseded authorization
+    // policy stayed reachable — the same stale-authorization failure the
+    // durable-owner-only slot key had.
+    let revised_policy = SecurityPartitionDescriptor::from_verified_ingress(
+        &VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+            provider: BASELINE.provider,
+            configuration_generation: BASELINE.configuration_generation,
+            issuer: BASELINE.issuer,
+            canonical_resource: BASELINE.resource,
+            verified_audience_binding: oauth_binding(&BASELINE),
+            tenant: BASELINE.tenant,
+            subject_or_principal: BASELINE.subject,
+            authorized_party_or_client: BASELINE.client,
+            verified_claims: &[],
+            auth_policy_revision: AUTH_POLICY_REVISION + 1,
+            trust_generation: BASELINE.trust_generation,
+        })
+        .expect("a revised authorization policy is still verified provider output"),
+    )
+    .to_partition_descriptor()
+    .expect("the production projection must succeed");
+    assert_ne!(
+        revised_policy.identity(),
+        descriptor.identity(),
+        "revising the authorization policy must move the descriptor identity"
+    );
+    assert_eq!(
+        owner_key(&revised_policy),
+        owner_key(&descriptor),
+        "revising the authorization policy must not move durable ownership"
+    );
+    assert_eq!(
+        controller.lookup(&authorization(&revised_policy), &slot),
+        LookupOutcome::Absent,
+        "a superseded authorization policy must not reach the old record"
+    );
+
     // The same partition key presented by a different durable owner — the
     // leaked-key case — is absent, and nothing changes.
     let before_foreign = observe(&controller, &descriptor, &quota);
@@ -731,6 +768,8 @@ fn auth_00_b_positive() {
         .is_err(),
         "AUTH-00 A must refuse an empty verified identity field at ingress"
     );
+    let binding_parts = oauth_binding(&BASELINE).canonical_parts();
+    let binding: Vec<&[u8]> = binding_parts.iter().map(Vec::as_slice).collect();
     assert_eq!(
         PartitionDescriptor::from_verified_facts(
             "",
@@ -741,10 +780,63 @@ fn auth_00_b_positive() {
             SUBJECT,
             CLIENT,
             TRUST_GENERATION,
-            AUDIENCE_POLICY_REVISION,
+            AUTH_POLICY_REVISION,
+            &binding,
         )
         .expect_err("an empty verified field must refuse"),
         SealedAdmissionKeyError::EmptyField
+    );
+    // The audience binding is a validated field, not an agreed convention: a
+    // caller who omits it, or supplies a part with no discriminant bytes, is
+    // refused rather than silently merged with another authentication path.
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[],
+        )
+        .expect_err("an absent audience binding must refuse"),
+        SealedAdmissionKeyError::EmptyField
+    );
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[b"" as &[u8]],
+        )
+        .expect_err("an empty binding part must refuse"),
+        SealedAdmissionKeyError::EmptyField
+    );
+    let oversized = vec![b'a'; AUDIENCE_BINDING_MAX_BYTES + 1];
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[oversized.as_slice()],
+        )
+        .expect_err("an oversized audience binding must refuse"),
+        SealedAdmissionKeyError::FieldTooLong
     );
 
     // -- Acceptance row (1): descriptor provenance -------------------------
@@ -807,9 +899,9 @@ fn auth_00_b_positive() {
 
     // The same separation must survive the projection into B's admission
     // descriptor, or a cache entry from one path could be served to the other.
-    // Today this holds because A projects a distinct sentinel per non-OAuth
-    // variant; this assertion is what keeps that convention honest from B's
-    // side until the binding becomes a structural descriptor field.
+    // This holds structurally: the descriptor binds the audience binding's
+    // canonical, discriminant-led encoding, so the three paths cannot share an
+    // identity regardless of what any policy revision happens to equal.
     let mutual_tls_admission = mutual_tls
         .to_partition_descriptor()
         .expect("mutual-TLS projection succeeds");

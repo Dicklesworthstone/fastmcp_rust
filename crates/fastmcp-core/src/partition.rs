@@ -32,8 +32,18 @@
 //! token rotation and scope churn preserve durable-owner and quota identity.
 //! [`CachePartitionKey`], [`ContinuationPartitionKey`] and
 //! [`SubscriptionPartitionKey`] bind the result-affecting facts (effective
-//! grants, token instance, audience-policy revision), so any change that can
-//! alter a result also changes the partition the result is stored under.
+//! grants, token instance), so any change that can alter a result also changes
+//! the partition the result is stored under.
+//!
+//! The descriptor itself binds the verified audience *binding*, not a
+//! projected policy revision. A revision cannot describe an authentication
+//! path that has no audience policy, so projecting one would give mutual-TLS
+//! and static-credential ingress for the same subject a single identity and
+//! let one path read the other's cached results. Encoding the binding makes
+//! that unrepresentable instead of relying on sentinel values two modules must
+//! agree to keep distinct. `auth_policy_revision` is bound for the same
+//! reason: revising authorization must not leave records admitted under the
+//! previous policy reachable.
 //!
 //! # No-claim boundary
 //!
@@ -78,6 +88,43 @@ pub const ATTEMPT_RATE_WINDOW: Duration = Duration::from_secs(60);
 // Verified descriptor
 // ---------------------------------------------------------------------------
 
+/// Maximum canonical bytes a verified audience binding may contribute.
+///
+/// The sealed-key digest is computed over a bounded buffer, so every caller
+/// input must be bounded before it reaches the hash. This budget is this
+/// module's own bound on its own parameter, not a mirror of a bound owned
+/// elsewhere, so nothing has to stay in agreement with another module for it
+/// to hold.
+pub const AUDIENCE_BINDING_MAX_BYTES: usize = 8 * 1024;
+
+/// Validates a verified audience binding's canonical encoding.
+///
+/// The binding must be non-empty and every part must be non-empty, because the
+/// leading part is the variant discriminant that distinguishes one
+/// authentication path from another. A caller who omits it gets a typed
+/// [`SealedAdmissionKeyError::EmptyField`] rather than a descriptor that
+/// silently merges two genuinely different principals into one partition.
+fn require_audience_binding<'a>(
+    binding: &'a [&'a [u8]],
+) -> Result<&'a [&'a [u8]], SealedAdmissionKeyError> {
+    if binding.is_empty() {
+        return Err(SealedAdmissionKeyError::EmptyField);
+    }
+    let mut total = 0_usize;
+    for part in binding {
+        if part.is_empty() {
+            return Err(SealedAdmissionKeyError::EmptyField);
+        }
+        total = total
+            .checked_add(part.len())
+            .ok_or(SealedAdmissionKeyError::FieldTooLong)?;
+        if total > AUDIENCE_BINDING_MAX_BYTES {
+            return Err(SealedAdmissionKeyError::FieldTooLong);
+        }
+    }
+    Ok(binding)
+}
+
 /// The immutable verified security facts every partition key is derived from.
 ///
 /// AUTH-00 A owns the only production producer of these facts. This type is
@@ -93,7 +140,7 @@ pub struct PartitionDescriptor {
     subject: String,
     client: String,
     trust_generation: u64,
-    audience_policy_revision: u64,
+    auth_policy_revision: u64,
     identity: [u8; 32],
 }
 
@@ -109,9 +156,43 @@ impl fmt::Debug for PartitionDescriptor {
 impl PartitionDescriptor {
     /// Builds a descriptor from already-verified provider output.
     ///
-    /// Every string field must be nonempty and within the sealed-key field
-    /// bound. No field may be a request-supplied identifier; AUTH-00 A is
-    /// responsible for that guarantee upstream.
+    /// AUTH-00 A owns the only production producer; see
+    /// `SecurityPartitionDescriptor::to_partition_descriptor`. Every string
+    /// field must be nonempty and within the sealed-key field bound, and
+    /// `audience_binding` must be the verified audience binding's canonical,
+    /// discriminant-led encoding.
+    ///
+    /// # Why the audience binding is a field and not a revision
+    ///
+    /// Carrying a projected policy *revision* cannot distinguish two
+    /// authentication paths that have no audience policy at all. A provider
+    /// authenticating one subject by both mutual TLS and a static credential
+    /// would derive a single descriptor for two genuinely different paths, and
+    /// a cache or continuation entry from one would be served to the other.
+    /// Encoding the binding itself makes that collision unrepresentable rather
+    /// than merely avoided by a sentinel convention two modules must agree to
+    /// keep.
+    ///
+    /// # What is deliberately excluded
+    ///
+    /// Verified claims are **not** inputs, and this is a decision rather than
+    /// an omission to be corrected later. Claims change on ordinary token
+    /// rotation, so binding them into descriptor identity would relocate
+    /// [`PartitionAuthorization`] on every refresh and cost a principal access
+    /// to their own continuation records each time they rotated. They belong
+    /// in AUTH-00 A's full identity, not in this admission projection.
+    ///
+    /// The token instance and effective grants are excluded for the same
+    /// reason: [`DurableOwnerKey`] and [`QuotaPartitionKey`] must survive
+    /// rotation and scope churn. Result-affecting facts enter through the
+    /// cache, continuation and subscription key derivations instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedAdmissionKeyError::EmptyField`] for an empty verified
+    /// field, an empty audience binding, or an empty binding part, and
+    /// [`SealedAdmissionKeyError::FieldTooLong`] when a field or the binding
+    /// exceeds its bound.
     #[allow(clippy::too_many_arguments)]
     pub fn from_verified_facts(
         provider: &str,
@@ -122,20 +203,32 @@ impl PartitionDescriptor {
         subject: &str,
         client: &str,
         trust_generation: u64,
-        audience_policy_revision: u64,
+        auth_policy_revision: u64,
+        audience_binding: &[&[u8]],
     ) -> Result<Self, SealedAdmissionKeyError> {
-        let identity = opaque_admission_digest(&[
-            b"auth-00-partition-descriptor-v1",
+        let binding = require_audience_binding(audience_binding)?;
+        let configuration_generation_bytes = configuration_generation.to_be_bytes();
+        let trust_generation_bytes = trust_generation.to_be_bytes();
+        let auth_policy_revision_bytes = auth_policy_revision.to_be_bytes();
+        let binding_count_bytes = u64::try_from(binding.len())
+            .map_err(|_| SealedAdmissionKeyError::FieldTooLong)?
+            .to_be_bytes();
+
+        let mut parts: Vec<&[u8]> = vec![
+            b"auth-00-partition-descriptor-v2",
             require_admission_field(provider)?,
-            &configuration_generation.to_be_bytes(),
+            &configuration_generation_bytes,
             require_admission_field(issuer)?,
             require_admission_field(canonical_resource)?,
             require_admission_field(tenant)?,
             require_admission_field(subject)?,
             require_admission_field(client)?,
-            &trust_generation.to_be_bytes(),
-            &audience_policy_revision.to_be_bytes(),
-        ]);
+            &trust_generation_bytes,
+            &auth_policy_revision_bytes,
+            &binding_count_bytes,
+        ];
+        parts.extend_from_slice(binding);
+
         Ok(Self {
             provider: provider.to_owned(),
             configuration_generation,
@@ -145,8 +238,8 @@ impl PartitionDescriptor {
             subject: subject.to_owned(),
             client: client.to_owned(),
             trust_generation,
-            audience_policy_revision,
-            identity,
+            auth_policy_revision,
+            identity: opaque_admission_digest(&parts),
         })
     }
 
@@ -198,10 +291,15 @@ impl PartitionDescriptor {
         self.trust_generation
     }
 
-    /// The audience-policy revision in force when these facts were verified.
+    /// The authorization-policy revision in force when these facts were
+    /// verified.
+    ///
+    /// Result-affecting: revising the authorization policy moves the
+    /// descriptor identity, so records admitted under the previous policy stop
+    /// being reachable instead of lingering as stale authorization.
     #[must_use]
-    pub const fn audience_policy_revision(&self) -> u64 {
-        self.audience_policy_revision
+    pub const fn auth_policy_revision(&self) -> u64 {
+        self.auth_policy_revision
     }
 
     /// The opaque identity digest over every verified field.
@@ -238,7 +336,7 @@ macro_rules! opaque_partition_key {
 
 opaque_partition_key! {
     /// Response-cache partition: binds the descriptor plus every
-    /// result-affecting fact, so a grant, token or audience-policy change
+    /// result-affecting fact, so a grant or token change
     /// moves the result to a different partition.
     CachePartitionKey
 }
@@ -311,7 +409,6 @@ impl CachePartitionKey {
                 descriptor.identity(),
                 &grants,
                 require_admission_field(token_instance)?,
-                &descriptor.audience_policy_revision().to_be_bytes(),
                 require_admission_field(representation_policy)?,
                 require_admission_field(cache_domain)?,
             ]),
@@ -371,7 +468,8 @@ impl DurableOwnerKey {
 /// The caller's **current** verified authorization for a partition.
 ///
 /// Binds the durable owner to the descriptor identity in force right now, so
-/// a trust-generation or audience-policy bump relocates every record the
+/// a trust-generation, audience-binding or authorization-policy change
+/// relocates every record the
 /// principal could previously reach. Ordinary token rotation and scope churn
 /// do not change it: neither the token instance nor the effective grants are
 /// descriptor fields.
