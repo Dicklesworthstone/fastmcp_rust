@@ -32,6 +32,9 @@ use crate::http_executor::{
 };
 use crate::sse::SseLimits;
 
+/// Typed core subscriptions retaining managed cancellation and token lifetime.
+pub mod subscriptions;
+
 /// Bounds shared renewal and response-head admission. Response bodies retain
 /// the native executor's separate idle/absolute limits after handoff, further
 /// constrained by the original access token's expiry and caller budget.
