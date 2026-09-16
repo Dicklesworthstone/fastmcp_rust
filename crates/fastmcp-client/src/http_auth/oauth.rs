@@ -64,6 +64,8 @@ pub enum OAuthError {
     InvalidTokenResponse,
     ScopeExpansion,
     ExpiredCredential,
+    CredentialBindingMismatch,
+    RefreshUnavailable,
 }
 
 impl fmt::Display for OAuthError {
@@ -85,6 +87,8 @@ impl fmt::Display for OAuthError {
             Self::InvalidTokenResponse => "OAuth token response rejected",
             Self::ScopeExpansion => "OAuth response expanded the requested scopes",
             Self::ExpiredCredential => "OAuth credential already expired",
+            Self::CredentialBindingMismatch => "OAuth credential belongs to a different client binding",
+            Self::RefreshUnavailable => "OAuth credential has no reusable refresh token",
         })
     }
 }
@@ -134,6 +138,9 @@ impl OAuthClientConfiguration {
         // Keep the original issuer spelling for the exact RFC 9207 comparison;
         // canonical network identity must not replace that comparison.
         if issuer.len() > 4096 || issuer.chars().any(char::is_whitespace) {
+            return Err(OAuthError::InvalidConfiguration);
+        }
+        if resource.scheme() != "https" {
             return Err(OAuthError::InvalidConfiguration);
         }
         CanonicalResourceId::parse_for_endpoint(
@@ -279,6 +286,74 @@ impl OAuthClient {
         if cx.checkpoint().is_err() { return Err(OAuthError::Cancelled); }
         if cx.now() >= deadline { return Err(OAuthError::TimedOut); }
         Ok(credentials)
+    }
+
+    /// Renews an access token through the same trusted issuer, registration,
+    /// resource and client policy that admitted the original grant.
+    ///
+    /// Exclusive access to the credentials serializes refresh operations. A
+    /// successful response replaces the complete token pair at once. Narrowed
+    /// scopes become the next refresh ceiling; they cannot silently re-expand.
+    /// When the issuer omits a new refresh token, the previous one is retained.
+    ///
+    /// After dispatch becomes possible, failure or cancellation discards the
+    /// old refresh token rather than retrying a possibly consumed/rotated token.
+    /// The previous access token and its original expiry remain unchanged;
+    /// `has_refresh_token()` becomes false and another login is required for
+    /// future renewal. Preflight failures leave the entire credential untouched.
+    pub async fn refresh(
+        &self,
+        cx: &Cx,
+        credentials: &mut OAuthCredentials,
+    ) -> Result<(), OAuthError> {
+        let deadline = operation_deadline(cx, TOKEN_TIMEOUT)?;
+        let (body, previous_refresh) = self.prepare_refresh(credentials)?;
+        let started = Instant::now();
+        let response = self.exchange(cx, deadline, body).await?;
+        // Do not publish a new token pair after the caller has cancelled.
+        if cx.checkpoint().is_err() { return Err(OAuthError::Cancelled); }
+        if cx.now() >= deadline { return Err(OAuthError::TimedOut); }
+        let mut replacement = self.admit_refresh(credentials, previous_refresh, &response, started)?;
+        if cx.checkpoint().is_err() { return Err(OAuthError::Cancelled); }
+        if cx.now() >= deadline { return Err(OAuthError::TimedOut); }
+        std::mem::swap(credentials, &mut replacement);
+        Ok(())
+    }
+
+    fn prepare_refresh(&self, credentials: &mut OAuthCredentials) -> Result<(String, String), OAuthError> {
+        if credentials.configuration != self.configuration {
+            return Err(OAuthError::CredentialBindingMismatch);
+        }
+        let previous = credentials.refresh_token.as_deref().ok_or(OAuthError::RefreshUnavailable)?;
+        let scope = credentials.scopes.join(" ");
+        let mut fields = vec![
+            ("grant_type", "refresh_token"),
+            ("client_id", self.configuration.client_id.as_str()),
+            ("refresh_token", previous),
+            ("resource", self.configuration.resource.as_str()),
+        ];
+        if !scope.is_empty() { fields.push(("scope", scope.as_str())); }
+        let body = encode_form(&fields)?;
+        // All fallible local validation precedes this ownership transfer. Once
+        // an exchange is possible, cancellation cannot put this secret back.
+        let previous = credentials.refresh_token.take().ok_or(OAuthError::RefreshUnavailable)?;
+        Ok((body, previous))
+    }
+
+    fn admit_refresh(
+        &self,
+        previous: &OAuthCredentials,
+        previous_refresh: String,
+        response: &[u8],
+        started: Instant,
+    ) -> Result<OAuthCredentials, OAuthError> {
+        let mut replacement = admit_token_response(
+            &self.configuration, &previous.scopes, response, started,
+        )?;
+        if replacement.refresh_token.is_none() {
+            replacement.refresh_token = Some(previous_refresh);
+        }
+        Ok(replacement)
     }
 
     async fn exchange(&self, cx: &Cx, deadline: Time, body: String) -> Result<Vec<u8>, OAuthError> {
@@ -919,5 +994,95 @@ mod tests {
                 TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)
             }).await.is_err());
         });
+    }
+
+    fn renewable_grant(config: &OAuthClientConfiguration) -> OAuthCredentials {
+        admit_token_response(config, &config.scopes,
+            br#"{"access_token":"access-one","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-one"}"#,
+            Instant::now(),
+        ).unwrap()
+    }
+
+    #[test]
+    fn refresh_rotation_replaces_the_pair_and_preserves_a_narrowed_scope_ceiling() {
+        let config = config();
+        let client = OAuthClient::new(config.clone());
+        let mut grant = renewable_grant(&config);
+        let (body, previous) = client.prepare_refresh(&mut grant).unwrap();
+        let fields = decode_form(&body).unwrap();
+        assert_eq!(fields["grant_type"], "refresh_token");
+        assert_eq!(fields["refresh_token"], "refresh-one");
+        assert_eq!(fields["resource"], "https://mcp.example/mcp");
+        assert!(!fields.contains_key("code_verifier"));
+        assert!(!grant.has_refresh_token());
+        let replacement = client.admit_refresh(&grant, previous,
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":"refresh-two","scope":"tools:read"}"#,
+            Instant::now(),
+        ).unwrap();
+        grant = replacement;
+        assert_eq!(grant.access.authorization_for_target(&config.resource), Some("Bearer access-two".to_owned()));
+        let (body, previous) = client.prepare_refresh(&mut grant).unwrap();
+        let fields = decode_form(&body).unwrap();
+        assert_eq!(fields["refresh_token"], "refresh-two");
+        assert_eq!(fields["scope"], "tools:read");
+        let invalid = client.admit_refresh(&grant, previous,
+            br#"{"access_token":"access-three","token_type":"Bearer","scope":"tools:write"}"#,
+            Instant::now(),
+        );
+        assert_eq!(invalid.err(), Some(OAuthError::ScopeExpansion));
+        assert!(!grant.has_refresh_token());
+        assert_eq!(grant.access.authorization_for_target(&config.resource), Some("Bearer access-two".to_owned()));
+    }
+
+    #[test]
+    fn refresh_without_rotation_retains_the_previous_token_only_after_valid_admission() {
+        let config = config();
+        let client = OAuthClient::new(config.clone());
+        let mut grant = renewable_grant(&config);
+        let (_, previous) = client.prepare_refresh(&mut grant).unwrap();
+        let replacement = client.admit_refresh(&grant, previous,
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120}"#,
+            Instant::now(),
+        ).unwrap();
+        assert_eq!(replacement.refresh_token.as_deref(), Some("refresh-one"));
+        assert_eq!(replacement.scopes, config.scopes);
+    }
+
+    #[test]
+    fn refresh_preflight_refuses_cross_binding_without_consuming_any_credential() {
+        let config = config();
+        let mut grant = renewable_grant(&config);
+        let access_before = grant.access.authorization_for_target(&config.resource);
+        let expiry_before = grant.expires_at;
+        for dimension in 0..5 {
+            let mut other = config.clone();
+            match dimension {
+                0 => other.issuer = "https://other.example".to_owned(),
+                1 => other.token_endpoint = url("https://other.example/token"),
+                2 => other.resource = url("https://other.example/mcp"),
+                3 => other.client_id = "another-client".to_owned(),
+                _ => other.max_access_token_lifetime = Duration::from_secs(1),
+            }
+            assert_eq!(OAuthClient::new(other).prepare_refresh(&mut grant).err(), Some(OAuthError::CredentialBindingMismatch));
+            assert_eq!(grant.refresh_token.as_deref(), Some("refresh-one"));
+            assert_eq!(grant.access.authorization_for_target(&config.resource), access_before);
+            assert_eq!(grant.expires_at, expiry_before);
+        }
+    }
+
+    #[test]
+    fn abandoned_refresh_custody_cannot_replay_the_previous_refresh_token() {
+        let config = config();
+        let client = OAuthClient::new(config.clone());
+        let mut grant = renewable_grant(&config);
+        let access_before = grant.access.authorization_for_target(&config.resource);
+        let expiry_before = grant.expires_at;
+        // The transport owns the body and previous token after this point.
+        // Losing that future has the same ownership outcome as a lost reply.
+        drop(client.prepare_refresh(&mut grant).unwrap());
+        assert_eq!(client.prepare_refresh(&mut grant).err(), Some(OAuthError::RefreshUnavailable));
+        assert_eq!(grant.access.authorization_for_target(&config.resource), access_before);
+        assert_eq!(grant.expires_at, expiry_before);
+        assert!(!grant.has_refresh_token());
     }
 }
