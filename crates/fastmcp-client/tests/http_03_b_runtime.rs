@@ -1426,6 +1426,21 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
             )
             .expect("write callback admission barrier");
             assert_connection_closed_by_client(&mut aborted);
+        } else {
+            // The server ends this exchange itself, so it completes the body.
+            //
+            // "Aborted response" here means a response stream that ends
+            // WITHOUT its correlated terminal message, not a severed
+            // transport. Those are different wire conditions and the client
+            // distinguishes them: a clean end yields `Ok(None)` and surfaces
+            // `UnexpectedResponseMessage { request_id }`
+            // (http_executor.rs:4736-4741), which is exactly what this case
+            // asserts, while a truncated chunked body yields `Err(..)` and
+            // surfaces `Modern(Executor(..))`. Dropping the socket without
+            // this terminating chunk would silently switch the case onto the
+            // truncation path and stop testing what it names.
+            end_sse_response(&mut aborted)
+                .expect("close the aborted response body without its terminal");
         }
         drop(aborted);
 
@@ -1593,18 +1608,55 @@ fn require_modern_response(
     }
 }
 
+/// Opens a streaming SSE response with chunked transfer coding.
+///
+/// The body must be chunk-framed rather than close-delimited. The pinned
+/// `asupersync` h1 client selects its body framing from the response head and
+/// has no close-delimited mode: `BodyKind` is `ContentLength`/`Chunked`/`Empty`
+/// only, and `ResponseHead::body_kind` falls through to `Empty` when a head
+/// carries neither `Content-Length` nor `Transfer-Encoding`. A head without
+/// framing therefore delivers **zero events** to the client, and an
+/// under-asserting test passes while observing nothing.
+///
+/// Every writer that appends to this body must emit a chunk — see
+/// [`write_sse_chunk`], which the event and comment writers both route through.
 fn begin_sse_response(stream: &mut TcpStream) {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     )
     .expect("write SSE response head");
     stream.flush().expect("flush SSE response head");
 }
 
-fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) -> std::io::Result<()> {
-    write!(stream, "data: {payload}\n\n")?;
+/// Writes one chunk of a chunk-framed SSE body.
+///
+/// Each call is its own chunk, so a caller places a chunk boundary wherever it
+/// writes. A zero-length payload is refused because it would encode the
+/// terminating chunk and end the body early; use [`end_sse_response`] for that.
+fn write_sse_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    assert!(
+        !bytes.is_empty(),
+        "a zero-length chunk would terminate the response body"
+    );
+    write!(stream, "{:x}\r\n", bytes.len())?;
+    stream.write_all(bytes)?;
+    write!(stream, "\r\n")?;
     stream.flush()
+}
+
+/// Ends a chunk-framed SSE body with its terminating zero-length chunk.
+///
+/// Sites whose changed variable is an abrupt server-side abort deliberately do
+/// **not** call this: an unterminated chunked body is the correct wire form of
+/// an aborted response, and completing it would erase the condition under test.
+fn end_sse_response(stream: &mut TcpStream) -> std::io::Result<()> {
+    write!(stream, "0\r\n\r\n")?;
+    stream.flush()
+}
+
+fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) -> std::io::Result<()> {
+    write_sse_chunk(stream, format!("data: {payload}\n\n").as_bytes())
 }
 
 fn progress_event(marker: &ProgressMarker, progress: u64) -> serde_json::Value {
@@ -1690,8 +1742,7 @@ fn assert_subscription_request(request: &CapturedHttpRequest, filter: &Subscript
 }
 
 fn write_sse_comment(stream: &mut TcpStream, comment: &str) -> std::io::Result<()> {
-    write!(stream, ": {comment}\n\n")?;
-    stream.flush()
+    write_sse_chunk(stream, format!(": {comment}\n\n").as_bytes())
 }
 
 #[test]
@@ -1720,6 +1771,9 @@ fn http_03_b_subscription_ack_accepted_event_refreshes_idle_positive() {
         thread::sleep(Duration::from_millis(100));
         write_sse_event(&mut stream, &subscription_terminal_event())
             .expect("write subscription terminal");
+        // This server completes its intended output, so the chunked body is
+        // closed properly rather than left truncated.
+        end_sse_response(&mut stream).expect("close the subscription response body");
     });
 
     runtime_block_on(async {
@@ -1931,7 +1985,10 @@ fn http_03_b_subscription_inert_fields_and_partial_comments_do_not_reset_idle_ne
                 } else {
                     format!("event: inert-{index}\n\n").into_bytes()
                 };
-                if stream.write_all(&bytes).is_err() || stream.flush().is_err() {
+                // Routed through the chunk writer like every other append to
+                // this body; the inert-field content under test is the chunk
+                // payload, not the HTTP framing.
+                if write_sse_chunk(&mut stream, &bytes).is_err() {
                     return;
                 }
             }
@@ -2708,6 +2765,9 @@ fn http_03_b_public_builder_progress_resets_idle_but_not_absolute_positive() {
         }
         write_sse_event(&mut request, &terminal_event(2, "progress-reset-ok"))
             .expect("write terminal event");
+        // This server completes its intended output, so the chunked body is
+        // closed properly rather than left truncated.
+        end_sse_response(&mut request).expect("close the progress response body");
     });
 
     runtime_block_on(async {

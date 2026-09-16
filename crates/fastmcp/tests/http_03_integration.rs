@@ -422,18 +422,44 @@ fn write_bounded_response(
     stream.flush().expect("flush fixture response");
 }
 
+/// Writes the streaming SSE response head.
+///
+/// The head MUST carry an explicit framing header. In asupersync 0.5.0 a
+/// response with neither `Content-Length` nor `Transfer-Encoding` frames an
+/// **empty** body — `BodyKind` has only `ContentLength`, `Chunked`, and
+/// `Empty`, with no close-delimited variant — so the client would observe zero
+/// events on a stream the fixture believed it had written. That failure mode is
+/// silent for any test that only checks "no error", which is why the framing is
+/// chunked here and the terminating chunk is always written.
 fn begin_sse_response(stream: &mut TcpStream) {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: identity\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     )
     .expect("write fixture SSE head");
     stream.flush().expect("flush fixture SSE head");
 }
 
+/// Writes one SSE event as its own chunk, so a chunk boundary sits between
+/// every dispatched event.
 fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) {
-    write!(stream, "data: {payload}\n\n").expect("write fixture SSE event");
+    let body = format!("data: {payload}\n\n").into_bytes();
+    assert!(
+        !body.is_empty(),
+        "a zero-length chunk would terminate the response body early"
+    );
+    write!(stream, "{:x}\r\n", body.len()).expect("write fixture chunk length");
+    stream
+        .write_all(&body)
+        .expect("write fixture chunk payload");
+    write!(stream, "\r\n").expect("write fixture chunk terminator");
     stream.flush().expect("flush fixture SSE event");
+}
+
+/// Closes a chunked SSE body with its terminating zero-length chunk.
+fn end_sse_response(stream: &mut TcpStream) {
+    write!(stream, "0\r\n\r\n").expect("write fixture terminating chunk");
+    stream.flush().expect("flush fixture terminating chunk");
 }
 
 fn accept_bounded(listener: &TcpListener) -> TcpStream {
@@ -724,6 +750,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         //    stream and its waiter survived everything that happened on
         //    /mcp-b, including the planted refusal.
         write_sse_event(&mut a_call_stream, &terminal_tool_event(2));
+        end_sse_response(&mut a_call_stream);
         drop(a_call_stream);
     });
 
@@ -854,13 +881,49 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         };
 
         // Reading past the terminal is the stream-close observation.
-        let a_post_terminal = match a_listener.next_event(&cx).await {
-            Ok(event) => panic!("a closed stream must not yield {event:?}"),
-            Err(ModernHttpFinalCoreListenError::EndOfStream { .. }) => {
-                "closed=end_of_stream".to_owned()
+        //
+        // THE CONTRACT, so nobody re-inverts it: `Ok(None)` is the correct and
+        // deliberate "this stream is finished" signal. Delivering the terminal
+        // sets `terminal_received = true` and calls `stream.close()`, and
+        // `ModernHttpFinalCoreListener::next_event` then short-circuits on that
+        // flag before touching the body at all (`http_executor.rs:1488-1490`).
+        //
+        // `Err(EndOfStream)` is NOT the healthy post-terminal outcome — it is
+        // what a body that ended *without* a terminal produces, i.e. truncation.
+        // An earlier revision of this fixture asserted exactly that, demanding
+        // the failure condition and rejecting the success one, which is why the
+        // first execution of this join reported a closed stream "yielding None".
+        //
+        // Both outcomes are still observed here, on opposite sides: `Ok(None)`
+        // passes, and truncation now fails as the distinct defect it is.
+        let post_terminal = a_listener.next_event(&cx).await;
+        let a_post_terminal = match post_terminal {
+            Ok(None) => "closed=terminal_then_none".to_owned(),
+            Ok(Some(event)) => {
+                panic!("a stream closed by its terminal must not yield another record: {event:?}")
             }
-            Err(other) => panic!("expected a typed end-of-stream, observed {other:?}"),
+            Err(ModernHttpFinalCoreListenError::EndOfStream { framing }) => panic!(
+                "the response body ended without delivering a terminal (framing {framing:?}); \
+                 that is truncation, not the post-terminal close this case observes"
+            ),
+            Err(other) => panic!(
+                "the post-terminal observation is INCONCLUSIVE ({other:?}); it proves neither a \
+                 clean close nor a leaked record"
+            ),
         };
+
+        // The close is stable, not a one-shot transition: a second read past the
+        // terminal must give the same clean signal rather than an error or a
+        // revived record.
+        match a_listener.next_event(&cx).await {
+            Ok(None) => {}
+            Ok(Some(event)) => {
+                panic!("a closed stream must stay closed, but a later read yielded {event:?}")
+            }
+            Err(error) => panic!(
+                "a closed stream must keep reporting its clean terminal signal, observed {error:?}"
+            ),
+        }
 
         ClientOutcome {
             a_era,
@@ -1561,8 +1624,9 @@ fn case_terminal_and_close(builder: &mut CaseBuilder, wire: &WireObservations) {
     builder.positive("terminal", &wire.a_terminal);
     assert_eq!(wire.a_terminal, "terminal=tools_call");
 
-    // One variable: the read position moves past the terminal record.
-    assert_eq!(wire.a_post_terminal, "closed=end_of_stream");
+    // One variable: the read position moves past the terminal record. The
+    // stream answers with its clean finished signal rather than another record.
+    assert_eq!(wire.a_post_terminal, "closed=terminal_then_none");
     builder.negative("read-past-terminal", &wire.a_post_terminal);
 }
 
@@ -2127,7 +2191,7 @@ fn http_03_i_positive() {
         receipt
             .case("HTTP-03.13")
             .record
-            .contains("closed=end_of_stream"),
+            .contains("closed=terminal_then_none"),
         "the owning stream must close exactly once after its terminal"
     );
 }
@@ -2188,7 +2252,7 @@ fn http_03_i_planted_negative() {
         planted
             .case("HTTP-03.13")
             .record
-            .contains("closed=end_of_stream"),
+            .contains("closed=terminal_then_none"),
         "the sibling stream must close exactly once, unaffected by the plant"
     );
 
