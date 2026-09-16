@@ -48,6 +48,8 @@ mod context;
 pub mod crypto;
 mod duration;
 mod error;
+/// AUTH-00 A verified principal, secret-fingerprint, and replay-purpose types.
+pub mod ingress;
 pub mod logging;
 /// AUTH-00 B security-partition admission and non-oracular lookup.
 pub mod partition;
