@@ -28,8 +28,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::{CancelKind, Cx};
+use fastmcp_client::http_auth::BoundBearerCredential;
 use fastmcp_client::http_executor::ModernHttpClient;
 use fastmcp_client::{
     CanonicalHttpUrl, ClientProtocolPlan, LEG_HTTP_01_B_EVALUATOR_MANIFEST_V1, LimitConflict,
@@ -244,6 +245,17 @@ impl SessionOutcome {
 /// driven by polling it with a noop waker, because nothing would advance the
 /// reactor.
 fn legacy_session(script: Script, reads: usize) -> SessionOutcome {
+    legacy_session_with(script, reads, false)
+}
+
+/// As [`legacy_session`], but optionally cancels the CLIENT's context after the
+/// lane opens and before the first read.
+///
+/// The client is given a context this function mints, never the ambient one, so
+/// cancelling it cancels the client alone and leaves the runtime's own context
+/// intact. `Cx::clone` would not do: it is an alias, so cancelling a clone would
+/// take the ambient domain down with it.
+fn legacy_session_with(script: Script, reads: usize, cancel_before_read: bool) -> SessionOutcome {
     let fixture = Fixture::bind();
     let (modern, sse, message) = (
         fixture.modern.clone(),
@@ -324,7 +336,8 @@ fn legacy_session(script: Script, reads: usize) -> SessionOutcome {
     });
 
     let outcome = runtime_block_on(async {
-        let cx = Cx::current().expect("the caller runtime installs a current Cx");
+        // A context minted for the client, not the ambient one.
+        let cx = Cx::for_request();
         let mut outcome = SessionOutcome::default();
         let connected = ModernHttpClient::connect(
             &cx,
@@ -349,6 +362,9 @@ fn legacy_session(script: Script, reads: usize) -> SessionOutcome {
         };
         outcome.configured = Some(legacy.configured_message_post_target().to_owned());
         outcome.advertised = Some(legacy.advertised_message_post_target().to_owned());
+        if cancel_before_read {
+            cx.cancel_with(CancelKind::User, Some("leg-http-01-b row 10"));
+        }
         for _ in 0..reads {
             let result = legacy.next_message(&cx).await;
             outcome.messages.push(format!("{result:?}"));
@@ -500,6 +516,44 @@ fn leg_http_01_b_positive() {
             refused.open_error
         );
     }
+
+    // ---- row 02: credential binding, to the extent it is provable ------
+    //
+    // The exact-2024 lane never carries a credential, and that is structural
+    // rather than incidental: `BoundBearerCredential::bind` refuses a cleartext
+    // resource outright, so no credential can even be constructed for a
+    // loopback `http:` legacy lane. The transport-side guard exists too - an
+    // authorised legacy fallback with a credential in hand refuses with
+    // `AuthenticatedLegacyFallback` rather than opening the lane - but driving
+    // that live needs an HTTPS fixture, which this target does not have. That
+    // half is declared unproven rather than implied; see the report on this
+    // bead.
+    for cleartext in [
+        "http://127.0.0.1:8443/mcp",
+        "http://[::1]:8443/mcp",
+        "http://localhost:8443/mcp",
+    ] {
+        let resource = CanonicalHttpUrl::parse(cleartext).expect("the cleartext variant parses");
+        assert!(
+            BoundBearerCredential::bind(resource, "leg-http-01-b-secret").is_err(),
+            "{cleartext}: a cleartext legacy lane must not be able to hold a credential"
+        );
+    }
+
+    // ---- row 10: cancellation ------------------------------------------
+    //
+    // The client is cancelled, not the ambient runtime context - the session
+    // helper mints the client's own context for exactly this reason.
+    let cancelled = legacy_session_with(Script::OneMessage, 1, true);
+    assert!(
+        cancelled.opened(),
+        "the lane must open before the caller cancels it"
+    );
+    assert!(
+        cancelled.messages[0].contains("Cancelled"),
+        "a cancelled caller must reach the typed cancellation boundary, observed {}",
+        cancelled.messages[0]
+    );
 
     // ---- row 06: size backpressure, MEASURED not declared --------------
     let observed = measure_sse_line_bound()
