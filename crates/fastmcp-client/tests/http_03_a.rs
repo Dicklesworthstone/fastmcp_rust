@@ -2096,7 +2096,9 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
                     serde_json::json!({
                         "name": "progress_tool",
                         "arguments": {},
-                        "_meta": {"progressToken": marker},
+                        // Cloned: `json!` serializes by value, and the marker is
+                        // still needed to prove progress ownership afterwards.
+                        "_meta": {"progressToken": marker.clone()},
                     }),
                     RequestId::Number(2),
                     limits(),
