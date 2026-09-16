@@ -49,6 +49,8 @@ pub mod crypto;
 mod duration;
 mod error;
 pub mod logging;
+/// AUTH-00 B security-partition admission and non-oracular lookup.
+pub mod partition;
 pub mod runtime;
 mod state;
 pub mod uri;
@@ -756,7 +758,7 @@ pub mod limits {
     const OPAQUE_ADMISSION_KEY_HASH_LIMIT: usize = 64 * 1024;
     const MAX_ADMISSION_FIELD_BYTES: usize = 8 * 1024;
 
-    fn require_admission_field(value: &str) -> Result<&[u8], SealedAdmissionKeyError> {
+    pub(crate) fn require_admission_field(value: &str) -> Result<&[u8], SealedAdmissionKeyError> {
         if value.is_empty() {
             return Err(SealedAdmissionKeyError::EmptyField);
         }
@@ -766,7 +768,7 @@ pub mod limits {
         Ok(value.as_bytes())
     }
 
-    fn opaque_admission_digest(parts: &[&[u8]]) -> [u8; 32] {
+    pub(crate) fn opaque_admission_digest(parts: &[&[u8]]) -> [u8; 32] {
         let mut encoded = Vec::new();
         for part in parts {
             encoded.extend_from_slice(&(part.len() as u64).to_be_bytes());
