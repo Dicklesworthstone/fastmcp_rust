@@ -61686,7 +61686,7 @@ mod live_websocket_bind {
 }
 
 #[test]
-fn fnd_03_i_positive() {
+fn fnd_03_i_e2e_positive() {
     fnd_03_integration_positive();
 }
 
@@ -61739,7 +61739,7 @@ fn fnd_03_integration_positive() {
 }
 
 #[test]
-fn fnd_03_i_planted_negative() {
+fn fnd_03_i_e2e_planted_negative() {
     fnd_03_integration_planted_negative();
 }
 
