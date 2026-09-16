@@ -131,7 +131,17 @@ const CANONICAL_MODERN: [WireFixture; 8] = [
     WireFixture {
         id: "modern/response-error/full",
         populated: Population::Full,
-        canonical: r#"{"jsonrpc":"2.0","error":{"code":-32602,"data":{"field":"name"},"message":"Invalid params"},"id":"req-1"}"#,
+        // NOTE: the error object is `code, message, data` — the DECLARATION
+        // order of the `JsonRpcError` struct, which carries a plain
+        // `#[derive(Serialize)]` (fastmcp-protocol/src/jsonrpc.rs:1012-1021).
+        // Do not "tidy" this to alphabetical. Free-form objects elsewhere in
+        // this corpus (`params`, `result` contents) ARE alphabetical, because
+        // they are `serde_json::Value` maps and `preserve_order` is not
+        // enabled, so `Map` is a `BTreeMap`. Two deterministic orderings
+        // coexist in one frame: typed structs use declaration order, untyped
+        // Value maps sort. Assuming one uniform rule is what made this fixture
+        // wrong on its first execution.
+        canonical: r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid params","data":{"field":"name"}},"id":"req-1"}"#,
     },
 ];
 
