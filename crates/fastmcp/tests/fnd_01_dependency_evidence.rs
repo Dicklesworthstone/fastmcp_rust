@@ -163,6 +163,71 @@ mod trust_std {
 
     pub const AUTHORING_PATHS: [&str; 3] = ["evidence/fnd-01/dependency-verification.toml", "crates/fastmcp/tests/fnd_01_dependency_evidence.rs", "crates/fastmcp/examples/fnd_01_evidence_harness.rs"];
     const AUTHORING_LIMITS: [u64; 3] = [MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, MAX_HARNESS_BYTES];
+
+    /// Stable diagnostic raised when the policy's declared authoring set and
+    /// the verifier's bound [`AUTHORING_PATHS`] disagree.
+    pub const E_AUTHORING_ORDERED_PATHS: &str = "E_AUTHORING_ORDERED_PATHS";
+
+    /// Decodes `[authoring_closure_contract] ordered_paths` from the policy.
+    ///
+    /// This is the row the authoring closure preimage is *defined* over. Until
+    /// this function existed it had zero readers anywhere in the workspace: the
+    /// authoritative input set was declared twice, once here and once as the
+    /// compiled [`AUTHORING_PATHS`], with nothing reconciling the two copies.
+    /// A divergence would therefore have left every freeze test green while the
+    /// policy declared a different set of inputs than the one actually frozen.
+    pub fn declared_authoring_ordered_paths(policy_bytes: &[u8]) -> TrustResult<Vec<String>> {
+        let sections = parse_closed_toml(policy_bytes, MAX_POLICY_BYTES, "authoring ordered_paths")?;
+        let section = sections
+            .iter()
+            .find(|section| !section.array && section.path == "authoring_closure_contract")
+            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "policy has no [authoring_closure_contract] table"))?;
+        let raw = section
+            .fields
+            .get("ordered_paths")
+            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "[authoring_closure_contract] declares no ordered_paths"))?;
+        let inner = raw
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths is not an inline array"))?;
+        if inner.is_empty() {
+            return Err(TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths is empty"));
+        }
+        let mut declared = Vec::new();
+        for element in inner.split(", ") {
+            if declared.len() >= AUTHORING_PATHS.len() {
+                return Err(TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths declares more rows than the verifier binds"));
+            }
+            declared.push(decode_toml_basic_string(element, "ordered_paths element")?);
+        }
+        Ok(declared)
+    }
+
+    /// Fails closed unless `declared` equals [`AUTHORING_PATHS`] exactly: same
+    /// element count, same order, same bytes.
+    ///
+    /// `declared` is taken as a parameter rather than re-read inside, so that a
+    /// caller can present a mutated declaration. An equality check that derived
+    /// both sides from [`AUTHORING_PATHS`] would be anchored to the constant
+    /// under test and could never fail (RH-5); the compiled constant is the
+    /// expectation here, and the policy's declaration is the input.
+    pub fn admit_authoring_ordered_paths(declared: &[String]) -> TrustResult<()> {
+        if declared.len() != AUTHORING_PATHS.len() {
+            return Err(TrustError::new(
+                E_AUTHORING_ORDERED_PATHS,
+                format!("policy declares {} authoring paths, verifier binds {}", declared.len(), AUTHORING_PATHS.len()),
+            ));
+        }
+        for (index, (declared_path, bound_path)) in declared.iter().zip(AUTHORING_PATHS.iter().copied()).enumerate() {
+            if declared_path.as_str() != bound_path {
+                return Err(TrustError::new(
+                    E_AUTHORING_ORDERED_PATHS,
+                    format!("ordered_paths[{index}]: policy declares {declared_path:?}, verifier binds {bound_path:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
     pub const INTEGRATION_SEAL_PATHS: [&str; 5] = [
         "Cargo.lock",
         "evidence/fnd-01/integration/source-snapshot.toml",
@@ -53239,8 +53304,8 @@ dependency_kinds = ["build", "normal"]
     #[test]
     fn authoring_closure_marker_round_trip() {
         use super::trust_std::{
-            AUTHORING_PATHS, AuthoringMarker, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, authoring_closure_preimage, encode_lower_hex, integration_seal_preimage, parse_authoring_marker,
-            parse_integration_seal,
+            AUTHORING_PATHS, AuthoringMarker, E_AUTHORING_ORDERED_PATHS, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, admit_authoring_ordered_paths, authoring_closure_preimage,
+            declared_authoring_ordered_paths, encode_lower_hex, integration_seal_preimage, parse_authoring_marker, parse_integration_seal,
         };
 
         let root = repository_root();
@@ -53275,6 +53340,57 @@ dependency_kinds = ["build", "normal"]
             ),
             "live marker must use the exact canonical grammar",
         );
+
+        // ------------------------------------------------------------------
+        // The policy's own declaration of the authoritative input set is read
+        // and enforced here. Before this it had zero readers in the workspace:
+        // `ordered_paths` and the compiled `AUTHORING_PATHS` declared the same
+        // three inputs independently, agreeing by care rather than by
+        // construction, so a divergence would have left this very test green
+        // while the policy named a different set than the one being frozen.
+        // ------------------------------------------------------------------
+        let policy_bytes = fs::read(root.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}"));
+        let declared_paths = declared_authoring_ordered_paths(&policy_bytes).expect("policy must declare [authoring_closure_contract] ordered_paths");
+        admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
+
+        // Planted negatives. The changed variable is one element of a COPY of
+        // the policy's declaration; `AUTHORING_PATHS` is never mutated, so a
+        // refusal cannot come from moving the expectation (RH-5).
+        let mut drifted_bytes = declared_paths.clone();
+        drifted_bytes[1].push_str(".bak");
+        assert_eq!(
+            admit_authoring_ordered_paths(&drifted_bytes).expect_err("a single changed path byte must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path byte drift",
+        );
+
+        let mut reordered = declared_paths.clone();
+        reordered.swap(0, 2);
+        assert_eq!(
+            admit_authoring_ordered_paths(&reordered).expect_err("a reordered declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path order drift",
+        );
+
+        let mut shortened = declared_paths.clone();
+        shortened.pop();
+        assert_eq!(
+            admit_authoring_ordered_paths(&shortened).expect_err("a short declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path count drift",
+        );
+
+        let mut extended = declared_paths.clone();
+        extended.push(AUTHORING_PATHS[0].to_owned());
+        assert_eq!(
+            admit_authoring_ordered_paths(&extended).expect_err("a long declaration must fail closed").code(),
+            E_AUTHORING_ORDERED_PATHS,
+            "declared-path surplus drift",
+        );
+
+        // Restored: the unmutated declaration is accepted again, so the four
+        // refusals above came from the mutation and not from a poisoned check.
+        admit_authoring_ordered_paths(&declared_paths).expect("the unmutated declaration must be accepted again");
 
         let mut marker = AuthoringMarker {
             policy: FileBinding { byte_length: 11, sha256: super::trust_std::sha256(b"policy").expect("frozen policy test hash") },
@@ -53540,11 +53656,21 @@ dependency_kinds = ["build", "normal"]
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn authoring_freeze_rejects_owned_path_drift() {
-        use super::trust_std::{AUTHORING_PATHS, FileBinding, MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, SnapshotStage, TrustError, checked_snapshot_set_with_hook};
+        use super::trust_std::{
+            AUTHORING_PATHS, FileBinding, MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, SnapshotStage, TrustError, admit_authoring_ordered_paths, checked_snapshot_set_with_hook,
+            declared_authoring_ordered_paths,
+        };
         use std::fs::OpenOptions;
 
         let repository = repository_root();
         let limits = [MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, MAX_HARNESS_BYTES];
+
+        // The set this test drifts is the set the policy declares. Enforce that
+        // agreement before exercising byte drift, so this test cannot pass by
+        // guarding a different three files than the policy names.
+        let declared_paths =
+            declared_authoring_ordered_paths(&fs::read(repository.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}"))).expect("policy must declare ordered_paths");
+        admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
         let copy_authoring_set = |namespace: &str| {
             let root = super::fresh_test_root(namespace);
             let mut expected = [FileBinding { byte_length: 0, sha256: [0; 32] }; 3];
