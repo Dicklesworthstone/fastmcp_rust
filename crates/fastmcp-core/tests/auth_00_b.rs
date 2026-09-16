@@ -24,6 +24,10 @@
 
 #![forbid(unsafe_code)]
 
+use fastmcp_core::ingress::{
+    SecurityPartitionDescriptor, VerifiedAudienceBinding, VerifiedIdentityFacts,
+    VerifiedIngressAuthentication,
+};
 use fastmcp_core::partition::{
     ATTEMPT_RATE_WINDOW, CachePartitionKey, ContinuationPartitionKey, CredentialStoreKey,
     DEFAULT_ATTEMPTS_PER_MINUTE_PER_PARTITION, DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER,
@@ -52,6 +56,9 @@ const TRUST_GENERATION: u64 = 3;
 const AUDIENCE_POLICY_REVISION: u64 = 11;
 const OWNERSHIP_EPOCH: u64 = 2;
 const QUOTA_EPOCH: u64 = 5;
+const AUDIENCE_POLICY_ID: &str = "audience-policy-main";
+const AUTH_POLICY_REVISION: u64 = 4;
+const VALIDATED_AUDIENCE: &str = "mcp://servers/main";
 
 const TOKEN_INSTANCE: &str = "token-instance-aaaa";
 const ROTATED_TOKEN_INSTANCE: &str = "token-instance-bbbb";
@@ -85,19 +92,56 @@ const BASELINE: VerifiedFacts = VerifiedFacts {
     audience_policy_revision: AUDIENCE_POLICY_REVISION,
 };
 
+/// Records verified provider output through AUTH-00 A's ingress type.
+///
+/// Acceptance row (1): the descriptor B admits on must come from A's verified
+/// ingress value, not from a test literal. Every descriptor in this file is
+/// built through the one production path
+/// `from_verified_provider_output` -> `from_verified_ingress` ->
+/// `to_partition_descriptor`. There is no loose-string constructor call left.
+fn verified_ingress_from(
+    facts: &VerifiedFacts,
+    binding: VerifiedAudienceBinding,
+) -> VerifiedIngressAuthentication {
+    VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+        provider: facts.provider,
+        configuration_generation: facts.configuration_generation,
+        issuer: facts.issuer,
+        canonical_resource: facts.resource,
+        verified_audience_binding: binding,
+        tenant: facts.tenant,
+        subject_or_principal: facts.subject,
+        authorized_party_or_client: facts.client,
+        verified_claims: &[],
+        auth_policy_revision: AUTH_POLICY_REVISION,
+        trust_generation: facts.trust_generation,
+    })
+    .expect("verified provider output must be admitted")
+}
+
+/// The OAuth audience binding these facts were verified under.
+fn oauth_binding(facts: &VerifiedFacts) -> VerifiedAudienceBinding {
+    VerifiedAudienceBinding::OAuth {
+        canonical_resource: facts.resource.to_owned(),
+        validated_audience: VALIDATED_AUDIENCE.to_owned(),
+        audience_policy_id: AUDIENCE_POLICY_ID.to_owned(),
+        audience_policy_revision: facts.audience_policy_revision,
+        provider: facts.provider.to_owned(),
+        configuration_generation: facts.configuration_generation,
+    }
+}
+
+fn security_descriptor_from(
+    facts: &VerifiedFacts,
+    binding: VerifiedAudienceBinding,
+) -> SecurityPartitionDescriptor {
+    SecurityPartitionDescriptor::from_verified_ingress(&verified_ingress_from(facts, binding))
+}
+
 fn descriptor_from(facts: &VerifiedFacts) -> PartitionDescriptor {
-    PartitionDescriptor::from_verified_facts(
-        facts.provider,
-        facts.configuration_generation,
-        facts.issuer,
-        facts.resource,
-        facts.tenant,
-        facts.subject,
-        facts.client,
-        facts.trust_generation,
-        facts.audience_policy_revision,
-    )
-    .expect("verified facts must mint a partition descriptor")
+    security_descriptor_from(facts, oauth_binding(facts))
+        .to_partition_descriptor()
+        .expect("the production projection must yield an admission descriptor")
 }
 
 fn baseline_descriptor() -> PartitionDescriptor {
@@ -667,6 +711,26 @@ fn auth_00_b_positive() {
     assert_eq!(controller.replay_reservation_count(), 1);
 
     // -- Sealed-field refusals --------------------------------------------
+    // Both boundaries must fail closed independently. A refuses the empty
+    // field at ingress, which is the production path; B's constructor is also
+    // public, so it must refuse on its own rather than trusting its caller.
+    assert!(
+        VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+            provider: "",
+            configuration_generation: CONFIGURATION_GENERATION,
+            issuer: ISSUER,
+            canonical_resource: RESOURCE,
+            verified_audience_binding: oauth_binding(&BASELINE),
+            tenant: TENANT,
+            subject_or_principal: SUBJECT,
+            authorized_party_or_client: CLIENT,
+            verified_claims: &[],
+            auth_policy_revision: AUTH_POLICY_REVISION,
+            trust_generation: TRUST_GENERATION,
+        })
+        .is_err(),
+        "AUTH-00 A must refuse an empty verified identity field at ingress"
+    );
     assert_eq!(
         PartitionDescriptor::from_verified_facts(
             "",
@@ -681,6 +745,98 @@ fn auth_00_b_positive() {
         )
         .expect_err("an empty verified field must refuse"),
         SealedAdmissionKeyError::EmptyField
+    );
+
+    // -- Acceptance row (1): descriptor provenance -------------------------
+    // The descriptor admitted above came from A's verified ingress value
+    // through the single production projection, not from a literal.
+    let ingress = verified_ingress_from(&BASELINE, oauth_binding(&BASELINE));
+    let security = SecurityPartitionDescriptor::from_verified_ingress(&ingress);
+    assert_eq!(
+        security
+            .to_partition_descriptor()
+            .expect("the production projection must succeed"),
+        descriptor,
+        "every descriptor in this file is the projection of A's verified ingress value"
+    );
+    assert_eq!(
+        security.verified_ingress().provider(),
+        PROVIDER,
+        "the projection must carry A's verified provider"
+    );
+    assert_eq!(security.verified_ingress().tenant(), TENANT);
+    assert_eq!(security.verified_ingress().subject_or_principal(), SUBJECT);
+    assert!(
+        security
+            .verified_ingress()
+            .verified_audience_binding()
+            .is_oauth(),
+        "the baseline principal was verified under an OAuth audience binding"
+    );
+    assert_eq!(
+        security
+            .verified_ingress()
+            .verified_audience_binding()
+            .audience_policy_id(),
+        Some(AUDIENCE_POLICY_ID)
+    );
+
+    // A's identity digest binds all twelve facts; B's binds the projected
+    // nine. They are different digests over different field sets by design.
+    assert_ne!(
+        security.identity(),
+        descriptor.identity(),
+        "A's twelve-fact identity and B's projected identity are distinct digests"
+    );
+
+    // Different authentication paths for the same subject must not collide.
+    // A distinguishes them structurally, by variant discriminant.
+    let mutual_tls = security_descriptor_from(&BASELINE, VerifiedAudienceBinding::MutualTlsPeer);
+    let static_credential =
+        security_descriptor_from(&BASELINE, VerifiedAudienceBinding::StaticCredential);
+    assert_ne!(
+        security.identity(),
+        mutual_tls.identity(),
+        "OAuth and mutual-TLS ingress for one subject are different principals"
+    );
+    assert_ne!(
+        mutual_tls.identity(),
+        static_credential.identity(),
+        "mutual-TLS and static-credential ingress for one subject are different principals"
+    );
+
+    // The same separation must survive the projection into B's admission
+    // descriptor, or a cache entry from one path could be served to the other.
+    // Today this holds because A projects a distinct sentinel per non-OAuth
+    // variant; this assertion is what keeps that convention honest from B's
+    // side until the binding becomes a structural descriptor field.
+    let mutual_tls_admission = mutual_tls
+        .to_partition_descriptor()
+        .expect("mutual-TLS projection succeeds");
+    let static_admission = static_credential
+        .to_partition_descriptor()
+        .expect("static-credential projection succeeds");
+    assert_ne!(
+        descriptor.identity(),
+        mutual_tls_admission.identity(),
+        "the OAuth and mutual-TLS admission descriptors must not collide"
+    );
+    assert_ne!(
+        mutual_tls_admission.identity(),
+        static_admission.identity(),
+        "the mutual-TLS and static-credential admission descriptors must not collide"
+    );
+    // And the separation must reach the partition keys a result is stored
+    // under, which is the property that actually prevents cross-path serving.
+    assert_ne!(
+        cache_key(&mutual_tls_admission, &GRANTS, TOKEN_INSTANCE),
+        cache_key(&static_admission, &GRANTS, TOKEN_INSTANCE),
+        "two authentication paths must not share a cache partition"
+    );
+    assert_eq!(
+        controller.lookup(&authorization(&mutual_tls_admission), &slot),
+        LookupOutcome::Absent,
+        "a mutual-TLS principal must not reach the OAuth principal's record"
     );
 }
 
