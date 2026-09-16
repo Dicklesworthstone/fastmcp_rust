@@ -90,6 +90,7 @@ let _ = Client::sse_with_cx;
 "
 )]
 pub mod http_executor;
+pub mod leg_http_01;
 pub mod leg_neg;
 pub mod leg_neg_stdio;
 #[cfg(feature = "apps")]
@@ -173,6 +174,10 @@ pub use mcp_apps::{
     McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
     McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_pair,
     mcp_apps_in_memory_wire_pair,
+};
+pub use leg_http_01::{
+    FrozenLimit, LEG_HTTP_01_B_EVALUATOR_MANIFEST_V1, LimitConflict, ObservedLimit, frozen_limits,
+    leg_http_01_b_manifest_digest, ordered_rows,
 };
 pub use leg_neg::{
     FallbackDecision, FallbackState, HttpFallbackCoordinator, HttpFallbackError, LegacyGetPermit,
