@@ -632,6 +632,25 @@ impl StaticTokenVerifier {
         I: IntoIterator<Item = (K, AuthContext)>,
         K: Into<String>,
     {
+        Self::new_with_expiry(
+            tokens
+                .into_iter()
+                .map(|(token, context)| (token, context, None)),
+        )
+    }
+
+    /// Creates a verifier with credentials and their deadlines admitted
+    /// together, before any credential can be verified.
+    ///
+    /// Each entry is `(token, context, deadline)`. `None` means no expiration;
+    /// a deadline at or before the verification instant denies access. Expired
+    /// entries are allowed in the configuration but never authenticate. This
+    /// constructor does not interpret wall-clock claims such as JWT `exp`.
+    pub fn new_with_expiry<I, K>(tokens: I) -> McpResult<Self>
+    where
+        I: IntoIterator<Item = (K, AuthContext, Option<Instant>)>,
+        K: Into<String>,
+    {
         Ok(Self {
             tokens: Arc::new(RwLock::new(Self::admit_tokens(tokens)?)),
             allowed_schemes: None,
@@ -640,11 +659,11 @@ impl StaticTokenVerifier {
 
     fn admit_tokens<I, K>(tokens: I) -> McpResult<HashMap<Sha256Digest, StaticTokenEntry>>
     where
-        I: IntoIterator<Item = (K, AuthContext)>,
+        I: IntoIterator<Item = (K, AuthContext, Option<Instant>)>,
         K: Into<String>,
     {
         let mut digests = HashMap::new();
-        for (token, context) in tokens {
+        for (token, context, expires_at) in tokens {
             if digests.len() >= MAX_STATIC_TOKEN_ENTRIES {
                 return Err(auth_error("Static token configuration is invalid"));
             }
@@ -667,7 +686,7 @@ impl StaticTokenVerifier {
                     digest,
                     StaticTokenEntry {
                         context,
-                        expires_at: None,
+                        expires_at,
                     },
                 )
                 .is_some()
@@ -683,17 +702,36 @@ impl StaticTokenVerifier {
 
     /// Atomically replaces the complete credential set for every clone.
     ///
-    /// Validation, duplicate detection, and allocation of the bounded new map
-    /// finish before the active map is changed. Invalid or empty replacement
-    /// input leaves the previous policy intact; use [`Self::revoke_all`] for
-    /// deliberate deny-all. Existing deadlines follow retained credentials so
-    /// a configuration reload cannot extend or revive an expired entry.
-    /// New credentials have no deadline until [`Self::expire_token_at`] is
-    /// called. This is an administrative grant operation: explicitly adding a
-    /// previously removed credential grants it again.
+    /// Invalid or empty replacement input leaves the previous policy intact;
+    /// use [`Self::revoke_all`] for deliberate deny-all. Existing deadlines
+    /// follow retained credentials, while new credentials have no expiration.
+    /// Use [`Self::replace_tokens_with_expiry`] to install new credentials and
+    /// their deadlines atomically, without an intervening unbounded grant.
     pub fn replace_tokens<I, K>(&self, tokens: I) -> McpResult<()>
     where
         I: IntoIterator<Item = (K, AuthContext)>,
+        K: Into<String>,
+    {
+        self.replace_tokens_with_expiry(
+            tokens
+                .into_iter()
+                .map(|(token, context)| (token, context, None)),
+        )
+    }
+
+    /// Atomically replaces credentials together with optional expiry deadlines.
+    ///
+    /// Validation, duplicate detection, and allocation of the bounded new map
+    /// finish before the active map is changed. For a retained credential, the
+    /// earlier of its existing and proposed deadlines wins: a reload cannot
+    /// extend, remove, or revive an already-expired entry's deadline. Newly
+    /// introduced entries use the supplied deadline, including immediate
+    /// expiry, from their first verification. This is an administrative grant
+    /// operation: explicitly adding a previously removed credential grants it
+    /// again according to the newly supplied policy.
+    pub fn replace_tokens_with_expiry<I, K>(&self, tokens: I) -> McpResult<()>
+    where
+        I: IntoIterator<Item = (K, AuthContext, Option<Instant>)>,
         K: Into<String>,
     {
         let mut replacement = Self::admit_tokens(tokens)?;
@@ -703,7 +741,11 @@ impl StaticTokenVerifier {
             .map_err(|_| auth_error("Static token registry is unavailable"))?;
         for (digest, entry) in &mut replacement {
             if let Some(previous) = active.get(digest) {
-                entry.expires_at = previous.expires_at;
+                entry.expires_at = match (previous.expires_at, entry.expires_at) {
+                    (Some(old), Some(new)) => Some(old.min(new)),
+                    (Some(old), None) => Some(old),
+                    (None, proposed) => proposed,
+                };
             }
         }
         let retired = std::mem::replace(&mut *active, replacement);
@@ -2434,7 +2476,7 @@ mod tests {
             }
         });
         let req = AuthRequest {
-            method: "tools/call",
+            method: "test",
             params: Some(&params),
             transport_authorization: None,
             request_id: 1,
@@ -2620,7 +2662,7 @@ mod tests {
             }
         });
         let req = AuthRequest {
-            method: "tools/call",
+            method: "test",
             params: Some(&params),
             transport_authorization: None,
             request_id: 1,
@@ -2901,7 +2943,7 @@ mod tests {
             .iter()
             .map(|(digest, entry)| {
                 (
-                    digest.clone(),
+                    *digest,
                     (
                         serde_json::to_string(&entry.context).expect("auth facts"),
                         entry.expires_at,
@@ -3049,6 +3091,7 @@ mod tests {
             .unwrap();
         assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
         assert!(authenticate_header(&provider, "Bearer removed-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer fresh-secret").is_err());
         let added = authenticate_header(&provider, "Bearer added-secret").unwrap();
         assert_eq!(added.scopes, revised.scopes);
         assert_eq!(added.subject, revised.subject);
@@ -3196,5 +3239,85 @@ mod tests {
         let debug = format!("{verifier:?}");
         assert!(!debug.contains("poison-secret"));
         assert!(!debug.contains("new-secret"));
+    }
+
+    #[test]
+    fn static_token_initial_expiry_applies_to_the_first_authentication() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(3_600);
+        let verifier = StaticTokenVerifier::new_with_expiry([
+            (
+                "expired-secret",
+                AuthContext::with_subject("expired"),
+                Some(now),
+            ),
+            (
+                "active-secret",
+                AuthContext::with_subject("active"),
+                Some(deadline),
+            ),
+            (
+                "unbounded-secret",
+                AuthContext::with_subject("unbounded"),
+                None,
+            ),
+        ])
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        assert!(authenticate_header(&provider, "Bearer expired-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer active-secret").is_ok());
+        assert!(authenticate_header(&provider, "Bearer unbounded-secret").is_ok());
+        let token = AccessToken::parse("Bearer active-secret").unwrap();
+        assert!(verifier.verify_with_clock(&token, || deadline).is_err());
+    }
+
+    #[test]
+    fn static_token_reload_admits_deadlines_atomically_and_only_shortens_existing_limits() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(3_600);
+        let owner = AuthContext::with_subject("owner");
+        let verifier = StaticTokenVerifier::new_with_expiry([
+            ("retained-secret", owner.clone(), Some(deadline)),
+            ("removed-secret", owner.clone(), None),
+        ])
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        let before = registry_snapshot(&verifier);
+        assert!(
+            verifier
+                .replace_tokens_with_expiry([
+                    ("fresh-secret", owner.clone(), Some(deadline)),
+                    ("fresh-secret", owner.clone(), None),
+                ])
+                .is_err()
+        );
+        assert_eq!(registry_snapshot(&verifier), before);
+        verifier
+            .replace_tokens_with_expiry([
+                (
+                    "retained-secret",
+                    owner.clone(),
+                    Some(deadline + Duration::from_secs(1)),
+                ),
+                ("expired-secret", owner.clone(), Some(now)),
+                ("fresh-secret", owner.clone(), Some(deadline)),
+            ])
+            .unwrap();
+        assert!(authenticate_header(&provider, "Bearer retained-secret").is_ok());
+        assert!(authenticate_header(&provider, "Bearer removed-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer expired-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer fresh-secret").is_ok());
+        let retained = AccessToken::parse("Bearer retained-secret").unwrap();
+        assert!(verifier.verify_with_clock(&retained, || deadline).is_err());
+        verifier
+            .replace_tokens_with_expiry([("retained-secret", owner.clone(), Some(now))])
+            .unwrap();
+        assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
+        verifier.replace_tokens([("retained-secret", owner)]).unwrap();
+        assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
     }
 }
