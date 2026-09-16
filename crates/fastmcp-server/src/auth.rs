@@ -3317,7 +3317,9 @@ mod tests {
             .replace_tokens_with_expiry([("retained-secret", owner.clone(), Some(now))])
             .unwrap();
         assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
-        verifier.replace_tokens([("retained-secret", owner)]).unwrap();
+        verifier
+            .replace_tokens([("retained-secret", owner)])
+            .unwrap();
         assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
     }
 }

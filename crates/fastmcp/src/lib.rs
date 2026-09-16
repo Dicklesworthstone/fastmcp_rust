@@ -13751,4 +13751,206 @@ mod tests {
             after_release_state
         );
     }
+
+    #[test]
+    fn http_03_integration_positive() {
+        use super::client::{
+            BoundBearerCredential, HttpEndpointConfig, MODERN_MCP_ACCEPT,
+            MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpRequest,
+            ModernHttpResponseKind, SubscriptionTimeoutPolicy, validate_response_head,
+        };
+        use super::{CanonicalHttpUrl, ProtocolPolicy};
+        use std::time::Duration;
+
+        let target_url = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+            .expect("canonical https url must parse");
+
+        let credential = BoundBearerCredential::bind(target_url.clone(), "bearer-secret-token-999")
+            .expect("bound bearer credential admits matching https target");
+        assert_eq!(credential.resource(), &target_url);
+
+        let debug_cred = format!("{credential:?}");
+        assert!(debug_cred.contains("<redacted>"));
+        assert!(!debug_cred.contains("bearer-secret-token-999"));
+
+        let request = ModernHttpRequest::new(
+            target_url.as_str(),
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
+            "2026-07-28",
+            "ping",
+            Some("fastmcp-client".to_owned()),
+        )
+        .expect("modern http request admits")
+        .with_authorization(&credential);
+
+        let headers = request.headers();
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    "Content-Type".to_owned(),
+                    MODERN_MCP_CONTENT_TYPE.to_owned()
+                ),
+                ("Accept".to_owned(), MODERN_MCP_ACCEPT.to_owned()),
+                (
+                    "Accept-Encoding".to_owned(),
+                    MODERN_MCP_ACCEPT_ENCODING.to_owned()
+                ),
+                ("MCP-Protocol-Version".to_owned(), "2026-07-28".to_owned()),
+                ("Mcp-Method".to_owned(), "ping".to_owned()),
+                ("Mcp-Name".to_owned(), "fastmcp-client".to_owned()),
+                (
+                    "Authorization".to_owned(),
+                    "Bearer bearer-secret-token-999".to_owned()
+                ),
+            ]
+        );
+
+        let json_head = validate_response_head(
+            200,
+            &[
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("Content-Encoding".to_owned(), "identity".to_owned()),
+            ],
+        )
+        .expect("json response head validates");
+        assert_eq!(json_head.kind(), ModernHttpResponseKind::Json);
+
+        let sse_head = validate_response_head(
+            200,
+            &[(
+                "Content-Type".to_owned(),
+                "text/event-stream; charset=utf-8".to_owned(),
+            )],
+        )
+        .expect("sse response head validates");
+        assert_eq!(sse_head.kind(), ModernHttpResponseKind::Sse);
+
+        let endpoint_config = HttpEndpointConfig::new(
+            ProtocolPolicy::ModernOnly,
+            Some("https://mcp.example.test/mcp".to_owned()),
+            None,
+            None,
+            "credential-partition-alpha".to_owned(),
+            "security-partition-omega".to_owned(),
+            "transport-profile-v1".to_owned(),
+            1,
+            2,
+            0,
+        )
+        .expect("endpoint config admits");
+        assert_eq!(endpoint_config.policy(), ProtocolPolicy::ModernOnly);
+
+        let sub_policy =
+            SubscriptionTimeoutPolicy::new(Duration::from_secs(45), Duration::from_secs(600))
+                .expect("subscription timeout policy admits");
+        assert_eq!(sub_policy.idle_timeout(), Duration::from_secs(45));
+        assert_eq!(sub_policy.absolute_timeout(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn http_03_integration_planted_negative() {
+        use super::client::{
+            BearerBindingError, BoundBearerCredential, HttpEndpointConfig, HttpEndpointConfigError,
+            ModernHttpExecutorError, ModernHttpRequest, validate_response_head,
+        };
+        use super::{CanonicalHttpUrl, ProtocolPolicy};
+
+        let cleartext_remote = CanonicalHttpUrl::parse("http://insecure.example.test/mcp")
+            .expect("cleartext remote url parses");
+        assert_eq!(
+            BoundBearerCredential::bind(cleartext_remote, "secret")
+                .expect_err("cleartext remote must fail"),
+            BearerBindingError::CleartextResource
+        );
+
+        let cleartext_loopback = CanonicalHttpUrl::parse("http://127.0.0.1:8080/mcp")
+            .expect("cleartext loopback url parses");
+        assert_eq!(
+            BoundBearerCredential::bind(cleartext_loopback, "secret")
+                .expect_err("cleartext loopback must fail"),
+            BearerBindingError::CleartextResource
+        );
+
+        let secure_url = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+            .expect("secure https url parses");
+        assert_eq!(
+            BoundBearerCredential::bind(secure_url.clone(), "").expect_err("empty token must fail"),
+            BearerBindingError::EmptyToken
+        );
+
+        assert_eq!(
+            BoundBearerCredential::bind(secure_url.clone(), "secret\r\ninjected-header")
+                .expect_err("newline injected token must fail"),
+            BearerBindingError::InvalidTokenBytes
+        );
+
+        let cred = BoundBearerCredential::bind(secure_url, "secret").unwrap();
+        let cross_origin_req = ModernHttpRequest::new(
+            "https://other-domain.example.test/mcp",
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
+            "2026-07-28",
+            "ping",
+            None,
+        )
+        .unwrap()
+        .with_authorization(&cred);
+        assert!(
+            cross_origin_req
+                .headers()
+                .iter()
+                .all(|(k, _)| k != "Authorization"),
+            "bearer credential must not leak across distinct canonical targets"
+        );
+
+        let gzip_head = validate_response_head(
+            200,
+            &[
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("Content-Encoding".to_owned(), "gzip".to_owned()),
+            ],
+        );
+        assert!(matches!(
+            gzip_head,
+            Err(ModernHttpExecutorError::UnsupportedContentEncoding)
+        ));
+
+        let html_head =
+            validate_response_head(200, &[("Content-Type".to_owned(), "text/html".to_owned())]);
+        assert!(matches!(
+            html_head,
+            Err(ModernHttpExecutorError::UnsupportedSuccessContentType)
+        ));
+
+        let redirect_head = validate_response_head(
+            302,
+            &[(
+                "Location".to_owned(),
+                "https://redirect.example.test/mcp".to_owned(),
+            )],
+        );
+        assert!(matches!(
+            redirect_head,
+            Err(ModernHttpExecutorError::Redirect { status: 302 })
+        ));
+
+        let missing_endpoint = HttpEndpointConfig::new(
+            ProtocolPolicy::ModernOnly,
+            None,
+            None,
+            None,
+            "cred-part".to_owned(),
+            "sec-part".to_owned(),
+            "profile".to_owned(),
+            1,
+            1,
+            0,
+        );
+        assert!(matches!(
+            missing_endpoint,
+            Err(HttpEndpointConfigError::MissingModernPostTarget {
+                policy: ProtocolPolicy::ModernOnly
+            })
+        ));
+    }
 }
