@@ -7,11 +7,13 @@
 //! No transport error, missing response or dropped future is a retry signal.
 //!
 //! This implements the caller-driven MRTR-01 path for tools/call,
-//! resources/read and prompts/get. It does not automatically invoke sampling,
-//! disclose roots, open elicitation URLs, negotiate Tasks, or verify server
-//! requestState signatures. Those are separate host/server responsibilities.
+//! resources/read and prompts/get. The optional `drive` method uses explicit
+//! host callbacks; it never supplies its own model, roots or browser handler.
+//! Tasks negotiation and server requestState signature verification remain
+//! separate host/server responsibilities.
 
 use std::fmt;
+use std::future::Future;
 
 use asupersync::Cx;
 use asupersync::types::Time;
@@ -80,6 +82,8 @@ pub enum ManagedInteractionError {
     ContinuationLimit,
     InputLimit,
     RepeatedRequestId,
+    /// The host declined further resolver or notification processing.
+    AbortedByHost,
     Closed,
     Core(ManagedCoreError),
 }
@@ -96,6 +100,7 @@ impl fmt::Display for ManagedInteractionError {
             Self::ContinuationLimit => "interaction continuation limit exceeded",
             Self::InputLimit => "interaction input-response limit exceeded",
             Self::RepeatedRequestId => "interaction continuation requires a fresh request ID",
+            Self::AbortedByHost => "managed interaction aborted by its host",
             Self::Closed => "managed interaction is closed",
             Self::Core(error) => return fmt::Display::fmt(error, f),
         })
@@ -115,6 +120,16 @@ pub enum ManagedInteractionEvent {
     Notification(Box<ServerNotification>),
     InputRequired(Box<InputRequiredResult>),
     Complete(Box<CoreResult>),
+}
+
+/// A host-selected answer to one admitted challenge. No requestState, target,
+/// method, original arguments or replacement capabilities can be supplied.
+/// Deliberately not Debug/Clone: response payloads may contain private input.
+pub struct ManagedInputReply {
+    /// Fresh ID for the single continuation POST.
+    pub request_id: RequestId,
+    /// Exact correlated replies, or absence for a state-only continuation.
+    pub input_responses: Option<FinalInputResponses>,
 }
 
 enum Step {
@@ -220,6 +235,63 @@ impl ManagedInteraction {
     /// Releases the current response or challenge without cancelling siblings.
     pub fn close(&mut self) { self.step = None; }
 
+    /// Runs this operation through explicitly supplied host callbacks.
+    ///
+    /// `resolve` receives each admitted input-required result once and returns
+    /// a fresh ID plus typed answers. The framework supplies no default resolver
+    /// and opens no URL, model session or filesystem root itself. `notify`
+    /// receives notifications as they arrive, before any later failure. It is
+    /// synchronous and must return promptly without blocking the async runtime.
+    ///
+    /// The resolver future is bounded by this operation's original deadline,
+    /// caller budget and cancellation domain. It must be cancellation-correct
+    /// when dropped. The host remains responsible for its own external effects;
+    /// completing a model/user action cannot be undone if the subsequent POST
+    /// fails. Session closure prevents network continuation, but cancelling a
+    /// host-owned resolver requires this operation's cancellation handle or its
+    /// caller Cx, rather than relying on OAuth session closure alone.
+    ///
+    /// Consuming ownership makes callback failure, invalid answers and dropped
+    /// driver futures terminal: neither the callback nor the POST is retried.
+    /// A manually observed pending challenge can be handed to `drive`; a
+    /// previously delivered final result is never delivered a second time.
+    pub async fn drive<R, F, N>(
+        mut self,
+        cx: &Cx,
+        mut resolve: R,
+        mut notify: N,
+    ) -> Result<Box<CoreResult>, ManagedInteractionError>
+    where
+        R: FnMut(Box<InputRequiredResult>) -> F,
+        F: Future<Output = Result<ManagedInputReply, ManagedInteractionError>>,
+        N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
+    {
+        loop {
+            self.check(cx)?;
+            let event = match self.pending_input() {
+                Some(input) => ManagedInteractionEvent::InputRequired(Box::new(input.clone())),
+                None => self.next_event(cx).await?.ok_or(ManagedInteractionError::Closed)?,
+            };
+            self.check(cx)?;
+            match event {
+                ManagedInteractionEvent::Notification(notification) => {
+                    notify(notification)?;
+                    self.check(cx)?;
+                }
+                ManagedInteractionEvent::InputRequired(input) => {
+                    // Invocation itself occurs inside the guarded future, so a
+                    // pre-existing cancellation cannot run the resolver once.
+                    let reply = bounded_wait(cx, &self.cancellation, self.deadline, async {
+                        Ok(resolve(input).await)
+                    }).await??;
+                    self.check(cx)?;
+                    self.resume(cx, reply.request_id, reply.input_responses).await?;
+                }
+                ManagedInteractionEvent::Complete(result) => return Ok(result),
+            }
+        }
+    }
+
     /// Delivers the next notification, input challenge or complete result.
     /// A challenge is emitted once. Further reads return `InputPending` until
     /// the host explicitly resumes, rather than reporting a false successful EOF.
@@ -242,7 +314,7 @@ impl ManagedInteraction {
         let event = call.next_event(cx).await?.ok_or(ManagedCoreError::MissingTerminal)?;
         self.response_bytes = call.decoder.bytes;
         self.notifications = call.decoder.notifications;
-        check_call(cx, &self.cancellation, self.deadline)?;
+        self.check(cx)?;
         match event {
             ManagedCoreEvent::Notification(notification) => {
                 self.step = Some(Step::Reading(call));
@@ -250,10 +322,16 @@ impl ManagedInteraction {
             }
             ManagedCoreEvent::Result(result) => {
                 if let Some(input) = input_required(&result) {
+                    // No possible next result fits a fully exhausted budget.
+                    // Refuse before exposing a new host-input work item.
+                    if self.response_bytes >= self.limits.core.total_bytes {
+                        return Err(ManagedCoreError::ResponseByteLimit.into());
+                    }
                     admit_challenge(
                         &self.original, input, self.limits,
                         self.continuations, self.input_responses,
                     )?;
+                    self.check(cx)?;
                     let input = Box::new(input.clone());
                     self.step = Some(Step::Awaiting(input.clone()));
                     Ok(Some(ManagedInteractionEvent::InputRequired(input)))
@@ -299,7 +377,7 @@ impl ManagedInteraction {
         )?;
         decoder.bytes = self.response_bytes;
         decoder.notifications = self.notifications;
-        check_call(cx, &self.cancellation, self.deadline)?;
+        self.check(cx)?;
         // Commit local ownership before the first await. A lost response, a
         // cancelled send, or a dropped future cannot resurrect this attempt.
         self.step = None;
