@@ -224,7 +224,7 @@ impl AuthenticatedTransportIngress {
 
     /// Rotation and revalidation facts, when the authorization outlives ingress.
     #[must_use]
-    pub const fn rotation(&self) -> Option<&AuthorizationRotationFacts> {
+    pub fn rotation(&self) -> Option<&AuthorizationRotationFacts> {
         self.rotation.as_ref()
     }
 

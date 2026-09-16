@@ -342,7 +342,7 @@ impl ReplayPurpose {
 
     /// The stable domain separator for this purpose.
     #[must_use]
-    pub const fn domain(self) -> &'static [u8] {
+    pub fn domain(self) -> &'static [u8] {
         match self {
             Self::EnterpriseIdentityAssertionReplay => {
                 b"auth-00-replay-enterprise-identity-assertion-v1"
