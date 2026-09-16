@@ -462,11 +462,15 @@ struct IssuerMetadata {
 }
 
 fn decode_metadata<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, OAuthDiscoveryError> {
-    if body.len() > MAX_OAUTH_METADATA_BYTES {
+    if body.len() > MAX_OAUTH_METADATA_BYTES
+        || body.iter().copied().find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n')) != Some(b'{')
+    {
         return Err(OAuthDiscoveryError::InvalidMetadata);
     }
-    // Derived structs reject repeated security-bearing fields, including
-    // escaped aliases; ordinary unknown metadata remains inert and unfetched.
+    // Serde's derived struct decoder also accepts positional sequences. Require
+    // the JSON object envelope first, without an intermediate Value that would
+    // collapse duplicate keys. Derived structs then reject repeated declared
+    // fields (including escaped aliases); unknown metadata remains inert.
     serde_json::from_slice(body).map_err(|_| OAuthDiscoveryError::InvalidMetadata)
 }
 
@@ -729,6 +733,32 @@ mod tests {
         assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::SignedMetadataUnsupported)));
         let oversized = vec![b' '; MAX_OAUTH_METADATA_BYTES + 1];
         assert!(matches!(plan.select_issuer(&oversized), Err(OAuthDiscoveryError::InvalidMetadata)));
+    }
+
+    #[test]
+    fn metadata_requires_objects_not_positional_structs_or_batch_arrays() {
+        let plan = plan();
+        let resource = json!({
+            "resource": "https://resource.example/mcp",
+            "authorization_servers": ["https://issuer.example/tenant"]
+        });
+        let admitted = format!(" \r\n\t{resource}");
+        assert!(plan.select_issuer(admitted.as_bytes()).is_ok());
+        for body in [
+            json!(["https://resource.example/mcp", ["https://issuer.example/tenant"]]),
+            json!([resource]), json!(null), json!(true), json!("{}"),
+        ] {
+            assert!(matches!(plan.select_issuer(body.to_string().as_bytes()), Err(OAuthDiscoveryError::InvalidMetadata)));
+        }
+        let positional = json!([
+            "https://issuer.example/tenant", "https://issuer.example/authorize",
+            "https://issuer.example/token", ["code"], ["authorization_code"],
+            ["query"], ["none"], ["S256"], true, ["tools:read"],
+            ["https://resource.example/mcp"]
+        ]);
+        assert!(matches!(admit(&plan, &positional), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(matches!(admit(&plan, &json!([issuer_document()])), Err(OAuthDiscoveryError::InvalidMetadata)));
+        assert!(admit(&plan, &issuer_document()).is_ok());
     }
 
     #[test]
