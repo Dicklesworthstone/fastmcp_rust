@@ -24,15 +24,19 @@
 
 #![forbid(unsafe_code)]
 
+use fastmcp_core::ingress::{
+    SecurityPartitionDescriptor, VerifiedAudienceBinding, VerifiedIdentityFacts,
+    VerifiedIngressAuthentication,
+};
 use fastmcp_core::partition::{
-    ATTEMPT_RATE_WINDOW, CachePartitionKey, ContinuationPartitionKey, CredentialStoreKey,
-    DEFAULT_ATTEMPTS_PER_MINUTE_PER_PARTITION, DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER,
-    DEFAULT_REVALIDATIONS_PER_DEPLOYMENT, DEFAULT_REVALIDATIONS_PER_PARTITION,
-    DEFAULT_REVALIDATIONS_PER_PROVIDER, DurableOwnerKey, HARD_ATTEMPTS_PER_MINUTE_PER_PARTITION,
-    HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER, HARD_REVALIDATIONS_PER_DEPLOYMENT,
-    HARD_REVALIDATIONS_PER_PARTITION, HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome,
-    PartitionAdmissionController, PartitionAdmissionError, PartitionAuthorization,
-    PartitionDescriptor, PartitionSlot,
+    ATTEMPT_RATE_WINDOW, AUDIENCE_BINDING_MAX_BYTES, CachePartitionKey, ContinuationPartitionKey,
+    CredentialStoreKey, DEFAULT_ATTEMPTS_PER_MINUTE_PER_PARTITION,
+    DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER, DEFAULT_REVALIDATIONS_PER_DEPLOYMENT,
+    DEFAULT_REVALIDATIONS_PER_PARTITION, DEFAULT_REVALIDATIONS_PER_PROVIDER, DurableOwnerKey,
+    HARD_ATTEMPTS_PER_MINUTE_PER_PARTITION, HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER,
+    HARD_REVALIDATIONS_PER_DEPLOYMENT, HARD_REVALIDATIONS_PER_PARTITION,
+    HARD_REVALIDATIONS_PER_PROVIDER, LookupOutcome, PartitionAdmissionController,
+    PartitionAdmissionError, PartitionAuthorization, PartitionDescriptor, PartitionSlot,
     QuotaPartitionKey, ReplayReservationKey, RevalidationFlightKey, RevalidationLimits,
     RevalidationLimitsError, SubscriptionPartitionKey,
 };
@@ -53,6 +57,9 @@ const TRUST_GENERATION: u64 = 3;
 const AUDIENCE_POLICY_REVISION: u64 = 11;
 const OWNERSHIP_EPOCH: u64 = 2;
 const QUOTA_EPOCH: u64 = 5;
+const AUDIENCE_POLICY_ID: &str = "audience-policy-main";
+const AUTH_POLICY_REVISION: u64 = 4;
+const VALIDATED_AUDIENCE: &str = "mcp://servers/main";
 
 const TOKEN_INSTANCE: &str = "token-instance-aaaa";
 const ROTATED_TOKEN_INSTANCE: &str = "token-instance-bbbb";
@@ -86,19 +93,56 @@ const BASELINE: VerifiedFacts = VerifiedFacts {
     audience_policy_revision: AUDIENCE_POLICY_REVISION,
 };
 
+/// Records verified provider output through AUTH-00 A's ingress type.
+///
+/// Acceptance row (1): the descriptor B admits on must come from A's verified
+/// ingress value, not from a test literal. Every descriptor in this file is
+/// built through the one production path
+/// `from_verified_provider_output` -> `from_verified_ingress` ->
+/// `to_partition_descriptor`. There is no loose-string constructor call left.
+fn verified_ingress_from(
+    facts: &VerifiedFacts,
+    binding: VerifiedAudienceBinding,
+) -> VerifiedIngressAuthentication {
+    VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+        provider: facts.provider,
+        configuration_generation: facts.configuration_generation,
+        issuer: facts.issuer,
+        canonical_resource: facts.resource,
+        verified_audience_binding: binding,
+        tenant: facts.tenant,
+        subject_or_principal: facts.subject,
+        authorized_party_or_client: facts.client,
+        verified_claims: &[],
+        auth_policy_revision: AUTH_POLICY_REVISION,
+        trust_generation: facts.trust_generation,
+    })
+    .expect("verified provider output must be admitted")
+}
+
+/// The OAuth audience binding these facts were verified under.
+fn oauth_binding(facts: &VerifiedFacts) -> VerifiedAudienceBinding {
+    VerifiedAudienceBinding::OAuth {
+        canonical_resource: facts.resource.to_owned(),
+        validated_audience: VALIDATED_AUDIENCE.to_owned(),
+        audience_policy_id: AUDIENCE_POLICY_ID.to_owned(),
+        audience_policy_revision: facts.audience_policy_revision,
+        provider: facts.provider.to_owned(),
+        configuration_generation: facts.configuration_generation,
+    }
+}
+
+fn security_descriptor_from(
+    facts: &VerifiedFacts,
+    binding: VerifiedAudienceBinding,
+) -> SecurityPartitionDescriptor {
+    SecurityPartitionDescriptor::from_verified_ingress(&verified_ingress_from(facts, binding))
+}
+
 fn descriptor_from(facts: &VerifiedFacts) -> PartitionDescriptor {
-    PartitionDescriptor::from_verified_facts(
-        facts.provider,
-        facts.configuration_generation,
-        facts.issuer,
-        facts.resource,
-        facts.tenant,
-        facts.subject,
-        facts.client,
-        facts.trust_generation,
-        facts.audience_policy_revision,
-    )
-    .expect("verified facts must mint a partition descriptor")
+    security_descriptor_from(facts, oauth_binding(facts))
+        .to_partition_descriptor()
+        .expect("the production projection must yield an admission descriptor")
 }
 
 fn baseline_descriptor() -> PartitionDescriptor {
@@ -402,10 +446,7 @@ fn auth_00_b_positive() {
     assert_eq!(descriptor.client(), CLIENT);
     assert_eq!(descriptor.canonical_resource(), RESOURCE);
     assert_eq!(descriptor.trust_generation(), TRUST_GENERATION);
-    assert_eq!(
-        descriptor.audience_policy_revision(),
-        AUDIENCE_POLICY_REVISION
-    );
+    assert_eq!(descriptor.auth_policy_revision(), AUTH_POLICY_REVISION);
     // Identity fields are redacted from Debug.
     let rendered = format!("{descriptor:?}");
     for secret in [PROVIDER, ISSUER, TENANT, SUBJECT, CLIENT, RESOURCE] {
@@ -555,6 +596,45 @@ fn auth_00_b_positive() {
         "a trust-generation bump must relocate the reachable partition"
     );
 
+    // Revising the authorization policy must do the same. Before the audience
+    // binding became a descriptor field, `auth_policy_revision` was dropped at
+    // the projection, so records admitted under a superseded authorization
+    // policy stayed reachable — the same stale-authorization failure the
+    // durable-owner-only slot key had.
+    let revised_policy = SecurityPartitionDescriptor::from_verified_ingress(
+        &VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+            provider: BASELINE.provider,
+            configuration_generation: BASELINE.configuration_generation,
+            issuer: BASELINE.issuer,
+            canonical_resource: BASELINE.resource,
+            verified_audience_binding: oauth_binding(&BASELINE),
+            tenant: BASELINE.tenant,
+            subject_or_principal: BASELINE.subject,
+            authorized_party_or_client: BASELINE.client,
+            verified_claims: &[],
+            auth_policy_revision: AUTH_POLICY_REVISION + 1,
+            trust_generation: BASELINE.trust_generation,
+        })
+        .expect("a revised authorization policy is still verified provider output"),
+    )
+    .to_partition_descriptor()
+    .expect("the production projection must succeed");
+    assert_ne!(
+        revised_policy.identity(),
+        descriptor.identity(),
+        "revising the authorization policy must move the descriptor identity"
+    );
+    assert_eq!(
+        owner_key(&revised_policy),
+        owner_key(&descriptor),
+        "revising the authorization policy must not move durable ownership"
+    );
+    assert_eq!(
+        controller.lookup(&authorization(&revised_policy), &slot),
+        LookupOutcome::Absent,
+        "a superseded authorization policy must not reach the old record"
+    );
+
     // The same partition key presented by a different durable owner — the
     // leaked-key case — is absent, and nothing changes.
     let before_foreign = observe(&controller, &descriptor, &quota);
@@ -668,6 +748,28 @@ fn auth_00_b_positive() {
     assert_eq!(controller.replay_reservation_count(), 1);
 
     // -- Sealed-field refusals --------------------------------------------
+    // Both boundaries must fail closed independently. A refuses the empty
+    // field at ingress, which is the production path; B's constructor is also
+    // public, so it must refuse on its own rather than trusting its caller.
+    assert!(
+        VerifiedIngressAuthentication::from_verified_provider_output(VerifiedIdentityFacts {
+            provider: "",
+            configuration_generation: CONFIGURATION_GENERATION,
+            issuer: ISSUER,
+            canonical_resource: RESOURCE,
+            verified_audience_binding: oauth_binding(&BASELINE),
+            tenant: TENANT,
+            subject_or_principal: SUBJECT,
+            authorized_party_or_client: CLIENT,
+            verified_claims: &[],
+            auth_policy_revision: AUTH_POLICY_REVISION,
+            trust_generation: TRUST_GENERATION,
+        })
+        .is_err(),
+        "AUTH-00 A must refuse an empty verified identity field at ingress"
+    );
+    let binding_parts = oauth_binding(&BASELINE).canonical_parts();
+    let binding: Vec<&[u8]> = binding_parts.iter().map(Vec::as_slice).collect();
     assert_eq!(
         PartitionDescriptor::from_verified_facts(
             "",
@@ -678,10 +780,155 @@ fn auth_00_b_positive() {
             SUBJECT,
             CLIENT,
             TRUST_GENERATION,
-            AUDIENCE_POLICY_REVISION,
+            AUTH_POLICY_REVISION,
+            &binding,
         )
         .expect_err("an empty verified field must refuse"),
         SealedAdmissionKeyError::EmptyField
+    );
+    // The audience binding is a validated field, not an agreed convention: a
+    // caller who omits it, or supplies a part with no discriminant bytes, is
+    // refused rather than silently merged with another authentication path.
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[],
+        )
+        .expect_err("an absent audience binding must refuse"),
+        SealedAdmissionKeyError::EmptyField
+    );
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[b"" as &[u8]],
+        )
+        .expect_err("an empty binding part must refuse"),
+        SealedAdmissionKeyError::EmptyField
+    );
+    let oversized = vec![b'a'; AUDIENCE_BINDING_MAX_BYTES + 1];
+    assert_eq!(
+        PartitionDescriptor::from_verified_facts(
+            PROVIDER,
+            CONFIGURATION_GENERATION,
+            ISSUER,
+            RESOURCE,
+            TENANT,
+            SUBJECT,
+            CLIENT,
+            TRUST_GENERATION,
+            AUTH_POLICY_REVISION,
+            &[oversized.as_slice()],
+        )
+        .expect_err("an oversized audience binding must refuse"),
+        SealedAdmissionKeyError::FieldTooLong
+    );
+
+    // -- Acceptance row (1): descriptor provenance -------------------------
+    // The descriptor admitted above came from A's verified ingress value
+    // through the single production projection, not from a literal.
+    let ingress = verified_ingress_from(&BASELINE, oauth_binding(&BASELINE));
+    let security = SecurityPartitionDescriptor::from_verified_ingress(&ingress);
+    assert_eq!(
+        security
+            .to_partition_descriptor()
+            .expect("the production projection must succeed"),
+        descriptor,
+        "every descriptor in this file is the projection of A's verified ingress value"
+    );
+    assert_eq!(
+        security.verified_ingress().provider(),
+        PROVIDER,
+        "the projection must carry A's verified provider"
+    );
+    assert_eq!(security.verified_ingress().tenant(), TENANT);
+    assert_eq!(security.verified_ingress().subject_or_principal(), SUBJECT);
+    assert!(
+        security
+            .verified_ingress()
+            .verified_audience_binding()
+            .is_oauth(),
+        "the baseline principal was verified under an OAuth audience binding"
+    );
+    assert_eq!(
+        security
+            .verified_ingress()
+            .verified_audience_binding()
+            .audience_policy_id(),
+        Some(AUDIENCE_POLICY_ID)
+    );
+
+    // A's identity digest binds all twelve facts; B's binds the projected
+    // nine. They are different digests over different field sets by design.
+    assert_ne!(
+        security.identity(),
+        descriptor.identity(),
+        "A's twelve-fact identity and B's projected identity are distinct digests"
+    );
+
+    // Different authentication paths for the same subject must not collide.
+    // A distinguishes them structurally, by variant discriminant.
+    let mutual_tls = security_descriptor_from(&BASELINE, VerifiedAudienceBinding::MutualTlsPeer);
+    let static_credential =
+        security_descriptor_from(&BASELINE, VerifiedAudienceBinding::StaticCredential);
+    assert_ne!(
+        security.identity(),
+        mutual_tls.identity(),
+        "OAuth and mutual-TLS ingress for one subject are different principals"
+    );
+    assert_ne!(
+        mutual_tls.identity(),
+        static_credential.identity(),
+        "mutual-TLS and static-credential ingress for one subject are different principals"
+    );
+
+    // The same separation must survive the projection into B's admission
+    // descriptor, or a cache entry from one path could be served to the other.
+    // This holds structurally: the descriptor binds the audience binding's
+    // canonical, discriminant-led encoding, so the three paths cannot share an
+    // identity regardless of what any policy revision happens to equal.
+    let mutual_tls_admission = mutual_tls
+        .to_partition_descriptor()
+        .expect("mutual-TLS projection succeeds");
+    let static_admission = static_credential
+        .to_partition_descriptor()
+        .expect("static-credential projection succeeds");
+    assert_ne!(
+        descriptor.identity(),
+        mutual_tls_admission.identity(),
+        "the OAuth and mutual-TLS admission descriptors must not collide"
+    );
+    assert_ne!(
+        mutual_tls_admission.identity(),
+        static_admission.identity(),
+        "the mutual-TLS and static-credential admission descriptors must not collide"
+    );
+    // And the separation must reach the partition keys a result is stored
+    // under, which is the property that actually prevents cross-path serving.
+    assert_ne!(
+        cache_key(&mutual_tls_admission, &GRANTS, TOKEN_INSTANCE),
+        cache_key(&static_admission, &GRANTS, TOKEN_INSTANCE),
+        "two authentication paths must not share a cache partition"
+    );
+    assert_eq!(
+        controller.lookup(&authorization(&mutual_tls_admission), &slot),
+        LookupOutcome::Absent,
+        "a mutual-TLS principal must not reach the OAuth principal's record"
     );
 }
 
@@ -689,7 +936,7 @@ fn auth_00_b_positive() {
 // Planted negative
 // ---------------------------------------------------------------------------
 
-/// The single verified field a planted negative mutates.
+/// The single verified field or key input a planted negative mutates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutatedRow {
     Tenant,
@@ -704,53 +951,84 @@ enum MutatedRow {
     QuotaEpoch,
 }
 
+/// What the mutation must cost the caller.
+///
+/// The three classes are distinct because the mutated fields enter the
+/// derivation at different points. Collapsing them into one blanket assertion
+/// would either be false or would have to be weakened to something that does
+/// not hold the implementation to account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedDenial {
+    /// The mutation changes the verified descriptor, so the caller's current
+    /// authorization no longer reaches the baseline record at all.
+    AuthorizationAbsent,
+    /// The mutation changes a partition-key input, so the result relocates to
+    /// a different, empty partition while the baseline record stays readable
+    /// by its legitimate owner.
+    PartitionRelocated,
+    /// The mutation changes an admission identity only: admission accounting
+    /// separates, and lookup authority is unaffected in either direction.
+    AdmissionSeparated,
+}
+
 /// One one-variable planted negative.
 #[derive(Debug, Clone, Copy)]
 struct PlantedCase {
     id: &'static str,
     row: MutatedRow,
+    expected: ExpectedDenial,
 }
 
 const PLANTED_CASES: [PlantedCase; 10] = [
     PlantedCase {
         id: "AUTH-00-B-NEG.01",
         row: MutatedRow::Tenant,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.02",
         row: MutatedRow::Issuer,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.03",
         row: MutatedRow::Resource,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.04",
         row: MutatedRow::Subject,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.05",
         row: MutatedRow::Client,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.06",
         row: MutatedRow::Provider,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.07",
         row: MutatedRow::RequiredGrant,
+        expected: ExpectedDenial::PartitionRelocated,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.08",
         row: MutatedRow::TrustGeneration,
+        expected: ExpectedDenial::AuthorizationAbsent,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.09",
         row: MutatedRow::ReplayAlias,
+        expected: ExpectedDenial::AdmissionSeparated,
     },
     PlantedCase {
         id: "AUTH-00-B-NEG.10",
         row: MutatedRow::QuotaEpoch,
+        expected: ExpectedDenial::AdmissionSeparated,
     },
 ];
 
@@ -775,6 +1053,37 @@ fn mutate(row: MutatedRow) -> (VerifiedFacts, &'static [&'static str], u64, &'st
     (facts, grants, quota_epoch, replay_alias)
 }
 
+/// Asserts the mutation changed exactly one input and nothing else.
+fn assert_one_variable(row: MutatedRow) {
+    let (facts, grants, quota_epoch, replay_alias) = mutate(row);
+    let descriptor_changed = facts != BASELINE;
+    let grants_changed = grants != GRANTS.as_slice();
+    let quota_changed = quota_epoch != QUOTA_EPOCH;
+    let alias_changed = replay_alias != "alias-1";
+    let changed = usize::from(descriptor_changed)
+        + usize::from(grants_changed)
+        + usize::from(quota_changed)
+        + usize::from(alias_changed);
+    assert_eq!(changed, 1, "{row:?} must change exactly one input family");
+
+    if descriptor_changed {
+        // Within the descriptor, exactly one field may differ.
+        let fields = usize::from(facts.provider != BASELINE.provider)
+            + usize::from(facts.configuration_generation != BASELINE.configuration_generation)
+            + usize::from(facts.issuer != BASELINE.issuer)
+            + usize::from(facts.resource != BASELINE.resource)
+            + usize::from(facts.tenant != BASELINE.tenant)
+            + usize::from(facts.subject != BASELINE.subject)
+            + usize::from(facts.client != BASELINE.client)
+            + usize::from(facts.trust_generation != BASELINE.trust_generation)
+            + usize::from(facts.audience_policy_revision != BASELINE.audience_policy_revision);
+        assert_eq!(
+            fields, 1,
+            "{row:?} must change exactly one descriptor field"
+        );
+    }
+}
+
 #[test]
 fn auth_00_b_planted_negative() {
     // Numeric floor: ten one-variable rows, one per named mutable field.
@@ -783,19 +1092,41 @@ fn auth_00_b_planted_negative() {
         10,
         "the acceptance names ten one-variable mutation rows"
     );
+    let ids: Vec<&str> = PLANTED_CASES.iter().map(|case| case.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "AUTH-00-B-NEG.01",
+            "AUTH-00-B-NEG.02",
+            "AUTH-00-B-NEG.03",
+            "AUTH-00-B-NEG.04",
+            "AUTH-00-B-NEG.05",
+            "AUTH-00-B-NEG.06",
+            "AUTH-00-B-NEG.07",
+            "AUTH-00-B-NEG.08",
+            "AUTH-00-B-NEG.09",
+            "AUTH-00-B-NEG.10",
+        ],
+        "planted rows must run in the frozen order"
+    );
 
     let baseline = baseline_descriptor();
     let baseline_rows = baseline_manifest(&baseline);
     let baseline_digest = manifest_digest(&baseline_rows);
+    let baseline_auth = authorization(&baseline);
     let baseline_owner = owner_key(&baseline);
     let baseline_quota = quota_key(&baseline);
     let baseline_cache = cache_key(&baseline, &GRANTS, TOKEN_INSTANCE);
     let baseline_slot = PartitionSlot::Cache(baseline_cache);
+    let baseline_replay = ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
+        .expect("baseline replay key derives");
 
     for case in &PLANTED_CASES {
+        assert_one_variable(case.row);
+
         // A fresh controller per row, populated identically.
         let controller = controller();
-        controller.store(&baseline_owner, &baseline_slot, b"result-bytes".to_vec());
+        controller.store(&baseline_auth, &baseline_slot, b"result-bytes".to_vec());
         let mut held = controller
             .reserve_quota(&baseline_quota, 3)
             .expect("baseline quota reserve is admitted");
@@ -804,22 +1135,19 @@ fn auth_00_b_planted_negative() {
         let mut flight = controller
             .begin_revalidation(&baseline, &baseline_flight)
             .expect("baseline flight is admitted");
-        let baseline_replay =
-            ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
-                .expect("baseline replay key derives");
         controller
             .reserve_replay(&baseline, &baseline_replay)
             .expect("baseline replay reservation is admitted");
 
         let before = observe(&controller, &baseline, &baseline_quota);
         assert_eq!(
-            controller.lookup(&baseline_owner, &baseline_slot),
+            controller.lookup(&baseline_auth, &baseline_slot),
             LookupOutcome::Present(b"result-bytes".to_vec()),
             "{}: the baseline record must be present before the mutation",
             case.id
         );
 
-        // -- apply exactly one mutation --------------------------------
+        // -- apply exactly one mutation ---------------------------------
         let (facts, grants, quota_epoch, replay_alias) = mutate(case.row);
         let mutated = descriptor_from(&facts);
         let mutated_rows =
@@ -840,29 +1168,90 @@ fn auth_00_b_planted_negative() {
             case.id
         );
 
-        // -- the typed denial -------------------------------------------
-        let mutated_owner = owner_key(&mutated);
-        let mutated_cache = cache_key(&mutated, grants, TOKEN_INSTANCE);
+        // -- the typed denial, per class ---------------------------------
+        let mutated_auth = authorization(&mutated);
+        let mutated_slot = PartitionSlot::Cache(cache_key(&mutated, grants, TOKEN_INSTANCE));
+        let mutated_quota =
+            QuotaPartitionKey::derive(&mutated, quota_epoch).expect("mutated quota derives");
+        let mutated_replay =
+            ReplayReservationKey::derive(&mutated, replay_alias, "assertion-replay")
+                .expect("mutated replay derives");
 
-        // Reading the victim's record with the mutated authorization is
-        // absent, and so is reading the mutated partition. Both are
-        // indistinguishable from a genuine miss: that is the non-oracular
-        // property.
-        assert_eq!(
-            controller.lookup(&mutated_owner, &baseline_slot),
-            LookupOutcome::Absent,
-            "{}: mutating {:?} must not authorize the baseline record",
-            case.id,
-            case.row
-        );
-        assert_eq!(
-            controller.lookup(&mutated_owner, &PartitionSlot::Cache(mutated_cache)),
-            LookupOutcome::Absent,
-            "{}: the mutated partition must hold nothing",
-            case.id
-        );
+        match case.expected {
+            ExpectedDenial::AuthorizationAbsent => {
+                assert_ne!(
+                    mutated_auth, baseline_auth,
+                    "{}: the mutation must move the current authorization",
+                    case.id
+                );
+                assert_eq!(
+                    controller.lookup(&mutated_auth, &baseline_slot),
+                    LookupOutcome::Absent,
+                    "{}: the mutated authorization must not reach the baseline record",
+                    case.id
+                );
+                assert_eq!(
+                    controller.lookup(&mutated_auth, &mutated_slot),
+                    LookupOutcome::Absent,
+                    "{}: the mutated partition must hold nothing",
+                    case.id
+                );
+            }
+            ExpectedDenial::PartitionRelocated => {
+                assert_eq!(
+                    mutated_auth, baseline_auth,
+                    "{}: a key-input mutation must not move the authorization",
+                    case.id
+                );
+                assert_ne!(
+                    mutated_slot, baseline_slot,
+                    "{}: the mutation must relocate the partition",
+                    case.id
+                );
+                assert_eq!(
+                    controller.lookup(&baseline_auth, &mutated_slot),
+                    LookupOutcome::Absent,
+                    "{}: the relocated partition must hold nothing",
+                    case.id
+                );
+            }
+            ExpectedDenial::AdmissionSeparated => {
+                assert_eq!(
+                    mutated_auth, baseline_auth,
+                    "{}: an admission-identity mutation must not move the authorization",
+                    case.id
+                );
+                assert_eq!(
+                    mutated_slot, baseline_slot,
+                    "{}: an admission-identity mutation must not relocate the partition",
+                    case.id
+                );
+                let separated =
+                    (mutated_quota != baseline_quota) || (mutated_replay != baseline_replay);
+                assert!(
+                    separated,
+                    "{}: an admission-identity mutation must separate admission accounting",
+                    case.id
+                );
+                if mutated_quota != baseline_quota {
+                    assert_eq!(
+                        controller.quota_in_use(&mutated_quota),
+                        0,
+                        "{}: the separated quota partition must start empty",
+                        case.id
+                    );
+                }
+                if mutated_replay != baseline_replay {
+                    assert!(
+                        !controller.replay_reserved(&mutated_replay),
+                        "{}: the separated replay alias must be unreserved",
+                        case.id
+                    );
+                }
+            }
+        }
 
-        // A duplicate replay alias reaches its typed denial.
+        // Typed admission denials that every row must still reach.
         assert_eq!(
             controller
                 .reserve_replay(&baseline, &baseline_replay)
@@ -871,7 +1260,6 @@ fn auth_00_b_planted_negative() {
             "{}: duplicate replay alias denial",
             case.id
         );
-        // A duplicate singleflight reaches its typed denial.
         assert_eq!(
             controller
                 .begin_revalidation(&baseline, &baseline_flight)
@@ -881,7 +1269,7 @@ fn auth_00_b_planted_negative() {
             case.id
         );
 
-        // -- cross-tenant no effect --------------------------------------
+        // -- cross-tenant no effect ---------------------------------------
         let after = observe(&controller, &baseline, &baseline_quota);
         assert_eq!(
             after.records, before.records,
@@ -914,7 +1302,7 @@ fn auth_00_b_planted_negative() {
             case.id
         );
         assert_eq!(
-            controller.lookup(&baseline_owner, &baseline_slot),
+            controller.lookup(&baseline_auth, &baseline_slot),
             LookupOutcome::Present(b"result-bytes".to_vec()),
             "{}: the victim's record must still be readable by its owner",
             case.id
@@ -929,34 +1317,33 @@ fn auth_00_b_planted_negative() {
         flight.finish().expect("baseline flight closes once");
     }
 
-    // Each mutation moves exactly the rows it should and no others.
+    // Identity stability: exactly which rows move ownership and quota.
     for case in &PLANTED_CASES {
         let (facts, grants, quota_epoch, replay_alias) = mutate(case.row);
+        let _ = (grants, replay_alias);
         let mutated = descriptor_from(&facts);
         let mutated_quota =
             QuotaPartitionKey::derive(&mutated, quota_epoch).expect("mutated quota derives");
         let mutated_owner = owner_key(&mutated);
-        let mutated_replay =
-            ReplayReservationKey::derive(&mutated, replay_alias, "assertion-replay")
-                .expect("mutated replay derives");
 
         match case.row {
             // Issuer is excluded from quota identity by design, so it moves
-            // ownership without moving quota.
+            // ownership without moving quota. This is what makes
+            // "no quota-key equality authorizes a lookup" observable.
             MutatedRow::Issuer => {
                 assert_eq!(
                     mutated_quota, baseline_quota,
-                    "{}: quota excludes issuer",
+                    "{}: quota identity excludes the issuer",
                     case.id
                 );
                 assert_ne!(
                     mutated_owner, baseline_owner,
-                    "{}: owner includes issuer",
+                    "{}: durable ownership includes the issuer",
                     case.id
                 );
             }
-            // Grants, trust generation and replay alias are not owner or
-            // quota inputs: ownership and quota identity survive them.
+            // Grants, trust generation and replay alias are neither owner nor
+            // quota inputs: both identities survive them.
             MutatedRow::RequiredGrant | MutatedRow::TrustGeneration | MutatedRow::ReplayAlias => {
                 assert_eq!(
                     mutated_quota, baseline_quota,
@@ -972,12 +1359,12 @@ fn auth_00_b_planted_negative() {
             MutatedRow::QuotaEpoch => {
                 assert_ne!(
                     mutated_quota, baseline_quota,
-                    "{}: quota epoch is a quota input",
+                    "{}: the quota epoch is a quota input",
                     case.id
                 );
                 assert_eq!(
                     mutated_owner, baseline_owner,
-                    "{}: quota epoch is not an owner input",
+                    "{}: the quota epoch is not an ownership input",
                     case.id
                 );
             }
@@ -989,25 +1376,15 @@ fn auth_00_b_planted_negative() {
             | MutatedRow::Provider => {
                 assert_ne!(
                     mutated_quota, baseline_quota,
-                    "{}: quota must move",
+                    "{}: quota identity must move",
                     case.id
                 );
                 assert_ne!(
                     mutated_owner, baseline_owner,
-                    "{}: ownership must move",
+                    "{}: durable ownership must move",
                     case.id
                 );
             }
-        }
-
-        if case.row == MutatedRow::ReplayAlias {
-            assert_ne!(
-                mutated_replay,
-                ReplayReservationKey::derive(&baseline, "alias-1", "assertion-replay")
-                    .expect("baseline replay derives"),
-                "{}: a different alias must be a different reservation",
-                case.id
-            );
         }
     }
 }
