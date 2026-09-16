@@ -365,3 +365,330 @@ impl Default for MaximumStaleness {
         Self::default_bound()
     }
 }
+
+// ===========================================================================
+// Verified audience binding
+// ===========================================================================
+
+/// Where a verified audience binding came from, or why there is none.
+///
+/// The OAuth variant is not a default with the others as exceptions: a
+/// provider that does not do OAuth audience validation must say which other
+/// thing it did, so that "no audience was checked" can never be mistaken for
+/// "an audience was checked and matched". The explicit non-OAuth variants
+/// carry no audience fields at all, so they cannot collide with an OAuth
+/// binding under comparison or in a derived key.
+#[derive(Clone, PartialEq, Eq)]
+pub enum VerifiedAudienceBinding {
+    /// The provider validated an OAuth audience against an accepted-audience
+    /// policy.
+    ///
+    /// Wire- and JOSE-neutral by construction: these are the *outcomes* of
+    /// validation, not the token, header, or claim set it was read from.
+    OAuth {
+        /// Exact canonical resource the principal was verified against.
+        canonical_resource: String,
+        /// Exact audience string that validated.
+        validated_audience: String,
+        /// Identity of the accepted-audience policy that accepted it.
+        audience_policy_id: String,
+        /// Revision of that policy.
+        audience_policy_revision: u64,
+        /// Provider that performed the validation.
+        provider: String,
+        /// Provider configuration generation in force at validation.
+        configuration_generation: u64,
+    },
+    /// The provider authenticates by mutual TLS; no audience applies.
+    MutualTlsPeer,
+    /// The provider authenticates a pre-shared static credential; no audience
+    /// applies.
+    StaticCredential,
+}
+
+impl VerifiedAudienceBinding {
+    /// Whether this binding carries a validated OAuth audience.
+    #[must_use]
+    pub const fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuth { .. })
+    }
+
+    /// The accepted-audience policy identity, when OAuth applies.
+    #[must_use]
+    pub fn audience_policy_id(&self) -> Option<&str> {
+        match self {
+            Self::OAuth {
+                audience_policy_id, ..
+            } => Some(audience_policy_id),
+            Self::MutualTlsPeer | Self::StaticCredential => None,
+        }
+    }
+
+    /// The accepted-audience policy revision, when OAuth applies.
+    #[must_use]
+    pub const fn audience_policy_revision(&self) -> Option<u64> {
+        match self {
+            Self::OAuth {
+                audience_policy_revision,
+                ..
+            } => Some(*audience_policy_revision),
+            Self::MutualTlsPeer | Self::StaticCredential => None,
+        }
+    }
+
+    /// A stable, domain-separated encoding for digesting and key derivation.
+    ///
+    /// The variant discriminant leads, so an OAuth binding and a non-OAuth one
+    /// can never produce the same bytes even if every other field were to
+    /// coincide.
+    #[must_use]
+    pub fn canonical_parts(&self) -> Vec<Vec<u8>> {
+        match self {
+            Self::OAuth {
+                canonical_resource,
+                validated_audience,
+                audience_policy_id,
+                audience_policy_revision,
+                provider,
+                configuration_generation,
+            } => vec![
+                b"oauth".to_vec(),
+                canonical_resource.as_bytes().to_vec(),
+                validated_audience.as_bytes().to_vec(),
+                audience_policy_id.as_bytes().to_vec(),
+                audience_policy_revision.to_be_bytes().to_vec(),
+                provider.as_bytes().to_vec(),
+                configuration_generation.to_be_bytes().to_vec(),
+            ],
+            Self::MutualTlsPeer => vec![b"mutual-tls-peer".to_vec()],
+            Self::StaticCredential => vec![b"static-credential".to_vec()],
+        }
+    }
+}
+
+impl fmt::Debug for VerifiedAudienceBinding {
+    /// Names the variant and policy identity; never the validated audience.
+    ///
+    /// The audience string can carry deployment topology a log reader should
+    /// not automatically receive, so it stays behind the typed accessors.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OAuth {
+                audience_policy_id,
+                audience_policy_revision,
+                ..
+            } => formatter
+                .debug_struct("VerifiedAudienceBinding::OAuth")
+                .field("audience_policy_id", audience_policy_id)
+                .field("audience_policy_revision", audience_policy_revision)
+                .finish_non_exhaustive(),
+            Self::MutualTlsPeer => formatter.write_str("VerifiedAudienceBinding::MutualTlsPeer"),
+            Self::StaticCredential => {
+                formatter.write_str("VerifiedAudienceBinding::StaticCredential")
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Verified ingress authentication facts
+// ===========================================================================
+
+/// The bounded verified identity an ingress authenticator produced.
+///
+/// # What constructing one asserts
+///
+/// Building this value asserts that a provider *verified* every field. The
+/// type cannot police that on its own — a provider is the thing that decides
+/// what verified means — so the enforcement lives one level up: only facts
+/// returned from a registered `IngressAuthenticator` are admitted into the
+/// opaque `AuthenticatedTransportIngress` that downstream code consumes. A
+/// caller who constructs this directly holds a value no framework entrypoint
+/// will accept.
+///
+/// Deliberately not `Serialize`: these facts name a principal, and a type that
+/// can be written to a log or a cache by default will be.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedIngressAuthentication {
+    provider: String,
+    configuration_generation: u64,
+    issuer: String,
+    canonical_resource: String,
+    verified_audience_binding: VerifiedAudienceBinding,
+    tenant: String,
+    subject_or_principal: String,
+    authorized_party_or_client: String,
+    verified_claims: Vec<(String, String)>,
+    auth_policy_revision: u64,
+    trust_generation: u64,
+}
+
+impl VerifiedIngressAuthentication {
+    /// Records verified provider output.
+    ///
+    /// `verified_claims` are normalized to a deterministic order so two
+    /// authenticators that verified the same claim set produce byte-identical
+    /// canonical bytes regardless of the order they happened to emit them in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngressFactsError::KeyIdEmpty`] when any required identity
+    /// field is empty. An empty identity field is not a benign default: it
+    /// would let two distinct principals derive one partition.
+    pub fn from_verified_provider_output(
+        facts: VerifiedIdentityFacts<'_>,
+    ) -> Result<Self, IngressFactsError> {
+        for field in [
+            facts.provider,
+            facts.issuer,
+            facts.canonical_resource,
+            facts.tenant,
+            facts.subject_or_principal,
+            facts.authorized_party_or_client,
+        ] {
+            if field.is_empty() {
+                return Err(IngressFactsError::KeyIdEmpty);
+            }
+        }
+
+        let mut verified_claims: Vec<(String, String)> = facts
+            .verified_claims
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        verified_claims.sort();
+        verified_claims.dedup();
+
+        Ok(Self {
+            provider: facts.provider.to_owned(),
+            configuration_generation: facts.configuration_generation,
+            issuer: facts.issuer.to_owned(),
+            canonical_resource: facts.canonical_resource.to_owned(),
+            verified_audience_binding: facts.verified_audience_binding,
+            tenant: facts.tenant.to_owned(),
+            subject_or_principal: facts.subject_or_principal.to_owned(),
+            authorized_party_or_client: facts.authorized_party_or_client.to_owned(),
+            verified_claims,
+            auth_policy_revision: facts.auth_policy_revision,
+            trust_generation: facts.trust_generation,
+        })
+    }
+
+    /// The verifying provider.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The provider configuration generation these facts were verified under.
+    #[must_use]
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// The verified issuer.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The canonical resource the principal was verified against.
+    #[must_use]
+    pub fn canonical_resource(&self) -> &str {
+        &self.canonical_resource
+    }
+
+    /// The verified audience binding.
+    #[must_use]
+    pub const fn verified_audience_binding(&self) -> &VerifiedAudienceBinding {
+        &self.verified_audience_binding
+    }
+
+    /// The verified tenant.
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// The verified subject or principal.
+    #[must_use]
+    pub fn subject_or_principal(&self) -> &str {
+        &self.subject_or_principal
+    }
+
+    /// The verified authorized party or client.
+    #[must_use]
+    pub fn authorized_party_or_client(&self) -> &str {
+        &self.authorized_party_or_client
+    }
+
+    /// The verified claims, in deterministic order.
+    #[must_use]
+    pub fn verified_claims(&self) -> &[(String, String)] {
+        &self.verified_claims
+    }
+
+    /// The authorization-policy revision in force at verification.
+    #[must_use]
+    pub const fn auth_policy_revision(&self) -> u64 {
+        self.auth_policy_revision
+    }
+
+    /// The trust generation in force at verification.
+    #[must_use]
+    pub const fn trust_generation(&self) -> u64 {
+        self.trust_generation
+    }
+}
+
+impl fmt::Debug for VerifiedIngressAuthentication {
+    /// Names the provider and generations; never the principal.
+    ///
+    /// Subject, tenant, client, issuer and claims identify a specific human or
+    /// workload. A `Debug` that prints them turns any incidental log line into
+    /// an identity disclosure, so they are reachable only through the typed
+    /// accessors a caller had to deliberately choose.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedIngressAuthentication")
+            .field("provider", &self.provider)
+            .field("configuration_generation", &self.configuration_generation)
+            .field("auth_policy_revision", &self.auth_policy_revision)
+            .field("trust_generation", &self.trust_generation)
+            .field("verified_claim_count", &self.verified_claims.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Borrowed verified identity fields, passed to
+/// [`VerifiedIngressAuthentication::from_verified_provider_output`].
+///
+/// A struct rather than eleven positional parameters: at this arity a
+/// positional call is one transposition away from swapping tenant and subject,
+/// and that transposition would be a cross-tenant identity bug that still
+/// compiles.
+#[derive(Debug, Clone)]
+pub struct VerifiedIdentityFacts<'a> {
+    /// The verifying provider.
+    pub provider: &'a str,
+    /// Provider configuration generation.
+    pub configuration_generation: u64,
+    /// Verified issuer.
+    pub issuer: &'a str,
+    /// Canonical resource verified against.
+    pub canonical_resource: &'a str,
+    /// Verified audience binding.
+    pub verified_audience_binding: VerifiedAudienceBinding,
+    /// Verified tenant.
+    pub tenant: &'a str,
+    /// Verified subject or principal.
+    pub subject_or_principal: &'a str,
+    /// Verified authorized party or client.
+    pub authorized_party_or_client: &'a str,
+    /// Verified claims as name/value pairs.
+    pub verified_claims: &'a [(&'a str, &'a str)],
+    /// Authorization-policy revision.
+    pub auth_policy_revision: u64,
+    /// Trust generation.
+    pub trust_generation: u64,
+}
