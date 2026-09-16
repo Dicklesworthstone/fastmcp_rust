@@ -48,7 +48,10 @@
 
 use std::path::{Path, PathBuf};
 
-use fastmcp_protocol::{JsonRpcMessage, RequestId};
+use fastmcp_protocol::{
+    ClientIngressFailureScope, JsonRpcEndpointRole, JsonRpcMessage, JsonRpcMessageDirection,
+    RawJsonRpcDisposition, RequestId, dispose_raw_jsonrpc_failure,
+};
 use fastmcp_transport::{Codec, CodecError, InvalidMessageKind};
 use serde_json::Value;
 
@@ -502,7 +505,14 @@ fn tst_01_a_planted_negative() {
     //
     // Every mutation is a one-member edit of a canonical frame above; the rest
     // of the frame is byte-identical to the accepted control.
-    let cases: [(&str, &str, Boundary); 8] = [
+    // `Boundary` here is the codec's InvalidMessageKind, which is a
+    // CODEC-LOCAL hint about which typed parse to attempt and whether an id is
+    // safe to surface. It is NOT the guard against answering server output
+    // with a JSON-RPC error — that rule is enforced structurally by
+    // `dispose_raw_jsonrpc_failure`, asserted separately below. An earlier
+    // revision of this test asserted the loop guard here and was wrong about
+    // the layer; do not move it back.
+    let cases: [(&str, &str, Boundary); 7] = [
         (
             "request id spelled as an explicit null rather than omitted",
             r#"{"jsonrpc":"2.0","method":"ping","id":null}"#,
@@ -524,18 +534,21 @@ fn tst_01_a_planted_negative() {
             Boundary::RequestLike,
         ),
         (
-            "request missing its method",
+            // Neither `method` nor `result`/`error`. On a COMPLETE scan the
+            // codec has positive evidence this is not a response — a response,
+            // however mangled, carries one of `result`/`error`, since that is
+            // the only thing that makes it one. So it attempts the request
+            // parse, which yields the accurate "missing field `method`"
+            // diagnostic. The genuinely ambiguous case is a scan that aborts
+            // before later members are seen, and `Codec::partial_kind` already
+            // resolves that one conservatively to Response.
+            "envelope carrying neither method nor result/error",
             r#"{"jsonrpc":"2.0","id":1}"#,
-            Boundary::ResponseLike,
+            Boundary::RequestLike,
         ),
         (
             "response carrying both result and error",
             r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32601,"message":"x"},"id":1}"#,
-            Boundary::ResponseLike,
-        ),
-        (
-            "response carrying neither result nor error",
-            r#"{"jsonrpc":"2.0","id":1}"#,
             Boundary::ResponseLike,
         ),
         (
@@ -660,6 +673,73 @@ fn tst_01_a_planted_negative() {
             "{description} must move the fixture digest"
         );
     }
+
+    // --- The real loop guard: client ingress can never emit a response -------
+    //
+    // This is the contract sentence the corpus exists to protect: "client-
+    // ingress server-output fixtures record only the bounded transport/
+    // connection outcome and assert an empty outbound wire."
+    //
+    // It is enforced structurally by role and direction, NOT by the codec's
+    // InvalidMessageKind — `dispose_raw_jsonrpc_failure` does not even take
+    // one. Its own doc states it: "Client ingress never obtains a
+    // response-emitting branch." Asserting it here, at the layer that owns it,
+    // is what an earlier revision of this test got wrong by asserting it on
+    // the codec's parse hint instead.
+    for scope in [
+        ClientIngressFailureScope::OwningExchange,
+        ClientIngressFailureScope::SharedChannel,
+    ] {
+        // A readable id is supplied deliberately: if the id were the thing
+        // withholding the response, passing one would produce a reply. It does
+        // not, because the branch is chosen by role and direction alone.
+        let disposition = dispose_raw_jsonrpc_failure(
+            JsonRpcEndpointRole::ClientIngress,
+            JsonRpcMessageDirection::ServerToClient,
+            Some(RequestId::Number(1)),
+            scope,
+        );
+        assert!(
+            matches!(
+                disposition,
+                RawJsonRpcDisposition::ClientOwningFailure
+                    | RawJsonRpcDisposition::ClientSharedChannelFailure
+            ),
+            "client ingress must never reach a response-emitting branch, even with a \
+             readable id; got {disposition:?} for {scope:?}"
+        );
+    }
+
+    // The near-identical positive: the same malformed input at SERVER ingress
+    // does get a correlated error. Without this, the assertion above would
+    // also pass for an implementation that emitted nothing anywhere.
+    let server_side = dispose_raw_jsonrpc_failure(
+        JsonRpcEndpointRole::ServerIngress,
+        JsonRpcMessageDirection::ClientToServer,
+        Some(RequestId::Number(1)),
+        ClientIngressFailureScope::OwningExchange,
+    );
+    assert!(
+        matches!(server_side, RawJsonRpcDisposition::CorrelatedError(_)),
+        "server ingress with a readable id must emit a correlated Invalid Request, or the \
+         client-ingress assertion above proves only that nothing ever replies: got \
+         {server_side:?}"
+    );
+
+    // Direction alone is not enough either: a client-role endpoint reading
+    // client-to-server traffic is not an ingress path and emits nothing.
+    assert!(
+        matches!(
+            dispose_raw_jsonrpc_failure(
+                JsonRpcEndpointRole::ClientIngress,
+                JsonRpcMessageDirection::ClientToServer,
+                Some(RequestId::Number(1)),
+                ClientIngressFailureScope::OwningExchange,
+            ),
+            RawJsonRpcDisposition::NoAction
+        ),
+        "a non-ingress role/direction pair must emit nothing"
+    );
 
     // --- Notifications never gain an id --------------------------------------
     //
