@@ -383,6 +383,21 @@ async fn execute_negative(cx: &Cx, case: ManifestCase) {
 // Loopback fixture
 // ---------------------------------------------------------------------------
 
+/// Per-case wall-clock ceiling.
+///
+/// This is deliberately not a generous "surely nothing takes this long" bound.
+/// Since each case gets its own runtime, the ceiling is paid **per case**, not
+/// per test: thirteen cases at a two-minute ceiling would let one target alone
+/// consume 1560s of a 1800s wave budget shared by 46 targets, so a single stuck
+/// case starves every other target instead of failing loudly.
+///
+/// Every case here is loopback and settles well under a second. The longest
+/// *intentional* wait in the whole target is the 1.5s peer stall in
+/// `negative_15_stalled_peer`, so twenty seconds leaves more than tenfold
+/// headroom over anything a healthy case does while capping the target at
+/// roughly 260s per test.
+const CASE_CEILING_NANOS: u64 = 20_000_000_000;
+
 /// Runs one case body on a real reactor under a bounded wall-clock ceiling.
 fn run(future: impl Future<Output = ()>) {
     RuntimeBuilder::current_thread()
@@ -391,9 +406,12 @@ fn run(future: impl Future<Output = ()>) {
         .expect("the loopback runtime must build")
         .block_on(async {
             let cx = Cx::current().expect("block_on must install a current Cx");
-            asupersync::time::timeout_at(cx.now().saturating_add_nanos(120_000_000_000), future)
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(CASE_CEILING_NANOS), future)
                 .await
-                .expect("every HTTP-03 B case must settle within two minutes");
+                .expect(
+                    "every HTTP-03 B case must settle within its per-case ceiling; a case that \
+                     exceeds it is stuck, not slow, because all of them are loopback",
+                );
         });
 }
 
