@@ -227,7 +227,10 @@ impl ModernProbeObservation {
 /// [`HttpFallbackCoordinator::open_legacy_get`] consumes it by value, so a
 /// second `GET` cannot be opened from one authorization even by mistake.
 /// Holding a permit is not an era selection and never mutates coordinator state.
-#[derive(Debug)]
+///
+/// `PartialEq` is derived so callers can assert on a decision; it deliberately
+/// does not weaken single use, which `Clone`'s absence enforces.
+#[derive(Debug, PartialEq, Eq)]
 pub struct LegacyGetPermit {
     target: String,
     attempt_id: u64,
@@ -248,7 +251,7 @@ impl LegacyGetPermit {
 }
 
 /// The coordinator's decision for one admitted observation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum FallbackDecision {
     /// No legacy `GET` is permitted; the modern observation stands.
     ModernRetained,
@@ -424,7 +427,10 @@ impl HttpFallbackCoordinator {
     ///
     /// Returns the exact configured target the caller must request. Opening a
     /// `GET` is still not an era selection.
-    pub fn open_legacy_get(&mut self, permit: LegacyGetPermit) -> Result<&str, HttpFallbackError> {
+    pub fn open_legacy_get(
+        &mut self,
+        permit: LegacyGetPermit,
+    ) -> Result<String, HttpFallbackError> {
         if self.state.legacy_gets_opened > 0 {
             return Err(HttpFallbackError::LegacyGetAlreadyOpened);
         }
@@ -432,7 +438,7 @@ impl HttpFallbackCoordinator {
             return Err(HttpFallbackError::CrossBundleObservation);
         }
         self.state.legacy_gets_opened += 1;
-        Ok(&self.legacy_sse_target)
+        Ok(self.legacy_sse_target.clone())
     }
 
     /// Admits the first valid `endpoint` event from the opened `GET`.
