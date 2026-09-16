@@ -23,7 +23,6 @@ use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::Poll;
-use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::net::TcpListener;
@@ -184,7 +183,7 @@ type LoginFuture<'client> = std::pin::Pin<
 /// make that future outlive the thing it points at.
 async fn login_until_bound<'client>(
     client: &'client OAuthClient,
-    cx: &Cx,
+    cx: &'client Cx,
 ) -> (LoginFuture<'client>, SocketAddr) {
     let bound: Rc<Cell<Option<SocketAddr>>> = Rc::new(Cell::new(None));
     let observed = Rc::clone(&bound);
