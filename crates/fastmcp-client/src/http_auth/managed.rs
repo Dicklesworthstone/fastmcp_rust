@@ -34,6 +34,9 @@ use crate::sse::SseLimits;
 
 /// Typed core subscriptions retaining managed cancellation and token lifetime.
 pub mod subscriptions;
+/// Official Tasks execution with credential-bound live discovery.
+#[cfg(feature = "tasks")]
+pub mod tasks;
 
 /// Bounds shared renewal and response-head admission. Response bodies retain
 /// the native executor's separate idle/absolute limits after handoff, further

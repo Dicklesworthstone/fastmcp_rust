@@ -1,0 +1,511 @@
+//! Official Tasks operations over the managed OAuth transport.
+//!
+//! Each operation first discovers the exact resource using the same access
+//! credential that will authenticate its Task POST. Discovery is deliberately
+//! not cached: credential renewal or a different principal cannot inherit an
+//! earlier advertisement. There is no retry of a task-creating or mutating POST.
+//! The existing protocol codecs, Tasks negotiation, input ledger and native
+//! streamed-tool validator remain the authorities for their respective layers.
+
+use std::fmt;
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
+
+use asupersync::Cx;
+use asupersync::types::Time;
+use fastmcp_core::McpRequestCancellation;
+use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
+use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::tasks_extension::{
+    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, Task,
+    TaskId, TaskInputLedger, TaskInputResponses, TaskMethodRequest, TaskRequestMeta,
+    UpdateTaskParams, UpdateTaskResult, TASK_CANCEL, TASK_GET, TASK_UPDATE, TASKS_EXTENSION,
+};
+use fastmcp_protocol::{
+    CoreRequest, CoreResult, ExtensionDirection, FinalCoreResult, FinalRequestMeta,
+    JsonInteger, JsonRpcResponse, ProgressMarker, RequestId, ServerDiscoverResult,
+    ServerNotification, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
+    decode_strict_jsonrpc_response,
+};
+use serde_json::Value;
+
+use super::{
+    ManagedOAuthResponse, ManagedOAuthSession, OAuthCredentialSnapshot, OAuthSessionError,
+    deadline_after,
+};
+use crate::http_executor::{
+    ModernHttpExecutor, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+    ModernHttpFinalCoreListener, ModernHttpRequest, ModernHttpResponseKind,
+};
+use crate::sse::SseLimits;
+
+/// Independent wire and lifetime bounds for discovery plus one Task operation.
+/// Native HTTP body/idle bounds still apply and may be tighter. Record count
+/// includes the terminal; it bounds total streamed work without collecting it.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedTasksLimits {
+    request_bytes: usize,
+    frame_bytes: usize,
+    records: usize,
+    timeout: Duration,
+}
+
+impl Default for ManagedTasksLimits {
+    fn default() -> Self {
+        Self { request_bytes: 64 * 1024, frame_bytes: 64 * 1024, records: 64, timeout: Duration::from_secs(120) }
+    }
+}
+
+impl ManagedTasksLimits {
+    pub fn new(request_bytes: usize, frame_bytes: usize, records: usize, timeout: Duration) -> Result<Self, ManagedTasksError> {
+        if !(1..=1024 * 1024).contains(&request_bytes)
+            || !(1..=1024 * 1024).contains(&frame_bytes)
+            || !(1..=1024).contains(&records)
+            || timeout.is_zero() || timeout > Duration::from_secs(900)
+        { return Err(ManagedTasksError::InvalidLimits); }
+        Ok(Self { request_bytes, frame_bytes, records, timeout })
+    }
+}
+
+/// Distinct correlation identities for the discovery and operation POSTs.
+/// Neither value is a task ID, idempotency key or authority to replay a POST.
+#[derive(Clone, Debug)]
+pub struct ManagedTaskRequestIds {
+    discovery: RequestId,
+    operation: RequestId,
+}
+
+impl ManagedTaskRequestIds {
+    pub fn new(discovery: RequestId, operation: RequestId) -> Result<Self, ManagedTasksError> {
+        discovery.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
+        operation.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
+        if discovery.correlates_with(&operation) { return Err(ManagedTasksError::InvalidRequest); }
+        Ok(Self { discovery, operation })
+    }
+}
+
+/// Typed operations. Tool calls may complete immediately, request input, or
+/// return a Task; Tasks negotiation does not force the server to create one.
+/// A task update takes a previously observed input-required snapshot. The
+/// server remains responsible for current ownership and stale-state checks.
+pub enum ManagedTaskRequest {
+    CallTool { name: String, arguments: Option<Value> },
+    Get(TaskId),
+    Update { task: Box<Task>, input_responses: TaskInputResponses },
+    Cancel(TaskId),
+}
+
+/// Sanitized failures, excluding peer messages, input answers and task IDs.
+#[derive(Debug)]
+pub enum ManagedTasksError {
+    InvalidLimits,
+    InvalidRequest,
+    RequestTooLarge,
+    Negotiation,
+    InvalidResponse,
+    ResponseIdMismatch,
+    TaskIdMismatch,
+    InvalidInputResponses,
+    UpdateRequiresInput,
+    InvalidProgress,
+    MissingTerminal,
+    RecordLimit,
+    Closed,
+    HttpStatus { status: u16 },
+    Remote { code: JsonInteger },
+    Session(OAuthSessionError),
+}
+
+impl fmt::Display for ManagedTasksError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpStatus { status } => write!(f, "managed Task request rejected with HTTP {status}"),
+            Self::Remote { code } => write!(f, "managed Task request failed with JSON-RPC {code}"),
+            Self::Session(error) => fmt::Display::fmt(error, f),
+            other => f.write_str(match other {
+                Self::InvalidLimits => "invalid managed Tasks limits",
+                Self::InvalidRequest => "invalid managed Task request",
+                Self::RequestTooLarge => "managed Task request exceeds its byte limit",
+                Self::Negotiation => "resource did not admit the exact official Tasks surface",
+                Self::InvalidResponse => "managed Task response failed protocol admission",
+                Self::ResponseIdMismatch => "Task response does not match the request identity",
+                Self::TaskIdMismatch => "Task response identifies a different task",
+                Self::InvalidInputResponses => "Task answers do not match the observed input ledger",
+                Self::UpdateRequiresInput => "Task update requires an input-required snapshot",
+                Self::InvalidProgress => "Task progress is uncorrelated or not increasing",
+                Self::MissingTerminal => "Task stream ended without its terminal result",
+                Self::RecordLimit => "managed Task response record limit exceeded",
+                Self::Closed => "managed Task call is closed",
+                Self::HttpStatus { .. } | Self::Remote { .. } | Self::Session(_) => unreachable!(),
+            }),
+        }
+    }
+}
+
+impl std::error::Error for ManagedTasksError {}
+impl From<OAuthSessionError> for ManagedTasksError {
+    fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+}
+
+/// Incremental tool-call activity or the selected method's terminal result.
+/// Update/cancel acknowledge the operation; they do not invent a task snapshot.
+pub enum ManagedTaskEvent {
+    Notification(Box<ServerNotification>),
+    ToolResult(Box<FinalCoreResult>),
+    Snapshot(Box<GetTaskResult>),
+    Updated(UpdateTaskResult),
+    Cancelled(CancelTaskResult),
+}
+
+/// Explicit Tasks-capable view of a managed login. Creating this view is local;
+/// every operation performs fresh resource discovery before its Task POST.
+/// Other extension settings must use their own negotiated clients.
+#[derive(Clone)]
+pub struct ManagedTasksClient {
+    session: ManagedOAuthSession,
+    metadata: Value,
+    limits: ManagedTasksLimits,
+}
+
+impl ManagedTasksClient {
+    pub fn new(session: ManagedOAuthSession, metadata: FinalRequestMeta, limits: ManagedTasksLimits) -> Result<Self, ManagedTasksError> {
+        let metadata = serde_json::to_value(metadata).map_err(|_| ManagedTasksError::InvalidRequest)?;
+        let _ = discovery_request(&metadata)?;
+        let extensions = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY).and_then(|caps| caps.get("extensions"));
+        if extensions.is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty)) {
+            return Err(ManagedTasksError::Negotiation);
+        }
+        Ok(Self { session, metadata, limits })
+    }
+
+    pub async fn request(&self, cx: &Cx, ids: ManagedTaskRequestIds, request: ManagedTaskRequest) -> Result<ManagedTaskCall, ManagedTasksError> {
+        self.request_with_cancellation(cx, &McpRequestCancellation::new(), ids, request).await
+    }
+
+    /// Validates before renewal/discovery, then dispatches one Task operation.
+    /// The single deadline includes credential acquisition, discovery, response
+    /// reads and caller pauses. No HTTP failure causes a retry or a downgrade.
+    pub async fn request_with_cancellation(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        ids: ManagedTaskRequestIds, request: ManagedTaskRequest,
+    ) -> Result<ManagedTaskCall, ManagedTasksError> {
+        self.session.check(cx, cancellation)?;
+        let deadline = deadline_after(cx, self.limits.timeout)?;
+        let prepared = prepare(self.session.resource().as_str(), &self.metadata, &ids.operation, request, self.limits)?;
+        let discovery = discovery_request(&self.metadata)?;
+        let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?.ok_or(ManagedTasksError::InvalidRequest)?;
+        let discover_wire = encode_request(self.session.resource().as_str(), "server/discover", &ids.discovery, params, None, self.limits.request_bytes)?;
+        let credential = self.session.await_active(cx, cancellation, deadline, None, async {
+            self.session.credential_with_cancellation(cx, cancellation).await
+        }).await?;
+        let response = self.execute_bound(cx, cancellation, deadline, &credential, &discover_wire).await?;
+        require_json(&response)?;
+        let bytes = self.session.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
+            response.read_to_end(cx, self.limits.frame_bytes).await
+        }).await?;
+        let (envelope, source) = response_source(&bytes, &ids.discovery, self.limits.frame_bytes)?;
+        let CoreResult::Final(FinalCoreResult::Discover(discovered)) = discovery.decode_response_result(&envelope, &source)
+            .map_err(|_| ManagedTasksError::InvalidResponse)? else { return Err(ManagedTasksError::InvalidResponse) };
+        admit_discovery(&discovered, &prepared.decoder)?;
+        // No credential acquisition occurs between discovery and the operation:
+        // a concurrent refresh may create a newer snapshot, never replace this one.
+        let response = self.execute_bound(cx, cancellation, deadline, &credential, &prepared.wire).await?;
+        ManagedTaskCall::from_response(response, prepared, ids.operation, self.limits, deadline)
+    }
+
+    async fn execute_bound(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time,
+        credential: &OAuthCredentialSnapshot, wire: &ModernHttpRequest,
+    ) -> Result<ManagedOAuthResponse, ManagedTasksError> {
+        let wire = wire.clone().with_authorization(credential.credential());
+        let head_deadline = deadline.min(deadline_after(cx, self.session.inner.policy.response_head_timeout)?);
+        let executor = ModernHttpExecutor::new();
+        let response = self.session.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
+            executor.execute_with_cancellation(cx, cancellation, &wire).await.map_err(OAuthSessionError::Http)
+        }).await?;
+        if response.metadata().status() != 200 { return Err(ManagedTasksError::HttpStatus { status: response.metadata().status() }); }
+        Ok(ManagedOAuthResponse {
+            response, session: self.session.clone(), cancellation: cancellation.clone(),
+            expires_at: credential.expires_at, generation: credential.generation,
+        })
+    }
+}
+
+enum TaskDecoder { Tool(CoreRequest), Get(TaskId), Update, Cancel }
+struct PreparedTask { wire: ModernHttpRequest, decoder: TaskDecoder, progress: Option<ProgressMarker> }
+enum TaskBody { Json(ManagedOAuthResponse), Sse(ModernHttpFinalCoreListener) }
+
+/// One owned response. Pending reads take socket ownership before suspension;
+/// abandonment, error, cancellation or expiry cannot leave a reusable parser.
+pub struct ManagedTaskCall {
+    body: Option<TaskBody>,
+    decoder: TaskDecoder,
+    session: ManagedOAuthSession,
+    cancellation: McpRequestCancellation,
+    request_id: RequestId,
+    progress: Option<ProgressMarker>,
+    last_progress: Option<ExactNonNegativeJsonNumber>,
+    deadline: Time,
+    expires_at: Instant,
+    generation: u64,
+    limits: ManagedTasksLimits,
+    records: usize,
+    finished: bool,
+}
+
+impl ManagedTaskCall {
+    fn from_response(response: ManagedOAuthResponse, prepared: PreparedTask, request_id: RequestId, limits: ManagedTasksLimits, deadline: Time) -> Result<Self, ManagedTasksError> {
+        let session = response.session.clone();
+        let cancellation = response.cancellation.clone();
+        let expires_at = response.expires_at;
+        let generation = response.generation;
+        let body = match response.metadata().kind() {
+            ModernHttpResponseKind::Json => TaskBody::Json(response),
+            ModernHttpResponseKind::Sse => {
+                let TaskDecoder::Tool(core) = &prepared.decoder else { return Err(ManagedTasksError::InvalidResponse) };
+                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64).ok_or(ManagedTasksError::InvalidLimits)?;
+                TaskBody::Sse(response.response.into_final_tasks_tool_call_listener(request_id.clone(), core.clone(), framing).map_err(stream_error)?)
+            }
+            _ => return Err(ManagedTasksError::InvalidResponse),
+        };
+        Ok(Self {
+            body: Some(body), decoder: prepared.decoder, session, cancellation, request_id,
+            progress: prepared.progress, last_progress: None, deadline, expires_at, generation,
+            limits, records: 0, finished: false,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId { &self.request_id }
+    pub fn credential_generation(&self) -> u64 { self.generation }
+    pub fn close(&mut self) { self.body = None; }
+
+    /// Results are delivered once. EOF without a result is an error. Session
+    /// renewal never lengthens the credential lifetime of this response.
+    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedTaskEvent>, ManagedTasksError> {
+        if self.finished { return Ok(None); }
+        let body = self.body.take().ok_or(ManagedTasksError::Closed)?;
+        self.session.check(cx, &self.cancellation)?;
+        if self.records >= self.limits.records { return Err(ManagedTasksError::RecordLimit); }
+        let (event, remaining) = match body {
+            TaskBody::Json(response) => {
+                let bytes = self.session.await_active(cx, &self.cancellation, self.deadline, Some(self.expires_at), async {
+                    response.read_to_end(cx, self.limits.frame_bytes).await
+                }).await?;
+                (decode_result(&self.decoder, &bytes, &self.request_id, self.limits.frame_bytes)?, None)
+            }
+            TaskBody::Sse(mut listener) => {
+                let event = self.session.await_active(cx, &self.cancellation, self.deadline, Some(self.expires_at), async {
+                    Ok(listener.next_event(cx).await)
+                }).await?.map_err(stream_error)?.ok_or(ManagedTasksError::MissingTerminal)?;
+                let event = match event {
+                    ModernHttpFinalCoreEvent::Progress(progress) => {
+                        if self.progress.as_ref() != Some(&progress.progress_token)
+                            || self.last_progress.as_ref().is_some_and(|last| progress.progress.cmp(last).is_le())
+                        { return Err(ManagedTasksError::InvalidProgress); }
+                        self.last_progress = Some(progress.progress.clone());
+                        ManagedTaskEvent::Notification(Box::new(ServerNotification::Progress(progress)))
+                    }
+                    ModernHttpFinalCoreEvent::Notification(notification) => {
+                        if matches!(notification, ServerNotification::SubscriptionsAcknowledged(_) | ServerNotification::Cancelled(_)) {
+                            return Err(ManagedTasksError::InvalidResponse);
+                        }
+                        ManagedTaskEvent::Notification(Box::new(notification))
+                    }
+                    ModernHttpFinalCoreEvent::Terminal(result) => tool_result(result)?,
+                };
+                (event, Some(TaskBody::Sse(listener)))
+            }
+        };
+        self.session.check(cx, &self.cancellation)?;
+        if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
+        if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        self.records += 1;
+        if matches!(event, ManagedTaskEvent::Notification(_)) { self.body = remaining; }
+        else { self.finished = true; }
+        Ok(Some(event))
+    }
+}
+
+fn discovery_request(metadata: &Value) -> Result<CoreRequest, ManagedTasksError> {
+    CoreRequest::decode(ProtocolEra::Modern2026, "server/discover", Some(&serde_json::json!({"_meta": metadata})))
+        .map_err(|_| ManagedTasksError::InvalidRequest)
+}
+
+fn admit_discovery(discovery: &ServerDiscoverResult, decoder: &TaskDecoder) -> Result<(), ManagedTasksError> {
+    if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+        return Err(ManagedTasksError::Negotiation);
+    }
+    match decoder {
+        TaskDecoder::Tool(_) => crate::admit_final_tasks_result_discriminator(discovery, "task"),
+        TaskDecoder::Get(_) => crate::admit_final_tasks_discovery_surface(discovery, TASK_GET, ExtensionDirection::ClientToServer),
+        TaskDecoder::Update => crate::admit_final_tasks_discovery_surface(discovery, TASK_UPDATE, ExtensionDirection::ClientToServer),
+        TaskDecoder::Cancel => crate::admit_final_tasks_discovery_surface(discovery, TASK_CANCEL, ExtensionDirection::ClientToServer),
+    }.map_err(|_| ManagedTasksError::Negotiation)
+}
+
+fn prepare(target: &str, metadata: &Value, id: &RequestId, request: ManagedTaskRequest, limits: ManagedTasksLimits) -> Result<PreparedTask, ManagedTasksError> {
+    let mut metadata = metadata.clone();
+    let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY).and_then(Value::as_object_mut)
+        .ok_or(ManagedTasksError::InvalidRequest)?;
+    capabilities.insert("extensions".to_owned(), serde_json::json!({TASKS_EXTENSION: {}}));
+    let request_meta = TaskRequestMeta { meta: serde_json::from_value(metadata.clone()).map_err(|_| ManagedTasksError::InvalidRequest)? };
+    let progress = metadata.get("progressToken").map(|value| serde_json::from_value(value.clone()).map_err(|_| ManagedTasksError::InvalidRequest)).transpose()?;
+    let (method, parameters, name, decoder) = match request {
+        ManagedTaskRequest::CallTool { name, arguments } => {
+            let mut params = serde_json::json!({"_meta": metadata, "name": name});
+            if let Some(arguments) = arguments { params["arguments"] = arguments; }
+            let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).map_err(|_| ManagedTasksError::InvalidRequest)?;
+            ("tools/call", params, Some(name), TaskDecoder::Tool(core))
+        }
+        ManagedTaskRequest::Get(task_id) => {
+            let wire = TaskMethodRequest::new(id.clone(), TASK_GET, GetTaskParams { request: request_meta, task_id: task_id.clone() });
+            let wire = TaskMethodRequest::decode(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?)
+                .map_err(|_| ManagedTasksError::InvalidRequest)?;
+            (TASK_GET, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Get(task_id))
+        }
+        ManagedTaskRequest::Update { task, input_responses } => {
+            let Task::InputRequired { base, input_requests } = *task else { return Err(ManagedTasksError::UpdateRequiresInput) };
+            let ledger = TaskInputLedger::from_requests(&input_requests).map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+            ledger.validate_responses(&input_responses).map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+            let wire = TaskMethodRequest::new(id.clone(), TASK_UPDATE, UpdateTaskParams { request: request_meta, task_id: base.task_id, input_responses });
+            let wire = TaskMethodRequest::decode_update(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?, &ledger)
+                .map_err(|_| ManagedTasksError::InvalidInputResponses)?;
+            (TASK_UPDATE, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Update)
+        }
+        ManagedTaskRequest::Cancel(task_id) => {
+            let wire = TaskMethodRequest::new(id.clone(), TASK_CANCEL, CancelTaskParams { request: request_meta, task_id });
+            let wire = TaskMethodRequest::decode_cancel(serde_json::to_value(wire).map_err(|_| ManagedTasksError::InvalidRequest)?)
+                .map_err(|_| ManagedTasksError::InvalidRequest)?;
+            (TASK_CANCEL, serde_json::to_value(wire.params).map_err(|_| ManagedTasksError::InvalidRequest)?, None, TaskDecoder::Cancel)
+        }
+    };
+    let wire = encode_request(target, method, id, parameters, name, limits.request_bytes)?;
+    Ok(PreparedTask { wire, decoder, progress })
+}
+
+fn encode_request(target: &str, method: &str, id: &RequestId, params: Value, name: Option<String>, maximum: usize) -> Result<ModernHttpRequest, ManagedTasksError> {
+    id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
+    let envelope = serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+    let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
+    serde_json::to_writer(&mut writer, &envelope).map_err(|_| ManagedTasksError::RequestTooLarge)?;
+    ModernHttpRequest::new(target, writer.bytes, FINAL_PROTOCOL_VERSION, method, name).map_err(|_| ManagedTasksError::InvalidRequest)
+}
+
+fn require_json(response: &ManagedOAuthResponse) -> Result<(), ManagedTasksError> {
+    if response.metadata().kind() == ModernHttpResponseKind::Json { Ok(()) } else { Err(ManagedTasksError::InvalidResponse) }
+}
+
+fn response_source(bytes: &[u8], id: &RequestId, maximum: usize) -> Result<(JsonRpcResponse, String), ManagedTasksError> {
+    let admitted = decode_strict_jsonrpc_response(bytes, maximum).map_err(|_| ManagedTasksError::InvalidResponse)?;
+    let (response, source) = admitted.into_parts();
+    if !response.id.as_ref().is_some_and(|actual| actual.correlates_with(id)) { return Err(ManagedTasksError::ResponseIdMismatch); }
+    if let Some(error) = &response.error { return Err(ManagedTasksError::Remote { code: error.code.clone() }); }
+    Ok((response, source.ok_or(ManagedTasksError::InvalidResponse)?))
+}
+
+fn decode_result(decoder: &TaskDecoder, bytes: &[u8], id: &RequestId, maximum: usize) -> Result<ManagedTaskEvent, ManagedTasksError> {
+    let (response, source) = response_source(bytes, id, maximum)?;
+    match decoder {
+        TaskDecoder::Tool(core) => {
+            let CoreResult::Final(result) = core.decode_response_result(&response, &source).map_err(|_| ManagedTasksError::InvalidResponse)? else { return Err(ManagedTasksError::InvalidResponse) };
+            tool_result(result)
+        }
+        TaskDecoder::Get(expected) => {
+            let result: GetTaskResult = serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?;
+            if &result.task.base().task_id != expected { return Err(ManagedTasksError::TaskIdMismatch); }
+            Ok(ManagedTaskEvent::Snapshot(Box::new(result)))
+        }
+        TaskDecoder::Update => serde_json::from_str(&source).map(ManagedTaskEvent::Updated).map_err(|_| ManagedTasksError::InvalidResponse),
+        TaskDecoder::Cancel => serde_json::from_str(&source).map(ManagedTaskEvent::Cancelled).map_err(|_| ManagedTasksError::InvalidResponse),
+    }
+}
+
+fn tool_result(result: FinalCoreResult) -> Result<ManagedTaskEvent, ManagedTasksError> {
+    match result {
+        FinalCoreResult::ToolsCall { .. } | FinalCoreResult::ToolsCallTask { .. } | FinalCoreResult::ToolsCallInputRequired { .. } => Ok(ManagedTaskEvent::ToolResult(Box::new(result))),
+        _ => Err(ManagedTasksError::InvalidResponse),
+    }
+}
+
+fn stream_error(error: ModernHttpFinalCoreListenError) -> ManagedTasksError {
+    match error {
+        ModernHttpFinalCoreListenError::RemoteError { code, .. } => ManagedTasksError::Remote { code },
+        ModernHttpFinalCoreListenError::EndOfStream { .. } => ManagedTasksError::MissingTerminal,
+        ModernHttpFinalCoreListenError::CallerCancelled { .. } => OAuthSessionError::Cancelled.into(),
+        ModernHttpFinalCoreListenError::Executor(error) => OAuthSessionError::Http(error).into(),
+        _ => ManagedTasksError::InvalidResponse,
+    }
+}
+
+struct BoundedWriter { bytes: Vec<u8>, maximum: usize }
+impl Write for BoundedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) { return Err(io::Error::other("managed Tasks request limit")); }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_protocol::ClientCapabilities;
+    use serde_json::json;
+
+    fn meta() -> Value { serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap() }
+    fn task_id() -> TaskId { TaskId::parse("task-one").unwrap() }
+    fn input_task() -> Task {
+        serde_json::from_value(json!({
+            "taskId":"task-one", "status":"input_required", "createdAt":"2026-09-16T00:00:00Z",
+            "lastUpdatedAt":"2026-09-16T00:00:00Z", "ttlMs":60000,
+            "inputRequests":{"roots":{"method":"roots/list"}}
+        })).unwrap()
+    }
+    fn envelope(result: &str) -> Vec<u8> { format!(r#"{{"jsonrpc":"2.0","id":2,"result":{result}}}"#).into_bytes() }
+
+    #[test]
+    fn task_requests_use_the_shared_codec_and_exact_empty_settings() {
+        for request in [ManagedTaskRequest::Get(task_id()), ManagedTaskRequest::Cancel(task_id()), ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:None }] {
+            let prepared = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), request, ManagedTasksLimits::default()).unwrap();
+            let wire: Value = serde_json::from_slice(prepared.wire.body()).unwrap();
+            assert_eq!(wire["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"], json!({TASKS_EXTENSION:{}}));
+            assert_eq!(wire["id"], 2);
+            assert!(!prepared.wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("mcp-session-id")));
+        }
+    }
+
+    #[test]
+    fn update_requires_the_current_input_ledger_not_a_syntactically_valid_map() {
+        let answers = |key: &str| serde_json::from_value::<TaskInputResponses>(json!({key:{"resultType":"complete","roots":[]}})).unwrap();
+        assert!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:answers("roots") }, ManagedTasksLimits::default()).is_ok());
+        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:answers("other") }, ManagedTasksLimits::default()), Err(ManagedTasksError::InvalidInputResponses)));
+    }
+
+    #[test]
+    fn response_identity_and_task_identity_are_independently_checked() {
+        let task = r#"{"resultType":"complete","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#;
+        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::Number(2), 4096), Ok(ManagedTaskEvent::Snapshot(_))));
+        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::String("2".to_owned()), 4096), Err(ManagedTasksError::ResponseIdMismatch)));
+        assert!(matches!(decode_result(&TaskDecoder::Get(TaskId::parse("task-two").unwrap()), &envelope(task), &RequestId::Number(2), 4096), Err(ManagedTasksError::TaskIdMismatch)));
+    }
+
+    #[test]
+    fn bounded_requests_and_ambiguous_ids_fail_locally() {
+        let tiny = ManagedTasksLimits::new(1, 4096, 1, Duration::from_secs(1)).unwrap();
+        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Get(task_id()), tiny), Err(ManagedTasksError::RequestTooLarge)));
+        let equivalent: RequestId = serde_json::from_str("2e0").unwrap();
+        assert!(ManagedTaskRequestIds::new(RequestId::Number(2), equivalent).is_err());
+        assert!(ManagedTaskRequestIds::new(RequestId::Number(2), RequestId::String("2".to_owned())).is_ok());
+    }
+
+    #[test]
+    fn raw_task_response_rejects_duplicate_fields_batches_and_secret_diagnostics() {
+        for raw in [br#"{"jsonrpc":"2.0","id":2,"id":2,"result":{"resultType":"complete"}}"#.as_slice(), br#"[{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}]"#.as_slice()] {
+            assert!(response_source(raw, &RequestId::Number(2), 4096).is_err());
+        }
+        let error = response_source(br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"secret-canary","data":"secret-canary"}}"#, &RequestId::Number(2), 4096).err().unwrap();
+        assert!(matches!(error, ManagedTasksError::Remote { .. }));
+        assert!(!format!("{error:?} {error}").contains("secret-canary"));
+    }
+}
