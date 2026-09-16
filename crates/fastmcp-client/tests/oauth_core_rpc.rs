@@ -32,6 +32,9 @@ use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId, ServerNotification};
 use serde_json::{Value, json};
 
+#[path = "oauth_core_rpc/subscriptions.rs"]
+mod subscriptions;
+
 const CHILD_CASE: &str = "FASTMCP_TEST_OAUTH_CORE_CASE";
 const ROOT: &[u8] = include_bytes!("fixtures/oauth-core-ca.pem");
 // TEST ONLY key and certificate, also used by the native OAuth fixture. The
@@ -216,6 +219,7 @@ impl Peer {
             assert_eq!(headers["authorization"], "Bearer typed-access");
             assert_eq!(headers["mcp-protocol-version"], "2026-07-28");
             assert!(!headers.contains_key("mcp-session-id"));
+            assert!(!headers.contains_key("last-event-id"));
             assert!(!headers.contains_key("cookie"));
             let envelope: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(headers["mcp-method"], envelope["method"].as_str().unwrap());
