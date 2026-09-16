@@ -192,9 +192,8 @@ impl fmt::Display for ProcessGenerationError {
                 "process generation mismatch: resource carries generation {observed} but the \
                  installed generation is {expected}"
             ),
-            Self::NotInstalled => formatter.write_str(
-                "process-local state was used before ProcessGenerationGuard::install()",
-            ),
+            Self::NotInstalled => formatter
+                .write_str("process-local state was used before ProcessGenerationGuard::install()"),
             Self::EntropyUnavailable(source) => write!(
                 formatter,
                 "process generation nonce could not be drawn: {source}"
@@ -296,11 +295,8 @@ impl ProcessBoundToken {
         // The live identity keeps the installed nonce and ordinal and takes
         // its PID from the operating system. A fork changes exactly that one
         // field, which is the divergence `admit` is looking for.
-        let observed = ProcessGeneration::observed(
-            std::process::id(),
-            installed.nonce,
-            installed.generation,
-        );
+        let observed =
+            ProcessGeneration::observed(std::process::id(), installed.nonce, installed.generation);
         installed.admit(observed)?;
         self.minted_in.admit(observed)
     }
@@ -340,7 +336,8 @@ impl ProcessGenerationGuard {
         if let Some(existing) = GUARD.get() {
             return Ok(existing);
         }
-        let nonce = draw_security_identifier().map_err(ProcessGenerationError::EntropyUnavailable)?;
+        let nonce =
+            draw_security_identifier().map_err(ProcessGenerationError::EntropyUnavailable)?;
         let candidate = Self {
             generation: ProcessGeneration {
                 pid: std::process::id(),
