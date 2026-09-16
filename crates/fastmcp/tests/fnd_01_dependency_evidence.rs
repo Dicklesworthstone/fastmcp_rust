@@ -20465,8 +20465,16 @@ mod ordinary {
     const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
     const HARD_MAX_POLICY_BYTES: u64 = 4 * 1024 * 1024;
     const MAX_CAMPAIGN_ISSUES_JSONL_BYTES: usize = 32 * 1024 * 1024;
-    const CAMPAIGN_PROOF_FIELD_COUNT: usize = 580;
-    const CAMPAIGN_PROOF_FIELD_SHA256: &str = "6940feeb5211f2aa35c64178b6cb376cb3d26b8ad4d5043bbefb10d16ca8c3d8";
+    // The frozen contract fixture the reality proofs evaluate. It deliberately
+    // does NOT measure `.beads/issues.jsonl`: that file is campaign-mutable, and
+    // the extractor skips any bead whose status is `closed` or `tombstone`, so a
+    // constant measuring it is a function of which beads happen to be closed and
+    // moves on every close, reopen and tombstone. Under the campaign rule that a
+    // frozen constant measuring mutable content will rot, these two describe a
+    // checked-in fixture instead, which cannot.
+    const CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD: &str = "fnd01-fixture-contract-bead";
+    const CAMPAIGN_PROOF_FIXTURE_CLOSED_BEAD: &str = "fnd01-fixture-closed-bead";
+    const CAMPAIGN_PROOF_FIXTURE_UNCONTRACTED_BEAD: &str = "fnd01-fixture-uncontracted-bead";
     const CAMPAIGN_PROOF_CONTROL_BEAD: &str = "bd-rebase-proof-toolchain-vjd8z";
     const CAMPAIGN_PROOF_NEGATIVE_MARKER: &str = "REALITY-PROOF-NEGATIVE:";
     const CAMPAIGN_PROOF_CHECKLIST_PREFIXES: [&str; 3] = ["- [ ] ", "- [x] ", "- [X] "];
@@ -51283,8 +51291,47 @@ activate = 1\n";
         }
     }
 
-    fn campaign_issues_jsonl_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(".beads/issues.jsonl")
+    /// Builds the frozen campaign-contract fixture the reality proofs evaluate.
+    ///
+    /// This replaces a live read of `.beads/issues.jsonl`. It is strictly more
+    /// discriminating than that read was: the live file proved only that
+    /// whatever beads happened to be open hashed to some value, whereas this
+    /// fixture exercises each distinct extractor path by construction -
+    /// the control bead's positive and planted-negative lines, one ordinary
+    /// contributing contract, a `closed` bead that must be skipped, and an open
+    /// bead carrying no toolchain predicate that must contribute nothing.
+    ///
+    /// The closed bead deliberately names a superseded toolchain: if the skip
+    /// rule ever broke, this fixture fails loudly instead of silently counting
+    /// an extra field.
+    fn campaign_proof_contract_fixture(identity: &CampaignProofIdentity) -> Vec<u8> {
+        let negative_toolchains = [identity.toolchain.as_str(), SUPERSEDED_CAMPAIGN_TOOLCHAINS[0], SUPERSEDED_CAMPAIGN_TOOLCHAINS[1]];
+        let mut fixture = campaign_proof_control_fixture(identity, "open", "- [ ] ", CAMPAIGN_PROOF_NEGATIVE_MARKER, negative_toolchains, 1);
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(
+            CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD,
+            "open",
+            &format!("- [ ] Proof configuration is frozen in the batch receipt: toolchain {}; workspace target and platform", identity.toolchain),
+        ));
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(
+            CAMPAIGN_PROOF_FIXTURE_CLOSED_BEAD,
+            "closed",
+            &format!("- [x] Proof configuration used {} historically", SUPERSEDED_CAMPAIGN_TOOLCHAINS[0]),
+        ));
+        fixture.extend_from_slice(&campaign_proof_issue_fixture(CAMPAIGN_PROOF_FIXTURE_UNCONTRACTED_BEAD, "open", "- [ ] This acceptance row declares no toolchain predicate at all"));
+        fixture
+    }
+
+    /// The exact field set the fixture must yield: the control bead and the one
+    /// ordinary contributing contract. The closed bead is skipped by status and
+    /// the uncontracted bead contributes no predicate, so neither appears.
+    ///
+    /// Written out explicitly rather than derived from the fixture, so the
+    /// expectation cannot drift with the subject it checks (RH-5).
+    fn campaign_proof_expected_fixture_fields() -> BTreeSet<String> {
+        let mut fields = BTreeSet::new();
+        assert!(fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
+        assert!(fields.insert(CAMPAIGN_PROOF_FIXTURE_CONTRACT_BEAD.to_owned()));
+        fields
     }
 
     fn campaign_proof_issue_fixture(id: &str, status: &str, acceptance: &str) -> Vec<u8> {
@@ -51315,23 +51362,38 @@ activate = 1\n";
         let identity = canonical_campaign_proof_identity().verified();
         assert_eq!(identity.toolchain, "nightly-2026-08-25");
         assert_eq!(identity.rust_version, "1.100");
-        let live_path = campaign_issues_jsonl_path();
-        let issues = fs::read(&live_path).expect("read live campaign issues JSONL");
+        // The subject is a frozen fixture, not `.beads/issues.jsonl`. The live
+        // file is campaign-mutable and the extractor skips closed and tombstone
+        // beads, so evaluating it made this proof a function of which beads were
+        // closed at the moment it ran - it moved on every close, reopen and
+        // tombstone, and could not be attributed to any source commit.
+        //
+        // The property the test exists to prove is preserved and sharpened:
+        // `identity` is still read live from the checked-in pin below, and the
+        // fixture's contracts are still required to agree with it.
+        let expected_fields = campaign_proof_expected_fixture_fields();
+        let expected_field_sha256 = campaign_proof_field_sha256(&expected_fields);
+        let contracts = campaign_proof_contract_fixture(&identity);
         let inventory = validate_campaign_executable_toolchain_contracts(
-            &issues,
+            &contracts,
             &identity,
             ExpectedCampaignProofInventory {
-                field_count: CAMPAIGN_PROOF_FIELD_COUNT,
-                current_predicates: CAMPAIGN_PROOF_FIELD_COUNT,
+                field_count: expected_fields.len(),
+                current_predicates: expected_fields.len(),
                 planted_negative_fields: 1,
-                field_sha256: CAMPAIGN_PROOF_FIELD_SHA256,
+                field_sha256: &expected_field_sha256,
             },
         )
         .verified();
-        assert_eq!(inventory.fields.len(), CAMPAIGN_PROOF_FIELD_COUNT);
-        assert_eq!(inventory.current_predicates, CAMPAIGN_PROOF_FIELD_COUNT);
+        assert_eq!(inventory.fields, expected_fields, "only the control bead and the contributing contract may yield fields");
+        assert_eq!(inventory.current_predicates, expected_fields.len());
         assert_eq!(inventory.planted_negative_fields, 1);
-        assert_eq!(inventory.field_sha256, CAMPAIGN_PROOF_FIELD_SHA256);
+        assert_eq!(inventory.field_sha256, expected_field_sha256);
+
+        // The validator must not mutate its input. Proved against the fixture
+        // itself, which is the actual claim - the previous live re-read only
+        // showed that a read-only test had not written to the tracker.
+        assert_eq!(contracts, campaign_proof_contract_fixture(&identity), "contract evaluation must not mutate its input");
 
         let mut control_fields = BTreeSet::new();
         assert!(control_fields.insert(CAMPAIGN_PROOF_CONTROL_BEAD.to_owned()));
@@ -51351,7 +51413,6 @@ activate = 1\n";
                 lifecycle_inventory = Some(observed);
             }
         }
-        assert_eq!(fs::read(live_path).expect("read live campaign state after lifecycle positives"), issues, "positive lifecycle evaluation must not mutate live state");
     }
 
     #[test]
@@ -51371,8 +51432,7 @@ activate = 1\n";
         )
         .verified();
 
-        let live_path = campaign_issues_jsonl_path();
-        let live_before = fs::read(&live_path).expect("read live campaign state before negatives");
+        let fixture_before = fixture.clone();
         for stale in SUPERSEDED_CAMPAIGN_TOOLCHAINS {
             let negative = fixture.replacen(&identity.toolchain, stale, 1);
             assert_eq!(negative.matches(stale).count(), 1);
@@ -51428,8 +51488,7 @@ activate = 1\n";
         assert_eq!(duplicate_error.code, "E_CAMPAIGN_PROOF_INVENTORY");
         assert_eq!(duplicate_error.subject, ".beads/issues.jsonl");
 
-        let live_after = fs::read(live_path).expect("read live campaign state after negatives");
-        assert_eq!(live_after, live_before, "negative evaluation must not mutate live state");
+        assert_eq!(fixture, fixture_before, "negative evaluation must not mutate its input");
     }
 
     #[test]
