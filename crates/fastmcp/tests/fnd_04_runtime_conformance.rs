@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -508,6 +509,29 @@ fn application_runtime(min_blocking: usize, max_blocking: usize) -> Runtime {
         .expect("application-owned runtime builds")
 }
 
+/// Wall-clock ceiling for a single subcase body.
+const SUBCASE_CEILING_SECS: u64 = 60;
+
+/// Runs a subcase body on an application-owned runtime under a wall-clock ceiling.
+///
+/// A subcase that hangs is a failure, not a licence to stall the serialized
+/// verification lane behind it. The ceiling resolves into a recorded outcome so
+/// one wedged region, lock waiter, or occupied blocking worker cannot block the
+/// remaining fourteen subcases or the receipt.
+fn run_bounded<T>(runtime: &Runtime, future: impl Future<Output = T>) -> Result<T, String> {
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("block_on installs a current Cx");
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(SUBCASE_CEILING_SECS * 1_000_000_000);
+        asupersync::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| {
+                format!("subcase body exceeded its {SUBCASE_CEILING_SECS}s wall-clock ceiling")
+            })
+    })
+}
+
 /// Six zero-effect counters required by the planted-negative acceptance item.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EffectCounters {
@@ -676,7 +700,7 @@ fn subcase_01_sibling_cancellation() -> SubcaseOutcome {
     let started = Arc::new(AtomicU64::new(0));
     let started_sink = Arc::clone(&started);
 
-    runtime.block_on(async move {
+    let bounded = run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx for block_on");
 
         let left = ambient
@@ -748,18 +772,25 @@ fn subcase_01_sibling_cancellation() -> SubcaseOutcome {
             "regions_distinct",
             (left_region != right_region).to_string(),
         );
-        sink.insert(
-            "left_cancelled",
-            left_result
-                .as_ref()
-                .map_or(true, |value| *value == "cancelled")
-                .to_string(),
-        );
+        // Cancellation may surface either as the body's own acknowledged
+        // return value or as a cancelled join, depending on whether the body
+        // acknowledged before its next checkpoint. A panic is neither, and
+        // must not be laundered into a cancellation.
+        let left_cancelled = match left_result.as_ref() {
+            Ok(value) => *value == "cancelled",
+            Err(asupersync::runtime::JoinError::Cancelled(_)) => true,
+            Err(_) => false,
+        };
+        sink.insert("left_cancelled", left_cancelled.to_string());
         sink.insert(
             "right_survived",
             matches!(right_result.as_ref(), Ok(&"ran-to-completion")).to_string(),
         );
     });
+    if let Err(error) = bounded {
+        outcome.require(false, error);
+        return outcome;
+    }
     let left_started = started.load(Ordering::SeqCst);
 
     let observed = observed.lock().expect("observation sink is readable");
@@ -803,7 +834,7 @@ fn subcase_02_shutdown_tree() -> SubcaseOutcome {
     let cancel_sink = Arc::clone(&observed_cancel);
     let start_sink = Arc::clone(&started);
 
-    let close_resolved = runtime.block_on(async move {
+    let close_resolved = match run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let server_region = ambient
             .open_child_region(ChildRegionSpec::inherit())
@@ -841,7 +872,13 @@ fn subcase_02_shutdown_tree() -> SubcaseOutcome {
         // Shutdown closes the tree: cancel remaining children, run finalizers,
         // and resolve only at quiescence.
         server_region.close().await.is_ok()
-    });
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            outcome.require(false, error);
+            return outcome;
+        }
+    };
 
     outcome
         .observe("close_resolved", close_resolved)
@@ -933,7 +970,7 @@ fn subcase_04_task_supervisor_ownership() -> SubcaseOutcome {
     let owners: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&owners);
 
-    let (root_region, child_region_id) = runtime.block_on(async move {
+    let (root_region, child_region_id) = match run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let root = ambient.region_id();
 
@@ -961,7 +998,13 @@ fn subcase_04_task_supervisor_ownership() -> SubcaseOutcome {
 
         child.close().await.expect("child region closes");
         (format!("{root:?}"), format!("{child_id:?}"))
-    });
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            outcome.require(false, error);
+            return outcome;
+        }
+    };
 
     let owners = owners.lock().expect("owner sink is readable");
     let all_owned_by_child = owners
@@ -1389,7 +1432,7 @@ fn subcase_08_lock_cancellation_fairness_shutdown() -> SubcaseOutcome {
     let report: Arc<Mutex<BTreeMap<&'static str, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let sink = Arc::clone(&report);
 
-    runtime.block_on(async move {
+    let bounded = run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let shared: Arc<asupersync::sync::Mutex<u64>> = Arc::new(asupersync::sync::Mutex::new(0));
 
@@ -1444,6 +1487,10 @@ fn subcase_08_lock_cancellation_fairness_shutdown() -> SubcaseOutcome {
         sink.insert("lock_reusable_after_cancellation", recovered_ok.to_string());
         sink.insert("waiter_region_closed", closed.to_string());
     });
+    if let Err(error) = bounded {
+        outcome.require(false, error);
+        return outcome;
+    }
 
     let report = report.lock().expect("report sink is readable");
     for (field, value) in report.iter() {
@@ -1484,7 +1531,7 @@ fn subcase_09_bounded_blocking_admission_reconciliation() -> SubcaseOutcome {
     let sink = Arc::clone(&report);
     let durable_handle = Arc::clone(&durable);
 
-    runtime.block_on(async move {
+    let bounded = run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let pool_present = ambient.blocking_pool_handle().is_some();
 
@@ -1544,6 +1591,10 @@ fn subcase_09_bounded_blocking_admission_reconciliation() -> SubcaseOutcome {
         sink.insert("durable_after_reconcile", reconciled.to_string());
         sink.insert("late_mutation_observable", (reconciled == 2).to_string());
     });
+    if let Err(error) = bounded {
+        outcome.require(false, error);
+        return outcome;
+    }
 
     let report = report.lock().expect("report sink is readable");
     for (field, value) in report.iter() {
@@ -1583,7 +1634,7 @@ fn subcase_10_hung_endpoint_and_recovery() -> SubcaseOutcome {
     let sink = Arc::clone(&report);
     let release_handle = Arc::clone(&release);
 
-    runtime.block_on(async move {
+    let bounded = run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let region = ambient
             .open_child_region(ChildRegionSpec::inherit())
@@ -1647,6 +1698,10 @@ fn subcase_10_hung_endpoint_and_recovery() -> SubcaseOutcome {
         );
         sink.insert("pool_recovered_after_release", recovered.to_string());
     });
+    if let Err(error) = bounded {
+        outcome.require(false, error);
+        return outcome;
+    }
 
     let report = report.lock().expect("report sink is readable");
     for (field, value) in report.iter() {
@@ -1685,7 +1740,7 @@ fn subcase_11_scope_and_zero_thread_negative() -> SubcaseOutcome {
     let report: Arc<Mutex<BTreeMap<&'static str, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let sink = Arc::clone(&report);
 
-    runtime.block_on(async move {
+    let bounded = run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         let ambient_region: RegionId = ambient.region_id();
         let scope_region = ambient.scope().region_id();
@@ -1707,14 +1762,25 @@ fn subcase_11_scope_and_zero_thread_negative() -> SubcaseOutcome {
         );
     });
 
+    if let Err(error) = bounded {
+        outcome.require(false, error);
+        return outcome;
+    }
+
     // Probe two: a runtime configured with no blocking threads must be
     // *detectably* poolless, so a server can refuse before serving instead of
     // silently running blocking work inline on an executor worker.
     let zero_thread = application_runtime(0, 0);
-    let pool_absent = zero_thread.block_on(async {
+    let pool_absent = match run_bounded(&zero_thread, async {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         ambient.blocking_pool_handle().is_none()
-    });
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            outcome.require(false, error);
+            return outcome;
+        }
+    };
 
     // The Cargo.toml comment that presented `scope_with_budget` as a
     // child-region solution must no longer say so.
@@ -1892,7 +1958,7 @@ fn subcase_13_cross_platform_stdio() -> SubcaseOutcome {
     let rows: Vec<StdioTargetRow> = TARGET_MATRIX
         .iter()
         .map(|target| StdioTargetRow {
-            target,
+            target: *target,
             own_process_cancel_aware: own_stdio,
             child_process_cancel_aware: child_stdio,
             transport_avoids_blocking_own_stdio: !uses_blocking_std_stdio,
@@ -2683,7 +2749,7 @@ fn fnd_04_b_planted_negative() {
     let control_ledger = Arc::clone(&ledger);
     let emitted: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let control_sink = Arc::clone(&emitted);
-    runtime.block_on(async move {
+    run_bounded(&runtime, async move {
         let ambient = Cx::current().expect("runtime installs an ambient Cx");
         control_ledger.runtime_roots.fetch_add(1, Ordering::SeqCst);
 
@@ -2745,7 +2811,8 @@ fn fnd_04_b_planted_negative() {
 
         let _ = accepted.close().await;
         let _ = sibling.close().await;
-    });
+    })
+    .expect("the planted-negative control must settle within its wall-clock ceiling");
 
     let control = ledger.read();
     assert_eq!(
