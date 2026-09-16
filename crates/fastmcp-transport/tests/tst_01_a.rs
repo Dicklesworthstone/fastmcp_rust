@@ -182,6 +182,10 @@ fn corpus() -> Vec<WireFixture> {
 /// Re-encoding goes back through the same public codec, so the comparison is
 /// against what the shipped encoder actually emits rather than against a
 /// locally reconstructed string.
+///
+/// `#[track_caller]` so an encode failure names the fixture being round-tripped
+/// instead of this helper.
+#[track_caller]
 fn round_trip(codec: &Codec, message: &JsonRpcMessage) -> Vec<u8> {
     match message {
         JsonRpcMessage::Request(request) => codec
