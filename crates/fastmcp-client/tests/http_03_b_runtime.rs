@@ -1426,6 +1426,21 @@ fn run_aborted_notification_cache_case(catalog_changed: bool, drop_request: bool
             )
             .expect("write callback admission barrier");
             assert_connection_closed_by_client(&mut aborted);
+        } else {
+            // The server ends this exchange itself, so it completes the body.
+            //
+            // "Aborted response" here means a response stream that ends
+            // WITHOUT its correlated terminal message, not a severed
+            // transport. Those are different wire conditions and the client
+            // distinguishes them: a clean end yields `Ok(None)` and surfaces
+            // `UnexpectedResponseMessage { request_id }`
+            // (http_executor.rs:4736-4741), which is exactly what this case
+            // asserts, while a truncated chunked body yields `Err(..)` and
+            // surfaces `Modern(Executor(..))`. Dropping the socket without
+            // this terminating chunk would silently switch the case onto the
+            // truncation path and stop testing what it names.
+            end_sse_response(&mut aborted)
+                .expect("close the aborted response body without its terminal");
         }
         drop(aborted);
 
