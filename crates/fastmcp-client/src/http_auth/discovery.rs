@@ -1,0 +1,760 @@
+//! Bounded OAuth discovery for preregistered native public clients (AUTH-03).
+//!
+//! Starting from a configured HTTPS MCP resource, fetch RFC 9728 protected
+//! resource metadata, select an explicitly trusted issuer in LOCAL preference
+//! order, and fetch its RFC 8414 or OpenID-location metadata. The admitted
+//! configuration feeds the existing PKCE login and shared-refresh driver.
+//!
+//! Trust is never bootstrapped from peer URLs alone. The host must configure
+//! the resource and issuer allowlist; cross-origin authorization/token endpoints
+//! require an additional explicit origin grant. This is not arbitrary-issuer
+//! discovery, DNS/IP pinning, dynamic registration, signed-metadata verification,
+//! or OIDC identity authentication. OpenID locations supply OAuth metadata only.
+//! No discovery result is persistently cached and no credential is sent on GET.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::future::{Future, poll_fn};
+use std::task::Poll;
+use std::time::Duration;
+
+use asupersync::Cx;
+use asupersync::channel::oneshot;
+use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
+use asupersync::time::Sleep;
+use asupersync::tls::{Certificate, RootCertStore};
+use asupersync::types::Time;
+use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
+use serde::{Deserialize, Deserializer};
+
+use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
+use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+
+/// Maximum retained bytes in each resource or issuer metadata document.
+pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
+const MAX_ISSUERS: usize = 16;
+const MAX_ARRAY_ENTRIES: usize = 128;
+const MAX_METADATA_STRING_BYTES: usize = 4096;
+
+/// Fixed diagnostics: peer metadata bodies and URLs are never retained in errors.
+#[derive(Debug)]
+pub enum OAuthDiscoveryError {
+    InvalidPolicy,
+    RuntimeUnavailable,
+    Cancelled,
+    TimedOut,
+    TransportFailed,
+    HttpStatus { status: u16 },
+    MetadataNotFound,
+    InvalidRepresentation,
+    InvalidMetadata,
+    ResourceMismatch,
+    NoTrustedIssuer,
+    IssuerMismatch,
+    EndpointNotTrusted,
+    UnsupportedFlow,
+    UnsupportedScopes,
+    SignedMetadataUnsupported,
+    Login(OAuthSessionError),
+}
+
+impl fmt::Display for OAuthDiscoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPolicy => "invalid OAuth discovery policy",
+            Self::RuntimeUnavailable => "OAuth discovery requires caller-owned I/O and time",
+            Self::Cancelled => "OAuth discovery cancelled",
+            Self::TimedOut => "OAuth discovery deadline exceeded",
+            Self::TransportFailed => "OAuth discovery transport failed",
+            Self::HttpStatus { .. } => "OAuth metadata endpoint rejected discovery",
+            Self::MetadataNotFound => "OAuth metadata not found at the permitted locations",
+            Self::InvalidRepresentation => "OAuth metadata representation rejected",
+            Self::InvalidMetadata => "OAuth metadata document rejected",
+            Self::ResourceMismatch => "OAuth metadata does not identify the configured resource",
+            Self::NoTrustedIssuer => "resource does not advertise an explicitly trusted issuer",
+            Self::IssuerMismatch => "OAuth metadata issuer differs from the selected issuer",
+            Self::EndpointNotTrusted => "OAuth endpoint origin is outside the issuer's trust policy",
+            Self::UnsupportedFlow => "issuer does not admit the native S256 code flow",
+            Self::UnsupportedScopes => "OAuth metadata does not admit the requested scopes",
+            Self::SignedMetadataUnsupported => "signed OAuth metadata requires a separate verifier",
+            Self::Login(_) => "login after OAuth discovery failed",
+        })
+    }
+}
+
+impl std::error::Error for OAuthDiscoveryError {}
+
+/// One administrator-trusted issuer and its permitted endpoint origins.
+/// The identifier keeps its exact spelling for RFC 9207 issuer comparison.
+/// Network URLs are separately canonicalized for transport and origin checks.
+#[derive(Clone, Debug)]
+pub struct TrustedOAuthIssuer {
+    identifier: String,
+    url: CanonicalHttpUrl,
+    endpoint_origins: Vec<String>,
+    roots: Vec<Certificate>,
+}
+
+impl TrustedOAuthIssuer {
+    /// Grants discovery access to one exact issuer, not to issuers named by it.
+    /// The caller must not populate this allowlist directly from untrusted
+    /// resource metadata. DNS for these explicitly trusted hosts is a host
+    /// deployment responsibility; this API does not pin resolved addresses.
+    pub fn new(identifier: impl Into<String>) -> Result<Self, OAuthDiscoveryError> {
+        let identifier = identifier.into();
+        let url = https_url(&identifier).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        Ok(Self { identifier, url, endpoint_origins: Vec::new(), roots: Vec::new() })
+    }
+
+    /// Allows a separately hosted login/token service. Pass an origin URL with
+    /// path `/` and no query, fragment or credentials. It is never derived from
+    /// the downloaded metadata. At most eight additional origins are admitted.
+    pub fn with_endpoint_origin(mut self, origin: CanonicalHttpUrl) -> Result<Self, OAuthDiscoveryError> {
+        validate_https(&origin).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        let origin_text = origin_of(&origin);
+        if origin.path() != "/" || self.endpoint_origins.len() >= 8
+            || origin_text == origin_of(&self.url)
+            || self.endpoint_origins.iter().any(|value| value == &origin_text)
+        {
+            return Err(OAuthDiscoveryError::InvalidPolicy);
+        }
+        self.endpoint_origins.push(origin_text);
+        Ok(self)
+    }
+
+    /// Adds a private root for this issuer's metadata and subsequent token
+    /// exchanges. It does not grant resource-metadata or MCP-resource trust.
+    pub fn with_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthDiscoveryError> {
+        admit_root(&mut self.roots, root)?;
+        Ok(self)
+    }
+
+    fn endpoint(&self, value: &str) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
+        let endpoint = https_url(value)?;
+        let origin = origin_of(&endpoint);
+        if origin != origin_of(&self.url) && !self.endpoint_origins.contains(&origin) {
+            return Err(OAuthDiscoveryError::EndpointNotTrusted);
+        }
+        Ok(endpoint)
+    }
+}
+
+/// Immutable discovery inputs for a preregistered native public client.
+/// Peer metadata cannot change resource identity, client registration, requested
+/// scopes, timeout, trust roots, or local issuer preference order.
+#[derive(Clone, Debug)]
+pub struct OAuthDiscoveryPlan {
+    resource: CanonicalHttpUrl,
+    issuers: Vec<TrustedOAuthIssuer>,
+    client_id: String,
+    scopes: Vec<String>,
+    resource_roots: Vec<Certificate>,
+    timeout: Duration,
+}
+
+impl OAuthDiscoveryPlan {
+    pub fn new(
+        resource: CanonicalHttpUrl,
+        issuers: Vec<TrustedOAuthIssuer>,
+        client_id: impl Into<String>,
+        scopes: Vec<String>,
+    ) -> Result<Self, OAuthDiscoveryError> {
+        validate_https(&resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        CanonicalResourceId::parse_for_endpoint(
+            resource.as_str(), &resource, CanonicalResourceIdPolicy::DEFAULT,
+        ).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        if issuers.is_empty() || issuers.len() > MAX_ISSUERS {
+            return Err(OAuthDiscoveryError::InvalidPolicy);
+        }
+        for (index, issuer) in issuers.iter().enumerate() {
+            if issuers[..index].iter().any(|other| {
+                other.identifier == issuer.identifier || other.url == issuer.url
+            }) {
+                return Err(OAuthDiscoveryError::InvalidPolicy);
+            }
+        }
+        let client_id = client_id.into();
+        if client_id.is_empty() || client_id.len() > 1024 || client_id.chars().any(char::is_control)
+            || scopes.len() > 32 || scopes.iter().map(String::len).sum::<usize>() > 4096
+        {
+            return Err(OAuthDiscoveryError::InvalidPolicy);
+        }
+        let mut seen = BTreeSet::new();
+        for scope in &scopes {
+            if scope.is_empty() || scope.len() > 256 || !seen.insert(scope)
+                || !scope.bytes().all(|byte| {
+                    byte == 0x21 || (0x23..=0x5b).contains(&byte) || (0x5d..=0x7e).contains(&byte)
+                })
+            {
+                return Err(OAuthDiscoveryError::InvalidPolicy);
+            }
+        }
+        Ok(Self { resource, issuers, client_id, scopes, resource_roots: Vec::new(), timeout: Duration::from_secs(30) })
+    }
+
+    /// One absolute bound across resource discovery and all permitted issuer
+    /// locations, not a fresh timeout per fallback. The caller's tighter budget
+    /// wins. Browser login uses its separate existing authorization deadline.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, OAuthDiscoveryError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(120) {
+            return Err(OAuthDiscoveryError::InvalidPolicy);
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    /// Grants a private CA only for the configured resource's metadata GET.
+    pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, OAuthDiscoveryError> {
+        admit_root(&mut self.resource_roots, root)?;
+        Ok(self)
+    }
+
+    /// Discovers usable public-client code-flow endpoints. A 404/410 alone
+    /// permits the next well-known issuer location; malformed JSON, issuer
+    /// mismatch, TLS failure, redirects, 401/403, or 5xx terminate discovery.
+    /// An invalid selected issuer never causes a switch to a lower-priority one.
+    pub async fn discover(&self, cx: &Cx) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        let deadline = discovery_deadline(cx, self.timeout)?;
+        let resource_url = resource_metadata_url(&self.resource)?;
+        let body = fetch_metadata(cx, deadline, &resource_url, &self.resource_roots)
+            .await?.ok_or(OAuthDiscoveryError::MetadataNotFound)?;
+        let issuer = self.select_issuer(&body)?;
+        for location in issuer_metadata_urls(&issuer.url)? {
+            check_context(cx, deadline)?;
+            if let Some(body) = fetch_metadata(cx, deadline, &location, &issuer.roots).await? {
+                let configuration = self.admit_issuer(issuer, &body)?;
+                check_context(cx, deadline)?;
+                return Ok(configuration);
+            }
+        }
+        Err(OAuthDiscoveryError::MetadataNotFound)
+    }
+
+    /// Resolves metadata and then drives the existing browser/PKCE/managed
+    /// renewal workflow. The launcher is not invoked until all discovery and
+    /// public-client policy checks succeed. This does not dynamically register
+    /// a client or silently relogin a previously failed managed session.
+    pub async fn authorize_managed<L, F>(
+        &self,
+        cx: &Cx,
+        policy: OAuthSessionPolicy,
+        launch_browser: L,
+    ) -> Result<ManagedOAuthSession, OAuthDiscoveryError>
+    where
+        L: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<(), OAuthError>>,
+    {
+        let configuration = self.discover(cx).await?;
+        ManagedOAuthSession::authorize(cx, OAuthClient::new(configuration), policy, launch_browser)
+            .await.map_err(OAuthDiscoveryError::Login)
+    }
+
+    fn select_issuer(&self, body: &[u8]) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
+        let metadata: ResourceMetadata = decode_metadata(body)?;
+        if metadata.signed_metadata.is_some() {
+            return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
+        }
+        // RFC 9728 requires exact identity, not merely the same origin/path prefix.
+        if metadata.resource != self.resource.as_str() {
+            return Err(OAuthDiscoveryError::ResourceMismatch);
+        }
+        validate_optional_array(metadata.bearer_methods_supported.as_deref())?;
+        if metadata.bearer_methods_supported.as_ref().is_some_and(|methods| {
+            !methods.iter().any(|method| method == "header")
+        }) {
+            return Err(OAuthDiscoveryError::UnsupportedFlow);
+        }
+        admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
+        let servers = metadata.authorization_servers.ok_or(OAuthDiscoveryError::NoTrustedIssuer)?;
+        validate_array(&servers)?;
+        if servers.len() > MAX_ISSUERS {
+            return Err(OAuthDiscoveryError::InvalidMetadata);
+        }
+        // Untrusted entries are never followed, even when they precede a match.
+        self.issuers.iter().find(|issuer| servers.contains(&issuer.identifier))
+            .ok_or(OAuthDiscoveryError::NoTrustedIssuer)
+    }
+
+    fn admit_issuer(
+        &self,
+        issuer: &TrustedOAuthIssuer,
+        body: &[u8],
+    ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        let metadata: IssuerMetadata = decode_metadata(body)?;
+        if metadata.signed_metadata.is_some() {
+            return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
+        }
+        if metadata.issuer != issuer.identifier {
+            return Err(OAuthDiscoveryError::IssuerMismatch);
+        }
+        for values in [
+            Some(metadata.response_types_supported.as_slice()),
+            metadata.grant_types_supported.as_deref(),
+            metadata.response_modes_supported.as_deref(),
+            metadata.token_endpoint_auth_methods_supported.as_deref(),
+            metadata.code_challenge_methods_supported.as_deref(),
+            metadata.protected_resources.as_deref(),
+        ] {
+            validate_optional_array(values)?;
+        }
+        if !metadata.response_types_supported.iter().any(|value| value == "code")
+            || metadata.grant_types_supported.as_ref().is_some_and(|values| !has(values, "authorization_code"))
+            || metadata.response_modes_supported.as_ref().is_some_and(|values| !has(values, "query"))
+            || !metadata.token_endpoint_auth_methods_supported.as_ref().is_some_and(|values| has(values, "none"))
+            || !metadata.code_challenge_methods_supported.as_ref().is_some_and(|values| has(values, "S256"))
+            || metadata.authorization_response_iss_parameter_supported != Some(true)
+        {
+            return Err(OAuthDiscoveryError::UnsupportedFlow);
+        }
+        if metadata.protected_resources.as_ref().is_some_and(|values| !has(values, self.resource.as_str())) {
+            return Err(OAuthDiscoveryError::ResourceMismatch);
+        }
+        admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
+        let authorization = issuer.endpoint(&metadata.authorization_endpoint)?;
+        let token = issuer.endpoint(&metadata.token_endpoint)?;
+        let mut configuration = OAuthClientConfiguration::from_trusted_endpoints(
+            issuer.identifier.clone(), authorization, token, self.resource.clone(),
+            self.client_id.clone(), self.scopes.clone(),
+        ).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+        for root in &issuer.roots {
+            configuration = configuration.with_extra_root_certificate(root.clone())
+                .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        }
+        Ok(configuration)
+    }
+}
+
+fn has(values: &[String], expected: &str) -> bool {
+    values.iter().any(|value| value == expected)
+}
+
+fn validate_https(url: &CanonicalHttpUrl) -> Result<(), OAuthDiscoveryError> {
+    if url.scheme() != "https" || url.has_userinfo() || url.query().is_some() || url.fragment().is_some() {
+        return Err(OAuthDiscoveryError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+fn https_url(text: &str) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
+    if text.is_empty() || text.len() > MAX_METADATA_STRING_BYTES
+        || text.chars().any(|character| character.is_whitespace() || character.is_control())
+        || text.contains('\\') || !text.starts_with("https://")
+    {
+        return Err(OAuthDiscoveryError::InvalidMetadata);
+    }
+    let url = CanonicalHttpUrl::parse(text).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+    validate_https(&url)?;
+    Ok(url)
+}
+
+// All callers have rejected query, fragment and userinfo. Slicing the canonical
+// path suffix preserves IPv6 brackets and explicit non-default port spelling.
+fn origin_of(url: &CanonicalHttpUrl) -> String {
+    url.as_str()[..url.as_str().len() - url.path().len()].to_owned()
+}
+
+fn resource_metadata_url(resource: &CanonicalHttpUrl) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
+    CanonicalHttpUrl::parse(&format!(
+        "{}/.well-known/oauth-protected-resource{}", origin_of(resource), resource.path(),
+    )).map_err(|_| OAuthDiscoveryError::InvalidPolicy)
+}
+
+fn issuer_metadata_urls(issuer: &CanonicalHttpUrl) -> Result<Vec<CanonicalHttpUrl>, OAuthDiscoveryError> {
+    let origin = origin_of(issuer);
+    let path = issuer.path().trim_end_matches('/');
+    let mut locations = Vec::new();
+    // RFC 8414 insertion, RFC 8414's OpenID suffix, then OIDC's appending rule.
+    for value in [
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/openid-configuration{path}"),
+        format!("{origin}{path}/.well-known/openid-configuration"),
+    ] {
+        let location = CanonicalHttpUrl::parse(&value).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+        if !locations.contains(&location) {
+            locations.push(location);
+        }
+    }
+    Ok(locations)
+}
+
+fn admit_root(roots: &mut Vec<Certificate>, root: Certificate) -> Result<(), OAuthDiscoveryError> {
+    if roots.len() >= 8 || root.as_der().is_empty() || root.as_der().len() > 16 * 1024
+        || roots.iter().any(|existing| existing.as_der() == root.as_der())
+    {
+        return Err(OAuthDiscoveryError::InvalidPolicy);
+    }
+    RootCertStore::empty().add(&root).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    roots.push(root);
+    Ok(())
+}
+
+fn validate_array(values: &[String]) -> Result<(), OAuthDiscoveryError> {
+    if values.is_empty() || values.len() > MAX_ARRAY_ENTRIES {
+        return Err(OAuthDiscoveryError::InvalidMetadata);
+    }
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if value.is_empty() || value.len() > MAX_METADATA_STRING_BYTES
+            || value.chars().any(char::is_control) || !seen.insert(value)
+        {
+            return Err(OAuthDiscoveryError::InvalidMetadata);
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_array(values: Option<&[String]>) -> Result<(), OAuthDiscoveryError> {
+    values.map_or(Ok(()), validate_array)
+}
+
+fn admit_scopes(requested: &[String], supported: Option<&[String]>) -> Result<(), OAuthDiscoveryError> {
+    validate_optional_array(supported)?;
+    if supported.is_some_and(|supported| requested.iter().any(|scope| !supported.contains(scope))) {
+        return Err(OAuthDiscoveryError::UnsupportedScopes);
+    }
+    Ok(())
+}
+
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    // Missing is default; explicit null does not impersonate absence.
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct ResourceMetadata {
+    resource: String,
+    #[serde(default, deserialize_with = "present")]
+    authorization_servers: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    bearer_methods_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    scopes_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    signed_metadata: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IssuerMetadata {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    response_types_supported: Vec<String>,
+    #[serde(default, deserialize_with = "present")]
+    grant_types_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    response_modes_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    authorization_response_iss_parameter_supported: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    scopes_supported: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    protected_resources: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    signed_metadata: Option<String>,
+}
+
+fn decode_metadata<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, OAuthDiscoveryError> {
+    if body.len() > MAX_OAUTH_METADATA_BYTES {
+        return Err(OAuthDiscoveryError::InvalidMetadata);
+    }
+    // Derived structs reject repeated security-bearing fields, including
+    // escaped aliases; ordinary unknown metadata remains inert and unfetched.
+    serde_json::from_slice(body).map_err(|_| OAuthDiscoveryError::InvalidMetadata)
+}
+
+fn validate_headers(headers: &[(String, String)]) -> Result<(), OAuthDiscoveryError> {
+    let mut media = None;
+    let mut encoding_seen = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("content-type") && media.replace(value.as_str()).is_some() {
+            return Err(OAuthDiscoveryError::InvalidRepresentation);
+        }
+        if name.eq_ignore_ascii_case("content-encoding") {
+            if encoding_seen || !value.trim().eq_ignore_ascii_case("identity") {
+                return Err(OAuthDiscoveryError::InvalidRepresentation);
+            }
+            encoding_seen = true;
+        }
+    }
+    let mut parts = media.ok_or(OAuthDiscoveryError::InvalidRepresentation)?.split(';');
+    if !parts.next().is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json")) {
+        return Err(OAuthDiscoveryError::InvalidRepresentation);
+    }
+    if let Some(parameter) = parts.next() {
+        let (name, value) = parameter.trim().split_once('=').ok_or(OAuthDiscoveryError::InvalidRepresentation)?;
+        let value = value.trim();
+        if !name.trim().eq_ignore_ascii_case("charset")
+            || !(value.eq_ignore_ascii_case("utf-8") || value.eq_ignore_ascii_case("\"utf-8\""))
+            || parts.next().is_some()
+        {
+            return Err(OAuthDiscoveryError::InvalidRepresentation);
+        }
+    }
+    Ok(())
+}
+
+fn check_context(cx: &Cx, deadline: Time) -> Result<(), OAuthDiscoveryError> {
+    if cx.now() >= deadline {
+        return Err(OAuthDiscoveryError::TimedOut);
+    }
+    cx.checkpoint().map_err(|_| OAuthDiscoveryError::Cancelled)
+}
+
+fn discovery_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthDiscoveryError> {
+    if cx.checkpoint().is_err() {
+        return Err(OAuthDiscoveryError::Cancelled);
+    }
+    if !cx.capabilities().io || cx.timer_driver().is_none() {
+        return Err(OAuthDiscoveryError::RuntimeUnavailable);
+    }
+    let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    let end = cx.now().as_nanos().checked_add(nanos).ok_or(OAuthDiscoveryError::InvalidPolicy)?;
+    Ok(cx.budget().deadline.map_or(Time::from_nanos(end), |parent| parent.min(Time::from_nanos(end))))
+}
+
+async fn within<T>(
+    cx: &Cx,
+    deadline: Time,
+    future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
+) -> Result<T, OAuthDiscoveryError> {
+    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
+    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    let (_sender, mut receiver) = oneshot::channel::<()>();
+    let mut cancelled = std::pin::pin!(receiver.recv(cx));
+    let mut future = std::pin::pin!(future);
+    poll_fn(|task| {
+        check_context(cx, deadline)?;
+        let _caller = Cx::set_current(Some(cx.clone()));
+        if cancelled.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(OAuthDiscoveryError::Cancelled));
+        }
+        if sleep.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(OAuthDiscoveryError::TimedOut));
+        }
+        let result = future.as_mut().poll(task);
+        check_context(cx, deadline)?;
+        result
+    }).await
+}
+
+async fn fetch_metadata(
+    cx: &Cx,
+    deadline: Time,
+    url: &CanonicalHttpUrl,
+    roots: &[Certificate],
+) -> Result<Option<Vec<u8>>, OAuthDiscoveryError> {
+    check_context(cx, deadline)?;
+    let mut builder = HttpClient::builder()
+        .redirect_policy(RedirectPolicy::None)
+        .retry_policy(RetryPolicy::None)
+        .no_proxy()
+        .no_cookie_store()
+        .max_body_size(MAX_OAUTH_METADATA_BYTES)
+        .max_total_connections(1);
+    for root in roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
+    let client = builder.build();
+    let response = within(cx, deadline, async {
+        client.request(cx, Method::Get, url.as_str(), vec![
+            ("Accept".to_owned(), "application/json".to_owned()),
+            ("Accept-Encoding".to_owned(), "identity".to_owned()),
+            ("Connection".to_owned(), "close".to_owned()),
+        ], Vec::new()).await.map_err(|_| OAuthDiscoveryError::TransportFailed)
+    }).await?;
+    if matches!(response.status, 404 | 410) {
+        return Ok(None);
+    }
+    if response.status != 200 {
+        return Err(OAuthDiscoveryError::HttpStatus { status: response.status });
+    }
+    validate_headers(&response.headers)?;
+    if response.body.len() > MAX_OAUTH_METADATA_BYTES || !response.trailers.is_empty() {
+        return Err(OAuthDiscoveryError::InvalidRepresentation);
+    }
+    Ok(Some(response.body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
+
+    fn plan() -> OAuthDiscoveryPlan {
+        OAuthDiscoveryPlan::new(url("https://resource.example/mcp"), vec![
+            TrustedOAuthIssuer::new("https://issuer.example/tenant").unwrap(),
+        ], "registered-client", vec!["tools:read".to_owned()]).unwrap()
+    }
+
+    fn issuer_document() -> serde_json::Value {
+        json!({
+            "issuer": "https://issuer.example/tenant",
+            "authorization_endpoint": "https://issuer.example/authorize",
+            "token_endpoint": "https://issuer.example/token",
+            "response_types_supported": ["code"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": true,
+            "scopes_supported": ["tools:read"],
+            "protected_resources": ["https://resource.example/mcp"]
+        })
+    }
+
+    fn admit(plan: &OAuthDiscoveryPlan, document: &serde_json::Value) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        plan.admit_issuer(&plan.issuers[0], &serde_json::to_vec(document).unwrap())
+    }
+
+    #[test]
+    fn well_known_paths_preserve_tenant_and_distinguish_rfc_and_oidc_layouts() {
+        let paths = issuer_metadata_urls(&url("https://issuer.example:8443/tenant/")).unwrap();
+        assert_eq!(paths.iter().map(CanonicalHttpUrl::as_str).collect::<Vec<_>>(), [
+            "https://issuer.example:8443/.well-known/oauth-authorization-server/tenant",
+            "https://issuer.example:8443/.well-known/openid-configuration/tenant",
+            "https://issuer.example:8443/tenant/.well-known/openid-configuration",
+        ]);
+        assert_eq!(issuer_metadata_urls(&url("https://issuer.example")).unwrap().len(), 2);
+        assert_eq!(resource_metadata_url(&url("https://[::1]:8443/mcp")).unwrap().as_str(),
+            "https://[::1]:8443/.well-known/oauth-protected-resource/mcp");
+    }
+
+    #[test]
+    fn local_issuer_order_wins_and_unknown_peer_urls_never_become_fetch_targets() {
+        let mut plan = plan();
+        plan.issuers.push(TrustedOAuthIssuer::new("https://second.example").unwrap());
+        let body = json!({"resource": plan.resource.as_str(), "authorization_servers": [
+            "http://127.0.0.1/private", "https://second.example", "https://issuer.example/tenant"
+        ]});
+        assert_eq!(plan.select_issuer(&serde_json::to_vec(&body).unwrap()).unwrap().identifier,
+            "https://issuer.example/tenant");
+        let unknown = br#"{"resource":"https://resource.example/mcp","authorization_servers":["https://unknown.example"]}"#;
+        assert!(matches!(plan.select_issuer(unknown), Err(OAuthDiscoveryError::NoTrustedIssuer)));
+    }
+
+    #[test]
+    fn valid_discovery_preserves_registration_resource_and_pkce_flow() {
+        let plan = plan();
+        let actual = admit(&plan, &issuer_document()).unwrap();
+        let expected = OAuthClientConfiguration::from_trusted_endpoints(
+            "https://issuer.example/tenant", url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"), plan.resource.clone(),
+            "registered-client", vec!["tools:read".to_owned()],
+        ).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn metadata_must_match_exact_resource_and_issuer_not_just_the_origin() {
+        let plan = plan();
+        let wrong_resource = br#"{"resource":"https://resource.example/","authorization_servers":["https://issuer.example/tenant"]}"#;
+        assert!(matches!(plan.select_issuer(wrong_resource), Err(OAuthDiscoveryError::ResourceMismatch)));
+        for issuer in ["https://issuer.example/tenant/", "https://ISSUER.example/tenant", "https://other.example/tenant"] {
+            let mut document = issuer_document();
+            document["issuer"] = json!(issuer);
+            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::IssuerMismatch)));
+        }
+    }
+
+    #[test]
+    fn metadata_cannot_relax_s256_public_client_or_query_response_requirements() {
+        let plan = plan();
+        for (member, value) in [
+            ("code_challenge_methods_supported", json!(["plain"])),
+            ("token_endpoint_auth_methods_supported", json!(["client_secret_basic"])),
+            ("authorization_response_iss_parameter_supported", json!(false)),
+            ("response_types_supported", json!(["token"])),
+            ("grant_types_supported", json!(["client_credentials"])),
+            ("response_modes_supported", json!(["fragment"])),
+        ] {
+            let mut document = issuer_document();
+            document[member] = value;
+            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedFlow)));
+        }
+        for member in ["code_challenge_methods_supported", "token_endpoint_auth_methods_supported", "authorization_response_iss_parameter_supported"] {
+            let mut document = issuer_document();
+            document.as_object_mut().unwrap().remove(member);
+            assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedFlow)));
+        }
+    }
+
+    #[test]
+    fn cross_origin_token_endpoint_needs_an_explicit_host_grant() {
+        let mut plan = plan();
+        let mut document = issuer_document();
+        document["token_endpoint"] = json!("https://tokens.example/exchange");
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::EndpointNotTrusted)));
+        plan.issuers[0] = plan.issuers[0].clone().with_endpoint_origin(url("https://tokens.example/")).unwrap();
+        assert!(admit(&plan, &document).is_ok());
+        for endpoint in ["http://tokens.example/exchange", "https://user@tokens.example/exchange", "https://tokens.example/exchange?q=1", "https://tokens.example/exchange#x"] {
+            document["token_endpoint"] = json!(endpoint);
+            assert!(admit(&plan, &document).is_err());
+        }
+    }
+
+    #[test]
+    fn scopes_and_reverse_resource_associations_cannot_expand_authority() {
+        let plan = plan();
+        let mut document = issuer_document();
+        document["scopes_supported"] = json!(["admin"]);
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedScopes)));
+        document = issuer_document();
+        document["protected_resources"] = json!(["https://other.example/mcp"]);
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::ResourceMismatch)));
+        let resource = br#"{"resource":"https://resource.example/mcp","authorization_servers":["https://issuer.example/tenant"],"bearer_methods_supported":["body"]}"#;
+        assert!(matches!(plan.select_issuer(resource), Err(OAuthDiscoveryError::UnsupportedFlow)));
+    }
+
+    #[test]
+    fn null_duplicate_and_signed_security_metadata_is_not_silently_accepted() {
+        let plan = plan();
+        for suffix in [",\"issuer\":\"https://other.example\"", ",\"iss\\u0075er\":\"https://other.example\""] {
+            let encoded = serde_json::to_string(&issuer_document()).unwrap();
+            let body = format!("{}{suffix}}}", &encoded[..encoded.len() - 1]);
+            assert!(matches!(plan.admit_issuer(&plan.issuers[0], body.as_bytes()), Err(OAuthDiscoveryError::InvalidMetadata)));
+        }
+        let mut document = issuer_document();
+        document["grant_types_supported"] = serde_json::Value::Null;
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::InvalidMetadata)));
+        document = issuer_document();
+        document["signed_metadata"] = json!("unverified.jwt.claims");
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::SignedMetadataUnsupported)));
+        let oversized = vec![b' '; MAX_OAUTH_METADATA_BYTES + 1];
+        assert!(matches!(plan.select_issuer(&oversized), Err(OAuthDiscoveryError::InvalidMetadata)));
+    }
+
+    #[test]
+    fn representation_requires_single_uncoded_json_content_type() {
+        assert!(validate_headers(&[("Content-Type".into(), "application/json; charset=\"utf-8\"".into())]).is_ok());
+        for headers in [
+            vec![],
+            vec![("Content-Type".into(), "text/html".into())],
+            vec![("Content-Type".into(), "application/json".into()), ("content-type".into(), "application/json".into())],
+            vec![("Content-Type".into(), "application/json".into()), ("Content-Encoding".into(), "gzip".into())],
+            vec![("Content-Type".into(), "application/json; charset=\"utf-8".into())],
+        ] {
+            assert!(matches!(validate_headers(&headers), Err(OAuthDiscoveryError::InvalidRepresentation)));
+        }
+    }
+
+    #[test]
+    fn trust_policy_rejects_ambiguous_issuers_and_overbroad_origin_grants() {
+        assert!(TrustedOAuthIssuer::new("http://localhost/issuer").is_err());
+        assert!(TrustedOAuthIssuer::new("https://issuer.example?query").is_err());
+        assert!(TrustedOAuthIssuer::new("https://issuer.example").unwrap()
+            .with_endpoint_origin(url("https://other.example/some-path")).is_err());
+        let issuer = TrustedOAuthIssuer::new("https://issuer.example").unwrap();
+        assert!(OAuthDiscoveryPlan::new(url("https://resource.example/mcp"),
+            vec![issuer.clone(), issuer], "client", vec![]).is_err());
+        assert!(plan().with_timeout(Duration::ZERO).is_err());
+        assert!(plan().with_timeout(Duration::from_secs(121)).is_err());
+    }
+}
