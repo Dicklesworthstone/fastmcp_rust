@@ -323,11 +323,10 @@ fn legacy_session_with(script: Script, reads: usize, cancel_before_read: bool) -
             }
             Script::DataLine(size) => {
                 write_chunk(&mut sse_stream, &endpoint_event(&message_for_server));
-                let mut event = Vec::with_capacity(size + 32);
-                event.extend_from_slice(b"event: message\ndata: ");
-                event.extend(std::iter::repeat_n(b'x', *size));
-                event.extend_from_slice(b"\n\n");
-                write_chunk(&mut sse_stream, &event);
+                write_chunk(
+                    &mut sse_stream,
+                    &message_event(&sized_jsonrpc_payload(*size)),
+                );
                 end_sse(&mut sse_stream);
             }
             Script::SseStatus(..) => unreachable!("handled above"),
@@ -377,30 +376,89 @@ fn legacy_session_with(script: Script, reads: usize, cancel_before_read: bool) -
     outcome
 }
 
-/// Feeds one `data:` line of `size` payload bytes and reports whether the
-/// shipped transport admitted it.
-fn line_of_size_is_admitted(size: usize) -> bool {
-    let outcome = legacy_session(Script::DataLine(size), 1);
-    outcome.opened()
-        && outcome
-            .messages
-            .first()
-            .is_some_and(|rendered| rendered.starts_with("Ok("))
+/// Builds a VALID JSON-RPC message whose `data:` payload is exactly `size`
+/// bytes, so line length is the ONLY variable across probe sizes.
+///
+/// An earlier revision padded with raw `x` bytes. That payload is not JSON-RPC,
+/// so every probe was refused by the decoder regardless of its length and the
+/// search never admitted anything - the measurement was vacuous and the ratio
+/// computed from it was an artifact of the first probe size, not a bound.
+fn sized_jsonrpc_payload(size: usize) -> String {
+    let envelope = r#"{"jsonrpc":"2.0","id":1,"result":{"pad":""}}"#;
+    assert!(
+        size >= envelope.len(),
+        "a probe size must leave room for the JSON-RPC envelope ({} bytes)",
+        envelope.len()
+    );
+    let pad = "x".repeat(size - envelope.len());
+    format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"pad":"{pad}"}}}}"#)
 }
 
-/// Measures the shipped SSE line bound by doubling until refusal.
+/// What the shipped transport did with one sized line.
+#[derive(Debug)]
+enum LineProbe {
+    /// Admitted and decoded as one JSON-RPC message.
+    Admitted,
+    /// Refused specifically because of its size.
+    RefusedForSize,
+    /// Anything else. Never counted as either, because a probe that cannot tell
+    /// admission from refusal has measured nothing.
+    Inconclusive(String),
+}
+
+/// Feeds one valid, sized `data:` line and classifies the transport's answer.
+fn probe_line(size: usize) -> LineProbe {
+    let outcome = legacy_session(Script::DataLine(size), 1);
+    if !outcome.opened() {
+        return LineProbe::Inconclusive(format!(
+            "the legacy lane did not open: {:?}",
+            outcome.open_error
+        ));
+    }
+    let Some(observed) = outcome.messages.first() else {
+        return LineProbe::Inconclusive("no read was performed".to_owned());
+    };
+    if observed.starts_with("Ok(Some(") {
+        LineProbe::Admitted
+    } else if observed.contains("SseLineTooLong") || observed.contains("SseEventTooLarge") {
+        LineProbe::RefusedForSize
+    } else {
+        LineProbe::Inconclusive(observed.clone())
+    }
+}
+
+/// Measures the shipped SSE line bound by doubling until a SIZE refusal.
 ///
-/// Returns the accepted/refused bracket. Stops at the frozen guarded floor: a
-/// transport that admits that has no conflict to record.
+/// Returns the accepted/refused bracket, or `None` when the transport admits the
+/// frozen guarded floor and there is therefore no conflict to record.
+///
+/// Panics rather than returning a bracket when the transport never admits
+/// anything or answers inconclusively: a conflict recorded against a measurement
+/// that never happened is worse than no conflict, because the number in it is
+/// evidence someone will act on.
 fn measure_sse_line_bound() -> Option<ObservedLimit> {
     let mut accepted = 0_usize;
     let mut size = 1024_usize;
     while size <= PROBE_CEILING_BYTES {
-        if line_of_size_is_admitted(size) {
-            accepted = size;
-            size = size.saturating_mul(2);
-        } else {
-            return Some(ObservedLimit::new(accepted as u64, size as u64));
+        match probe_line(size) {
+            LineProbe::Admitted => {
+                accepted = size;
+                size = size.saturating_mul(2);
+            }
+            LineProbe::RefusedForSize => {
+                assert!(
+                    accepted > 0,
+                    "the transport refused {size} bytes for size without ever admitting a \
+                     smaller line, so no bound was bracketed. A conflict computed from this \
+                     would divide the frozen floor by the first probe size and report an \
+                     artifact, not a measurement."
+                );
+                return Some(ObservedLimit::new(accepted as u64, size as u64));
+            }
+            LineProbe::Inconclusive(reason) => panic!(
+                "the line probe at {size} bytes is INCONCLUSIVE ({reason}); it distinguishes \
+                 neither admission nor a size refusal, so nothing may be recorded from it"
+            ),
         }
     }
     None
