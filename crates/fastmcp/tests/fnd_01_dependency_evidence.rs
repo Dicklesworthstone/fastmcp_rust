@@ -168,41 +168,6 @@ mod trust_std {
     /// the verifier's bound [`AUTHORING_PATHS`] disagree.
     pub const E_AUTHORING_ORDERED_PATHS: &str = "E_AUTHORING_ORDERED_PATHS";
 
-    /// Decodes `[authoring_closure_contract] ordered_paths` from the policy.
-    ///
-    /// This is the row the authoring closure preimage is *defined* over. Until
-    /// this function existed it had zero readers anywhere in the workspace: the
-    /// authoritative input set was declared twice, once here and once as the
-    /// compiled [`AUTHORING_PATHS`], with nothing reconciling the two copies.
-    /// A divergence would therefore have left every freeze test green while the
-    /// policy declared a different set of inputs than the one actually frozen.
-    pub fn declared_authoring_ordered_paths(policy_bytes: &[u8]) -> TrustResult<Vec<String>> {
-        let sections = parse_closed_toml(policy_bytes, MAX_POLICY_BYTES, "authoring ordered_paths")?;
-        let section = sections
-            .iter()
-            .find(|section| !section.array && section.path == "authoring_closure_contract")
-            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "policy has no [authoring_closure_contract] table"))?;
-        let raw = section
-            .fields
-            .get("ordered_paths")
-            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "[authoring_closure_contract] declares no ordered_paths"))?;
-        let inner = raw
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .ok_or_else(|| TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths is not an inline array"))?;
-        if inner.is_empty() {
-            return Err(TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths is empty"));
-        }
-        let mut declared = Vec::new();
-        for element in inner.split(", ") {
-            if declared.len() >= AUTHORING_PATHS.len() {
-                return Err(TrustError::new(E_AUTHORING_ORDERED_PATHS, "ordered_paths declares more rows than the verifier binds"));
-            }
-            declared.push(decode_toml_basic_string(element, "ordered_paths element")?);
-        }
-        Ok(declared)
-    }
-
     /// Fails closed unless `declared` equals [`AUTHORING_PATHS`] exactly: same
     /// element count, same order, same bytes.
     ///
@@ -24051,6 +24016,42 @@ activate = 1\n";
     fn parse_toml_strict<T: DeserializeOwned>(bytes: &[u8], subject: &str) -> VResult<T> {
         let text = std::str::from_utf8(bytes).map_err(|_| Diagnostic::error("E_UTF8", subject).at("complete TOML document must be UTF-8"))?;
         toml::from_str(text).map_err(|_| Diagnostic::error("E_TOML_SCHEMA", subject).at("strict typed parse"))
+    }
+
+    /// Decodes `[authoring_closure_contract] ordered_paths` from the policy.
+    ///
+    /// This is the row the authoring closure preimage is *defined* over, and
+    /// until it was consumed here it had zero readers anywhere in the
+    /// workspace: the authoritative input set was declared twice, once in the
+    /// policy and once as the compiled `trust_std::AUTHORING_PATHS`, with
+    /// nothing reconciling the two copies.
+    ///
+    /// It deliberately uses `parse_toml_strict`, the same reader `read_policy`
+    /// uses for this document. The canonical-envelope reader in `trust_std`
+    /// exists for machine-generated receipts and refuses a leading comment by
+    /// design; `dependency-verification.toml` is hand-authored and opens with a
+    /// comment header, so it is not in that file class. The strict receipt
+    /// reader is left untouched rather than relaxed to admit comments.
+    fn declared_authoring_ordered_paths(policy_bytes: &[u8]) -> VResult<Vec<String>> {
+        let relative = "evidence/fnd-01/dependency-verification.toml";
+        let document: toml::Value = parse_toml_strict(policy_bytes, relative)?;
+        let contract = document
+            .get("authoring_closure_contract")
+            .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("authoring_closure_contract"))?;
+        let rows = contract
+            .get("ordered_paths")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths"))?;
+        if rows.is_empty() {
+            return Err(Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths is empty"));
+        }
+        rows.iter()
+            .map(|row| {
+                row.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| Diagnostic::error("E_AUTHORING_ORDERED_PATHS", relative).at("ordered_paths element is not a string"))
+            })
+            .collect()
     }
 
     fn parse_toml_document(text: &str, subject: &str) -> VResult<toml::Value> {
@@ -53304,8 +53305,8 @@ dependency_kinds = ["build", "normal"]
     #[test]
     fn authoring_closure_marker_round_trip() {
         use super::trust_std::{
-            AUTHORING_PATHS, AuthoringMarker, E_AUTHORING_ORDERED_PATHS, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, admit_authoring_ordered_paths, authoring_closure_preimage,
-            declared_authoring_ordered_paths, encode_lower_hex, integration_seal_preimage, parse_authoring_marker, parse_integration_seal,
+            AUTHORING_PATHS, AuthoringMarker, E_AUTHORING_ORDERED_PATHS, FileBinding, IntegrationSeal, MAX_OUTER_TRANSPORT_RECORD_BYTES, admit_authoring_ordered_paths, authoring_closure_preimage, encode_lower_hex,
+            integration_seal_preimage, parse_authoring_marker, parse_integration_seal,
         };
 
         let root = repository_root();
@@ -53350,7 +53351,7 @@ dependency_kinds = ["build", "normal"]
         // while the policy named a different set than the one being frozen.
         // ------------------------------------------------------------------
         let policy_bytes = fs::read(root.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}"));
-        let declared_paths = declared_authoring_ordered_paths(&policy_bytes).expect("policy must declare [authoring_closure_contract] ordered_paths");
+        let declared_paths = declared_authoring_ordered_paths(&policy_bytes).unwrap_or_else(|diagnostic| panic!("policy must declare [authoring_closure_contract] ordered_paths: {}", diagnostic.stable()));
         admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
 
         // Planted negatives. The changed variable is one element of a COPY of
@@ -53658,7 +53659,6 @@ dependency_kinds = ["build", "normal"]
     fn authoring_freeze_rejects_owned_path_drift() {
         use super::trust_std::{
             AUTHORING_PATHS, FileBinding, MAX_HARNESS_BYTES, MAX_POLICY_BYTES, MAX_VERIFIER_BYTES, SnapshotStage, TrustError, admit_authoring_ordered_paths, checked_snapshot_set_with_hook,
-            declared_authoring_ordered_paths,
         };
         use std::fs::OpenOptions;
 
@@ -53668,8 +53668,8 @@ dependency_kinds = ["build", "normal"]
         // The set this test drifts is the set the policy declares. Enforce that
         // agreement before exercising byte drift, so this test cannot pass by
         // guarding a different three files than the policy names.
-        let declared_paths =
-            declared_authoring_ordered_paths(&fs::read(repository.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}"))).expect("policy must declare ordered_paths");
+        let declared_paths = declared_authoring_ordered_paths(&fs::read(repository.join(AUTHORING_PATHS[0])).unwrap_or_else(|error| panic!("read policy for ordered_paths: {error}")))
+            .unwrap_or_else(|diagnostic| panic!("policy must declare ordered_paths: {}", diagnostic.stable()));
         admit_authoring_ordered_paths(&declared_paths).expect("policy ordered_paths must equal the verifier's bound authoring set");
         let copy_authoring_set = |namespace: &str| {
             let root = super::fresh_test_root(namespace);
