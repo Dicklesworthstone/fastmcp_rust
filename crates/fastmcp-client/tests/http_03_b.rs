@@ -310,12 +310,16 @@ fn http_03_b_positive() {
         26,
         "the manifest requires a minimum of 26 ordered cases"
     );
-    run(async {
-        let cx = Cx::current().expect("the caller runtime must install a current Cx");
-        for case in POSITIVE_CASES {
+    // One runtime, and therefore one cancellation domain, per case. `Cx::clone`
+    // shares the cancellation `Arc` rather than creating a child, so a case that
+    // cancels its context would otherwise cancel every case that follows it in a
+    // shared `run(..)` and the whole target would die in the harness.
+    for case in POSITIVE_CASES {
+        run(async move {
+            let cx = Cx::current().expect("the caller runtime must install a current Cx");
             execute_positive(&cx, case).await;
-        }
-    });
+        });
+    }
 }
 
 #[test]
@@ -327,12 +331,14 @@ fn http_03_b_planted_negative() {
         MANIFEST_GROUP_ORDER.len(),
         "every manifest group carries exactly one planted negative"
     );
-    run(async {
-        let cx = Cx::current().expect("the caller runtime must install a current Cx");
-        for case in NEGATIVE_CASES {
+    // One runtime, and therefore one cancellation domain, per case. See the
+    // note in `http_03_b_positive`.
+    for case in NEGATIVE_CASES {
+        run(async move {
+            let cx = Cx::current().expect("the caller runtime must install a current Cx");
             execute_negative(&cx, case).await;
-        }
-    });
+        });
+    }
 }
 
 async fn execute_positive(cx: &Cx, case: ManifestCase) {
@@ -463,12 +469,28 @@ impl Peer {
     /// Proves the client opened no further socket. A modern MCP client that
     /// replayed a POST, followed a redirect, or answered the server with its
     /// own request would have to connect again to do so.
+    ///
+    /// This is deliberately three-way rather than `is_pending()`. A cancelled
+    /// ambient `Cx` makes `TcpListener::poll_accept` return
+    /// `Ready(Err(Interrupted, "cancelled"))` rather than `Pending`, so a
+    /// two-way check reports "the client opened another socket" when in fact
+    /// no connection exists and the poll was merely refused — a false finding
+    /// against the shipped client. An inconclusive probe is not evidence of
+    /// good behaviour either, so it fails on its own terms rather than passing.
     fn assert_no_further_connection(&self) {
         let mut task = Context::from_waker(Waker::noop());
-        assert!(
-            self.listener.poll_accept(&mut task).is_pending(),
-            "the client must not open another socket"
-        );
+        match self.listener.poll_accept(&mut task) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(_)) => {
+                panic!("the client must not open another socket")
+            }
+            Poll::Ready(Err(error)) => panic!(
+                "the no-further-connection probe was inconclusive: poll_accept refused with \
+                 {error:?}. This proves nothing about the client — a cancelled ambient Cx makes \
+                 poll_accept return Ready(Err(Interrupted)) instead of Pending — so the case must \
+                 probe from an uncancelled context rather than treat this as a pass."
+            ),
+        }
     }
 }
 
@@ -685,40 +707,57 @@ const RECOGNIZED: HttpModernProbe = HttpModernProbe {
 // HTTP-03.14 — caller cancellation closes the owned response
 // ---------------------------------------------------------------------------
 
-/// A cancellation raised while the owned exchange is in flight closes the
-/// response and opens no replacement socket.
+/// A caller that cancels while it owns an admitted response is refused the
+/// body, and opens no replacement socket.
+///
+/// Ordering matters and is the point of this case. The fixture writes a
+/// complete, correctly framed response and closes it **before** any
+/// cancellation is raised. `Cx::clone` shares the cancellation `Arc` rather
+/// than creating a child, so cancelling first would make the fixture's own
+/// cancel-aware writes fail with `Interrupted` and the fixture, not the client,
+/// would become the thing under test. The cancellation is therefore raised by
+/// the caller, after the response head is in hand, and the observable is that
+/// the owned body is then refused.
+///
+/// The no-further-connection probe runs against an uncancelled listener,
+/// because the socket probe itself is unusable once the ambient context is
+/// cancelled — see [`Peer::assert_no_further_connection`].
 async fn positive_14_cancellation_closes_response(cx: &Cx) {
     let peer = Peer::bind().await;
     let target = peer.target();
     let request = ping_request(&target);
-    let child = cx.clone();
 
     let server = async {
         let mut io = peer.accept().await;
         let wire = read_request(&mut io).await;
         assert_eq!(wire.body, ping_body(), "the POST body is sent exactly once");
-        begin_sse(&mut io).await;
-        write_bytes(&mut io, b": open\n\n").await;
-        // Cancel only after the exchange is committed, so this case observes
-        // in-flight cancellation rather than pre-dispatch refusal.
-        child.cancel_with(
-            asupersync::CancelKind::User,
-            Some("http-03.14 caller cancellation"),
-        );
-        end_sse_stream(&mut io).await;
+        write_json_response(&mut io, DISCOVERY_BODY).await;
+        end_stream(&mut io).await;
         wire
     };
 
     let client = async {
-        let outcome = post(cx, &request).await;
-        match outcome {
-            Ok(stream) => drop(stream),
-            Err(ModernHttpExecutorError::Cancelled)
-            | Err(ModernHttpExecutorError::Transport(_))
-            | Err(ModernHttpExecutorError::ResponseBodyReadFailed)
-            | Err(ModernHttpExecutorError::SseStreamClosed) => {}
-            Err(other) => panic!("in-flight cancellation produced {other:?}"),
-        }
+        let stream = post(cx, &request)
+            .await
+            .expect("the response head must arrive before the caller cancels");
+        assert_eq!(
+            stream.metadata().kind(),
+            ModernHttpResponseKind::Json,
+            "the admitted response selects the immediate JSON lane"
+        );
+
+        // The caller now owns the response and cancels. Nothing else writes to
+        // this exchange from here on.
+        cx.cancel_with(
+            asupersync::CancelKind::User,
+            Some("http-03.14 caller cancellation while owning the response"),
+        );
+
+        let outcome = stream.read_to_end(cx, 64 * 1024).await;
+        assert!(
+            outcome.is_err(),
+            "a caller that cancelled while owning the response must not receive its body"
+        );
     };
 
     let (wire, ()) = pair(server, client).await;
@@ -726,33 +765,41 @@ async fn positive_14_cancellation_closes_response(cx: &Cx) {
         header_values(&wire.head, "last-event-id").is_empty(),
         "a cancelled exchange must not have offered resumption state"
     );
-    peer.assert_no_further_connection();
+    // Deliberately not probing the listener here: this case's own context is
+    // cancelled by design, which makes `poll_accept` return
+    // `Ready(Err(Interrupted))` and the probe inconclusive. The no-replacement-
+    // socket property for the cancellation dimension is carried by the
+    // uncancelled cases below.
 }
 
-/// One variable changes: cancellation is requested *before* dispatch. The
-/// executor must refuse with the typed `Cancelled` outcome and never open a
-/// socket at all.
+/// One variable changes: cancellation is requested *before* dispatch rather
+/// than while the caller owns the response. The executor must refuse with the
+/// typed `Cancelled` outcome.
+///
+/// The listener is deliberately **not** probed here. This case must cancel its
+/// own context before dispatching, and a cancelled ambient context makes
+/// `TcpListener::poll_accept` return `Ready(Err(Interrupted))` rather than
+/// `Pending`, so the probe cannot distinguish "no connection" from "I could not
+/// look" and would report a socket that does not exist. The no-socket property
+/// for this dimension is instead carried by the typed refusal itself: the
+/// executor's `check_modern_http_context` checkpoint precedes any connect, so a
+/// `Cancelled` outcome is only reachable before a socket exists.
 async fn negative_14_precancelled_dispatch(cx: &Cx) {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let child = cx.clone();
-    child.cancel_with(
+    cx.cancel_with(
         asupersync::CancelKind::User,
         Some("http-03.14 pre-dispatch cancellation"),
     );
 
-    let error = post(&child, &request)
+    let error = post(cx, &request)
         .await
         .err()
         .expect("a pre-cancelled dispatch must not produce a response");
     assert!(
-        matches!(
-            error,
-            ModernHttpExecutorError::Cancelled | ModernHttpExecutorError::Transport(_)
-        ),
-        "pre-dispatch cancellation must be typed, got {error:?}"
+        matches!(error, ModernHttpExecutorError::Cancelled),
+        "pre-dispatch cancellation must be the typed Cancelled refusal, got {error:?}"
     );
-    peer.assert_no_further_connection();
 }
 
 // ---------------------------------------------------------------------------
