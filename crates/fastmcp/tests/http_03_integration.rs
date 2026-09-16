@@ -881,13 +881,49 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         };
 
         // Reading past the terminal is the stream-close observation.
-        let a_post_terminal = match a_listener.next_event(&cx).await {
-            Ok(event) => panic!("a closed stream must not yield {event:?}"),
-            Err(ModernHttpFinalCoreListenError::EndOfStream { .. }) => {
-                "closed=end_of_stream".to_owned()
+        //
+        // THE CONTRACT, so nobody re-inverts it: `Ok(None)` is the correct and
+        // deliberate "this stream is finished" signal. Delivering the terminal
+        // sets `terminal_received = true` and calls `stream.close()`, and
+        // `ModernHttpFinalCoreListener::next_event` then short-circuits on that
+        // flag before touching the body at all (`http_executor.rs:1488-1490`).
+        //
+        // `Err(EndOfStream)` is NOT the healthy post-terminal outcome — it is
+        // what a body that ended *without* a terminal produces, i.e. truncation.
+        // An earlier revision of this fixture asserted exactly that, demanding
+        // the failure condition and rejecting the success one, which is why the
+        // first execution of this join reported a closed stream "yielding None".
+        //
+        // Both outcomes are still observed here, on opposite sides: `Ok(None)`
+        // passes, and truncation now fails as the distinct defect it is.
+        let post_terminal = a_listener.next_event(&cx).await;
+        let a_post_terminal = match post_terminal {
+            Ok(None) => "closed=terminal_then_none".to_owned(),
+            Ok(Some(event)) => {
+                panic!("a stream closed by its terminal must not yield another record: {event:?}")
             }
-            Err(other) => panic!("expected a typed end-of-stream, observed {other:?}"),
+            Err(ModernHttpFinalCoreListenError::EndOfStream { framing }) => panic!(
+                "the response body ended without delivering a terminal (framing {framing:?}); \
+                 that is truncation, not the post-terminal close this case observes"
+            ),
+            Err(other) => panic!(
+                "the post-terminal observation is INCONCLUSIVE ({other:?}); it proves neither a \
+                 clean close nor a leaked record"
+            ),
         };
+
+        // The close is stable, not a one-shot transition: a second read past the
+        // terminal must give the same clean signal rather than an error or a
+        // revived record.
+        match a_listener.next_event(&cx).await {
+            Ok(None) => {}
+            Ok(Some(event)) => {
+                panic!("a closed stream must stay closed, but a later read yielded {event:?}")
+            }
+            Err(error) => panic!(
+                "a closed stream must keep reporting its clean terminal signal, observed {error:?}"
+            ),
+        }
 
         ClientOutcome {
             a_era,
@@ -1588,8 +1624,9 @@ fn case_terminal_and_close(builder: &mut CaseBuilder, wire: &WireObservations) {
     builder.positive("terminal", &wire.a_terminal);
     assert_eq!(wire.a_terminal, "terminal=tools_call");
 
-    // One variable: the read position moves past the terminal record.
-    assert_eq!(wire.a_post_terminal, "closed=end_of_stream");
+    // One variable: the read position moves past the terminal record. The
+    // stream answers with its clean finished signal rather than another record.
+    assert_eq!(wire.a_post_terminal, "closed=terminal_then_none");
     builder.negative("read-past-terminal", &wire.a_post_terminal);
 }
 
@@ -2154,7 +2191,7 @@ fn http_03_i_positive() {
         receipt
             .case("HTTP-03.13")
             .record
-            .contains("closed=end_of_stream"),
+            .contains("closed=terminal_then_none"),
         "the owning stream must close exactly once after its terminal"
     );
 }
@@ -2215,7 +2252,7 @@ fn http_03_i_planted_negative() {
         planted
             .case("HTTP-03.13")
             .record
-            .contains("closed=end_of_stream"),
+            .contains("closed=terminal_then_none"),
         "the sibling stream must close exactly once, unaffected by the plant"
     );
 
