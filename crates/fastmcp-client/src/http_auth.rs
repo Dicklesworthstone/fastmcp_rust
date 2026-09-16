@@ -18,6 +18,10 @@
 //!   through diagnostics, and header-hostile bytes are refused at binding.
 
 use core::fmt;
+use std::time::Instant;
+
+/// Interactive native-public-client authorization with a caller-owned runtime.
+pub mod oauth;
 
 pub use fastmcp_core::CanonicalHttpUrl;
 
@@ -56,6 +60,7 @@ impl std::error::Error for BearerBindingError {}
 pub struct BoundBearerCredential {
     resource: CanonicalHttpUrl,
     token: String,
+    expires_at: Option<Instant>,
 }
 
 impl fmt::Debug for BoundBearerCredential {
@@ -94,7 +99,20 @@ impl BoundBearerCredential {
         {
             return Err(BearerBindingError::InvalidTokenBytes);
         }
-        Ok(Self { resource, token })
+        Ok(Self { resource, token, expires_at: None })
+    }
+
+    /// Binds a token with a monotonic deadline. At and after this instant,
+    /// header construction withholds the credential, even from its resource.
+    /// Already-emitted headers cannot be recalled by this value.
+    pub fn bind_with_expiry(
+        resource: CanonicalHttpUrl,
+        token: impl Into<String>,
+        expires_at: Instant,
+    ) -> Result<Self, BearerBindingError> {
+        let mut credential = Self::bind(resource, token)?;
+        credential.expires_at = Some(expires_at);
+        Ok(credential)
     }
 
     /// Returns the bound HTTPS resource.
@@ -103,15 +121,28 @@ impl BoundBearerCredential {
         &self.resource
     }
 
+    /// Returns the locally enforced expiry, when the credential has one.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
+
     /// Returns the `Authorization` header value for `target`, or `None`
-    /// when the target is not canonically identical to the bound resource.
+    /// when the target is not canonically identical to the bound resource or
+    /// the credential has expired.
     ///
     /// A `None` is not an error: the request simply proceeds without a
     /// credential, so a mismatched, downgraded, or redirected target can
     /// never observe the token.
     #[must_use]
     pub fn authorization_for_target(&self, target: &CanonicalHttpUrl) -> Option<String> {
-        if target.as_str() == self.resource.as_str() {
+        self.authorization_at(target, Instant::now())
+    }
+
+    fn authorization_at(&self, target: &CanonicalHttpUrl, now: Instant) -> Option<String> {
+        if target.as_str() == self.resource.as_str()
+            && self.expires_at.is_none_or(|deadline| now < deadline)
+        {
             Some(format!("Bearer {}", self.token))
         } else {
             None
@@ -222,5 +253,28 @@ mod tests {
             !debug.contains("super-secret-token-value"),
             "the token must never appear in diagnostics: {debug}"
         );
+    }
+
+    #[test]
+    fn expiring_credential_clones_withhold_headers_at_the_exact_deadline() {
+        use std::time::{Duration, Instant};
+
+        let resource = url("https://mcp.example/api");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let credential = BoundBearerCredential::bind_with_expiry(
+            resource.clone(), "expiring-secret", deadline,
+        ).unwrap();
+        for credential in [credential.clone(), credential] {
+            assert_eq!(credential.expires_at(), Some(deadline));
+            assert_eq!(
+                credential.authorization_at(&resource, deadline - Duration::from_nanos(1)),
+                Some("Bearer expiring-secret".to_owned()),
+            );
+            assert_eq!(credential.authorization_at(&resource, deadline), None);
+            assert_eq!(credential.authorization_at(&resource, deadline + Duration::from_nanos(1)), None);
+            assert_eq!(credential.authorization_at(&url("https://other.example/api"), deadline - Duration::from_secs(1)), None);
+        }
+        let expired = BoundBearerCredential::bind_with_expiry(resource.clone(), "expired", Instant::now()).unwrap();
+        assert_eq!(expired.authorization_for_target(&resource), None);
     }
 }
