@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use fastmcp_core::{
     AccessToken, AuthContext, MAX_ACCESS_TOKEN_BYTES, McpContext, McpError, McpErrorCode,
@@ -576,16 +577,41 @@ impl AuthProvider for TokenAuthProvider {
     }
 }
 
-/// Static token verifier backed by fixed-width token digests.
+/// Static-token authentication with a shared, live-updatable digest registry.
+///
+/// Clone this verifier before installing it in [`TokenAuthProvider`] to retain
+/// an administrative handle. All clones observe token replacement, rotation,
+/// expiry, and revocation without rebuilding the provider or restarting a
+/// listener. Configure allowed schemes before cloning; that policy belongs to
+/// each handle and is not changed by registry updates.
+///
+/// Mutations are atomic with respect to subsequent verification decisions.
+/// They do not cancel already-admitted work or close connections whose
+/// transport authenticates only at connection establishment. This is an
+/// in-memory registry, not a persistent revocation store or an OAuth issuer.
+/// Raw credentials are never retained: only bounded fixed-width digests and
+/// admitted authentication facts enter the registry.
+#[derive(Clone)]
 pub struct StaticTokenVerifier {
-    tokens: HashMap<Sha256Digest, AuthContext>,
+    // TokenVerifier is synchronous. These short in-memory critical sections
+    // contain no I/O, await, or application callbacks; configuration admission
+    // and disposal of replaced maps happen outside the lock.
+    tokens: Arc<RwLock<HashMap<Sha256Digest, StaticTokenEntry>>>,
     allowed_schemes: Option<Vec<String>>,
+}
+
+struct StaticTokenEntry {
+    context: AuthContext,
+    expires_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for StaticTokenVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StaticTokenVerifier")
-            .field("token_count", &self.tokens.len())
+            .field(
+                "token_count",
+                &self.tokens.try_read().ok().map(|tokens| tokens.len()),
+            )
             .field(
                 "allowed_scheme_count",
                 &self.allowed_schemes.as_ref().map_or(0, Vec::len),
@@ -602,6 +628,17 @@ impl StaticTokenVerifier {
     /// configuration that succeeds in isolation but is guaranteed to fail at
     /// the server's authentication-admission boundary.
     pub fn new<I, K>(tokens: I) -> McpResult<Self>
+    where
+        I: IntoIterator<Item = (K, AuthContext)>,
+        K: Into<String>,
+    {
+        Ok(Self {
+            tokens: Arc::new(RwLock::new(Self::admit_tokens(tokens)?)),
+            allowed_schemes: None,
+        })
+    }
+
+    fn admit_tokens<I, K>(tokens: I) -> McpResult<HashMap<Sha256Digest, StaticTokenEntry>>
     where
         I: IntoIterator<Item = (K, AuthContext)>,
         K: Into<String>,
@@ -625,17 +662,152 @@ impl StaticTokenVerifier {
             digests
                 .try_reserve(1)
                 .map_err(|_| auth_error("Static token configuration is invalid"))?;
-            if digests.insert(digest, context).is_some() {
+            if digests
+                .insert(
+                    digest,
+                    StaticTokenEntry {
+                        context,
+                        expires_at: None,
+                    },
+                )
+                .is_some()
+            {
                 return Err(auth_error("Static token configuration is invalid"));
             }
         }
         if digests.is_empty() {
             return Err(auth_error("Static token configuration is invalid"));
         }
-        Ok(Self {
-            tokens: digests,
-            allowed_schemes: None,
-        })
+        Ok(digests)
+    }
+
+    /// Atomically replaces the complete credential set for every clone.
+    ///
+    /// Validation, duplicate detection, and allocation of the bounded new map
+    /// finish before the active map is changed. Invalid or empty replacement
+    /// input leaves the previous policy intact; use [`Self::revoke_all`] for
+    /// deliberate deny-all. Existing deadlines follow retained credentials so
+    /// a configuration reload cannot extend or revive an expired entry.
+    /// New credentials have no deadline until [`Self::expire_token_at`] is
+    /// called. This is an administrative grant operation: explicitly adding a
+    /// previously removed credential grants it again.
+    pub fn replace_tokens<I, K>(&self, tokens: I) -> McpResult<()>
+    where
+        I: IntoIterator<Item = (K, AuthContext)>,
+        K: Into<String>,
+    {
+        let mut replacement = Self::admit_tokens(tokens)?;
+        let mut active = self
+            .tokens
+            .write()
+            .map_err(|_| auth_error("Static token registry is unavailable"))?;
+        for (digest, entry) in &mut replacement {
+            if let Some(previous) = active.get(digest) {
+                entry.expires_at = previous.expires_at;
+            }
+        }
+        let retired = std::mem::replace(&mut *active, replacement);
+        drop(active);
+        drop(retired);
+        Ok(())
+    }
+
+    /// Revokes exactly one credential across every installed clone.
+    ///
+    /// Returns whether the credential was present. Repeated revocation is
+    /// harmless. Malformed input or a poisoned registry fails without changing
+    /// the credential set, and errors never include the credential.
+    pub fn revoke_token(&self, token: &str) -> McpResult<bool> {
+        let digest = Self::token_digest(token)?;
+        let mut active = self
+            .tokens
+            .write()
+            .map_err(|_| auth_error("Static token registry is unavailable"))?;
+        let removed = active.remove(&digest);
+        drop(active);
+        Ok(removed.is_some())
+    }
+
+    /// Revokes all credentials atomically and returns the number removed.
+    ///
+    /// Every subsequent verification fails until an administrator explicitly
+    /// installs a new set using [`Self::replace_tokens`].
+    pub fn revoke_all(&self) -> McpResult<usize> {
+        let mut active = self
+            .tokens
+            .write()
+            .map_err(|_| auth_error("Static token registry is unavailable"))?;
+        let retired = std::mem::take(&mut *active);
+        drop(active);
+        Ok(retired.len())
+    }
+
+    /// Sets or shortens a credential's monotonic expiration deadline.
+    ///
+    /// The credential is refused at and after `deadline`. A past deadline
+    /// expires it immediately. Repeated calls may shorten, but never extend,
+    /// an existing deadline; rotation and replacement preserve that deadline.
+    /// Returns `false` for an unknown credential without adding an entry.
+    /// No wall-clock claims are interpreted implicitly.
+    pub fn expire_token_at(&self, token: &str, deadline: Instant) -> McpResult<bool> {
+        let digest = Self::token_digest(token)?;
+        let mut active = self
+            .tokens
+            .write()
+            .map_err(|_| auth_error("Static token registry is unavailable"))?;
+        let Some(entry) = active.get_mut(&digest) else {
+            return Ok(false);
+        };
+        entry.expires_at = Some(entry.expires_at.map_or(deadline, |old| old.min(deadline)));
+        Ok(true)
+    }
+
+    /// Atomically replaces one live secret while preserving its identity,
+    /// scopes, claims, and expiration deadline.
+    ///
+    /// The old secret must still be present and unexpired; the new secret must
+    /// be different and not already registered. Any refusal leaves the active
+    /// credentials unchanged. Rotation works at the entry limit because it
+    /// does not increase the credential count. Neither secret is returned or
+    /// included in an error message.
+    pub fn rotate_token(&self, old_token: &str, new_token: &str) -> McpResult<()> {
+        let old_digest = Self::token_digest(old_token)?;
+        let new_digest = Self::token_digest(new_token)?;
+        if old_digest == new_digest {
+            return Err(auth_error("Static token rotation is invalid"));
+        }
+        let mut active = self
+            .tokens
+            .write()
+            .map_err(|_| auth_error("Static token registry is unavailable"))?;
+        if active.contains_key(&new_digest) || !active.contains_key(&old_digest) {
+            return Err(auth_error("Static token rotation is invalid"));
+        }
+        // Reserve before removing the old entry, so allocation failure cannot
+        // accidentally revoke it. No fallible operation follows removal.
+        active
+            .try_reserve(1)
+            .map_err(|_| auth_error("Static token rotation is invalid"))?;
+        let now = Instant::now();
+        if active
+            .get(&old_digest)
+            .is_some_and(|entry| entry.expires_at.is_some_and(|deadline| now >= deadline))
+        {
+            return Err(auth_error("Static token rotation is invalid"));
+        }
+        let Some(entry) = active.remove(&old_digest) else {
+            return Err(auth_error("Static token rotation is invalid"));
+        };
+        active.insert(new_digest, entry);
+        Ok(())
+    }
+
+    fn token_digest(token: &str) -> McpResult<Sha256Digest> {
+        if !AccessToken::is_valid_token68(token) {
+            return Err(auth_error("Invalid access token"));
+        }
+        sha256_bounded(token.as_bytes(), MAX_ACCESS_TOKEN_BYTES)
+            .map_err(|_| auth_error("Invalid access token"))
     }
 
     /// Restricts accepted token schemes (case-insensitive).
@@ -668,14 +840,11 @@ impl StaticTokenVerifier {
         self.allowed_schemes = Some(admitted);
         Ok(self)
     }
-}
 
-impl TokenVerifier for StaticTokenVerifier {
-    fn verify(
+    fn verify_with_clock(
         &self,
-        _ctx: &McpContext,
-        _request: AuthRequest<'_>,
         token: &AccessToken,
+        clock: impl FnOnce() -> Instant,
     ) -> McpResult<AuthContext> {
         if !AccessToken::is_valid_http_scheme(&token.scheme)
             || !AccessToken::is_valid_token68(&token.token)
@@ -689,13 +858,32 @@ impl TokenVerifier for StaticTokenVerifier {
             }
         }
 
-        let digest = sha256_bounded(token.token.as_bytes(), MAX_ACCESS_TOKEN_BYTES)
+        let digest = Self::token_digest(&token.token)?;
+        let active = self
+            .tokens
+            .read()
             .map_err(|_| auth_error("Invalid access token"))?;
-        let Some(auth) = self.tokens.get(&digest) else {
+        // Sample after acquiring the registry lock, not before a possibly
+        // contended acquisition. Tests drive this same path at exact deadlines.
+        let now = clock();
+        let Some(entry) = active.get(&digest) else {
             return Err(auth_error("Invalid access token"));
         };
+        if entry.expires_at.is_some_and(|deadline| now >= deadline) {
+            return Err(auth_error("Invalid access token"));
+        }
+        Ok(entry.context.clone())
+    }
+}
 
-        Ok(auth.clone())
+impl TokenVerifier for StaticTokenVerifier {
+    fn verify(
+        &self,
+        _ctx: &McpContext,
+        _request: AuthRequest<'_>,
+        token: &AccessToken,
+    ) -> McpResult<AuthContext> {
+        self.verify_with_clock(token, Instant::now)
     }
 }
 
@@ -1931,6 +2119,8 @@ mod tests {
             StaticTokenVerifier::new(maximum_entries)
                 .expect("the documented entry maximum is admissible")
                 .tokens
+                .read()
+                .expect("registry lock")
                 .len(),
             MAX_STATIC_TOKEN_ENTRIES
         );
@@ -2699,5 +2889,262 @@ mod tests {
             "Multiple conflicting credential sources"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn registry_snapshot(
+        verifier: &StaticTokenVerifier,
+    ) -> HashMap<Sha256Digest, (String, Option<Instant>)> {
+        verifier
+            .tokens
+            .read()
+            .expect("registry lock")
+            .iter()
+            .map(|(digest, entry)| {
+                (
+                    digest.clone(),
+                    (
+                        serde_json::to_string(&entry.context).expect("auth facts"),
+                        entry.expires_at,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn authenticate_header(
+        provider: &TokenAuthProvider,
+        authorization: &str,
+    ) -> McpResult<AuthContext> {
+        provider.authenticate(
+            &ctx(),
+            AuthRequest {
+                method: "tools/call",
+                params: None,
+                transport_authorization: Some(authorization),
+                request_id: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn static_token_rotation_is_visible_to_installed_provider_clones() {
+        let mut facts = AuthContext::with_subject("rotation-owner");
+        facts.scopes = vec!["read".to_owned()];
+        facts.claims = Some(serde_json::json!({"policy_revision": 7}));
+        let verifier = StaticTokenVerifier::new([("old-secret", facts.clone())])
+            .unwrap()
+            .with_allowed_schemes(["Bearer"])
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3_600);
+        assert!(verifier.expire_token_at("old-secret", deadline).unwrap());
+        let controls = verifier.clone();
+        let provider = TokenAuthProvider::new(verifier);
+        let peer = provider.clone();
+        assert!(authenticate_header(&provider, "Bearer old-secret").is_ok());
+
+        controls.rotate_token("old-secret", "new-secret").unwrap();
+        for installed in [&provider, &peer] {
+            assert!(authenticate_header(installed, "Bearer old-secret").is_err());
+            let actual = authenticate_header(installed, "Bearer new-secret").unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&facts).unwrap()
+            );
+            assert!(authenticate_header(installed, "Basic new-secret").is_err());
+        }
+        let snapshot = registry_snapshot(&controls);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.values().next().unwrap().1, Some(deadline));
+        let debug = format!("{controls:?}");
+        assert!(!debug.contains("old-secret"));
+        assert!(!debug.contains("new-secret"));
+        assert!(!debug.contains("rotation-owner"));
+    }
+
+    #[test]
+    fn static_token_rotation_refusals_preserve_the_registry() {
+        let verifier = StaticTokenVerifier::new([
+            ("alpha-secret", AuthContext::with_subject("alice")),
+            ("beta-secret", AuthContext::with_subject("bob")),
+        ])
+        .unwrap();
+        let before = registry_snapshot(&verifier);
+        for (old, new) in [
+            ("missing-secret", "fresh-secret"),
+            ("alpha-secret", "beta-secret"),
+            ("alpha-secret", "alpha-secret"),
+            ("alpha-secret", "invalid:secret"),
+            ("invalid:secret", "fresh-secret"),
+        ] {
+            let error = verifier.rotate_token(old, new).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+            assert!(!error.message.contains(old));
+            assert!(!error.message.contains(new));
+            assert_eq!(registry_snapshot(&verifier), before);
+        }
+        verifier.expire_token_at("alpha-secret", Instant::now()).unwrap();
+        let expired = registry_snapshot(&verifier);
+        assert!(verifier.rotate_token("alpha-secret", "fresh-secret").is_err());
+        assert_eq!(registry_snapshot(&verifier), expired);
+        let provider = TokenAuthProvider::new(verifier);
+        assert!(authenticate_header(&provider, "Bearer alpha-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer beta-secret").is_ok());
+        assert!(authenticate_header(&provider, "Bearer fresh-secret").is_err());
+    }
+
+    #[test]
+    fn static_token_replacement_refusals_preserve_every_active_entry() {
+        let verifier = StaticTokenVerifier::new([("existing-secret", AuthContext::with_subject("owner"))])
+            .unwrap();
+        let before = registry_snapshot(&verifier);
+        for replacement in [
+            vec![],
+            vec![("new-secret", AuthContext::anonymous())],
+            vec![
+                ("new-secret", AuthContext::with_subject("first")),
+                ("new-secret", AuthContext::with_subject("second")),
+            ],
+            vec![
+                ("new-secret", AuthContext::with_subject("first")),
+                ("bad:secret", AuthContext::with_subject("second")),
+            ],
+        ] {
+            assert!(verifier.replace_tokens(replacement).is_err());
+            assert_eq!(registry_snapshot(&verifier), before);
+        }
+        let excessive = (0..=MAX_STATIC_TOKEN_ENTRIES)
+            .map(|index| (format!("new-{index}"), AuthContext::with_subject("owner")));
+        assert!(verifier.replace_tokens(excessive).is_err());
+        assert_eq!(registry_snapshot(&verifier), before);
+        let provider = TokenAuthProvider::new(verifier);
+        assert!(authenticate_header(&provider, "Bearer existing-secret").is_ok());
+        assert!(authenticate_header(&provider, "Bearer new-secret").is_err());
+    }
+
+    #[test]
+    fn static_token_replacement_updates_facts_without_reviving_retained_secrets() {
+        let verifier = StaticTokenVerifier::new([
+            ("retained-secret", AuthContext::with_subject("owner")),
+            ("removed-secret", AuthContext::with_subject("other")),
+        ])
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        let mut revised = AuthContext::with_subject("owner");
+        revised.scopes = vec!["read".to_owned()];
+        verifier.expire_token_at("retained-secret", Instant::now()).unwrap();
+        verifier
+            .replace_tokens([
+                ("retained-secret", revised.clone()),
+                ("added-secret", revised.clone()),
+            ])
+            .unwrap();
+        assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer removed-secret").is_err());
+        let added = authenticate_header(&provider, "Bearer added-secret").unwrap();
+        assert_eq!(added.scopes, revised.scopes);
+        assert_eq!(added.subject, revised.subject);
+        assert_eq!(registry_snapshot(&verifier).len(), 2);
+    }
+
+    #[test]
+    fn static_token_expiry_is_inclusive_monotonic_and_cannot_be_extended() {
+        let verifier = StaticTokenVerifier::new([("expiring-secret", AuthContext::with_subject("owner"))])
+            .unwrap();
+        let token = AccessToken::parse("Bearer expiring-secret").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3_600);
+        assert!(verifier.expire_token_at("expiring-secret", deadline).unwrap());
+        assert!(
+            verifier
+                .verify_with_clock(&token, || deadline - std::time::Duration::from_nanos(1))
+                .is_ok()
+        );
+        assert!(verifier.verify_with_clock(&token, || deadline).is_err());
+        assert!(
+            verifier
+                .verify_with_clock(&token, || deadline + std::time::Duration::from_nanos(1))
+                .is_err()
+        );
+        let before = registry_snapshot(&verifier);
+        assert!(verifier
+            .expire_token_at("expiring-secret", deadline + std::time::Duration::from_secs(1))
+            .unwrap());
+        assert_eq!(registry_snapshot(&verifier), before);
+        assert!(!verifier.expire_token_at("unknown-secret", deadline).unwrap());
+        assert_eq!(registry_snapshot(&verifier), before);
+
+        let provider = TokenAuthProvider::new(verifier.clone());
+        assert!(authenticate_header(&provider, "Bearer expiring-secret").is_ok());
+        verifier.expire_token_at("expiring-secret", Instant::now()).unwrap();
+        assert!(authenticate_header(&provider, "Bearer expiring-secret").is_err());
+        verifier.expire_token_at("expiring-secret", deadline).unwrap();
+        assert!(authenticate_header(&provider, "Bearer expiring-secret").is_err());
+    }
+
+    #[test]
+    fn static_token_revocation_and_deny_all_reach_installed_providers() {
+        let verifier = StaticTokenVerifier::new([
+            ("first-secret", AuthContext::with_subject("first")),
+            ("second-secret", AuthContext::with_subject("second")),
+        ])
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        assert!(authenticate_header(&provider, "Bearer first-secret").is_ok());
+        let before = registry_snapshot(&verifier);
+        assert!(verifier.revoke_token("bad:secret").is_err());
+        assert_eq!(registry_snapshot(&verifier), before);
+        assert!(!verifier.revoke_token("unknown-secret").unwrap());
+        assert_eq!(registry_snapshot(&verifier), before);
+        assert!(verifier.revoke_token("first-secret").unwrap());
+        assert!(!verifier.revoke_token("first-secret").unwrap());
+        assert!(authenticate_header(&provider, "Bearer first-secret").is_err());
+        assert!(authenticate_header(&provider, "Bearer second-secret").is_ok());
+        assert_eq!(verifier.revoke_all().unwrap(), 1);
+        assert_eq!(verifier.revoke_all().unwrap(), 0);
+        assert!(authenticate_header(&provider, "Bearer second-secret").is_err());
+        verifier.replace_tokens([("fresh-secret", AuthContext::with_subject("fresh"))]).unwrap();
+        assert!(authenticate_header(&provider, "Bearer fresh-secret").is_ok());
+        assert!(authenticate_header(&provider, "Bearer first-secret").is_err());
+    }
+
+    #[test]
+    fn static_token_rotation_works_at_the_registry_capacity_limit() {
+        let verifier = StaticTokenVerifier::new((0..MAX_STATIC_TOKEN_ENTRIES).map(|index| {
+            (format!("secret-{index}"), AuthContext::with_subject(format!("owner-{index}")))
+        }))
+        .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        verifier.rotate_token("secret-0", "replacement-secret").unwrap();
+        assert_eq!(registry_snapshot(&verifier).len(), MAX_STATIC_TOKEN_ENTRIES);
+        assert!(authenticate_header(&provider, "Bearer secret-0").is_err());
+        assert_eq!(
+            authenticate_header(&provider, "Bearer replacement-secret").unwrap().subject.as_deref(),
+            Some("owner-0")
+        );
+        assert!(authenticate_header(&provider, "Bearer secret-1").is_ok());
+    }
+
+    #[test]
+    fn poisoned_static_token_registry_fails_closed_without_repair_or_secret_leak() {
+        let verifier = StaticTokenVerifier::new([("poison-secret", AuthContext::with_subject("owner"))])
+            .unwrap();
+        let provider = TokenAuthProvider::new(verifier.clone());
+        assert!(authenticate_header(&provider, "Bearer poison-secret").is_ok());
+        let planted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = verifier.tokens.write().unwrap();
+            panic!("planted registry poison");
+        }));
+        assert!(planted.is_err());
+        let error = authenticate_header(&provider, "Bearer poison-secret").unwrap_err();
+        assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+        assert!(!error.message.contains("poison-secret"));
+        assert!(verifier.revoke_token("poison-secret").is_err());
+        assert!(verifier.revoke_all().is_err());
+        assert!(verifier.expire_token_at("poison-secret", Instant::now()).is_err());
+        assert!(verifier.rotate_token("poison-secret", "new-secret").is_err());
+        assert!(verifier.replace_tokens([("new-secret", AuthContext::with_subject("owner"))]).is_err());
+        assert!(authenticate_header(&provider, "Bearer new-secret").is_err());
+        let debug = format!("{verifier:?}");
+        assert!(!debug.contains("poison-secret"));
+        assert!(!debug.contains("new-secret"));
     }
 }
