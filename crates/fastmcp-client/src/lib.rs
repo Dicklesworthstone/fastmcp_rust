@@ -90,6 +90,7 @@ let _ = Client::sse_with_cx;
 "
 )]
 pub mod http_executor;
+pub mod leg_neg;
 #[cfg(feature = "apps")]
 pub mod mcp_apps;
 pub mod mcp_config;
@@ -171,6 +172,10 @@ pub use mcp_apps::{
     McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
     McpAppsWireHostConfiguration, McpAppsWireHostPolicy, mcp_apps_in_memory_pair,
     mcp_apps_in_memory_wire_pair,
+};
+pub use leg_neg::{
+    FallbackDecision, FallbackState, HttpFallbackCoordinator, HttpFallbackError, LegacyGetPermit,
+    ModernProbeObservation,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{
