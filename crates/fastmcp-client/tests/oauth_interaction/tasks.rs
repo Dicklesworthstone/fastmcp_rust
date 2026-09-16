@@ -30,8 +30,12 @@ fn isolated_task(name: &str, case: TaskCase) {
     impl Drop for Child {
         fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
     }
+    // This module is included by the shared driver's module, not at crate
+    // root. Keep the executable selection exact rather than silently running
+    // zero tests under an unmatched short name.
+    let exact_name = format!("driver::{name}");
     let mut child = Child(Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .args(["--exact", &exact_name, "--nocapture", "--test-threads=1"])
         .env(TASK_CASE, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
         .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
     let end = Instant::now() + Duration::from_secs(30);
