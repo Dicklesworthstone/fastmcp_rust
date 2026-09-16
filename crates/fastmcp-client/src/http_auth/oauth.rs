@@ -7,8 +7,8 @@
 //!
 //! This is the preregistered public-client slice of AUTH-07, not discovery,
 //! dynamic registration, OIDC authentication, or AUTH-05 durable token custody.
-//! Returned secrets stay in process memory; neither credentials nor private
-//! response bodies implement serialization or diagnostic formatting.
+//! Returned secrets stay in process memory. Credential and parsed token-response
+//! types deliberately omit serialization and diagnostic formatting.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -50,6 +50,7 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum OAuthError {
     InvalidConfiguration,
     RuntimeTimerUnavailable,
+    RuntimeCapabilityUnavailable,
     Cancelled,
     TimedOut,
     RandomSourceUnavailable,
@@ -73,6 +74,7 @@ impl fmt::Display for OAuthError {
         f.write_str(match self {
             Self::InvalidConfiguration => "invalid native OAuth configuration",
             Self::RuntimeTimerUnavailable => "OAuth requires the caller's timer capability",
+            Self::RuntimeCapabilityUnavailable => "OAuth requires the caller's I/O and entropy authority",
             Self::Cancelled => "OAuth operation cancelled",
             Self::TimedOut => "OAuth operation deadline exceeded",
             Self::RandomSourceUnavailable => "OAuth security randomness unavailable",
@@ -112,6 +114,7 @@ pub struct OAuthClientConfiguration {
     scopes: Vec<String>,
     authorization_timeout: Duration,
     max_access_token_lifetime: Duration,
+    extra_root_certificates: Vec<Vec<u8>>,
 }
 
 impl OAuthClientConfiguration {
@@ -137,7 +140,7 @@ impl OAuthClientConfiguration {
         }
         // Keep the original issuer spelling for the exact RFC 9207 comparison;
         // canonical network identity must not replace that comparison.
-        if issuer.len() > 4096 || issuer.chars().any(char::is_whitespace) {
+        if issuer.len() > 4096 || issuer.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(OAuthError::InvalidConfiguration);
         }
         if resource.scheme() != "https" {
@@ -166,6 +169,7 @@ impl OAuthClientConfiguration {
             scopes,
             authorization_timeout: Duration::from_secs(300),
             max_access_token_lifetime: Duration::from_secs(3600),
+            extra_root_certificates: Vec::new(),
         })
     }
 
@@ -188,6 +192,26 @@ impl OAuthClientConfiguration {
             return Err(OAuthError::InvalidConfiguration);
         }
         self.max_access_token_lifetime = lifetime;
+        Ok(self)
+    }
+
+    /// Adds an explicitly trusted private CA for this client's token endpoint.
+    /// This does not disable hostname/certificate verification or alter the
+    /// host's browser trust store. The exact root bytes become part of the
+    /// immutable credential binding, so refresh cannot switch trust policies.
+    pub fn with_extra_root_certificate(
+        mut self,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, OAuthError> {
+        let der = certificate.as_der();
+        if der.is_empty() || der.len() > 16 * 1024 || self.extra_root_certificates.len() >= 8
+            || self.extra_root_certificates.iter().any(|existing| existing.as_slice() == der)
+        {
+            return Err(OAuthError::InvalidConfiguration);
+        }
+        asupersync::tls::RootCertStore::empty().add(&certificate)
+            .map_err(|_| OAuthError::InvalidConfiguration)?;
+        self.extra_root_certificates.push(der.to_vec());
         Ok(self)
     }
 }
@@ -251,6 +275,9 @@ impl OAuthClient {
         F: Future<Output = Result<(), OAuthError>>,
     {
         let deadline = operation_deadline(cx, self.configuration.authorization_timeout)?;
+        if !cx.capabilities().entropy {
+            return Err(OAuthError::RuntimeCapabilityUnavailable);
+        }
         let listener = within(cx, deadline, bind_loopback()).await?;
         let address = listener.local_addr().map_err(|_| OAuthError::CallbackBindFailed)?;
         if !address.ip().is_loopback() || address.port() == 0 {
@@ -358,14 +385,17 @@ impl OAuthClient {
 
     async fn exchange(&self, cx: &Cx, deadline: Time, body: String) -> Result<Vec<u8>, OAuthError> {
         let deadline = deadline.min(operation_deadline(cx, TOKEN_TIMEOUT)?);
-        let client = HttpClient::builder()
+        let mut builder = HttpClient::builder()
             .redirect_policy(RedirectPolicy::None)
             .retry_policy(RetryPolicy::None)
             .no_proxy()
             .no_cookie_store()
             .max_body_size(MAX_TOKEN_RESPONSE_BYTES)
-            .max_total_connections(1)
-            .build();
+            .max_total_connections(1);
+        for der in &self.configuration.extra_root_certificates {
+            builder = builder.add_root_certificate(asupersync::tls::Certificate::from_der(der.clone()));
+        }
+        let client = builder.build();
         let response = within(cx, deadline, async {
             client
                 .request(
@@ -464,6 +494,7 @@ async fn bind_loopback() -> Result<TcpListener, OAuthError> {
 
 fn operation_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthError> {
     if cx.checkpoint().is_err() { return Err(OAuthError::Cancelled); }
+    if !cx.capabilities().io { return Err(OAuthError::RuntimeCapabilityUnavailable); }
     if cx.timer_driver().is_none() { return Err(OAuthError::RuntimeTimerUnavailable); }
     let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
     let end = cx.now().as_nanos().checked_add(nanos).ok_or(OAuthError::InvalidConfiguration)?;
@@ -479,7 +510,11 @@ async fn within<T>(
 ) -> Result<T, OAuthError> {
     let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
     let mut future = std::pin::pin!(future);
-    let mut sleep = std::pin::pin!(Sleep::new(deadline));
+    let sleep = {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        Sleep::new(deadline)
+    };
+    let mut sleep = std::pin::pin!(sleep);
     // A pending cancel-correct receive registers a cancellation wake even when
     // the socket or the host's browser future has no traffic of its own.
     let (_sender, mut receiver) = oneshot::channel::<()>();
@@ -937,7 +972,7 @@ mod tests {
     #[test]
     fn live_loopback_accepts_only_the_matching_attempt_and_releases_the_listener() {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::for_request();
+            let cx = Cx::current().expect("caller-owned runtime context");
             let deadline = operation_deadline(&cx, Duration::from_secs(10)).unwrap();
             let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -981,7 +1016,7 @@ mod tests {
     #[test]
     fn callback_deadline_releases_idle_work_without_needing_peer_traffic() {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
-            let cx = Cx::for_request();
+            let cx = Cx::current().expect("caller-owned runtime context");
             let setup_deadline = operation_deadline(&cx, Duration::from_secs(10)).unwrap();
             let listener = within(&cx, setup_deadline, bind_loopback()).await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1084,5 +1119,253 @@ mod tests {
         assert_eq!(grant.access.authorization_for_target(&config.resource), access_before);
         assert_eq!(grant.expires_at, expiry_before);
         assert!(!grant.has_refresh_token());
+    }
+
+    // TEST ONLY credentials. The CA and localhost leaf are valid 2020-2049;
+    // none of these keys are used outside this in-process TLS fixture.
+    const TEST_ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
+    const TEST_LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
+    const TEST_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
+
+    fn test_root() -> asupersync::tls::Certificate {
+        asupersync::tls::Certificate::from_pem(TEST_ROOT).unwrap().remove(0)
+    }
+
+    fn test_acceptor() -> asupersync::tls::TlsAcceptor {
+        asupersync::tls::TlsAcceptorBuilder::new(
+            asupersync::tls::CertificateChain::from_pem(TEST_LEAF).unwrap(),
+            asupersync::tls::PrivateKey::from_pem(TEST_KEY).unwrap(),
+        ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap()
+    }
+
+    async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output) {
+        let mut left = std::pin::pin!(left);
+        let mut right = std::pin::pin!(right);
+        let mut left_output = None;
+        let mut right_output = None;
+        poll_fn(|task| {
+            if left_output.is_none() {
+                if let Poll::Ready(value) = left.as_mut().poll(task) { left_output = Some(value); }
+            }
+            if right_output.is_none() {
+                if let Poll::Ready(value) = right.as_mut().poll(task) { right_output = Some(value); }
+            }
+            if left_output.is_some() && right_output.is_some() {
+                Poll::Ready((left_output.take().unwrap(), right_output.take().unwrap()))
+            } else { Poll::Pending }
+        }).await
+    }
+
+    async fn read_token_request<IO: asupersync::io::AsyncRead + Unpin>(
+        stream: &mut IO,
+    ) -> Result<(String, BTreeMap<String, String>), OAuthError> {
+        let mut wire = Vec::new();
+        let mut buffer = [0; 1024];
+        let head_end = loop {
+            let count = stream.read(&mut buffer).await.map_err(|_| OAuthError::TransportFailed)?;
+            if count == 0 || wire.len() + count > MAX_FORM_BYTES { return Err(OAuthError::TransportFailed); }
+            wire.extend_from_slice(&buffer[..count]);
+            if let Some(index) = wire.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+        };
+        let head = std::str::from_utf8(&wire[..head_end]).map_err(|_| OAuthError::TransportFailed)?.to_owned();
+        let count = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+        }).ok_or(OAuthError::TransportFailed)?;
+        if count > MAX_FORM_BYTES - head_end { return Err(OAuthError::TransportFailed); }
+        while wire.len() < head_end + count {
+            let n = stream.read(&mut buffer).await.map_err(|_| OAuthError::TransportFailed)?;
+            if n == 0 || wire.len() + n > MAX_FORM_BYTES { return Err(OAuthError::TransportFailed); }
+            wire.extend_from_slice(&buffer[..n]);
+        }
+        if wire.len() != head_end + count { return Err(OAuthError::TransportFailed); }
+        let form = std::str::from_utf8(&wire[head_end..]).map_err(|_| OAuthError::TransportFailed)?;
+        Ok((head, decode_form(form)?))
+    }
+
+    async fn send_callback(cx: &Cx, authorization: CanonicalHttpUrl) -> Result<BTreeMap<String, String>, OAuthError> {
+        let fields = decode_form(authorization.query().ok_or(OAuthError::CallbackRejected)?)?;
+        let callback = CanonicalHttpUrl::parse(&fields["redirect_uri"]).map_err(|_| OAuthError::CallbackRejected)?;
+        let address: SocketAddr = callback.as_str().strip_prefix("http://").unwrap().split('/').next().unwrap().parse().unwrap();
+        let query = encode_form(&[("code", "issued-code"), ("iss", "https://issuer.example"), ("state", &fields["state"])])?;
+        let request = format!("GET {CALLBACK_PATH}?{query} HTTP/1.1\r\nHost: {address}\r\n\r\n");
+        let deadline = operation_deadline(cx, Duration::from_secs(10))?;
+        within(cx, deadline, async {
+            let mut stream = TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)?;
+            stream.write_all(request.as_bytes()).await.map_err(|_| OAuthError::CallbackRejected)?;
+            Ok(())
+        }).await?;
+        Ok(fields)
+    }
+
+    #[test]
+    fn native_https_login_and_refresh_verify_pkce_and_rotate_the_live_grant() {
+        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+            let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+            configuration.token_endpoint = url(&format!("https://{address}/token"));
+            let client = OAuthClient::new(configuration.clone());
+            let browser = std::sync::Mutex::new(None::<BTreeMap<String, String>>);
+            let acceptor = test_acceptor();
+            let server = within(&cx, deadline, async {
+                for index in 0..2 {
+                    let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor.accept(socket).await.map_err(|_| OAuthError::TransportFailed)?;
+                    let (head, form) = read_token_request(&mut tls).await?;
+                    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                    assert!(!head.to_ascii_lowercase().contains("authorization:"));
+                    assert!(!head.to_ascii_lowercase().contains("cookie:"));
+                    assert_eq!(form["client_id"], "native-client");
+                    assert_eq!(form["resource"], "https://mcp.example/mcp");
+                    let body = if index == 0 {
+                        let observed = browser.lock().unwrap();
+                        let observed = observed.as_ref().unwrap();
+                        assert_eq!(form["grant_type"], "authorization_code");
+                        assert_eq!(form["code"], "issued-code");
+                        assert_eq!(pkce_challenge(&form["code_verifier"]).unwrap(), observed["code_challenge"]);
+                        assert_eq!(form["redirect_uri"], observed["redirect_uri"]);
+                        r#"{"access_token":"live-access-one","token_type":"Bearer","expires_in":600,"refresh_token":"live-refresh-one"}"#
+                    } else {
+                        assert_eq!(form["grant_type"], "refresh_token");
+                        assert_eq!(form["refresh_token"], "live-refresh-one");
+                        assert!(!form.contains_key("code_verifier"));
+                        r#"{"access_token":"live-access-two","token_type":"Bearer","expires_in":300,"refresh_token":"live-refresh-two","scope":"tools:read"}"#
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+                    tls.write_all(response.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
+                    tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                }
+                Ok(())
+            });
+            let application = async {
+                let caller = &cx;
+                let observed_browser = &browser;
+                let mut credentials = client.authorize(&cx, |authorization| async move {
+                    let fields = send_callback(caller, authorization).await?;
+                    *observed_browser.lock().unwrap() = Some(fields);
+                    Ok(())
+                }).await?;
+                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer live-access-one".to_owned()));
+                client.refresh(&cx, &mut credentials).await?;
+                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer live-access-two".to_owned()));
+                assert_eq!(credentials.refresh_token.as_deref(), Some("live-refresh-two"));
+                assert_eq!(credentials.scopes, ["tools:read".to_owned()]);
+                Ok::<(), OAuthError>(())
+            };
+            let (server, application) = pair(server, application).await;
+            assert_eq!(server, Ok(()));
+            assert_eq!(application, Ok(()));
+        });
+    }
+
+    #[test]
+    fn native_https_rejects_untrusted_certificate_before_sending_the_code() {
+        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+            let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+            let mut configuration = config();
+            configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+            // The only changed trust dimension: do not install the test root.
+            let client = OAuthClient::new(configuration);
+            let acceptor = test_acceptor();
+            let server = within(&cx, deadline, async {
+                let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                assert!(acceptor.accept(socket).await.is_err(), "untrusted TLS cannot become an HTTP request stream");
+                Ok(())
+            });
+            let caller = &cx;
+            let application = client.authorize(&cx, |authorization| async move {
+                send_callback(caller, authorization).await.map(|_| ())
+            });
+            let (server, application) = pair(server, application).await;
+            assert_eq!(server, Ok(()));
+            assert_eq!(application.err(), Some(OAuthError::TransportFailed));
+        });
+    }
+
+    #[test]
+    fn lost_https_refresh_reply_and_redirect_never_replay_a_consumed_token() {
+        for redirect in [false, true] {
+            asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let mut credentials = renewable_grant(&configuration);
+                let before = credentials.access.authorization_for_target(&configuration.resource);
+                let expires_before = credentials.expires_at;
+                let acceptor = test_acceptor();
+                let server = within(&cx, deadline, async {
+                    let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor.accept(socket).await.map_err(|_| OAuthError::TransportFailed)?;
+                    let (_, form) = read_token_request(&mut tls).await?;
+                    assert_eq!(form["refresh_token"], "refresh-one");
+                    if redirect {
+                        tls.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:9/forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.map_err(|_| OAuthError::TransportFailed)?;
+                        tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    }
+                    // Without a response, the client cannot know whether the
+                    // server rotated the refresh token. The connection is lost.
+                    Ok(())
+                });
+                let (server, result) = pair(server, client.refresh(&cx, &mut credentials)).await;
+                assert_eq!(server, Ok(()));
+                assert_eq!(result, Err(if redirect { OAuthError::TokenEndpointRejected } else { OAuthError::TransportFailed }));
+                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), before);
+                assert_eq!(credentials.expires_at, expires_before);
+                assert!(!credentials.has_refresh_token());
+                assert_eq!(client.refresh(&cx, &mut credentials).await, Err(OAuthError::RefreshUnavailable));
+                let waker = std::task::Waker::noop();
+                let mut task = std::task::Context::from_waker(waker);
+                assert!(listener.poll_accept(&mut task).is_pending(), "no retry opened another connection");
+            });
+        }
+    }
+
+    #[test]
+    fn dropping_public_login_future_closes_its_bound_callback_listener() {
+        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let deadline = operation_deadline(&cx, Duration::from_secs(10)).unwrap();
+            let client = OAuthClient::new(config());
+            let bound = std::cell::Cell::new(None::<SocketAddr>);
+            let observed_bound = &bound;
+            let mut login = Box::pin(client.authorize(&cx, |authorization| async move {
+                let fields = decode_form(authorization.query().unwrap())?;
+                let address = fields["redirect_uri"].strip_prefix("http://").unwrap().split('/').next().unwrap().parse().unwrap();
+                observed_bound.set(Some(address));
+                Ok(())
+            }));
+            let address = within(&cx, deadline, poll_fn(|task| {
+                if let Poll::Ready(result) = login.as_mut().poll(task) {
+                    return Poll::Ready(Err(result.err().unwrap_or(OAuthError::CallbackRejected)));
+                }
+                match bound.get() {
+                    Some(address) => Poll::Ready(Ok(address)),
+                    None => Poll::Pending,
+                }
+            })).await.unwrap();
+            drop(login);
+            assert!(within(&cx, deadline, async {
+                TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)
+            }).await.is_err());
+        });
+    }
+
+    #[test]
+    fn private_ca_policy_is_validated_and_bound_to_refresh_credentials() {
+        assert!(config().with_extra_root_certificate(asupersync::tls::Certificate::from_der(vec![0; 32])).is_err());
+        let configuration = config().with_extra_root_certificate(test_root()).unwrap();
+        assert!(configuration.clone().with_extra_root_certificate(test_root()).is_err());
+        let mut credentials = renewable_grant(&configuration);
+        let before = credentials.refresh_token.clone();
+        assert_eq!(OAuthClient::new(config()).prepare_refresh(&mut credentials).err(), Some(OAuthError::CredentialBindingMismatch));
+        assert_eq!(credentials.refresh_token, before);
     }
 }
