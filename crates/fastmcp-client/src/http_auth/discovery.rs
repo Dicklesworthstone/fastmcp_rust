@@ -584,8 +584,14 @@ async fn within<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
 ) -> Result<T, OAuthDiscoveryError> {
-    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
-    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    // Fail closed when the caller's runtime has no timer driver. The sleep
+    // below resolves its driver from the ambient `Cx` that each poll installs,
+    // so a missing driver must surface as a typed error here rather than as a
+    // future that is never woken.
+    if cx.timer_driver().is_none() {
+        return Err(OAuthDiscoveryError::RuntimeUnavailable);
+    }
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
