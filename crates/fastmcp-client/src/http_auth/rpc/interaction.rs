@@ -18,7 +18,7 @@ use std::future::Future;
 use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
-use fastmcp_protocol::result::exact_json_to_serde;
+use fastmcp_protocol::exact_json_to_serde;
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FinalCoreRequest, FinalCoreResult,
     FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FinalInputResponses,
