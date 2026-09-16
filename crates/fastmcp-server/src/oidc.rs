@@ -2502,6 +2502,55 @@ mod non_signing_tests {
         );
     }
 
+    /// FND-01 surface 2, frozen case 4.
+    ///
+    /// **This case proves the absence of an advertised issuance path. It does
+    /// not prove the runtime refusal.** The two halves are deliberately
+    /// separate cases so a reader can tell which one carries the security
+    /// claim; see `signer_activation_tests::
+    /// issuance_without_activation_fails_closed_with_signing_error` for the
+    /// half that does.
+    ///
+    /// It is ungated because the frozen target map pins this case to
+    /// `oidc::non_signing_tests` on the `fastmcp-server` lib target, and that
+    /// module compiles under the crate's default features
+    /// (`default = ["legacy-2024-11-05"]`). Under those features
+    /// [`OidcProvider::issue_id_token`] does not exist at all — it is
+    /// `#[cfg(feature = "builtin-auth-server")]` — so there is no issuance
+    /// entry point here to refuse. That absence is a compile-time fact and
+    /// cannot be asserted at run time; what is asserted is its externally
+    /// observable consequence.
+    ///
+    /// What is proved: a provider that has activated no external signer
+    /// advertises no ID-token signing capability, so no relying party can be
+    /// induced to expect a signed ID token. This holds in *both* feature
+    /// configurations, because `discovery_document` populates
+    /// `id_token_signing_alg_values_supported` and `jwks_uri` only when an
+    /// activation is both active and published. The case therefore means the
+    /// same thing however the crate is built.
+    ///
+    /// This is distinct from `discovery_does_not_advertise_signing`, which
+    /// asserts the defaults of a bare [`DiscoveryDocument`]. This asserts what
+    /// a live provider actually advertises.
+    #[test]
+    fn issuance_fails_closed_without_external_signer() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default provider");
+
+        let discovery = provider.discovery_document("https://issuer.example");
+
+        assert!(
+            discovery.id_token_signing_alg_values_supported.is_empty(),
+            "a provider with no activated external signer must advertise no \
+             ID-token signing algorithm"
+        );
+        assert!(
+            discovery.jwks_uri.is_none(),
+            "a provider with no activated external signer must advertise no \
+             JWKS endpoint"
+        );
+    }
+
     #[test]
     fn user_claims_filter_by_scope() {
         let claims = UserClaims::new("subject")
@@ -3208,6 +3257,53 @@ mod signer_activation_tests {
     fn signing_deadline() -> ExternalRs256SigningDeadline {
         ExternalRs256SigningDeadline::new(std::time::Duration::from_secs(1))
             .expect("bounded test deadline")
+    }
+
+    /// FND-01 surface 2, the security half of frozen case 4.
+    ///
+    /// **This is the case that proves the fail-closed security claim.** Its
+    /// ungated sibling, `non_signing_tests::
+    /// issuance_fails_closed_without_external_signer`, proves only that an
+    /// unactivated provider advertises no signing capability; it cannot reach
+    /// this refusal because [`OidcProvider::issue_id_token`] does not exist
+    /// under the crate's default features.
+    ///
+    /// Surface identity, stated explicitly because the feature is part of it:
+    /// package `fastmcp-server`, lib target, module
+    /// `oidc::signer_activation_tests`, cfg
+    /// `all(test, feature = "builtin-auth-server")`. The behaviour under test
+    /// does not exist without that feature, so this case is a different
+    /// surface from its ungated sibling rather than a relocation of it.
+    ///
+    /// What is proved: a provider that has activated no external signer
+    /// refuses to issue an ID token, and refuses *at the signing-activation
+    /// boundary*. The boundary assertion is the point of the case — reaching
+    /// an access-token or claims refusal first would leave the fail-closed
+    /// property unproven while the test still passed green.
+    #[test]
+    fn issuance_without_activation_fails_closed_with_signing_error() {
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        // Deliberately `with_defaults`: no signer is begun, published, or
+        // activated, so the activation slot is empty at issuance time.
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default provider");
+        let cx = Cx::for_testing();
+
+        let error = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ))
+        .expect_err("issuance must fail closed without an activated external signer");
+
+        // The credential itself is valid and openid-scoped, and a default
+        // provider's claims lookup succeeds, so the only refusal this call can
+        // reach is the signing-activation one. Asserting the exact boundary
+        // keeps the case from passing for an unrelated reason.
+        assert!(
+            matches!(&error, OidcError::SigningError(message) if message.contains("activation")),
+            "expected the signing-activation refusal, saw {error:?}"
+        );
     }
 
     #[test]
