@@ -422,18 +422,44 @@ fn write_bounded_response(
     stream.flush().expect("flush fixture response");
 }
 
+/// Writes the streaming SSE response head.
+///
+/// The head MUST carry an explicit framing header. In asupersync 0.5.0 a
+/// response with neither `Content-Length` nor `Transfer-Encoding` frames an
+/// **empty** body — `BodyKind` has only `ContentLength`, `Chunked`, and
+/// `Empty`, with no close-delimited variant — so the client would observe zero
+/// events on a stream the fixture believed it had written. That failure mode is
+/// silent for any test that only checks "no error", which is why the framing is
+/// chunked here and the terminating chunk is always written.
 fn begin_sse_response(stream: &mut TcpStream) {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: identity\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     )
     .expect("write fixture SSE head");
     stream.flush().expect("flush fixture SSE head");
 }
 
+/// Writes one SSE event as its own chunk, so a chunk boundary sits between
+/// every dispatched event.
 fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) {
-    write!(stream, "data: {payload}\n\n").expect("write fixture SSE event");
+    let body = format!("data: {payload}\n\n").into_bytes();
+    assert!(
+        !body.is_empty(),
+        "a zero-length chunk would terminate the response body early"
+    );
+    write!(stream, "{:x}\r\n", body.len()).expect("write fixture chunk length");
+    stream
+        .write_all(&body)
+        .expect("write fixture chunk payload");
+    write!(stream, "\r\n").expect("write fixture chunk terminator");
     stream.flush().expect("flush fixture SSE event");
+}
+
+/// Closes a chunked SSE body with its terminating zero-length chunk.
+fn end_sse_response(stream: &mut TcpStream) {
+    write!(stream, "0\r\n\r\n").expect("write fixture terminating chunk");
+    stream.flush().expect("flush fixture terminating chunk");
 }
 
 fn accept_bounded(listener: &TcpListener) -> TcpStream {
@@ -724,6 +750,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         //    stream and its waiter survived everything that happened on
         //    /mcp-b, including the planted refusal.
         write_sse_event(&mut a_call_stream, &terminal_tool_event(2));
+        end_sse_response(&mut a_call_stream);
         drop(a_call_stream);
     });
 
