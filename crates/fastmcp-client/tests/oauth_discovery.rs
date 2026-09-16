@@ -420,7 +420,7 @@ fn dropping_an_active_discovery_releases_its_socket_without_cancelling_the_paren
         let server = async {
             peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
             let (mut socket, _) = peer.request("GET", "/.well-known/oauth-authorization-server/tenant").await;
-            started_tx.send(()).unwrap();
+            started_tx.send(&cx, ()).unwrap();
             let mut byte = [0];
             assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
         };
@@ -455,9 +455,12 @@ fn metadata_location_exhaustion_is_bounded_and_precancellation_has_no_contact() 
         let ((), result) = pair(server, plan.discover(&cx)).await;
         assert!(matches!(result, Err(OAuthDiscoveryError::MetadataNotFound)));
         assert_eq!(peer.paths.lock().unwrap().len(), 4);
-        let cancelled = Cx::detached_cancel_context();
-        cancelled.cancel_with(asupersync::CancelKind::User, Some("test cancellation"));
-        assert!(matches!(plan.discover(&cancelled).await, Err(OAuthDiscoveryError::Cancelled)));
+        // Cancel the caller's real, capability-carrying context rather than a
+        // detached one: `Cx::detached_cancel_context` yields an empty capability
+        // mask, which `discover` cannot accept, and a detached context would not
+        // reproduce how a production caller cancels an in-flight discovery.
+        cx.cancel_with(asupersync::CancelKind::User, Some("test cancellation"));
+        assert!(matches!(plan.discover(&cx).await, Err(OAuthDiscoveryError::Cancelled)));
         peer.assert_no_extra_connections();
     });
 }
@@ -538,9 +541,7 @@ fn native_registration_login_and_refresh_reuse_one_admitted_client_id() {
                     *observed_redirect.lock().unwrap() = Some(fields["redirect_uri"].clone());
                     callback_for_client(authorization, &issuer, &resource, &assigned_id)
                 }).await.unwrap();
-                asupersync::time::Sleep::with_timer_driver(
-                    cx.now().saturating_add_nanos(1_100_000_000), cx.timer_driver().unwrap(),
-                ).await;
+                asupersync::time::Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
                 let snapshot = session.credential(&cx).await.unwrap();
                 assert_eq!(snapshot.generation(), 2);
                 assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer registration-access-two".to_owned()));
@@ -717,7 +718,7 @@ fn dropping_a_registration_after_post_closes_the_owned_exchange_without_replay()
         let server = async {
             peer.registration_discovery(&document).await;
             let (mut socket, _) = peer.request("POST", "/register").await;
-            started_tx.send(()).unwrap();
+            started_tx.send(&cx, ()).unwrap();
             let mut byte = [0];
             assert!(!matches!(socket.read(&mut byte).await, Ok(count) if count > 0));
         };
@@ -754,9 +755,11 @@ fn registration_deadline_covers_the_post_and_precancellation_has_no_contact() {
         assert!(matches!(result, Err(OAuthRegistrationError::Discovery(OAuthDiscoveryError::TimedOut))));
         assert!(cx.checkpoint().is_ok());
         assert_eq!(peer.paths.lock().unwrap().len(), 3);
-        let cancelled = Cx::detached_cancel_context();
-        cancelled.cancel_with(asupersync::CancelKind::User, Some("registration preflight"));
-        assert!(matches!(peer.registration().register(&cancelled).await,
+        // Same reasoning as the discovery cancellation above: cancel the real
+        // capability-carrying context, which is both what `register` accepts and
+        // what a production caller actually does.
+        cx.cancel_with(asupersync::CancelKind::User, Some("registration preflight"));
+        assert!(matches!(peer.registration().register(&cx).await,
             Err(OAuthRegistrationError::Discovery(OAuthDiscoveryError::Cancelled))));
         peer.assert_no_extra_connections();
     });
