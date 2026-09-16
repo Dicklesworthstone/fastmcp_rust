@@ -450,13 +450,36 @@ fn leg_http_01_b_positive() {
     );
 
     // ---- row 07: endpoint-mutation denial ------------------------------
+    // The shipped contract refuses a second `endpoint` event outright:
+    // `next_legacy_sse_message` maps `Some(LegacySseEvent::Endpoint(_))` to
+    // `Err(UnexpectedEndpointEvent)` (http_executor.rs:8452). The refusal
+    // therefore lands on whichever read first meets that event, which depends on
+    // how the body frames chunk rather than on the contract. So this asserts on
+    // the observed SEQUENCE rather than on a fixed index: an earlier revision
+    // indexed `messages[1]` and reported a contract violation that was really a
+    // fixture-chunking assumption.
     let mutated = legacy_session(Script::SecondEndpoint, 2);
     assert!(mutated.opened(), "the first endpoint event opens the lane");
+    let refusal = mutated
+        .messages
+        .iter()
+        .position(|observed| observed.contains("UnexpectedEndpointEvent"));
     assert!(
-        mutated.messages[1].contains("UnexpectedEndpointEvent"),
-        "a second endpoint event must be refused, observed {}",
-        mutated.messages[1]
+        refusal.is_some(),
+        "a second endpoint event must be refused, observed {:?}",
+        mutated.messages
     );
+    // Nothing may be admitted from the mutated stream before the refusal.
+    for observed in mutated
+        .messages
+        .iter()
+        .take(refusal.expect("checked above"))
+    {
+        assert!(
+            !observed.starts_with("Ok(Some("),
+            "no message may be admitted before the endpoint-mutation refusal, observed {observed}"
+        );
+    }
 
     // ---- row 03: malformed SSE framing ---------------------------------
     let not_endpoint = legacy_session(Script::FirstEventNotEndpoint, 0);
