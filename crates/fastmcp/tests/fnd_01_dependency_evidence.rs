@@ -157,6 +157,12 @@ mod trust_std {
     const MAX_ABSOLUTE_PATH_BYTES: usize = 4096;
     const MAX_ABSOLUTE_PATH_COMPONENT_BYTES: usize = 255;
     const MAX_ABSOLUTE_PATH_DEPTH: usize = 64;
+    /// Entries that may vanish between `read_dir` and their stat, per directory.
+    ///
+    /// A DESIGN LIMIT, not a measurement: nothing in the repository can make it
+    /// wrong, so it does not rot. It exists so that tolerating the unavoidable
+    /// enumerate-then-unlink race cannot degrade into silently scanning nothing.
+    const MAX_VANISHED_SCAN_ENTRIES: usize = 64;
     const MAX_RELATIVE_PATH_BYTES: usize = 240;
     const MAX_RELATIVE_PATH_COMPONENT_BYTES: usize = 100;
     const MAX_RELATIVE_PATH_DEPTH: usize = 8;
@@ -1592,6 +1598,8 @@ mod trust_std {
             return Err(TrustError::new("E_SPACE_FILE_TYPE", format!("{subject}: {} is not a no-follow directory", current.display())));
         }
         let before = linux_identity(&before_metadata, subject)?;
+        // Bounded per directory: see the NotFound arm on the per-entry stat.
+        let mut vanished_entries = 0_usize;
         for entry in fs::read_dir(current).map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", current.display())))? {
             let entry = entry.map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", current.display())))?;
             let name = entry.file_name().into_string().map_err(|_| TrustError::new("E_SPACE_ROOT", format!("{subject}: non-UTF-8 filesystem entry")))?;
@@ -1599,7 +1607,41 @@ mod trust_std {
                 return Err(TrustError::new("E_SPACE_ROOT", format!("{subject}: invalid filesystem entry {name:?}")));
             }
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", path.display())))?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // The entry was enumerated by `read_dir` and then unlinked
+                // before it could be stat'd. That is a race against the
+                // filesystem, not a scan failure, and it is unavoidable for any
+                // directory whose contents can change - `/proc/self/fd` merely
+                // makes it reproducible, because a descriptor closing between
+                // the listing and the stat removes its symlink.
+                //
+                // Only a VANISHED entry is benign. An entry that still exists
+                // but cannot be read - EACCES, EIO, ELOOP - is a genuine scan
+                // failure and still fails closed below, so this does not make
+                // the scanner blanket-tolerant of unreadable entries. That is
+                // the same distinction `resolve_missing_root_ancestor` already
+                // draws for a missing root; this applies it one level deeper.
+                //
+                // Vanishes are bounded so a pathologically churning directory
+                // cannot silently reduce this to scanning nothing.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    vanished_entries = vanished_entries.saturating_add(1);
+                    if vanished_entries > MAX_VANISHED_SCAN_ENTRIES {
+                        return Err(TrustError::new(
+                            "E_SPACE_SCAN",
+                            format!(
+                                "{subject}: {vanished_entries} entries vanished while enumerating {}",
+                                current.display()
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(TrustError::new("E_SPACE_SCAN", format!("{subject}: {}: {error}", path.display())));
+                }
+            };
             let file_type = metadata.file_type();
             *usage = usage.checked_projected(FilesystemUsage { entry_count: 1, regular_file_bytes: 0 }, cap, subject)?;
             if file_type.is_symlink() {
