@@ -25,7 +25,6 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use asupersync::Cx;
-use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_client::CanonicalHttpUrl;
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
@@ -124,14 +123,32 @@ fn callback_address(authorization: &CanonicalHttpUrl) -> SocketAddr {
 /// No sleep, no retry, no timing tolerance: the close is synchronous in `Drop`,
 /// so there is nothing to wait for and a tolerance would hide the very leak this
 /// exists to catch.
-async fn assert_listener_released(address: SocketAddr) {
-    match TcpListener::bind(address).await {
+/// SYNCHRONOUS ON PURPOSE. The previous form awaited asupersync's `bind`, and
+/// that `.await` is a scheduling point: between `drop(login)` closing the
+/// descriptor and the bind reaching the kernel, the runtime polls other tasks
+/// and other harness threads get a full async round trip in which to claim the
+/// just-freed ephemeral port. The failure that produces is indistinguishable
+/// from the leak this exists to catch, and a test that only passes in isolation
+/// lies in every wave. `std::net`'s blocking bind removes the await, making the
+/// drop and the bind straight-line code with no yield between them. Theft is
+/// not impossible - other OS threads still run - but the structural cause is
+/// gone rather than tolerated, at no cost in sleep, retry or timing tolerance.
+///
+/// DO NOT reintroduce an `.await` between the drop and this bind.
+///
+/// The same argument and the same pair live at
+/// `fastmcp-client/src/http_auth/oauth.rs` (`assert_listener_bound` /
+/// `assert_listener_released`) for the internal unit test. They cannot share
+/// code across the crate boundary without putting a test helper on the public
+/// surface, so if you change the concurrency argument here, change it there.
+fn assert_listener_released(address: SocketAddr) {
+    match std::net::TcpListener::bind(address) {
         Ok(listener) => drop(listener),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => panic!(
-            "{address} is still bound after the public login future was dropped. Either the \
-             callback listener leaked - the defect this proves against - or a concurrent test \
-             took the port between the drop and this bind. Re-run this test alone with --exact \
-             to separate them."
+            "{address} is still bound after the public login future was dropped, and the bind \
+             was issued with no await between it and the drop. Either the callback listener \
+             leaked - the defect this proves against - or a concurrent test on another thread \
+             took the port inside that straight-line window."
         ),
         Err(error) => panic!(
             "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither closure \
@@ -145,8 +162,10 @@ async fn assert_listener_released(address: SocketAddr) {
 /// This is the control that gives the positive its meaning: a bind probe that
 /// could never fail would prove nothing, so this proves the probe can in fact
 /// observe a live listener.
-async fn assert_listener_still_bound(address: SocketAddr) {
-    match TcpListener::bind(address).await {
+/// Synchronous for the same reason as [`assert_listener_released`], though this
+/// direction cannot be stolen in any case: we hold the port.
+fn assert_listener_still_bound(address: SocketAddr) {
+    match std::net::TcpListener::bind(address) {
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
         Ok(_) => panic!(
             "{address} was rebindable while the public login future was still alive, so the \
@@ -242,7 +261,7 @@ fn oauth_callback_listener_is_released_when_the_public_login_future_is_dropped()
 
             // The one variable: the caller abandons the login.
             drop(login);
-            assert_listener_released(address).await;
+            assert_listener_released(address);
         });
 }
 
@@ -261,7 +280,7 @@ fn oauth_callback_listener_remains_bound_while_the_public_login_future_is_held()
             // The one changed variable against the case above: the login future
             // is HELD rather than dropped. Everything else - the configuration,
             // the client, the callback, the address - is identical.
-            assert_listener_still_bound(address).await;
+            assert_listener_still_bound(address);
 
             // Held across the probe on purpose; dropping it earlier would make
             // this the other case.
