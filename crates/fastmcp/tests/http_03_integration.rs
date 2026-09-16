@@ -1,0 +1,2235 @@
+//! HTTP-03 integration (role `I`): join the accepted implementation A and
+//! implementation B capability slices through shipped public entrypoints only.
+//!
+//! This target is an external consumer of the published facade. It reaches the
+//! joined surface exclusively through `fastmcp_rust::...` and never through
+//! `use super::...` or a `#[cfg(test)]` module, so what it proves is the
+//! packaged public surface rather than crate-internal behaviour (PL-3).
+//!
+//! The join has two halves and both are mandatory:
+//!
+//! * The **manifest half** consumes the exact `http_03_evaluator_manifest_v1`
+//!   inputs published by implementation A (`HTTP-03.01`..`HTTP-03.13`) and
+//!   implementation B (`HTTP-03.14`..`HTTP-03.26`) together with their
+//!   SHA-256 digests, and verifies the ordered union across both producers.
+//!   The manifests are producer-owned inputs: this file deliberately does not
+//!   define, mirror, or reconstruct them, because a locally authored manifest
+//!   would prove nothing about the producers.
+//! * The **execution half** drives the shipped modern HTTP client against real
+//!   `TcpListener` fixtures and records, per manifest case, the exact POST
+//!   method/body/headers, the JSON-or-SSE terminal outcome, stream-close and
+//!   progress ownership, endpoint/security partition identity, the canonical
+//!   target, the discovery frame, and the 3x3 no-downgrade observation state.
+//!
+//! The `floor=N` value declared by each producer row is enforced by execution:
+//! the evaluator must actually perform at least `N` observations for that case.
+//! No floor table is duplicated here, so raising a producer floor raises what
+//! this join demands rather than silently passing.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+// The caller-owned runtime comes from the `asupersync` dev-dependency directly,
+// never through `fastmcp_rust::asupersync`: that facade re-export is gated behind
+// the `testing-lab` feature, so reaching it would drag `asupersync/test-internals`
+// into this target's graph and force a `required-features` stanza. The AC requires
+// this target to be auto-discovered under the DEFAULT facade feature set, and
+// `cfg(test)`-only or lab-only behaviour cannot prove shipped behaviour (PL-3).
+// Every sibling target does the same; see `tests/e2e_stress.rs:18`.
+use asupersync::Cx;
+use asupersync::runtime::RuntimeBuilder;
+use fastmcp_rust::client::http_executor::{
+    HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreEvent,
+    ModernHttpFinalCoreListenError, http_03_a_manifest_digest, http_03_b_manifest_digest,
+};
+use fastmcp_rust::client::{
+    BearerBindingError, BoundBearerCredential, ClientBuilder, ClientHttpConnection,
+    ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationDecision,
+    ClientHttpNegotiationError, ClientHttpResponse, ClientProtocolPlan, MODERN_MCP_ACCEPT,
+    MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClientError,
+    ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, RequestTimeoutPolicy,
+    SseLimits, validate_response_head,
+};
+use fastmcp_rust::{
+    CanonicalHttpUrl, FinalCoreResult, HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody,
+    ProgressMarker, ProtocolEra, ProtocolPolicy, RequestId, Sha256Digest, sha256_bounded,
+};
+
+/// The join's own public entrypoint, recorded in the receipt (PL-3).
+const JOINED_PUBLIC_ENTRYPOINT: &str =
+    "fastmcp_rust::client::ClientBuilder::connect_http_with_cx -> ClientHttpConnection";
+
+/// Ordered case identifiers the union must equal, inclusive.
+const FIRST_CASE_ORDINAL: usize = 1;
+const LAST_CASE_ORDINAL: usize = 26;
+
+/// Minimum ordered positive cases the integrated evaluator must execute.
+const MINIMUM_POSITIVE_CASES: usize = 26;
+/// Minimum ordered one-variable planted-negative cases it must execute.
+const MINIMUM_NEGATIVE_CASES: usize = 26;
+
+/// The manifest case whose single variable the planted-negative test changes.
+const PLANTED_CASE_ID: &str = "HTTP-03.11";
+
+/// Bound used for every manifest digest recomputation.
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// The bearer secret used for credential-binding observations. It must never
+/// reach a wire capture or a rendered diagnostic.
+const BEARER_SECRET: &str = "http-03-integration-bearer-secret";
+
+/// Placeholder substituted for the ephemeral fixture authority so that case
+/// records are byte-comparable across runs.
+const FIXTURE_AUTHORITY_PLACEHOLDER: &str = "<fixture-authority>";
+
+// ---------------------------------------------------------------------------
+// Producer manifest consumption
+// ---------------------------------------------------------------------------
+
+/// One ordered evaluator case declared by a producer manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestCase {
+    id: String,
+    name: String,
+    floor: usize,
+}
+
+/// One producer's parsed `http_03_evaluator_manifest_v1`.
+#[derive(Debug, Clone)]
+struct ProducerManifest {
+    header: String,
+    producer_revision: String,
+    producer_tree: String,
+    entrypoint: String,
+    cases: Vec<ManifestCase>,
+}
+
+/// Parses one producer manifest, enforcing LF canonicality before any row is
+/// interpreted. Anything that is not exactly the frozen shape is a failure of
+/// the join, never something this side repairs.
+fn parse_producer_manifest(expected_header: &str, text: &str) -> ProducerManifest {
+    assert!(
+        !text.is_empty(),
+        "{expected_header}: the producer manifest must not be empty"
+    );
+    assert!(
+        text.ends_with('\n'),
+        "{expected_header}: the producer manifest must be LF-terminated"
+    );
+    assert!(
+        !text.contains('\r'),
+        "{expected_header}: the producer manifest must be LF-canonical (no CR)"
+    );
+
+    let mut lines = text.split('\n');
+    let mut rows: Vec<&str> = Vec::new();
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+        assert_eq!(
+            line.trim_end(),
+            line,
+            "{expected_header}: manifest rows must not carry trailing whitespace"
+        );
+        rows.push(line);
+    }
+    assert!(
+        lines.next().is_none(),
+        "{expected_header}: the manifest must contain no blank or trailing lines"
+    );
+    assert!(
+        rows.len() > 4,
+        "{expected_header}: the manifest needs its four header rows and at least one case row"
+    );
+
+    assert_eq!(
+        rows[0], expected_header,
+        "the producer manifest must declare its exact frozen header"
+    );
+    let producer_revision = required_field(expected_header, rows[1], "producer-revision");
+    let producer_tree = required_field(expected_header, rows[2], "producer-tree");
+    let entrypoint = required_field(expected_header, rows[3], "entrypoint");
+    assert!(
+        is_lowercase_hex(&producer_revision),
+        "{expected_header}: producer-revision must be a lowercase hex object name"
+    );
+    assert!(
+        is_lowercase_hex(&producer_tree),
+        "{expected_header}: producer-tree must be a lowercase hex object name"
+    );
+    assert!(
+        entrypoint.starts_with("fastmcp"),
+        "{expected_header}: entrypoint must name a shipped public path, got {entrypoint:?}"
+    );
+
+    let cases = rows[4..]
+        .iter()
+        .map(|row| parse_case_row(expected_header, row))
+        .collect::<Vec<_>>();
+
+    ProducerManifest {
+        header: rows[0].to_owned(),
+        producer_revision,
+        producer_tree,
+        entrypoint,
+        cases,
+    }
+}
+
+fn required_field(header: &str, row: &str, key: &str) -> String {
+    let value = row
+        .strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("{header}: expected a `{key} <value>` row, got {row:?}"));
+    assert!(
+        !value.is_empty(),
+        "{header}: the `{key}` row must carry a value"
+    );
+    value.to_owned()
+}
+
+fn parse_case_row(header: &str, row: &str) -> ManifestCase {
+    let mut fields = row.split(' ');
+    let id = fields
+        .next()
+        .unwrap_or_else(|| panic!("{header}: empty case row"))
+        .to_owned();
+    let name = fields
+        .next()
+        .unwrap_or_else(|| panic!("{header}: case {id} has no case name"))
+        .to_owned();
+    let floor_field = fields
+        .next()
+        .unwrap_or_else(|| panic!("{header}: case {id} has no `floor=` field"));
+    assert!(
+        fields.next().is_none(),
+        "{header}: case {id} carries unexpected trailing fields"
+    );
+    let floor: usize = floor_field
+        .strip_prefix("floor=")
+        .unwrap_or_else(|| {
+            panic!("{header}: case {id} must declare `floor=<N>`, got {floor_field:?}")
+        })
+        .parse()
+        .unwrap_or_else(|_| panic!("{header}: case {id} declares a non-numeric floor"));
+    assert!(
+        floor >= 1,
+        "{header}: case {id} must declare a positive numeric floor"
+    );
+    assert!(
+        !name.is_empty(),
+        "{header}: case {id} must declare a non-empty case name"
+    );
+    ManifestCase { id, name, floor }
+}
+
+fn is_lowercase_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The ordered union of both producer manifests plus the digest binding.
+#[derive(Debug, Clone)]
+struct JoinedManifest {
+    a: ProducerManifest,
+    b: ProducerManifest,
+    a_digest: Sha256Digest,
+    b_digest: Sha256Digest,
+    cases: Vec<ManifestCase>,
+}
+
+impl JoinedManifest {
+    /// Consumes both producer manifests through their shipped public accessors
+    /// and verifies the ordered union `HTTP-03.01`..`HTTP-03.26`.
+    fn consume() -> Self {
+        let a = parse_producer_manifest(
+            "HTTP-03-A evaluator manifest v1",
+            HTTP_03_A_EVALUATOR_MANIFEST_V1,
+        );
+        let b = parse_producer_manifest(
+            "HTTP-03-B evaluator manifest v1",
+            HTTP_03_B_EVALUATOR_MANIFEST_V1,
+        );
+
+        // The published digest must bind the published bytes. A digest that
+        // does not recompute means the two halves of the producer's own
+        // acceptance input have drifted apart.
+        let a_digest = recompute_digest(HTTP_03_A_EVALUATOR_MANIFEST_V1);
+        let b_digest = recompute_digest(HTTP_03_B_EVALUATOR_MANIFEST_V1);
+        assert_eq!(
+            http_03_a_manifest_digest().as_bytes(),
+            a_digest.as_bytes(),
+            "implementation A's published digest must bind its published manifest bytes"
+        );
+        assert_eq!(
+            http_03_b_manifest_digest().as_bytes(),
+            b_digest.as_bytes(),
+            "implementation B's published digest must bind its published manifest bytes"
+        );
+        assert_ne!(
+            a_digest.as_bytes(),
+            b_digest.as_bytes(),
+            "the two producer manifests must be distinct acceptance inputs"
+        );
+
+        assert_ne!(
+            a.header, b.header,
+            "the A and B manifests must declare distinct frozen headers"
+        );
+
+        let mut cases = a.cases.clone();
+        cases.extend(b.cases.iter().cloned());
+
+        let expected: Vec<String> = (FIRST_CASE_ORDINAL..=LAST_CASE_ORDINAL)
+            .map(|ordinal| format!("HTTP-03.{ordinal:02}"))
+            .collect();
+        let observed: Vec<String> = cases.iter().map(|case| case.id.clone()).collect();
+        assert_eq!(
+            observed, expected,
+            "the ordered union of the A and B manifests must be exactly HTTP-03.01..HTTP-03.26 \
+             with no omission, duplication, or reorder"
+        );
+
+        let mut names: BTreeMap<&str, &str> = BTreeMap::new();
+        for case in &cases {
+            assert!(
+                names.insert(case.name.as_str(), case.id.as_str()).is_none(),
+                "case name {:?} is declared twice in the joined manifest",
+                case.name
+            );
+        }
+
+        Self {
+            a,
+            b,
+            a_digest,
+            b_digest,
+            cases,
+        }
+    }
+}
+
+fn recompute_digest(manifest: &str) -> Sha256Digest {
+    sha256_bounded(manifest.as_bytes(), MAX_MANIFEST_BYTES)
+        .expect("a producer manifest must stay within the bounded digest input")
+}
+
+fn render_digest(digest: &Sha256Digest) -> String {
+    digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Real-socket fixture
+// ---------------------------------------------------------------------------
+
+/// One HTTP request exactly as it arrived at the fixture.
+#[derive(Debug, Clone)]
+struct CapturedRequest {
+    head: String,
+    body: Vec<u8>,
+}
+
+impl CapturedRequest {
+    fn header(&self, name: &str) -> Option<String> {
+        self.head.lines().find_map(|line| {
+            line.split_once(':').and_then(|(field, value)| {
+                field
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        })
+    }
+
+    fn request_line(&self) -> &str {
+        self.head.lines().next().unwrap_or_default()
+    }
+
+    fn json_body(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).expect("every captured MCP POST body must be JSON-RPC")
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> CapturedRequest {
+    let mut wire = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let head_end = loop {
+        let read = stream.read(&mut buffer).expect("read fixture HTTP request");
+        assert!(read > 0, "client closed before a complete request arrived");
+        wire.extend_from_slice(&buffer[..read]);
+        if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = std::str::from_utf8(&wire[..head_end])
+        .expect("request head must be UTF-8")
+        .to_owned();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(field, value)| {
+                field.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric Content-Length")
+                })
+            })
+        })
+        .unwrap_or(0);
+    while wire.len() < head_end.saturating_add(content_length) {
+        let read = stream.read(&mut buffer).expect("read fixture request body");
+        assert!(read > 0, "client closed before the advertised body arrived");
+        wire.extend_from_slice(&buffer[..read]);
+    }
+    CapturedRequest {
+        head,
+        body: wire[head_end..head_end + content_length].to_vec(),
+    }
+}
+
+fn write_bounded_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    content_encoding: Option<&str>,
+    body: &[u8],
+) {
+    let reason = match status {
+        200 => "OK",
+        202 => "Accepted",
+        _ => "Fixture Response",
+    };
+    write!(stream, "HTTP/1.1 {status} {reason}\r\n").expect("write fixture status line");
+    write!(stream, "Content-Type: {content_type}\r\n").expect("write fixture content type");
+    if let Some(encoding) = content_encoding {
+        write!(stream, "Content-Encoding: {encoding}\r\n").expect("write fixture content coding");
+    }
+    write!(stream, "Content-Length: {}\r\n", body.len()).expect("write fixture content length");
+    write!(stream, "Connection: close\r\n\r\n").expect("write fixture head terminator");
+    stream.write_all(body).expect("write fixture body");
+    stream.flush().expect("flush fixture response");
+}
+
+fn begin_sse_response(stream: &mut TcpStream) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: identity\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write fixture SSE head");
+    stream.flush().expect("flush fixture SSE head");
+}
+
+fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) {
+    write!(stream, "data: {payload}\n\n").expect("write fixture SSE event");
+    stream.flush().expect("flush fixture SSE event");
+}
+
+fn accept_bounded(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    listener
+        .set_nonblocking(true)
+        .expect("set fixture listener nonblocking");
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted fixture stream blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("bound accepted fixture reads");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .expect("bound accepted fixture writes");
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for a client connection on the fixture listener"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("unexpected fixture accept error: {error}"),
+        }
+    }
+}
+
+fn discovery_body(id: u64, instance: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {},
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": format!("http-03-integration-{instance}"),
+                    "version": "1.0.0"
+                }
+            }
+        }
+    }))
+    .expect("fixture discovery result must serialize")
+}
+
+fn progress_event(marker: &ProgressMarker, progress: u64) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": marker,
+            "progress": progress,
+            "total": 2,
+        },
+    })
+}
+
+fn terminal_tool_event(request_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "http-03-join-terminal"}],
+            "isError": false,
+        },
+    })
+}
+
+fn ping_body(id: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {},
+    }))
+    .expect("fixture ping result must serialize")
+}
+
+// ---------------------------------------------------------------------------
+// Wire observations produced by one fixture run
+// ---------------------------------------------------------------------------
+
+/// Everything the joined run observed on real sockets and through the public
+/// client state, normalized so it is byte-comparable between runs.
+#[derive(Debug, Clone)]
+struct WireObservations {
+    fixture_authority: String,
+    a_probe: CapturedRequest,
+    a_call: CapturedRequest,
+    b_probe: CapturedRequest,
+    b_ping: CapturedRequest,
+    b_lane_probe: CapturedRequest,
+    a_progress: Vec<String>,
+    a_terminal: String,
+    a_post_terminal: String,
+    a_discovery: String,
+    a_versions: Vec<String>,
+    a_endpoint_key: HttpEndpointBundleKey,
+    a_target: String,
+    a_era: ProtocolEra,
+    b_discovery: String,
+    b_versions: Vec<String>,
+    b_endpoint_key: HttpEndpointBundleKey,
+    b_target: String,
+    b_era: ProtocolEra,
+    b_json_outcome: String,
+    b_lane_refusal: String,
+    method_count: BTreeMap<String, usize>,
+    legacy_get_count: usize,
+}
+
+impl WireObservations {
+    /// Replaces the ephemeral fixture authority so records compare byte-for-byte.
+    fn normalize(&self, value: &str) -> String {
+        value.replace(&self.fixture_authority, FIXTURE_AUTHORITY_PLACEHOLDER)
+    }
+}
+
+fn canonical_plan(
+    target: &str,
+    policy: ProtocolPolicy,
+    security_partition: &str,
+) -> ClientProtocolPlan {
+    ClientProtocolPlan::http(
+        policy,
+        Some(CanonicalHttpUrl::parse(target).expect("fixture target must be canonical")),
+        None,
+        None,
+        "credential-partition-http-03-integration".to_owned(),
+        security_partition.to_owned(),
+        "native-h1-http-03-integration".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("the modern-only integration plan must be accepted")
+}
+
+/// A dual-era classification plan whose endpoint set is identical for every
+/// policy, so the no-downgrade matrix can change the policy and nothing else.
+fn classification_plan(policy: ProtocolPolicy) -> ClientProtocolPlan {
+    ClientProtocolPlan::http(
+        policy,
+        Some(
+            CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+                .expect("the classification modern target is canonical"),
+        ),
+        Some(
+            CanonicalHttpUrl::parse("https://mcp.example.test/sse")
+                .expect("the classification legacy SSE target is canonical"),
+        ),
+        Some(
+            CanonicalHttpUrl::parse("https://mcp.example.test/messages")
+                .expect("the classification legacy message target is canonical"),
+        ),
+        "credential-partition-http-03-integration".to_owned(),
+        "security-partition-http-03-integration".to_owned(),
+        "native-h1-http-03-integration".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("the classification plan must be accepted for every policy")
+}
+
+fn integration_builder(target: &str) -> ClientBuilder {
+    ClientBuilder::new()
+        .client_info("http-03-integration-client", "1.0.0")
+        .protocol_plan(canonical_plan(
+            target,
+            ProtocolPolicy::ModernOnly,
+            "security-partition-http-03-integration",
+        ))
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(20))
+                .expect("integration request timeout policy must be valid")
+                .reset_idle_on_matching_progress(true),
+        )
+}
+
+/// What the joined client half of one fixture run observed.
+struct ClientOutcome {
+    a_era: ProtocolEra,
+    a_discovery: String,
+    a_versions: Vec<String>,
+    a_endpoint_key: HttpEndpointBundleKey,
+    a_progress: Vec<String>,
+    a_terminal: String,
+    a_post_terminal: String,
+    b_era: ProtocolEra,
+    b_discovery: String,
+    b_versions: Vec<String>,
+    b_endpoint_key: HttpEndpointBundleKey,
+    b_json_outcome: String,
+    b_lane_refusal: String,
+}
+
+fn endpoint_key(connection: &ClientHttpConnection) -> HttpEndpointBundleKey {
+    connection
+        .protocol_plan()
+        .http_endpoints()
+        .expect("an HTTP connection must retain its configured endpoint bundle")
+        .key()
+}
+
+/// Drives one complete fixture run. `plant_case_11` changes exactly one
+/// variable: the `Content-Encoding` of the `/mcp-b` JSON terminal response.
+fn run_fixture(plant_case_11: bool) -> WireObservations {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the HTTP-03 integration fixture");
+    let address = listener
+        .local_addr()
+        .expect("read the fixture listener address");
+    let authority = address.to_string();
+    let a_target = format!("http://{authority}/mcp-a");
+    let b_target = format!("http://{authority}/mcp-b");
+    let marker = ProgressMarker::from("http-03-integration-progress");
+    let server_marker = marker.clone();
+    let (captures_tx, captures_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        // 1. /mcp-a one-shot discovery probe.
+        let mut a_probe_stream = accept_bounded(&listener);
+        let a_probe = read_request(&mut a_probe_stream);
+        write_bounded_response(
+            &mut a_probe_stream,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "a"),
+        );
+        captures_tx.send(a_probe).expect("record /mcp-a probe");
+
+        // 2. /mcp-a streaming tools/call: head plus progress, terminal held back
+        //    so the caller's waiter stays live across the /mcp-b exchanges.
+        let mut a_call_stream = accept_bounded(&listener);
+        let a_call = read_request(&mut a_call_stream);
+        captures_tx.send(a_call).expect("record /mcp-a tools/call");
+        begin_sse_response(&mut a_call_stream);
+        write_sse_event(&mut a_call_stream, &progress_event(&server_marker, 1));
+        write_sse_event(&mut a_call_stream, &progress_event(&server_marker, 2));
+
+        // 3. /mcp-b one-shot discovery probe on the same origin.
+        let mut b_probe_stream = accept_bounded(&listener);
+        let b_probe = read_request(&mut b_probe_stream);
+        write_bounded_response(
+            &mut b_probe_stream,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "b"),
+        );
+        captures_tx.send(b_probe).expect("record /mcp-b probe");
+
+        // 4. /mcp-b JSON terminal. The planted run changes only this coding.
+        let mut b_ping_stream = accept_bounded(&listener);
+        let b_ping = read_request(&mut b_ping_stream);
+        write_bounded_response(
+            &mut b_ping_stream,
+            200,
+            "application/json",
+            Some(if plant_case_11 { "gzip" } else { "identity" }),
+            &ping_body(11),
+        );
+        captures_tx.send(b_ping).expect("record /mcp-b ping");
+
+        // 5. /mcp-b second JSON terminal, used for the lane-selection refusal.
+        let mut b_lane_stream = accept_bounded(&listener);
+        let b_lane = read_request(&mut b_lane_stream);
+        write_bounded_response(
+            &mut b_lane_stream,
+            200,
+            "application/json",
+            Some("identity"),
+            &ping_body(12),
+        );
+        captures_tx.send(b_lane).expect("record /mcp-b lane probe");
+
+        // 6. Release the held /mcp-a terminal only now, proving the sibling
+        //    stream and its waiter survived everything that happened on
+        //    /mcp-b, including the planted refusal.
+        write_sse_event(&mut a_call_stream, &terminal_tool_event(2));
+        drop(a_call_stream);
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the integration test owns its caller runtime");
+
+    let outcome = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+
+        let a_connection = integration_builder(&a_target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the /mcp-a endpoint instance must connect through the public builder");
+        let a_era = a_connection.selected_protocol_era();
+        let a_discovery_result = a_connection
+            .server_discovery()
+            .expect("a modern connection retains its discovery frame");
+        let a_versions: Vec<String> = a_discovery_result.supported_versions().to_vec();
+        let a_discovery = format!("{a_discovery_result:?}");
+        let a_endpoint_key = endpoint_key(&a_connection);
+
+        let mut a_listener = a_connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "http_03_join_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker.clone()},
+                }),
+                RequestId::Number(2),
+                limits,
+            )
+            .await
+            .expect("the shipped SSE lane must open a request-owned listener");
+
+        let mut a_progress = Vec::new();
+        for _ in 0_u8..2 {
+            let event = a_listener
+                .next_event(&cx)
+                .await
+                .expect("request-scoped progress must remain admissible")
+                .expect("a progress event must precede the terminal");
+            match event {
+                ModernHttpFinalCoreEvent::Progress(progress) => {
+                    assert_eq!(
+                        progress.progress_token, marker,
+                        "progress must be delivered only to the request that owns the marker"
+                    );
+                    a_progress.push(progress.progress.as_str().to_owned());
+                }
+                other => panic!("expected a progress record, observed {other:?}"),
+            }
+        }
+
+        // The /mcp-a waiter is now live and pending. Everything below happens
+        // on a different endpoint instance while that stream stays open.
+        let mut b_connection = integration_builder(&b_target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the /mcp-b endpoint instance must connect through the public builder");
+        let b_era = b_connection.selected_protocol_era();
+        let b_discovery_result = b_connection
+            .server_discovery()
+            .expect("a modern connection retains its discovery frame");
+        let b_versions: Vec<String> = b_discovery_result.supported_versions().to_vec();
+        let b_discovery = format!("{b_discovery_result:?}");
+        let b_endpoint_key = endpoint_key(&b_connection);
+
+        let b_json_outcome = match b_connection
+            .request_json(
+                &cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(11),
+                65_536,
+            )
+            .await
+        {
+            Ok(response) => format!(
+                "terminal=json id={:?} result={}",
+                response.id,
+                response
+                    .result
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_owned(), serde_json::Value::to_string)
+            ),
+            Err(error) => format!("refusal={}", render_connection_error(&error)),
+        };
+
+        // A second JSON terminal, converted through the SSE lane entrypoint.
+        // Only the requested lane differs from the accepted JSON consumption.
+        let b_lane_refusal = match b_connection
+            .request(&cx, "ping", serde_json::json!({}), RequestId::Number(12))
+            .await
+            .expect("the second /mcp-b JSON exchange must reach a response head")
+        {
+            ClientHttpResponse::Modern(stream) => {
+                assert_eq!(
+                    stream.metadata().kind(),
+                    ModernHttpResponseKind::Json,
+                    "the fixture answered this POST on the JSON lane"
+                );
+                match stream.into_sse_stream(limits) {
+                    Ok(_) => panic!("a JSON response must not be admitted as an SSE stream"),
+                    Err(error) => format!("{error:?}"),
+                }
+            }
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpResponse::Legacy(_) => {
+                panic!("a modern-only plan must never yield a legacy response")
+            }
+        };
+
+        // Back to the still-open sibling stream.
+        let a_terminal = match a_listener
+            .next_event(&cx)
+            .await
+            .expect("the sibling stream must still deliver its terminal")
+            .expect("the terminal record must arrive")
+        {
+            ModernHttpFinalCoreEvent::Terminal(FinalCoreResult::ToolsCall { .. }) => {
+                "terminal=tools_call".to_owned()
+            }
+            other => panic!("expected the correlated tools/call terminal, observed {other:?}"),
+        };
+
+        // Reading past the terminal is the stream-close observation.
+        let a_post_terminal = match a_listener.next_event(&cx).await {
+            Ok(event) => panic!("a closed stream must not yield {event:?}"),
+            Err(ModernHttpFinalCoreListenError::EndOfStream { .. }) => {
+                "closed=end_of_stream".to_owned()
+            }
+            Err(other) => panic!("expected a typed end-of-stream, observed {other:?}"),
+        };
+
+        ClientOutcome {
+            a_era,
+            a_discovery,
+            a_versions,
+            a_endpoint_key,
+            a_progress,
+            a_terminal,
+            a_post_terminal,
+            b_era,
+            b_discovery,
+            b_versions,
+            b_endpoint_key,
+            b_json_outcome,
+            b_lane_refusal,
+        }
+    });
+
+    server.join().expect("the fixture server thread must join");
+
+    let a_probe = captures_rx.recv().expect("the /mcp-a probe was captured");
+    let a_call = captures_rx
+        .recv()
+        .expect("the /mcp-a tools/call was captured");
+    let b_probe = captures_rx.recv().expect("the /mcp-b probe was captured");
+    let b_ping = captures_rx.recv().expect("the /mcp-b ping was captured");
+    let b_lane_probe = captures_rx
+        .recv()
+        .expect("the /mcp-b lane probe was captured");
+    assert!(
+        captures_rx.try_recv().is_err(),
+        "the fixture must observe exactly the five expected requests"
+    );
+
+    let ClientOutcome {
+        a_era,
+        a_discovery,
+        a_versions,
+        a_endpoint_key,
+        a_progress,
+        a_terminal,
+        a_post_terminal,
+        b_era,
+        b_discovery,
+        b_versions,
+        b_endpoint_key,
+        b_json_outcome,
+        b_lane_refusal,
+    } = outcome;
+
+    let captured = [&a_probe, &a_call, &b_probe, &b_ping, &b_lane_probe];
+    let mut method_count: BTreeMap<String, usize> = BTreeMap::new();
+    let mut legacy_get_count = 0_usize;
+    for request in captured {
+        if request.request_line().starts_with("GET ") {
+            legacy_get_count += 1;
+        }
+        if let Some(method) = request.header("Mcp-Method") {
+            *method_count.entry(method).or_default() += 1;
+        }
+    }
+
+    WireObservations {
+        fixture_authority: authority,
+        a_probe,
+        a_call,
+        b_probe,
+        b_ping,
+        b_lane_probe,
+        a_progress,
+        a_terminal,
+        a_post_terminal,
+        a_discovery,
+        a_versions,
+        a_endpoint_key,
+        a_target,
+        a_era,
+        b_discovery,
+        b_versions,
+        b_endpoint_key,
+        b_target,
+        b_era,
+        b_json_outcome,
+        b_lane_refusal,
+        method_count,
+        legacy_get_count,
+    }
+}
+
+fn render_connection_error(error: &ClientHttpConnectionError) -> String {
+    match error {
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(executor)) => {
+            format!("executor::{executor:?}")
+        }
+        ClientHttpConnectionError::Modern(modern) => format!("modern::{modern:?}"),
+        other => format!("connection::{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Joined evaluator
+// ---------------------------------------------------------------------------
+
+/// One evaluated manifest case: its ordered record plus the observation counts
+/// that the producer's declared floor is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaseRecord {
+    id: String,
+    name: String,
+    floor: usize,
+    positive_observations: usize,
+    negative_observations: usize,
+    record: String,
+}
+
+/// Accumulates one case's observations in evaluation order.
+struct CaseBuilder {
+    positive_observations: usize,
+    negative_observations: usize,
+    record: String,
+}
+
+impl CaseBuilder {
+    fn new() -> Self {
+        Self {
+            positive_observations: 0,
+            negative_observations: 0,
+            record: String::new(),
+        }
+    }
+
+    /// Records one positive observation of the shipped joined behaviour.
+    fn positive(&mut self, field: &str, observed: &str) {
+        self.positive_observations += 1;
+        writeln!(self.record, "+ {field} = {observed}").expect("record writes are infallible");
+    }
+
+    /// Records one one-variable planted-negative observation.
+    fn negative(&mut self, variable: &str, observed: &str) {
+        self.negative_observations += 1;
+        writeln!(self.record, "- {variable} -> {observed}").expect("record writes are infallible");
+    }
+}
+
+/// The receipt produced by one complete joined evaluation.
+#[derive(Debug, Clone)]
+struct JoinReceipt {
+    joined_entrypoint: String,
+    producer_a_revision: String,
+    producer_a_tree: String,
+    producer_a_entrypoint: String,
+    producer_b_revision: String,
+    producer_b_tree: String,
+    producer_b_entrypoint: String,
+    a_digest: String,
+    b_digest: String,
+    endpoint_identity: String,
+    canonical_targets: (String, String),
+    fixture_identity: String,
+    discovery_frames: (String, String),
+    no_downgrade_matrix: Vec<String>,
+    cases: Vec<CaseRecord>,
+}
+
+impl JoinReceipt {
+    fn case(&self, id: &str) -> &CaseRecord {
+        self.cases
+            .iter()
+            .find(|case| case.id == id)
+            .unwrap_or_else(|| panic!("the receipt must carry {id}"))
+    }
+
+    fn total_positive(&self) -> usize {
+        self.cases
+            .iter()
+            .map(|case| case.positive_observations)
+            .sum()
+    }
+
+    fn total_negative(&self) -> usize {
+        self.cases
+            .iter()
+            .map(|case| case.negative_observations)
+            .sum()
+    }
+}
+
+/// Evaluates the full ordered join. `plant_case_11` changes exactly one
+/// variable across the whole evaluation.
+fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
+    let manifest = JoinedManifest::consume();
+    let wire = run_fixture(plant_case_11);
+    let matrix = no_downgrade_matrix();
+
+    let mut cases = Vec::with_capacity(manifest.cases.len());
+    for declared in &manifest.cases {
+        let mut builder = CaseBuilder::new();
+        match declared.id.as_str() {
+            "HTTP-03.01" => case_post_route(&mut builder, &wire),
+            "HTTP-03.02" => case_request_content_type(&mut builder, &wire),
+            "HTTP-03.03" => case_request_accept(&mut builder, &wire),
+            "HTTP-03.04" => case_request_accept_encoding(&mut builder, &wire),
+            "HTTP-03.05" => case_protocol_version_header(&mut builder, &wire),
+            "HTTP-03.06" => case_method_mirror_header(&mut builder, &wire),
+            "HTTP-03.07" => case_name_header(&mut builder, &wire),
+            "HTTP-03.08" => case_body_stamping(&mut builder, &wire),
+            "HTTP-03.09" => case_json_lane(&mut builder, &wire),
+            "HTTP-03.10" => case_sse_lane(&mut builder, &wire),
+            "HTTP-03.11" => case_content_encoding(&mut builder, &wire, plant_case_11),
+            "HTTP-03.12" => case_bounded_sse_parse(&mut builder, &wire),
+            "HTTP-03.13" => case_terminal_and_close(&mut builder, &wire),
+            "HTTP-03.14" => case_one_shot_probe(&mut builder, &wire),
+            "HTTP-03.15" => case_modern_era_selection(&mut builder, &wire),
+            "HTTP-03.16" => case_discovery_frames(&mut builder, &wire),
+            "HTTP-03.17" => case_bearer_bound_target(&mut builder),
+            "HTTP-03.18" => case_bearer_not_forwarded(&mut builder),
+            "HTTP-03.19" => case_bearer_never_cleartext(&mut builder),
+            "HTTP-03.20" => case_bearer_token_bytes(&mut builder),
+            "HTTP-03.21" => case_credential_redaction(&mut builder, &wire),
+            "HTTP-03.22" => case_redirects_rejected(&mut builder),
+            "HTTP-03.23" => case_endpoint_instance_partition(&mut builder, &wire),
+            "HTTP-03.24" => case_security_partition(&mut builder, &wire),
+            "HTTP-03.25" => case_configuration_generation(&mut builder, &wire),
+            "HTTP-03.26" => case_no_downgrade_matrix(&mut builder, &matrix),
+            other => panic!("the joined evaluator has no registered predicate for {other}"),
+        }
+
+        let observations = builder.positive_observations + builder.negative_observations;
+        assert!(
+            observations >= declared.floor,
+            "{} ({}) declares floor={} but the evaluator performed only {observations} \
+             observations; the producer floor is enforced by execution, never re-declared here",
+            declared.id,
+            declared.name,
+            declared.floor
+        );
+        assert!(
+            builder.positive_observations >= 1,
+            "{} must perform at least one positive observation",
+            declared.id
+        );
+        assert!(
+            builder.negative_observations >= 1,
+            "{} must perform at least one one-variable planted-negative observation",
+            declared.id
+        );
+
+        cases.push(CaseRecord {
+            id: declared.id.clone(),
+            name: declared.name.clone(),
+            floor: declared.floor,
+            positive_observations: builder.positive_observations,
+            negative_observations: builder.negative_observations,
+            record: builder.record,
+        });
+    }
+
+    JoinReceipt {
+        joined_entrypoint: JOINED_PUBLIC_ENTRYPOINT.to_owned(),
+        producer_a_revision: manifest.a.producer_revision.clone(),
+        producer_a_tree: manifest.a.producer_tree.clone(),
+        producer_a_entrypoint: manifest.a.entrypoint.clone(),
+        producer_b_revision: manifest.b.producer_revision.clone(),
+        producer_b_tree: manifest.b.producer_tree.clone(),
+        producer_b_entrypoint: manifest.b.entrypoint.clone(),
+        a_digest: render_digest(&manifest.a_digest),
+        b_digest: render_digest(&manifest.b_digest),
+        endpoint_identity: format!("a={:?} b={:?}", wire.a_endpoint_key, wire.b_endpoint_key),
+        canonical_targets: (
+            wire.normalize(&wire.a_target),
+            wire.normalize(&wire.b_target),
+        ),
+        fixture_identity: format!(
+            "loopback-tcp authority={} routes=/mcp-a,/mcp-b requests={}",
+            wire.fixture_authority,
+            wire.method_count.values().sum::<usize>()
+        ),
+        discovery_frames: (
+            wire.normalize(&wire.a_discovery),
+            wire.normalize(&wire.b_discovery),
+        ),
+        no_downgrade_matrix: matrix.iter().map(|row| row.render.clone()).collect(),
+        cases,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-case predicates — A group (executor: request, response, stream)
+// ---------------------------------------------------------------------------
+
+fn case_post_route(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [
+        ("mcp-a-probe", &wire.a_probe),
+        ("mcp-a-call", &wire.a_call),
+        ("mcp-b-probe", &wire.b_probe),
+        ("mcp-b-ping", &wire.b_ping),
+    ] {
+        builder.positive(label, request.request_line());
+    }
+    assert!(
+        wire.a_call
+            .request_line()
+            .starts_with("POST /mcp-a HTTP/1.1")
+    );
+    assert!(
+        wire.b_ping
+            .request_line()
+            .starts_with("POST /mcp-b HTTP/1.1")
+    );
+
+    // One variable: the configured target is emptied; nothing else changes.
+    let refusal = ModernHttpRequest::new(
+        "",
+        wire.a_call.body.clone(),
+        "2026-07-28",
+        "tools/call",
+        Some("http_03_join_tool".to_owned()),
+    )
+    .expect_err("an empty target must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative("target=\"\"", &format!("{refusal:?}"));
+}
+
+fn case_request_content_type(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
+        let observed = request
+            .header("Content-Type")
+            .expect("every modern JSON-RPC POST carries a content type");
+        assert_eq!(observed, MODERN_MCP_CONTENT_TYPE);
+        assert_eq!(observed, "application/json");
+        builder.positive(label, &observed);
+        assert!(
+            request.header("Content-Encoding").is_none(),
+            "an uncoded request body must not advertise a content coding"
+        );
+        builder.positive(&format!("{label}-request-content-encoding"), "<absent>");
+    }
+
+    // One variable: the response media type gains a non-UTF-8 charset.
+    let refusal = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "application/json; charset=us-ascii".to_owned(),
+        )],
+    )
+    .expect_err("only an optional charset=utf-8 parameter is admitted");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::UnsupportedSuccessContentType
+    ));
+    builder.negative("charset=us-ascii", &format!("{refusal:?}"));
+}
+
+fn case_request_accept(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
+        let observed = request
+            .header("Accept")
+            .expect("every modern POST advertises both response media types");
+        assert_eq!(observed, MODERN_MCP_ACCEPT);
+        assert_eq!(observed, "application/json, text/event-stream");
+        builder.positive(label, &observed);
+    }
+
+    // One variable: a weakened media range. The shipped builder exposes no
+    // input that can produce one, so the negative is proven both at the public
+    // builder and on the captured wire.
+    let built = ModernHttpRequest::new(
+        wire.b_target.as_str(),
+        b"{}".to_vec(),
+        "2026-07-28",
+        "ping",
+        None,
+    )
+    .expect("a canonical modern POST builds")
+    .headers()
+    .into_iter()
+    .find(|(field, _)| field == "Accept")
+    .map(|(_, value)| value)
+    .expect("the builder always emits Accept");
+    assert_eq!(built, MODERN_MCP_ACCEPT);
+    for weakened in ["*/*", "application/json, text/event-stream;q=0", "q=0"] {
+        assert!(
+            !wire.a_call.head.contains(weakened) && !wire.b_ping.head.contains(weakened),
+            "a weakened accept range {weakened:?} must never reach the wire"
+        );
+    }
+    builder.negative(
+        "accept-weakening-input",
+        &format!("builder Accept stays {built}"),
+    );
+}
+
+fn case_request_accept_encoding(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [("mcp-a-call", &wire.a_call), ("mcp-b-ping", &wire.b_ping)] {
+        let observed = request
+            .header("Accept-Encoding")
+            .expect("every modern POST requests the canonical identity coding");
+        assert_eq!(observed, MODERN_MCP_ACCEPT_ENCODING);
+        assert_eq!(observed, "identity");
+        builder.positive(label, &observed);
+    }
+
+    // One variable: a compressed coding offered on the request.
+    let built = ModernHttpRequest::new(
+        wire.b_target.as_str(),
+        b"{}".to_vec(),
+        "2026-07-28",
+        "ping",
+        None,
+    )
+    .expect("a canonical modern POST builds")
+    .headers()
+    .into_iter()
+    .find(|(field, _)| field == "Accept-Encoding")
+    .map(|(_, value)| value)
+    .expect("the builder always emits Accept-Encoding");
+    assert_eq!(built, "identity");
+    assert!(
+        !wire.a_call.head.contains("gzip") && !wire.b_ping.head.contains("gzip"),
+        "a compressed coding must never be offered on a modern MCP POST"
+    );
+    builder.negative(
+        "accept-encoding-gzip-input",
+        &format!("builder Accept-Encoding stays {built}"),
+    );
+}
+
+fn case_protocol_version_header(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request) in [
+        ("mcp-a-probe", &wire.a_probe),
+        ("mcp-a-call", &wire.a_call),
+        ("mcp-b-ping", &wire.b_ping),
+    ] {
+        let observed = request
+            .header("MCP-Protocol-Version")
+            .expect("every JSON-RPC request carries the negotiated version");
+        assert_eq!(observed, "2026-07-28");
+        builder.positive(label, &observed);
+    }
+
+    // One variable: the protocol version supplied to the public builder.
+    let refusal = ModernHttpRequest::new(wire.b_target.as_str(), b"{}".to_vec(), "", "ping", None)
+        .expect_err("an empty protocol version must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative("protocol_version=\"\"", &format!("{refusal:?}"));
+}
+
+fn case_method_mirror_header(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request, expected) in [
+        ("mcp-a-probe", &wire.a_probe, "server/discover"),
+        ("mcp-a-call", &wire.a_call, "tools/call"),
+        ("mcp-b-probe", &wire.b_probe, "server/discover"),
+        ("mcp-b-ping", &wire.b_ping, "ping"),
+    ] {
+        let observed = request
+            .header("Mcp-Method")
+            .expect("every JSON-RPC request mirrors its method");
+        assert_eq!(observed, expected);
+        assert_eq!(request.json_body()["method"], expected);
+        builder.positive(label, &observed);
+    }
+
+    // One variable: the mirrored method name.
+    let refusal = ModernHttpRequest::new(
+        wire.b_target.as_str(),
+        b"{}".to_vec(),
+        "2026-07-28",
+        "",
+        None,
+    )
+    .expect_err("an empty method must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative("method=\"\"", &format!("{refusal:?}"));
+}
+
+fn case_name_header(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let call_name = wire
+        .a_call
+        .header("Mcp-Name")
+        .expect("tools/call mirrors its tool name");
+    assert_eq!(call_name, "http_03_join_tool");
+    assert_eq!(
+        wire.a_call.json_body()["params"]["name"],
+        "http_03_join_tool"
+    );
+    builder.positive("mcp-a-call", &call_name);
+
+    // `ping` is not a name-bearing method, so the header must be absent.
+    assert!(wire.b_ping.header("Mcp-Name").is_none());
+    builder.positive("mcp-b-ping", "<absent>");
+
+    // One variable: the name-bearing parameter is removed from tools/call.
+    let refusal = ModernHttpRequest::new(
+        wire.a_target.as_str(),
+        br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{}}"#.to_vec(),
+        "2026-07-28",
+        "tools/call",
+        Some("name\r\nInjected: header".to_owned()),
+    )
+    .expect_err("a header-splitting name mirror must not build a modern POST");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::InvalidRequestMetadata
+    ));
+    builder.negative(
+        "name=\"name\\r\\nInjected: header\"",
+        &format!("{refusal:?}"),
+    );
+}
+
+fn case_body_stamping(builder: &mut CaseBuilder, wire: &WireObservations) {
+    for (label, request, method) in [
+        ("mcp-a-probe", &wire.a_probe, "server/discover"),
+        ("mcp-a-call", &wire.a_call, "tools/call"),
+        ("mcp-b-ping", &wire.b_ping, "ping"),
+    ] {
+        let body = request.json_body();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["method"], method);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+            "http-03-integration-client"
+        );
+        builder.positive(label, &body["method"].to_string());
+    }
+
+    // One variable: the POST becomes a reverse-response envelope rather than a
+    // client request. Request-only stamping must disappear with it, so a
+    // reverse response can never be mistaken for a stamped client request.
+    let reverse = ModernHttpRequest::for_jsonrpc_response(
+        wire.b_target.as_str(),
+        "2026-07-28",
+        br#"{"jsonrpc":"2.0","id":7,"result":{}}"#.to_vec(),
+    )
+    .expect("a reverse-response POST builds");
+    let reverse_headers = reverse.headers();
+    assert!(
+        reverse_headers
+            .iter()
+            .all(|(field, _)| field != "Mcp-Method"),
+        "a reverse-response POST must not mirror a client request method"
+    );
+    assert!(
+        reverse_headers.iter().all(|(field, _)| field != "Mcp-Name"),
+        "a reverse-response POST must not mirror a client request name"
+    );
+    builder.negative(
+        "envelope=jsonrpc-response",
+        "Mcp-Method and Mcp-Name absent",
+    );
+}
+
+fn case_json_lane(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let head = validate_response_head(
+        200,
+        &[
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Content-Encoding".to_owned(), "identity".to_owned()),
+        ],
+    )
+    .expect("an identity-coded JSON head selects the JSON lane");
+    assert_eq!(head.kind(), ModernHttpResponseKind::Json);
+    builder.positive("json-head-kind", &format!("{:?}", head.kind()));
+
+    // The live JSON lane is observed here only through the fixture's second
+    // `/mcp-b` exchange, whose head is never the planted variable. The planted
+    // terminal itself belongs to HTTP-03.11 alone.
+    assert!(
+        wire.b_lane_probe.request_line().starts_with("POST /mcp-b"),
+        "the JSON lane observation must come from the /mcp-b endpoint instance"
+    );
+    builder.positive("json-lane-route", wire.b_lane_probe.request_line());
+
+    let charset = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "APPLICATION/JSON; CHARSET=UTF-8".to_owned(),
+        )],
+    )
+    .expect("the JSON essence and charset parameter are case-insensitive");
+    assert_eq!(charset.kind(), ModernHttpResponseKind::Json);
+    builder.positive(
+        "json-head-case-insensitive",
+        &format!("{:?}", charset.kind()),
+    );
+
+    // One variable: the media type.
+    let refusal =
+        validate_response_head(200, &[("Content-Type".to_owned(), "text/html".to_owned())])
+            .expect_err("an unrelated media type must not select a body lane");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::UnsupportedSuccessContentType
+    ));
+    builder.negative("content-type=text/html", &format!("{refusal:?}"));
+}
+
+fn case_sse_lane(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let head = validate_response_head(
+        200,
+        &[(
+            "Content-Type".to_owned(),
+            "text/event-stream; charset=utf-8".to_owned(),
+        )],
+    )
+    .expect("a charset-utf-8 event stream selects the SSE lane");
+    assert_eq!(head.kind(), ModernHttpResponseKind::Sse);
+    builder.positive("sse-head-kind", &format!("{:?}", head.kind()));
+    builder.positive("mcp-a-progress-count", &wire.a_progress.len().to_string());
+
+    // One variable: the live response lane the caller asks the stream for.
+    assert!(
+        wire.b_lane_refusal.contains("ExpectedSseResponse"),
+        "a JSON response must refuse SSE conversion, observed {}",
+        wire.b_lane_refusal
+    );
+    builder.negative("json-response-as-sse", &wire.b_lane_refusal);
+}
+
+fn case_content_encoding(builder: &mut CaseBuilder, wire: &WireObservations, planted: bool) {
+    let accepted = validate_response_head(
+        200,
+        &[
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Content-Encoding".to_owned(), "IDENTITY".to_owned()),
+        ],
+    )
+    .expect("a case-insensitive singleton identity coding is admitted");
+    assert_eq!(accepted.kind(), ModernHttpResponseKind::Json);
+    builder.positive("singleton-identity-ci", &format!("{:?}", accepted.kind()));
+
+    // This is the one variable the planted-negative test changes: the live
+    // `/mcp-b` terminal response coding.
+    builder.positive("mcp-b-live-terminal", &wire.b_json_outcome);
+    if planted {
+        assert!(
+            wire.b_json_outcome.contains("UnsupportedContentEncoding"),
+            "the planted gzip coding must reach the typed refusal boundary, observed {}",
+            wire.b_json_outcome
+        );
+    } else {
+        assert!(
+            wire.b_json_outcome.starts_with("terminal=json"),
+            "the accepted identity coding must yield a JSON terminal, observed {}",
+            wire.b_json_outcome
+        );
+    }
+
+    // One variable: the response content coding.
+    let refusal = validate_response_head(
+        200,
+        &[
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Content-Encoding".to_owned(), "gzip".to_owned()),
+        ],
+    )
+    .expect_err("a compressed response coding must be refused before body decoding");
+    assert!(matches!(
+        refusal,
+        ModernHttpExecutorError::UnsupportedContentEncoding
+    ));
+    builder.negative("content-encoding=gzip", &format!("{refusal:?}"));
+}
+
+fn case_bounded_sse_parse(builder: &mut CaseBuilder, wire: &WireObservations) {
+    assert_eq!(wire.a_progress, vec!["1".to_owned(), "2".to_owned()]);
+    builder.positive("assembled-progress", &wire.a_progress.join(","));
+    builder.positive("assembled-terminal", &wire.a_terminal);
+
+    // One variable: the event ceiling supplied to the public parser bound.
+    assert!(
+        SseLimits::new(4_096, 65_536, 8).is_some(),
+        "the accepted bounds are constructible"
+    );
+    assert!(
+        SseLimits::new(4_096, 0, 8).is_none(),
+        "a zero event ceiling must fail closed at configuration time"
+    );
+    builder.negative("max_event_bytes=0", "SseLimits::new -> None");
+}
+
+fn case_terminal_and_close(builder: &mut CaseBuilder, wire: &WireObservations) {
+    builder.positive("terminal", &wire.a_terminal);
+    assert_eq!(wire.a_terminal, "terminal=tools_call");
+
+    // One variable: the read position moves past the terminal record.
+    assert_eq!(wire.a_post_terminal, "closed=end_of_stream");
+    builder.negative("read-past-terminal", &wire.a_post_terminal);
+}
+
+// ---------------------------------------------------------------------------
+// Per-case predicates — B group (isolation, auth, redirects, partitioning)
+// ---------------------------------------------------------------------------
+
+fn case_one_shot_probe(builder: &mut CaseBuilder, wire: &WireObservations) {
+    assert_eq!(
+        wire.method_count
+            .get("server/discover")
+            .copied()
+            .unwrap_or_default(),
+        2,
+        "exactly one discovery probe per endpoint instance, never a replay"
+    );
+    builder.positive("discover-probe-count", "2");
+    builder.positive(
+        "mcp-a-probe-body",
+        &wire.a_probe.json_body()["method"].to_string(),
+    );
+    builder.positive(
+        "mcp-b-probe-body",
+        &wire.b_probe.json_body()["method"].to_string(),
+    );
+    assert_eq!(wire.legacy_get_count, 0);
+    builder.positive("legacy-get-count", "0");
+
+    // One variable: a second probe on the same attempt.
+    let mut negotiation = integration_builder(&wire.a_target)
+        .http_negotiation()
+        .expect("the configured plan starts one classification attempt");
+    negotiation
+        .observe_modern_probe(HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::RecognizedModernJsonRpc,
+        })
+        .expect("the one permitted probe is admitted");
+    let refusal = negotiation
+        .observe_modern_probe(HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::RecognizedModernJsonRpc,
+        })
+        .expect_err("a probe replay must be refused");
+    assert!(matches!(
+        refusal,
+        ClientHttpNegotiationError::ModernProbeAlreadyDispatched
+    ));
+    builder.negative("second-probe-on-same-attempt", &format!("{refusal:?}"));
+}
+
+fn case_modern_era_selection(builder: &mut CaseBuilder, wire: &WireObservations) {
+    assert_eq!(wire.a_era, ProtocolEra::Modern2026);
+    assert_eq!(wire.b_era, ProtocolEra::Modern2026);
+    builder.positive("mcp-a-era", &format!("{:?}", wire.a_era));
+    builder.positive("mcp-b-era", &format!("{:?}", wire.b_era));
+
+    let mut negotiation = integration_builder(&wire.a_target)
+        .http_negotiation()
+        .expect("the configured plan starts one classification attempt");
+    let decision = negotiation
+        .observe_modern_probe(HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::RecognizedModernJsonRpc,
+        })
+        .expect("a recognized modern JSON-RPC probe selects modern");
+    assert_eq!(decision, ClientHttpNegotiationDecision::ModernSelected);
+    assert_eq!(
+        negotiation.state().selected_era(),
+        Some(ProtocolEra::Modern2026)
+    );
+    builder.positive("classifier-decision", &format!("{decision:?}"));
+
+    // One variable: the probe body class.
+    let mut planted = integration_builder(&wire.a_target)
+        .http_negotiation()
+        .expect("the configured plan starts one classification attempt");
+    let refusal = planted
+        .observe_modern_probe(HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::Unrecognized,
+        })
+        .expect_err("an unrecognized body must not select an era");
+    assert!(matches!(
+        refusal,
+        ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+            status: 200,
+            body: HttpProbeBody::Unrecognized,
+        }
+    ));
+    assert_eq!(planted.state().selected_era(), None);
+    assert!(!planted.state().legacy_sse_fallback_authorized());
+    builder.negative("probe-body=Unrecognized", &format!("{refusal:?}"));
+}
+
+fn case_discovery_frames(builder: &mut CaseBuilder, wire: &WireObservations) {
+    assert_eq!(wire.a_versions, vec!["2026-07-28".to_owned()]);
+    assert_eq!(wire.b_versions, vec!["2026-07-28".to_owned()]);
+    builder.positive("mcp-a-versions", &wire.a_versions.join(","));
+    builder.positive("mcp-b-versions", &wire.b_versions.join(","));
+    assert_ne!(
+        wire.a_discovery, wire.b_discovery,
+        "each endpoint instance retains its own discovery frame"
+    );
+    builder.positive("frames-distinct", "true");
+
+    // One variable: the probe body class becomes a transport failure.
+    let mut planted = integration_builder(&wire.a_target)
+        .http_negotiation()
+        .expect("the configured plan starts one classification attempt");
+    let refusal = planted
+        .observe_modern_probe(HttpModernProbe {
+            status: 200,
+            body: HttpProbeBody::TransportFailure,
+        })
+        .expect_err("a transport failure is never a downgrade signal");
+    assert!(matches!(
+        refusal,
+        ClientHttpNegotiationError::ModernProbeTransportFailure
+    ));
+    assert_eq!(planted.state().selected_era(), None);
+    builder.negative("probe-body=TransportFailure", &format!("{refusal:?}"));
+}
+
+fn case_bearer_bound_target(builder: &mut CaseBuilder) {
+    let resource = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+        .expect("the admitted protected target is canonical HTTPS");
+    let credential = BoundBearerCredential::bind(resource.clone(), BEARER_SECRET)
+        .expect("an HTTPS target binds the caller-acquired credential");
+    assert_eq!(credential.resource(), &resource);
+    builder.positive("bound-resource", resource.as_str());
+
+    let authorized = ModernHttpRequest::new(
+        resource.as_str(),
+        br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
+        "2026-07-28",
+        "ping",
+        None,
+    )
+    .expect("a canonical modern POST builds")
+    .with_authorization(&credential);
+    let header = authorized
+        .headers()
+        .into_iter()
+        .find(|(field, _)| field == "Authorization")
+        .map(|(_, value)| value)
+        .expect("the exact bound target carries the credential");
+    assert_eq!(header, format!("Bearer {BEARER_SECRET}"));
+    builder.positive("authorization-attached", "Bearer <redacted>");
+
+    // One variable: the bound resource scheme.
+    let cleartext = CanonicalHttpUrl::parse("http://mcp.example.test/mcp")
+        .expect("the cleartext variant parses");
+    let refusal = BoundBearerCredential::bind(cleartext, BEARER_SECRET)
+        .expect_err("a cleartext resource must not bind a bearer credential");
+    assert_eq!(refusal, BearerBindingError::CleartextResource);
+    builder.negative("scheme=http", &format!("{refusal:?}"));
+}
+
+fn case_bearer_not_forwarded(builder: &mut CaseBuilder) {
+    let resource = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+        .expect("the admitted protected target is canonical HTTPS");
+    let credential = BoundBearerCredential::bind(resource.clone(), BEARER_SECRET)
+        .expect("an HTTPS target binds the caller-acquired credential");
+    let bound = ModernHttpRequest::new(
+        resource.as_str(),
+        b"{}".to_vec(),
+        "2026-07-28",
+        "ping",
+        None,
+    )
+    .expect("a canonical modern POST builds")
+    .with_authorization(&credential);
+    assert!(
+        bound
+            .headers()
+            .iter()
+            .any(|(field, _)| field == "Authorization")
+    );
+    builder.positive("exact-target", "Authorization present");
+
+    // One variable: the request target, against the same credential.
+    for other in [
+        "https://mcp.example.test/mcp-b",
+        "https://other.example.test/mcp",
+    ] {
+        let elsewhere = ModernHttpRequest::new(other, b"{}".to_vec(), "2026-07-28", "ping", None)
+            .expect("a canonical modern POST builds")
+            .with_authorization(&credential);
+        assert!(
+            elsewhere
+                .headers()
+                .iter()
+                .all(|(field, _)| field != "Authorization"),
+            "a bearer credential must never follow a changed canonical target"
+        );
+        builder.negative(&format!("target={other}"), "Authorization absent");
+    }
+}
+
+fn case_bearer_never_cleartext(builder: &mut CaseBuilder) {
+    let secure = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+        .expect("the admitted protected target is canonical HTTPS");
+    assert!(BoundBearerCredential::bind(secure, BEARER_SECRET).is_ok());
+    builder.positive("https-target", "bound");
+
+    // One variable: the same local server addressed over cleartext.
+    for cleartext in [
+        "http://127.0.0.1:8443/mcp",
+        "http://[::1]:8443/mcp",
+        "http://localhost:8443/mcp",
+    ] {
+        let resource = CanonicalHttpUrl::parse(cleartext).expect("the cleartext variant parses");
+        let refusal = BoundBearerCredential::bind(resource, BEARER_SECRET)
+            .expect_err("a loopback cleartext resource must not bind a bearer credential");
+        assert_eq!(refusal, BearerBindingError::CleartextResource);
+        builder.negative(cleartext, &format!("{refusal:?}"));
+    }
+}
+
+fn case_bearer_token_bytes(builder: &mut CaseBuilder) {
+    let resource = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+        .expect("the admitted protected target is canonical HTTPS");
+    assert!(BoundBearerCredential::bind(resource.clone(), BEARER_SECRET).is_ok());
+    builder.positive("token-bytes", "admitted");
+
+    // One variable: the token bytes.
+    let empty = BoundBearerCredential::bind(resource.clone(), "")
+        .expect_err("an empty token must not bind");
+    assert_eq!(empty, BearerBindingError::EmptyToken);
+    builder.negative("token=\"\"", &format!("{empty:?}"));
+
+    let injected = BoundBearerCredential::bind(resource, "secret\r\nInjected: header")
+        .expect_err("a header-splitting token must not bind");
+    assert_eq!(injected, BearerBindingError::InvalidTokenBytes);
+    builder.negative(
+        "token=\"secret\\r\\nInjected: header\"",
+        &format!("{injected:?}"),
+    );
+}
+
+fn case_credential_redaction(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let resource = CanonicalHttpUrl::parse("https://mcp.example.test/mcp")
+        .expect("the admitted protected target is canonical HTTPS");
+    let credential = BoundBearerCredential::bind(resource.clone(), BEARER_SECRET)
+        .expect("an HTTPS target binds the caller-acquired credential");
+    let credential_debug = format!("{credential:?}");
+    assert!(!credential_debug.contains(BEARER_SECRET));
+    builder.positive("credential-debug", &credential_debug);
+
+    let request_debug = format!(
+        "{:?}",
+        ModernHttpRequest::new(
+            resource.as_str(),
+            b"{}".to_vec(),
+            "2026-07-28",
+            "ping",
+            None
+        )
+        .expect("a canonical modern POST builds")
+        .with_authorization(&credential)
+    );
+    assert!(request_debug.contains("<redacted>"));
+    assert!(!request_debug.contains(BEARER_SECRET));
+    builder.positive("request-debug", &request_debug);
+
+    // One variable: search the same secret across every captured wire head and
+    // body of the unauthenticated fixture exchanges.
+    for (label, request) in [
+        ("mcp-a-probe", &wire.a_probe),
+        ("mcp-a-call", &wire.a_call),
+        ("mcp-b-probe", &wire.b_probe),
+        ("mcp-b-ping", &wire.b_ping),
+        ("mcp-b-lane", &wire.b_lane_probe),
+    ] {
+        assert!(!request.head.contains(BEARER_SECRET));
+        assert!(!String::from_utf8_lossy(&request.body).contains(BEARER_SECRET));
+        assert!(request.header("Authorization").is_none());
+        builder.negative(&format!("{label}-secret-search"), "absent");
+    }
+}
+
+fn case_redirects_rejected(builder: &mut CaseBuilder) {
+    let accepted = validate_response_head(
+        200,
+        &[("Content-Type".to_owned(), "application/json".to_owned())],
+    )
+    .expect("a 200 JSON head is admitted");
+    assert_eq!(accepted.kind(), ModernHttpResponseKind::Json);
+    builder.positive("status=200", &format!("{:?}", accepted.kind()));
+
+    // One variable: the response status.
+    for status in [301_u16, 302, 303, 307, 308] {
+        let refusal = validate_response_head(
+            status,
+            &[
+                (
+                    "Location".to_owned(),
+                    "https://redirect.example.test/mcp".to_owned(),
+                ),
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+            ],
+        )
+        .expect_err("every 3xx must be refused without a replay");
+        assert!(matches!(
+            refusal,
+            ModernHttpExecutorError::Redirect { status: observed } if observed == status
+        ));
+        builder.negative(&format!("status={status}"), &format!("{refusal:?}"));
+    }
+}
+
+fn case_endpoint_instance_partition(builder: &mut CaseBuilder, wire: &WireObservations) {
+    // Determinism: identical configured inputs reproduce the same identity.
+    let repeat_a = canonical_plan(
+        &wire.a_target,
+        ProtocolPolicy::ModernOnly,
+        "security-partition-http-03-integration",
+    );
+    let repeat_key = repeat_a
+        .http_endpoints()
+        .expect("the plan retains its endpoint bundle")
+        .key();
+    assert_eq!(repeat_key, wire.a_endpoint_key);
+    builder.positive("mcp-a-identity-deterministic", "true");
+    builder.positive("mcp-a-target", &wire.normalize(&wire.a_target));
+    builder.positive("mcp-b-target", &wire.normalize(&wire.b_target));
+
+    // One variable: the configured path on the same origin.
+    assert_ne!(
+        wire.a_endpoint_key, wire.b_endpoint_key,
+        "same-origin /mcp-a and /mcp-b are distinct endpoint instances"
+    );
+    builder.negative("path=/mcp-b", "endpoint identity differs");
+}
+
+fn case_security_partition(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let baseline = canonical_plan(
+        &wire.a_target,
+        ProtocolPolicy::ModernOnly,
+        "security-partition-http-03-integration",
+    );
+    let baseline_key = baseline
+        .http_endpoints()
+        .expect("the plan retains its endpoint bundle")
+        .key();
+    assert_eq!(baseline_key, wire.a_endpoint_key);
+    builder.positive("baseline-identity", "matches the live connection");
+
+    // One variable: the security partition.
+    let repartitioned = canonical_plan(
+        &wire.a_target,
+        ProtocolPolicy::ModernOnly,
+        "security-partition-http-03-integration-other",
+    );
+    let repartitioned_key = repartitioned
+        .http_endpoints()
+        .expect("the plan retains its endpoint bundle")
+        .key();
+    assert_ne!(
+        repartitioned_key, baseline_key,
+        "a changed security partition must not share a cache entry"
+    );
+    builder.negative("security_partition=<other>", "endpoint identity differs");
+}
+
+fn case_configuration_generation(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let modern_target =
+        CanonicalHttpUrl::parse(&wire.a_target).expect("the fixture target is canonical");
+    let baseline = ClientProtocolPlan::http(
+        ProtocolPolicy::ModernOnly,
+        Some(modern_target.clone()),
+        None,
+        None,
+        "credential-partition-http-03-integration".to_owned(),
+        "security-partition-http-03-integration".to_owned(),
+        "native-h1-http-03-integration".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("the baseline plan is accepted")
+    .http_endpoints()
+    .expect("the plan retains its endpoint bundle")
+    .key();
+    assert_eq!(baseline, wire.a_endpoint_key);
+    builder.positive("configuration_generation=1", "matches the live connection");
+
+    // One variable: the configuration generation.
+    let regenerated = ClientProtocolPlan::http(
+        ProtocolPolicy::ModernOnly,
+        Some(modern_target),
+        None,
+        None,
+        "credential-partition-http-03-integration".to_owned(),
+        "security-partition-http-03-integration".to_owned(),
+        "native-h1-http-03-integration".to_owned(),
+        1,
+        2,
+        0,
+    )
+    .expect("the regenerated plan is accepted")
+    .http_endpoints()
+    .expect("the plan retains its endpoint bundle")
+    .key();
+    assert_ne!(
+        regenerated, baseline,
+        "a changed configuration generation must not share a cache entry"
+    );
+    builder.negative("configuration_generation=2", "endpoint identity differs");
+}
+
+/// One cell of the 3x3 no-downgrade observation matrix.
+#[derive(Debug, Clone)]
+struct MatrixCell {
+    render: String,
+}
+
+/// Builds the 3x3 ineligible-status by body-class matrix. No cell may select
+/// an era, authorize a legacy fallback, or mutate retained state.
+fn no_downgrade_matrix() -> Vec<MatrixCell> {
+    let mut cells = Vec::with_capacity(9);
+    for status in [401_u16, 429, 500] {
+        for body in [
+            HttpProbeBody::Empty,
+            HttpProbeBody::Unrecognized,
+            HttpProbeBody::TransportFailure,
+        ] {
+            let plan = classification_plan(ProtocolPolicy::Auto);
+            let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&plan)
+                .expect("the configured Auto plan starts one classification attempt");
+            let before = negotiation.state();
+            assert!(!before.probe_dispatched());
+            let refusal = negotiation
+                .observe_modern_probe(HttpModernProbe { status, body })
+                .expect_err("an ineligible observation must never authorize a downgrade");
+            let after = negotiation.state();
+            assert_eq!(after.selected_era(), None);
+            assert!(!after.legacy_sse_fallback_authorized());
+            cells.push(MatrixCell {
+                render: format!("{status}/{body:?} -> {refusal:?}"),
+            });
+        }
+    }
+    assert_eq!(cells.len(), 9);
+    cells
+}
+
+fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
+    for cell in matrix {
+        builder.positive("no-downgrade", &cell.render);
+    }
+
+    // One variable: the policy, against the single eligible observation. Both
+    // plans carry the identical endpoint set, so policy is the only difference.
+    let plan = classification_plan(ProtocolPolicy::Auto);
+    let mut eligible = ClientHttpNegotiation::from_protocol_plan(&plan)
+        .expect("the configured Auto plan starts one classification attempt");
+    let decision = eligible
+        .observe_modern_probe(HttpModernProbe {
+            status: 404,
+            body: HttpProbeBody::Unrecognized,
+        })
+        .expect("Auto admits the isolated-first-probe fallback authorization");
+    assert_eq!(
+        decision,
+        ClientHttpNegotiationDecision::LegacySseFallbackAuthorized
+    );
+    assert_eq!(
+        eligible.state().selected_era(),
+        None,
+        "authorizing an observation is never an era selection"
+    );
+    builder.positive("policy=Auto,404/Unrecognized", &format!("{decision:?}"));
+
+    let modern_only = classification_plan(ProtocolPolicy::ModernOnly);
+    let mut planted = ClientHttpNegotiation::from_protocol_plan(&modern_only)
+        .expect("the configured ModernOnly plan starts one classification attempt");
+    let before = planted.state();
+    let refusal = planted
+        .observe_modern_probe(HttpModernProbe {
+            status: 404,
+            body: HttpProbeBody::Unrecognized,
+        })
+        .expect_err("ModernOnly must refuse the same observation");
+    assert!(matches!(
+        refusal,
+        ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+            status: 404,
+            body: HttpProbeBody::Unrecognized,
+        }
+    ));
+    let after = planted.state();
+    assert_eq!(after.selected_era(), before.selected_era());
+    assert_eq!(
+        after.legacy_sse_fallback_authorized(),
+        before.legacy_sse_fallback_authorized()
+    );
+    builder.negative("policy=ModernOnly", &format!("{refusal:?}"));
+}
+
+// ---------------------------------------------------------------------------
+// Frozen acceptance IDs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_03_i_positive() {
+    let receipt = evaluate_join(false);
+
+    // Manifest half: the join consumed both producer inputs and their digests.
+    assert_eq!(receipt.cases.len(), LAST_CASE_ORDINAL);
+    assert_eq!(receipt.a_digest.len(), 64);
+    assert_eq!(receipt.b_digest.len(), 64);
+    assert_ne!(receipt.a_digest, receipt.b_digest);
+    assert!(!receipt.producer_a_revision.is_empty());
+    assert!(!receipt.producer_a_tree.is_empty());
+    assert!(!receipt.producer_b_revision.is_empty());
+    assert!(!receipt.producer_b_tree.is_empty());
+    assert!(receipt.producer_a_entrypoint.starts_with("fastmcp"));
+    assert!(receipt.producer_b_entrypoint.starts_with("fastmcp"));
+    assert_eq!(receipt.joined_entrypoint, JOINED_PUBLIC_ENTRYPOINT);
+
+    // Execution half: the declared ordered floors were met by real work.
+    assert!(
+        receipt.total_positive() >= MINIMUM_POSITIVE_CASES,
+        "the integrated evaluator executed {} positive observations, below the floor of {}",
+        receipt.total_positive(),
+        MINIMUM_POSITIVE_CASES
+    );
+    assert!(
+        receipt.total_negative() >= MINIMUM_NEGATIVE_CASES,
+        "the integrated evaluator executed {} planted-negative observations, below the floor of {}",
+        receipt.total_negative(),
+        MINIMUM_NEGATIVE_CASES
+    );
+
+    // Recorded observation fields required of the join.
+    assert_eq!(receipt.no_downgrade_matrix.len(), 9);
+    assert!(receipt.canonical_targets.0.ends_with("/mcp-a"));
+    assert!(receipt.canonical_targets.1.ends_with("/mcp-b"));
+    assert_ne!(receipt.discovery_frames.0, receipt.discovery_frames.1);
+    assert!(
+        receipt
+            .fixture_identity
+            .starts_with("loopback-tcp authority=")
+    );
+    assert!(receipt.endpoint_identity.contains("a=") && receipt.endpoint_identity.contains("b="));
+
+    // The live terminal outcomes on both lanes.
+    assert!(
+        receipt.case("HTTP-03.11").record.contains("terminal=json"),
+        "the JSON lane must reach its terminal under the accepted identity coding"
+    );
+    assert!(
+        receipt
+            .case("HTTP-03.13")
+            .record
+            .contains("terminal=tools_call"),
+        "the SSE lane must reach its correlated terminal"
+    );
+    assert!(
+        receipt
+            .case("HTTP-03.13")
+            .record
+            .contains("closed=end_of_stream"),
+        "the owning stream must close exactly once after its terminal"
+    );
+}
+
+#[test]
+fn http_03_i_planted_negative() {
+    let accepted = evaluate_join(false);
+    let planted = evaluate_join(true);
+
+    // The one changed variable is the `/mcp-b` terminal response coding, which
+    // lives in exactly one manifest case.
+    let planted_case = planted.case(PLANTED_CASE_ID);
+    let accepted_case = accepted.case(PLANTED_CASE_ID);
+    assert_ne!(
+        planted_case.record, accepted_case.record,
+        "the planted variable must change the case it was planted in"
+    );
+    assert!(
+        planted_case.record.contains("UnsupportedContentEncoding"),
+        "the planted coding must reach the registered typed refusal, observed: {}",
+        planted_case.record
+    );
+    assert!(
+        !planted_case.record.contains("terminal=json"),
+        "a refused response coding must not also yield a decoded JSON terminal"
+    );
+
+    // Every other manifest case is byte-for-byte unchanged.
+    assert_eq!(accepted.cases.len(), planted.cases.len());
+    for (accepted_case, planted_case) in accepted.cases.iter().zip(planted.cases.iter()) {
+        assert_eq!(accepted_case.id, planted_case.id);
+        assert_eq!(accepted_case.name, planted_case.name);
+        assert_eq!(accepted_case.floor, planted_case.floor);
+        if accepted_case.id == PLANTED_CASE_ID {
+            continue;
+        }
+        assert_eq!(
+            accepted_case, planted_case,
+            "{} must be unchanged by a plant in {PLANTED_CASE_ID}",
+            accepted_case.id
+        );
+    }
+
+    // The unrelated sibling stream and its waiter completed normally while the
+    // planted POST was refused on the other endpoint instance.
+    assert_eq!(
+        planted.case("HTTP-03.12").record,
+        accepted.case("HTTP-03.12").record
+    );
+    assert!(
+        planted
+            .case("HTTP-03.13")
+            .record
+            .contains("terminal=tools_call"),
+        "the sibling SSE stream must still reach its terminal"
+    );
+    assert!(
+        planted
+            .case("HTTP-03.13")
+            .record
+            .contains("closed=end_of_stream"),
+        "the sibling stream must close exactly once, unaffected by the plant"
+    );
+
+    // Credential, cache, endpoint-selection, and era state are unchanged.
+    assert_eq!(
+        planted.case("HTTP-03.21").record,
+        accepted.case("HTTP-03.21").record,
+        "no credential state may change on a refused response"
+    );
+    assert_eq!(
+        planted.case("HTTP-03.15").record,
+        accepted.case("HTTP-03.15").record,
+        "era selection must be unchanged"
+    );
+    assert_eq!(
+        planted.case("HTTP-03.23").record,
+        accepted.case("HTTP-03.23").record,
+        "endpoint selection must be unchanged"
+    );
+    assert_eq!(
+        planted.no_downgrade_matrix, accepted.no_downgrade_matrix,
+        "the 3x3 no-downgrade observation state must be unchanged"
+    );
+    assert_eq!(planted.discovery_frames, accepted.discovery_frames);
+
+    // An ineligible observation performs zero legacy GET and zero era mutation.
+    assert!(
+        planted
+            .case("HTTP-03.14")
+            .record
+            .contains("legacy-get-count = 0"),
+        "the planted run must issue no legacy GET"
+    );
+    assert_eq!(
+        planted.case("HTTP-03.14").record,
+        accepted.case("HTTP-03.14").record
+    );
+
+    // Producer identity is bound to both runs.
+    assert_eq!(planted.a_digest, accepted.a_digest);
+    assert_eq!(planted.b_digest, accepted.b_digest);
+    assert_eq!(planted.producer_a_revision, accepted.producer_a_revision);
+    assert_eq!(planted.producer_b_revision, accepted.producer_b_revision);
+}
