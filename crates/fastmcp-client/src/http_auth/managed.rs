@@ -438,7 +438,10 @@ impl ManagedOAuthResponse {
     pub async fn read_to_end(self, cx: &Cx, maximum_bytes: usize) -> Result<Vec<u8>, OAuthSessionError> {
         let Self { response, session, cancellation, expires_at, .. } = self;
         session.check(cx, &cancellation)?;
-        let deadline = credential_deadline(cx, expires_at)?;
+        // await_active alone translates token expiry to runtime time. Sampling
+        // it twice could misclassify nanosecond clock skew as a caller timeout.
+        // The native body still owns its idle/absolute response deadlines.
+        let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
         session.await_active(cx, &cancellation, deadline, Some(expires_at), async {
             response.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes)
                 .await.map_err(OAuthSessionError::Http)
@@ -495,7 +498,7 @@ impl ManagedOAuthSseStream {
             ModernHttpExecutorError::SseStreamClosed,
         ))?;
         self.session.check(cx, &self.cancellation)?;
-        let deadline = credential_deadline(cx, self.expires_at)?;
+        let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
         let result = self.session.await_active(
             cx, &self.cancellation, deadline, Some(self.expires_at), async {
                 stream.next_event(cx).await.map_err(OAuthSessionError::Http)
