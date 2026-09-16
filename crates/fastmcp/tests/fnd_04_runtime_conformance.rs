@@ -50,6 +50,7 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 use asupersync::types::CancelReason;
 use asupersync::{Cx, RegionId};
 
+use fastmcp_core::SECURITY_IDENTIFIER_BYTES;
 use fastmcp_core::runtime::{
     ExternalEpoch, ProcessGeneration, ProcessGenerationError, ProcessGenerationGuard,
     SNAPSHOT_CLONE_IS_DETECTABLE, SnapshotCloneStance,
