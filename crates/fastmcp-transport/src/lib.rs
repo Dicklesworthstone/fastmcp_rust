@@ -45,6 +45,8 @@ mod async_io;
 mod codec;
 pub mod event_store;
 pub mod http;
+/// AUTH-00 A lower ingress-authentication seam.
+pub mod ingress;
 pub mod memory;
 pub mod sse;
 mod stdio;
