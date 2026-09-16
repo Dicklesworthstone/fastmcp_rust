@@ -30,7 +30,11 @@ fn isolated_subscription(name: &str, case: SubscriptionCase) {
             let _ = self.0.wait();
         }
     }
-    let roots = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/oauth-core-ca.pem");
+    // Materialized from the parent target's inlined TEST ONLY root: the remote
+    // build worker never receives `*.pem`, so reading it from `tests/fixtures/`
+    // failed every case here with "public subscription case failed".
+    let roots = std::env::temp_dir().join(format!("fastmcp-oauth-core-ca-{}.pem", name.replace("::", "_")));
+    std::fs::write(&roots, ROOT).expect("materialize the TEST ONLY root for the child trust store");
     let mut child = Child(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD_CASE, name).env("SSL_CERT_FILE", roots).env_remove("SSL_CERT_DIR")
@@ -131,7 +135,10 @@ fn run_subscription(case: SubscriptionCase) {
             let policy = OAuthSessionPolicy::new(Duration::ZERO, Duration::from_secs(30), Duration::from_secs(20), 64).unwrap();
             let ((), session) = pair(login, ManagedOAuthSession::authorize(&cx, peer.client(), policy, browser)).await;
             let session = session.unwrap();
-            match case {
+            // Boxed so the twelve cases' locals live on the heap. Inlined, this
+            // match makes one state machine large enough to abort the child with
+            // `fatal runtime error: stack overflow` before any assertion runs.
+            Box::pin(async { match case {
                 SubscriptionCase::Live => {
                     let (release_tx, mut release_rx) = oneshot::channel::<()>();
                     let server = async {
@@ -145,7 +152,7 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(listener.accepted_filter().is_none());
                         assert!(listener.request_id().correlates_with(&RequestId::Number(41)));
                         consume_ack(&mut listener, &cx).await;
-                        release_tx.send(()).unwrap();
+                        release_tx.send(&cx, ()).unwrap();
                         let Some(ManagedSubscriptionEvent::Notification(notification)) = listener.next_event(&cx).await.unwrap() else { panic!("catalog change expected") };
                         assert!(matches!(*notification, ServerNotification::ToolsListChanged(_)));
                         let Some(ManagedSubscriptionEvent::Notification(notification)) = listener.next_event(&cx).await.unwrap() else { panic!("resource change expected") };
@@ -325,7 +332,7 @@ fn run_subscription(case: SubscriptionCase) {
                     pair(server, application).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 6);
                 }
-            }
+            } }).await;
             assert_eq!(peer.token_posts.load(Ordering::SeqCst), 1, "stream failures must not renew or replay a grant");
             peer.no_extra_connections();
             session.close();
