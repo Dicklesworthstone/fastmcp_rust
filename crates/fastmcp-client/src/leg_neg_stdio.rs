@@ -64,24 +64,33 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// that must appear in that line; the surrounding envelope carries a request id
 /// and client version that are not frozen, so the marker rather than the whole
 /// line is what the contract pins.
+/// The eligible and ineligible members of the frozen pair differ in exactly one
+/// field: the JSON-RPC `id` of the discovery refusal. A correlated `-32601`
+/// authorizes the fallback; the byte-identical refusal carrying a different id
+/// does not. That is the one-variable pairing the acceptance criteria require,
+/// and it is the shipped rule rather than a restatement — see
+/// `ClientBuilder::try_connect_auto`, "Only a correlated JSON-RPC discovery
+/// refusal or Unix-observable clean first-probe timeout authorizes a second
+/// spawn."
 pub const LEG_NEG_01_A_EVALUATOR_MANIFEST_V1: &str = concat!(
     "LEG-NEG-01-A evaluator manifest v1\n",
     "entrypoint fastmcp_client::Client::stdio_with_protocol_plan_with_cx\n",
     "transport stdio\n",
     "supported-eras 2026-07-28,2024-11-05\n",
-    "policy-case auto-modern-selected policy=Auto eligible=false paired=auto-eligible-unrecognized-modern\n",
-    "policy-case auto-eligible-unrecognized-modern policy=Auto eligible=true paired=auto-ineligible-recognized-modern-error\n",
-    "policy-case auto-ineligible-recognized-modern-error policy=Auto eligible=false paired=auto-eligible-unrecognized-modern\n",
-    "policy-case auto-ineligible-malformed-modern policy=Auto eligible=false paired=auto-eligible-unrecognized-modern\n",
-    "policy-case modern-only-never-falls-back policy=ModernOnly eligible=false paired=auto-eligible-unrecognized-modern\n",
-    "policy-case legacy-only-never-probes policy=LegacyOnly eligible=false paired=auto-eligible-unrecognized-modern\n",
+    "policy-case auto-modern-selected policy=Auto signal=modern-discovery-result eligible=false paired=auto-eligible-correlated-refusal\n",
+    "policy-case auto-eligible-correlated-refusal policy=Auto signal=correlated-discovery-refusal eligible=true paired=auto-ineligible-uncorrelated-refusal\n",
+    "policy-case auto-ineligible-uncorrelated-refusal policy=Auto signal=uncorrelated-discovery-refusal eligible=false paired=auto-eligible-correlated-refusal\n",
+    "policy-case auto-ineligible-recognized-modern-error policy=Auto signal=recognized-modern-error eligible=false paired=auto-eligible-correlated-refusal\n",
+    "policy-case modern-only-never-falls-back policy=ModernOnly signal=correlated-discovery-refusal eligible=false paired=auto-eligible-correlated-refusal\n",
+    "policy-case legacy-only-never-probes policy=LegacyOnly signal=no-modern-probe eligible=false paired=auto-eligible-correlated-refusal\n",
     "first-wire auto-modern-selected \"method\":\"server/discover\"\n",
-    "first-wire auto-eligible-unrecognized-modern \"method\":\"server/discover\"\n",
+    "first-wire auto-eligible-correlated-refusal \"method\":\"server/discover\"\n",
+    "first-wire auto-ineligible-uncorrelated-refusal \"method\":\"server/discover\"\n",
     "first-wire auto-ineligible-recognized-modern-error \"method\":\"server/discover\"\n",
-    "first-wire auto-ineligible-malformed-modern \"method\":\"server/discover\"\n",
     "first-wire modern-only-never-falls-back \"method\":\"server/discover\"\n",
     "first-wire legacy-only-never-probes \"method\":\"initialize\"\n",
-    "fallback-first-wire auto-eligible-unrecognized-modern \"protocolVersion\":\"2024-11-05\"\n",
+    "fallback-first-wire auto-eligible-correlated-refusal \"protocolVersion\":\"2024-11-05\"\n",
+    "pair auto-eligible-correlated-refusal auto-ineligible-uncorrelated-refusal variable=discovery-refusal-response-id\n",
 );
 
 /// Returns the canonical LEG-NEG-01 A evaluator manifest digest.
@@ -133,21 +142,29 @@ pub const fn policy_token(policy: ProtocolPolicy) -> &'static str {
 
 /// The closed set of first-wire signals a disposable probe child may emit.
 ///
-/// Exactly one member — [`Self::EligibleUnrecognizedModern`] — may terminate the
+/// Exactly one member — [`Self::CorrelatedDiscoveryRefusal`] — may terminate the
 /// probe and authorize a fresh exact-2024 child. Every other member forbids
 /// fallback.
+///
+/// [`Self::UncorrelatedDiscoveryRefusal`] is byte-identical to the eligible
+/// signal except for the JSON-RPC response `id`, which is what makes the two a
+/// one-variable pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdioFirstWireSignal {
     /// A valid modern discovery result. Selects `2026-07-28`.
     ModernDiscoveryResult,
-    /// The frozen eligible signal: an unrecognized modern method. This is the
-    /// only signal that may reap the probe and start a fresh legacy child.
-    EligibleUnrecognizedModern,
-    /// A recognized modern JSON-RPC error. Proof of the modern era, never a
-    /// downgrade signal.
+    /// The frozen eligible signal: a `MethodNotFound` discovery refusal whose
+    /// response `id` correlates to the probe request. The only signal that may
+    /// reap the probe and start a fresh legacy child.
+    CorrelatedDiscoveryRefusal,
+    /// The same `MethodNotFound` refusal carrying a different response `id`.
+    /// Uncorrelated, so it proves nothing about the peer and never downgrades.
+    UncorrelatedDiscoveryRefusal,
+    /// A correlated modern JSON-RPC error other than `MethodNotFound`, such as
+    /// invalid params. Proof the peer speaks the modern era, never a downgrade.
     RecognizedModernError,
-    /// Malformed modern output. Never a downgrade signal.
-    MalformedModernOutput,
+    /// No modern probe is sent at all, as under `LegacyOnly`.
+    NoModernProbe,
     /// The planted unsupported `2025-11-25` era. Negative use only; it can
     /// never satisfy a `2026-07-28` or exact-`2024-11-05` positive.
     UnsupportedEraAdvertised,
@@ -159,9 +176,10 @@ impl StdioFirstWireSignal {
     pub const fn token(self) -> &'static str {
         match self {
             Self::ModernDiscoveryResult => "modern-discovery-result",
-            Self::EligibleUnrecognizedModern => "eligible-unrecognized-modern",
+            Self::CorrelatedDiscoveryRefusal => "correlated-discovery-refusal",
+            Self::UncorrelatedDiscoveryRefusal => "uncorrelated-discovery-refusal",
             Self::RecognizedModernError => "recognized-modern-error",
-            Self::MalformedModernOutput => "malformed-modern-output",
+            Self::NoModernProbe => "no-modern-probe",
             Self::UnsupportedEraAdvertised => "unsupported-era-advertised",
         }
     }
@@ -171,7 +189,7 @@ impl StdioFirstWireSignal {
     /// Only under `Auto`; the policy is checked separately.
     #[must_use]
     pub const fn is_fallback_eligible(self) -> bool {
-        matches!(self, Self::EligibleUnrecognizedModern)
+        matches!(self, Self::CorrelatedDiscoveryRefusal)
     }
 }
 
