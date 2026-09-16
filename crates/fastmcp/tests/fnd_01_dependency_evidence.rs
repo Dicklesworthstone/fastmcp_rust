@@ -31503,18 +31503,54 @@ activate = 1\n";
         let table = value.as_table().ok_or_else(|| Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at("root declaration must be an inline/table declaration"))?;
         let expected_fields = ["default-features", "features", "optional", "version"].into_iter().collect::<BTreeSet<_>>();
         let actual_fields = table.keys().map(String::as_str).collect::<BTreeSet<_>>();
-        if actual_fields != expected_fields
-            || table.get("version").and_then(toml::Value::as_str) != Some(rule.version.as_str())
-            || table.get("default-features").and_then(toml::Value::as_bool)
-                != match rule.declaration_default_features.as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                }
-            || string_array_value(table.get("features"), subject, "features")? != rule.declaration_features
-            || table.get("optional").and_then(toml::Value::as_bool) != Some(rule.optional)
+        // An `||` chain can only report THAT the declaration diverged, never WHICH clause
+        // did, and `.at(&rule.id)` named only the rule - so acting on a refusal meant
+        // reading this source, the same tax that let these contracts rot unnoticed. The
+        // chain below holds exactly the same five clauses in the same order, with no second
+        // predicate list to drift out of step with the first, and additionally names the
+        // divergent field and both sides of it.
+        //
+        // `string_array_value` is deliberately still evaluated lazily, in clause-4 position:
+        // hoisting it above the chain would run its `?` even when clauses 1-3 diverge, which
+        // would change which diagnostic a caller sees. Order here is behaviour, not style.
+        let declaration_divergence: Option<String> = if actual_fields != expected_fields {
+            let missing = expected_fields.difference(&actual_fields).copied().collect::<Vec<_>>();
+            let unexpected = actual_fields.difference(&expected_fields).copied().collect::<Vec<_>>();
+            Some(format!("declaration field set: missing {missing:?}, unexpected {unexpected:?}"))
+        } else if table.get("version").and_then(toml::Value::as_str) != Some(rule.version.as_str()) {
+            Some(format!(
+                "version: contract {}, manifest {}",
+                rule.version,
+                table.get("version").and_then(toml::Value::as_str).unwrap_or("<absent>")
+            ))
+        } else if table.get("default-features").and_then(toml::Value::as_bool)
+            != match rule.declaration_default_features.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
         {
-            return Err(Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at(&rule.id));
+            Some(format!(
+                "default-features: contract {}, manifest {:?}",
+                rule.declaration_default_features,
+                table.get("default-features").and_then(toml::Value::as_bool)
+            ))
+        } else {
+            let manifest_features = string_array_value(table.get("features"), subject, "features")?;
+            if manifest_features != rule.declaration_features {
+                Some(format!("features: contract {:?}, manifest {manifest_features:?}", rule.declaration_features))
+            } else if table.get("optional").and_then(toml::Value::as_bool) != Some(rule.optional) {
+                Some(format!(
+                    "optional: contract {}, manifest {:?}",
+                    rule.optional,
+                    table.get("optional").and_then(toml::Value::as_bool)
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(divergence) = declaration_divergence {
+            return Err(Diagnostic::error("E_INTEGRATION_DEPENDENCY_DECLARATION", subject).at(format!("{}: {divergence}", rule.id)));
         }
         effective_dependency_declaration(value, subject)
     }
@@ -56910,14 +56946,17 @@ original = "value"
         for (path, source) in &inventory.rust_sources {
             for (api, references) in STATE_PARTITION_RNG_SEALED_APIS.into_iter().zip(source.reference_counts.sealed_apis) {
                 if references != 0 && !state_partition_rng_sealed_api_is_allowlisted(path, api) {
-                    return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(path));
+                    // Naming the path alone forces the reader to re-derive WHICH of the five
+                    // sealed draws the file touched - a blame trace, on a 3.9MB source. `api`
+                    // is already bound by the enclosing loop; this only spends it.
+                    return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(format!("{path}: {api}")));
                 }
             }
         }
         for api in STATE_PARTITION_RNG_SEALED_APIS {
             let expected_references = usize::from(api == "draw_security_identifier");
             if state_partition_rng_sealed_api_reference_count(&state.tokens, api) != expected_references {
-                return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at("crates/fastmcp-core/src/state.rs"));
+                return Err(Diagnostic::error("E_STATE_PARTITION_RNG_SEALED_API_OWNER", "state-partition-rng").at(format!("crates/fastmcp-core/src/state.rs: {api}")));
             }
         }
         for api in STATE_PARTITION_RNG_SEALED_APIS {
@@ -57630,7 +57669,16 @@ original = "value"
             state_partition_rng_replace_rust_source_text(sealed_api_state, sealed_api_state_text, api).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
             assert_eq!(state_partition_rng_other_input_digest(&sealed_api_planted), baseline_other_input_digest, "{api} plant must not alter any non-state inventory input");
             let sealed_api_error = validate_state_partition_rng_seam(&sealed_api_planted).expect_err("each unallowlisted sealed API reference must fail closed");
-            assert_eq!(sealed_api_error.stable(), "FND01|Error|E_STATE_PARTITION_RNG_SEALED_API_OWNER|state-partition-rng|crates/fastmcp-core/src/state.rs", "{api}");
+            // Before the diagnostic named the API, all five plants expected one identical
+            // string and `{api}` was only a failure label - so this loop proved the gate
+            // fires without proving it fires for the RIGHT sealed draw, and would still
+            // have passed had the gate collapsed to a single hardcoded refusal. Binding the
+            // expectation to `api` makes each of the five rows distinguishable.
+            assert_eq!(
+                sealed_api_error.stable(),
+                format!("FND01|Error|E_STATE_PARTITION_RNG_SEALED_API_OWNER|state-partition-rng|crates/fastmcp-core/src/state.rs: {api}"),
+                "{api}"
+            );
             assert_fresh_baseline();
         }
 
