@@ -91,6 +91,7 @@ pub enum ManagedCoreError {
     InvalidLimits,
     InvalidRequest,
     UnsupportedRequest,
+    UnsupportedResult,
     RequestTooLarge,
     InvalidResponse,
     ResponseIdMismatch,
@@ -119,6 +120,7 @@ impl fmt::Display for ManagedCoreError {
                 Self::InvalidLimits => "invalid managed core call limits",
                 Self::InvalidRequest => "invalid typed core request",
                 Self::UnsupportedRequest => "request requires a different protocol or extension client",
+                Self::UnsupportedResult => "result requires extension negotiation absent from this core call",
                 Self::RequestTooLarge => "typed core request exceeds the encoded-byte limit",
                 Self::InvalidResponse => "core response failed strict JSON-RPC admission",
                 Self::ResponseIdMismatch => "core response does not match the owning request ID",
@@ -346,6 +348,16 @@ impl CoreDecoder {
                 if let Some(error) = response.error {
                     return Err(ManagedCoreError::Remote { code: error.code });
                 }
+                // Compile-time Tasks support in the shared codec is not this
+                // call's authority to accept a Task. Check the core discriminator
+                // boundary after strict envelope admission and before decoding
+                // any extension result, identically in every feature profile.
+                if response.result.as_ref().and_then(|result| result.get("resultType"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| !matches!(kind, "complete" | "input_required"))
+                {
+                    return Err(ManagedCoreError::UnsupportedResult);
+                }
                 let admission = decode_strict_jsonrpc_response(frame, self.limits.frame_bytes)
                     .map_err(|_| ManagedCoreError::InvalidResponse)?;
                 let (response, source) = admission.into_parts();
@@ -525,15 +537,15 @@ mod tests {
     #[test]
     fn notifications_are_incremental_and_limits_leave_invalid_state_unchanged() {
         let notification = br#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
-        let mut decoder = decoder("tools/list", json!({}));
-        decoder.limits.notifications = 1;
-        assert!(matches!(decoder.admit(notification, true), Ok(ManagedCoreEvent::Notification(_))));
-        let before = decoder.bytes;
-        assert!(matches!(decoder.admit(notification, true), Err(ManagedCoreError::NotificationLimit)));
-        assert_eq!(decoder.bytes, before);
-        assert_eq!(decoder.notifications, 1);
-        assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true), Ok(ManagedCoreEvent::Result(_))));
-        let mut json_decoder = super::tests::decoder("tools/list", json!({}));
+        let mut state = decoder("tools/list", json!({}));
+        state.limits.notifications = 1;
+        assert!(matches!(state.admit(notification, true), Ok(ManagedCoreEvent::Notification(_))));
+        let before = state.bytes;
+        assert!(matches!(state.admit(notification, true), Err(ManagedCoreError::NotificationLimit)));
+        assert_eq!(state.bytes, before);
+        assert_eq!(state.notifications, 1);
+        assert!(matches!(state.admit(&frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true), Ok(ManagedCoreEvent::Result(_))));
+        let mut json_decoder = decoder("tools/list", json!({}));
         assert!(matches!(json_decoder.admit(notification, false), Err(ManagedCoreError::UnexpectedNotification)));
     }
 
@@ -572,5 +584,73 @@ mod tests {
         assert!(decoder.admit(notification, true).is_ok());
         assert!(matches!(decoder.admit(notification, true), Err(ManagedCoreError::ResponseByteLimit)));
         assert_eq!(decoder.notifications, 1);
+    }
+
+    #[test]
+    fn compiled_extension_codecs_do_not_authorize_core_call_task_results() {
+        let task = r#"{"resultType":"task","taskId":"opaque","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":1000}"#;
+        #[cfg(feature = "tasks")]
+        assert!(matches!(request("tools/call", json!({"name":"echo"})).decode_result(task),
+            Ok(CoreResult::Final(fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }))));
+        for sse in [false, true] {
+            let mut decoder = decoder("tools/call", json!({"name":"echo"}));
+            assert!(matches!(decoder.admit(&frame(task), sse), Err(ManagedCoreError::UnsupportedResult)));
+            assert_eq!(decoder.bytes, 0);
+            assert_eq!(decoder.notifications, 0);
+            assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","content":[]}"#), sse), Ok(ManagedCoreEvent::Result(_))));
+        }
+    }
+
+    #[test]
+    fn progress_identity_is_retained_from_the_actual_encoded_request() {
+        let mut params = request("tools/call", json!({"name":"echo"})).encode_params().unwrap().unwrap();
+        params["_meta"]["progressToken"] = json!("owned");
+        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+        let (wire, decoder) = prepare("https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default()).unwrap();
+        assert_eq!(decoder.progress_marker, Some(ProgressMarker::String("owned".to_owned())));
+        let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
+        assert_eq!(body["params"]["_meta"]["progressToken"], "owned");
+    }
+
+    #[test]
+    fn same_poll_cancellation_withholds_a_ready_value_without_cancelling_parent() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+            let result = bounded_wait(&cx, &cancellation, deadline, async {
+                cancellation.cancel();
+                Ok(7_u8)
+            }).await;
+            assert!(matches!(result, Err(ManagedCoreError::Cancelled)));
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn dropping_a_polled_wait_drops_its_owned_future_without_parent_cancellation() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        struct OwnedPending(Arc<AtomicBool>);
+        impl Future for OwnedPending {
+            type Output = Result<(), ManagedCoreError>;
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+        }
+        impl Drop for OwnedPending {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+            let mut waiting = Box::pin(bounded_wait(&cx, &cancellation, deadline, OwnedPending(Arc::clone(&dropped))));
+            poll_fn(|task| { assert!(waiting.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+            drop(waiting);
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
     }
 }
