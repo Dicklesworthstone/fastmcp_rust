@@ -25059,7 +25059,7 @@ fn e2e_public_http_static_token_refuses_missing_and_wrong_and_commits_subject() 
 }
 
 #[test]
-fn auth_01_a_positive() {
+fn auth_01_a_e2e_http_positive() {
     let runtime_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -25126,7 +25126,7 @@ fn auth_01_a_positive() {
 }
 
 #[test]
-fn auth_01_a_planted_negative() {
+fn auth_01_a_e2e_http_planted_negative() {
     let runtime_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
