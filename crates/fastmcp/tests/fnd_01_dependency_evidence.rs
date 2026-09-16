@@ -50454,6 +50454,16 @@ activate = 1\n";
 
         validate_media_dependency_bundle(&media_dependency_bundle(files)?, files, policy)?;
 
+        // The state-capability bundle is admitted through the same ordinary
+        // verifier path as the media bundle above, not only by its own two
+        // tests. A validator reachable solely from the tests that assert it
+        // proves the test build rather than the verifier's admitted-source
+        // decision, which is what bd-mcp-2026-07-28-support-ahet.1.13's
+        // acceptance means by the "ordinary run_verifier proof". The bundle is
+        // built from the same `root` and `files` the tests use, so this adds no
+        // new source authority.
+        validate_state_capability_bundle(&state_capability_bundle(root, files)?)?;
+
         let auth = parse_source_toml(files, "evidence/fnd-01/auth-standards.toml")?;
         validate_auth_sources(&auth)?;
         validate_serialization_uri_dependency_contract(files)?;
