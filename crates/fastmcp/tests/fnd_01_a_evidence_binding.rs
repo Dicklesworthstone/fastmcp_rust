@@ -22,8 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fastmcp_rust::evidence_binding::{
-    BindingDeclarationError, BindingDrift, ClosedChildBinding, MAX_BOUND_SOURCE_BYTES,
-    SHA256_HEX_LENGTH,
+    BindingDeclarationError, BindingDrift, ClosedChildBinding, DeclaredFact,
+    MAX_BOUND_SOURCE_BYTES, SHA256_HEX_LENGTH,
 };
 
 /// A real checked-in source file, used so the positive binds actual bytes
@@ -276,6 +276,11 @@ fn declared_closed_child_bindings() -> Vec<DeclaredRow> {
     let parsed: toml::Value = document
         .parse()
         .expect("the FND-01 evidence document parses as TOML");
+    // This `.get` is the ONLY line in the workspace that consumes the
+    // `closed_child_binding` key. Every other mention of that string here is a
+    // function name, which a grep matches without anything being read. Delete
+    // this line and the declared rows silently go back to being unenforced
+    // with the whole file still compiling.
     let rows = parsed
         .get("closed_child_binding")
         .and_then(toml::Value::as_array)
@@ -357,5 +362,205 @@ fn fnd_01_a_recorded_closed_child_bindings_hold() {
         drifted.len(),
         declared.len(),
         drifted.join("\n"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Policy versus reality: does the evidence document describe this repository?
+// ---------------------------------------------------------------------------
+
+/// Reads one `*_rule` string from its declaring contract table.
+///
+/// The rules are not at the document root; each lives under the contract that
+/// owns it. Looking them up by table makes a relocated rule a loud failure
+/// rather than a silently absent declaration.
+fn policy_rule(document: &toml::Value, table: &str, key: &str) -> String {
+    document
+        .get(table)
+        .unwrap_or_else(|| panic!("the evidence document declares the {table} table"))
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("{table} declares {key}"))
+        .to_owned()
+}
+
+/// Extracts every `nightly-YYYY-MM-DD` channel a rule names.
+///
+/// Scans for the literal marker rather than parsing prose, so a rule that
+/// names no channel yields an empty set and is reported as such instead of
+/// silently contributing nothing.
+fn declared_channels(rule: &str) -> Vec<String> {
+    const MARKER: &str = "nightly-";
+    const DATE_LENGTH: usize = 10; // YYYY-MM-DD
+    let bytes = rule.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while let Some(offset) = rule[index..].find(MARKER) {
+        let start = index + offset;
+        let date_start = start + MARKER.len();
+        let date_end = date_start + DATE_LENGTH;
+        if date_end <= bytes.len() {
+            let date = &rule[date_start..date_end];
+            let shaped = date.len() == DATE_LENGTH
+                && date.as_bytes().iter().enumerate().all(|(position, byte)| {
+                    if position == 4 || position == 7 {
+                        *byte == b'-'
+                    } else {
+                        byte.is_ascii_digit()
+                    }
+                });
+            if shaped {
+                let channel = format!("{MARKER}{date}");
+                if !found.contains(&channel) {
+                    found.push(channel);
+                }
+            }
+        }
+        index = start + MARKER.len();
+    }
+    found
+}
+
+/// Extracts the `rust-version <major>.<minor>` a rule names, if any.
+fn declared_rust_version(rule: &str) -> Option<String> {
+    const MARKER: &str = "rust-version ";
+    let start = rule.find(MARKER)? + MARKER.len();
+    let rest = &rule[start..];
+    let end = rest
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(rest.len());
+    let version = &rest[..end];
+    if version.is_empty() || !version.contains('.') {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+/// The evidence document must describe *this* repository.
+///
+/// This is a consistency check, not a literal-value assertion. It does not
+/// require any particular toolchain: it requires that the toolchain the
+/// evidence document declares is the toolchain the repository actually pins,
+/// and that the `rust-version` the document tells the documentation to state
+/// is the one the workspace actually declares and the documentation actually
+/// states.
+///
+/// This test is expected to FAIL while the document is behind the project's
+/// deliberate toolchain move. The red is the inventory for the re-attest that
+/// owns correcting it; it must not be resolved here by editing the policy
+/// string, nor by asserting the document's stale literals, which would demand
+/// the repository move backwards.
+#[test]
+fn fnd_01_a_policy_describes_this_repository() {
+    let root = workspace_root();
+    let evidence: toml::Value =
+        fs::read_to_string(root.join("evidence/fnd-01/dependency-verification.toml"))
+            .expect("the FND-01 evidence document is readable")
+            .parse()
+            .expect("the FND-01 evidence document parses as TOML");
+
+    // --- what the repository actually is --------------------------------
+    let toolchain: toml::Value = fs::read_to_string(root.join("rust-toolchain.toml"))
+        .expect("rust-toolchain.toml is readable")
+        .parse()
+        .expect("rust-toolchain.toml parses as TOML");
+    let actual_channel = toolchain
+        .get("toolchain")
+        .and_then(|table| table.get("channel"))
+        .and_then(toml::Value::as_str)
+        .expect("rust-toolchain.toml declares toolchain.channel")
+        .to_owned();
+
+    let manifest: toml::Value = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("the workspace manifest is readable")
+        .parse()
+        .expect("the workspace manifest parses as TOML");
+    let actual_rust_version = manifest
+        .get("workspace")
+        .and_then(|table| table.get("package"))
+        .and_then(|table| table.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .expect("the workspace declares rust-version")
+        .to_owned();
+
+    let agents = fs::read_to_string(root.join("AGENTS.md")).expect("AGENTS.md is readable");
+
+    // --- what the evidence document declares ----------------------------
+    let rules = [
+        (
+            "workspace_manifest_integration_contract",
+            "toolchain_relationship_rule",
+        ),
+        ("repository_surface_contract", "toolchain_rule"),
+        (
+            "repository_surface_contract",
+            "documentation_toolchain_rule",
+        ),
+    ];
+
+    let mut divergences = Vec::new();
+    let mut compared = 0_usize;
+
+    for (table, key) in rules {
+        let rule = policy_rule(&evidence, table, key);
+        let channels = declared_channels(&rule);
+        assert!(
+            !channels.is_empty(),
+            "{key} names no toolchain channel; a rule that declares nothing \
+             would let this check pass while comparing nothing"
+        );
+        for channel in channels {
+            let fact = DeclaredFact::declare(&format!("{key} toolchain channel"), &channel)
+                .expect("a nonempty declared channel is admissible");
+            let outcome = fact.compare(&actual_channel);
+            compared += 1;
+            if !outcome.describes_repository() {
+                divergences.push(outcome.to_string());
+            }
+        }
+
+        if let Some(version) = declared_rust_version(&rule) {
+            let fact = DeclaredFact::declare(&format!("{key} rust-version"), &version)
+                .expect("a nonempty declared rust-version is admissible");
+            let outcome = fact.compare(&actual_rust_version);
+            compared += 1;
+            if !outcome.describes_repository() {
+                divergences.push(outcome.to_string());
+            }
+        }
+    }
+
+    // The documentation side: AGENTS.md must state the repository's real
+    // toolchain and rust-version, so a divergence cannot be blamed on the
+    // docs having moved instead of the policy.
+    for (subject, expected) in [
+        ("AGENTS.md toolchain channel", actual_channel.as_str()),
+        ("AGENTS.md rust-version", actual_rust_version.as_str()),
+    ] {
+        let stated = if agents.contains(expected) {
+            expected.to_owned()
+        } else {
+            "absent".to_owned()
+        };
+        let fact =
+            DeclaredFact::declare(subject, expected).expect("a nonempty expectation is admissible");
+        let outcome = fact.compare(&stated);
+        compared += 1;
+        if !outcome.describes_repository() {
+            divergences.push(outcome.to_string());
+        }
+    }
+
+    assert!(
+        compared >= rules.len(),
+        "every declared toolchain rule must contribute at least one comparison"
+    );
+    assert!(
+        divergences.is_empty(),
+        "the FND-01 evidence document does not describe this repository \
+         ({} of {} compared facts diverge):\n{}",
+        divergences.len(),
+        compared,
+        divergences.join("\n"),
     );
 }

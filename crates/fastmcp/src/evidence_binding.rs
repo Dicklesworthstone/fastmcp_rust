@@ -1,4 +1,4 @@
-//! FND-01 A: enforcement for the authoritative closed-child source freeze.
+//! FND-01 A: enforcement for the authoritative source and toolchain freeze.
 //!
 //! This module is the shipped, non-`cfg(test)` public surface that makes a
 //! declared closed-child binding *checkable*. Each binding in
@@ -29,6 +29,27 @@
 //! same-length, different-content edit is exactly the case a length-only
 //! comparison misses, so the digest is always evaluated even when the length
 //! already disagrees.
+
+//! # Two declared shapes, one invariant
+//!
+//! This module enforces two kinds of declaration, both resting on the same
+//! invariant: **the authoritative evidence document describes this
+//! repository.**
+//!
+//! - A [`ClosedChildBinding`] declares the byte length and digest of an owned
+//!   source file. It is checked against that file's bytes.
+//! - A [`DeclaredFact`] declares a value the document asserts about the
+//!   repository — the toolchain channel it pins, the `rust-version` its
+//!   documentation states. It is checked against what the repository actually
+//!   contains.
+//!
+//! The second shape is deliberately a *consistency* check rather than a
+//! literal-value assertion. Asserting the document's literals directly would
+//! encode whichever values happened to be recorded, so a document that had
+//! fallen behind a deliberate project decision would force the repository to
+//! match the stale document. Comparing declaration against reality stays
+//! correct in both directions and keeps its meaning after a divergence is
+//! resolved, whichever side moves.
 
 use fastmcp_core::sha256_bounded;
 
@@ -291,5 +312,128 @@ impl BindingDrift {
     #[must_use]
     pub const fn is_bound(self) -> bool {
         matches!(self, Self::Bound)
+    }
+}
+
+/// A refused fact declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactDeclarationError {
+    /// The subject naming what is declared was empty.
+    EmptySubject,
+    /// The declared value was empty.
+    ///
+    /// An empty declaration is refused rather than treated as "no claim",
+    /// because a silently absent value would let a consistency check pass
+    /// while comparing nothing.
+    EmptyDeclared,
+}
+
+impl std::fmt::Display for FactDeclarationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySubject => formatter.write_str("declared fact subject must be nonempty"),
+            Self::EmptyDeclared => formatter.write_str("declared fact value must be nonempty"),
+        }
+    }
+}
+
+impl std::error::Error for FactDeclarationError {}
+
+/// One fact the evidence document declares about this repository.
+///
+/// The document is authoritative about what it *claims*; the repository is
+/// authoritative about what is *true*. This type carries the claim so it can
+/// be confronted with the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredFact {
+    subject: String,
+    declared: String,
+}
+
+impl DeclaredFact {
+    /// Records a declared fact, refusing an empty subject or value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FactDeclarationError`] when either field is empty.
+    pub fn declare(subject: &str, declared: &str) -> Result<Self, FactDeclarationError> {
+        if subject.is_empty() {
+            return Err(FactDeclarationError::EmptySubject);
+        }
+        if declared.is_empty() {
+            return Err(FactDeclarationError::EmptyDeclared);
+        }
+        Ok(Self {
+            subject: subject.to_owned(),
+            declared: declared.to_owned(),
+        })
+    }
+
+    /// What this fact is about.
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The value the evidence document declares.
+    #[must_use]
+    pub fn declared(&self) -> &str {
+        &self.declared
+    }
+
+    /// Confronts the declaration with what the repository actually contains.
+    #[must_use]
+    pub fn compare(&self, observed: &str) -> FactOutcome {
+        FactOutcome {
+            subject: self.subject.clone(),
+            declared: self.declared.clone(),
+            observed: observed.to_owned(),
+        }
+    }
+}
+
+/// The result of confronting one declaration with reality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactOutcome {
+    subject: String,
+    declared: String,
+    observed: String,
+}
+
+impl FactOutcome {
+    /// What this fact is about.
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The value the evidence document declares.
+    #[must_use]
+    pub fn declared(&self) -> &str {
+        &self.declared
+    }
+
+    /// The value the repository actually contains.
+    #[must_use]
+    pub fn observed(&self) -> &str {
+        &self.observed
+    }
+
+    /// Whether the document describes the repository for this fact.
+    #[must_use]
+    pub fn describes_repository(&self) -> bool {
+        self.declared == self.observed
+    }
+}
+
+impl std::fmt::Display for FactOutcome {
+    /// Names both sides, so a divergence report is actionable without
+    /// re-deriving either value.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: evidence declares {:?}, repository has {:?}",
+            self.subject, self.declared, self.observed
+        )
     }
 }
