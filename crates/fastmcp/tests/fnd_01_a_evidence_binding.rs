@@ -273,9 +273,13 @@ fn declared_closed_child_bindings() -> Vec<DeclaredRow> {
     let document =
         fs::read_to_string(workspace_root().join("evidence/fnd-01/dependency-verification.toml"))
             .expect("the FND-01 evidence document is readable");
-    let parsed: toml::Value = document
-        .parse()
-        .expect("the FND-01 evidence document parses as TOML");
+    // `toml::from_str`, NOT `str::parse`. `<toml::Value as FromStr>` routes
+    // through `ValueDeserializer`, which parses a single TOML *value* and then
+    // expects end-of-input, so it rejects a whole document with "unexpected
+    // content, expected nothing". `from_str` is the document deserializer,
+    // which is what the ordinary verifier's `parse_toml_strict` uses.
+    let parsed: toml::Value =
+        toml::from_str(&document).expect("the FND-01 evidence document parses as a TOML document");
     // This `.get` is the ONLY line in the workspace that consumes the
     // `closed_child_binding` key. Every other mention of that string here is a
     // function name, which a grep matches without anything being read. Delete
@@ -453,17 +457,17 @@ fn declared_rust_version(rule: &str) -> Option<String> {
 #[test]
 fn fnd_01_a_policy_describes_this_repository() {
     let root = workspace_root();
-    let evidence: toml::Value =
+    let evidence_text =
         fs::read_to_string(root.join("evidence/fnd-01/dependency-verification.toml"))
-            .expect("the FND-01 evidence document is readable")
-            .parse()
-            .expect("the FND-01 evidence document parses as TOML");
+            .expect("the FND-01 evidence document is readable");
+    let evidence: toml::Value = toml::from_str(&evidence_text)
+        .expect("the FND-01 evidence document parses as a TOML document");
 
     // --- what the repository actually is --------------------------------
-    let toolchain: toml::Value = fs::read_to_string(root.join("rust-toolchain.toml"))
-        .expect("rust-toolchain.toml is readable")
-        .parse()
-        .expect("rust-toolchain.toml parses as TOML");
+    let toolchain_text = fs::read_to_string(root.join("rust-toolchain.toml"))
+        .expect("rust-toolchain.toml is readable");
+    let toolchain: toml::Value =
+        toml::from_str(&toolchain_text).expect("rust-toolchain.toml parses as a TOML document");
     let actual_channel = toolchain
         .get("toolchain")
         .and_then(|table| table.get("channel"))
@@ -471,10 +475,10 @@ fn fnd_01_a_policy_describes_this_repository() {
         .expect("rust-toolchain.toml declares toolchain.channel")
         .to_owned();
 
-    let manifest: toml::Value = fs::read_to_string(root.join("Cargo.toml"))
-        .expect("the workspace manifest is readable")
-        .parse()
-        .expect("the workspace manifest parses as TOML");
+    let manifest_text =
+        fs::read_to_string(root.join("Cargo.toml")).expect("the workspace manifest is readable");
+    let manifest: toml::Value =
+        toml::from_str(&manifest_text).expect("the workspace manifest parses as a TOML document");
     let actual_rust_version = manifest
         .get("workspace")
         .and_then(|table| table.get("package"))
