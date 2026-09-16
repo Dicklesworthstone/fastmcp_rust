@@ -182,9 +182,45 @@ impl Peer {
         reply(&mut tls, status, body).await;
     }
 
+    /// Asserts discovery opened no further connection.
+    ///
+    /// # Why this probe owns its context
+    ///
+    /// `poll_accept` returns `Ready(Err(Interrupted))` whenever the **ambient**
+    /// `Cx` is cancelled, before it ever looks at the accept queue. Both callers
+    /// of this function run it immediately after `cx.cancel_with(..)`, so an
+    /// earlier `is_pending()` form reported "discovery replayed its fetch plan"
+    /// against a client that had done nothing — the probe was reporting the
+    /// caller's cancellation, not the listener's state.
+    ///
+    /// So the probe installs a context **it mints itself**, for the duration of
+    /// the poll only. The client under test stays cancelled and nothing is
+    /// reordered; only this observation runs somewhere it can answer the
+    /// question. Do not "simplify" this back by dropping the frame, and do not
+    /// derive it from the caller's context with `Cx::clone` — a clone is an
+    /// alias, not a child, so it shares the cancelled domain and rebuilds the
+    /// exact bug this guards against.
+    ///
+    /// # Why three outcomes rather than two
+    ///
+    /// `is_pending()` collapsed "no connection arrived" and "the probe could not
+    /// observe" into one boolean. They are different facts and only one of them
+    /// is a pass, so an inconclusive observation must fail rather than be read
+    /// as an absence.
     fn assert_no_extra_connections(&self) {
+        let _frame = Cx::set_current(Some(Cx::for_request()));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut task).is_pending(), "discovery must not replay or widen its fetch plan");
+        match self.listener.poll_accept(&mut task) {
+            Poll::Pending => {}
+            Poll::Ready(Ok((_stream, peer))) => panic!(
+                "discovery must not replay or widen its fetch plan, but a further connection was \
+                 accepted from {peer}"
+            ),
+            Poll::Ready(Err(error)) => panic!(
+                "the no-extra-connection probe is INCONCLUSIVE ({error}); it proves neither that \
+                 discovery stayed quiet nor that it reconnected, and must not be read as either"
+            ),
+        }
     }
 }
 
