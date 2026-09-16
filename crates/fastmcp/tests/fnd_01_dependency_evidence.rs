@@ -20407,6 +20407,19 @@ mod ordinary {
     const POLICY_SCHEMA_VERSION: u32 = 2;
     const RECEIPT_SCHEMA_VERSION: u32 = 2;
     const EXPECTED_SOURCE_FILES: usize = 71;
+    /// Aggregate byte length of the `EXPECTED_SOURCE_FILES` recorded inputs.
+    ///
+    /// This is a MEASUREMENT of mutable repository content, not a declared
+    /// design limit, so any byte that changes in any recorded source input
+    /// invalidates it. It is named rather than written inline at its one
+    /// comparison site precisely because it has rotted once already: the
+    /// cascade at `152a030b` rustfmt'd a probe (+47 bytes), updated the
+    /// evidence document and its row, and walked past the bare literal in the
+    /// verifier, leaving `3024805` against a document declaring `3024852`
+    /// until `1cbb77a2`. Six sibling measurements below were named and
+    /// survived the same cascade. Keep every measurement named and treat this
+    /// block as the cascade checklist.
+    const EXPECTED_SOURCE_INPUT_TOTAL_BYTES: u64 = 3_024_852;
     const EXPECTED_NEGATIVES: usize = 188;
     const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
     const MUTATION_RECIPE_CANONICAL_SHA256: &str = "609f0ce94ad6403a3324f1afd705f641573469a833fd3271e84b0647e86f2f5a";
@@ -25925,7 +25938,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3024852
+            || policy.source_input_total_bytes != EXPECTED_SOURCE_INPUT_TOTAL_BYTES
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
