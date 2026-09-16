@@ -3829,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn fnd_03_i_positive() {
+    fn fnd_03_i_unit_positive() {
         fnd_03_integration_positive();
     }
 
@@ -3878,7 +3878,7 @@ mod tests {
     }
 
     #[test]
-    fn fnd_03_i_planted_negative() {
+    fn fnd_03_i_unit_planted_negative() {
         fnd_03_integration_planted_negative();
     }
 
