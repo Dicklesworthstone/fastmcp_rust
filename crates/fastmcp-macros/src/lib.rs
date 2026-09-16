@@ -4493,7 +4493,7 @@ mod schema_bound_tool_expansion_tests {
     };
 
     #[test]
-    fn sch_02_a_positive() {
+    fn sch_02_a_unit_positive() {
         let inline_schema: syn::Expr = syn::parse_quote!(serde_json::json!({ "type": "object" }));
         validate_output_schema_expr(&inline_schema).expect("object schemas are accepted");
 
@@ -4532,7 +4532,7 @@ mod schema_bound_tool_expansion_tests {
     }
 
     #[test]
-    fn sch_02_a_planted_negative() {
+    fn sch_02_a_unit_planted_negative() {
         let inline_schema: syn::Expr = syn::parse_quote!(serde_json::json!(true));
         let error = validate_output_schema_expr(&inline_schema)
             .expect_err("the paired boolean schema must fail macro expansion");
