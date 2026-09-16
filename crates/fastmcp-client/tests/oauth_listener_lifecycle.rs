@@ -1,0 +1,257 @@
+//! OAUTH-LISTENER-EXT — external-consumer proof of the shipped callback-listener
+//! lifecycle.
+//!
+//! `bd-p6wg3`. This target exists because the lifecycle was previously proved
+//! only from inside the crate. `dropping_public_login_future_closes_its_bound_callback_listener`
+//! drives the public `OAuthClient::authorize`, but it lives in a
+//! `#[cfg(test)] mod tests` inside `src/http_auth/oauth.rs`, and `cfg(test)`
+//! behaviour cannot prove shipped behaviour (PL-3). So there was no
+//! external-consumer proof of it anywhere.
+//!
+//! Everything here is reached the way a downstream crate reaches it. The only
+//! names used are `fastmcp_client::http_auth::oauth::{OAuthClient,
+//! OAuthClientConfiguration, OAuthError}`, `fastmcp_client::CanonicalHttpUrl`,
+//! and the asupersync runtime — no private symbol, and no `use super::`.
+//!
+//! In particular the loopback address is recovered from the **authorization URL
+//! handed to the caller's `launch_browser` callback**, which is the only place a
+//! downstream consumer can observe it, and its `redirect_uri` is percent-decoded
+//! by this file rather than by the crate's private `decode_form`.
+
+use std::cell::Cell;
+use std::future::{Future, poll_fn};
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::task::Poll;
+use std::time::Duration;
+
+use asupersync::Cx;
+use asupersync::net::TcpListener;
+use asupersync::runtime::RuntimeBuilder;
+use fastmcp_client::CanonicalHttpUrl;
+use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+
+/// Guards against a pathological spin if the callback never fires. It cannot
+/// rescue a genuine hang - nothing would re-poll us - but it turns a runaway
+/// loop into a named failure instead of a silent stall.
+const MAX_LOGIN_POLLS: u32 = 10_000;
+
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).expect("fixture endpoint is canonical")
+}
+
+/// Builds a configuration entirely from the public constructor.
+fn configuration() -> OAuthClientConfiguration {
+    OAuthClientConfiguration::from_trusted_endpoints(
+        "https://issuer.example",
+        url("https://issuer.example/authorize"),
+        url("https://issuer.example/token"),
+        url("https://mcp.example/mcp"),
+        "oauth-listener-ext-client",
+        vec!["tools:read".to_owned()],
+    )
+    .expect("the trusted-endpoint configuration is accepted")
+}
+
+/// Percent-decodes one query value.
+///
+/// Deliberately local: the crate's `decode_form` is private, and reaching for it
+/// would make this an internal test wearing an external test's clothes.
+fn percent_decode(value: &str) -> String {
+    let mut out = Vec::new();
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let high = bytes.next().expect("a percent escape has two digits");
+                let low = bytes.next().expect("a percent escape has two digits");
+                let decode = |digit: u8| {
+                    char::from(digit)
+                        .to_digit(16)
+                        .expect("a percent escape is hexadecimal") as u8
+                };
+                out.push(decode(high) * 16 + decode(low));
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8(out).expect("the redirect target is UTF-8")
+}
+
+/// Extracts the loopback callback address from the authorization URL's
+/// `redirect_uri`, using only the public `CanonicalHttpUrl::query`.
+fn callback_address(authorization: &CanonicalHttpUrl) -> SocketAddr {
+    let query = authorization
+        .query()
+        .expect("the authorization URL carries its parameters");
+    let redirect = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("redirect_uri="))
+        .map(percent_decode)
+        .expect("the authorization URL names a redirect_uri");
+    let authority = redirect
+        .strip_prefix("http://")
+        .expect("the loopback callback is cleartext by design")
+        .split('/')
+        .next()
+        .expect("the redirect target has an authority");
+    authority
+        .parse()
+        .expect("the callback authority is a socket address")
+}
+
+/// Asserts the loopback listener at `address` is CLOSED, not merely unreachable.
+///
+/// These are different claims, and the difference is the whole point. A
+/// `TcpStream::connect` that fails proves only that nobody answered; a connect
+/// that SUCCEEDS proves only that *somebody* is listening, never that *ours* is.
+/// Test binaries in this workspace run hundreds of cases in parallel with many
+/// ephemeral loopback binds, so a port freed a microsecond earlier can be handed
+/// straight to a concurrent test and satisfy a connect against a listener with
+/// nothing to do with OAuth.
+///
+/// Binding the same address inverts the evidence: a successful bind proves
+/// NOBODY is listening, which is direct proof the descriptor was closed, and it
+/// reclaims the port so nothing can occupy it mid-observation.
+///
+/// DO NOT add `SO_REUSEADDR` or `SO_REUSEPORT` to this bind. `SO_REUSEADDR` only
+/// permits rebinding a port left in `TIME_WAIT` by an already-closed socket; it
+/// does NOT permit two live listeners on one port, and that refusal is the
+/// entire mechanism of this probe. `SO_REUSEPORT` does permit exactly that, so
+/// setting it would let a leaked listener coexist with the probe bind and
+/// silently turn this proof into a no-op.
+///
+/// No sleep, no retry, no timing tolerance: the close is synchronous in `Drop`,
+/// so there is nothing to wait for and a tolerance would hide the very leak this
+/// exists to catch.
+async fn assert_listener_released(address: SocketAddr) {
+    match TcpListener::bind(address).await {
+        Ok(listener) => drop(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => panic!(
+            "{address} is still bound after the public login future was dropped. Either the \
+             callback listener leaked - the defect this proves against - or a concurrent test \
+             took the port between the drop and this bind. Re-run this test alone with --exact \
+             to separate them."
+        ),
+        Err(error) => panic!(
+            "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither closure \
+             nor a leak and must not be read as either"
+        ),
+    }
+}
+
+/// Asserts the listener at `address` is STILL bound.
+///
+/// This is the control that gives the positive its meaning: a bind probe that
+/// could never fail would prove nothing, so this proves the probe can in fact
+/// observe a live listener.
+async fn assert_listener_still_bound(address: SocketAddr) {
+    match TcpListener::bind(address).await {
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+        Ok(_) => panic!(
+            "{address} was rebindable while the public login future was still alive, so the \
+             callback listener was released early - or this probe cannot detect a live listener \
+             at all, which would make the released-case assertion vacuous"
+        ),
+        Err(error) => panic!(
+            "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither that the \
+             listener is live nor that it is closed"
+        ),
+    }
+}
+
+/// Drives the public `authorize` until its callback reports the bound address,
+/// returning the still-live login future alongside it.
+///
+/// The future is returned rather than dropped so each case decides its own fate
+/// for it; that choice is the single variable between the two tests here.
+type LoginFuture<'client> = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<fastmcp_client::http_auth::oauth::OAuthCredentials, OAuthError>>
+            + 'client,
+    >,
+>;
+
+/// Drives the public `authorize` until its callback reports the bound address,
+/// returning the still-live login future alongside it.
+///
+/// The future is returned rather than dropped so each case decides its own fate
+/// for it; that choice is the single variable between the two tests here.
+///
+/// The address cell is an `Rc` rather than a borrowed local on purpose: the
+/// closure is captured by the returned future, so borrowing a local here would
+/// make that future outlive the thing it points at.
+async fn login_until_bound<'client>(
+    client: &'client OAuthClient,
+    cx: &Cx,
+) -> (LoginFuture<'client>, SocketAddr) {
+    let bound: Rc<Cell<Option<SocketAddr>>> = Rc::new(Cell::new(None));
+    let observed = Rc::clone(&bound);
+    let mut login: LoginFuture<'client> = Box::pin(client.authorize(cx, move |authorization| {
+        observed.set(Some(callback_address(&authorization)));
+        async move { Ok(()) }
+    }));
+
+    let mut polls = 0_u32;
+    let address = poll_fn(|task| {
+        polls += 1;
+        assert!(
+            polls < MAX_LOGIN_POLLS,
+            "the authorization URL never reached the caller's browser callback"
+        );
+        if let Poll::Ready(result) = login.as_mut().poll(task) {
+            panic!("authorize completed before its callback bound a listener: {result:?}");
+        }
+        match bound.get() {
+            Some(address) => Poll::Ready(address),
+            None => Poll::Pending,
+        }
+    })
+    .await;
+    (login, address)
+}
+
+#[test]
+fn oauth_callback_listener_is_released_when_the_public_login_future_is_dropped() {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("the test owns its caller runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("the caller runtime installs a current Cx");
+            let client = OAuthClient::new(configuration());
+            let (login, address) = login_until_bound(&client, &cx).await;
+
+            assert!(
+                address.ip().is_loopback(),
+                "the shipped client must bind its callback on loopback, observed {address}"
+            );
+
+            // The one variable: the caller abandons the login.
+            drop(login);
+            assert_listener_released(address).await;
+        });
+}
+
+#[test]
+fn oauth_callback_listener_remains_bound_while_the_public_login_future_is_held() {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("the test owns its caller runtime")
+        .block_on(async {
+            let cx = Cx::current().expect("the caller runtime installs a current Cx");
+            let client = OAuthClient::new(configuration());
+            let (login, address) = login_until_bound(&client, &cx).await;
+
+            assert!(address.ip().is_loopback());
+
+            // The one changed variable against the case above: the login future
+            // is HELD rather than dropped. Everything else - the configuration,
+            // the client, the callback, the address - is identical.
+            assert_listener_still_bound(address).await;
+
+            // Held across the probe on purpose; dropping it earlier would make
+            // this the other case.
+            drop(login);
+        });
+}
