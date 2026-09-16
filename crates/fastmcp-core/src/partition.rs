@@ -8,13 +8,16 @@
 //! # The authorization rule
 //!
 //! Possessing a partition key is **not** authorization. Every record slot is
-//! identified by `(purpose, partition key, durable owner)`, so a caller who
-//! somehow obtains another principal's partition key names a slot in their own
-//! owner space, which is empty. The foreign read is therefore
+//! identified by `(purpose, partition key, current authorization)`, where the
+//! authorization is [`PartitionAuthorization::current`] — the durable owner
+//! bound to the descriptor identity in force right now. A caller who somehow
+//! obtains another principal's partition key, or whose own trust generation or
+//! audience policy has moved on, names a slot in a different authorization
+//! space, and that slot is empty. The read is therefore
 //! [`LookupOutcome::Absent`] — byte-identical to a genuine miss — and the
 //! victim's record, counters, quota reservations and revalidation flight are
 //! untouched. There is no code path on which a caller learns that a record
-//! exists in a partition they do not currently own.
+//! exists in a partition they do not currently hold authorization for.
 //!
 //! Quota is admission-only. [`QuotaPartitionKey`] gates how much work a
 //! principal may consume; it never authorizes a lookup, and no lookup
