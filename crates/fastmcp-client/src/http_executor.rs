@@ -74,7 +74,7 @@ use crate::{
 };
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
-use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
+use fastmcp_core::{McpError, McpRequestCancellation, McpResult, Sha256Digest, sha256_bounded};
 
 const LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
 
@@ -148,6 +148,62 @@ fn raw_final_notification_params(
             method: NOTIFICATIONS_PROGRESS,
         })
         .map(Some)
+}
+
+/// Maximum bytes admitted when digesting one HTTP-03 evaluator manifest.
+///
+/// The manifests are fixed acceptance inputs, so the bound exists to keep the
+/// digest a bounded operation rather than to describe an expected size.
+const MAX_HTTP_03_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// The canonical `http_03_evaluator_manifest_v1` rows owned by HTTP-03
+/// implementation A: ordered groups `HTTP-03.01` through `HTTP-03.13`.
+///
+/// This is an executable acceptance input, not a hash of this source file. It
+/// is LF-canonical and LF-terminated, carries no CR, no blank line, and no
+/// trailing whitespace, and its four header rows bind the producer revision,
+/// the producer tree, and the shipped public entrypoint the slice is proved
+/// through. Each case row is exactly `<id> <name> floor=<N>`, where `floor` is
+/// the minimum number of observations an integrating evaluator must actually
+/// perform for that case. Raising a floor here raises what integration demands;
+/// reordering, omitting, or renaming a row changes
+/// [`http_03_a_manifest_digest`] and fails the join.
+///
+/// The `B` half (`HTTP-03.14`..`HTTP-03.26`) is owned by the HTTP-03 B slice
+/// and is deliberately not declared here.
+pub const HTTP_03_A_EVALUATOR_MANIFEST_V1: &str = concat!(
+    "HTTP-03-A evaluator manifest v1\n",
+    "producer-revision 3a8f4ac54c644f53ac63aedb333c3c8a924545ae\n",
+    "producer-tree 9eaea54b5d866441d51de43a3ae062b36cb79e95\n",
+    "entrypoint fastmcp_client::http_executor::ModernHttpExecutor::execute\n",
+    "HTTP-03.01 post-route floor=2\n",
+    "HTTP-03.02 request-content-type floor=3\n",
+    "HTTP-03.03 request-accept-two-ranges floor=2\n",
+    "HTTP-03.04 request-accept-encoding-identity floor=2\n",
+    "HTTP-03.05 protocol-version-header floor=2\n",
+    "HTTP-03.06 method-mirror-header floor=2\n",
+    "HTTP-03.07 name-header floor=3\n",
+    "HTTP-03.08 request-body-stamping floor=2\n",
+    "HTTP-03.09 immediate-json-lane floor=3\n",
+    "HTTP-03.10 request-scoped-sse-lane floor=3\n",
+    "HTTP-03.11 response-content-encoding floor=3\n",
+    "HTTP-03.12 bounded-sse-parse floor=3\n",
+    "HTTP-03.13 terminal-outcome-and-stream-close floor=2\n",
+);
+
+/// Returns the canonical HTTP-03 A evaluator manifest digest.
+///
+/// The digest binds the exact published bytes of
+/// [`HTTP_03_A_EVALUATOR_MANIFEST_V1`]. An integrating consumer recomputes it
+/// over those same bytes, so a digest that no longer reproduces means the
+/// producer's two published halves have drifted apart.
+#[must_use]
+pub fn http_03_a_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        HTTP_03_A_EVALUATOR_MANIFEST_V1.as_bytes(),
+        MAX_HTTP_03_MANIFEST_BYTES,
+    )
+    .expect("the fixed HTTP-03 A manifest is within its exact byte bound")
 }
 
 /// Maximum response bytes retained while classifying a disposable modern probe.
