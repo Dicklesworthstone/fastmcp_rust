@@ -1111,22 +1111,82 @@ mod tests {
     /// No sleep, no retry, no timing tolerance: the close is synchronous in
     /// `Drop`, so there is nothing to wait for and a tolerance would hide the
     /// very leak being tested.
-    async fn assert_listener_released(cx: &Cx, deadline: Time, address: SocketAddr) {
-        let reclaimed = within(cx, deadline, async {
-            Ok(TcpListener::bind(address).await.map_err(|error| error.kind()))
-        })
-        .await
-        .expect("the bind probe must resolve within the operation deadline");
-        match reclaimed {
-            Ok(listener) => drop(listener),
-            Err(std::io::ErrorKind::AddrInUse) => panic!(
-                "{address} is still bound after the callback listener was dropped. Either the \
-                 listener leaked - the defect this probe exists to catch - or a concurrent test \
-                 took the port between the drop and this bind. Re-run this test alone with \
-                 --exact to separate them."
+    /// Positive control for [`assert_listener_released`], run while the login
+    /// future is still alive.
+    ///
+    /// Without it the release probe is vacuous in one direction: a bind that
+    /// succeeds after the drop proves the port is free, but not that this
+    /// listener ever held it. A callback that was never bound, or an address
+    /// parsed out of the wrong field, would make the release probe pass while
+    /// proving nothing. This establishes that the probe can detect *this*
+    /// listener on *this* port, so the later success is a state change rather
+    /// than a constant.
+    ///
+    /// This direction cannot be stolen by a concurrent test: we hold the port.
+    fn assert_listener_bound(address: SocketAddr) {
+        match std::net::TcpListener::bind(address) {
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Ok(listener) => {
+                drop(listener);
+                panic!(
+                    "{address} was bindable while the login future was still alive, so the \
+                     release probe cannot prove anything: either the callback listener was \
+                     never bound or this is not the address it bound"
+                );
+            }
+            Err(error) => panic!(
+                "the bind control for {address} is INCONCLUSIVE ({error}); it establishes \
+                 neither that the callback listener holds the port nor that it does not"
             ),
-            Err(kind) => panic!(
-                "the bind probe for {address} is INCONCLUSIVE ({kind:?}); it proves neither \
+        }
+    }
+
+    /// Asserts the callback listener at `address` is CLOSED.
+    ///
+    /// SYNCHRONOUS ON PURPOSE, and this is the whole robustness argument.
+    ///
+    /// The previous form awaited `asupersync::net::TcpListener::bind`. That
+    /// `.await` is a scheduling point: between `drop(login)` closing the
+    /// descriptor and the bind syscall reaching the kernel, the runtime polls
+    /// other tasks and the harness's other threads get a full async round trip
+    /// in which to claim the just-freed ephemeral port. This binary runs ~655
+    /// tests, ~100 of which bind ephemeral loopback ports, so that window was
+    /// routinely lost: the probe reported `AddrInUse` and that failure was
+    /// indistinguishable from the leak it exists to catch. A test that only
+    /// passes in isolation lies in every wave.
+    ///
+    /// `std::net::TcpListener::bind` removes the await entirely - the drop and
+    /// the bind become straight-line code in one task with no yield between
+    /// them. This does not make theft impossible, since other OS threads still
+    /// run, but it removes the structural cause instead of tolerating the
+    /// symptom, and it costs no sleep, no retry and no timing tolerance. The
+    /// close is synchronous: the listener is a local of the dropped `authorize`
+    /// future, asupersync's `TcpListener` has no `Drop` of its own, and its
+    /// `std::net::TcpListener` closes the descriptor in `Drop`. There is
+    /// nothing to wait for.
+    ///
+    /// DO NOT reintroduce an `.await` between the drop and this bind, and DO
+    /// NOT add `SO_REUSEADDR` or `SO_REUSEPORT`. `SO_REUSEADDR` only permits
+    /// rebinding a port left in `TIME_WAIT` by an already-closed socket and
+    /// that refusal is the entire mechanism; `SO_REUSEPORT` permits two live
+    /// listeners on one port, which would let a leaked listener coexist with
+    /// this bind and silently turn the proof into a no-op.
+    ///
+    /// The ambiguous arm still fails closed. It is narrower than it was, not
+    /// gone, so it names both hypotheses rather than asserting either.
+    fn assert_listener_released(address: SocketAddr) {
+        match std::net::TcpListener::bind(address) {
+            Ok(listener) => drop(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => panic!(
+                "{address} is still bound after the callback listener was dropped, and the \
+                 bind was issued with no await between it and the drop. Either the listener \
+                 leaked - the defect this probe exists to catch - or a concurrent test on \
+                 another thread took the port inside that straight-line window. The control \
+                 above proved the probe detects this listener, so this is a real state \
+                 observation, not a vacuous one."
+            ),
+            Err(error) => panic!(
+                "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither \
                  closure nor a leak and must not be read as either"
             ),
         }
@@ -1452,42 +1512,19 @@ mod tests {
                     None => Poll::Pending,
                 }
             })).await.unwrap();
+            // Positive control BEFORE the drop: while the login future is
+            // alive its callback listener holds the port, so this bind must be
+            // refused. It makes the release probe a state change rather than a
+            // constant, and it cannot be stolen because we hold the port.
+            assert_listener_bound(address);
+
             drop(login);
 
-            // Prove the bound callback listener is CLOSED, not merely that its
-            // port is unreachable. Those are different claims.
-            //
-            // This probe used to assert `TcpStream::connect(address).is_err()`.
-            // A successful connect proves only that *somebody* is listening on
-            // that port, never that *our* listener is. This is a lib unit test
-            // sharing one binary with ~800 others, ~100 of which bind ephemeral
-            // loopback ports in parallel, so the port `drop(login)` just freed can
-            // be handed straight to a concurrent test and satisfy the connect
-            // against a listener that has nothing to do with OAuth. That is how
-            // this assertion failed the first time the suite ever ran it.
-            //
-            // Binding the same address inverts the evidence. A successful bind
-            // proves NOBODY is listening, which is direct proof the descriptor was
-            // closed, and it reclaims the port so no concurrent test can occupy it
-            // mid-observation. The leak this test exists to catch still fails here
-            // and fails harder: a retained listener makes the bind fail
-            // deterministically with `AddrInUse` instead of leaving the outcome to
-            // whichever process wins a port race.
-            //
-            // DO NOT add `SO_REUSEADDR` or `SO_REUSEPORT` to this bind.
-            // `SO_REUSEADDR` only permits rebinding a port left in `TIME_WAIT` by
-            // an already-closed socket; it does NOT permit two live listeners on
-            // one port, and that refusal is the entire mechanism of this probe.
-            // `SO_REUSEPORT` does permit exactly that, so setting it would let a
-            // leaked listener coexist with the probe bind and silently turn this
-            // proof into a no-op.
-            //
-            // No sleep, no retry, no timing tolerance. The close is synchronous:
-            // the listener is a local of the dropped `authorize` future, asupersync's
-            // `TcpListener` has no `Drop` of its own, and its `std::net::TcpListener`
-            // closes the descriptor in `Drop`. There is nothing to wait for, and a
-            // tolerance here would hide precisely the leak being tested.
-            assert_listener_released(&cx, deadline, address).await;
+            // No await between the drop and the probe. The probe is synchronous
+            // precisely so the runtime cannot schedule another task into the
+            // window where the freed port is unclaimed - see
+            // `assert_listener_released` for the full argument.
+            assert_listener_released(address);
         });
     }
 
