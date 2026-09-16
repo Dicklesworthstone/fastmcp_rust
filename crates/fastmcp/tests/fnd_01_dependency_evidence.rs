@@ -25990,27 +25990,57 @@ activate = 1\n";
     }
 
     fn validate_policy_shape(policy: &Policy) -> VResult<()> {
-        if policy.format != "fastmcp-fnd-01-dependency-verification-v2"
-            || policy.schema_version != POLICY_SCHEMA_VERSION
-            || policy.policy_id != "FND-01/dependency-verification"
-            || policy.protocol_version != "2026-07-28"
-            || policy.recorded_on != "2026-07-30"
-            || policy.hash_algorithm != "sha256"
-            || policy.authoring_bead != POLICY_OWNER
-            || policy.integration_producer_bead != INTEGRATION_PRODUCER
-            || policy.final_attester_bead != FINAL_ATTESTER
-            || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != EXPECTED_SOURCE_INPUT_TOTAL_BYTES
-            || policy.negative_case_count != EXPECTED_NEGATIVES
-            || policy.derived_output_count != EXPECTED_RECEIPTS
-            || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
-            || policy.derived_binary_count != EXPECTED_RECEIPT_BINARIES
-            || policy.derived_direct_parent_edge_count != EXPECTED_DIRECT_PARENT_EDGES
-            || !policy.deny_unknown_policy_fields
-            || !policy.deny_unknown_receipt_fields
-            || policy.aggregate_support_claimed
-        {
-            return Err(Diagnostic::error("E_POLICY_IDENTITY", &policy.policy_id).at("format/version/identity/cardinality"));
+        // Nineteen clauses fused by `||` produced one refusal reading
+        // "format/version/identity/cardinality" - four category words for nineteen
+        // distinct facts, so a reader still had to open this file to learn which one
+        // moved. The chain below holds exactly the same nineteen clauses in the same
+        // order, with no second predicate list to drift out of step, and names the
+        // divergent field plus both sides. Six of these compare a frozen MEASUREMENT
+        // of mutable content; those are precisely the ones that rot, and precisely the
+        // ones whose two sides a reader needs to see.
+        let identity_divergence: Option<String> = if policy.format != "fastmcp-fnd-01-dependency-verification-v2" {
+            Some(format!("format: document {}, contract fastmcp-fnd-01-dependency-verification-v2", policy.format))
+        } else if policy.schema_version != POLICY_SCHEMA_VERSION {
+            Some(format!("schema_version: document {}, contract {POLICY_SCHEMA_VERSION}", policy.schema_version))
+        } else if policy.policy_id != "FND-01/dependency-verification" {
+            Some(format!("policy_id: document {}, contract FND-01/dependency-verification", policy.policy_id))
+        } else if policy.protocol_version != "2026-07-28" {
+            Some(format!("protocol_version: document {}, contract 2026-07-28", policy.protocol_version))
+        } else if policy.recorded_on != "2026-07-30" {
+            Some(format!("recorded_on: document {}, contract 2026-07-30", policy.recorded_on))
+        } else if policy.hash_algorithm != "sha256" {
+            Some(format!("hash_algorithm: document {}, contract sha256", policy.hash_algorithm))
+        } else if policy.authoring_bead != POLICY_OWNER {
+            Some(format!("authoring_bead: document {}, contract {POLICY_OWNER}", policy.authoring_bead))
+        } else if policy.integration_producer_bead != INTEGRATION_PRODUCER {
+            Some(format!("integration_producer_bead: document {}, contract {INTEGRATION_PRODUCER}", policy.integration_producer_bead))
+        } else if policy.final_attester_bead != FINAL_ATTESTER {
+            Some(format!("final_attester_bead: document {}, contract {FINAL_ATTESTER}", policy.final_attester_bead))
+        } else if policy.source_input_count != EXPECTED_SOURCE_FILES {
+            Some(format!("source_input_count: document {}, contract {EXPECTED_SOURCE_FILES}", policy.source_input_count))
+        } else if policy.source_input_total_bytes != EXPECTED_SOURCE_INPUT_TOTAL_BYTES {
+            Some(format!("source_input_total_bytes: document {}, contract {EXPECTED_SOURCE_INPUT_TOTAL_BYTES}", policy.source_input_total_bytes))
+        } else if policy.negative_case_count != EXPECTED_NEGATIVES {
+            Some(format!("negative_case_count: document {}, contract {EXPECTED_NEGATIVES}", policy.negative_case_count))
+        } else if policy.derived_output_count != EXPECTED_RECEIPTS {
+            Some(format!("derived_output_count: document {}, contract {EXPECTED_RECEIPTS}", policy.derived_output_count))
+        } else if policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS {
+            Some(format!("derived_toml_count: document {}, contract {EXPECTED_RECEIPT_TOMLS}", policy.derived_toml_count))
+        } else if policy.derived_binary_count != EXPECTED_RECEIPT_BINARIES {
+            Some(format!("derived_binary_count: document {}, contract {EXPECTED_RECEIPT_BINARIES}", policy.derived_binary_count))
+        } else if policy.derived_direct_parent_edge_count != EXPECTED_DIRECT_PARENT_EDGES {
+            Some(format!("derived_direct_parent_edge_count: document {}, contract {EXPECTED_DIRECT_PARENT_EDGES}", policy.derived_direct_parent_edge_count))
+        } else if !policy.deny_unknown_policy_fields {
+            Some("deny_unknown_policy_fields: document false, contract requires true".to_owned())
+        } else if !policy.deny_unknown_receipt_fields {
+            Some("deny_unknown_receipt_fields: document false, contract requires true".to_owned())
+        } else if policy.aggregate_support_claimed {
+            Some("aggregate_support_claimed: document true, contract requires false".to_owned())
+        } else {
+            None
+        };
+        if let Some(divergence) = identity_divergence {
+            return Err(Diagnostic::error("E_POLICY_IDENTITY", &policy.policy_id).at(divergence));
         }
         if policy.paths.repository_root_resolution
             != "ordinary no-argument read-only verifier mode uses compile-time CARGO_MANIFEST_DIR for crates/fastmcp followed by exactly two parent() operations and never reads current_dir. Produce, Attest, Gate, and ordinary same-PID handoff role entry instead require argv[2] literal dot, call current_dir exactly once, and validate that absolute physical no-symlink directory as the remote synchronized repository root; PWD, canonicalization, environment-selected roots, and ancestor discovery are forbidden in every mode"
@@ -50174,24 +50204,53 @@ activate = 1\n";
         }
         for (file, (id, path, kind, bytes, digest)) in actual.iter().zip(TOOLCHAIN_SOURCE_INPUTS) {
             let contract = &file.contract;
-            if contract.id != id
-                || contract.path != path
-                || contract.family != "toolchain"
-                || contract.owner_bead != OWNER
-                || contract.parse_kind != kind
-                || contract.observation_kind != ObservationKind::LocalFile
-                || contract.byte_length != bytes
-                || contract.sha256 != digest
-                || !contract.bytes_available
-                || contract.rehash_mode != "exact_local"
-                || contract.claim_ceiling != "local-byte-proof"
-                || !contract.required
-                || !contract.source_tree_member
-                || file.bytes.len() as u64 != bytes
-                || file.digest != sha256(&file.bytes)
-                || lower_hex(&file.digest) != digest
-            {
-                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at(path));
+            // Sixteen clauses fused by `||` behind an `.at(path)` that looks informative:
+            // it named WHICH FILE diverged but never WHICH OF SIXTEEN properties, so
+            // "byte_length drifted" and "the bytes on disk no longer hash to the recorded
+            // digest" were the same output. The chain below holds exactly the same sixteen
+            // clauses in the same order and keeps the path, adding only the property and
+            // both sides.
+            let file_divergence: Option<String> = if contract.id != id {
+                Some(format!("id: document {}, contract {id}", contract.id))
+            } else if contract.path != path {
+                Some(format!("path: document {}, contract {path}", contract.path))
+            } else if contract.family != "toolchain" {
+                Some(format!("family: document {}, contract toolchain", contract.family))
+            } else if contract.owner_bead != OWNER {
+                Some(format!("owner_bead: document {}, contract {OWNER}", contract.owner_bead))
+            } else if contract.parse_kind != kind {
+                Some(format!("parse_kind: document {:?}, contract {kind:?}", contract.parse_kind))
+            } else if contract.observation_kind != ObservationKind::LocalFile {
+                Some(format!("observation_kind: document {:?}, contract LocalFile", contract.observation_kind))
+            } else if contract.byte_length != bytes {
+                Some(format!("byte_length: document {}, contract {bytes}", contract.byte_length))
+            } else if contract.sha256 != digest {
+                Some(format!("sha256: document {}, contract {digest}", contract.sha256))
+            } else if !contract.bytes_available {
+                Some("bytes_available: document false, contract requires true".to_owned())
+            } else if contract.rehash_mode != "exact_local" {
+                Some(format!("rehash_mode: document {}, contract exact_local", contract.rehash_mode))
+            } else if contract.claim_ceiling != "local-byte-proof" {
+                Some(format!("claim_ceiling: document {}, contract local-byte-proof", contract.claim_ceiling))
+            } else if !contract.required {
+                Some("required: document false, contract requires true".to_owned())
+            } else if !contract.source_tree_member {
+                Some("source_tree_member: document false, contract requires true".to_owned())
+            } else if file.bytes.len() as u64 != bytes {
+                Some(format!("on-disk length: observed {}, contract {bytes}", file.bytes.len()))
+            } else if file.digest != sha256(&file.bytes) {
+                Some(format!(
+                    "on-disk digest: recorded {}, recomputed {}",
+                    lower_hex(&file.digest),
+                    lower_hex(&sha256(&file.bytes))
+                ))
+            } else if lower_hex(&file.digest) != digest {
+                Some(format!("on-disk digest: observed {}, contract {digest}", lower_hex(&file.digest)))
+            } else {
+                None
+            };
+            if let Some(divergence) = file_divergence {
+                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at(format!("{path}: {divergence}")));
             }
         }
         let (tree, bytes) = source_tree_digest_refs(&actual)?;
