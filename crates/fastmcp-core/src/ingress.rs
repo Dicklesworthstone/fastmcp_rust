@@ -87,6 +87,8 @@ pub enum IngressFactsError {
     KeyIdNotPrintableAscii,
     /// Fingerprint material exceeded the audited input bound.
     FingerprintMaterialTooLong,
+    /// The material did not reproduce the fingerprint's tag.
+    FingerprintMismatch,
     /// A configured maximum staleness exceeded [`HARD_MAXIMUM_STALENESS`].
     MaximumStalenessAboveCeiling,
     /// A configured maximum staleness was zero, which no provider can satisfy.
@@ -109,6 +111,9 @@ impl fmt::Display for IngressFactsError {
                 formatter,
                 "secret fingerprint material exceeds {SECRET_FINGERPRINT_INPUT_LIMIT_BYTES} bytes"
             ),
+            Self::FingerprintMismatch => {
+                formatter.write_str("material does not reproduce the secret fingerprint")
+            }
             Self::MaximumStalenessAboveCeiling => write!(
                 formatter,
                 "configured maximum staleness exceeds the {}s hard ceiling",
@@ -136,11 +141,25 @@ impl std::error::Error for IngressFactsError {}
 ///
 /// The key material is used and dropped; it is never stored, so no accessor,
 /// `Debug`, or future `Serialize` impl can leak it.
-#[derive(Clone, PartialEq, Eq)]
 pub struct SecretFingerprint {
     key_id: String,
     generation: u64,
     tag: HmacSha256Tag,
+}
+
+impl Clone for SecretFingerprint {
+    /// Hand-written because [`HmacSha256Tag`] deliberately derives nothing.
+    ///
+    /// Cloning is not a timing hazard, so it is safe to provide here; deriving
+    /// it on the tag itself would be a change to a type this module does not
+    /// own, for a need only this module has.
+    fn clone(&self) -> Self {
+        Self {
+            key_id: self.key_id.clone(),
+            generation: self.generation,
+            tag: HmacSha256Tag::from_bytes(*self.tag.as_bytes()),
+        }
+    }
 }
 
 impl SecretFingerprint {
@@ -164,18 +183,9 @@ impl SecretFingerprint {
             return Err(IngressFactsError::FingerprintMaterialTooLong);
         }
 
-        // Length-prefix every part so no two distinct field splittings can
-        // produce the same preimage.
-        let mut preimage = Vec::with_capacity(material.len() + key_id.len() + 48);
-        for part in [
-            SECRET_FINGERPRINT_DOMAIN,
-            key_id.as_bytes(),
-            &generation.to_be_bytes(),
-            material,
-        ] {
-            preimage.extend_from_slice(&(part.len() as u64).to_be_bytes());
-            preimage.extend_from_slice(part);
-        }
+        // Length-prefixed so no two distinct field splittings can produce the
+        // same preimage.
+        let preimage = Self::preimage(key_id, generation, material);
 
         let tag = key
             .authenticate_bounded(&preimage, SECRET_FINGERPRINT_INPUT_LIMIT_BYTES * 2)
@@ -221,9 +231,69 @@ impl SecretFingerprint {
     ///
     /// This is a MAC over the material, not the secret, and is safe to record
     /// in a manifest or receipt.
+    ///
+    /// # Comparison
+    ///
+    /// Do not compare these bytes with `==`. A tag is an authenticator: an
+    /// attacker who can submit candidate fingerprints and measure how long the
+    /// comparison takes recovers it byte by byte, because `==` on a byte array
+    /// short-circuits at the first difference. That is why
+    /// [`HmacSha256Tag`] deliberately implements no equality at all, why this
+    /// type does not derive `PartialEq`, and why
+    /// [`Self::verify_material`] exists. Use it.
     #[must_use]
     pub const fn tag(&self) -> &[u8; SECRET_FINGERPRINT_TAG_BYTES] {
         self.tag.as_bytes()
+    }
+
+    /// Verifies in constant time that this fingerprint names `material` under `key`.
+    ///
+    /// This is the only sanctioned way to decide whether a fingerprint
+    /// matches. It recomputes the MAC and delegates the comparison to
+    /// [`HmacSha256Key::verify_bounded`], which is constant time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngressFactsError::FingerprintMismatch`] when the material,
+    /// key identifier, generation, or key does not reproduce this tag, and
+    /// [`IngressFactsError::FingerprintMaterialTooLong`] when the material
+    /// exceeds the audited bound. The two are distinguishable because an
+    /// over-long input is refused before any MAC work and therefore leaks
+    /// nothing about the tag.
+    pub fn verify_material(
+        &self,
+        key: &HmacSha256Key,
+        material: &[u8],
+    ) -> Result<(), IngressFactsError> {
+        if material.len() > SECRET_FINGERPRINT_INPUT_LIMIT_BYTES {
+            return Err(IngressFactsError::FingerprintMaterialTooLong);
+        }
+        let preimage = Self::preimage(&self.key_id, self.generation, material);
+        key.verify_bounded(
+            &preimage,
+            SECRET_FINGERPRINT_INPUT_LIMIT_BYTES * 2,
+            &self.tag,
+        )
+        .map_err(|_| IngressFactsError::FingerprintMismatch)
+    }
+
+    /// Builds the length-prefixed, domain-separated preimage.
+    ///
+    /// Shared by derivation and verification so the two can never drift; a
+    /// verifier that hashed a different preimage than the deriver would reject
+    /// every genuine match.
+    fn preimage(key_id: &str, generation: u64, material: &[u8]) -> Vec<u8> {
+        let mut preimage = Vec::with_capacity(material.len() + key_id.len() + 48);
+        for part in [
+            SECRET_FINGERPRINT_DOMAIN,
+            key_id.as_bytes(),
+            &generation.to_be_bytes(),
+            material,
+        ] {
+            preimage.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            preimage.extend_from_slice(part);
+        }
+        preimage
     }
 }
 
@@ -845,7 +915,7 @@ impl fmt::Debug for SecurityPartitionDescriptor {
 /// The provider chooses the reference; the framework only compares and digests
 /// it. It must not be a bearer value, and the type gives no way to recover one
 /// — there is no accessor returning the raw reference, only its fingerprint.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SealedProviderReference {
     fingerprint: SecretFingerprint,
 }
@@ -872,6 +942,19 @@ impl SealedProviderReference {
     pub const fn fingerprint(&self) -> &SecretFingerprint {
         &self.fingerprint
     }
+
+    /// Verifies in constant time that this reference names `reference`.
+    ///
+    /// # Errors
+    ///
+    /// See [`SecretFingerprint::verify_material`].
+    pub fn verify_reference(
+        &self,
+        key: &HmacSha256Key,
+        reference: &[u8],
+    ) -> Result<(), IngressFactsError> {
+        self.fingerprint.verify_material(key, reference)
+    }
 }
 
 impl fmt::Debug for SealedProviderReference {
@@ -887,7 +970,7 @@ impl fmt::Debug for SealedProviderReference {
 /// Deliberately not `Serialize`: a persisted revalidation fact is a stale
 /// assertion the moment it is written, and the one legitimate durable form is
 /// AUTH-00's separate durable-execution authorization, not this.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthorizationRotationFacts {
     provider_reference: SealedProviderReference,
     token_instance: SealedProviderReference,
