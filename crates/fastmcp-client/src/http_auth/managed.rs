@@ -376,8 +376,14 @@ impl ManagedOAuthSession {
         let expiry_wins = expiry_deadline.is_some_and(|expiry| expiry <= deadline);
         let deadline = expiry_deadline.map_or(deadline, |expiry| expiry.min(deadline));
         let elapsed = || if expiry_wins { OAuthSessionError::LoginRequired } else { OAuthSessionError::TimedOut };
-        let timer = cx.timer_driver().ok_or(OAuthSessionError::RuntimeTimerUnavailable)?;
-        let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+        // Fail closed when the caller's runtime has no timer driver. The sleep
+        // below resolves its driver from the ambient `Cx` that every poll below
+        // installs, so a missing driver must surface as a typed error here
+        // rather than as a future that is never woken.
+        if cx.timer_driver().is_none() {
+            return Err(OAuthSessionError::RuntimeTimerUnavailable);
+        }
+        let mut sleep = std::pin::pin!(Sleep::new(deadline));
         let mut closed = std::pin::pin!(self.inner.closed.cancelled());
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
         let (_sender, mut receiver) = oneshot::channel::<()>();
@@ -552,7 +558,7 @@ struct PendingPermit<'a>(&'a AtomicUsize);
 
 impl<'a> PendingPermit<'a> {
     fn acquire(pending: &'a AtomicUsize, maximum: usize) -> Result<Self, OAuthSessionError> {
-        pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        pending.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < maximum).then(|| current + 1)
         }).map_err(|_| OAuthSessionError::Saturated)?;
         Ok(Self(pending))

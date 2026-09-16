@@ -187,7 +187,7 @@ impl Peer {
 }
 
 async fn expire_first_grant(cx: &Cx) {
-    Sleep::with_timer_driver(cx.now().saturating_add_nanos(1_100_000_000), cx.timer_driver().unwrap()).await;
+    Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn cancelling_a_refresh_waiter_does_not_cancel_the_refresh_owner() {
         let server = async {
             peer.login(FIRST).await;
             let mut tls = peer.accept("refresh_token").await;
-            started_tx.send(()).unwrap();
+            started_tx.send(&cx, ()).unwrap();
             release_rx.recv(&cx).await.unwrap();
             reply(&mut tls, NEXT).await;
         };
@@ -247,7 +247,7 @@ fn cancelling_a_refresh_waiter_does_not_cancel_the_refresh_owner() {
                 cancellation.cancel();
                 assert!(matches!(waiter.await, Err(OAuthSessionError::Cancelled)));
                 assert!(cx.checkpoint().is_ok());
-                release_tx.send(()).unwrap();
+                release_tx.send(&cx, ()).unwrap();
             };
             let (snapshot, ()) = pair(owner, waiter).await;
             assert_eq!(snapshot.unwrap().generation(), 2);
@@ -269,7 +269,7 @@ fn bounded_refresh_admission_recovers_after_saturation() {
         let server = async {
             peer.login(FIRST).await;
             let mut tls = peer.accept("refresh_token").await;
-            started_tx.send(()).unwrap();
+            started_tx.send(&cx, ()).unwrap();
             release_rx.recv(&cx).await.unwrap();
             reply(&mut tls, NEXT).await;
         };
@@ -281,7 +281,7 @@ fn bounded_refresh_admission_recovers_after_saturation() {
             let contender = async {
                 started_rx.recv(&cx).await.unwrap();
                 assert!(matches!(session.credential(&cx).await, Err(OAuthSessionError::Saturated)));
-                release_tx.send(()).unwrap();
+                release_tx.send(&cx, ()).unwrap();
             };
             let (snapshot, ()) = pair(owner, contender).await;
             assert_eq!(snapshot.unwrap().generation(), 2);
@@ -303,7 +303,7 @@ fn abandoned_or_closed_refresh_never_reuses_the_consumed_lineage() {
             let server = async {
                 peer.login(FIRST).await;
                 let mut tls = peer.accept("refresh_token").await;
-                started_tx.send(()).unwrap();
+                started_tx.send(&cx, ()).unwrap();
                 let mut byte = [0];
                 assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "abandonment closes the owned exchange");
             };
