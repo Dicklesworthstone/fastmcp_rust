@@ -20,6 +20,8 @@
 use core::fmt;
 use std::time::Instant;
 
+/// Protected-resource and issuer discovery for preregistered native clients.
+pub mod discovery;
 /// Shared OAuth renewal and authenticated modern HTTP dispatch.
 pub mod managed;
 /// Interactive native-public-client authorization with a caller-owned runtime.
