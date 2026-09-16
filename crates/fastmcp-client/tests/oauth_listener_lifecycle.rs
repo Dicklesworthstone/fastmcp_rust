@@ -201,7 +201,21 @@ async fn login_until_bound<'client>(
             "the authorization URL never reached the caller's browser callback"
         );
         if let Poll::Ready(result) = login.as_mut().poll(task) {
-            panic!("authorize completed before its callback bound a listener: {result:?}");
+            // The success arm deliberately does not format `result`.
+            // `OAuthCredentials` has no `Debug` on purpose (oauth.rs:219-222) so
+            // refresh-token bytes are not formattable; deriving it to enrich a
+            // panic message would trade a shipped confidentiality property for
+            // test convenience. Returning at all is the finding, and the arm
+            // itself already reports which way it returned. `OAuthError` is
+            // `Debug`, so the failure arm can name the cause.
+            match result {
+                Ok(_) => panic!(
+                    "authorize completed successfully before its callback bound a listener"
+                ),
+                Err(error) => panic!(
+                    "authorize failed before its callback bound a listener: {error:?}"
+                ),
+            }
         }
         match bound.get() {
             Some(address) => Poll::Ready(address),
