@@ -365,6 +365,46 @@ impl DurableOwnerKey {
     }
 }
 
+/// The caller's **current** verified authorization for a partition.
+///
+/// Binds the durable owner to the descriptor identity in force right now, so
+/// a trust-generation or audience-policy bump relocates every record the
+/// principal could previously reach. Ordinary token rotation and scope churn
+/// do not change it: neither the token instance nor the effective grants are
+/// descriptor fields.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PartitionAuthorization {
+    binding: [u8; 32],
+}
+
+impl fmt::Debug for PartitionAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PartitionAuthorization")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartitionAuthorization {
+    /// Derives the authorization in force for this descriptor and owner.
+    #[must_use]
+    pub fn current(descriptor: &PartitionDescriptor, owner: &DurableOwnerKey) -> Self {
+        Self {
+            binding: opaque_admission_digest(&[
+                b"auth-00-partition-authorization-v1",
+                descriptor.identity(),
+                owner.as_bytes(),
+            ]),
+        }
+    }
+
+    /// The opaque binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.binding
+    }
+}
+
 impl SubscriptionPartitionKey {
     /// Derives the subscription partition for one topic and delivery policy.
     pub fn derive(
@@ -721,6 +761,8 @@ pub enum PartitionAdmissionError {
         /// Configured per-minute ceiling.
         limit: u32,
     },
+    /// A revalidation flight was closed twice.
+    RevalidationAlreadyFinished,
     /// This replay alias is already reserved in this partition.
     ReplayAliasAlreadyReserved,
 }
@@ -762,6 +804,9 @@ impl fmt::Display for PartitionAdmissionError {
                 formatter,
                 "provider revalidation attempt rate {limit}/min exceeded (attempts {attempts})"
             ),
+            Self::RevalidationAlreadyFinished => {
+                formatter.write_str("revalidation flight is already finished")
+            }
             Self::ReplayAliasAlreadyReserved => {
                 formatter.write_str("replay alias is already reserved in this partition")
             }
@@ -784,7 +829,7 @@ impl std::error::Error for PartitionAdmissionError {}
 struct RecordSlot {
     purpose: LookupPurpose,
     key: [u8; 32],
-    owner: [u8; 32],
+    authorization: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -875,19 +920,19 @@ impl PartitionAdmissionController {
 
     /// Stores a record in the caller's own owner space.
     ///
-    /// A caller can only ever write into a slot owned by the durable owner
-    /// derived from their own current descriptor, so this can neither
-    /// overwrite nor reveal another principal's record.
+    /// A caller can only ever write into a slot bound to their own current
+    /// verified authorization, so this can neither overwrite nor reveal
+    /// another principal's record.
     pub fn store(
         &self,
-        owner: &DurableOwnerKey,
+        authorization: &PartitionAuthorization,
         slot: &PartitionSlot,
         value: Vec<u8>,
     ) -> Option<Vec<u8>> {
         let record = RecordSlot {
             purpose: slot.purpose(),
             key: *slot.key_bytes(),
-            owner: *owner.as_bytes(),
+            authorization: *authorization.as_bytes(),
         };
         lock_state(&self.inner).records.insert(record, value)
     }
@@ -899,11 +944,15 @@ impl PartitionAdmissionController {
     /// caller who does not own the partition observes [`LookupOutcome::Absent`]
     /// and no state changes.
     #[must_use]
-    pub fn lookup(&self, owner: &DurableOwnerKey, slot: &PartitionSlot) -> LookupOutcome {
+    pub fn lookup(
+        &self,
+        authorization: &PartitionAuthorization,
+        slot: &PartitionSlot,
+    ) -> LookupOutcome {
         let record = RecordSlot {
             purpose: slot.purpose(),
             key: *slot.key_bytes(),
-            owner: *owner.as_bytes(),
+            authorization: *authorization.as_bytes(),
         };
         lock_state(&self.inner)
             .records
@@ -1262,7 +1311,7 @@ impl RevalidationFlight {
     /// genuinely made.
     pub fn finish(&mut self) -> Result<(), PartitionAdmissionError> {
         if !self.live {
-            return Err(PartitionAdmissionError::RevalidationAlreadyInFlight);
+            return Err(PartitionAdmissionError::RevalidationAlreadyFinished);
         }
         self.live = false;
         let mut state = lock_state(&self.inner);
