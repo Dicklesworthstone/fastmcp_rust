@@ -54,15 +54,6 @@ const SECRET_FINGERPRINT_INPUT_LIMIT_BYTES: usize = 64 * 1024;
 /// Domain separator, so a fingerprint can never collide with another MAC use.
 const SECRET_FINGERPRINT_DOMAIN: &[u8] = b"auth-00-secret-fingerprint-v1";
 
-/// Projected audience-policy revision for a mutual-TLS binding.
-///
-/// Reserved at the top of the `u64` range so a real policy revision, which
-/// counts up from zero, can never collide with it.
-pub const NON_OAUTH_MUTUAL_TLS_POLICY_SENTINEL: u64 = u64::MAX;
-
-/// Projected audience-policy revision for a static-credential binding.
-pub const NON_OAUTH_STATIC_CREDENTIAL_POLICY_SENTINEL: u64 = u64::MAX - 1;
-
 /// Default maximum staleness for a revalidated authorization.
 pub const DEFAULT_MAXIMUM_STALENESS: Duration = Duration::from_secs(30);
 
@@ -718,29 +709,6 @@ impl VerifiedIngressAuthentication {
     pub const fn trust_generation(&self) -> u64 {
         self.trust_generation
     }
-
-    /// The audience-policy revision to project into an admission descriptor.
-    ///
-    /// OAuth bindings project their real revision. Non-OAuth bindings have no
-    /// revision, and projecting a shared `0` for all of them would let a
-    /// provider that authenticates the same subject by both mutual TLS and a
-    /// static credential derive **one** partition for two genuinely different
-    /// authentication paths. Each non-OAuth variant therefore projects its own
-    /// reserved sentinel, drawn from the top of the range so it cannot be
-    /// reached by a real policy revision counting up from zero.
-    #[must_use]
-    const fn projected_audience_policy_revision(&self) -> u64 {
-        match &self.verified_audience_binding {
-            VerifiedAudienceBinding::OAuth {
-                audience_policy_revision,
-                ..
-            } => *audience_policy_revision,
-            VerifiedAudienceBinding::MutualTlsPeer => NON_OAUTH_MUTUAL_TLS_POLICY_SENTINEL,
-            VerifiedAudienceBinding::StaticCredential => {
-                NON_OAUTH_STATIC_CREDENTIAL_POLICY_SENTINEL
-            }
-        }
-    }
 }
 
 impl fmt::Debug for VerifiedIngressAuthentication {
@@ -865,10 +833,27 @@ impl SecurityPartitionDescriptor {
 
     /// Projects this descriptor onto AUTH-00 B's admission input.
     ///
-    /// AUTH-00 B derives partition keys from a nine-field subset; this is a
-    /// projection of the twelve verified facts, so nothing is invented and the
-    /// discarded fields (audience binding, policy identity, claims) remain
-    /// bound in [`Self::identity`] for any caller that needs full identity.
+    /// The audience binding crosses the seam **structurally**, as its
+    /// discriminant-led canonical parts, rather than collapsed into a single
+    /// revision number. An earlier version projected a `u64` and reserved
+    /// sentinels for the non-OAuth variants; that worked, but it made a
+    /// cross-principal cache collision depend on two modules keeping a
+    /// convention neither type expressed, and it left an OAuth deployment
+    /// whose revision reached `u64::MAX` aliasing mutual TLS. B validates the
+    /// binding parts like any other sealed field, so a caller who omits them
+    /// now gets `EmptyField` instead of a silent merge.
+    ///
+    /// `auth_policy_revision` crosses too. Without it, revising the
+    /// authorization policy — tightening required grants, say — would leave
+    /// every record cached under the old policy still reachable, which is the
+    /// exact failure `PartitionAuthorization` exists to prevent.
+    ///
+    /// `verified_claims` is deliberately **not** projected, and that is a
+    /// decision rather than an omission: claims change on ordinary token
+    /// rotation, so binding them into admission identity would relocate every
+    /// partition on each refresh and cost a principal their own continuation
+    /// records. They stay bound in [`Self::identity`], which is A's full
+    /// twelve-fact identity.
     ///
     /// This is the only production path from verified ingress to an admission
     /// descriptor.
@@ -876,10 +861,12 @@ impl SecurityPartitionDescriptor {
     /// # Errors
     ///
     /// Propagates [`crate::limits::SealedAdmissionKeyError`] when a verified
-    /// field is outside the sealed-key bound.
+    /// field is empty or outside the sealed-key bound.
     pub fn to_partition_descriptor(
         &self,
     ) -> Result<crate::partition::PartitionDescriptor, crate::limits::SealedAdmissionKeyError> {
+        let binding = self.facts.verified_audience_binding.canonical_parts();
+        let binding_parts: Vec<&[u8]> = binding.iter().map(Vec::as_slice).collect();
         crate::partition::PartitionDescriptor::from_verified_facts(
             &self.facts.provider,
             self.facts.configuration_generation,
@@ -889,7 +876,8 @@ impl SecurityPartitionDescriptor {
             &self.facts.subject_or_principal,
             &self.facts.authorized_party_or_client,
             self.facts.trust_generation,
-            self.facts.projected_audience_policy_revision(),
+            self.facts.auth_policy_revision,
+            &binding_parts,
         )
     }
 }
