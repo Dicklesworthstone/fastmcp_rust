@@ -481,12 +481,38 @@ fn sch_02_a_planted_negative() {
     schema::validate(&root, &missing_optional)
         .expect("dropping an optional field is not a refusal");
 
-    // --- A boolean schema is never valid macro output -------------------------
+    // --- Where the object-root rule actually lives ---------------------------
     //
-    // The package contract forbids emitting a boolean MCP output schema. The
-    // shipped admission path must refuse one outright.
+    // A boolean IS a JSON Schema: `true` admits everything, `false` admits
+    // nothing. `admit_final_schema` is the general wire-boundary layer and
+    // therefore admits booleans **by design** — its doc comment says so
+    // ("the final wire boundary accepts only JSON Schema booleans or
+    // objects", schema.rs:233-240) and its refusal text at schema.rs:469 is
+    // "schema must be an object or boolean". Refusing them there would be the
+    // bug, not the fix.
+    //
+    // This is written out because it looks like a hole and is not: an earlier
+    // revision of this test asserted refusal here and failed, and the next
+    // reader should not re-file that as a defect.
     schema::admit_final_schema(json!(true))
-        .expect_err("a boolean schema must be refused by the admission path");
+        .expect("a JSON Schema boolean is a schema; the general layer admits it by design");
+
+    // The package contract requires input root-object enforcement to be
+    // SEPARATE from reusable type schemas, and it is — at the layers that own
+    // a root. The form layer refuses a non-object root outright
+    // (schema.rs:266, "final form schema must be an object"), and tool
+    // registration applies the same rule before admission ever runs
+    // (fastmcp-server/src/router.rs:905-914). So a boolean can never become a
+    // tool input schema, which is the property that actually matters.
+    schema::admit_final_form_schema(json!(true))
+        .expect_err("a root-enforcing layer must refuse a non-object schema");
+
+    // And the derive never produces one: every generated root is an object.
+    assert_eq!(
+        Subject::json_schema().get("type").and_then(Value::as_str),
+        Some("object"),
+        "the derive must never emit a boolean or non-object root"
+    );
 
     // Final unchanged-state proof after every case.
     assert_eq!(
