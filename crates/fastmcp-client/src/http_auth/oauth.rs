@@ -1006,8 +1006,11 @@ mod tests {
                 assert!(reply.starts_with(if index == 0 { "HTTP/1.1 400" } else { "HTTP/1.1 200" }));
                 assert!(!reply.contains("live-code"));
             }
+            // Observe OUR listener directly rather than the port namespace.
+            // See `assert_listener_drained` for why the port probe was wrong
+            // here specifically.
+            assert_listener_drained(&listener);
             drop(listener);
-            assert_listener_released(&cx, deadline, address).await;
         });
     }
 
@@ -1022,9 +1025,63 @@ mod tests {
             let deadline = operation_deadline(&cx, Duration::from_millis(20)).unwrap();
             let outcome = wait_for_code(&cx, deadline, &listener, address, &attempt, &config()).await;
             assert_eq!(outcome, Err(OAuthError::TimedOut));
+            // No port probe here. This test binds and drops its own listener, so
+            // its release is guaranteed by ownership, not by anything
+            // `wait_for_code` does - see `assert_listener_drained`. The subject of
+            // this test is the deadline expiring without peer traffic, which the
+            // `TimedOut` assertion above proves completely. A port probe could
+            // only ever add a false positive.
             drop(listener);
-            assert_listener_released(&cx, setup_deadline, address).await;
         });
+    }
+
+    /// Observes THIS listener directly: no further connection is pending on it.
+    ///
+    /// # Why the port probe was the wrong instrument in the tests that use this
+    ///
+    /// A bind probe asks a question about the **port namespace**, which is shared
+    /// with every other test in this binary. That is the right question when the
+    /// listener is owned by something we cannot inspect - the `authorize` future
+    /// in `dropping_public_login_future_closes_its_bound_callback_listener` - and
+    /// it stays a bind probe there.
+    ///
+    /// It is the wrong question when the TEST itself binds and drops the
+    /// listener, as the two callers of this helper do. There, release is
+    /// guaranteed by ownership: `wait_for_code` takes `&TcpListener`, so the
+    /// borrow checker forbids it retaining one, and `asupersync`'s `TcpListener`
+    /// has no `Drop` of its own and closes its `std::net::TcpListener` descriptor
+    /// synchronously. A port probe in that position cannot fail for a real
+    /// reason - only when a concurrent test wins the freed ephemeral port, which
+    /// is what happened in wave-12b.
+    ///
+    /// A probe that can only produce false positives is worse than no probe: it
+    /// fails on schedule, gets dismissed as flake, and trains everyone to ignore
+    /// the one time it means something.
+    ///
+    /// So this asks a question about **our own listener** instead, which no other
+    /// test can influence: after `wait_for_code` has taken what it needed, is
+    /// anything still queued on it? That is race-free, and it is an OAuth
+    /// property rather than a restatement of Rust ownership.
+    ///
+    /// The probe mints its own context. `poll_accept` returns
+    /// `Ready(Err(Interrupted))` whenever the ambient `Cx` is cancelled, before
+    /// it looks at the accept queue, so a probe inheriting a cancelled caller
+    /// would report a pending connection that does not exist. `Cx::clone` would
+    /// not do - it is an alias sharing the cancelled domain.
+    fn assert_listener_drained(listener: &TcpListener) {
+        let _frame = Cx::set_current(Some(Cx::for_request()));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        match listener.poll_accept(&mut task) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(Ok((_stream, peer))) => panic!(
+                "a connection from {peer} is still queued after the callback was resolved; \
+                 wait_for_code must consume exactly the connections it admits"
+            ),
+            std::task::Poll::Ready(Err(error)) => panic!(
+                "the drained-listener probe is INCONCLUSIVE ({error}); it proves neither that \
+                 the listener is quiet nor that a connection is pending"
+            ),
+        }
     }
 
     /// Asserts the loopback callback listener at `address` is CLOSED, not merely
@@ -1430,24 +1487,7 @@ mod tests {
             // `TcpListener` has no `Drop` of its own, and its `std::net::TcpListener`
             // closes the descriptor in `Drop`. There is nothing to wait for, and a
             // tolerance here would hide precisely the leak being tested.
-            let reclaimed = within(&cx, deadline, async {
-                Ok(TcpListener::bind(address).await.map_err(|error| error.kind()))
-            })
-            .await
-            .expect("the bind probe must resolve within the operation deadline");
-            match reclaimed {
-                Ok(listener) => drop(listener),
-                Err(std::io::ErrorKind::AddrInUse) => panic!(
-                    "{address} is still bound after the login future was dropped. \
-                     Either the callback listener leaked - the defect this test exists \
-                     to catch - or a concurrent test took the port between the drop and \
-                     this bind. Re-run this test alone with --exact to separate them."
-                ),
-                Err(kind) => panic!(
-                    "the bind probe for {address} is INCONCLUSIVE ({kind:?}); it proves \
-                     neither closure nor a leak and must not be read as either"
-                ),
-            }
+            assert_listener_released(&cx, deadline, address).await;
         });
     }
 
