@@ -428,7 +428,8 @@ fn fnd_03_b_unsupported_version_selects_modern_without_downgrading() {
 fn fnd_03_b_bundle_key_binds_every_dimension() {
     /// One bundle with every key dimension supplied explicitly.
     #[allow(clippy::too_many_arguments)]
-    fn bundle(
+    fn bundle_with_policy(
+        policy: ProtocolPolicy,
         modern: &str,
         sse: &str,
         message: &str,
@@ -440,7 +441,7 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
         legacy_receipt_generation: u64,
     ) -> HttpEndpointBundle {
         HttpEndpointBundle::new(
-            ProtocolPolicy::Auto,
+            policy,
             Some(CanonicalHttpUrl::parse(modern).unwrap()),
             Some(CanonicalHttpUrl::parse(sse).unwrap()),
             Some(CanonicalHttpUrl::parse(message).unwrap()),
@@ -451,7 +452,34 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
             configuration_generation,
             legacy_receipt_generation,
         )
-        .expect("a complete Auto bundle must be admitted")
+        .expect("a complete bundle must be admitted")
+    }
+
+    /// The same, pinned to Auto, for the nine non-policy dimensions.
+    #[allow(clippy::too_many_arguments)]
+    fn bundle(
+        modern: &str,
+        sse: &str,
+        message: &str,
+        credential_partition: &str,
+        security_partition: &str,
+        transport_profile: &str,
+        policy_generation: u64,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> HttpEndpointBundle {
+        bundle_with_policy(
+            ProtocolPolicy::Auto,
+            modern,
+            sse,
+            message,
+            credential_partition,
+            security_partition,
+            transport_profile,
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+        )
     }
 
     const MODERN: &str = "https://api.example.test/mcp?tenant=alpha";
@@ -509,21 +537,28 @@ fn fnd_03_b_bundle_key_binds_every_dimension() {
         );
     }
 
-    // The tenth dimension is the policy itself.
-    let modern_only = HttpEndpointBundle::new(
+    // The tenth dimension is the policy itself. `new` requires targets but
+    // never rejects extra ones, so this variant supplies all three exactly as
+    // the baseline does and differs in the policy field alone. Dropping the
+    // legacy targets here would also have produced a distinct key, but for
+    // three reasons at once, which would not have isolated the policy.
+    let modern_only = bundle_with_policy(
         ProtocolPolicy::ModernOnly,
-        Some(CanonicalHttpUrl::parse(MODERN).unwrap()),
-        None,
-        None,
-        "cred-a".to_owned(),
-        "sec-a".to_owned(),
-        "http-sse-v2".to_owned(),
+        MODERN,
+        SSE,
+        MESSAGE,
+        "cred-a",
+        "sec-a",
+        "http-sse-v2",
         3,
         7,
         11,
-    )
-    .expect("a ModernOnly bundle needs only its modern target");
-    assert_ne!(baseline.key(), modern_only.key(), "policy must discriminate");
+    );
+    assert_ne!(
+        baseline.key(),
+        modern_only.key(),
+        "policy alone must discriminate the bundle key"
+    );
 
     // Every variant is distinct from every other, not merely from the
     // baseline: two dimensions must not alias onto one another.
