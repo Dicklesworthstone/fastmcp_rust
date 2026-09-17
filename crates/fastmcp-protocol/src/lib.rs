@@ -52,6 +52,7 @@ pub mod protocol_policy;
 pub mod protocol_version;
 mod result;
 pub mod schema;
+pub mod security_admission;
 pub mod server_discovery;
 #[cfg(feature = "tasks")]
 pub mod tasks_extension;
@@ -123,6 +124,17 @@ pub use schema::{
     AdmittedFinalFormSchema, AdmittedSchema, FinalCoreResultType, SchemaAdmissionError,
     ValidationError, ValidationResult, admit_final_form_schema, admit_final_schema, validate,
     validate_final_core_result, validate_strict,
+};
+pub use security_admission::{
+    ADMITTED_RSA_PUBLIC_EXPONENT, AdmittedCompactJws, AdmittedRsaPublicJwk, CompactJwsProfile,
+    JwkAdmissionPolicy, JwkThumbprintSha256, JwsProtectedHeader, MAX_CLIENT_ID_METADATA_BYTES,
+    MAX_CLIENT_REGISTRATION_BYTES, MAX_COMPACT_JWS_ENCODED_BYTES, MAX_JWK_BYTES, MAX_JWK_KID_BYTES,
+    MAX_JWK_SET_BYTES, MAX_JWK_SET_KEYS, MAX_JWS_CLAIMS_BYTES, MAX_JWS_PROTECTED_HEADER_BYTES,
+    MAX_JWS_SIGNATURE_BYTES, MAX_OAUTH_METADATA_BYTES, MAX_OIDC_PROVIDER_METADATA_BYTES,
+    MAX_PROTECTED_RESOURCE_METADATA_BYTES, MAX_RFC7638_CANONICAL_INPUT_BYTES,
+    MAX_RSA_MODULUS_BYTES, MAX_TOKEN_RESPONSE_BYTES, MIN_RSA_MODULUS_BYTES, SecurityAdmissionError,
+    SecurityDocumentKind, admit_compact_jws, admit_public_jwk_set, admit_public_rsa_components,
+    admit_public_rsa_jwk, admit_security_document, admit_security_document_object,
 };
 pub use server_discovery::{
     DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
