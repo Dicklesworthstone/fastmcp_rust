@@ -1022,14 +1022,30 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         assert_eq!(response.status, HttpStatus::OK);
         let state = probe.snapshot();
         assert_eq!(state.handler_calls, 2);
+        // THIRD instance of the pre-75099bf1 premise, repaired 2026-09-17
+        // alongside the two above. This expected
+        // ["Bearer:true", "absent:false", "Bearer:true"].
+        //
+        // The middle entry is gone BY DERIVATION, not by shrinking a vector
+        // until it matched a run. `observed_credentials` gains one entry per
+        // PROVIDER INVOCATION (:222), and this test makes three requests:
+        //   1. credentialed   -> provider consulted      -> "Bearer:true"
+        //   2. uncredentialed -> refused at lib.rs:19893
+        //                        BEFORE the provider     -> nothing recorded
+        //   3. recovered      -> provider consulted      -> "Bearer:true"
+        // Two entries, and the vector's LENGTH is itself the proof that the
+        // uncredentialed request never reached the provider.
+        //
+        // `handler_calls == 2` above is the independent discriminator that the
+        // third request was really SERVED and not merely re-extracted: an
+        // implementation that re-ran extraction but declined to dispatch would
+        // produce this identical vector and fail there instead.
         assert_eq!(
             state.observed_credentials,
-            vec![
-                "Bearer:true".to_owned(),
-                "absent:false".to_owned(),
-                "Bearer:true".to_owned()
-            ],
-            "the recovered admission must re-extract the credential from the wire"
+            vec!["Bearer:true".to_owned(), "Bearer:true".to_owned()],
+            "the recovered admission must re-extract the credential from the wire; two entries \
+             with no absence marker is what proves the uncredentialed request was refused at \
+             the transport guard rather than recorded as an absent credential"
         );
     });
 }
