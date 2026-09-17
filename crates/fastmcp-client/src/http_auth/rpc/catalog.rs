@@ -43,6 +43,9 @@ use crate::cache::{
 };
 use crate::http_auth::BoundBearerCredential;
 
+/// Subscription-driven full-catalog reconciliation with bounded restart policy.
+pub mod watch;
+
 /// One budget spanning all pages, notifications, cache hits and host callbacks.
 /// `core` supplies the request/frame/cumulative-payload/notification/time bounds.
 /// State bytes account encoded IDs and decoded opaque cursors; their counts are
