@@ -15,7 +15,7 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, SERVER_DISCOVER_METHOD,
 };
-use fastmcp_protocol::{JsonRpcRequest, MAX_SERVER_INSTRUCTIONS_BYTES};
+use fastmcp_protocol::{JsonRpcRequest, MAX_SERVER_INSTRUCTIONS_BYTES, ServerDiscoverResult};
 use fastmcp_server::ServerHttpEndpointResponse;
 use fastmcp_server::{
     FinalToolOutcome, InboundRequestContext, InboundRequestTransport, Server, ToolHandler,
@@ -260,6 +260,113 @@ fn srv_02_b_positive() {
     assert!(first_result["capabilities"].get("subscriptions").is_none());
     assert!(first_result.get("extensions").is_none());
 
+    // "Capabilities exactly match enabled behavior" and "discovery reflects
+    // runtime policy, not compile-time possibility" are claims about AGREEMENT
+    // between two independent derivations from registration: the behavior
+    // registry that builds `capabilities` (router.rs server_discovery_behavior_registry,
+    // consulted in exactly one production place to author the advertisement)
+    // and the dispatch table, which never reads that registry. Asserting the
+    // advertisement alone, as the checks above do, cannot fail interestingly —
+    // it restates the derivation instead of testing it.
+    //
+    // This is the load-bearing proof: two servers from the same binary with
+    // the same name and the same instructions, differing ONLY in whether a
+    // tool was registered. A hard-coded or compile-time-derived capability set
+    // advertises identically for both and fails here.
+    let toolless = Server::new("discoverable-server", "1.0.0")
+        .instructions("")
+        .build();
+    let toolless_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 407, InboundRequestTransport::Stdio);
+    let toolless_discover = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        407_i64,
+    );
+    let toolless_result = toolless
+        .dispatch_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &toolless_inbound,
+            &toolless_discover,
+        )
+        .expect("tool-less discovery request has an id")
+        .result
+        .expect("tool-less discovery succeeds");
+    assert!(
+        toolless_result["capabilities"].get("tools").is_none(),
+        "an unregistered behavior must be absent from the advertisement, not \
+         encoded as a placeholder: {}",
+        toolless_result["capabilities"]
+    );
+    assert_ne!(
+        toolless_result["capabilities"], first_result["capabilities"],
+        "the advertised capabilities did not follow runtime registration"
+    );
+
+    // Corroborating direction: advertised => dispatchable. The registry admits
+    // a tool only when it carries a final registration, while dispatch reads
+    // the catalog, so the two can disagree. The server that advertised `tools`
+    // must actually serve tools/list with that exact tool, and the one that did
+    // not advertise it must not serve it either.
+    // `u32` so the one request identity converts losslessly to both the
+    // sanitized ingress `u64` and the JSON-RPC `i64` without a fallible cast.
+    let listed_tool_names = |server: &Server, id: u32| -> Vec<String> {
+        let inbound = InboundRequestContext::new(
+            Cx::for_testing(),
+            u64::from(id),
+            InboundRequestTransport::Stdio,
+        );
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(json!({
+                "_meta": {
+                    FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            i64::from(id),
+        );
+        let response = server
+            .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &inbound, &request)
+            .expect("tools/list request has an id");
+        assert!(
+            response.error.is_none(),
+            "discovery advertised tools but tools/list refused: {:?}",
+            response.error
+        );
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("name"))
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let advertised_names = listed_tool_names(&server, 408);
+    assert!(
+        advertised_names.iter().any(|name| name == "discoverable"),
+        "discovery advertised tools but tools/list omitted the registered tool: \
+         {advertised_names:?}"
+    );
+    let unadvertised_names = listed_tool_names(&toolless, 409);
+    assert!(
+        !unadvertised_names.iter().any(|name| name == "discoverable"),
+        "a server that never advertised tools dispatched one anyway: \
+         {unadvertised_names:?}"
+    );
+
     let instructionless = Server::new("discoverable-server", "1.0.0")
         .tool(Discoverable)
         .build();
@@ -420,6 +527,36 @@ fn srv_02_i_positive() {
         json!("discoverable-integration")
     );
     assert!(result["capabilities"].get("tools").is_some());
+
+    // The integration claim is the join: B's server composition must emit
+    // exactly the typed contract A defines. Every assertion above stays inside
+    // serde_json and so cannot show the two slices agree — a server emitting a
+    // field A's type does not model, or omitting one A requires, would satisfy
+    // all of them. Decoding the live wire result with A's public type, and
+    // requiring the re-encode to reproduce the server's bytes exactly, is what
+    // actually binds the A contract to the B runtime.
+    let typed: ServerDiscoverResult = serde_json::from_value(result.clone())
+        .expect("the server's live discovery result must decode as the typed SRV-02 A contract");
+    assert_eq!(typed.result_type(), "complete");
+    assert_eq!(
+        typed
+            .supported_versions()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [MODERN_PROTOCOL_VERSION],
+        "the typed contract must carry the same final-only version list as the wire"
+    );
+    assert_eq!(
+        typed.peer_diagnostic(),
+        None,
+        "a locally authored discovery result must need no peer-compatibility diagnostic"
+    );
+    assert_eq!(
+        serde_json::to_value(&typed).expect("typed discovery result re-encodes"),
+        result,
+        "the typed SRV-02 A contract did not round-trip the server's own discovery bytes"
+    );
 }
 
 #[test]
