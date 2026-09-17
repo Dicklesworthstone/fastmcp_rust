@@ -3066,8 +3066,19 @@ mod tests {
         );
     }
 
+    // These four deliberately do NOT carry the frozen PRT-02 A/B acceptance
+    // IDs, for the same two reasons the FND-03 family records in lib.rs. A
+    // `cfg(test)` function cannot prove shipped behavior (PL-3), and a frozen
+    // ID must resolve to exactly one definition workspace-wide (PL-1) so that
+    // `cargo test <id> -- --exact` discovers exactly one test. Before this
+    // rename each of `prt_02_a_positive`, `prt_02_a_planted_negative`,
+    // `prt_02_b_positive` and `prt_02_b_planted_negative` had two definitions
+    // — one here and one in the external public-surface consumer — so an
+    // exact-set run discovered two rows per required ID. The frozen pairs live
+    // in `crates/fastmcp-protocol/tests/prt_02_common_types.rs`; these retain
+    // their assertions as in-crate coverage.
     #[test]
-    fn prt_02_a_positive() {
+    fn prt_02_a_unit_positive() {
         let implementation = Implementation::try_new("fastmcp", "0.1.0").expect("implementation");
         let metadata = OpenMetadata::try_from_entries([
             ("".to_owned(), json!("empty name is valid")),
@@ -3118,7 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_02_a_planted_negative() {
+    fn prt_02_a_unit_planted_negative() {
         let accepted = OpenMetadata::try_from_entries([(
             "com.example/valid".to_owned(),
             json!({"kept": true}),
@@ -3187,7 +3198,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_02_b_positive() {
+    fn prt_02_b_unit_positive() {
         let request = json!({
             "_meta": {
                 "com.example/future": {"nullIsData": null},
@@ -3630,7 +3641,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_02_b_planted_negative() {
+    fn prt_02_b_unit_planted_negative() {
         let accepted = json!({
             "_meta": {
                 "com.example/future": {"kept": true},
