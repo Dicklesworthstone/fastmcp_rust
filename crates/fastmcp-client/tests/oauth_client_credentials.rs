@@ -6,6 +6,9 @@
 #[cfg(feature = "tasks")]
 #[path = "oauth_client_credentials/tasks.rs"]
 mod tasks;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "oauth_client_credentials/private_key_jwt.rs"]
+mod private_key_jwt;
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
