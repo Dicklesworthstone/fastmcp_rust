@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use fastmcp_core::McpRequestCancellation;
+
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
 /// Shared OAuth renewal and authenticated modern HTTP dispatch.
@@ -69,12 +71,14 @@ impl std::error::Error for BearerBindingError {}
 ///
 /// Clones share local revocation state. Dropping one clone does not revoke
 /// the others; explicit [`Self::revoke`] is irreversible for this lineage.
+/// Owner-bound clones additionally retain their owner's cancellation signal.
 #[derive(Clone)]
 pub struct BoundBearerCredential {
     resource: CanonicalHttpUrl,
     token: String,
     expires_at: Option<Instant>,
     revoked: Arc<AtomicBool>,
+    owner_cancellation: Option<McpRequestCancellation>,
 }
 
 impl fmt::Debug for BoundBearerCredential {
@@ -118,6 +122,7 @@ impl BoundBearerCredential {
             token,
             expires_at: None,
             revoked: Arc::new(AtomicBool::new(false)),
+            owner_cancellation: None,
         })
     }
 
@@ -132,6 +137,26 @@ impl BoundBearerCredential {
         let mut credential = Self::bind(resource, token)?;
         credential.expires_at = Some(expires_at);
         Ok(credential)
+    }
+
+    /// Creates a credential clone additionally bound to an owner's lifetime.
+    /// Cancelling `owner` stops subsequent header construction by that clone
+    /// and its descendants, without cancelling the source unowned credential.
+    /// Token-local revocation remains shared with the source.
+    ///
+    /// Returns `None` when this credential already has an owner. Reparenting
+    /// would remove the first owner's future revocation, so it is never
+    /// permitted, even when the replacement owner is currently active.
+    /// Binding an already-cancelled owner produces a revoked clone, not a
+    /// fresh credential. No network revocation request is performed.
+    #[must_use]
+    pub fn for_owner(&self, owner: &McpRequestCancellation) -> Option<Self> {
+        if self.owner_cancellation.is_some() {
+            return None;
+        }
+        let mut credential = self.clone();
+        credential.owner_cancellation = Some(owner.clone());
+        Some(credential)
     }
 
     /// Returns the bound HTTPS resource.
@@ -157,11 +182,14 @@ impl BoundBearerCredential {
         self.revoked.store(true, Ordering::Release);
     }
 
-    /// Returns whether this credential lineage has been locally revoked.
-    /// Expiry is a separate condition and does not set this flag.
+    /// Returns whether this credential lineage has been locally revoked or
+    /// its owner has cancelled. Expiry remains a separate condition.
     #[must_use]
     pub fn is_revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+            || self.owner_cancellation.as_ref().is_some_and(
+                McpRequestCancellation::is_cancel_requested,
+            )
     }
 
     /// Returns the `Authorization` header value for `target`, or `None`
@@ -378,5 +406,42 @@ mod tests {
         credential.revoke();
         revoked.send(()).unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn owner_cancellation_cannot_be_removed_by_cloning_or_reparenting() {
+        use fastmcp_core::McpRequestCancellation;
+
+        let resource = url("https://mcp.example/api");
+        let source = BoundBearerCredential::bind(resource.clone(), "secret").unwrap();
+        let owner = McpRequestCancellation::new();
+        let other = McpRequestCancellation::new();
+        let owned = source.for_owner(&owner).unwrap();
+        let clone = owned.clone();
+        assert!(owned.for_owner(&other).is_none());
+        assert_eq!(owned.authorization_for_target(&resource), Some("Bearer secret".to_owned()));
+        owner.cancel();
+        for candidate in [&owned, &clone] {
+            assert!(candidate.is_revoked());
+            assert_eq!(candidate.authorization_for_target(&resource), None);
+            assert!(candidate.for_owner(&other).is_none());
+        }
+        assert!(!source.is_revoked());
+        assert_eq!(source.authorization_for_target(&resource), Some("Bearer secret".to_owned()));
+        assert!(source.for_owner(&owner).unwrap().is_revoked());
+    }
+
+    #[test]
+    fn token_revocation_survives_binding_to_a_new_owner() {
+        use fastmcp_core::McpRequestCancellation;
+
+        let resource = url("https://mcp.example/api");
+        let source = BoundBearerCredential::bind(resource.clone(), "secret").unwrap();
+        let owner = McpRequestCancellation::new();
+        source.revoke();
+        let owned = source.for_owner(&owner).unwrap();
+        assert!(owned.is_revoked());
+        assert_eq!(owned.authorization_for_target(&resource), None);
+        assert!(!owner.is_cancel_requested());
     }
 }
