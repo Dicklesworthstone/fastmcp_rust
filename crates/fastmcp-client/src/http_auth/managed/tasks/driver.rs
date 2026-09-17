@@ -16,7 +16,7 @@ use asupersync::Cx;
 use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, Sha256Digest, sha256_bounded};
-use fastmcp_protocol::CorrelationKey;
+use fastmcp_protocol::{CorrelationKey, FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FINAL_CLIENT_CAPABILITIES_META_KEY};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
 
 use super::{
@@ -53,9 +53,10 @@ impl ManagedTaskDriverPolicy {
     /// Polling never runs faster than either this nonzero local floor or the
     /// latest peer `pollIntervalMs`. A huge peer interval is not shortened to
     /// fit the run: the overall deadline expires instead of an early new POST.
-    /// Zero updates/input keys provides an explicit observation-only budget.
-    /// State bytes bound encoded request identities and retained input-key
-    /// fingerprints, not allocator overhead. Counts bound that overhead too.
+    /// Zero updates provides an explicit observation-only budget; the input
+    /// key budget is unused in that mode. State bytes bound encoded request
+    /// identities and retained input-key fingerprints, not allocator overhead.
+    /// Counts bound that overhead too.
     pub fn new(
         minimum_poll_interval: Duration,
         timeout: Duration,
@@ -109,6 +110,7 @@ pub enum ManagedTaskDriverError {
     RepeatedRequestId,
     InvalidInputResponse,
     InputKeyReused,
+    CapabilityNotAdvertised,
     UnexpectedResponse,
     AbortedByHost,
     Task(ManagedTasksError),
@@ -127,6 +129,7 @@ impl fmt::Display for ManagedTaskDriverError {
             Self::RepeatedRequestId => "managed Task driver request identity already used",
             Self::InvalidInputResponse => "host answers do not match unresolved Task input",
             Self::InputKeyReused => "Task reused an answered input key with a different descriptor",
+            Self::CapabilityNotAdvertised => "Task input requires an unadvertised client capability",
             Self::UnexpectedResponse => "managed Task driver received an unexpected result",
             Self::AbortedByHost => "managed Task driver stopped by its host",
             Self::Task(_) => unreachable!(),
@@ -149,9 +152,12 @@ impl ManagedTasksClient {
     /// aliases. The resolver sees only input keys not successfully acknowledged
     /// earlier in this run. An unchanged stale input snapshot therefore cannot
     /// cause duplicate resolver work or a duplicate update. Reusing an answered
-    /// key with a different descriptor fails rather than approving new input.
+    /// key with a different serialized descriptor fails rather than approving
+    /// new input. Descriptor fingerprints are representation-sensitive.
     ///
     /// Observers run once per admitted snapshot, including unchanged snapshots.
+    /// Automatic roots, sampling/tools/context and form/URL elicitation require
+    /// the corresponding capability in this client's immutable metadata.
     /// Neither observer nor resolver errors are retried. After an uncertain
     /// update, the driver returns an error and performs no further get/update.
     /// Starting another driver is an explicit new operation with no exactly-once
@@ -230,14 +236,15 @@ impl ManagedTasksClient {
                         return Ok(ManagedTaskRunOutcome::Terminal(Box::new(task)));
                     }
                     let Task::InputRequired { input_requests, .. } = &task else { continue };
-                    let (pending, fingerprints) = state.unanswered(input_requests, policy)?;
-                    if pending.is_empty() { continue; }
-                    // Observation-only policy returns the challenge without
-                    // invoking a resolver or spending an input-update budget.
+                    // Observation-only mode cannot invoke input handlers, even
+                    // when the configured input-key budget is zero.
                     if policy.maximum_updates == 0 {
                         return Ok(ManagedTaskRunOutcome::InputRequired(Box::new(task)));
                     }
+                    let (pending, fingerprints) = state.unanswered(input_requests, policy)?;
+                    if pending.is_empty() { continue; }
                     if updates >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit); }
+                    admit_capabilities(&self.metadata, &pending)?;
                     let resolution = resolve(pending.clone());
                     self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
                     let action = resolution.await?;
@@ -256,6 +263,9 @@ impl ManagedTasksClient {
                     let ids = next_ids()?;
                     self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
                     state.reserve_ids(&ids, policy.maximum_state_bytes)?;
+                    // Include the newly reserved IDs before verifying that an
+                    // acknowledged update can fit our retained input ledger.
+                    state.answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
                     updates += 1;
                     let mut call = self.request_with_cancellation(cx, cancellation, ids, update).await?;
                     if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Updated(_))) {
@@ -339,7 +349,7 @@ impl DriverState {
         Ok((pending, fingerprints))
     }
 
-    fn record_answers(&mut self, keys: &[String], fingerprints: &BTreeMap<String, Sha256Digest>, maximum: usize) -> Result<(), ManagedTaskDriverError> {
+    fn answer_bytes(&self, keys: &[String], fingerprints: &BTreeMap<String, Sha256Digest>, maximum: usize) -> Result<usize, ManagedTaskDriverError> {
         let mut bytes = self.retained_bytes;
         for key in keys {
             if self.answered.contains_key(key) || !fingerprints.contains_key(key) {
@@ -349,6 +359,11 @@ impl DriverState {
                 .ok_or(ManagedTaskDriverError::StateByteLimit)?;
         }
         if bytes > maximum { return Err(ManagedTaskDriverError::StateByteLimit); }
+        Ok(bytes)
+    }
+
+    fn record_answers(&mut self, keys: &[String], fingerprints: &BTreeMap<String, Sha256Digest>, maximum: usize) -> Result<(), ManagedTaskDriverError> {
+        let bytes = self.answer_bytes(keys, fingerprints, maximum)?;
         for key in keys { self.answered.insert(key.clone(), fingerprints[key].clone()); }
         self.retained_bytes = bytes;
         Ok(())
@@ -361,6 +376,31 @@ fn validate_answers(requests: &TaskInputRequests, responses: &TaskInputResponses
     }
     TaskInputLedger::from_requests(requests).and_then(|ledger| ledger.validate_responses(responses))
         .map_err(|_| ManagedTaskDriverError::InvalidInputResponse)
+}
+
+fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests) -> Result<(), ManagedTaskDriverError> {
+    let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
+    for request in requests.values() {
+        let advertised = match request {
+            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
+            FinalEmbeddedInputRequest::Sampling(_) => {
+                let wire = serde_json::to_value(request).map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?;
+                let sampling = &capabilities["sampling"];
+                sampling.is_object()
+                    && (wire["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
+                    && (wire["params"].get("includeContext").is_none_or(|context| context == "none")
+                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
+            }
+            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
+                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object)
+            }
+            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
+                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object)
+            }
+        };
+        if !advertised { return Err(ManagedTaskDriverError::CapabilityNotAdvertised); }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,5 +506,30 @@ mod tests {
             (second, second, 1, 1, 4097, 1024),
             (second, second, 1, 1, 1, 0),
         ] { assert!(ManagedTaskDriverPolicy::new(delay, timeout, polls, updates, inputs, bytes).is_err()); }
+    }
+
+    #[test]
+    fn input_capabilities_are_admitted_before_automatic_resolution() {
+        let absent = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{}});
+        let roots = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{}}});
+        assert!(matches!(admit_capabilities(&absent, &inputs()), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        assert!(admit_capabilities(&roots, &inputs()).is_ok());
+        let sampling = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":1,"includeContext":"allServers"}}})).unwrap();
+        let plain = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{}}});
+        let context = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"context":{}}}});
+        assert!(matches!(admit_capabilities(&plain, &sampling), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        assert!(admit_capabilities(&context, &sampling).is_ok());
+    }
+
+    #[test]
+    fn update_identity_bytes_cannot_displace_acknowledged_input_custody() {
+        let mut state = DriverState::default();
+        let policy = ManagedTaskDriverPolicy::default();
+        let (_, fingerprints) = state.unanswered(&inputs(), policy).unwrap();
+        let exact = "one".len() + 32;
+        assert!(state.answer_bytes(&["one".to_owned()], &fingerprints, exact).is_ok());
+        state.reserve_ids(&ids(3, 4), exact).unwrap();
+        assert!(matches!(state.answer_bytes(&["one".to_owned()], &fingerprints, exact), Err(ManagedTaskDriverError::StateByteLimit)));
+        assert!(state.answered.is_empty());
     }
 }
