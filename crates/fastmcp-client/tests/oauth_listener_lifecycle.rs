@@ -138,18 +138,55 @@ fn callback_address(authorization: &CanonicalHttpUrl) -> SocketAddr {
 ///
 /// The same argument and the same pair live at
 /// `fastmcp-client/src/http_auth/oauth.rs` (`assert_listener_bound` /
-/// `assert_listener_released`) for the internal unit test. They cannot share
-/// code across the crate boundary without putting a test helper on the public
-/// surface, so if you change the concurrency argument here, change it there.
-fn assert_listener_released(address: SocketAddr) {
+/// `probe_listener_released`, with the same `RELEASE_TRIALS`) for the internal
+/// unit test. They cannot share code across the crate boundary without putting
+/// a test helper on the public surface, so if you change the concurrency
+/// argument here, change it there. Both were changed together in the wave-50
+/// repair; neither is the authority on its own.
+/// What one release trial observed. `StillBound` is deliberately NOT a panic: a
+/// single trial cannot distinguish a leak from a stolen port, and the caller
+/// resolves that by repeating the whole experiment.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseTrial {
+    /// The bind succeeded, so nothing holds the port. The descriptor was
+    /// closed. One such observation is conclusive on its own.
+    Released,
+    /// The port was still held. Either the listener leaked or a concurrent
+    /// ephemeral bind won it inside the straight-line window.
+    StillBound,
+}
+
+/// Number of independent release trials before a leak is declared.
+///
+/// Sized against the two hypotheses, not against a clock. A leaked listener
+/// fails EVERY trial - the close is unconditional, so a leak is not a
+/// probabilistic event. A thief must win a fresh, kernel-assigned ephemeral port
+/// on each trial, so the chance of a clean run failing throughout is the
+/// per-trial probability raised to the fifth power.
+const RELEASE_TRIALS: usize = 5;
+
+/// Runs ONE release trial and reports what it saw.
+///
+/// Everything the old assertion did, it still does: `std::net`'s blocking bind
+/// with no `.await` between the drop and the syscall, no sleep, no timing
+/// tolerance, no `SO_REUSEADDR`, no `SO_REUSEPORT`. Only the reporting changed -
+/// an ambiguous single observation is returned rather than thrown, because it is
+/// resolvable by repetition instead of by tolerance.
+///
+/// This is not a retry in the forbidden sense. A retry would re-observe THE SAME
+/// port after a delay, which is the tolerance that would hide a slow close. Each
+/// trial re-runs the entire experiment from a fresh `authorize` on a fresh
+/// ephemeral port, so the trials are independent samples of one property.
+///
+/// The unexpected-errno arm still fails immediately and is never retried: an
+/// unrecognised error is not a race.
+fn probe_listener_released(address: SocketAddr) -> ReleaseTrial {
     match std::net::TcpListener::bind(address) {
-        Ok(listener) => drop(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => panic!(
-            "{address} is still bound after the public login future was dropped, and the bind \
-             was issued with no await between it and the drop. Either the callback listener \
-             leaked - the defect this proves against - or a concurrent test on another thread \
-             took the port inside that straight-line window."
-        ),
+        Ok(listener) => {
+            drop(listener);
+            ReleaseTrial::Released
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => ReleaseTrial::StillBound,
         Err(error) => panic!(
             "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither closure \
              nor a leak and must not be read as either"
@@ -162,8 +199,9 @@ fn assert_listener_released(address: SocketAddr) {
 /// This is the control that gives the positive its meaning: a bind probe that
 /// could never fail would prove nothing, so this proves the probe can in fact
 /// observe a live listener.
-/// Synchronous for the same reason as [`assert_listener_released`], though this
-/// direction cannot be stolen in any case: we hold the port.
+/// Synchronous for the same reason as [`probe_listener_released`], though this
+/// direction cannot be stolen in any case: we hold the port. It needs no trial
+/// loop for that same reason - there is no race for it to lose.
 fn assert_listener_still_bound(address: SocketAddr) {
     match std::net::TcpListener::bind(address) {
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
@@ -252,16 +290,39 @@ fn oauth_callback_listener_is_released_when_the_public_login_future_is_dropped()
         .block_on(async {
             let cx = Cx::current().expect("the caller runtime installs a current Cx");
             let client = OAuthClient::new(configuration());
-            let (login, address) = login_until_bound(&client, &cx).await;
+            // Each iteration is a COMPLETE, independent experiment: its own
+            // login, its own listener, its own kernel-assigned ephemeral port.
+            // A leaked listener fails all of them; a port thief would have to
+            // win a different port every time.
+            let mut still_bound = Vec::new();
+            let mut released = false;
+            for _ in 0..RELEASE_TRIALS {
+                let (login, address) = login_until_bound(&client, &cx).await;
+
+                assert!(
+                    address.ip().is_loopback(),
+                    "the shipped client must bind its callback on loopback, observed {address}"
+                );
+
+                // The one variable: the caller abandons the login.
+                drop(login);
+                match probe_listener_released(address) {
+                    ReleaseTrial::Released => {
+                        released = true;
+                        break;
+                    }
+                    ReleaseTrial::StillBound => still_bound.push(address),
+                }
+            }
 
             assert!(
-                address.ip().is_loopback(),
-                "the shipped client must bind its callback on loopback, observed {address}"
+                released,
+                "the public callback listener was still bound after the login future was \
+                 dropped in all {RELEASE_TRIALS} independent trials, on these separately \
+                 assigned ephemeral ports: {still_bound:?}. Each trial issued its bind with no \
+                 await between it and the drop. A concurrent test can steal one freed port; it \
+                 cannot steal {RELEASE_TRIALS} different ones in a row. The listener leaked."
             );
-
-            // The one variable: the caller abandons the login.
-            drop(login);
-            assert_listener_released(address);
         });
 }
 
