@@ -7763,7 +7763,7 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
 
     let response = runtime_block_on_bounded(
         &cx,
-        client.request(&cx, "tools/list", json!({ "cursor": null })),
+        client.request(&cx, "tools/list", json!({})),
     )
     .expect("the Auto-selected modern connection serves requests");
     let ClientHttpResponse::Modern(response) = response else {
@@ -7805,7 +7805,7 @@ fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
     );
     let response = runtime_block_on_bounded(
         &cx,
-        client.request(&cx, "tools/list", json!({ "cursor": null })),
+        client.request(&cx, "tools/list", json!({})),
     )
     .expect("the selected ModernOnly connection serves tools/list");
     let ClientHttpResponse::Modern(response) = response else {
@@ -8019,7 +8019,7 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
                     "overlapping modern tools/list response",
                     async {
                         let response = client
-                            .request(&cx, "tools/list", json!({ "cursor": null }))
+                            .request(&cx, "tools/list", json!({}))
                             .await
                             .map_err(|error| {
                                 format!("the modern tools/list request failed: {error}")
