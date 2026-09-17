@@ -713,3 +713,171 @@ fn auth_01_a_admission_does_not_license_a_later_in_band_credential() {
         assert_admitted(&probe, &response, 1);
     });
 }
+
+/// The OTHER refusal limb. Supplementary, not a frozen ID.
+///
+/// The shipped extractor refuses on two distinct grounds, and the frozen
+/// negative exercises only the first:
+///
+/// - `native_http_credential_location_rejection` — a credential outside the
+///   `Authorization` header. 401, challenge, and a JSON migration diagnostic.
+/// - `native_http_authentication_rejection` — credential AMBIGUITY, raised by
+///   `singleton.replace(..).is_some()`. 401, challenge, and **no body**.
+///
+/// `HttpRequest::headers` is a `HashMap<String, String>`, so a duplicate header
+/// *name* is impossible — but the extractor matches with `eq_ignore_ascii_case`,
+/// so `authorization` and `Authorization` are two distinct entries that both
+/// match. That is reachable by any consumer, and it is the dangerous shape: a
+/// server that resolved the pair instead of refusing would pick a credential by
+/// `HashMap` iteration order, i.e. NONDETERMINISTICALLY, and would therefore
+/// fail only intermittently in exactly the way nobody debugs.
+///
+/// The empty body is the discriminator. Asserting only the status would let a
+/// server collapse both limbs into one diagnostic and still pass.
+#[test]
+fn auth_01_a_ambiguous_authorization_headers_are_refused_before_any_provider_call() {
+    run_auth_01_scenario(|cx| async move {
+        let probe = Auth01Probe::new();
+        let endpoint = auth_01_endpoint(&probe);
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("the public HTTP session must open");
+
+        let before = probe.snapshot();
+        let before_bytes = before.canonical_bytes();
+
+        // A second credential that must never be chosen. It is deliberately not
+        // the probe's token, so "which one won" is answerable from the receipt.
+        let rival = "Bearer auth-01-a-rival-credential";
+        let mut request =
+            auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader);
+        // The builder writes the lowercase name; this is a SECOND, distinct map
+        // entry that still matches the extractor's case-insensitive compare.
+        request
+            .headers
+            .insert("Authorization".to_owned(), rival.to_owned());
+        assert_eq!(
+            request
+                .headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("authorization"))
+                .count(),
+            2,
+            "the ambiguity this case exists to prove must actually be present in the request"
+        );
+
+        let response = immediate(
+            session
+                .handle_async(&cx, request)
+                .await
+                .expect("an ambiguous credential is an ordinary HTTP refusal"),
+        );
+
+        assert_eq!(
+            response.status,
+            HttpStatus::UNAUTHORIZED,
+            "two Authorization headers must not be silently resolved to one"
+        );
+        assert_eq!(
+            response.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer"),
+            "the ambiguity refusal must remain a bounded bearer challenge"
+        );
+        assert!(
+            response.body.is_empty(),
+            "the ambiguity refusal carries no body; a JSON migration diagnostic here would \
+             mean the two refusal limbs have been collapsed into one"
+        );
+
+        // Refused BEFORE the provider ran - the status alone cannot show this.
+        let after = probe.snapshot();
+        assert_eq!(
+            after, before,
+            "an ambiguous credential moved named AUTH-01 state"
+        );
+        assert_eq!(
+            after.canonical_bytes(),
+            before_bytes,
+            "an ambiguous credential left state that is not byte-for-byte unchanged"
+        );
+
+        let rendered = String::from_utf8_lossy(&response.body);
+        assert!(
+            !rendered.contains(&probe.token) && !rendered.contains(rival),
+            "the ambiguity refusal reflected a credential"
+        );
+
+        // Still usable: the ambiguity is rejected, not the session.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("an ambiguous credential must not wedge the session"),
+        );
+        assert_admitted(&probe, &response, 0);
+    });
+}
+
+/// Idempotency of refusal. Supplementary, not a frozen ID.
+///
+/// The frozen negative sends each forbidden placement once. That cannot show
+/// whether refusals ACCUMULATE — a server that counted attempts, degraded its
+/// diagnostic, or admitted on a later try would pass it. Repetition of one
+/// identical request is the only way to observe this.
+#[test]
+fn auth_01_a_repeated_identical_refusal_is_idempotent() {
+    run_auth_01_scenario(|cx| async move {
+        let probe = Auth01Probe::new();
+        let endpoint = auth_01_endpoint(&probe);
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("the public HTTP session must open");
+
+        let before = probe.snapshot();
+        let before_bytes = before.canonical_bytes();
+        let mut refusals: Vec<Vec<u8>> = Vec::new();
+
+        for attempt in 0..3 {
+            let response = immediate(
+                session
+                    .handle_async(
+                        &cx,
+                        auth_01_http_request(&probe.token, CredentialPlacement::BodyCredentialOnly),
+                    )
+                    .await
+                    .expect("a credential-location refusal is an ordinary HTTP response"),
+            );
+            assert_credential_location_refusal(&probe, &response);
+            refusals.push(response.body.clone());
+
+            let after = probe.snapshot();
+            assert_eq!(after, before, "refusal {attempt} moved named AUTH-01 state");
+            assert_eq!(
+                after.canonical_bytes(),
+                before_bytes,
+                "refusal {attempt} left state that is not byte-for-byte unchanged"
+            );
+        }
+
+        assert!(
+            refusals.windows(2).all(|pair| pair[0] == pair[1]),
+            "the refusal diagnostic changed across identical attempts, so it carries \
+             attempt-dependent state"
+        );
+
+        // And the repetition still did not wedge the session.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("repeated refusals must not wedge the session"),
+        );
+        assert_admitted(&probe, &response, 0);
+    });
+}
