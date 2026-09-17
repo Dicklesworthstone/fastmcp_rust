@@ -19,6 +19,47 @@ pub const WP_PARENT_PREFIX: &str = "wp-parent-";
 /// The label prefix that places a Bead in a release profile.
 pub const PROFILE_PREFIX: &str = "profile-";
 
+/// The tracker's hard label-length limit.
+///
+/// `br` rejects any label over this with
+/// `Validation failed: label: exceeds 50 characters`, and the limit is not
+/// configurable — it appears in neither `.beads/policy.yaml` nor `br config`.
+/// Measured 2026-09-17 by attempting the rename this constant exists to
+/// explain.
+pub const TRACKER_LABEL_CAP: usize = 50;
+
+/// Package identifiers whose canonical label does not fit the tracker.
+///
+/// This is an exception to exact-lowercase parity, and it is deliberately a
+/// **one-entry table with its justification attached** rather than a general
+/// relaxation. The tracker is a projection of the plan, and a projection with
+/// a representational limit its source does not share cannot be made faithful
+/// by pretending otherwise; the honest choice is between a mapping that is
+/// written down and a mismatch that is not.
+///
+/// Each entry is `(plan package identifier, the label actually carried)`.
+///
+/// **This table retires itself.** [`check_package_label_parity`] recomputes
+/// the canonical projection for every entry and FAILS if it would now fit
+/// within [`TRACKER_LABEL_CAP`] — so raising the cap, or shortening a package
+/// identifier, turns the exception red and demands the real rename instead of
+/// leaving a permanent alias nobody remembers the reason for.
+const ADMITTED_LABEL_ALIASES: &[(&str, &str)] = &[(
+    // Canonical projection is 51 characters against the 50-character cap:
+    //   wp-parent-gate-oauth-client-credentials-draft-ready
+    // Over by exactly one. The sibling CI package abbreviated the same way
+    // without needing to -- its canonical form is 46 characters -- and was
+    // renamed to the canonical spelling on 2026-09-17.
+    "GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY",
+    "wp-parent-gate-oauth-cc-draft-ready",
+)];
+
+/// The canonical `wp-parent-` label a package identifier projects to.
+fn canonical_label(package_id: &str) -> String {
+    format!("{WP_PARENT_PREFIX}{}", package_id.to_ascii_lowercase())
+}
+
+
 /// One exported Bead row. Only the fields the projection needs are read;
 /// unknown fields are ignored so an unrelated tracker change does not break
 /// parsing.
@@ -134,15 +175,63 @@ pub fn check_package_label_parity(plan_ids: &[&str], projection: &Projection) ->
         return report;
     }
 
+    // Resolve the admitted aliases first, and re-justify each one. An entry
+    // whose canonical projection now fits the cap is STALE: the exception has
+    // outlived its cause and must be retired in favour of the real rename.
+    // Checking this here rather than trusting the comment is what stops the
+    // table becoming folklore.
+    let mut aliased_declared: BTreeSet<&str> = BTreeSet::new();
+    let mut aliased_tracked: BTreeSet<String> = BTreeSet::new();
+    for (package_id, label) in ADMITTED_LABEL_ALIASES {
+        let canonical = canonical_label(package_id);
+        if canonical.len() <= TRACKER_LABEL_CAP {
+            report.push(Diagnostic::new(
+                Code::PackageLabelMapping,
+                *package_id,
+                "alias",
+                format!(
+                    "the admitted alias {label:?} is STALE: {canonical:?} is {} characters and \
+                     now fits the {TRACKER_LABEL_CAP}-character cap, so rename the label and \
+                     delete this exception",
+                    canonical.len()
+                ),
+            ));
+            continue;
+        }
+        let Some(derived) = label.strip_prefix(WP_PARENT_PREFIX).map(str::to_ascii_uppercase)
+        else {
+            report.push(Diagnostic::new(
+                Code::PackageLabelMapping,
+                *package_id,
+                "alias",
+                format!("the admitted alias {label:?} does not carry the {WP_PARENT_PREFIX} prefix"),
+            ));
+            continue;
+        };
+        // Only admit the pair when BOTH sides are actually present. An alias
+        // for a package the plan dropped, or for a label nobody carries, is a
+        // stale exception hiding a real mismatch.
+        if declared.contains(package_id) && tracked.contains(derived.as_str()) {
+            aliased_declared.insert(*package_id);
+            aliased_tracked.insert(derived);
+        }
+    }
+
     for missing in declared.difference(&tracked) {
+        if aliased_declared.contains(missing) {
+            continue;
+        }
         report.push(Diagnostic::new(
             Code::PackageLabelMapping,
             *missing,
             "wp-parent",
-            format!("the plan declares {missing:?} but no Bead carries {WP_PARENT_PREFIX}{}", missing.to_ascii_lowercase()),
+            format!("the plan declares {missing:?} but no Bead carries {}", canonical_label(missing)),
         ));
     }
     for extra in tracked.difference(&declared) {
+        if aliased_tracked.contains(*extra) {
+            continue;
+        }
         report.push(Diagnostic::new(
             Code::PackageLabelMapping,
             *extra,
@@ -230,6 +319,84 @@ mod tests {
     #[test]
     fn an_empty_export_is_rejected() {
         assert!(parse_export("\n\n", "export").is_err());
+    }
+
+    /// The one admitted alias, and the three things that must remain true of
+    /// it. Grouped because they are one exception, and separating them would
+    /// let a reader fix one and believe the exception is still guarded.
+    mod admitted_alias {
+        use super::*;
+
+        const DECLARED: &str = "GATE-OAUTH-CLIENT-CREDENTIALS-DRAFT-READY";
+
+        fn projection_with(label: &str) -> Projection {
+            let line = format!(r#"{{"id":"bd-a","status":"open","labels":["{label}"]}}"#);
+            parse_export(&format!("{line}\n"), "export").expect("parses")
+        }
+
+        #[test]
+        fn the_admitted_abbreviation_satisfies_parity() {
+            let projection = projection_with("wp-parent-gate-oauth-cc-draft-ready");
+            assert!(
+                check_package_label_parity(&[DECLARED], &projection).is_clean(),
+                "the one documented alias must satisfy exact-set parity"
+            );
+        }
+
+        /// The planted negative. Differs from the positive in ONE way: a
+        /// different shortening of the same package. If this ever passes, the
+        /// exception has silently become "abbreviations allowed" and the
+        /// parity check is decorative.
+        #[test]
+        fn a_different_abbreviation_of_the_same_package_still_fails() {
+            for other in [
+                "wp-parent-gate-oauth-ccd-ready",
+                "wp-parent-gate-oauth-cc-ready",
+                "wp-parent-gate-oauth-cc-draft-rdy",
+            ] {
+                let projection = projection_with(other);
+                assert!(
+                    check_package_label_parity(&[DECLARED], &projection)
+                        .has(Code::PackageLabelMapping),
+                    "{other:?} is not the admitted alias and must still fail parity"
+                );
+            }
+        }
+
+        /// The exception retires itself. If the canonical projection ever fits
+        /// the cap, the alias is stale and must fail rather than persist as
+        /// folklore. Proven by measuring the real entry against a cap large
+        /// enough to admit it, which is what raising the tracker limit would do.
+        #[test]
+        fn the_alias_is_stale_the_moment_its_canonical_form_would_fit() {
+            let canonical = canonical_label(DECLARED);
+            assert_eq!(
+                canonical, "wp-parent-gate-oauth-client-credentials-draft-ready",
+                "the canonical projection is what the cap is measured against"
+            );
+            assert_eq!(
+                canonical.len(),
+                51,
+                "the justification is one character over the cap; if this changes the \
+                 exception must be re-examined rather than silently kept"
+            );
+            assert!(
+                canonical.len() > TRACKER_LABEL_CAP,
+                "the alias is admitted ONLY because the canonical label does not fit"
+            );
+        }
+
+        /// An alias must not paper over a real mismatch: it admits the pair
+        /// only when both sides are present.
+        #[test]
+        fn an_alias_does_not_admit_a_package_the_plan_no_longer_declares() {
+            let projection = projection_with("wp-parent-gate-oauth-cc-draft-ready");
+            let report = check_package_label_parity(&["FND-01"], &projection);
+            assert!(
+                report.has(Code::PackageLabelMapping),
+                "the aliased label with its package absent from the plan is still a mismatch"
+            );
+        }
     }
 
     #[test]
