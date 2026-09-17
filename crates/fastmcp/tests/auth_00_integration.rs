@@ -954,3 +954,82 @@ fn auth_00_i_planted_negative() {
         "the accepted record survives a refused ingress untouched"
     );
 }
+
+/// Proves the two compile-time revision bindings are load-bearing.
+/// Supplementary coverage, deliberately NOT a frozen acceptance ID.
+///
+/// # Why this test has to exist
+///
+/// Bindings (2) and (4) of `auth_00_integration_manifest_digest` — the A/B
+/// public API revisions and this leaf's own revision — are `include_str!`
+/// constants. They are byte-identical on both sides of every comparison the
+/// frozen tests make, so no assertion in those tests can distinguish a real
+/// digest from a fixed one. Name the worthless implementation first: every
+/// frozen assertion in this file still passes if `source_revision_digest` is
+/// replaced by `|_, _| [0_u8; 32]`. A binding that cannot detect a broken
+/// digest function is not binding anything; it asserts that a constant is
+/// present, which is true by construction.
+///
+/// Each assertion below fails against that worthless implementation, which is
+/// the property that makes them worth writing.
+#[test]
+fn auth_00_integration_revision_bindings_are_falsifiable() {
+    let a_revision =
+        source_revision_digest(b"auth_00_a_public_api-v1", &AUTH_00_A_PUBLIC_API_SOURCE);
+    let b_revision =
+        source_revision_digest(b"auth_00_b_public_api-v1", &AUTH_00_B_PUBLIC_API_SOURCE);
+    let integration_revision = source_revision_digest(
+        b"auth_00_integration_revision-v1",
+        &[(
+            "crates/fastmcp/tests/auth_00_integration.rs",
+            AUTH_00_INTEGRATION_SOURCE,
+        )],
+    );
+
+    // A constant-returning helper collapses all three onto one value.
+    assert_ne!(
+        a_revision, b_revision,
+        "A's and B's public API revisions must be distinct digests"
+    );
+    assert_ne!(
+        b_revision, integration_revision,
+        "B's revision and this leaf's revision must be distinct digests"
+    );
+    assert_ne!(
+        a_revision, integration_revision,
+        "A's revision and this leaf's revision must be distinct digests"
+    );
+    assert_ne!(
+        a_revision,
+        [0_u8; 32],
+        "a revision digest must not be the zero value a stubbed helper returns"
+    );
+
+    // The one-variable negative: identical inputs except a single appended
+    // byte in one source file. This is the assertion that proves the helper
+    // READS its input rather than ignoring it.
+    let mutated_text = format!("{} ", AUTH_00_B_PUBLIC_API_SOURCE[0].1);
+    let mutated_source = [(AUTH_00_B_PUBLIC_API_SOURCE[0].0, mutated_text.as_str())];
+    assert_ne!(
+        b_revision,
+        source_revision_digest(b"auth_00_b_public_api-v1", &mutated_source),
+        "one changed byte in a bound public API source must move its revision digest"
+    );
+
+    // The path is bound too, not just the text: same bytes under a different
+    // name is a different revision.
+    let renamed_source = [("crates/fastmcp-core/src/renamed.rs", AUTH_00_B_PUBLIC_API_SOURCE[0].1)];
+    assert_ne!(
+        b_revision,
+        source_revision_digest(b"auth_00_b_public_api-v1", &renamed_source),
+        "the bound path participates in the revision digest, not only the file text"
+    );
+
+    // The domain separator is bound: the same sources under a different tag
+    // must not collide, or A's and B's digests could alias each other.
+    assert_ne!(
+        b_revision,
+        source_revision_digest(b"auth_00_a_public_api-v1", &AUTH_00_B_PUBLIC_API_SOURCE),
+        "the version tag separates the revision domains"
+    );
+}
