@@ -10,6 +10,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use fastmcp_core::crypto::{Sha256Digest, sha256_bounded};
+
 use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
 use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
@@ -1023,6 +1025,38 @@ impl ResultDiscriminatorPolicy for CoreResultDiscriminatorPolicy {
     }
 }
 
+/// The retaining policy: a non-core discriminator is deferred, never refused.
+///
+/// `CoreResultDiscriminatorPolicy` is the right seam for a terminal consumer
+/// that must not proceed on a result it cannot interpret. It is the wrong seam
+/// for a transparent proxy or for a client decoding a peer result before any
+/// extension has been negotiated: for those roles an unrecognised `resultType`
+/// is not a protocol error, because they are carrying the envelope rather than
+/// acting on it. Without this policy the [`ResultDiscriminatorDecision::
+/// DeferredExtension`] arm of the seam has no shipped producer at all, and a
+/// bounded raw envelope can only ever be reached through a decode failure.
+///
+/// Deferring is not activating. This type supplies a *decision* and nothing
+/// else: it holds no descriptor registry, performs no negotiation, and selects
+/// no decoder. A deferred envelope is returned as [`DecodedResult::Deferred`],
+/// which carries no typed payload, no metadata view, and no core semantics —
+/// it has exactly the same (zero) behavioural authority as an inert open
+/// sibling. EXT-01 later supplies the frozen negotiated policy and the typed
+/// extension decoders; neither exists here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeferringResultDiscriminatorPolicy;
+
+impl sealed::Sealed for DeferringResultDiscriminatorPolicy {}
+
+impl ResultDiscriminatorPolicy for DeferringResultDiscriminatorPolicy {
+    fn decide(&self, discriminator: &str) -> ResultDiscriminatorDecision {
+        match discriminator {
+            "complete" | "input_required" => ResultDiscriminatorDecision::Core,
+            _ => ResultDiscriminatorDecision::DeferredExtension,
+        }
+    }
+}
+
 /// Protocol era used only for peer-ingress compatibility diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultPeerEra {
@@ -1434,6 +1468,58 @@ pub fn encode_complete_result(
     members.extend(checked_extras.members);
     validate_local_result_members(&members)?;
     Ok(encode_exact_object(&ExactJsonObject { members }))
+}
+
+/// Maximum bytes accepted when digesting a PRT-04 evaluator manifest.
+pub const MAX_PRT_04_MANIFEST_BYTES: usize = 4 * 1024;
+
+/// The canonical `prt_04_evaluator_manifest_v1` rows owned by PRT-04
+/// implementation A: ordered cases `PRT-04.01` through `PRT-04.09`.
+///
+/// This is an executable acceptance input, not a hash of this source file. It
+/// is LF-canonical and LF-terminated, carries no CR, no blank line, and no
+/// trailing whitespace, and its four header rows bind the producer revision,
+/// the producer tree, and the shipped public entrypoint this slice is proved
+/// through. Each case row is exactly `<id> <name> floor=<N>`, where `floor` is
+/// the minimum number of observations an integrating evaluator must actually
+/// perform for that case. The floors are this producer's own case definitions,
+/// never a count borrowed back from a consumer: a gate whose reference values
+/// come from the thing being gated confirms arithmetic rather than agreement.
+/// Raising a floor here raises what integration must demonstrate; reordering,
+/// omitting, or renaming a row changes [`prt_04_a_manifest_digest`] and fails
+/// the join.
+///
+/// The `B` half (`PRT-04.10`..) is owned by the PRT-04 B slice and is
+/// deliberately not declared here.
+pub const PRT_04_A_EVALUATOR_MANIFEST_V1: &str = concat!(
+    "PRT-04-A evaluator manifest v1\n",
+    "producer-revision 028482181e82864812b3a4062329619a15e3d3cf\n",
+    "producer-tree 6866cb5d5af7994b2c5c56764058a254f3e9b694\n",
+    "entrypoint fastmcp_protocol::decode_peer_result\n",
+    "PRT-04.01 core-discriminator-selection floor=2\n",
+    "PRT-04.02 absent-discriminator-defaults-complete floor=2\n",
+    "PRT-04.03 nonstring-discriminator-refused floor=3\n",
+    "PRT-04.04 policy-seam-core-deferred-rejected floor=3\n",
+    "PRT-04.05 deferred-envelope-never-activated floor=3\n",
+    "PRT-04.06 open-member-kind-and-order-preservation floor=6\n",
+    "PRT-04.07 open-member-byte-faithful-reencode floor=2\n",
+    "PRT-04.08 common-name-never-demoted-to-extras floor=3\n",
+    "PRT-04.09 foreign-composition-names-inert floor=3\n",
+);
+
+/// Returns the canonical PRT-04 A evaluator manifest digest.
+///
+/// The digest binds the exact published bytes of
+/// [`PRT_04_A_EVALUATOR_MANIFEST_V1`]. An integrating consumer recomputes it
+/// over those same bytes, so a digest that no longer reproduces means the
+/// published rows and the digest have drifted apart.
+#[must_use]
+pub fn prt_04_a_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        PRT_04_A_EVALUATOR_MANIFEST_V1.as_bytes(),
+        MAX_PRT_04_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-04 A manifest is within its exact byte bound")
 }
 
 fn append_result_meta(members: &mut Vec<ExactJsonMember>, meta: &ResultMeta) {

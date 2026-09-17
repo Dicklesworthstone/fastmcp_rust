@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
 use fastmcp_derive::tool;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest};
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 use fastmcp_server::{InboundRequestContext, InboundRequestTransport, Server};
 use fastmcp_transport::{Transport, TransportError};
 
@@ -26,6 +26,73 @@ fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
 #[tool(name = "declined", description = "Returns a typed caller refusal")]
 fn declined_tool(_ctx: &McpContext) -> McpResult<String> {
     Err(McpError::invalid_params("caller input was declined"))
+}
+
+/// Attempts, from inside a handler, both mutations that immutable stateless
+/// dispatch must confine to a single request.
+///
+/// It reads and writes request-scoped session state, so a later dispatch that
+/// can observe `observed=1` proves the first dispatch's state survived. It also
+/// calls `disable_tool`, so a later list that omits `greet` proves a handler
+/// reached shared router catalog state through its context. Both mutation
+/// attempts are reported in the response text, so a silent no-op cannot make
+/// the assertion pass for the wrong reason.
+#[tool(
+    name = "leak_probe",
+    description = "Reports how much earlier dispatch state this context observes"
+)]
+fn leak_probe(ctx: &McpContext) -> McpResult<String> {
+    let observed: u64 = ctx.get_state("srv01.dispatch.count").unwrap_or_default();
+    let recorded = observed + 1;
+    let stored = ctx.set_state("srv01.dispatch.count", recorded);
+    let disabled = ctx.disable_tool("greet");
+    Ok(format!(
+        "observed={observed} recorded={recorded} stored={stored} disabled={disabled}"
+    ))
+}
+
+/// Extracts the first text content block from a successful tool result.
+fn stateless_tool_text(response: &JsonRpcResponse) -> Option<String> {
+    response
+        .result
+        .as_ref()
+        .and_then(|result| result.pointer("/content/0/text"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// Lists the tool names a dispatched `tools/list` result published.
+fn stateless_listed_tool_names(response: &JsonRpcResponse) -> Vec<String> {
+    response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name"))
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Builds one modern `tools/call` request for the named tool.
+fn stateless_tool_call(name: &str, id: i64) -> JsonRpcRequest {
+    JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": name,
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        id,
+    )
 }
 
 #[derive(Default)]
@@ -357,6 +424,115 @@ fn srv_01_a_positive() {
         "runtime admission cannot mutate caller-owned modern metadata"
     );
 
+    // Immutability is a claim about what dispatch cannot do, so it needs an
+    // observation that a stateful dispatcher would fail. `leak_probe` writes
+    // request-scoped session state on every call; dispatching the *same*
+    // request twice through the same `&Server` and the same sanitized ingress
+    // must produce byte-identical responses that both start from empty state.
+    // A dispatcher that carried request state forward would answer
+    // `observed=1` the second time.
+    let immutable_server = Server::new("stateless-immutable-dispatch", "1.0.0")
+        .tool(Greet)
+        .tool(LeakProbe)
+        .build();
+    let catalog_before = stateless_public_catalog_snapshot(&immutable_server);
+    let probe_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 81, InboundRequestTransport::Memory);
+    let probe_request = stateless_tool_call("leak_probe", 81_i64);
+
+    let first = immutable_server
+        .dispatch_stateless(&probe_inbound, &probe_request)
+        .expect("the first stateless dispatch returns a response");
+    let second = immutable_server
+        .dispatch_stateless(&probe_inbound, &probe_request)
+        .expect("the second stateless dispatch returns a response");
+
+    const FRESH_DISPATCH: &str = "observed=0 recorded=1 stored=true disabled=true";
+    assert_eq!(
+        stateless_tool_text(&first).as_deref(),
+        Some(FRESH_DISPATCH),
+        "the first stateless dispatch must start from empty request state \
+         and both mutation attempts must really be applied to it"
+    );
+    assert_eq!(
+        stateless_tool_text(&second).as_deref(),
+        Some(FRESH_DISPATCH),
+        "the second dispatch of the same request observed state left by the first"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first).expect("first response must serialize"),
+        serde_json::to_vec(&second).expect("second response must serialize"),
+        "repeating one immutable dispatch is not byte-identical"
+    );
+
+    // `leak_probe` called `disable_tool("greet")` on both dispatches and both
+    // writes succeeded. Neither the published catalog nor a later list result
+    // may observe them: a handler cannot reach shared router state through its
+    // context.
+    assert_eq!(
+        stateless_public_catalog_snapshot(&immutable_server),
+        catalog_before,
+        "a handler mutated the published router catalog through its context"
+    );
+    // The invocation path is what actually consults the disabled set
+    // (`session_state.is_tool_enabled` in the final tools/call dispatch), so
+    // this is the observation that would change if the disable survived: a
+    // later `greet` call would come back MethodNotFound / "disabled for this
+    // session" instead of a result.
+    let greet_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 82, InboundRequestTransport::Memory);
+    let greet_request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "greet",
+            "arguments": {"name": "after leak probe"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        82_i64,
+    );
+    let greeted = immutable_server
+        .dispatch_stateless(&greet_inbound, &greet_request)
+        .expect("a later greet dispatch returns a response");
+    assert!(
+        greeted.error.is_none(),
+        "an earlier handler's disable_tool leaked into a later dispatch: {:?}",
+        greeted.error
+    );
+    assert_eq!(
+        stateless_tool_text(&greeted).as_deref(),
+        Some("Hello, after leak probe!"),
+        "the later dispatch must really reach the tool the earlier handler disabled"
+    );
+
+    // The published catalog is catalog-derived rather than session-filtered on
+    // the modern list path, so this is a shape check, not the immutability
+    // proof above.
+    let list_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 86, InboundRequestTransport::Memory);
+    let list_request = JsonRpcRequest::new(
+        "tools/list",
+        Some(serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        86_i64,
+    );
+    let listed = immutable_server
+        .dispatch_stateless(&list_inbound, &list_request)
+        .expect("a stateless tools/list returns a response");
+    assert!(listed.error.is_none(), "tools/list is dispatchable");
+    let listed_names = stateless_listed_tool_names(&listed);
+    assert!(
+        listed_names.iter().any(|name| name == "greet")
+            && listed_names.iter().any(|name| name == "leak_probe"),
+        "the list result must be the real published catalog: {listed_names:?}"
+    );
+
     #[cfg(feature = "legacy-2024-11-05")]
     {
         let legacy_initialize = JsonRpcRequest::new(
@@ -440,12 +616,85 @@ fn srv_01_a_planted_negative() {
         planted_input_before,
         "rejected version admission changed caller input"
     );
+
+    // The runtime half above proves the typed refusal but cannot prove
+    // unchanged server state, because `run_transport_returning_with_cx`
+    // consumes the server. This half plants one variable at the
+    // immutable-ingress boundary of the retained `&Server` surface — the
+    // JSON-RPC request id no longer matches the sanitized ingress identity —
+    // so every named mutable state field can be read back after the refusal.
+    let identity_server = Server::new("stateless-ingress-identity-refusal", "1.0.0")
+        .tool(Greet)
+        .tool(LeakProbe)
+        .build();
+    let identity_catalog_before = stateless_public_catalog_snapshot(&identity_server);
+    let identity_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 83, InboundRequestTransport::Memory);
+    let identity_baseline = stateless_tool_call("leak_probe", 83_i64);
+    let identity_planted = stateless_tool_call("leak_probe", 84_i64);
+
+    // The request id is the sole planted dimension.
+    assert_eq!(identity_baseline.jsonrpc, identity_planted.jsonrpc);
+    assert_eq!(identity_baseline.method, identity_planted.method);
+    assert_eq!(identity_baseline.params, identity_planted.params);
+    assert_ne!(identity_baseline.id, identity_planted.id);
+    let identity_planted_before =
+        serde_json::to_vec(&identity_planted).expect("planted request must serialize");
+
+    let accepted = identity_server
+        .dispatch_stateless(&identity_inbound, &identity_baseline)
+        .expect("the matching-identity baseline receives a response");
+    assert!(accepted.error.is_none(), "the baseline is admitted");
+    assert_eq!(
+        stateless_tool_text(&accepted).as_deref(),
+        Some("observed=0 recorded=1 stored=true disabled=true"),
+        "the accepted baseline must really reach the handler and mutate its \
+         own request state, or the refusal below proves nothing"
+    );
+
+    let refused = identity_server
+        .dispatch_stateless(&identity_inbound, &identity_planted)
+        .expect("a request carrying an id must receive a response");
+    assert_eq!(
+        refused.error.as_ref().map(|error| error.code.clone()),
+        Some(McpErrorCode::InvalidRequest.into()),
+        "a mismatched ingress identity must reach the typed refusal boundary"
+    );
+    assert!(
+        refused.result.is_none(),
+        "a refused dispatch must not carry a result"
+    );
+
+    // Every named mutable state field, byte for byte, after the refusal:
+    // the published catalog, the caller's own request, and the request state
+    // a following accepted dispatch can observe.
+    assert_eq!(
+        stateless_public_catalog_snapshot(&identity_server),
+        identity_catalog_before,
+        "the typed identity refusal changed the published catalog"
+    );
+    assert_eq!(
+        serde_json::to_vec(&identity_planted).expect("planted request remains serializable"),
+        identity_planted_before,
+        "the typed identity refusal changed caller input"
+    );
+    let after_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 85, InboundRequestTransport::Memory);
+    let after = identity_server
+        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 85_i64))
+        .expect("a later accepted dispatch receives a response");
+    assert_eq!(
+        stateless_tool_text(&after).as_deref(),
+        Some("observed=0 recorded=1 stored=true disabled=true"),
+        "the refused dispatch left observable request state behind"
+    );
 }
 
 #[test]
 fn srv_01_b_positive() {
     let server = Server::new("stateless-handler-result", "1.0.0")
         .tool(DeclinedTool)
+        .tool(Greet)
         .build();
     let inbound =
         InboundRequestContext::new(Cx::for_testing(), 73, InboundRequestTransport::Memory);
@@ -484,12 +733,56 @@ fn srv_01_b_positive() {
             .and_then(serde_json::Value::as_str),
         Some("caller input was declined")
     );
+    assert_eq!(
+        response.id, request.id,
+        "the converted handler error still echoes the request id"
+    );
+
+    // The other handler outcome must convert to a visibly different public
+    // shape on the same immutable server: a success carries content and no
+    // `isError` flag at all. Without this arm the isError assertion above
+    // would also pass against an implementation that flagged every result.
+    let success_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 77, InboundRequestTransport::Memory);
+    let success_request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "greet",
+            "arguments": {"name": "stateless client"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        77_i64,
+    );
+    let success = server
+        .dispatch_stateless(&success_inbound, &success_request)
+        .expect("a successful handler request with an id must receive a response");
+    assert!(
+        success.error.is_none(),
+        "a successful handler is not a JSON-RPC failure"
+    );
+    assert_eq!(
+        stateless_tool_text(&success).as_deref(),
+        Some("Hello, stateless client!")
+    );
+    assert_eq!(
+        success
+            .result
+            .as_ref()
+            .and_then(|result| result.get("isError")),
+        None,
+        "a successful handler result must not carry an isError flag"
+    );
+    assert_eq!(success.id, success_request.id);
 }
 
 #[test]
 fn srv_01_b_planted_negative() {
     let server = Server::new("stateless-handler-refusal", "1.0.0")
         .tool(DeclinedTool)
+        .tool(LeakProbe)
         .build();
     let inbound =
         InboundRequestContext::new(Cx::for_testing(), 74, InboundRequestTransport::Memory);
@@ -581,6 +874,20 @@ fn srv_01_b_planted_negative() {
         catalog_before,
         "typed handler refusal changed the public catalog"
     );
+
+    // Third named mutable state field: the request state a handler can reach.
+    // A following accepted dispatch must still start from empty state, so the
+    // refused invocation left nothing behind for the next handler.
+    let after_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 78, InboundRequestTransport::Memory);
+    let after = server
+        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 78_i64))
+        .expect("a later accepted dispatch receives a response");
+    assert_eq!(
+        stateless_tool_text(&after).as_deref(),
+        Some("observed=0 recorded=1 stored=true disabled=true"),
+        "the typed handler refusal left observable request state behind"
+    );
 }
 
 #[test]
@@ -617,12 +924,51 @@ fn srv_01_i_positive() {
         Some("Hello, FastMCP!")
     );
     assert_eq!(response.id, request.id);
+
+    // The integration claim is the join itself: a server composed through the
+    // public builder and driven by the shipped runtime transport (the A
+    // surface) must deliver B's handler-result conversion on the wire. The
+    // dispatch-surface assertions above never cross the transport, so on their
+    // own they cannot show the two slices are wired together.
+    let joined_request = stateless_tool_call("declined", 79_i64);
+    let (transport, probe) = RuntimeTransport::single_request(joined_request.clone());
+    Server::new("stateless-integration-join", "1.0.0")
+        .tool(Greet)
+        .tool(DeclinedTool)
+        .build()
+        .run_transport_returning_with_cx(&Cx::for_testing(), transport)
+        .expect("the public runtime admits one modern tools/call");
+
+    let outgoing = probe.outgoing();
+    assert_eq!(outgoing.len(), 1, "the joined runtime emits one response");
+    let JsonRpcMessage::Response(joined) = &outgoing[0] else {
+        panic!("the joined runtime emits a JSON-RPC response");
+    };
+    assert!(
+        joined.error.is_none(),
+        "a handler refusal must not become a JSON-RPC failure on the wire"
+    );
+    assert_eq!(
+        joined
+            .result
+            .as_ref()
+            .and_then(|result| result.get("isError"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "B's handler-error conversion must survive A's runtime transport path"
+    );
+    assert_eq!(
+        stateless_tool_text(joined).as_deref(),
+        Some("caller input was declined")
+    );
+    assert_eq!(joined.id, joined_request.id);
 }
 
 #[test]
 fn srv_01_i_planted_negative() {
     let server = Server::new("stateless-integration-refusal", "1.0.0")
         .tool(Greet)
+        .tool(LeakProbe)
         .build();
     let inbound =
         InboundRequestContext::new(Cx::for_testing(), 76, InboundRequestTransport::Memory);
@@ -683,6 +1029,20 @@ fn srv_01_i_planted_negative() {
         stateless_public_catalog_snapshot(&server),
         catalog_before,
         "typed refusal changed server catalog"
+    );
+
+    // Third named mutable state field: the request state reachable from a
+    // handler. After the refused run, a later accepted dispatch on the
+    // retained server must still start from empty state.
+    let after_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 80, InboundRequestTransport::Memory);
+    let after = server
+        .dispatch_stateless(&after_inbound, &stateless_tool_call("leak_probe", 80_i64))
+        .expect("a later accepted dispatch receives a response");
+    assert_eq!(
+        stateless_tool_text(&after).as_deref(),
+        Some("observed=0 recorded=1 stored=true disabled=true"),
+        "the typed refusal left observable request state behind"
     );
 }
 
