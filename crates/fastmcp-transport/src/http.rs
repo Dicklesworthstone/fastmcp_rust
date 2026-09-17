@@ -6767,9 +6767,22 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         Err("loopback HTTP request exceeded header bound or ended before terminator".to_owned())
     }
 
+    /// Bounds every phase INDEPENDENTLY, with `phase_budget` restarted at each
+    /// phase, rather than spending one budget across the whole sequence.
+    ///
+    /// The property a test server owes its caller is "no single phase may block
+    /// forever". That property is per-phase by nature. The previous signature
+    /// took one absolute `Time` and applied it to N accepts, N handshakes, N
+    /// reads and N writes, so a slow first fetch stole the budget of every fetch
+    /// after it and the server stopped accepting mid-sequence. That is a
+    /// wall-clock bound spanning a multi-step sequence: it fails on a loaded
+    /// host while the code under test is correct, which is precisely backwards.
+    ///
+    /// Total runtime stays finite (phases x budget), so the anti-hang guarantee
+    /// is preserved exactly; only the false-red mode is removed.
     async fn guarded_loopback_serve(
         cx: Cx,
-        deadline: asupersync::Time,
+        phase_budget: Duration,
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -6778,15 +6791,15 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         for response in responses {
             cx.checkpoint()
                 .map_err(|_| "loopback server cancelled before accept".to_owned())?;
-            let (stream, _) = time::timeout_at(deadline, listener.accept())
+            let (stream, _) = time::timeout_at(time::wall_now() + phase_budget, listener.accept())
                 .await
-                .map_err(|_| "loopback server accept deadline elapsed".to_owned())?
+                .map_err(|_| format!("loopback TEST HARNESS bound: accept phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?
                 .map_err(|error| error.to_string())?;
             cx.checkpoint()
                 .map_err(|_| "loopback server cancelled before TLS".to_owned())?;
-            let tls = time::timeout_at(deadline, acceptor.accept(stream))
+            let tls = time::timeout_at(time::wall_now() + phase_budget, acceptor.accept(stream))
                 .await
-                .map_err(|_| "loopback server TLS deadline elapsed".to_owned())?;
+                .map_err(|_| format!("loopback TEST HARNESS bound: TLS-handshake phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?;
             let Ok(mut tls) = tls else {
                 // A hostname refusal can terminate TLS before HTTP bytes are
                 // available. The next accepted connection is the valid retry.
@@ -6794,18 +6807,18 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
             };
             cx.checkpoint()
                 .map_err(|_| "loopback server cancelled before HTTP read".to_owned())?;
-            let request = time::timeout_at(deadline, guarded_loopback_read_request(&mut tls))
+            let request = time::timeout_at(time::wall_now() + phase_budget, guarded_loopback_read_request(&mut tls))
                 .await
-                .map_err(|_| "loopback server HTTP-read deadline elapsed".to_owned())??;
+                .map_err(|_| format!("loopback TEST HARNESS bound: HTTP-read phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))??;
             requests
                 .lock()
                 .expect("loopback request record lock")
                 .push(request);
             cx.checkpoint()
                 .map_err(|_| "loopback server cancelled before HTTP write".to_owned())?;
-            time::timeout_at(deadline, tls.write_all(&response))
+            time::timeout_at(time::wall_now() + phase_budget, tls.write_all(&response))
                 .await
-                .map_err(|_| "loopback server HTTP-write deadline elapsed".to_owned())?
+                .map_err(|_| format!("loopback TEST HARNESS bound: HTTP-write phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
@@ -6824,14 +6837,18 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
                 .await
                 .expect("bind loopback listener");
             let authority = listener.local_addr().expect("loopback listener address");
-            let server_deadline = time::wall_now() + Duration::from_secs(2);
+            // A PER-PHASE budget, not a budget for the whole sequence. See
+            // `guarded_loopback_serve`. 10s is ~200x the observed cost of a
+            // loopback phase, so it never fires on a healthy run at any load we
+            // have measured, while still making a genuine hang terminate.
+            let phase_budget = Duration::from_secs(10);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server_requests = Arc::clone(&requests);
             let mut server = cx
                 .spawn(move |server_cx| {
                     guarded_loopback_serve(
                         server_cx,
-                        server_deadline,
+                        phase_budget,
                         listener,
                         responses,
                         server_requests,
@@ -6855,7 +6872,11 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
                         .expect("loopback proof URL");
                 results.push(fetcher.fetch(&cx, &url).await);
             }
-            match time::timeout_at(server_deadline, server.join(&cx)).await {
+            // The join gets its own fresh bound too. By now the server has either
+            // finished its response list or is parked in one phase, so one full
+            // phase budget plus slack is the tightest sound bound available.
+            let join_deadline = time::wall_now() + phase_budget + Duration::from_secs(1);
+            match time::timeout_at(join_deadline, server.join(&cx)).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => panic!("loopback TLS server: {error}"),
                 Ok(Err(error)) => panic!("loopback TLS server task: {error}"),
@@ -7502,14 +7523,41 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         );
 
         assert!(matches!(results[0], Err(GuardedHttpFetchError::Tls(_))));
+
+        // THE SECURITY PROPERTY, on its own, so that a fence leak is reported AS
+        // a fence leak. Previously this was folded into `requests.len() == 1`,
+        // which conflated two independent claims -- "the refused host wrote
+        // nothing" and "the valid retry wrote one" -- into a single number. A
+        // failure could not be read from its left/right values: 0 meant the
+        // RETRY was lost (fence held) while 2 meant the fence LEAKED, and the
+        // message blamed the fence either way. Identify the leak by the Host
+        // header, so this holds whatever the total count happens to be.
+        let leaked = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .windows(b"Host: wrong.example:".len())
+                    .any(|window| window == b"Host: wrong.example:")
+            })
+            .count();
         assert_eq!(
-            requests.len(),
-            1,
-            "hostname refusal must precede HTTP bytes"
+            leaked, 0,
+            "FENCE LEAK: the hostname-refused fetch wrote {leaked} HTTP request(s); \
+             hostname refusal must precede any HTTP bytes"
         );
+
+        // THE LIVENESS PROPERTY, separately: a refusal must not poison the same
+        // fetcher for a subsequent valid host. Failing any assertion below does
+        // NOT mean the fence leaked -- the assertion above already proved it did
+        // not -- it means the retry did not complete.
         assert_eq!(
             results[1].as_ref().expect("same fetcher valid retry").body,
             b"ok"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "the valid retry must be the only request that reached the server"
         );
         assert!(
             requests[0]
