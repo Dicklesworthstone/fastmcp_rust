@@ -16,6 +16,10 @@ categories = ["network-programming"]
 default = ["legacy-2024-11-05"]
 legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "fastmcp-transport/legacy-2024-11-05"]
 tasks = ["fastmcp-protocol/tasks"]
+# Externally signed RFC 7523 client assertions (private_key_jwt). Opt-in
+# because fastmcp-protocol/jose pulls ring and zeroize; keeping it off the
+# default graph preserves FND-01's frozen dependency evidence.
+builtin-auth-server = ["fastmcp-protocol/jose"]
 apps = ["fastmcp-protocol/apps", "dep:html5ever"]
 # Use the operating system trust store for private-CA HTTPS deployments.
 # Without this option, the transport's bundled WebPKI roots remain in use.

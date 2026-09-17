@@ -6,7 +6,7 @@
 #[cfg(feature = "tasks")]
 #[path = "oauth_client_credentials/tasks.rs"]
 mod tasks;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
 #[path = "oauth_client_credentials/private_key_jwt.rs"]
 mod private_key_jwt;
 

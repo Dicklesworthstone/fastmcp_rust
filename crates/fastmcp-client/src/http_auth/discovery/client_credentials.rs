@@ -15,7 +15,7 @@
 #[cfg(feature = "tasks")]
 pub mod tasks;
 /// Native, externally signed RFC 7523 assertions with exact registration binding.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
 pub mod private_key_jwt;
 
 use std::fmt;
@@ -118,7 +118,7 @@ struct ClientSecret(String);
 #[derive(Clone)]
 enum MachineAuthentication {
     Basic(Arc<ClientSecret>),
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
     PrivateKeyJwt(Arc<private_key_jwt::PrivateKeyJwtAuthentication>),
 }
 
@@ -134,7 +134,7 @@ impl MachineAuthentication {
     fn method(&self) -> &'static str {
         match self {
             Self::Basic(_) => "client_secret_basic",
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(_) => "private_key_jwt",
         }
     }
@@ -142,7 +142,7 @@ impl MachineAuthentication {
     fn check(&self) -> Result<(), ClientCredentialsError> {
         match self {
             Self::Basic(_) => Ok(()),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => authentication.check(),
         }
     }
@@ -150,7 +150,7 @@ impl MachineAuthentication {
     fn token_expiry_limit(&self) -> Option<Instant> {
         match self {
             Self::Basic(_) => None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => Some(authentication.valid_until()),
         }
     }
@@ -168,7 +168,7 @@ impl MachineAuthentication {
                 authorization: Some(basic(client_id, &secret.0)?),
                 deadline,
             }),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => {
                 authentication.prepare(cx, deadline, client_id, resource, scopes).await
             }
@@ -295,7 +295,7 @@ fn admit_machine_issuer(
         return Err(OAuthDiscoveryError::ResourceMismatch.into());
     }
     admit_scopes(&plan.scopes, metadata.scopes_supported.as_deref())?;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
     if let MachineAuthentication::PrivateKeyJwt(authentication) = authentication {
         authentication.admit_metadata(&metadata, body)?;
     }

@@ -64,6 +64,7 @@ proxy-tasks = [
 # and the server's external-signer admission without selecting a local key.
 builtin-auth-server = [
     "fastmcp-protocol/jose",
+    "fastmcp-client/builtin-auth-server",
     "fastmcp-server/builtin-auth-server",
     "fastmcp-console/builtin-auth-server",
 ]
