@@ -36,6 +36,13 @@ toml.workspace = true
 dirs.workspace = true
 html5ever = { version = "=0.40.1", optional = true }
 
+# The native client always compiles its externally signed private_key_jwt
+# adapter. Enable that adapter's protocol primitives on the same target
+# boundary instead of relying on feature unification with an auth-enabled
+# server or an all-features build. Basic and legacy selection remain explicit.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fastmcp-protocol = { workspace = true, features = ["jose"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["event", "fs", "process"] }
 
