@@ -259,7 +259,7 @@ impl ClientCredentialsCoreSubscription {
         // Compiling Tasks does not opt this core-only owner into Task events.
         // Retire the body rather than exposing an extension event to the caller.
         #[cfg(feature = "tasks")]
-        if matches!(&event, ModernHttpSubscriptionListenEvent::TaskNotification { .. }) {
+        if matches!(&event, ModernHttpSubscriptionListenEvent::TaskNotification(_)) {
             return Err(ClientCredentialsCoreSubscriptionError::InvalidResponse);
         }
         if let ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } = &event {
@@ -367,7 +367,7 @@ mod tests {
 
     fn filter() -> SubscriptionFilter {
         serde_json::from_value(json!({
-            "resources": ["file:///tmp/watched", "file:///tmp/also-requested"],
+            "resourceSubscriptions": ["file:///tmp/watched", "file:///tmp/also-requested"],
             "toolsListChanged": true,
         }))
         .unwrap()
@@ -511,15 +511,17 @@ mod tests {
 
     const ACK: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",",
-        "\"params\":{\"requestId\":7,\"notifications\":{\"resources\":[\"file:///tmp/watched\"]}}}\n\n"
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",
+        "\"notifications\":{\"resourceSubscriptions\":[\"file:///tmp/watched\"]}}}\n\n"
     );
     const UPDATE: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
-        "\"params\":{\"requestId\":7,\"uri\":\"file:///tmp/watched\"}}\n\n"
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",
+        "\"uri\":\"file:///tmp/watched\"}}\n\n"
     );
     const TERMINAL: &str = concat!(
-        "id: cursor-final\n",
-        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"empty\"}}\n\n"
+        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",",
+        "\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}\n\n"
     );
 
     async fn native_subscription(
@@ -630,10 +632,10 @@ mod tests {
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
             let accepted = subscription.accepted_filter().unwrap();
-            assert_eq!(accepted.resources, vec!["file:///tmp/watched".to_owned()]);
-            assert!(!accepted.tools_list_changed);
+            assert_eq!(accepted.resource_subscriptions, Some(vec!["file:///tmp/watched".to_owned()]));
+            assert_eq!(accepted.tools_list_changed, None);
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Notification { .. })));
+                Some(ModernHttpSubscriptionListenEvent::Notification(_))));
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Terminal { .. })));
             assert_eq!(subscription.records_delivered(), 3);
@@ -650,6 +652,7 @@ mod tests {
             for (body, has_ack) in [
                 (TERMINAL.to_owned(), false),
                 ([ACK, &TERMINAL.replace("\"id\":7", "\"id\":8")].concat(), true),
+                ([ACK, &TERMINAL.replace("subscriptionId\":7", "subscriptionId\":8")].concat(), true),
             ] {
                 let (mut subscription, peer) = native_subscription(
                     &cx, body, false, ClientCredentialsCoreSubscriptionLimits::default(),
@@ -785,8 +788,8 @@ mod tests {
             assert!(subscription.is_closed());
             assert!(matches!(subscription.next_event(&cx).await,
                 Err(ClientCredentialsCoreSubscriptionError::Closed)));
-            assert!(!subscription.cancellation.is_cancelled());
-            assert!(!subscription.owner.is_cancelled());
+            assert!(!subscription.cancellation.is_cancel_requested());
+            assert!(!subscription.owner.is_cancel_requested());
             peer.join().unwrap();
         });
     }
