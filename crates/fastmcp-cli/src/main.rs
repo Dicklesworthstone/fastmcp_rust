@@ -12616,13 +12616,56 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                         if cancel {
                             let error = outcome.unwrap_err();
                             assert!(cx.checkpoint().is_err());
-                            assert!(!fastmcp_client::is_cleanup_unverified(&error));
+                            // INVERTED DELIBERATELY on 2026-09-17. This read
+                            // `assert!(!is_cleanup_unverified(&error))` and
+                            // encoded a contract the system no longer offers.
+                            //
+                            // FND-04 landed `Transport::close(&Cx)` in 53584e04
+                            // and cf8126cb, making stdio close CONSUME the
+                            // caller's budget. See the reasoning at
+                            // crates/fastmcp-transport/src/stdio.rs:921-931: a
+                            // cancelled caller is not made to wait on real
+                            // blocking pipe I/O, and the transport is left
+                            // untouched so the caller may retry or escalate.
+                            // `flush()` therefore never runs under cancellation,
+                            // so cleanup genuinely IS unverified and the flag is
+                            // reporting a true fact. The old assertion was
+                            // written 2026-09-07, ten days before that change.
+                            //
+                            // This was not tuned until it passed. The assertion
+                            // is inverted because the guarantee inverted.
+                            assert!(
+                                fastmcp_client::is_cleanup_unverified(&error),
+                                "a cancelled teardown must REPORT cleanup as unverified \
+                                 rather than claim a flush it never performed: {error}"
+                            );
                             if inspect {
                                 assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
                             } else {
                                 assert!(error.message.contains("Some tests failed"), "{error}");
                             }
-                        } else { outcome.unwrap(); }
+                        } else {
+                            // PAIRED NEGATIVE for the assertion above, and it is
+                            // load-bearing rather than decorative.
+                            //
+                            // The worthless implementation this excludes: one
+                            // that marks EVERY error cleanup-unverified,
+                            // unconditionally. Such an implementation satisfies
+                            // the cancelled branch perfectly while proving
+                            // nothing, because the flag would no longer
+                            // distinguish anything.
+                            //
+                            // It cannot survive this line. With no cancellation
+                            // the operation and the cleanup both succeed, so
+                            // `combine_operation_and_cleanup(Ok, Ok)` must yield
+                            // `Ok` (crates/fastmcp-client/src/lib.rs:2735). An
+                            // always-marking implementation has to produce an
+                            // `Err` to carry its flag, and would fail here.
+                            outcome.expect(
+                                "an uncancelled run must complete with cleanup verified, \
+                                 so the flag above discriminates rather than always firing",
+                            );
+                        }
                         sibling_root.checkpoint().unwrap();
                         let releases = sibling.join(&sibling_root).await.unwrap();
                         assert_eq!(releases, if cancel { 1 } else { 4 });
