@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 // this target to be auto-discovered under the DEFAULT facade feature set, and
 // `cfg(test)`-only or lab-only behaviour cannot prove shipped behaviour (PL-3).
 // Every sibling target does the same; see `tests/e2e_stress.rs:18`.
-use asupersync::Cx;
+use asupersync::{CancelKind, Cx};
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp_rust::client::http_executor::{
     HTTP_03_A_EVALUATOR_MANIFEST_V1, HTTP_03_B_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreEvent,
@@ -580,6 +580,7 @@ struct WireObservations {
     legacy_get_count: usize,
     uncertain_dispatch: LaneObservation,
     deadline_race: LaneObservation,
+    caller_cancellation: CancellationObservation,
 }
 
 impl WireObservations {
@@ -762,6 +763,146 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
         requests_during_call,
         connections_after_return,
         server_held_connection_open,
+    }
+}
+
+/// What the HTTP-03.14 caller-cancellation scenario observed.
+#[derive(Debug, Clone)]
+struct CancellationObservation {
+    progress_before_cancel: usize,
+    post_cancel_outcome: String,
+    server_saw_stream_close: bool,
+    requests_during_call: usize,
+    connections_after_return: usize,
+}
+
+/// Opens a request-scoped SSE stream, consumes one progress event to prove the
+/// stream is live, cancels the caller's `Cx`, and observes both what the caller
+/// sees and what the server sees.
+///
+/// The server half matters as much as the client half: `server_saw_stream_close`
+/// is EOF observed on the response connection. Without it this would prove only
+/// that the caller stopped reading, which is not the same claim as the response
+/// stream being closed - a leaked connection would look identical from inside
+/// the client. The wait for EOF is bounded and the case REQUIRES the close, so a
+/// leak fails here rather than being tolerated.
+fn observe_caller_cancellation() -> CancellationObservation {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the cancellation fixture");
+    let address = listener
+        .local_addr()
+        .expect("read the cancellation fixture address");
+    let target = format!("http://{address}/mcp-cancel");
+    let marker = ProgressMarker::from("http-03-integration-cancel");
+    let server_marker = marker.clone();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (report_tx, report_rx) = mpsc::channel::<(usize, bool, usize)>();
+
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded(&listener);
+        let _probe_request = read_request(&mut probe);
+        write_bounded_response(
+            &mut probe,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "cancel"),
+        );
+        drop(probe);
+
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        begin_sse_response(&mut call);
+        write_sse_event(&mut call, &progress_event(&server_marker, 1));
+
+        // Block reading the response connection. A cancelling caller closes it,
+        // which surfaces here as EOF.
+        call.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound the cancellation fixture read");
+        let mut sink = [0_u8; 1024];
+        let saw_close = matches!(call.read(&mut sink), Ok(0));
+        drop(call);
+
+        release_rx
+            .recv()
+            .expect("driver reports the cancelled call returned");
+        listener
+            .set_nonblocking(true)
+            .expect("set the cancellation listener nonblocking for the backlog drain");
+        let mut extra = 0_usize;
+        while let Ok((stream, _)) = listener.accept() {
+            extra += 1;
+            drop(stream);
+        }
+        report_tx
+            .send((1, saw_close, extra))
+            .expect("report cancellation observations");
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the cancellation scenario owns its caller runtime");
+    let (progress_before_cancel, post_cancel_outcome) = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+        let connection = integration_builder(&target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the cancellation endpoint must connect through the public builder");
+        let mut stream_listener = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "http_03_cancel_tool",
+                    "arguments": {},
+                    "_meta": {"progressToken": marker.clone()},
+                }),
+                RequestId::Number(51),
+                limits,
+            )
+            .await
+            .expect("the shipped SSE lane must open a request-owned listener");
+
+        // One live progress event proves the stream is open and delivering
+        // before anything is cancelled.
+        let mut seen = 0_usize;
+        match stream_listener.next_event(&cx).await {
+            Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) => {
+                assert_eq!(
+                    progress.progress_token, marker,
+                    "progress must reach only the request that owns the marker"
+                );
+                seen += 1;
+            }
+            other => panic!("expected a live progress event before cancelling, observed {other:?}"),
+        }
+
+        // The single variable: the caller cancels.
+        cx.cancel_with(CancelKind::User, Some("http-03-integration caller cancellation"));
+
+        let outcome = match stream_listener.next_event(&cx).await {
+            Ok(Some(event)) => format!("unexpected-event::{event:?}"),
+            Ok(None) => "unexpected-clean-end".to_owned(),
+            Err(error) => format!("listen::{error:?}"),
+        };
+        (seen, outcome)
+    });
+
+    release_tx
+        .send(())
+        .expect("release the cancellation fixture");
+    let (requests_during_call, server_saw_stream_close, connections_after_return) =
+        report_rx.recv().expect("collect cancellation observations");
+    server
+        .join()
+        .expect("the cancellation fixture thread must not panic");
+
+    CancellationObservation {
+        progress_before_cancel,
+        post_cancel_outcome,
+        server_saw_stream_close,
+        requests_during_call,
+        connections_after_return,
     }
 }
 
@@ -1122,6 +1263,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     // POST, which the shared A/B fixture above must not do.
     let uncertain_dispatch = observe_lane(false, Duration::from_secs(5));
     let deadline_race = observe_lane(true, Duration::from_millis(50));
+    let caller_cancellation = observe_caller_cancellation();
 
     WireObservations {
         fixture_authority: authority,
@@ -1149,6 +1291,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         legacy_get_count,
         uncertain_dispatch,
         deadline_race,
+        caller_cancellation,
     }
 }
 
@@ -2366,8 +2509,51 @@ fn case_endpoint_instance_key_partition(builder: &mut CaseBuilder, wire: &WireOb
 // to reach a floor would be exactly the unevidenced box this evaluator exists to
 // prevent. A check that cannot fail is not evidence.
 
-/// HTTP-03.14 `caller-cancellation-response-close` (floor 5). UNPROVEN.
-fn case_caller_cancellation_close(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+/// HTTP-03.14 `caller-cancellation-response-close` (floor 5).
+///
+/// B's subject has two halves and this proves both. The caller half is that a
+/// cancelled caller gets a typed refusal rather than a hang or a silent clean
+/// end. The server half is that the response stream is actually CLOSED - EOF
+/// observed on the response connection - which is the claim a purely
+/// client-side assertion cannot make, because a leaked connection looks
+/// identical from inside the client.
+fn case_caller_cancellation_close(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let cancel = &wire.caller_cancellation;
+
+    assert_eq!(
+        cancel.progress_before_cancel, 1,
+        "the stream must deliver a live progress event before anything is cancelled, \
+         otherwise this case proves only that a dead stream stayed dead"
+    );
+    builder.positive("cancel-progress-before-cancel", "1");
+
+    assert!(
+        cancel.post_cancel_outcome.starts_with("listen::"),
+        "a cancelled caller must observe a typed listen refusal; observed {}",
+        cancel.post_cancel_outcome
+    );
+    builder.positive("cancel-outcome", &cancel.post_cancel_outcome);
+
+    assert!(
+        cancel.server_saw_stream_close,
+        "the server must observe EOF on the response connection; without it the caller \
+         merely stopped reading and the response stream was not proven closed"
+    );
+    builder.positive("cancel-response-stream-closed", "true");
+
+    assert_eq!(
+        cancel.requests_during_call, 1,
+        "the cancellation lane must post exactly once"
+    );
+    builder.positive("cancel-requests", "1");
+
+    assert_eq!(
+        cancel.connections_after_return, 0,
+        "a cancelled request must not be replayed; {} retry connection(s) were queued",
+        cancel.connections_after_return
+    );
+    builder.positive("cancel-retry-connections", "0");
+}
 
 /// HTTP-03.15 `deadline-and-disconnect-races` (floor 4).
 ///
