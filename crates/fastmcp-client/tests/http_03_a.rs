@@ -1323,6 +1323,91 @@ async fn duplicate_content_encoding_outcome(cx: &Cx) -> ModernHttpExecutorError 
     error
 }
 
+/// A body whose FIRST BYTES advertise gzip. It is never valid JSON and is never
+/// meant to be inflated; it exists so an accidental decompression, or a
+/// "decompress if it looks compressed" fallback, changes the delivered bytes.
+const GZIP_MAGIC_BODY: &[u8] = &[0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+
+/// The complete body shared by the delivery control and its truncation
+/// negative, so the two differ only in how much of it arrives.
+const COMPLETE_RESPONSE_BODY: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+
+/// Drives one response that declares `Content-Encoding: identity` and carries
+/// `body` verbatim, returning the delivered bytes or the typed refusal.
+async fn identity_labelled_body_outcome(
+    cx: &Cx,
+    body: &[u8],
+) -> Result<Vec<u8>, ModernHttpExecutorError> {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(
+                &mut io,
+                200,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Content-Encoding", "identity"),
+                ],
+                body,
+            )
+            .await;
+            end_stream(&mut io).await;
+        },
+        async {
+            match post(cx, &request).await {
+                Ok(response) => response.read_to_end(cx, 64 * 1024).await,
+                Err(error) => Err(error),
+            }
+        },
+    )
+    .await;
+    outcome
+}
+
+/// Drives one response whose head declares `declared_length` bytes and which
+/// then delivers `delivered` before closing.
+///
+/// `write_response` always derives `Content-Length` from the bytes it sends,
+/// which is correct everywhere else here and makes an under-delivery
+/// impossible to express. This separates the declaration from the delivery.
+async fn truncated_body_outcome(
+    cx: &Cx,
+    declared_length: usize,
+    delivered: &[u8],
+) -> Result<Vec<u8>, ModernHttpExecutorError> {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+            );
+            io.write_all(head.as_bytes())
+                .await
+                .expect("write the declared-length response head");
+            io.write_all(delivered)
+                .await
+                .expect("write the delivered response bytes");
+            io.flush().await.expect("flush the response");
+            end_stream(&mut io).await;
+        },
+        async {
+            match post(cx, &request).await {
+                Ok(response) => response.read_to_end(cx, 64 * 1024).await,
+                Err(error) => Err(error),
+            }
+        },
+    )
+    .await;
+    outcome
+}
+
 async fn positive_04_identity_accept_encoding(cx: &Cx) {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
@@ -1404,6 +1489,33 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
             "Content-Encoding {encoding:?} must deliver the body unchanged"
         );
     }
+    // -----------------------------------------------------------------------
+    // Mislabelled body. A response declaring `identity` whose payload BEGINS
+    // WITH THE GZIP MAGIC NUMBER is delivered verbatim.
+    //
+    // This is the strongest proof available here that no automatic
+    // decompression is attempted: the payload advertises itself as compressed
+    // in its own first bytes, the declared coding says it is not, and it is the
+    // DECLARED CODING the client obeys. A client that sniffed the body, or that
+    // ran a "decompress if it looks compressed" fallback, returns different
+    // bytes here while passing every other case in this group.
+    // -----------------------------------------------------------------------
+    let delivered = identity_labelled_body_outcome(cx, GZIP_MAGIC_BODY)
+        .await
+        .expect("an identity-labelled body must be delivered without inspection");
+    assert_eq!(
+        delivered.as_slice(),
+        GZIP_MAGIC_BODY,
+        "an identity-labelled body must reach the caller byte for byte"
+    );
+
+    // Delivery control on the same lane: a body that fully satisfies its
+    // declared length is returned intact, so the truncation negative differs
+    // from it in delivery alone.
+    let complete = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY)
+        .await
+        .expect("a fully delivered body must be readable");
+    assert_eq!(complete.as_slice(), COMPLETE_RESPONSE_BODY);
 }
 
 async fn negative_04_compressed_response(cx: &Cx) {
@@ -1504,6 +1616,33 @@ async fn negative_04_compressed_response(cx: &Cx) {
     assert!(
         content_encoding_outcome(cx, Some("identity")).await.is_ok(),
         "the unmutated accepted coding must be admitted again"
+    );
+    // -----------------------------------------------------------------------
+    // Truncated body. The sole changed variable is DELIVERY: the head declares
+    // the same length as the admitted control, and exactly one byte of the body
+    // never arrives before the connection closes.
+    //
+    // What a permissive reader produces here is not an error but a WRONG
+    // SUCCESS - a body one byte shorter than the server declared, handed on as
+    // if it were complete. So the assertion is that the call FAILS, and fails
+    // through a typed body-path variant rather than any refusal at all.
+    // -----------------------------------------------------------------------
+    let truncated = &COMPLETE_RESPONSE_BODY[..COMPLETE_RESPONSE_BODY.len() - 1];
+    assert_eq!(
+        truncated.len() + 1,
+        COMPLETE_RESPONSE_BODY.len(),
+        "the planted negative under-delivers by exactly one byte"
+    );
+    let refusal = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), truncated)
+        .await
+        .err()
+        .expect("a body shorter than its declared length must not be delivered");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::ResponseBodyReadFailed | ModernHttpExecutorError::Transport(_)
+        ),
+        "a truncated body must reach a typed body-read failure, saw {refusal:?}"
     );
 }
 
