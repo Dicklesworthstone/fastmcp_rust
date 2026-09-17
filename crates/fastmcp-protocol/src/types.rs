@@ -101,6 +101,27 @@ pub struct ClientCapabilities {
     /// Roots capability (filesystem roots).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
+    /// Experimental, non-standard capabilities that the client supports.
+    ///
+    /// Schema: `type: object`, `additionalProperties: JSONObject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, serde_json::Value>>,
+    /// Optional MCP extensions that the client supports.
+    ///
+    /// Keys are extension identifiers (for example
+    /// `io.modelcontextprotocol/oauth-client-credentials`) and values are
+    /// per-extension settings objects; an empty object indicates support with
+    /// no settings. Schema: `type: object`, `additionalProperties: JSONObject`.
+    ///
+    /// The value type is deliberately `serde_json::Value` rather than a nested
+    /// map, matching `ServerDiscoverCapabilities::members` and the `additional`
+    /// fields in this file. `ClientCapabilities` has `additionalProperties`
+    /// UNSET in the schema, i.e. open, so this must not gain
+    /// `deny_unknown_fields`, and a non-object value must stay representable so
+    /// consumers can reject it at a typed boundary instead of failing the whole
+    /// deserialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Sampling capability.
@@ -2439,6 +2460,7 @@ mod tests {
             sampling: Some(SamplingCapability {}),
             elicitation: Some(ElicitationCapability::both()),
             roots: Some(RootsCapability { list_changed: true }),
+            ..Default::default()
         };
         let value = serde_json::to_value(&caps).expect("serialize");
         assert!(value.get("sampling").is_some());
@@ -2454,6 +2476,7 @@ mod tests {
             roots: Some(RootsCapability {
                 list_changed: false,
             }),
+            ..Default::default()
         };
         let json_str = serde_json::to_string(&caps).expect("serialize");
         let deserialized: ClientCapabilities =

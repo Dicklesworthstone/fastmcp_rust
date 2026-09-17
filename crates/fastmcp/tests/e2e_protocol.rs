@@ -8051,6 +8051,7 @@ fn e2e_public_stdio_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_
             .capabilities(ClientCapabilities {
                 roots: Some(legacy_2024::RootsCapability { list_changed: true }),
                 ..ClientCapabilities::default()
+                ..Default::default()
             })
             .reverse_request_handlers(
                 legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(

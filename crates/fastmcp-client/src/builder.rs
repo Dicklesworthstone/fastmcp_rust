@@ -2703,6 +2703,7 @@ exec sleep 5
                 list_changed: false,
             }),
             ..ClientCapabilities::default()
+            ..Default::default()
         });
         let legacy_error = missing_handler
             .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
@@ -4388,6 +4389,7 @@ exit 73
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
             elicitation: None,
             roots: None,
+            ..Default::default()
         };
         let builder = ClientBuilder::new().capabilities(capabilities);
 

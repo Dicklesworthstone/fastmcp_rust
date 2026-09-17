@@ -3808,6 +3808,7 @@ fn e2e_public_sse_handler_sees_initialized_client_capabilities() {
             sampling: Some(Default::default()),
             elicitation: None,
             roots: Some(Default::default()),
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new()
@@ -19085,6 +19086,7 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
                         roots: Some(legacy_2024::RootsCapability {
                             list_changed: false,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -26779,6 +26781,7 @@ fn e2e_public_http_handler_sees_client_and_server_capabilities() {
                 sampling: Some(Default::default()),
                 elicitation: None,
                 roots: Some(Default::default()),
+                ..Default::default()
             })
             .connect_http_with_cx(public_http_target(with_resources.address(), "/mcp"), &cx),
     )
@@ -29087,6 +29090,7 @@ fn e2e_public_http_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_i
         .capabilities(ClientCapabilities {
             roots: Some(legacy_2024::RootsCapability { list_changed: true }),
             ..ClientCapabilities::default()
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
@@ -29296,6 +29300,7 @@ fn e2e_public_http_legacy_sampling_callback_reaches_context() {
             sampling: Some(Default::default()),
             elicitation: None,
             roots: None,
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new().with_sampling_create_message({
@@ -29532,6 +29537,7 @@ fn e2e_public_http_legacy_roots_callback_reaches_context() {
             sampling: None,
             elicitation: None,
             roots: Some(Default::default()),
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
@@ -33643,6 +33649,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
                         roots: Some(legacy_2024::RootsCapability {
                             list_changed: false,
                         }),
+                        ..Default::default()
                     },
                     cx.clone(),
                 ))
@@ -34710,6 +34717,7 @@ fn e2e_public_http_legacy_as_proxy_forwards_inbound_sampling_and_roots() {
             sampling: Some(Default::default()),
             elicitation: None,
             roots: Some(Default::default()),
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new()
@@ -34870,6 +34878,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_sampling_and_roots() {
             sampling: Some(Default::default()),
             elicitation: None,
             roots: Some(Default::default()),
+            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new()
@@ -47675,6 +47684,7 @@ mod live_websocket_bind {
                         sampling: Some(Default::default()),
                         elicitation: None,
                         roots: None,
+                        ..Default::default()
                     })
                     .reverse_request_handlers(
                         legacy_2024::LegacyReverseRequestHandlers::new()
@@ -47800,6 +47810,7 @@ mod live_websocket_bind {
                         sampling: None,
                         elicitation: None,
                         roots: Some(Default::default()),
+                        ..Default::default()
                     })
                     .reverse_request_handlers(
                         legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
@@ -47928,6 +47939,7 @@ mod live_websocket_bind {
                     .capabilities(ClientCapabilities {
                         roots: Some(legacy_2024::RootsCapability { list_changed: true }),
                         ..ClientCapabilities::default()
+                        ..Default::default()
                     })
                     .reverse_request_handlers(
                         legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
@@ -50941,6 +50953,7 @@ mod live_websocket_bind {
                         roots: Some(legacy_2024::RootsCapability {
                             list_changed: false,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -50985,6 +50998,7 @@ mod live_websocket_bind {
                         sampling: Some(Default::default()),
                         elicitation: None,
                         roots: Some(Default::default()),
+                        ..Default::default()
                     })
                     .reverse_request_handlers(
                         legacy_2024::LegacyReverseRequestHandlers::new()
@@ -54837,6 +54851,7 @@ mod live_websocket_bind {
                         roots: Some(legacy_2024::RootsCapability {
                             list_changed: false,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await
@@ -54901,6 +54916,7 @@ mod live_websocket_bind {
                         roots: Some(legacy_2024::RootsCapability {
                             list_changed: false,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await

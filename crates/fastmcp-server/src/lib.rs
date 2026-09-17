@@ -30071,6 +30071,7 @@ mod lib_unit_tests {
                 sampling: Some(fastmcp_protocol::SamplingCapability {}),
                 elicitation: None,
                 roots: None,
+                ..Default::default()
             },
             "original-protocol".to_string(),
         );
@@ -30086,6 +30087,7 @@ mod lib_unit_tests {
                         sampling: None,
                         elicitation: Some(fastmcp_protocol::ElicitationCapability::form()),
                         roots: None,
+                        ..Default::default()
                     },
                 ),
                 &notification_sender,

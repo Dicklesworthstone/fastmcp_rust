@@ -20310,6 +20310,7 @@ exec sleep 2
                 roots: Some(fastmcp_protocol::RootsCapability {
                     list_changed: false,
                 }),
+                ..Default::default()
             },
         );
 
@@ -20417,6 +20418,7 @@ exec sleep 2
                 roots: Some(fastmcp_protocol::RootsCapability {
                     list_changed: false,
                 }),
+                ..Default::default()
             },
         );
 
@@ -20874,6 +20876,7 @@ exec sleep 2
             ClientCapabilities {
                 roots: Some(fastmcp_protocol::RootsCapability { list_changed: true }),
                 ..ClientCapabilities::default()
+                ..Default::default()
             },
         ))
         .expect("one clientCapabilities field change opens a separate modern upstream");

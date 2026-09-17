@@ -8105,6 +8105,7 @@ mod helper_function_tests {
                                     capabilities: ClientCapabilities {
                                         sampling: Some(SamplingCapability::default()),
                                         ..ClientCapabilities::default()
+                                        ..Default::default()
                                     },
                                     client_info: ClientInfo {
                                         name: "sampling-client".to_string(),

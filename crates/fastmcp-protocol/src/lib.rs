@@ -252,6 +252,7 @@ fn prt_03_i_unit_positive() {
     let required_capabilities = ClientCapabilities {
         roots: Some(RootsCapability { list_changed: true }),
         ..ClientCapabilities::default()
+        ..Default::default()
     };
     let metadata = FinalRequestMeta::new(required_capabilities.clone());
     let admission = admit_final_http_request(FinalHttpRequestMetadata {
@@ -292,6 +293,7 @@ fn prt_03_i_unit_planted_negative() {
     let metadata = FinalRequestMeta::new(ClientCapabilities {
         roots: Some(RootsCapability { list_changed: true }),
         ..ClientCapabilities::default()
+        ..Default::default()
     });
     let wire_before = serde_json::to_value(&metadata).expect("metadata serializes");
     let error = admit_final_http_request(FinalHttpRequestMetadata {

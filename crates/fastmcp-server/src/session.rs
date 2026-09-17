@@ -728,6 +728,7 @@ mod tests {
             sampling: Some(SamplingCapability {}),
             elicitation: None,
             roots: None,
+            ..Default::default()
         };
         session.initialize(make_client_info(), caps, "2024-11-05".to_string());
         let stored = session.client_capabilities().expect("caps set");
@@ -1157,6 +1158,7 @@ mod tests {
                 sampling: Some(SamplingCapability {}),
                 elicitation: None,
                 roots: None,
+                ..Default::default()
             },
             "2024-11-05".to_string(),
         );
@@ -1185,6 +1187,7 @@ mod tests {
                 sampling: None,
                 elicitation: Some(ElicitationCapability::form()),
                 roots: None,
+                ..Default::default()
             },
             "2024-11-05".to_string(),
         );
@@ -1213,6 +1216,7 @@ mod tests {
                 sampling: None,
                 elicitation: None,
                 roots: Some(RootsCapability { list_changed: true }),
+                ..Default::default()
             },
             "2024-11-05".to_string(),
         );
@@ -1243,6 +1247,7 @@ mod tests {
                 roots: Some(RootsCapability {
                     list_changed: false,
                 }),
+                ..Default::default()
             },
             "2024-11-05".to_string(),
         );
@@ -1295,6 +1300,7 @@ mod tests {
                 sampling: Some(SamplingCapability {}),
                 elicitation: None,
                 roots: None,
+                ..Default::default()
             },
             "2025-03-26".to_string(),
         );

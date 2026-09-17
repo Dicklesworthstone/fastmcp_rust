@@ -10723,6 +10723,7 @@ mod tests {
                         list_changed: false,
                     }),
                     ..ClientCapabilities::default()
+                    ..Default::default()
                 },
                 super::HttpConnectionSettings {
                     mcp_apps: None,
@@ -15291,6 +15292,7 @@ mod tests {
                 list_changed: false,
             }),
             ..ClientCapabilities::default()
+            ..Default::default()
         };
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message(|_cx, _cancellation, _params| {

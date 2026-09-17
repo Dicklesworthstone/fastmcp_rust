@@ -318,6 +318,7 @@ mod tests {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
             elicitation: None,
             roots: Some(RootsCapability { list_changed: true }),
+            ..Default::default()
         }
     }
 
@@ -396,6 +397,7 @@ mod tests {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
             elicitation: None,
             roots: None,
+            ..Default::default()
         };
         assert_eq!(renderer.format_capabilities(&caps), "sampling");
     }
@@ -409,6 +411,7 @@ mod tests {
             roots: Some(RootsCapability {
                 list_changed: false,
             }),
+            ..Default::default()
         };
         assert_eq!(renderer.format_capabilities(&caps), "roots");
     }
@@ -427,6 +430,7 @@ mod tests {
                 sampling: None,
                 elicitation: Some(elicitation),
                 roots: None,
+                ..Default::default()
             };
             assert_eq!(renderer.format_capabilities(&caps), expected);
         }
@@ -439,6 +443,7 @@ mod tests {
             sampling: Some(fastmcp_protocol::SamplingCapability {}),
             elicitation: Some(ElicitationCapability::both()),
             roots: Some(RootsCapability { list_changed: true }),
+            ..Default::default()
         };
         assert_eq!(
             renderer.format_capabilities(&caps),

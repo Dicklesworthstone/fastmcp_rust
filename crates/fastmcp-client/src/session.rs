@@ -1074,6 +1074,7 @@ mod tests {
                 sampling: Some(fastmcp_protocol::SamplingCapability {}),
                 elicitation: None,
                 roots: None,
+                ..Default::default()
             },
             ServerInfo {
                 name: "srv".to_string(),

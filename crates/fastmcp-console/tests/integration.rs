@@ -399,6 +399,7 @@ fn test_client_info_with_capabilities() {
         sampling: Some(fastmcp_protocol::SamplingCapability {}),
         elicitation: None,
         roots: Some(RootsCapability { list_changed: true }),
+        ..Default::default()
     };
 
     renderer.render_connected_with_caps(&client, &caps, tc.console());
