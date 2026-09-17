@@ -75,6 +75,12 @@ fn transport_with(writer: CountingWriter) -> StdioTransport<Cursor<Vec<u8>>, Cou
     StdioTransport::new(Cursor::new(Vec::new()), writer)
 }
 
+/// A context whose deadline has already passed, with the cancellation bit never
+/// set. That is what makes the expiry row distinct from the cancellation row.
+fn expired_context() -> Cx {
+    Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(asupersync::Time::ZERO))
+}
+
 fn cancelled_context() -> Cx {
     let cx = Cx::for_testing();
     cx.set_cancel_requested(true);
@@ -128,6 +134,34 @@ fn stdio_close_under_a_cancelled_context_refuses_before_the_write_side_commit() 
     assert!(
         writer.recorded().is_empty(),
         "a refused close writes nothing"
+    );
+}
+
+/// The second limb: no cancellation bit is set, only the deadline has expired.
+/// `stdio_checkpoint` reports that as `Timeout`, distinctly from `Cancelled`, so
+/// a caller can tell "someone cancelled me" from "I ran out of time". A guard
+/// that read only the cancellation flag would have flushed here.
+#[test]
+fn stdio_close_under_an_expired_deadline_refuses_as_timeout() {
+    let writer = CountingWriter::default();
+    let mut transport = transport_with(writer.clone());
+
+    let error = transport
+        .close(&expired_context())
+        .expect_err("an expired caller budget must refuse the close");
+
+    assert!(
+        matches!(error, TransportError::Timeout),
+        "an exhausted deadline is reported distinctly from cancellation: {error:?}"
+    );
+    assert!(
+        !transport.is_closed(),
+        "refusing on an expired budget leaves the transport untouched"
+    );
+    assert_eq!(
+        writer.flushes(),
+        0,
+        "an out-of-budget caller is not made to wait on the flush"
     );
 }
 
@@ -190,15 +224,10 @@ fn stdio_close_stays_idempotent_under_a_cancelled_context() {
 // these remain external-consumer rows. Unlike `SseWriter`, `StdioSendHalf` is not
 // behind an opt-in feature, so this proof runs in a DEFAULT-feature gate.
 //
-// These rows prove BOTH limbs of the budget - cancellation and expiry - where the
-// `StdioTransport::close` rows above still prove only cancellation. Back-porting
-// the expiry limb to those rows is the next separate unit.
-
-/// A context whose deadline has already passed, with the cancellation bit never
-/// set. That is what makes the expiry row distinct from the cancellation row.
-fn expired_context() -> Cx {
-    Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(asupersync::Time::ZERO))
-}
+// Both sets now prove BOTH limbs of the budget, cancellation and expiry, in the
+// same five-case shape: live control, cancelled, expired, refusal-is-retryable,
+// idempotent-under-cancellation. That shape is the template for the remaining
+// production blocking closes.
 
 fn split_send_half(writer: CountingWriter) -> impl TransportSendHalf {
     let (_receiver, sender) = StdioTransport::new(Cursor::new(Vec::new()), writer).into_split();
