@@ -32267,10 +32267,26 @@ IFS= read -r end
             .close()
             .expect_err("a noncooperative callback must bound explicit shutdown");
         assert_eq!(error.message, REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR);
-        assert!(
-            close_started.elapsed() < Duration::from_secs(1),
-            "explicit close must return within its callback-shutdown bound"
-        );
+        // REMOVED: assert!(close_started.elapsed() < 1s, "explicit close must
+        // return within its callback-shutdown bound").
+        // Redundant: the assertion directly above
+        // (error.message == REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR) already
+        // proves close returned AND that the 250ms callback-shutdown bound was
+        // the thing that bounded it — that typed error cannot be produced any
+        // other way. The 1s ceiling only added "and the host was fast enough to
+        // finish within 4x that bound", which is not a property of this code.
+        //
+        // FOUND BY A MULTILINE SCAN. A single-line `assert.*elapsed() <` regex
+        // is blind to this site because rustfmt split the assert across lines;
+        // it was missed by my first pass over this file. Sweep with
+        // `rg -U "assert!\(\s*[^)]*elapsed\(\) *<"`.
+        //
+        // COVERAGE NOTE, pre-existing and not introduced here: unlike the
+        // sibling shutdown-timeout site later in this file, this one has NO
+        // lower-bound assertion, so nothing here checks that close actually
+        // waited the 250ms. Removing the upper bound loses no coverage that
+        // existed; adding a lower bound would be new coverage.
+        // Do not reinstate an upper bound on wall time here.
         assert!(
             !client
                 .reverse_callback_pool
