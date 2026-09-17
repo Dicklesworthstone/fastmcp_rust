@@ -279,9 +279,12 @@ impl ManagedOAuthSession {
         credential: &OAuthCredentialSnapshot,
         wire: &ModernHttpRequest,
     ) -> Result<ManagedOAuthResponse, ManagedSubscriptionError> {
+        self.check(cx, cancellation)?;
         // All callers construct this wire against this session's exact resource.
         super::admit_target(self.resource(), wire.target())?;
-        let wire = wire.clone().with_authorization(credential.credential());
+        // Both discovery and listen require the selected live credential;
+        // withholding its header must not silently dispatch anonymously.
+        let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.inner.policy.response_head_timeout)?);
         let executor = ModernHttpExecutor::new();
         let response = self.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
@@ -688,5 +691,53 @@ mod tests {
         let error = admit_tasks_discovery(&discovery, br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"private-peer-detail"}}"#, &RequestId::Number(1), 4096).err().unwrap();
         assert!(matches!(error, ManagedSubscriptionError::Remote { .. }));
         assert!(!format!("{error:?} {error}").contains("private-peer-detail"));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn subscription_dispatch_refuses_revoked_credentials_on_its_first_poll() {
+        use std::future::{Future, poll_fn};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use std::task::Poll;
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use asupersync::sync::Mutex;
+        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
+        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let url = |value| CanonicalHttpUrl::parse(value).unwrap();
+                let resource = url("https://mcp.example/mcp");
+                let config = OAuthClientConfiguration::from_trusted_endpoints(
+                    "https://issuer.example", url("https://issuer.example/authorize"),
+                    url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
+                ).unwrap();
+                let session = ManagedOAuthSession {
+                    inner: Arc::new(SessionInner {
+                        client: OAuthClient::new(config), resource: resource.clone(),
+                        policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
+                        closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
+                    }),
+                };
+                let expiry = Instant::now() + Duration::from_secs(60);
+                let bearer = BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", expiry).unwrap();
+                let credential = OAuthCredentialSnapshot::new(&bearer, &[], 1, expiry, &session.inner.closed).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                bearer.revoke();
+                for method in ["server/discover", "subscriptions/listen"] {
+                    let wire = ModernHttpRequest::new(resource.as_str(), b"{}".to_vec(), FINAL_PROTOCOL_VERSION, method, None).unwrap();
+                    let mut dispatch = std::pin::pin!(session.execute_subscription_snapshot(
+                        &cx, &cancellation, Time::from_nanos(u64::MAX), &credential, &wire,
+                    ));
+                    poll_fn(|task| match dispatch.as_mut().poll(task) {
+                        Poll::Ready(Err(ManagedSubscriptionError::Session(OAuthSessionError::LoginRequired))) => Poll::Ready(()),
+                        _ => panic!("revoked subscription credentials must fail locally before any network wait"),
+                    }).await;
+                }
+                assert!(cx.checkpoint().is_ok());
+                assert!(!session.inner.closed.is_cancel_requested());
+            });
     }
 }
