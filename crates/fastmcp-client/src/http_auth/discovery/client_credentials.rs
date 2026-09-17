@@ -1,10 +1,10 @@
 //! Explicit preregistered machine-to-machine OAuth (AUTHX-02).
 //!
-//! Implements RFC 6749 `client_secret_basic`, not `private_key_jwt`, secret-post,
-//! dynamic registration, browser login, or persistent credential custody. The
-//! pinned draft's secret-body example differs from its Basic metadata: this
-//! explicit API follows the Basic method and the pinned Basic conformance case,
-//! never guessing or falling back to another way of transmitting the secret.
+//! Supports explicitly selected RFC 6749 `client_secret_basic` and native
+//! external-signer `private_key_jwt`. No secret-post, dynamic registration,
+//! browser login, authentication fallback, or persistent custody is installed.
+//! The Basic branch follows the pinned Basic metadata/conformance case rather
+//! than the incompatible secret-body example.
 //!
 //! Trusted resource/issuer discovery is shared with the native OAuth path.
 //! Every protected operation additionally verifies the official extension by
@@ -14,6 +14,9 @@
 /// Explicit composition with official Tasks and typed incremental responses.
 #[cfg(feature = "tasks")]
 pub mod tasks;
+/// Native, externally signed RFC 7523 assertions with exact registration binding.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod private_key_jwt;
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -61,6 +64,8 @@ const MAX_ACQUISITIONS: usize = 64;
 #[derive(Debug)]
 pub enum ClientCredentialsError {
     InvalidPolicy,
+    InvalidRegistration,
+    AssertionSigning,
     Closed,
     Expired,
     Saturated,
@@ -81,12 +86,14 @@ impl fmt::Display for ClientCredentialsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidPolicy => "invalid client-credentials policy",
+            Self::InvalidRegistration => "private-key client registration is invalid, expired or mismatched",
+            Self::AssertionSigning => "private-key client assertion signing failed",
             Self::Closed => "client-credentials owner is closed",
             Self::Expired => "client-credentials access token is expired or revoked",
             Self::Saturated => "client-credentials acquisition capacity exhausted",
             Self::StateUnavailable => "client-credentials state unavailable",
             Self::GenerationExhausted => "client-credentials generation exhausted",
-            Self::UnsupportedAuthentication => "issuer does not admit client_credentials with client_secret_basic",
+            Self::UnsupportedAuthentication => "issuer does not admit the selected client-credentials authentication",
             Self::InvalidToken => "client-credentials token response rejected",
             Self::ExpandedScope => "client-credentials token exceeds requested scopes",
             Self::TokenEndpointRejected => "client-credentials token endpoint rejected the grant",
@@ -108,12 +115,74 @@ impl From<OAuthDiscoveryError> for ClientCredentialsError {
 // memory is used; protected persistence and zeroized-memory custody are not claimed.
 struct ClientSecret(String);
 
-/// Administrator-selected resource, ONE issuer-bound registration and secret.
+#[derive(Clone)]
+enum MachineAuthentication {
+    Basic(Arc<ClientSecret>),
+    #[cfg(not(target_arch = "wasm32"))]
+    PrivateKeyJwt(Arc<private_key_jwt::PrivateKeyJwtAuthentication>),
+}
+
+// One owned, non-Clone grant candidate. The request consumes it exactly once;
+// no ambiguous dispatch exposes prepared bytes for automatic replay.
+struct PreparedMachineGrant {
+    body: Vec<u8>,
+    authorization: Option<String>,
+    deadline: Time,
+}
+
+impl MachineAuthentication {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Basic(_) => "client_secret_basic",
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::PrivateKeyJwt(_) => "private_key_jwt",
+        }
+    }
+
+    fn check(&self) -> Result<(), ClientCredentialsError> {
+        match self {
+            Self::Basic(_) => Ok(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::PrivateKeyJwt(authentication) => authentication.check(),
+        }
+    }
+
+    fn token_expiry_limit(&self) -> Option<Instant> {
+        match self {
+            Self::Basic(_) => None,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::PrivateKeyJwt(authentication) => Some(authentication.valid_until()),
+        }
+    }
+
+    async fn prepare(
+        &self, cx: &Cx, deadline: Time, client_id: &str,
+        resource: &CanonicalHttpUrl, scopes: &[String],
+    ) -> Result<PreparedMachineGrant, ClientCredentialsError> {
+        self.check()?;
+        check_context(cx, deadline)?;
+        match self {
+            Self::Basic(secret) => Ok(PreparedMachineGrant {
+                body: form(&[("grant_type", "client_credentials"), ("resource", resource.as_str()),
+                    ("scope", &scopes.join(" "))]).into_bytes(),
+                authorization: Some(basic(client_id, &secret.0)?),
+                deadline,
+            }),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::PrivateKeyJwt(authentication) => {
+                authentication.prepare(cx, deadline, client_id, resource, scopes).await
+            }
+        }
+    }
+}
+
+/// Administrator-selected resource, ONE issuer-bound registration and method.
 /// Extra token-endpoint origins and issuer roots are explicit host grants.
-/// Metadata cannot move the registration to a different issuer.
+/// Metadata cannot move the registration to a different issuer. `new` selects
+/// Basic; `private_key_jwt` selects an external signer without acquiring a secret.
 pub struct ClientCredentialsPlan {
     discovery: OAuthDiscoveryPlan,
-    secret: Arc<ClientSecret>,
+    authentication: MachineAuthentication,
     maximum_lifetime: Duration,
     leeway: Duration,
 }
@@ -131,7 +200,7 @@ impl ClientCredentialsPlan {
         { return Err(ClientCredentialsError::InvalidPolicy); }
         Ok(Self {
             discovery: OAuthDiscoveryPlan::new(resource, vec![issuer], client_id, scopes)?,
-            secret: Arc::new(ClientSecret(client_secret)),
+            authentication: MachineAuthentication::Basic(Arc::new(ClientSecret(client_secret))),
             maximum_lifetime: Duration::from_secs(3600),
             leeway: Duration::from_secs(30),
         })
@@ -166,18 +235,20 @@ impl ClientCredentialsPlan {
         Ok(self)
     }
 
-    /// Discovers endpoints without transmitting the secret. A later credential
-    /// call owns an explicit grant attempt. No DCR/browser branch is reachable.
+    /// Discovers endpoints without transmitting credentials or invoking a
+    /// signer. A later credential call owns one explicit grant attempt.
     pub async fn discover(&self, cx: &Cx) -> Result<ClientCredentialsClient, ClientCredentialsError> {
+        self.authentication.check()?;
         let deadline = discovery_deadline(cx, self.discovery.timeout)?;
         let (issuer, body) = self.discovery.discover_issuer_document(cx, deadline).await?;
-        let token_endpoint = admit_machine_issuer(&self.discovery, issuer, &body)?;
+        let token_endpoint = admit_machine_issuer(&self.discovery, issuer, &body, &self.authentication)?;
         check_context(cx, deadline)?;
+        self.authentication.check()?;
         Ok(ClientCredentialsClient {
             inner: Arc::new(ClientInner {
                 resource: self.discovery.resource.clone(), token_endpoint,
                 client_id: self.discovery.client_id.clone().ok_or(ClientCredentialsError::InvalidPolicy)?,
-                scopes: self.discovery.scopes.clone(), secret: Arc::clone(&self.secret),
+                scopes: self.discovery.scopes.clone(), authentication: self.authentication.clone(),
                 issuer_roots: issuer.roots.clone(), timeout: self.discovery.timeout,
                 maximum_lifetime: self.maximum_lifetime, leeway: self.leeway,
                 closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
@@ -188,8 +259,8 @@ impl ClientCredentialsPlan {
 }
 impl fmt::Debug for ClientCredentialsPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClientCredentialsPlan").field("authentication", &"client_secret_basic")
-            .field("secret", &"<redacted>").finish_non_exhaustive()
+        f.debug_struct("ClientCredentialsPlan").field("authentication", &self.authentication.method())
+            .field("credential", &"<redacted>").finish_non_exhaustive()
     }
 }
 
@@ -206,9 +277,11 @@ struct MachineIssuerMetadata {
     #[serde(default, deserialize_with = "present")]
     signed_metadata: Option<String>,
 }
-fn admit_machine_issuer(plan: &OAuthDiscoveryPlan, issuer: &TrustedOAuthIssuer, body: &[u8])
-    -> Result<CanonicalHttpUrl, ClientCredentialsError>
-{
+fn admit_machine_issuer(
+    plan: &OAuthDiscoveryPlan, issuer: &TrustedOAuthIssuer, body: &[u8],
+    authentication: &MachineAuthentication,
+) -> Result<CanonicalHttpUrl, ClientCredentialsError> {
+    authentication.check()?;
     let metadata: MachineIssuerMetadata = decode_metadata(body)?;
     if metadata.issuer != issuer.identifier { return Err(OAuthDiscoveryError::IssuerMismatch.into()); }
     if metadata.signed_metadata.is_some() { return Err(OAuthDiscoveryError::SignedMetadataUnsupported.into()); }
@@ -216,12 +289,16 @@ fn admit_machine_issuer(plan: &OAuthDiscoveryPlan, issuer: &TrustedOAuthIssuer, 
     validate_array(&metadata.token_endpoint_auth_methods_supported)?;
     validate_optional_array(metadata.protected_resources.as_deref())?;
     if !has(&metadata.grant_types_supported, "client_credentials")
-        || !has(&metadata.token_endpoint_auth_methods_supported, "client_secret_basic")
+        || !has(&metadata.token_endpoint_auth_methods_supported, authentication.method())
     { return Err(ClientCredentialsError::UnsupportedAuthentication); }
     if metadata.protected_resources.as_ref().is_some_and(|values| !has(values, plan.resource.as_str())) {
         return Err(OAuthDiscoveryError::ResourceMismatch.into());
     }
     admit_scopes(&plan.scopes, metadata.scopes_supported.as_deref())?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let MachineAuthentication::PrivateKeyJwt(authentication) = authentication {
+        authentication.admit_metadata(&metadata, body)?;
+    }
     Ok(issuer.endpoint(&metadata.token_endpoint)?)
 }
 
@@ -230,7 +307,7 @@ struct ClientInner {
     token_endpoint: CanonicalHttpUrl,
     client_id: String,
     scopes: Vec<String>,
-    secret: Arc<ClientSecret>,
+    authentication: MachineAuthentication,
     issuer_roots: Vec<Certificate>,
     timeout: Duration,
     maximum_lifetime: Duration,
@@ -302,29 +379,37 @@ impl ClientCredentialsClient {
         let deadline = discovery_deadline(cx, self.inner.timeout)?;
         let _permit = AcquisitionPermit::new(&self.inner.pending)?;
         active(cx, deadline, &self.inner.closed, cancellation, None, async {
+            self.inner.authentication.check()?;
             let mut state = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx).await
                 .map_err(|_| ClientCredentialsError::StateUnavailable)?;
+            self.inner.authentication.check()?;
             if state.current.as_ref().is_some_and(|token| token.bearer.is_revoked()) {
                 return Err(ClientCredentialsError::Expired);
             }
             if state.current.as_ref().is_none_or(|token| Instant::now() >= token.renew_after) {
                 let generation = state.generation.checked_add(1).ok_or(ClientCredentialsError::GenerationExhausted)?;
                 let started = Instant::now();
-                let body = form(&[("grant_type", "client_credentials"), ("resource", self.resource().as_str()),
-                    ("scope", &self.inner.scopes.join(" "))]);
-                let headers = vec![
+                let grant = self.inner.authentication.prepare(
+                    cx, deadline, &self.inner.client_id, self.resource(), &self.inner.scopes,
+                ).await?;
+                let mut headers = vec![
                     ("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
                     ("Accept".to_owned(), "application/json".to_owned()),
                     ("Accept-Encoding".to_owned(), "identity".to_owned()),
                     ("Connection".to_owned(), "close".to_owned()),
-                    ("Authorization".to_owned(), basic(&self.inner.client_id, &self.inner.secret.0)?),
                 ];
+                if let Some(authorization) = grant.authorization {
+                    headers.push(("Authorization".to_owned(), authorization));
+                }
                 let transport = token_transport(&self.inner.issuer_roots);
-                let response = transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, body.into_bytes())
-                    .await.map_err(|_| ClientCredentialsError::Transport)?;
+                let response = active(cx, grant.deadline, &self.inner.closed, cancellation, None, async {
+                    transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, grant.body)
+                        .await.map_err(|_| ClientCredentialsError::Transport)
+                }).await?;
                 if response.status != 200 { return Err(ClientCredentialsError::TokenEndpointRejected); }
                 validate_headers(&response.headers)?;
                 if !response.trailers.is_empty() { return Err(ClientCredentialsError::InvalidToken); }
+                self.inner.authentication.check()?;
                 let token = admit_token(&self.inner, &response.body, started)?;
                 check_context(cx, deadline)?;
                 if self.inner.closed.is_cancel_requested() { return Err(ClientCredentialsError::Closed); }
@@ -446,6 +531,7 @@ fn admit_token(inner: &ClientInner, bytes: &[u8], started: Instant) -> Result<Se
     }) { return Err(ClientCredentialsError::ExpandedScope); }
     let lifetime = token.expires_in.map_or(inner.maximum_lifetime, |seconds| Duration::from_secs(seconds).min(inner.maximum_lifetime));
     let expires_at = started.checked_add(lifetime).ok_or(ClientCredentialsError::InvalidToken)?;
+    let expires_at = inner.authentication.token_expiry_limit().map_or(expires_at, |limit| expires_at.min(limit));
     if Instant::now() >= expires_at { return Err(ClientCredentialsError::Expired); }
     let bearer = BoundBearerCredential::bind_with_expiry(inner.resource.clone(), token.access_token, expires_at)
         .map_err(|_| ClientCredentialsError::InvalidToken)?
@@ -668,7 +754,7 @@ mod tests {
     fn inner() -> ClientInner {
         let plan = plan();
         ClientInner { resource:plan.discovery.resource, token_endpoint:url("https://issuer.example/token"),
-            client_id:"service-client".to_owned(), scopes:vec!["read".to_owned(),"write".to_owned()], secret:plan.secret,
+            client_id:"service-client".to_owned(), scopes:vec!["read".to_owned(),"write".to_owned()], authentication:plan.authentication,
             issuer_roots:vec![], timeout:Duration::from_secs(30), maximum_lifetime:Duration::from_secs(60),
             leeway:Duration::from_secs(30), closed:McpRequestCancellation::new(), pending:AtomicUsize::new(0),
             state:Arc::new(Mutex::new(TokenState::default())) }
@@ -681,12 +767,12 @@ mod tests {
     #[test]
     fn machine_metadata_does_not_require_a_browser_endpoint_or_pkce() {
         let plan = plan();
-        assert!(admit_machine_issuer(&plan.discovery, &plan.discovery.issuers[0], &serde_json::to_vec(&issuer()).unwrap()).is_ok());
+        assert!(admit_machine_issuer(&plan.discovery, &plan.discovery.issuers[0], &serde_json::to_vec(&issuer()).unwrap(), &plan.authentication).is_ok());
         for (key, value) in [("issuer",json!("https://other.example")),("token_endpoint",json!("https://other.example/token")),
             ("grant_types_supported",json!(["authorization_code"])),("token_endpoint_auth_methods_supported",json!(["private_key_jwt"])),
             ("protected_resources",json!(["https://other.example/mcp"])),("signed_metadata",json!("unverified"))] {
             let mut document=issuer(); document[key]=value;
-            assert!(admit_machine_issuer(&plan.discovery,&plan.discovery.issuers[0],&serde_json::to_vec(&document).unwrap()).is_err());
+            assert!(admit_machine_issuer(&plan.discovery,&plan.discovery.issuers[0],&serde_json::to_vec(&document).unwrap(), &plan.authentication).is_err());
         }
     }
     #[test]
