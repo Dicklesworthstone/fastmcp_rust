@@ -581,6 +581,7 @@ struct WireObservations {
     uncertain_dispatch: LaneObservation,
     deadline_race: LaneObservation,
     caller_cancellation: CancellationObservation,
+    independent_server_request: ServerRequestObservation,
 }
 
 impl WireObservations {
@@ -901,6 +902,127 @@ fn observe_caller_cancellation() -> CancellationObservation {
         progress_before_cancel,
         post_cancel_outcome,
         server_saw_stream_close,
+        requests_during_call,
+        connections_after_return,
+    }
+}
+
+/// What the HTTP-03.24 independent-server-request scenario observed.
+#[derive(Debug, Clone)]
+struct ServerRequestObservation {
+    outcome: String,
+    requests_during_call: usize,
+    connections_after_return: usize,
+}
+
+/// Delivers an independent server->client JSON-RPC *request* over a response
+/// stream the caller opened for its own request, and observes what the shipped
+/// client does with it.
+///
+/// The frame carries both `id` and `method`, which is what makes it a request
+/// rather than a response or a notification. A response stream is owned by the
+/// caller's request; an independent request arriving on it is not the caller's
+/// result and must not be handed back as one.
+///
+/// The outcome is captured rather than predicted. This records whatever the
+/// shipped surface does and asserts only that the frame was NOT delivered as an
+/// ordinary event - if the client admitted it, that is a real finding and this
+/// case is where it surfaces.
+fn observe_independent_server_request() -> ServerRequestObservation {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the server-request fixture");
+    let address = listener
+        .local_addr()
+        .expect("read the server-request fixture address");
+    let target = format!("http://{address}/mcp-server-request");
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (report_tx, report_rx) = mpsc::channel::<(usize, usize)>();
+
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded(&listener);
+        let _probe_request = read_request(&mut probe);
+        write_bounded_response(
+            &mut probe,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "server-request"),
+        );
+        drop(probe);
+
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        begin_sse_response(&mut call);
+        // An independent server->client request: `id` AND `method` together.
+        write_sse_event(
+            &mut call,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9001,
+                "method": "sampling/createMessage",
+                "params": {},
+            }),
+        );
+        release_rx
+            .recv()
+            .expect("driver reports the server-request call returned");
+        drop(call);
+
+        listener
+            .set_nonblocking(true)
+            .expect("set the server-request listener nonblocking for the backlog drain");
+        let mut extra = 0_usize;
+        while let Ok((stream, _)) = listener.accept() {
+            extra += 1;
+            drop(stream);
+        }
+        report_tx
+            .send((1, extra))
+            .expect("report server-request observations");
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the server-request scenario owns its caller runtime");
+    let outcome = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+        let connection = integration_builder(&target)
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the server-request endpoint must connect through the public builder");
+        let mut stream_listener = connection
+            .open_final_core_listener(
+                &cx,
+                "tools/call",
+                serde_json::json!({
+                    "name": "http_03_server_request_tool",
+                    "arguments": {},
+                }),
+                RequestId::Number(61),
+                limits,
+            )
+            .await
+            .expect("the shipped SSE lane must open a request-owned listener");
+
+        match stream_listener.next_event(&cx).await {
+            Ok(Some(event)) => format!("admitted::{event:?}"),
+            Ok(None) => "clean-end".to_owned(),
+            Err(error) => format!("rejected::{error:?}"),
+        }
+    });
+
+    release_tx
+        .send(())
+        .expect("release the server-request fixture");
+    let (requests_during_call, connections_after_return) = report_rx
+        .recv()
+        .expect("collect server-request observations");
+    server
+        .join()
+        .expect("the server-request fixture thread must not panic");
+
+    ServerRequestObservation {
+        outcome,
         requests_during_call,
         connections_after_return,
     }
@@ -1264,6 +1386,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     let uncertain_dispatch = observe_lane(false, Duration::from_secs(5));
     let deadline_race = observe_lane(true, Duration::from_millis(50));
     let caller_cancellation = observe_caller_cancellation();
+    let independent_server_request = observe_independent_server_request();
 
     WireObservations {
         fixture_authority: authority,
@@ -1292,6 +1415,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         uncertain_dispatch,
         deadline_race,
         caller_cancellation,
+        independent_server_request,
     }
 }
 
@@ -2635,15 +2759,70 @@ fn case_uncertain_dispatch_no_retry(builder: &mut CaseBuilder, wire: &WireObserv
 /// HTTP-03.23 `extension-activation-proof-notification` (floor 4). UNPROVEN.
 fn case_extension_activation_notification(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
 
-/// HTTP-03.24 `independent-server-request-rejection` (floor 2). UNPROVEN.
-fn case_independent_server_request_rejection(
-    _builder: &mut CaseBuilder,
-    _wire: &WireObservations,
-) {
+/// HTTP-03.24 `independent-server-request-rejection` (floor 2).
+fn case_independent_server_request_rejection(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let observed = &wire.independent_server_request;
+
+    assert!(
+        !observed.outcome.starts_with("admitted::"),
+        "an independent server->client request arriving on a caller-owned response stream \
+         must not be handed back as the caller's event; observed {}",
+        observed.outcome
+    );
+    builder.positive("independent-server-request-outcome", &observed.outcome);
+
+    assert_eq!(
+        observed.connections_after_return, 0,
+        "rejecting an independent server request must not replay the caller's request; {} \
+         retry connection(s) were queued",
+        observed.connections_after_return
+    );
+    assert_eq!(
+        observed.requests_during_call, 1,
+        "the server-request lane must post exactly once"
+    );
+    builder.positive("independent-server-request-no-replay", "1 post, 0 retries");
 }
 
-/// HTTP-03.25 `no-event-id-retry-resumption-state` (floor 2). UNPROVEN.
-fn case_no_event_id_retry_resumption(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+/// HTTP-03.25 `no-event-id-retry-resumption-state` (floor 2).
+///
+/// Every event this fixture writes is `data:` only - it carries no `id:` field,
+/// so the stream offers the client nothing to resume from. Two things follow and
+/// both are checked against the wire rather than against the client's internals.
+///
+/// This is a negative-space assertion, so it is worth saying why it is not
+/// tautological: it fails the moment the shipped client starts emitting a
+/// resumption header, which is exactly the regression it guards. The second
+/// observation keeps it from resting on absence alone by requiring that the
+/// terminal still arrived - delivery must not depend on resumption state that
+/// was never established.
+fn case_no_event_id_retry_resumption(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let requests = [
+        ("a_probe", &wire.a_probe),
+        ("a_call", &wire.a_call),
+        ("b_probe", &wire.b_probe),
+        ("b_ping", &wire.b_ping),
+        ("b_lane_probe", &wire.b_lane_probe),
+    ];
+    for (name, request) in requests {
+        assert!(
+            request.header("Last-Event-ID").is_none(),
+            "no request may carry a resumption header when the stream published no event \
+             ids; {name} carried Last-Event-ID"
+        );
+    }
+    builder.positive("resumption-header-absent-on-all-requests", "5/5");
+
+    assert!(
+        wire.a_terminal.starts_with("terminal="),
+        "the id-less stream must still deliver its terminal; observed {}",
+        wire.a_terminal
+    );
+    builder.positive(
+        "terminal-delivered-without-event-ids",
+        &wire.normalize(&wire.a_terminal),
+    );
+}
 
 fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
     for cell in matrix {
