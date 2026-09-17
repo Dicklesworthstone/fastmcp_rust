@@ -1584,6 +1584,48 @@ async fn negative_05_missing_name_mirror(cx: &Cx) {
 // HTTP-03.06 — immediate JSON strict UTF-8/BOM admission
 // ---------------------------------------------------------------------------
 
+/// Builds a JSON-RPC response whose `note` string holds the caller's raw bytes.
+///
+/// The surrounding envelope is byte-identical across every case, so the only
+/// thing that varies between an admitted and a refused body is the injected
+/// sequence itself.
+fn json_response_with_raw_note(raw_note: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"result":{"note":""#);
+    body.extend_from_slice(raw_note);
+    body.extend_from_slice(br#""}}"#);
+    body
+}
+
+/// Sends one direct-lane JSON response with an exact body and returns the
+/// strict-admission outcome through the public client.
+async fn direct_json_admission(cx: &Cx, body: Vec<u8>) -> Result<(), ClientHttpConnectionError> {
+    let peer = Peer::bind().await;
+    let mut connection = connect(cx, &peer).await;
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_json_response(&mut io, &body).await;
+            end_stream(&mut io).await;
+        },
+        async {
+            connection
+                .request_json(
+                    cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    RequestId::Number(2),
+                    64 * 1024,
+                )
+                .await
+                .map(|_| ())
+        },
+    )
+    .await;
+    outcome
+}
+
 /// A valid JSON-RPC response whose result carries a multi-byte UTF-8 scalar.
 fn utf8_json_response() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -1626,6 +1668,14 @@ async fn positive_06_json_strict_utf8(cx: &Cx) {
         response.error.is_none(),
         "the admitted response must be the peer's result"
     );
+
+    // A correctly encoded U+FFFD is ordinary text and is admitted. The direct
+    // lane refuses MALFORMED BYTES, not the replacement character itself - and
+    // the distinction matters, because the negative half proves the same
+    // logical character arrives legitimately over SSE.
+    direct_json_admission(cx, json_response_with_raw_note("\u{FFFD}".as_bytes()))
+        .await
+        .expect("a well-formed U+FFFD is ordinary UTF-8 and must be admitted");
 }
 
 async fn negative_06_json_byte_order_mark(cx: &Cx) {
@@ -1672,6 +1722,77 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
             ))
         ),
         "expected a typed BOM refusal on the direct JSON lane, saw {refusal:?}"
+    );
+
+    // ---------------------------------------------------------------------
+    // A BOM is refused wherever it appears, not merely at byte 0. The changed
+    // variable is the BOM's POSITION: here it sits inside a string value, deep
+    // in an otherwise valid document.
+    // ---------------------------------------------------------------------
+    let mut midstream_note = Vec::new();
+    midstream_note.extend_from_slice(b"before");
+    midstream_note.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    midstream_note.extend_from_slice(b"after");
+    let midstream = direct_json_admission(cx, json_response_with_raw_note(&midstream_note))
+        .await
+        .expect_err("a midstream BOM must be refused, not just a leading one");
+    assert!(
+        matches!(
+            midstream,
+            ClientHttpConnectionError::ResponseAdmission(JsonRpcAdmissionError::Raw(
+                RawJsonAdmissionError::ByteOrderMark
+            ))
+        ),
+        "a midstream BOM must raise the same typed BOM refusal, saw {midstream:?}"
+    );
+
+    // ---------------------------------------------------------------------
+    // DECODER-DISPATCH DIFFERENTIAL. This is the case the contract names: one
+    // byte sequence that is invalid UTF-8 and would become a VALID JSON
+    // document if it were replacement-decoded.
+    //
+    // The direct JSON lane must refuse it outright - strict UTF-8, never
+    // repaired. The SSE lane must replacement-decode the identical bytes into
+    // an ordinary U+FFFD inside a valid assembled payload. Same bytes, two
+    // lanes, two different and both-correct outcomes; a single shared decoder
+    // could not produce both.
+    // ---------------------------------------------------------------------
+    const LONE_CONTINUATION: &[u8] = &[0xFF];
+
+    let malformed = direct_json_admission(cx, json_response_with_raw_note(LONE_CONTINUATION))
+        .await
+        .expect_err("malformed UTF-8 must be refused on the direct lane, never repaired");
+    assert!(
+        matches!(
+            malformed,
+            ClientHttpConnectionError::ResponseAdmission(JsonRpcAdmissionError::Raw(
+                RawJsonAdmissionError::InvalidUtf8
+            ))
+        ),
+        "the direct lane must refuse malformed UTF-8 as such, saw {malformed:?}"
+    );
+
+    let peer = Peer::bind().await;
+    let mut sse_body = Vec::new();
+    sse_body.extend_from_slice(b"data: ");
+    sse_body.extend_from_slice(&json_response_with_raw_note(LONE_CONTINUATION));
+    sse_body.extend_from_slice(b"\n\n");
+    let payloads = drain_sse(cx, &peer, sse_body, limits())
+        .await
+        .expect("the SSE lane replacement-decodes rather than refusing");
+    assert_eq!(
+        payloads.len(),
+        1,
+        "the malformed byte must not break event framing"
+    );
+    assert!(
+        payloads[0].contains('\u{FFFD}'),
+        "the SSE lane must replace the malformed byte with U+FFFD: {:?}",
+        payloads[0]
+    );
+    assert!(
+        !payloads[0].as_bytes().contains(&0xFF),
+        "no raw malformed byte may survive the SSE decoder"
     );
 }
 
