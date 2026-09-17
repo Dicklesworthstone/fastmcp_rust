@@ -47602,9 +47602,24 @@ mod lib_unit_tests {
                     "io"
                 };
                 if release_before_shutdown {
+                    // `stage == "receive"` already entails that the non-quiescent
+                    // cleanup wait was not entered: entering it produces a
+                    // `run_and_cleanup` combined error carrying a `cleanup` key,
+                    // which is what the other branch asserts. The two are mutually
+                    // exclusive by construction, so this branch needs no separate
+                    // check that the cleanup timeout was skipped.
+                    //
+                    // An `assert!(started.elapsed() < SHUTDOWN_CLEANUP_TIMEOUT)`
+                    // stood here and was removed. It added no information about the
+                    // property above, and it was an UPPER bound on real wall time
+                    // (`Instant::now()`) covering the whole pump lifecycle, so a
+                    // loaded host failed it with no code change: this test passed
+                    // 1926/0 and failed 1925/1 seventeen minutes apart on identical
+                    // source. Note the sibling branch's `>= SHUTDOWN_CLEANUP_TIMEOUT`
+                    // is a LOWER bound and is load-monotone, so it is sound and stays.
+                    // Do not reinstate an upper bound on wall time here.
                     assert_eq!(data["run"]["data"]["stage"], "receive");
                     assert_eq!(data["run"]["data"]["kind"], receive_kind);
-                    assert!(started.elapsed() < SHUTDOWN_CLEANUP_TIMEOUT);
                 } else {
                     assert_eq!(data["run"]["data"]["stage"], "run_and_cleanup");
                     assert_eq!(data["run"]["data"]["kind"], "multiple_failures");
