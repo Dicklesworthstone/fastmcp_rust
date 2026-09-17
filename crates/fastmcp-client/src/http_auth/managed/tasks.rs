@@ -39,6 +39,8 @@ use crate::sse::SseLimits;
 
 /// Opt-in bounded Task polling and host input resolution.
 pub mod driver;
+/// Notification-driven multi-task observation with authenticated reconciliation.
+pub mod watch;
 
 /// Independent wire and lifetime bounds for discovery plus one Task operation.
 /// Native HTTP body/idle bounds still apply and may be tighter. Record count
