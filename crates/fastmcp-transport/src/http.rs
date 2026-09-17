@@ -7559,6 +7559,32 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
             response.provenance.leaf_certificate_sha256, fixture_leaf_digest,
             "recorded provenance must carry the digest of the PEER'S LEAF certificate"
         );
+        // bd-0a6lr: `alpn` and `tls_protocol` are DERIVED from the live session
+        // in `guarded_peer_provenance` and were asserted NOWHERE in the crate, so
+        // an implementation that reported `None` for both passed every test.
+        // The fixture acceptor pins ALPN to `http/1.1`, which makes the expected
+        // value fixed by the fixture rather than guessed.
+        assert_eq!(
+            response.provenance.alpn.as_deref(),
+            Some(&b"http/1.1"[..]),
+            "provenance must report the ALPN the acceptor actually negotiated"
+        );
+        // `tls_protocol` is checked for presence and non-emptiness, NOT for an
+        // exact version string, and that restraint is deliberate. The negotiated
+        // version is mutable content: pinning it would fail this test on a
+        // legitimate TLS-library upgrade while proving nothing extra about
+        // derivation. `None` is what a non-deriving implementation returns, so
+        // presence is the discriminating half; an exact match would be a frozen
+        // measurement that rots.
+        let tls_protocol = response
+            .provenance
+            .tls_protocol
+            .as_deref()
+            .expect("provenance must report the negotiated TLS version, not None");
+        assert!(
+            !tls_protocol.is_empty(),
+            "the negotiated TLS version must be a real identity, not an empty placeholder"
+        );
         // And not simply some certificate from the chain: the issuer is present
         // in the same PEM, so an implementation digesting the wrong chain
         // element would still have passed the equality above by accident had we
