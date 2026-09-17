@@ -514,7 +514,7 @@ mod tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
             self.closed = true;
             Ok(())
         }
@@ -549,7 +549,7 @@ mod tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
             self.terminal = true;
             Ok(())
         }

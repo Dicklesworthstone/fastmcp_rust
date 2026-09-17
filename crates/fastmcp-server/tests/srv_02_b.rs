@@ -86,7 +86,7 @@ impl Transport for FeatureOffTransport {
         state.incoming.pop_front().ok_or(TransportError::Closed)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.state
             .lock()
             .expect("feature-off transport mutex must not be poisoned")

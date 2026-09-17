@@ -776,7 +776,7 @@ impl<W: Write> SseWriter<W> {
     }
 
     /// Closes the writer terminally, flushing any buffered output once.
-    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    pub fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
@@ -1322,7 +1322,7 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         Ok(())
     }
@@ -1552,7 +1552,7 @@ impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         Ok(())
     }
@@ -1733,7 +1733,7 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }

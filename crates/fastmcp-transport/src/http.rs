@@ -3187,7 +3187,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         Ok(JsonRpcMessage::Request(json_rpc))
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.response_pending = false;
         self.response_origin = None;
@@ -5046,7 +5046,7 @@ impl Transport for StreamableHttpTransport {
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.close_queues();
         Ok(())
     }

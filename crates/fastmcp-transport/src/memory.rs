@@ -322,7 +322,7 @@ impl Transport for MemoryTransport {
         recv_memory_message(&mut self.receiver, &mut self.closed, self.poll_interval, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.sender.take();
         self.receiver.close();
@@ -372,7 +372,7 @@ impl TransportRecvHalf for MemoryRecvHalf {
         recv_memory_message(receiver, &mut self.closed, self.poll_interval, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         close_memory_receiver(&mut self.receiver, &mut self.closed);
         Ok(())
     }
@@ -422,7 +422,7 @@ impl TransportSendHalf for MemorySendHalf {
         send_memory_message(&mut self.sender, &self.codec, &mut self.closed, cx, message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.sender.take();
         Ok(())
