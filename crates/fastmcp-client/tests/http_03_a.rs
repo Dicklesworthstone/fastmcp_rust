@@ -4235,6 +4235,49 @@ async fn negative_12_invalid_direction(cx: &Cx) {
 // HTTP-03.13 — JSON-or-SSE one terminal outcome with request-scoped progress
 // ---------------------------------------------------------------------------
 
+/// The line ceiling the stream-close pair runs against, small enough that one
+/// payload byte decides admission.
+const CLOSE_LINE_CEILING: usize = 32;
+
+/// Reads one SSE stream TWICE and returns both outcomes.
+///
+/// Every other drain helper here reads to completion, which can only observe a
+/// stream's first answer. Whether a stream stays closed after it has refused is
+/// a property of the second read, so it needs its own fixture.
+async fn read_sse_twice(
+    cx: &Cx,
+    peer: &Peer,
+    body: Vec<u8>,
+    sse_limits: SseLimits,
+) -> (
+    Result<Option<String>, ModernHttpExecutorError>,
+    Result<Option<String>, ModernHttpExecutorError>,
+) {
+    let request = ping_request(&peer.target());
+    let ((), outcomes) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, &body).await;
+            end_sse_stream(&mut io).await;
+        },
+        async {
+            let response = post(cx, &request)
+                .await
+                .expect("the SSE response head must be admitted");
+            let mut stream = response
+                .into_sse_stream(sse_limits)
+                .expect("an admitted SSE response must convert to an event stream");
+            let first = stream.next_event(cx).await;
+            let second = stream.next_event(cx).await;
+            (first, second)
+        },
+    )
+    .await;
+    outcomes
+}
+
 async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
     let peer = Peer::bind().await;
     let mut connection = connect(cx, &peer).await;
@@ -4327,6 +4370,33 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
         serde_json::to_value(&marker).expect("the marker must serialize"),
         "the progress token travels with the request that owns it"
     );
+    // -----------------------------------------------------------------------
+    // Stream close, the second-read half of this group's contract.
+    //
+    // A healthy stream answers twice: its event, then a clean end. That is the
+    // control - without it, "the second read did not return an event" would be
+    // satisfied by a stream that had simply broken early.
+    // -----------------------------------------------------------------------
+    let admitted_payload = CLOSE_LINE_CEILING - b"data: ".len();
+    let peer = Peer::bind().await;
+    let (first, second) = read_sse_twice(
+        cx,
+        &peer,
+        sized_event(admitted_payload, 1),
+        SseLimits::new(CLOSE_LINE_CEILING, 65_536, 64).expect("stream-close limits"),
+    )
+    .await;
+    assert_eq!(
+        first
+            .expect("a line at exactly the ceiling must be admitted")
+            .expect("the event must arrive")
+            .len(),
+        admitted_payload
+    );
+    assert!(
+        matches!(second, Ok(None)),
+        "a healthy stream reports a clean end on its second read, saw {second:?}"
+    );
 }
 
 async fn negative_13_terminal_id_mismatch(cx: &Cx) {
@@ -4370,4 +4440,56 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
         "expected a typed correlation refusal, saw {refusal:?}"
     );
     peer.assert_no_further_connection();
+    // -----------------------------------------------------------------------
+    // Stream close after a refusal. The sole changed variable is ONE PAYLOAD
+    // BYTE: the control's line grows from the ceiling to one octet over it.
+    //
+    // The first read must be the typed refusal. The SECOND read is the half
+    // that matters: a refused stream is closed, so it must keep saying so. It
+    // may not deliver an event, and - the subtler failure - it may not report
+    // `Ok(None)` either, because a clean end is what a caller reads as "the
+    // server finished". A stream that answered a refusal and then EOF would let
+    // a caller treat a malformed response as a completed one.
+    // -----------------------------------------------------------------------
+    let admitted_payload = CLOSE_LINE_CEILING - b"data: ".len();
+    let over_payload = admitted_payload + 1;
+    let peer = Peer::bind().await;
+    let (first, second) = read_sse_twice(
+        cx,
+        &peer,
+        sized_event(over_payload, 1),
+        SseLimits::new(CLOSE_LINE_CEILING, 65_536, 64).expect("stream-close limits"),
+    )
+    .await;
+    let refusal = first
+        .err()
+        .expect("a line one octet over the ceiling must be refused");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::SseParse(SseParseError::LineTooLong { limit_bytes })
+                if limit_bytes == CLOSE_LINE_CEILING
+        ),
+        "expected a typed line-bound refusal, saw {refusal:?}"
+    );
+    let closed = second
+        .err()
+        .expect("a refused stream must not answer a second read with an event or a clean end");
+    assert!(
+        matches!(closed, ModernHttpExecutorError::SseStreamClosed),
+        "a refused stream must report itself closed, saw {closed:?}"
+    );
+    peer.assert_no_further_connection();
+
+    // Unchanged state: a fresh stream at the ceiling still answers twice, so
+    // the refusal closed only its own response.
+    let peer = Peer::bind().await;
+    let (first, second) = read_sse_twice(
+        cx,
+        &peer,
+        sized_event(admitted_payload, 1),
+        SseLimits::new(CLOSE_LINE_CEILING, 65_536, 64).expect("stream-close limits"),
+    )
+    .await;
+    assert!(first.is_ok() && matches!(second, Ok(None)));
 }
