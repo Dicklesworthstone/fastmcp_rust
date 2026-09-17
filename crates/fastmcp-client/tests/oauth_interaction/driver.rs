@@ -11,6 +11,10 @@ mod tasks;
 #[path = "task_subscriptions.rs"]
 mod task_subscriptions;
 
+#[cfg(feature = "tasks")]
+#[path = "task_driver.rs"]
+mod task_driver;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
