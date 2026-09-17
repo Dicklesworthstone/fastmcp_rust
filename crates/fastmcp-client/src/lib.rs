@@ -2711,9 +2711,24 @@ fn stop_child(
 }
 
 fn combine_cleanup_errors(first: McpError, second: McpError) -> McpError {
-    McpError::internal_error(format!(
-        "Multiple client cleanup steps failed ({first}); ({second})"
-    ))
+    // Two cleanup failures that AGREE on a terminal keep it. Folding two
+    // cancellations into an internal error erases the classification at exactly
+    // the point a caller reads it, and this function also FOLDS (lib.rs:14181),
+    // so a genericised code would poison every later combination too. Codes
+    // differ only when the steps failed for genuinely different reasons, which
+    // is what InternalError states here rather than merely defaulting to.
+    // Both originals are retained as data instead of surviving only as message
+    // text, so the cause is recoverable rather than reformatted away.
+    let code = if first.code == second.code {
+        first.code
+    } else {
+        McpErrorCode::InternalError
+    };
+    McpError::with_data(
+        code,
+        format!("Multiple client cleanup steps failed ({first}); ({second})"),
+        serde_json::json!({ "first": first, "second": second }),
+    )
 }
 
 pub(crate) fn combine_cleanup_results(
