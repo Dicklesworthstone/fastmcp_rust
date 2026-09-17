@@ -12935,8 +12935,32 @@ IFS= read -r end
                         outcome.unwrap_err().code,
                         fastmcp_core::McpErrorCode::RequestCancelled
                     );
+                    // The bound is `delay`, not a hardcoded literal. This
+                    // previously read `Duration::from_millis(250)` while its own
+                    // message named "the advertised interval", which is `delay`
+                    // = 500ms — the code enforced half the property the message
+                    // claimed. An assertion whose message names one bound and
+                    // whose code enforces another reads as correct to anyone
+                    // checking intent, and only diverges for values the
+                    // hardcode happens to exclude.
+                    //
+                    // KNOWN LOAD-DEPENDENT SITE (category (c)): this is still an
+                    // upper bound on real wall time, so a loaded host can fail a
+                    // correct cancellation. It is retained rather than removed
+                    // because the property is real and nothing else proves it —
+                    // the `RequestCancelled` assertion above holds whether
+                    // cancellation was prompt or waited out the full interval,
+                    // and the sibling `else` branch's `>= delay` is a sound
+                    // lower bound that says nothing about this path.
+                    //
+                    // The correct replacement is a poll count, not a clock: this
+                    // test already hand-drives the future through `poll_fn`, so
+                    // "resolved within N polls of `set_cancel_requested`" is
+                    // observable and load-independent. Doing that means
+                    // restructuring the shared closure both branches use, which
+                    // is a larger change than this repair.
                     assert!(
-                        started.elapsed() < std::time::Duration::from_millis(250),
+                        started.elapsed() < delay,
                         "cancellation must stop the wait before the advertised interval"
                     );
                 } else {
