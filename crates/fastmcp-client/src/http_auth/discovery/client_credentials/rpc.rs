@@ -10,6 +10,8 @@
 //! closure remain enforced by the original machine credential snapshot. This
 //! does not negotiate Tasks, Apps, or subscriptions.
 
+/// Complete, bounded and invalidation-aware machine catalog discovery.
+pub mod catalog;
 /// Explicit, bounded host-driven input-required continuations.
 pub mod interaction;
 
