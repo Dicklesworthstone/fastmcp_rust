@@ -213,7 +213,10 @@ impl ManagedTasksClient {
         &self, cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time,
         credential: &OAuthCredentialSnapshot, wire: &ModernHttpRequest,
     ) -> Result<ManagedOAuthResponse, ManagedTasksError> {
-        let wire = wire.clone().with_authorization(credential.credential());
+        self.session.check(cx, cancellation)?;
+        // Discovery and the subsequent mutation both require this same live
+        // snapshot; withholding its header must never become anonymous dispatch.
+        let wire = credential.authorize_request(wire)?;
         let head_deadline = deadline.min(deadline_after(cx, self.session.inner.policy.response_head_timeout)?);
         let executor = ModernHttpExecutor::new();
         let response = self.session.await_active(cx, cancellation, head_deadline, Some(credential.expires_at), async {
@@ -556,5 +559,52 @@ mod tests {
         }
         let result = envelope(r#"{"resultType":"task","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#);
         assert!(matches!(decode_stream_record(&prepared.decoder, &result, &RequestId::Number(2), 4096, Some(&owned), &mut last), Ok(ManagedTaskEvent::ToolResult(_))));
+    }
+
+    #[test]
+    fn task_dispatch_refuses_revoked_credentials_on_its_first_poll() {
+        use std::future::{Future, poll_fn};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use std::task::Poll;
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use asupersync::sync::Mutex;
+        use crate::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
+        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let url = |value| CanonicalHttpUrl::parse(value).unwrap();
+                let resource = url("https://mcp.example/mcp");
+                let config = OAuthClientConfiguration::from_trusted_endpoints(
+                    "https://issuer.example", url("https://issuer.example/authorize"),
+                    url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
+                ).unwrap();
+                let session = ManagedOAuthSession {
+                    inner: Arc::new(SessionInner {
+                        client: OAuthClient::new(config), resource: resource.clone(),
+                        policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
+                        closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
+                    }),
+                };
+                let expiry = Instant::now() + Duration::from_secs(60);
+                let bearer = BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", expiry).unwrap();
+                let credential = OAuthCredentialSnapshot::new(&bearer, &[], 1, expiry, &session.inner.closed).unwrap();
+                let client = ManagedTasksClient::new(session, FinalRequestMeta::new(ClientCapabilities::default()), ManagedTasksLimits::default()).unwrap();
+                let wire = ModernHttpRequest::new(resource.as_str(), b"{}".to_vec(), FINAL_PROTOCOL_VERSION, TASK_GET, None).unwrap();
+                assert!(credential.authorize_request(&wire).is_ok());
+                bearer.revoke();
+                let cancellation = McpRequestCancellation::new();
+                let mut dispatch = std::pin::pin!(client.execute_bound(
+                    &cx, &cancellation, Time::from_nanos(u64::MAX), &credential, &wire,
+                ));
+                poll_fn(|task| match dispatch.as_mut().poll(task) {
+                    Poll::Ready(Err(ManagedTasksError::Session(OAuthSessionError::LoginRequired))) => Poll::Ready(()),
+                    _ => panic!("revoked Tasks credentials must fail locally before any network wait"),
+                }).await;
+                assert!(cx.checkpoint().is_ok());
+                assert!(!client.session.inner.closed.is_cancel_requested());
+            });
     }
 }
