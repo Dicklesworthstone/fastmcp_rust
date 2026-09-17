@@ -951,6 +951,7 @@ mod tests {
                 logging: None,
                 completions: None,
                 tasks: None,
+                ..Default::default()
             },
             protocol_version.to_owned(),
         )

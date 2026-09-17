@@ -13213,6 +13213,7 @@ IFS= read -r end
             logging: None,
             completions: None,
             tasks: None,
+            ..Default::default()
         }
     }
 

@@ -40,6 +40,24 @@ pub struct ServerCapabilities {
     /// Background tasks capability (Docket/SEP-1686).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TasksCapability>,
+    /// Experimental, non-standard capabilities that the server supports.
+    ///
+    /// Schema: `type: object`, `additionalProperties: JSONObject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, serde_json::Value>>,
+    /// Optional MCP extensions that the server supports.
+    ///
+    /// Keys are extension identifiers and values are per-extension settings
+    /// objects; an empty object indicates support with no settings. Schema:
+    /// `type: object`, `additionalProperties: JSONObject`.
+    ///
+    /// `serde_json::Value` rather than a nested map, symmetrical with
+    /// `ClientCapabilities`: `additionalProperties` is UNSET on this type in
+    /// the schema, i.e. open, so it must not gain `deny_unknown_fields`, and a
+    /// non-object value must stay representable so consumers reject it at a
+    /// typed boundary instead of failing the whole deserialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Empty object advertised when `completion/complete` is installed.
@@ -2351,6 +2369,7 @@ mod tests {
             logging: Some(LoggingCapability {}),
             completions: Some(CompletionsCapability {}),
             tasks: Some(TasksCapability { list_changed: true }),
+            ..Default::default()
         };
         let value = serde_json::to_value(&caps).expect("serialize");
         assert_eq!(value["tools"]["listChanged"], true);
@@ -2388,6 +2407,7 @@ mod tests {
             logging: Some(LoggingCapability {}),
             completions: None,
             tasks: None,
+            ..Default::default()
         };
         let json_str = serde_json::to_string(&caps).expect("serialize");
         let deserialized: ServerCapabilities =

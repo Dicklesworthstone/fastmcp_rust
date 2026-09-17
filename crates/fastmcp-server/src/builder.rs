@@ -285,6 +285,7 @@ impl ServerBuilder {
             capabilities: ServerCapabilities {
                 logging: Some(LoggingCapability::default()),
                 ..ServerCapabilities::default()
+                ..Default::default()
             },
             router: Router::new(),
             instructions: None,
