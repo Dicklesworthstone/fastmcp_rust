@@ -16,6 +16,9 @@
 //! local policy change. Those operations also fence collections already running.
 //! Observed invalidation, changed cache scope, or credential renewal prevents a
 //! mixed collection. No server-side snapshot isolation or gap recovery is claimed.
+//! Local bearer revocation is checked even on cache-only paths. It cannot recall
+//! results already returned, and does not wake an idle socket by itself; caller
+//! cancellation, session closure and the response deadlines own those wakes.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -38,6 +41,7 @@ use crate::cache::{
     FinalCacheLookup, FinalCacheResultSet, FinalCacheStats, FinalResultCache,
     MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, final_cache_hints,
 };
+use crate::http_auth::BoundBearerCredential;
 
 /// One budget spanning all pages, notifications, cache hits and host callbacks.
 /// `core` supplies the request/frame/cumulative-payload/notification/time bounds.
@@ -94,6 +98,7 @@ pub enum ManagedCatalogError {
     ScopeChanged,
     Invalidated,
     CredentialChanged,
+    CredentialRevoked,
     CacheUnavailable,
     AbortedByHost,
     Core(ManagedCoreError),
@@ -115,6 +120,7 @@ impl fmt::Display for ManagedCatalogError {
                 Self::ScopeChanged => "catalog cache scope changed between pages",
                 Self::Invalidated => "catalog was invalidated during collection",
                 Self::CredentialChanged => "catalog credential changed during collection",
+                Self::CredentialRevoked => "catalog credential has been locally revoked",
                 Self::CacheUnavailable => "catalog cache state is unavailable",
                 Self::AbortedByHost => "catalog collection stopped by the host",
                 Self::Core(_) => unreachable!(),
@@ -234,12 +240,14 @@ impl ManagedCatalogClient {
             Ok(async {
                 let credential = self.session.credential_with_cancellation(cx, cancellation).await
                     .map_err(ManagedCoreError::from)?;
+                require_unrevoked(credential.credential())?;
                 let generation = credential.generation();
                 let result_set = kind.result_set();
                 let cache_generation = self.cache()?.begin_fetch(&result_set);
                 let mut pages = Vec::new();
                 loop {
                     check_call(cx, cancellation, deadline)?;
+                    require_unrevoked(credential.credential())?;
                     self.require_generation(&result_set, cache_generation)?;
                     if pages.len() >= self.limits.maximum_pages { return Err(ManagedCatalogError::PageLimit); }
                     let key = cache_key(self.session.resource().as_str(), &request, generation)?;
@@ -256,6 +264,10 @@ impl ManagedCatalogClient {
                         FinalCacheLookup::Miss(_) => {
                             let id = next_id()?;
                             check_call(cx, cancellation, deadline)?;
+                            // Host callbacks can revoke a shared credential or
+                            // invalidate this catalog without yielding first.
+                            require_unrevoked(credential.credential())?;
+                            self.require_generation(&result_set, cache_generation)?;
                             state.reserve_id(&id, self.limits.maximum_state_bytes)?;
                             // This is the existing one-POST core API, not a new
                             // response parser. Carry its counters across pages.
@@ -273,11 +285,13 @@ impl ManagedCatalogClient {
                                 state.bytes = call.decoder.bytes;
                                 state.notifications = call.decoder.notifications;
                                 check_call(cx, cancellation, deadline)?;
+                                require_unrevoked(credential.credential())?;
                                 match event {
                                     ManagedCoreEvent::Notification(notification) => {
                                         self.invalidate_notification(&notification)?;
                                         observe(notification)?;
                                         check_call(cx, cancellation, deadline)?;
+                                        require_unrevoked(credential.credential())?;
                                         self.require_generation(&result_set, cache_generation)?;
                                     }
                                     ManagedCoreEvent::Result(result) => break *result,
@@ -297,23 +311,28 @@ impl ManagedCatalogClient {
                         if cache.begin_fetch(&result_set) != cache_generation {
                             return Err(ManagedCatalogError::Invalidated);
                         }
+                        require_unrevoked(credential.credential())?;
                         if fetched && cache.is_enabled() {
                             if cache.insert_if_current_at(key, cache_generation, result.clone(), receipt)
                                 == FinalCacheInsert::InvalidatedDuringFetch
                             { return Err(ManagedCatalogError::Invalidated); }
                         }
                     }
+                    require_unrevoked(credential.credential())?;
                     pages.push(result);
                     let Some(cursor) = next else { break };
                     list_params_mut(&mut request)?.cursor = Some(cursor);
                 }
                 // Verify that a cached collection did not outlive its login or
                 // cross a renewal while callbacks/other page fetches were active.
+                require_unrevoked(credential.credential())?;
                 let current = self.session.credential_with_cancellation(cx, cancellation).await
                     .map_err(ManagedCoreError::from)?;
                 if current.generation() != generation { return Err(ManagedCatalogError::CredentialChanged); }
                 self.require_generation(&result_set, cache_generation)?;
                 check_call(cx, cancellation, deadline)?;
+                require_unrevoked(credential.credential())?;
+                require_unrevoked(current.credential())?;
                 Ok(CollectedCatalog { kind, pages, item_count: state.items, credential_generation: generation })
             }.await)
         }).await?
@@ -327,6 +346,15 @@ impl ManagedCatalogClient {
         if self.cache()?.begin_fetch(result_set) != expected { return Err(ManagedCatalogError::Invalidated); }
         Ok(())
     }
+}
+
+// A cache hit constructs no Authorization header, so transport-side revocation
+// admission alone is insufficient. Read the shared lineage directly without
+// allocating a secret-bearing header. A concurrent revoke after the final check
+// may follow an already-admitted result; returned data cannot be recalled.
+fn require_unrevoked(credential: &BoundBearerCredential) -> Result<(), ManagedCatalogError> {
+    if credential.is_revoked() { return Err(ManagedCatalogError::CredentialRevoked); }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -547,5 +575,19 @@ mod tests {
         let generation = cache.begin_fetch(key.result_set());
         cache.clear();
         assert_eq!(cache.insert_if_current(key, generation, result), FinalCacheInsert::InvalidatedDuringFetch);
+    }
+
+    #[test]
+    fn revoked_lineage_cannot_admit_cached_data_without_an_authorization_header() {
+        let resource = crate::http_auth::CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+        let credential = BoundBearerCredential::bind(resource, "test-revocation-canary").unwrap();
+        let shared = credential.clone();
+        assert!(require_unrevoked(&credential).is_ok());
+        shared.revoke();
+        for credential in [credential, shared] {
+            let error = require_unrevoked(&credential).unwrap_err();
+            assert!(matches!(error, ManagedCatalogError::CredentialRevoked));
+            assert!(!format!("{error:?} {error}").contains("test-revocation-canary"));
+        }
     }
 }
