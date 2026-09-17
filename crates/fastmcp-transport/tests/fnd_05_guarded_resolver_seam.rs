@@ -76,8 +76,12 @@ fn fetch_with(answers: Vec<IpAddr>) -> (Result<(), GuardedHttpFetchError>, usize
     let fetcher = GuardedHttpFetcher::with_resolver(policy(), resolver)
         .expect("the shipped public seam accepts a caller-supplied resolver");
 
-    let outcome =
-        asupersync::block_on(|cx| async move { fetcher.fetch(&cx, &url()).await.map(|_| ()) });
+    // Same driver the crate's own guarded-fetch tests use: `block_on` installs
+    // the runtime and the ambient context, which `Cx::current()` then reads.
+    let outcome = fastmcp_core::block_on(async {
+        let cx = Cx::current().expect("block_on installs an ambient context");
+        fetcher.fetch(&cx, &url()).await.map(|_| ())
+    });
     (outcome, calls.load(Ordering::SeqCst))
 }
 
