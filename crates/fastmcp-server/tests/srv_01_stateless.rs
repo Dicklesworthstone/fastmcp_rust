@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use asupersync::{CancelReason, Cx, PanicPayload};
+use asupersync::{CancelKind, CancelReason, Cx, PanicPayload};
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome};
 use fastmcp_derive::tool;
 use fastmcp_protocol::{Content, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, Tool};
@@ -959,6 +959,40 @@ fn srv_01_b_positive() {
     assert!(
         !unwound_wire.contains(OUTCOME_PANIC_SECRET),
         "the panic message reached the peer: {unwound_wire}"
+    );
+
+    // REAL cancellation, as opposed to a handler that returns the Cancelled
+    // variant. `run_handler_in_request` tests
+    // `request_cx_cancellation_is_visible(request_cx)` before the handler
+    // future is ever polled (crates/fastmcp-server/src/router.rs:2037) and
+    // again after it resolves (:2072), so a genuinely cancelled request context
+    // is intercepted UPSTREAM of the outcome match.
+    //
+    // This is a one-variable contrast against the panic arm immediately above:
+    // same server, same tool, same request shape, and the only difference is
+    // that this request's context is already cancelled. If cancellation were
+    // not intercepted upstream, the handler would run and this would come back
+    // InternalError exactly as `returns_panicked` just did. Getting
+    // RequestCancelled instead is what proves the precedence.
+    let cancelled_cx = Cx::for_testing();
+    cancelled_cx.cancel_with(CancelKind::User, None);
+    let precancelled_inbound =
+        InboundRequestContext::new(cancelled_cx, 95, InboundRequestTransport::Memory);
+    let precancelled = arms_server
+        .dispatch_stateless(
+            &precancelled_inbound,
+            &stateless_tool_call("returns_panicked", 95_i64),
+        )
+        .expect("a cancelled request carrying an id still receives a response");
+    assert_eq!(
+        precancelled.error.as_ref().map(|error| error.code.clone()),
+        Some(McpErrorCode::RequestCancelled.into()),
+        "real cancellation must be intercepted upstream of the handler rather than \
+         converted from whatever outcome the handler would have produced"
+    );
+    assert!(
+        precancelled.result.is_none(),
+        "a cancelled request must not also carry a result payload"
     );
 
     // None of the three framework-terminal arms may disturb the catalog, and
