@@ -3630,6 +3630,7 @@ fn progress_then_terminal_body(
     marker: &ProgressMarker,
     progress_events: usize,
     request_id: i64,
+    final_result: bool,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     for progress in 1..=progress_events {
@@ -3637,9 +3638,11 @@ fn progress_then_terminal_body(
         body.extend_from_slice(&progress_notification(marker, progress as u64));
         body.extend_from_slice(b"\n\n");
     }
-    body.extend_from_slice(b"data: ");
-    body.extend_from_slice(&terminal_tool_result(request_id, "progress-queue-terminal"));
-    body.extend_from_slice(b"\n\n");
+    if final_result {
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(&terminal_tool_result(request_id, "progress-queue-terminal"));
+        body.extend_from_slice(b"\n\n");
+    }
     body
 }
 
@@ -3655,12 +3658,13 @@ fn progress_then_terminal_body(
 async fn collect_with_progress(
     cx: &Cx,
     progress_events: usize,
+    final_result: bool,
 ) -> Result<ModernHttpFinalCoreCollector, ModernHttpFinalCoreListenError> {
     const REQUEST_ID: i64 = 11;
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
     let marker = ProgressMarker::from("http-03-a-progress-queue");
-    let body = progress_then_terminal_body(&marker, progress_events, REQUEST_ID);
+    let body = progress_then_terminal_body(&marker, progress_events, REQUEST_ID, final_result);
 
     // The fixture stays strictly under both SSE aggregate ceilings, so an
     // outcome here can only be the progress queue's and never a pending-event
@@ -3835,7 +3839,7 @@ async fn positive_11_bounds(cx: &Cx) {
     // Progress queue, exactly N. Sixty-four request-scoped progress
     // notifications ahead of one terminal are all delivered, in order, to the
     // caller that owns them, and the terminal still arrives.
-    let collected = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING)
+    let collected = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING, true)
         .await
         .expect("a progress queue at exactly the ceiling must be admitted");
     assert_eq!(
@@ -4003,7 +4007,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     // N+1 ahead of a byte-identical terminal on an otherwise identical stream.
     // The framing, the marker, the request ID, the chunking and the terminal
     // are all unchanged.
-    let refusal = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING + 1)
+    let refusal = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING + 1, true)
         .await
         .err()
         .expect("a progress queue one notification over the ceiling must be refused");
@@ -4560,6 +4564,15 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
         matches!(second, Ok(None)),
         "a healthy stream reports a clean end on its second read, saw {second:?}"
     );
+    // -----------------------------------------------------------------------
+    // A response that does reach its final result: three progress
+    // notifications and then one terminal. This is the control for the
+    // no-final-result negative, which omits exactly the terminal.
+    // -----------------------------------------------------------------------
+    let collected = collect_with_progress(cx, 3, true)
+        .await
+        .expect("a stream that reaches its terminal must complete");
+    assert_eq!(collected.progress_notifications.len(), 3);
 }
 
 async fn negative_13_terminal_id_mismatch(cx: &Cx) {
@@ -4655,4 +4668,50 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     )
     .await;
     assert!(first.is_ok() && matches!(second, Ok(None)));
+    // -----------------------------------------------------------------------
+    // Endless response without a final result, in its terminable form. The sole
+    // changed variable is the TERMINAL: the control's stream is sent verbatim
+    // with its final result omitted, and nothing else differs - same marker,
+    // same request ID, same three progress notifications, same framing.
+    //
+    // The caller must be told the stream ended without a result. It must not
+    // receive the three progress notifications as though the call had
+    // completed, and it must not be handed a synthesized terminal: a collector
+    // that returned Ok here would report a finished call the server never
+    // finished, which is a wrong success rather than an error.
+    //
+    // BOUNDARY, named rather than papered over: this covers a stream that ENDS
+    // without a result. It does not cover one that never ends at all. That case
+    // needs the caller's own budget to terminate it, and the executor's
+    // response deadlines default to 30s/120s behind a private setter, so a
+    // stall-based case here would prove DISCONNECT rather than TIMEOUT. Driving
+    // it instead by cancelling this Cx is not available either: a clone is an
+    // alias, not a child, so cancelling it would take the fixture's server half
+    // down with the client and the observation would be of my own teardown.
+    // -----------------------------------------------------------------------
+    let refusal = collect_with_progress(cx, 3, false)
+        .await
+        .err()
+        .expect("a stream that never sends its final result must not complete");
+    match refusal {
+        ModernHttpFinalCoreListenError::EndOfStream { framing } => {
+            let framing = framing.expect("end-of-stream framing must be reported");
+            assert!(
+                !framing.discarded_pending_event,
+                "every progress event was correctly framed; only the terminal is absent"
+            );
+            assert!(
+                !framing.discarded_partial_line,
+                "the body is correctly terminated; only the terminal is absent"
+            );
+        }
+        other => panic!("expected a typed end-of-stream refusal, saw {other:?}"),
+    }
+
+    // Unchanged state: the control stream still completes with its three
+    // progress notifications and its terminal.
+    let restored = collect_with_progress(cx, 3, true)
+        .await
+        .expect("the control stream must complete again");
+    assert_eq!(restored.progress_notifications.len(), 3);
 }
