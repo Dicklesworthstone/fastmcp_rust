@@ -10,6 +10,9 @@
 //! an SSE body. The SSE owner retains its session until explicit async close or
 //! drop; returning a stream never drops the session that owns its dispatch.
 
+/// Socket-to-dispatch security for the caller-owned native HTTP listener.
+pub mod listener;
+
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 
