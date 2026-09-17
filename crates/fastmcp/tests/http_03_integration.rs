@@ -582,6 +582,7 @@ struct WireObservations {
     deadline_race: LaneObservation,
     caller_cancellation: CancellationObservation,
     independent_server_request: ServerRequestObservation,
+    extension_notification: NotificationObservation,
 }
 
 impl WireObservations {
@@ -1028,6 +1029,150 @@ fn observe_independent_server_request() -> ServerRequestObservation {
     }
 }
 
+/// What the HTTP-03.23 extension/notification scenario observed.
+#[derive(Debug, Clone)]
+struct NotificationObservation {
+    first_event: String,
+    terminal_after_notification: String,
+    era_after_notification: ProtocolEra,
+    requests_during_call: usize,
+    connections_after_return: usize,
+}
+
+/// Delivers an admitted final-server notification on a caller-owned response
+/// stream, ahead of the caller's terminal.
+///
+/// # Why this proves the reachable half of B's subject and says so
+///
+/// B names `extension-activation-proof-notification`. The activation-receipt
+/// half of that - `mcp_apps_active` / `mcp_apps_activation_receipt` - is
+/// `#[cfg(feature = "apps")]`, and `apps` is NOT in the default feature set
+/// (facade default is `legacy-2024-11-05` + `tasks`; the client default is
+/// `legacy-2024-11-05`). Those accessors are therefore not compiled into this
+/// target at all. Adding `required-features = ["apps"]` would make the
+/// no-flags runner in AC-7 stop discovering this target entirely, which AC-9
+/// counts as a feature-disabled zero-run row - a worse outcome than an honest
+/// partial proof.
+///
+/// So this exercises the half that IS on the default surface: the notification
+/// delivery path, which carries no `cfg(feature)` gate
+/// (`http_executor.rs:1454`, produced at `:1606`). The activation-receipt half
+/// is reported as out of reach rather than simulated.
+fn observe_extension_notification() -> NotificationObservation {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the notification fixture");
+    let address = listener
+        .local_addr()
+        .expect("read the notification fixture address");
+    let target = format!("http://{address}/mcp-notification");
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (report_tx, report_rx) = mpsc::channel::<(usize, usize)>();
+
+    let server = thread::spawn(move || {
+        let mut probe = accept_bounded(&listener);
+        let _probe_request = read_request(&mut probe);
+        write_bounded_response(
+            &mut probe,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "notification"),
+        );
+        drop(probe);
+
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        begin_sse_response(&mut call);
+        // An admitted final-server notification: a method, no id.
+        write_sse_event(
+            &mut call,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+            }),
+        );
+        // The caller's own terminal still follows it.
+        write_sse_event(&mut call, &terminal_tool_event(71));
+        end_sse_response(&mut call);
+        release_rx
+            .recv()
+            .expect("driver reports the notification call returned");
+        drop(call);
+
+        listener
+            .set_nonblocking(true)
+            .expect("set the notification listener nonblocking for the backlog drain");
+        let mut extra = 0_usize;
+        while let Ok((stream, _)) = listener.accept() {
+            extra += 1;
+            drop(stream);
+        }
+        report_tx
+            .send((1, extra))
+            .expect("report notification observations");
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the notification scenario owns its caller runtime");
+    let (first_event, terminal_after_notification, era_after_notification) =
+        runtime.block_on(async {
+            let cx = Cx::current().expect("the caller runtime must install a current Cx");
+            let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
+            let connection = integration_builder(&target)
+                .connect_http_with_cx(&cx)
+                .await
+                .expect("the notification endpoint must connect through the public builder");
+            let mut stream_listener = connection
+                .open_final_core_listener(
+                    &cx,
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "http_03_notification_tool",
+                        "arguments": {},
+                    }),
+                    RequestId::Number(71),
+                    limits,
+                )
+                .await
+                .expect("the shipped SSE lane must open a request-owned listener");
+
+            let first = match stream_listener.next_event(&cx).await {
+                Ok(Some(ModernHttpFinalCoreEvent::Notification(notification))) => {
+                    format!("notification::{notification:?}")
+                }
+                Ok(Some(other)) => format!("other::{other:?}"),
+                Ok(None) => "clean-end".to_owned(),
+                Err(error) => format!("rejected::{error:?}"),
+            };
+            let terminal = match stream_listener.next_event(&cx).await {
+                Ok(Some(ModernHttpFinalCoreEvent::Terminal(_))) => "terminal=tools_call".to_owned(),
+                Ok(Some(other)) => format!("other::{other:?}"),
+                Ok(None) => "clean-end".to_owned(),
+                Err(error) => format!("rejected::{error:?}"),
+            };
+            let era = connection.selected_protocol_era();
+            (first, terminal, era)
+        });
+
+    release_tx
+        .send(())
+        .expect("release the notification fixture");
+    let (requests_during_call, connections_after_return) = report_rx
+        .recv()
+        .expect("collect notification observations");
+    server
+        .join()
+        .expect("the notification fixture thread must not panic");
+
+    NotificationObservation {
+        first_event,
+        terminal_after_notification,
+        era_after_notification,
+        requests_during_call,
+        connections_after_return,
+    }
+}
+
 fn integration_builder(target: &str) -> ClientBuilder {
     ClientBuilder::new()
         .client_info("http-03-integration-client", "1.0.0")
@@ -1387,6 +1532,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     let deadline_race = observe_lane(true, Duration::from_millis(50));
     let caller_cancellation = observe_caller_cancellation();
     let independent_server_request = observe_independent_server_request();
+    let extension_notification = observe_extension_notification();
 
     WireObservations {
         fixture_authority: authority,
@@ -1416,6 +1562,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         deadline_race,
         caller_cancellation,
         independent_server_request,
+        extension_notification,
     }
 }
 
@@ -2756,8 +2903,50 @@ fn case_uncertain_dispatch_no_retry(builder: &mut CaseBuilder, wire: &WireObserv
     builder.positive("uncertain-retry-connections", "0");
 }
 
-/// HTTP-03.23 `extension-activation-proof-notification` (floor 4). UNPROVEN.
-fn case_extension_activation_notification(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+/// HTTP-03.23 `extension-activation-proof-notification` (floor 4).
+///
+/// Proves the half of B's subject that the DEFAULT feature set exposes. See
+/// [`observe_extension_notification`] for why the activation-receipt half is
+/// out of reach here and is reported rather than simulated.
+fn case_extension_activation_notification(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let observed = &wire.extension_notification;
+
+    assert!(
+        observed.first_event.starts_with("notification::"),
+        "an admitted final-server notification must surface as a Notification event rather \
+         than as progress, a terminal, or a refusal; observed {}",
+        observed.first_event
+    );
+    builder.positive("extension-notification-admitted", &observed.first_event);
+
+    assert_eq!(
+        observed.terminal_after_notification, "terminal=tools_call",
+        "the caller's terminal must still arrive after an interleaved notification; a \
+         notification must not consume or close the caller's stream"
+    );
+    builder.positive(
+        "terminal-survives-notification",
+        &observed.terminal_after_notification,
+    );
+
+    assert_eq!(
+        observed.era_after_notification,
+        ProtocolEra::Modern2026,
+        "an interleaved server notification must not mutate the negotiated era"
+    );
+    builder.positive("era-unchanged-by-notification", "Modern2026");
+
+    assert_eq!(
+        observed.connections_after_return, 0,
+        "an interleaved notification must not cause a replay; {} retry connection(s) queued",
+        observed.connections_after_return
+    );
+    assert_eq!(
+        observed.requests_during_call, 1,
+        "the notification lane must post exactly once"
+    );
+    builder.positive("notification-no-replay", "1 post, 0 retries");
+}
 
 /// HTTP-03.24 `independent-server-request-rejection` (floor 2).
 fn case_independent_server_request_rejection(builder: &mut CaseBuilder, wire: &WireObservations) {
