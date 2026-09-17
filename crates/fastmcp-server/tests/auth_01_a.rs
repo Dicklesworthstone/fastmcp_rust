@@ -837,6 +837,146 @@ fn auth_01_a_ambiguous_authorization_headers_are_refused_before_any_provider_cal
     });
 }
 
+/// Negative authority, the sharpest form. Supplementary, not a frozen ID.
+///
+/// `:649` proves a prior admission does not license a credential in a FORBIDDEN
+/// LOCATION. This proves the stronger thing: it does not license a request
+/// carrying **no credential at all**. A server that verified once and then
+/// trusted the session would admit this, and it would pass every other case in
+/// this file.
+///
+/// It also reaches a THIRD refusal ground, distinct from both transport limbs.
+/// A missing header is not rejected at the transport boundary - `AuthRequest`
+/// is still built with `transport_authorization: None` (`router.rs:113/126`)
+/// and the provider IS invoked. So unlike `:738` and the frozen negative,
+/// `provider_calls` is expected to MOVE here. Asserting "state unchanged" would
+/// be false of this subject, so it is not asserted; the observable that carries
+/// the proof is the recorded credential observation instead.
+///
+/// `observed_credentials` gaining exactly `absent:false` is the load-bearing
+/// assertion: it shows the shipped extractor reported ABSENCE to the provider
+/// rather than replaying the credential it had already seen on this session.
+///
+/// Deliberately NOT asserted, with reasons, rather than guessed:
+/// - The exact HTTP status. A provider denial is remapped to a fixed
+///   `ResourceForbidden` (`lib.rs:20109`) and I did not establish which status
+///   the endpoint renders for it by reading. Asserting a guessed constant would
+///   be invented evidence, so this asserts only that it is not an admission.
+/// - `middleware_calls`. Whether middleware runs before or after authentication
+///   is not part of the AUTH-01 contract, and pinning it here would couple this
+///   proof to an unrelated design choice that is free to change.
+#[test]
+fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
+    run_auth_01_scenario(|cx| async move {
+        let probe = Auth01Probe::new();
+        let endpoint = auth_01_endpoint(&probe);
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("the public HTTP session must open");
+
+        // Control: a native header credential is admitted.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("the public HTTP session must complete the admitted request"),
+        );
+        assert_admitted(&probe, &response, 0);
+
+        // The one variable: the identical request with its Authorization field
+        // removed. The builder writes the lowercase name.
+        let mut request =
+            auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader);
+        request
+            .headers
+            .remove("authorization")
+            .expect("the builder must have written the field this case removes");
+        assert!(
+            !request
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization")),
+            "the uncredentialed request must carry no Authorization field in any spelling"
+        );
+
+        let response = immediate(
+            session
+                .handle_async(&cx, request)
+                .await
+                .expect("an uncredentialed request is an ordinary HTTP response"),
+        );
+
+        assert_ne!(
+            response.status,
+            HttpStatus::OK,
+            "a request carrying no credential was admitted after an earlier one succeeded, so \
+             the session is honouring a cached principal"
+        );
+
+        let state = probe.snapshot();
+        assert_eq!(
+            state.handler_calls, 1,
+            "the tool ran for an uncredentialed request"
+        );
+        assert_eq!(
+            state.provider_calls, 2,
+            "the provider must be consulted for the uncredentialed request rather than skipped"
+        );
+        assert_eq!(
+            state.observed_credentials,
+            vec!["Bearer:true".to_owned(), "absent:false".to_owned()],
+            "the extractor replayed a previously seen credential instead of reporting absence"
+        );
+        assert_eq!(
+            state.observed_subjects,
+            vec![probe.subject.clone()],
+            "a second principal was published for a request that carried no credential"
+        );
+        assert_eq!(state.credential_leaks, 0);
+
+        // No oracle: the refusal must not disclose the credential, the
+        // principal, or which provider check failed.
+        let rendered = String::from_utf8_lossy(&response.body);
+        assert!(
+            !rendered.contains(&probe.token) && !rendered.contains(&probe.subject),
+            "the uncredentialed refusal reflected the credential or the principal"
+        );
+        assert!(
+            !rendered.contains("native HTTP must supply its credential through Authorization"),
+            "the refusal echoed the provider's own denial text, which is a failure oracle; the \
+             shipped path replaces it with a fixed diagnostic at lib.rs:20109"
+        );
+
+        // Still usable: the refusal is not a wedge. Asserted directly rather
+        // than through `assert_admitted`, whose sequence model assumes every
+        // prior observation was an admission - which is false here.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("an uncredentialed refusal must not wedge the session"),
+        );
+        assert_eq!(response.status, HttpStatus::OK);
+        let state = probe.snapshot();
+        assert_eq!(state.handler_calls, 2);
+        assert_eq!(
+            state.observed_credentials,
+            vec![
+                "Bearer:true".to_owned(),
+                "absent:false".to_owned(),
+                "Bearer:true".to_owned()
+            ],
+            "the recovered admission must re-extract the credential from the wire"
+        );
+    });
+}
+
 /// Idempotency of refusal. Supplementary, not a frozen ID.
 ///
 /// The frozen negative sends each forbidden placement once. That cannot show
