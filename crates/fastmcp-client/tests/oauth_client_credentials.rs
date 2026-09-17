@@ -445,7 +445,7 @@ fn run(case: Case) {
                     acquire(&peer,&cx,&client,"access-one",300).await;
                     let snapshot=client.credential(&cx).await.unwrap();
                     let bearer=snapshot.credential().clone();
-                    assert!(bearer.authorization_for_target(&resource_placeholder(client.resource())).is_some());
+                    assert!(bearer.authorization_for_target(client.resource()).is_some());
                     let resource=client.resource().clone();
                     drop(client);
                     assert!(bearer.authorization_for_target(&resource).is_none());

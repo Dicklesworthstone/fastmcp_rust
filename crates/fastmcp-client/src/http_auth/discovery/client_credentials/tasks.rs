@@ -6,6 +6,9 @@
 //! failed discovery, grant, tool call, update or cancel is automatically retried.
 //! This is process-local client orchestration, not durable task storage.
 
+/// Authenticated Tasks subscriptions, optionally composed with core filters.
+pub mod subscriptions;
+
 use std::fmt;
 use std::io::{self, Write};
 use std::time::Duration;
