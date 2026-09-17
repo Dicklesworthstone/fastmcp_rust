@@ -996,7 +996,7 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.terminal.store(true, Ordering::Release);
         self.partial_frame_deadline = None;
-        self.transport.close()
+        self.transport.close(cx)
     }
 }
 
@@ -2257,7 +2257,7 @@ mod tests {
             sender.send_until(&cx, &message, Instant::now() + Duration::from_secs(1)),
             Err(TransportError::Closed)
         ));
-        sender.close().unwrap();
+        sender.close(&cx).unwrap();
         let mut emitted = Vec::new();
         peer.read_to_end(&mut emitted).unwrap();
         assert!(!emitted.is_empty());
@@ -2511,7 +2511,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        sender.close().unwrap();
+        sender.close(&cx).unwrap();
         peer.write_all(b"25e+2}}\n").unwrap();
         assert!(matches!(
             receiver.recv_slice_or_closed(&cx, Instant::now() + Duration::from_secs(1), None),
@@ -3159,7 +3159,8 @@ mod tests {
         entered_poll_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("bounded split receive must enter readiness polling");
-        send_half.close().expect("close split writer");
+        let cx = Cx::for_testing();
+        send_half.close(&cx).expect("close split writer");
         assert!(matches!(
             result_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -3324,7 +3325,7 @@ mod tests {
                 recv_half.recv(&cx),
                 Ok(JsonRpcMessage::Request(_))
             ));
-            send_half.close().expect("close split writer");
+            send_half.close(&cx).expect("close split writer");
             assert!(matches!(recv_half.recv(&cx), Err(TransportError::Closed)));
             assert!(matches!(
                 send_half.send(
@@ -3485,7 +3486,7 @@ mod tests {
             transport.reserve_send(&cx),
             Err(TransportError::Closed)
         ));
-        assert!(transport.close().is_ok());
+        assert!(transport.close(&cx).is_ok());
         assert!(transport.writer.is_none());
     }
 
@@ -3930,7 +3931,7 @@ mod tests {
             transport.send_request_direct(&cx, &request).unwrap();
 
             // Close should flush
-            transport.close().unwrap();
+            transport.close(&cx).unwrap();
         }
 
         // Verify data was flushed
@@ -3949,10 +3950,11 @@ mod tests {
         };
         let mut transport = StdioTransport::new(Cursor::new(Vec::new()), writer);
 
-        transport.close().unwrap();
+        let cx = Cx::for_testing();
+        transport.close(&cx).unwrap();
 
         assert!(dropped.load(Ordering::SeqCst));
-        transport.close().unwrap();
+        transport.close(&cx).unwrap();
 
         let cx = Cx::for_testing();
         let request = JsonRpcRequest::new("test", None, 1_i64);
@@ -3980,9 +3982,10 @@ mod tests {
         };
         let mut transport = StdioTransport::new(Cursor::new(Vec::new()), writer);
 
-        assert!(matches!(transport.close(), Err(TransportError::Io(_))));
+        let cx = Cx::for_testing();
+        assert!(matches!(transport.close(&cx), Err(TransportError::Io(_))));
         assert!(dropped.load(Ordering::SeqCst));
-        assert!(transport.close().is_ok());
+        assert!(transport.close(&cx).is_ok());
     }
 
     #[test]

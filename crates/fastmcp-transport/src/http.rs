@@ -10352,7 +10352,7 @@ Content-Length: {}\r\n\
         assert_eq!(transport.pending_requests(), 1);
         assert_eq!(transport.pending_responses(), 1);
 
-        transport.close().unwrap();
+        transport.close(&cx).unwrap();
 
         assert!(transport.has_responses());
         assert_eq!(transport.pending_requests(), 0);
@@ -10969,7 +10969,7 @@ Content-Length: {}\r\n\
         let mut transport = HttpTransport::new(reader, &mut output);
 
         // Close transport
-        transport.close().unwrap();
+        transport.close(&cx).unwrap();
 
         // Operations should fail after close
         let response = JsonRpcResponse {

@@ -955,7 +955,7 @@ mod tests {
         client.send_request(&cx, &request).unwrap();
 
         // Close server
-        server.close().unwrap();
+        server.close(&cx).unwrap();
 
         // Recv should fail
         let result = server.recv(&cx);
@@ -1184,7 +1184,7 @@ mod tests {
             .unwrap();
         assert_eq!(server.receiver.len(), 2);
 
-        server.close().unwrap();
+        server.close(&cx).unwrap();
 
         assert_eq!(server.receiver.len(), 0);
         cx.set_cancel_requested(true);
