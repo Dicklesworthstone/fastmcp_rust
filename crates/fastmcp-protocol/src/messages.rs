@@ -399,7 +399,16 @@ pub struct FinalListParams {
     #[serde(rename = "_meta")]
     pub meta: OpenMetadata,
     /// Opaque pagination cursor; a present empty cursor remains present.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Absent, present-and-valid, and explicit `null` are three distinct wire
+    /// states. Omitting the member yields `None`; a present string yields
+    /// `Some`, including the empty string; an explicit `null` is refused
+    /// rather than silently collapsed into absence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
+    )]
     pub cursor: Option<String>,
     /// Only include catalog entries with every listed tag.
     #[serde(
@@ -2281,7 +2290,16 @@ pub struct FinalListToolsResult {
     /// Catalog tools in their selected order.
     pub tools: Vec<crate::types::FinalTool>,
     /// Opaque next cursor, if another page is available.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Absent, present-and-valid, and explicit `null` are three distinct wire
+    /// states; an explicit `null` is refused rather than read as "no further
+    /// page".
+    #[serde(
+        rename = "nextCursor",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
+    )]
     pub next_cursor: Option<String>,
     /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
@@ -2348,7 +2366,16 @@ pub struct FinalListResourcesResult {
     /// Catalog resources in their selected order.
     pub resources: Vec<crate::types::FinalResource>,
     /// Opaque next cursor, if another page is available.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Absent, present-and-valid, and explicit `null` are three distinct wire
+    /// states; an explicit `null` is refused rather than read as "no further
+    /// page".
+    #[serde(
+        rename = "nextCursor",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
+    )]
     pub next_cursor: Option<String>,
     /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
@@ -2369,7 +2396,16 @@ pub struct FinalListResourceTemplatesResult {
     #[serde(rename = "resourceTemplates")]
     pub resource_templates: Vec<crate::types::FinalResourceTemplate>,
     /// Opaque next cursor, if another page is available.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Absent, present-and-valid, and explicit `null` are three distinct wire
+    /// states; an explicit `null` is refused rather than read as "no further
+    /// page".
+    #[serde(
+        rename = "nextCursor",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
+    )]
     pub next_cursor: Option<String>,
     /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]
@@ -2406,7 +2442,16 @@ pub struct FinalListPromptsResult {
     /// Catalog prompts in their selected order.
     pub prompts: Vec<crate::types::FinalPrompt>,
     /// Opaque next cursor, if another page is available.
-    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Absent, present-and-valid, and explicit `null` are three distinct wire
+    /// states; an explicit `null` is refused rather than read as "no further
+    /// page".
+    #[serde(
+        rename = "nextCursor",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
+    )]
     pub next_cursor: Option<String>,
     /// Required lossless final cache lifetime.
     #[serde(rename = "ttlMs")]

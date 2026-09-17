@@ -3,6 +3,7 @@
 //! These functions intentionally live at the integration-test harness root: the frozen RCH
 //! runners invoke their literal names with `--exact`, so nested unit-test names are insufficient.
 
+use fastmcp_protocol::FinalListParams;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, CancellationNotification, CancellationRequestId, CommonTypeError,
     CommonWireDirection, ContentBlock, EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme,
@@ -11,9 +12,12 @@ use fastmcp_protocol::common_types::{
     MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES, MAX_ICON_SIZE_ENTRIES,
     MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata,
     PRT_02_A_ICON_CONTENT_MANIFEST_V1, PRT_02_A_METADATA_MANIFEST_V1,
-    PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1, RawIcon, TraceContext, parse_prt_02_manifest_rows,
-    prt_02_a_icon_content_manifest_digest, prt_02_a_metadata_manifest_digest,
-    prt_02_a_uri_cursor_cancel_manifest_digest,
+    PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1, PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1,
+    PRT_02_B_OPEN_GOLDENS_MANIFEST_V1, PRT_02_B_SERDE_SCHEMA_MANIFEST_V1, RawIcon, TraceContext,
+    parse_prt_02_manifest_rows, prt_02_a_icon_content_manifest_digest,
+    prt_02_a_metadata_manifest_digest, prt_02_a_uri_cursor_cancel_manifest_digest,
+    prt_02_b_bounds_direction_manifest_digest, prt_02_b_open_goldens_manifest_digest,
+    prt_02_b_serde_schema_manifest_digest,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -697,6 +701,316 @@ fn prt_02_b_positive() {
         TraceContext::try_from_metadata(&trace_n_plus_one),
         Err(CommonTypeError::TooLong("trace context"))
     );
+
+    // --- PRT-02 B ordered matrices -------------------------------------
+    // The declared row set comes from the shipped manifests, never from this
+    // test, so the matrix cannot shrink to whatever happens to be exercised.
+    let mut serde_ledger = SubcaseLedger::new(PRT_02_B_SERDE_SCHEMA_MANIFEST_V1);
+    let mut bounds_ledger = SubcaseLedger::new(PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1);
+    let mut golden_ledger = SubcaseLedger::new(PRT_02_B_OPEN_GOLDENS_MANIFEST_V1);
+
+    // PRT-B-01: serde and schema round trips through the public API.
+    let implementation = Implementation::try_new("fastmcp", "0.1.0").expect("implementation");
+    assert_eq!(
+        serde_json::from_value::<Implementation>(
+            serde_json::to_value(&implementation).expect("wire")
+        )
+        .expect("round trip"),
+        implementation
+    );
+    serde_ledger.observe("PRT-B-01.01");
+
+    let metadata = request_metadata();
+    assert_eq!(
+        serde_json::from_value::<OpenMetadata>(serde_json::to_value(&metadata).expect("wire"))
+            .expect("round trip"),
+        metadata
+    );
+    serde_ledger.observe("PRT-B-01.02");
+
+    let annotations: Annotations =
+        serde_json::from_value(json!({"audience": ["user"], "priority": 0.5}))
+            .expect("annotations");
+    assert_eq!(
+        serde_json::from_value::<Annotations>(serde_json::to_value(&annotations).expect("wire"))
+            .expect("round trip"),
+        annotations
+    );
+    serde_ledger.observe("PRT-B-01.03");
+
+    let uri = AbsoluteUri::parse("https://example.test/a?b#c").expect("uri");
+    assert_eq!(
+        serde_json::from_value::<AbsoluteUri>(serde_json::to_value(&uri).expect("wire"))
+            .expect("round trip"),
+        uri
+    );
+    serde_ledger.observe("PRT-B-01.04");
+
+    let cursor_value = OpaqueCursor::try_from_presence(Some("page-2".to_owned())).expect("cursor");
+    assert_eq!(
+        serde_json::from_value::<OpaqueCursor>(serde_json::to_value(&cursor_value).expect("wire"))
+            .expect("round trip"),
+        cursor_value
+    );
+    serde_ledger.observe("PRT-B-01.05");
+
+    assert_eq!(
+        serde_json::from_value::<CancellationRequestId>(json!(42)).expect("request id"),
+        CancellationRequestId::Integer(42)
+    );
+    serde_ledger.observe("PRT-B-01.06");
+
+    assert!(
+        !FinalCommonTypesSchema::validate_icon(
+            &json!({"src": "HTTPS://example.test/icon.svg", "sizes": [], "theme": "dark"})
+        )
+        .expect("icon schema")
+        .effective_any_size()
+    );
+    serde_ledger.observe("PRT-B-01.07");
+
+    for (subcase, content) in [
+        ("PRT-B-01.08", ContentBlock::text("round trip")),
+        (
+            "PRT-B-01.09",
+            ContentBlock::image("aGVsbG8=", "image/png").expect("image"),
+        ),
+        (
+            "PRT-B-01.10",
+            ContentBlock::Resource {
+                resource: EmbeddedResourceContents::Text {
+                    uri: AbsoluteUri::parse("https://example.test/embedded").expect("uri"),
+                    text: "embedded".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    meta: None,
+                    additional: BTreeMap::new(),
+                },
+                annotations: None,
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        ),
+    ] {
+        let wire = serde_json::to_value(&content).expect("content wire");
+        assert_eq!(
+            serde_json::from_value::<ContentBlock>(wire).expect("content round trip"),
+            content
+        );
+        serde_ledger.observe(subcase);
+    }
+
+    let trace = TraceContext::try_from_metadata(&metadata).expect("trace");
+    assert_eq!(trace.tracestate.as_deref(), Some("vendor=value"));
+    serde_ledger.observe("PRT-B-01.11");
+
+    let subscription = OpenMetadata::try_from_entries([(
+        "io.modelcontextprotocol/subscriptionId".to_owned(),
+        json!(7),
+    )])
+    .expect("subscription exception");
+    assert_eq!(
+        serde_json::from_value::<OpenMetadata>(serde_json::to_value(&subscription).expect("wire"))
+            .expect("round trip"),
+        subscription
+    );
+    serde_ledger.observe("PRT-B-01.12");
+
+    // PRT-B-01.13/.14/.15 — the three distinct WIRE states of a cursor member
+    // on a shipped typed struct. OpaqueCursor models presence correctly on its
+    // own; what matters here is that the enclosing struct preserves the
+    // distinction, which only a serde row can observe.
+    let meta_wire = serde_json::to_value(request_metadata()).expect("metadata wire");
+
+    let absent: FinalListParams =
+        serde_json::from_value(json!({"_meta": meta_wire.clone()})).expect("omitted cursor");
+    assert_eq!(absent.cursor, None, "an omitted cursor member is absent");
+    serde_ledger.observe("PRT-B-01.13");
+
+    for spelling in ["", "page-2"] {
+        let present: FinalListParams =
+            serde_json::from_value(json!({"_meta": meta_wire.clone(), "cursor": spelling}))
+                .expect("present cursor");
+        assert_eq!(
+            present.cursor.as_deref(),
+            Some(spelling),
+            "a present cursor keeps its exact value, including the empty string"
+        );
+        serde_ledger.observe("PRT-B-01.14");
+    }
+
+    assert!(
+        serde_json::from_value::<FinalListParams>(
+            json!({"_meta": meta_wire.clone(), "cursor": null})
+        )
+        .is_err(),
+        "an explicit null cursor is refused rather than collapsed into absence"
+    );
+    // And the accepted absent value is unchanged by that refusal.
+    let readmitted: FinalListParams =
+        serde_json::from_value(json!({"_meta": meta_wire.clone()})).expect("omitted cursor again");
+    assert_eq!(readmitted.cursor, absent.cursor);
+    serde_ledger.observe("PRT-B-01.15");
+
+    // PRT-B-02: bounds at N-1 and N, plus accepted directions. The N+1
+    // counterparts live in prt_02_b_planted_negative.
+    OpenMetadata::try_from_entries(
+        (0..MAX_METADATA_ENTRIES - 1).map(|i| (format!("com.example/k{i}"), Value::Null)),
+    )
+    .expect("metadata N-1");
+    bounds_ledger.observe("PRT-B-02.01");
+    OpenMetadata::try_from_entries(
+        (0..MAX_METADATA_ENTRIES).map(|i| (format!("com.example/k{i}"), Value::Null)),
+    )
+    .expect("metadata N");
+    bounds_ledger.observe("PRT-B-02.02");
+
+    for (subcase, length) in [
+        ("PRT-B-02.03", MAX_ABSOLUTE_URI_BYTES - 1),
+        ("PRT-B-02.04", MAX_ABSOLUTE_URI_BYTES),
+    ] {
+        let candidate = format!("x:{}", "a".repeat(length - 2));
+        assert_eq!(
+            AbsoluteUri::parse(candidate)
+                .expect("uri at bound")
+                .as_str()
+                .len(),
+            length
+        );
+        bounds_ledger.observe(subcase);
+    }
+    for (subcase, length) in [
+        ("PRT-B-02.05", MAX_CURSOR_BYTES - 1),
+        ("PRT-B-02.06", MAX_CURSOR_BYTES),
+    ] {
+        assert_eq!(
+            OpaqueCursor::try_from_presence(Some("x".repeat(length)))
+                .expect("cursor at bound")
+                .as_present()
+                .map(str::len),
+            Some(length)
+        );
+        bounds_ledger.observe(subcase);
+    }
+    RawIcon::try_with_details(
+        "https://example.test/icon",
+        None,
+        Some(vec![
+            "x".repeat(MAX_ICON_SIZE_BYTES - 1);
+            MAX_ICON_SIZE_ENTRIES - 1
+        ]),
+        None,
+    )
+    .expect("icon sizes N-1");
+    bounds_ledger.observe("PRT-B-02.07");
+    RawIcon::try_with_details(
+        "https://example.test/icon",
+        None,
+        Some(vec!["x".repeat(MAX_ICON_SIZE_BYTES); MAX_ICON_SIZE_ENTRIES]),
+        None,
+    )
+    .expect("icon sizes N");
+    bounds_ledger.observe("PRT-B-02.08");
+    ContentBlock::image("A".repeat(MAX_CONTENT_ENCODED_BYTES - 1), "image/png")
+        .expect("content bytes N-1");
+    bounds_ledger.observe("PRT-B-02.09");
+    assert!(
+        CancellationNotification::try_new(
+            CancellationRequestId::Integer(1),
+            Some("x".repeat(4 * 1024 + 1))
+        )
+        .expect("the MCP schema imposes no cancellation-reason byte bound")
+        .has_untrusted_reason()
+    );
+    bounds_ledger.observe("PRT-B-02.10");
+
+    FinalCommonTypesSchema::validate(
+        CommonWireDirection::Request,
+        &json!({"_meta": meta_wire.clone()}),
+    )
+    .expect("request direction");
+    bounds_ledger.observe("PRT-B-02.11");
+    FinalCommonTypesSchema::validate(
+        CommonWireDirection::Notification,
+        &json!({
+            "method": "notifications/cancelled",
+            "params": {"requestId": "request-7", "reason": "bounded"}
+        }),
+    )
+    .expect("notification direction");
+    bounds_ledger.observe("PRT-B-02.12");
+
+    // PRT-B-03: goldens. Rows .01-.03 assert exact canonical bytes; rows
+    // .04-.08 assert canonical-byte stability across a round trip, which is
+    // the same observation where a fixed literal would only restate the
+    // encoder.
+    let request = json!({"_meta": request_metadata()});
+    let request_golden = "{\"_meta\":{\"baggage\":\"user=opaque\",\"com.example/\":{\"open\":null},\"io.modelcontextprotocol/clientCapabilities\":{\"roots\":{\"listChanged\":true}},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"fastmcp\",\"version\":\"0.1.0\"},\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"tracestate\":\"vendor=value\"}}";
+    FinalCommonTypesSchema::validate_golden(CommonWireDirection::Request, &request, request_golden)
+        .expect("known metadata golden");
+    golden_ledger.observe("PRT-B-03.01");
+    assert!(
+        request_golden.contains("\"traceparent\":"),
+        "trace fields survive into the canonical golden bytes"
+    );
+    golden_ledger.observe("PRT-B-03.08");
+
+    let open = OpenMetadata::try_from_entries([("com.example/x".to_owned(), json!({"k": 1}))])
+        .expect("valid open metadata");
+    assert_eq!(
+        serde_json::to_string(&open).expect("open golden"),
+        "{\"com.example/x\":{\"k\":1}}"
+    );
+    golden_ledger.observe("PRT-B-03.02");
+
+    let unknown = OpenMetadata::try_from_entries([(
+        "com.example/unknown".to_owned(),
+        json!([1, {"z": null}]),
+    )])
+    .expect("unknown open metadata");
+    assert_eq!(
+        serde_json::to_string(&unknown).expect("unknown open golden"),
+        "{\"com.example/unknown\":[1,{\"z\":null}]}",
+        "an unrecognized open value is preserved exactly, never aliased"
+    );
+    golden_ledger.observe("PRT-B-03.03");
+
+    for (subcase, value) in [
+        ("PRT-B-03.04", serde_json::to_value(&uri).expect("uri wire")),
+        (
+            "PRT-B-03.05",
+            serde_json::to_value(&cursor_value).expect("cursor wire"),
+        ),
+        (
+            "PRT-B-03.06",
+            json!({"requestId": "request-7", "reason": "bounded"}),
+        ),
+        (
+            "PRT-B-03.07",
+            json!({"src": "HTTPS://example.test/icon.svg", "theme": "dark"}),
+        ),
+    ] {
+        let bytes = serde_json::to_string(&value).expect("canonical bytes");
+        let replayed: Value = serde_json::from_str(&bytes).expect("golden replays");
+        assert_eq!(
+            serde_json::to_string(&replayed).expect("canonical bytes again"),
+            bytes,
+            "canonical golden bytes are stable across a replay"
+        );
+        golden_ledger.observe(subcase);
+    }
+
+    serde_ledger.settle(15);
+    bounds_ledger.settle(12);
+    golden_ledger.settle(8);
+
+    let digests = [
+        prt_02_b_serde_schema_manifest_digest(),
+        prt_02_b_bounds_direction_manifest_digest(),
+        prt_02_b_open_goldens_manifest_digest(),
+    ];
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[1], digests[2]);
+    assert_ne!(digests[0], digests[2]);
 }
 
 #[test]

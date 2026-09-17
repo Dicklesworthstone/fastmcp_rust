@@ -415,6 +415,207 @@ fn fnd_03_b_unsupported_version_selects_modern_without_downgrading() {
     );
 }
 
+/// Every dimension of the bundle key discriminates, and origin equality alone
+/// is never bundle identity.
+///
+/// The key binds ten fields. Before this test only two of them were ever
+/// varied, so eight could have been dropped from the key without any test
+/// noticing — and a dropped field is a cache collision between two bundles
+/// that differ in exactly that field. Two of those fields are the credential
+/// and security partitions, so a collision there would let one partition's
+/// negotiated era be served to another.
+#[test]
+fn fnd_03_b_bundle_key_binds_every_dimension() {
+    /// One bundle with every key dimension supplied explicitly.
+    #[allow(clippy::too_many_arguments)]
+    fn bundle(
+        modern: &str,
+        sse: &str,
+        message: &str,
+        credential_partition: &str,
+        security_partition: &str,
+        transport_profile: &str,
+        policy_generation: u64,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> HttpEndpointBundle {
+        HttpEndpointBundle::new(
+            ProtocolPolicy::Auto,
+            Some(CanonicalHttpUrl::parse(modern).unwrap()),
+            Some(CanonicalHttpUrl::parse(sse).unwrap()),
+            Some(CanonicalHttpUrl::parse(message).unwrap()),
+            credential_partition.to_owned(),
+            security_partition.to_owned(),
+            transport_profile.to_owned(),
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+        )
+        .expect("a complete Auto bundle must be admitted")
+    }
+
+    const MODERN: &str = "https://api.example.test/mcp?tenant=alpha";
+    const SSE: &str = "https://api.example.test/sse?tenant=alpha";
+    const MESSAGE: &str = "https://api.example.test/messages?tenant=alpha";
+
+    let baseline = bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11);
+
+    // One variant per key dimension, each differing from the baseline in
+    // exactly that dimension and nothing else.
+    let variants: [(&str, HttpEndpointBundle); 9] = [
+        (
+            "modern_post_target",
+            bundle("https://api.example.test/mcp2?tenant=alpha", SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+        ),
+        (
+            "legacy_sse_target",
+            bundle(MODERN, "https://api.example.test/sse2?tenant=alpha", MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+        ),
+        (
+            "legacy_message_post_target",
+            bundle(MODERN, SSE, "https://api.example.test/messages2?tenant=alpha", "cred-a", "sec-a", "http-sse-v2", 3, 7, 11),
+        ),
+        (
+            "credential_partition",
+            bundle(MODERN, SSE, MESSAGE, "cred-b", "sec-a", "http-sse-v2", 3, 7, 11),
+        ),
+        (
+            "security_partition",
+            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-b", "http-sse-v2", 3, 7, 11),
+        ),
+        (
+            "transport_profile",
+            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v3", 3, 7, 11),
+        ),
+        (
+            "policy_generation",
+            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 4, 7, 11),
+        ),
+        (
+            "configuration_generation",
+            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 8, 11),
+        ),
+        (
+            "legacy_receipt_generation",
+            bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 12),
+        ),
+    ];
+
+    for (dimension, variant) in &variants {
+        assert_ne!(
+            baseline.key(),
+            variant.key(),
+            "{dimension} must discriminate the bundle key"
+        );
+    }
+
+    // The tenth dimension is the policy itself.
+    let modern_only = HttpEndpointBundle::new(
+        ProtocolPolicy::ModernOnly,
+        Some(CanonicalHttpUrl::parse(MODERN).unwrap()),
+        None,
+        None,
+        "cred-a".to_owned(),
+        "sec-a".to_owned(),
+        "http-sse-v2".to_owned(),
+        3,
+        7,
+        11,
+    )
+    .expect("a ModernOnly bundle needs only its modern target");
+    assert_ne!(baseline.key(), modern_only.key(), "policy must discriminate");
+
+    // Every variant is distinct from every other, not merely from the
+    // baseline: two dimensions must not alias onto one another.
+    let mut keys: Vec<_> = variants.iter().map(|(_, b)| b.key()).collect();
+    keys.push(baseline.key());
+    keys.push(modern_only.key());
+    let total = keys.len();
+    let unique: std::collections::HashSet<_> = keys.into_iter().collect();
+    assert_eq!(unique.len(), total, "two key dimensions alias onto one another");
+
+    // Origin equality alone is never bundle identity: same scheme, host and
+    // port, differing only in path, then only in query.
+    let same_origin_different_path = bundle(
+        "https://api.example.test/other?tenant=alpha",
+        SSE,
+        MESSAGE,
+        "cred-a",
+        "sec-a",
+        "http-sse-v2",
+        3,
+        7,
+        11,
+    );
+    let same_origin_different_query = bundle(
+        "https://api.example.test/mcp?tenant=beta",
+        SSE,
+        MESSAGE,
+        "cred-a",
+        "sec-a",
+        "http-sse-v2",
+        3,
+        7,
+        11,
+    );
+    assert_ne!(baseline.key(), same_origin_different_path.key());
+    assert_ne!(baseline.key(), same_origin_different_query.key());
+    assert_ne!(
+        same_origin_different_path.key(),
+        same_origin_different_query.key()
+    );
+
+    // An identically configured bundle is the same bundle: the key is a
+    // function of its inputs, not of construction identity. Without this the
+    // inequality assertions above would pass for a key that is simply always
+    // unique, which would cache nothing and prove nothing.
+    let rebuilt = bundle(MODERN, SSE, MESSAGE, "cred-a", "sec-a", "http-sse-v2", 3, 7, 11);
+    assert_eq!(baseline.key(), rebuilt.key());
+}
+
+/// A negotiated era is never served across a partition boundary.
+#[test]
+fn fnd_03_b_cache_does_not_leak_across_partitions() {
+    let partition_a = auto_bundle("security-partition-leak-a", 3);
+    let partition_b = auto_bundle("security-partition-leak-b", 3);
+
+    let mut cache = HttpEraCache::default();
+    assert_eq!(
+        cache.classify_or_cached(
+            &partition_a,
+            HttpModernProbe {
+                status: 200,
+                body: HttpProbeBody::RecognizedModernJsonRpc,
+            },
+        ),
+        HttpEraDecision::Selected(ProtocolEra::Modern2026)
+    );
+
+    // Partition B has negotiated nothing, so it must classify on its own
+    // probe rather than inherit A's selection.
+    assert_eq!(cache.selected_era(&partition_a.key()), Some(ProtocolEra::Modern2026));
+    assert_eq!(cache.selected_era(&partition_b.key()), None);
+    assert_eq!(
+        cache.classify_or_cached(
+            &partition_b,
+            HttpModernProbe {
+                status: 404,
+                body: HttpProbeBody::Empty,
+            },
+        ),
+        HttpEraDecision::LegacySseFallbackAuthorized,
+        "partition B must not inherit partition A's negotiated era"
+    );
+
+    // Invalidating one partition leaves the other untouched.
+    assert_eq!(
+        cache.invalidate(&partition_a.key()),
+        Some(ProtocolEra::Modern2026)
+    );
+    assert_eq!(cache.selected_era(&partition_a.key()), None);
+    assert_eq!(cache.invalidate(&partition_b.key()), None);
+}
+
 #[test]
 fn http_endpoint_bundle_errors_have_stable_display_and_error_surfaces() {
     let modern = CanonicalHttpUrl::parse("https://api.example.test/mcp").unwrap();

@@ -2877,6 +2877,115 @@ pub fn prt_02_a_icon_content_manifest_digest() -> fastmcp_core::Sha256Digest {
     .expect("the fixed PRT-02 A icon/content manifest is within its exact byte bound")
 }
 
+/// The canonical `PRT02-B-SERDE-SCHEMA-v1` rows: ordered subcases
+/// `PRT-B-01.01` through `PRT-B-01.15`.
+///
+/// Same contract as the A manifests. The three wire-cursor rows are the
+/// serde-level counterpart of `PRT-A-02.14`..`.16`: `OpaqueCursor` models
+/// presence correctly on its own, but the property that matters on the wire is
+/// whether an enclosing typed struct preserves the distinction, which only a
+/// serde row can observe.
+pub const PRT_02_B_SERDE_SCHEMA_MANIFEST_V1: &str = concat!(
+    "PRT02-B-SERDE-SCHEMA-v1\n",
+    "producer-bead bd-mcp-prt-02-b-nnva\n",
+    "producer-revision 0733ee3e4b7b04a1ad0a33d78a8e1b0f6e6f6d2f\n",
+    "entrypoint serde_json::to_value\n",
+    "entrypoint serde_json::from_value\n",
+    "entrypoint fastmcp_protocol::common_types::FinalCommonTypesSchema::validate\n",
+    "PRT-B-01.01 implementation-round-trip floor=1\n",
+    "PRT-B-01.02 open-metadata-round-trip floor=1\n",
+    "PRT-B-01.03 annotations-round-trip floor=1\n",
+    "PRT-B-01.04 absolute-uri-round-trip floor=1\n",
+    "PRT-B-01.05 cursor-value-round-trip floor=1\n",
+    "PRT-B-01.06 cancellation-request-id-round-trip floor=1\n",
+    "PRT-B-01.07 icon-schema-verdict floor=1\n",
+    "PRT-B-01.08 content-text-round-trip floor=1\n",
+    "PRT-B-01.09 content-image-round-trip floor=1\n",
+    "PRT-B-01.10 embedded-resource-round-trip floor=1\n",
+    "PRT-B-01.11 trace-context-round-trip floor=1\n",
+    "PRT-B-01.12 subscription-exception-round-trip floor=1\n",
+    "PRT-B-01.13 wire-cursor-absent floor=1\n",
+    "PRT-B-01.14 wire-cursor-present floor=2\n",
+    "PRT-B-01.15 wire-cursor-explicit-null-refused floor=1\n",
+);
+
+/// The canonical `PRT02-B-BOUNDS-DIRECTION-v1` rows: ordered subcases
+/// `PRT-B-02.01` through `PRT-B-02.12`.
+///
+/// Each bounded row is evaluated at N-1 and N, and its N+1 counterpart is
+/// evaluated in the planted negative. Same contract as the A manifests.
+pub const PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1: &str = concat!(
+    "PRT02-B-BOUNDS-DIRECTION-v1\n",
+    "producer-bead bd-mcp-prt-02-b-nnva\n",
+    "producer-revision 0733ee3e4b7b04a1ad0a33d78a8e1b0f6e6f6d2f\n",
+    "entrypoint fastmcp_protocol::common_types::OpenMetadata::try_from_entries\n",
+    "entrypoint fastmcp_protocol::common_types::AbsoluteUri::parse\n",
+    "entrypoint fastmcp_protocol::common_types::OpaqueCursor::try_from_presence\n",
+    "PRT-B-02.01 metadata-entries-n-minus-one floor=1\n",
+    "PRT-B-02.02 metadata-entries-n floor=1\n",
+    "PRT-B-02.03 uri-bytes-n-minus-one floor=1\n",
+    "PRT-B-02.04 uri-bytes-n floor=1\n",
+    "PRT-B-02.05 cursor-bytes-n-minus-one floor=1\n",
+    "PRT-B-02.06 cursor-bytes-n floor=1\n",
+    "PRT-B-02.07 icon-sizes-n-minus-one floor=1\n",
+    "PRT-B-02.08 icon-sizes-n floor=1\n",
+    "PRT-B-02.09 content-bytes-n-minus-one floor=1\n",
+    "PRT-B-02.10 cancellation-reason-unbounded-by-schema floor=1\n",
+    "PRT-B-02.11 request-direction-accepted floor=1\n",
+    "PRT-B-02.12 notification-direction-accepted floor=1\n",
+);
+
+/// The canonical `PRT02-B-OPEN-GOLDENS-v1` rows: ordered subcases
+/// `PRT-B-03.01` through `PRT-B-03.08`.
+///
+/// Same contract as the A manifests. A golden row asserts exact canonical
+/// bytes, so an unrecognized or malformed row can never quietly become a
+/// compatibility alias for a recognized one.
+pub const PRT_02_B_OPEN_GOLDENS_MANIFEST_V1: &str = concat!(
+    "PRT02-B-OPEN-GOLDENS-v1\n",
+    "producer-bead bd-mcp-prt-02-b-nnva\n",
+    "producer-revision 0733ee3e4b7b04a1ad0a33d78a8e1b0f6e6f6d2f\n",
+    "entrypoint fastmcp_protocol::common_types::FinalCommonTypesSchema::validate_golden\n",
+    "PRT-B-03.01 golden-known-metadata floor=1\n",
+    "PRT-B-03.02 golden-valid-open-metadata floor=1\n",
+    "PRT-B-03.03 golden-unknown-open-preserved floor=1\n",
+    "PRT-B-03.04 golden-absolute-uri floor=1\n",
+    "PRT-B-03.05 golden-cursor floor=1\n",
+    "PRT-B-03.06 golden-cancellation floor=1\n",
+    "PRT-B-03.07 golden-icon floor=1\n",
+    "PRT-B-03.08 golden-trace floor=1\n",
+);
+
+/// Returns the canonical `PRT02-B-SERDE-SCHEMA-v1` digest.
+#[must_use]
+pub fn prt_02_b_serde_schema_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_B_SERDE_SCHEMA_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 B serde/schema manifest is within its exact byte bound")
+}
+
+/// Returns the canonical `PRT02-B-BOUNDS-DIRECTION-v1` digest.
+#[must_use]
+pub fn prt_02_b_bounds_direction_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 B bounds/direction manifest is within its exact byte bound")
+}
+
+/// Returns the canonical `PRT02-B-OPEN-GOLDENS-v1` digest.
+#[must_use]
+pub fn prt_02_b_open_goldens_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_B_OPEN_GOLDENS_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 B open-goldens manifest is within its exact byte bound")
+}
+
 /// Parses one published PRT-02 manifest into its ordered `(id, name, floor)`
 /// subcase rows.
 ///
