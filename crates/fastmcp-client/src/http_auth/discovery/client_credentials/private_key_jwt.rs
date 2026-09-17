@@ -9,6 +9,9 @@
 //! custody, or deployment attestation. Those remain deployment obligations;
 //! this source surface does not promote the complete AUTHX-02 security profile.
 
+#[cfg(test)]
+mod tests;
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -102,8 +105,8 @@ impl PrivateKeyJwtRegistration {
             || document.token_endpoint_auth_signing_alg != "RS256"
             || document.client_id.is_empty() || document.client_id.len() > 4096
             || document.client_id.chars().any(char::is_control)
-            || document.client_id.starts_with("https://")
-            || document.client_id.starts_with("http://")
+            || document.client_id.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+            || document.client_id.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
