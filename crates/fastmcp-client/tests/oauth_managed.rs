@@ -370,3 +370,65 @@ fn a_nonrenewable_expired_grant_requires_explicit_login_without_peer_contact() {
         peer.assert_no_extra_connection();
     });
 }
+
+#[test]
+fn issued_credentials_cannot_outlive_close_or_the_last_managed_login_owner() {
+    for explicit_close in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let application = async {
+                // A long-lived grant distinguishes revocation from expiry.
+                let session = ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser_callback).await.unwrap();
+                let resource = session.resource().clone();
+                let snapshot = session.credential(&cx).await.unwrap();
+                let extracted = snapshot.credential().clone();
+                let remaining_owner = session.clone();
+                drop(session);
+                assert_eq!(extracted.authorization_for_target(&resource), Some("Bearer access-two".to_owned()));
+                if explicit_close {
+                    remaining_owner.close();
+                    assert!(matches!(remaining_owner.credential(&cx).await, Err(OAuthSessionError::Closed)));
+                } else {
+                    drop(remaining_owner);
+                }
+                for credential in [snapshot.credential(), &extracted] {
+                    assert!(credential.is_revoked());
+                    assert_eq!(credential.authorization_for_target(&resource), None);
+                    assert!(credential.expires_at().unwrap() > std::time::Instant::now());
+                }
+                assert!(cx.checkpoint().is_ok());
+            };
+            pair(peer.login(NEXT), application).await;
+            assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+            peer.assert_no_extra_connection();
+        });
+    }
+}
+
+#[test]
+fn revoking_an_issued_snapshot_prevents_reacquisition_and_authenticated_dispatch() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let application = async {
+            let session = ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser_callback).await.unwrap();
+            let first = session.credential(&cx).await.unwrap();
+            let second = session.credential(&cx).await.unwrap();
+            first.credential().clone().revoke();
+            assert!(first.credential().is_revoked());
+            assert!(second.credential().is_revoked());
+            assert_eq!(second.credential().authorization_for_target(session.resource()), None);
+            assert!(matches!(session.credential(&cx).await, Err(OAuthSessionError::LoginRequired)));
+            let request = ModernHttpRequest::new(session.resource().as_str(), b"{}".to_vec(), "2026-07-28", "tools/call", None).unwrap();
+            assert!(matches!(session.execute(&cx, &request).await, Err(OAuthSessionError::LoginRequired)));
+            assert!(cx.checkpoint().is_ok());
+            // Revocation requires explicit login; it is not session close.
+            session.close();
+            assert!(matches!(session.credential(&cx).await, Err(OAuthSessionError::Closed)));
+        };
+        pair(peer.login(NEXT), application).await;
+        assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+        peer.assert_no_extra_connection();
+    });
+}
