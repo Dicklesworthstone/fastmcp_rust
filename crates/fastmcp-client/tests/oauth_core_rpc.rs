@@ -23,13 +23,21 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::time::Sleep;
-use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
+use asupersync::tls::{
+    Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
+};
 use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use fastmcp_client::http_auth::rpc::catalog::{
+    CollectedCatalog, ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
+};
 use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::{ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId, ServerNotification};
+use fastmcp_protocol::{
+    ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta, RequestId,
+    ServerNotification,
+};
 use serde_json::{Value, json};
 
 #[path = "oauth_core_rpc/subscriptions.rs"]
@@ -45,16 +53,44 @@ const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIK
 const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEGCCqGSM49\nAwEHA0IABPPKylLna9VpWAlpshHBhSsQHNOv3BaEGX4HSBhHiBVel0ce+qfHF15O\n0T63Zlp7TtxlMdEY+rPpgioSFDQVadijYzBhMAwGA1UdEwEB/wQCMAAwLAYDVR0R\nBCUwI4IJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAAAAABMBMGA1UdJQQM\nMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiEA\n6qrAr2qp/t6K62T9Et2mUU/zfd4kJb+ekyoAim1yTFcCICb6SdVY2fg15/SXf0vE\nIvYelqtTk8FQInCEcIxvfF3m\n-----END CERTIFICATE-----\n";
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 const CATALOG: &str = r#"{"resultType":"complete","tools":[],"ttlMs":100,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#;
-const TOOL_RESULT: &str = r#"{"resultType":"complete","content":[{"type":"text","text":"hello from TLS"}]}"#;
+const TOOL_RESULT: &str =
+    r#"{"resultType":"complete","content":[{"type":"text","text":"hello from TLS"}]}"#;
 const CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 const PROGRESS: &str = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"work","progress":1}}"#;
 
+// Two catalog pages for the collector cases. Every page carries `ttlMs` and
+// `cacheScope` because `page_facts` requires cache hints on each page and
+// rejects a page without them as InvalidPage -- a page omitting them would
+// fail these tests for a reason unrelated to pagination.
+const CATALOG_PAGE_ONE: &str = r#"{"resultType":"complete","ttlMs":60000,"cacheScope":"private","tools":[{"name":"alpha","inputSchema":{"type":"object"}}],"nextCursor":"opaque-cursor-1"}"#;
+// The positive's second page ends the traversal. The negative's differs from
+// it in EXACTLY ONE TOKEN -- the trailing `nextCursor` repeating page one's --
+// which is the single planted variable and the only difference between the
+// two cases anywhere in this file.
+const CATALOG_PAGE_TWO_FINAL: &str = r#"{"resultType":"complete","ttlMs":60000,"cacheScope":"private","tools":[{"name":"beta","inputSchema":{"type":"object"}}]}"#;
+const CATALOG_PAGE_TWO_REPEATS_CURSOR: &str = r#"{"resultType":"complete","ttlMs":60000,"cacheScope":"private","tools":[{"name":"beta","inputSchema":{"type":"object"}}],"nextCursor":"opaque-cursor-1"}"#;
+
 #[derive(Clone, Copy)]
-enum Case { Json, Sse, InvalidResponse, InputRequired, Cancel, Deadline, Preflight, HttpFailure, UntrustedResource }
+enum Case {
+    Json,
+    Sse,
+    InvalidResponse,
+    InputRequired,
+    Cancel,
+    Deadline,
+    Preflight,
+    HttpFailure,
+    UntrustedResource,
+    CatalogPages,
+    CatalogRepeatedCursor,
+}
 
 fn isolated(name: &str, case: Case) {
     if let Ok(selected) = std::env::var(CHILD_CASE) {
-        assert_eq!(selected, name, "the child must execute exactly the selected test");
+        assert_eq!(
+            selected, name,
+            "the child must execute exactly the selected test"
+        );
         run(case);
         return;
     }
@@ -68,8 +104,12 @@ fn isolated(name: &str, case: Case) {
         // `tests/fixtures/`: the remote build worker never receives `*.pem`, so
         // pointing the child's trust store at a repository file made every
         // case here fail with "public TLS case ... failed" on that worker.
-        let path = std::env::temp_dir().join(format!("fastmcp-oauth-core-ca-{}.pem", name.replace("::", "_")));
-        std::fs::write(&path, ROOT).expect("materialize the TEST ONLY root for the child trust store");
+        let path = std::env::temp_dir().join(format!(
+            "fastmcp-oauth-core-ca-{}.pem",
+            name.replace("::", "_")
+        ));
+        std::fs::write(&path, ROOT)
+            .expect("materialize the TEST ONLY root for the child trust store");
         path
     };
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -77,8 +117,11 @@ fn isolated(name: &str, case: Case) {
         .env(CHILD_CASE, name)
         .env("SSL_CERT_FILE", roots)
         .env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-        .spawn().expect("launch isolated public transport test");
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("launch isolated public transport test");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -101,18 +144,27 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut two = None;
     poll_fn(|task| {
         if one.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(task) { one = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(task) {
+                one = Some(value);
+            }
         }
         if two.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(task) { two = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(task) {
+                two = Some(value);
+            }
         }
         if one.is_some() && two.is_some() {
             Poll::Ready((one.take().unwrap(), two.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
-fn url(text: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(text).unwrap() }
+fn url(text: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(text).unwrap()
+}
 
 fn decode_component(input: &str) -> String {
     let mut output = Vec::new();
@@ -132,29 +184,44 @@ fn decode_component(input: &str) -> String {
 }
 
 fn form(input: &str) -> BTreeMap<String, String> {
-    input.split('&').map(|field| {
-        let (key, value) = field.split_once('=').unwrap();
-        (decode_component(key), decode_component(value))
-    }).collect()
+    input
+        .split('&')
+        .map(|field| {
+            let (key, value) = field.split_once('=').unwrap();
+            (decode_component(key), decode_component(value))
+        })
+        .collect()
 }
 
 async fn browser(authorization: CanonicalHttpUrl) -> Result<(), OAuthError> {
     let params = form(authorization.query().unwrap());
     assert_eq!(params["client_id"], "typed-client");
     assert_eq!(params["code_challenge_method"], "S256");
-    let address: SocketAddr = params["redirect_uri"].strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().parse().unwrap();
+    let address: SocketAddr = params["redirect_uri"]
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(address.ip().is_loopback());
     let request = format!(
         "GET /oauth/callback?code=typed-code&iss=https%3A%2F%2Fissuer.example&state={} HTTP/1.1\r\nHost: {address}\r\n\r\n",
         params["state"],
     );
-    let mut socket = TcpStream::connect(address).await.map_err(|_| OAuthError::CallbackRejected)?;
-    socket.write_all(request.as_bytes()).await.map_err(|_| OAuthError::CallbackRejected)
+    let mut socket = TcpStream::connect(address)
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)?;
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| OAuthError::CallbackRejected)
 }
 
 fn core(method: &str, mut params: Value) -> CoreRequest {
-    params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+    params["_meta"] =
+        serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     params["_meta"]["progressToken"] = json!("work");
     CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
 }
@@ -175,20 +242,38 @@ impl Peer {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
             acceptor: TlsAcceptorBuilder::new(
-                CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
-            ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
-            token_posts: AtomicUsize::new(0), mcp_posts: AtomicUsize::new(0),
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
+            token_posts: AtomicUsize::new(0),
+            mcp_posts: AtomicUsize::new(0),
         }
     }
 
-    fn resource(&self) -> String { format!("https://{}/mcp", self.listener.local_addr().unwrap()) }
+    fn resource(&self) -> String {
+        format!("https://{}/mcp", self.listener.local_addr().unwrap())
+    }
 
     fn client(&self) -> OAuthClient {
-        OAuthClient::new(OAuthClientConfiguration::from_trusted_endpoints(
-            "https://issuer.example", url("https://issuer.example/authorize"),
-            url(&format!("https://{}/token", self.listener.local_addr().unwrap())),
-            url(&self.resource()), "typed-client", vec!["tools:read".to_owned()],
-        ).unwrap().with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0)).unwrap())
+        OAuthClient::new(
+            OAuthClientConfiguration::from_trusted_endpoints(
+                "https://issuer.example",
+                url("https://issuer.example/authorize"),
+                url(&format!(
+                    "https://{}/token",
+                    self.listener.local_addr().unwrap()
+                )),
+                url(&self.resource()),
+                "typed-client",
+                vec!["tools:read".to_owned()],
+            )
+            .unwrap()
+            .with_extra_root_certificate(Certificate::from_pem(ROOT).unwrap().remove(0))
+            .unwrap(),
+        )
     }
 
     async fn request(&self, path: &str) -> (TlsStream<TcpStream>, Vec<u8>) {
@@ -200,13 +285,20 @@ impl Peer {
             let count = tls.read(&mut buffer).await.unwrap();
             assert!(count > 0 && bytes.len() + count <= 16 * 1024);
             bytes.extend_from_slice(&buffer[..count]);
-            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break index + 4; }
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
         };
         let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
         assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
-        let headers: BTreeMap<String, String> = head.lines().skip(1).filter_map(|line| {
-            line.split_once(':').map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-        }).collect();
+        let headers: BTreeMap<String, String> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
         let length: usize = headers["content-length"].parse().unwrap();
         assert!(end + length <= 16 * 1024);
         while bytes.len() < end + length {
@@ -232,8 +324,13 @@ impl Peer {
             assert!(!headers.contains_key("cookie"));
             let envelope: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(headers["mcp-method"], envelope["method"].as_str().unwrap());
-            assert_eq!(envelope["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-            if envelope["method"] == "tools/call" { assert_eq!(headers["mcp-name"], "echo"); }
+            assert_eq!(
+                envelope["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            if envelope["method"] == "tools/call" {
+                assert_eq!(headers["mcp-name"], "echo");
+            }
             self.mcp_posts.fetch_add(1, Ordering::SeqCst);
         }
         (tls, body)
@@ -252,19 +349,27 @@ impl Peer {
 
     fn no_extra_connections(&self) {
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(self.listener.poll_accept(&mut task).is_pending(), "no automatic request/renewal replay");
+        assert!(
+            self.listener.poll_accept(&mut task).is_pending(),
+            "no automatic request/renewal replay"
+        );
     }
 }
 
 async fn json_reply(tls: &mut TlsStream<TcpStream>, status: u16, body: &str) {
-    let wire = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let wire = format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     tls.write_all(wire.as_bytes()).await.unwrap();
     tls.flush().await.unwrap();
 }
 
 async fn chunk(tls: &mut TlsStream<TcpStream>, payloads: &[String], terminal: bool) {
     let mut body = String::new();
-    for payload in payloads { body.push_str(&format!("data: {payload}\n\n")); }
+    for payload in payloads {
+        body.push_str(&format!("data: {payload}\n\n"));
+    }
     let end = if terminal { "0\r\n\r\n" } else { "" };
     let wire = format!("{:X}\r\n{body}\r\n{end}", body.len());
     tls.write_all(wire.as_bytes()).await.unwrap();
@@ -273,19 +378,98 @@ async fn chunk(tls: &mut TlsStream<TcpStream>, payloads: &[String], terminal: bo
 
 async fn begin_stream(peer: &Peer) -> TlsStream<TcpStream> {
     let (mut tls, _) = peer.request("/mcp").await;
-    tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+    tls.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await
+    .unwrap();
     chunk(&mut tls, &[CHANGED.to_owned()], false).await;
     tls
 }
 
 async fn first_changed(call: &mut fastmcp_client::http_auth::rpc::ManagedCoreCall, cx: &Cx) {
-    let Some(ManagedCoreEvent::Notification(notification)) = call.next_event(cx).await.unwrap() else { panic!("incremental notification expected") };
-    assert!(matches!(*notification, ServerNotification::ToolsListChanged(_)));
+    let Some(ManagedCoreEvent::Notification(notification)) = call.next_event(cx).await.unwrap()
+    else {
+        panic!("incremental notification expected")
+    };
+    assert!(matches!(
+        *notification,
+        ServerNotification::ToolsListChanged(_)
+    ));
+}
+
+/// Serves page one, then `second` for the cursor-bearing follow-up.
+///
+/// Both collector cases share this server verbatim; only `second` differs, so
+/// the two tests are near-identical by construction rather than by review.
+/// The follow-up assertions are the point of the positive: the second POST has
+/// to carry the EXACT opaque cursor page one emitted, under a FRESH request id.
+async fn two_page_catalog_peer(peer: &Peer, second: &'static str) {
+    let (mut tls, first) = peer.request("/mcp").await;
+    let first: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(first["method"], "tools/list");
+    assert!(
+        first["params"].get("cursor").is_none(),
+        "the first page must be requested without a cursor"
+    );
+    let first_id = first["id"].as_i64().expect("numeric request id");
+    json_reply(&mut tls, 200, &terminal(first_id, CATALOG_PAGE_ONE)).await;
+    drop(tls);
+
+    let (mut tls, follow) = peer.request("/mcp").await;
+    let follow: Value = serde_json::from_slice(&follow).unwrap();
+    assert_eq!(follow["method"], "tools/list");
+    assert_eq!(
+        follow["params"]["cursor"], "opaque-cursor-1",
+        "the follow-up POST must carry the exact opaque cursor the peer emitted"
+    );
+    let follow_id = follow["id"].as_i64().expect("numeric request id");
+    assert_ne!(
+        follow_id, first_id,
+        "the follow-up POST must use a fresh request id"
+    );
+    json_reply(&mut tls, 200, &terminal(follow_id, second)).await;
+}
+
+/// A cached collector over one login. `new` disables caching, so the cache
+/// limits are what make the reuse half of the positive observable at all.
+fn catalog_client(session: &ManagedOAuthSession) -> ManagedCatalogClient {
+    ManagedCatalogClient::new(session.clone(), ManagedCatalogLimits::default())
+        .with_cache_limits(4, 64 * 1024)
+        .expect("bounded cache limits are valid")
+}
+
+/// Monotonic request ids for a collection, so each page gets a fresh one.
+fn fresh_ids(start: i64) -> impl FnMut() -> Result<RequestId, ManagedCatalogError> {
+    let mut next = start;
+    move || {
+        let id = RequestId::Number(next);
+        next += 1;
+        Ok(id)
+    }
+}
+
+fn catalog_tool_names(collected: &CollectedCatalog) -> String {
+    collected
+        .pages()
+        .iter()
+        .map(|page| page.encode().unwrap())
+        .collect()
 }
 
 async fn complete_catalog(session: &ManagedOAuthSession, cx: &Cx, id: i64) {
-    let mut call = session.request_core(cx, core("tools/list", json!({})), RequestId::Number(id), ManagedCoreLimits::default()).await.unwrap();
-    let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else { panic!("typed catalog expected") };
+    let mut call = session
+        .request_core(
+            cx,
+            core("tools/list", json!({})),
+            RequestId::Number(id),
+            ManagedCoreLimits::default(),
+        )
+        .await
+        .unwrap();
+    let Some(ManagedCoreEvent::Result(result)) = call.next_event(cx).await.unwrap() else {
+        panic!("typed catalog expected")
+    };
     let encoded = result.encode().unwrap();
     assert!(encoded.contains("900719925474099312345"));
     assert!(encoded.contains("1.20e+4"));
@@ -420,6 +604,66 @@ fn run(case: Case) {
                     assert!(result.is_err());
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 0);
                 }
+                Case::CatalogPages => {
+                    let client = catalog_client(&session);
+                    let ((), collected) = pair(
+                        two_page_catalog_peer(&peer, CATALOG_PAGE_TWO_FINAL),
+                        client.collect(&cx, core("tools/list", json!({})), fresh_ids(61), |_| Ok(())),
+                    ).await;
+                    let collected = collected.expect("a complete two-page traversal must succeed");
+
+                    // Complete output: BOTH pages, and both actual tools.
+                    assert_eq!(collected.pages().len(), 2, "both pages must be retained, unmerged");
+                    assert_eq!(collected.item_count(), 2);
+                    let tools = catalog_tool_names(&collected);
+                    assert!(tools.contains("alpha"), "page one's tool must survive the traversal");
+                    assert!(tools.contains("beta"), "page two's tool must survive the traversal");
+                    assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 2, "exactly two authenticated POSTs");
+
+                    // Cached repeat: identical tools and NOT ONE further POST.
+                    // `fresh_ids` deliberately starts elsewhere -- a cache hit
+                    // must not consume an id, and must not reach the peer even
+                    // though the peer has nothing left to serve.
+                    let again = client
+                        .collect(&cx, core("tools/list", json!({})), fresh_ids(91), |_| Ok(()))
+                        .await
+                        .expect("the cached repeat must succeed without the peer");
+                    assert_eq!(
+                        catalog_tool_names(&again), tools,
+                        "the cached repeat must return identical tools"
+                    );
+                    assert_eq!(
+                        peer.mcp_posts.load(Ordering::SeqCst), 2,
+                        "a cache hit must not issue a POST"
+                    );
+                }
+                Case::CatalogRepeatedCursor => {
+                    // Identical to Case::CatalogPages up to ONE token in the
+                    // second page: its nextCursor repeats page one's instead
+                    // of being absent.
+                    let client = catalog_client(&session);
+                    let ((), collected) = pair(
+                        two_page_catalog_peer(&peer, CATALOG_PAGE_TWO_REPEATS_CURSOR),
+                        client.collect(&cx, core("tools/list", json!({})), fresh_ids(61), |_| Ok(())),
+                    ).await;
+
+                    // Destructured rather than `expect_err`: CollectedCatalog
+                    // does not implement Debug, so the Err-extracting helpers
+                    // are unavailable here.
+                    let Err(error) = collected else {
+                        panic!("a repeated opaque cursor must be refused, not collected");
+                    };
+                    assert!(
+                        matches!(error, ManagedCatalogError::RepeatedCursor),
+                        "the refusal must be the typed RepeatedCursor, got {error:?}"
+                    );
+                    // No third request: the refusal happens on admission of the
+                    // repeating page, before any further POST is prepared.
+                    assert_eq!(
+                        peer.mcp_posts.load(Ordering::SeqCst), 2,
+                        "refusing a repeated cursor must not issue a third POST"
+                    );
+                }
             }
             assert_eq!(peer.token_posts.load(Ordering::SeqCst), 1, "MCP failures never trigger a grant replay");
             peer.no_extra_connections();
@@ -431,20 +675,79 @@ fn run(case: Case) {
 }
 
 #[test]
-fn managed_core_live_json_call_preserves_exact_results() { isolated("managed_core_live_json_call_preserves_exact_results", Case::Json); }
+fn managed_core_live_json_call_preserves_exact_results() {
+    isolated(
+        "managed_core_live_json_call_preserves_exact_results",
+        Case::Json,
+    );
+}
 #[test]
-fn managed_core_live_sse_delivers_notifications_before_terminal() { isolated("managed_core_live_sse_delivers_notifications_before_terminal", Case::Sse); }
+fn managed_core_live_sse_delivers_notifications_before_terminal() {
+    isolated(
+        "managed_core_live_sse_delivers_notifications_before_terminal",
+        Case::Sse,
+    );
+}
 #[test]
-fn managed_core_bad_response_does_not_poison_sibling_calls() { isolated("managed_core_bad_response_does_not_poison_sibling_calls", Case::InvalidResponse); }
+fn managed_core_bad_response_does_not_poison_sibling_calls() {
+    isolated(
+        "managed_core_bad_response_does_not_poison_sibling_calls",
+        Case::InvalidResponse,
+    );
+}
 #[test]
-fn managed_core_input_required_does_not_repeat_the_post() { isolated("managed_core_input_required_does_not_repeat_the_post", Case::InputRequired); }
+fn managed_core_input_required_does_not_repeat_the_post() {
+    isolated(
+        "managed_core_input_required_does_not_repeat_the_post",
+        Case::InputRequired,
+    );
+}
 #[test]
-fn managed_core_idle_cancellation_closes_only_its_request() { isolated("managed_core_idle_cancellation_closes_only_its_request", Case::Cancel); }
+fn managed_core_idle_cancellation_closes_only_its_request() {
+    isolated(
+        "managed_core_idle_cancellation_closes_only_its_request",
+        Case::Cancel,
+    );
+}
 #[test]
-fn managed_core_deadline_includes_time_between_event_reads() { isolated("managed_core_deadline_includes_time_between_event_reads", Case::Deadline); }
+fn managed_core_deadline_includes_time_between_event_reads() {
+    isolated(
+        "managed_core_deadline_includes_time_between_event_reads",
+        Case::Deadline,
+    );
+}
 #[test]
-fn managed_core_oversized_request_is_rejected_before_dispatch() { isolated("managed_core_oversized_request_is_rejected_before_dispatch", Case::Preflight); }
+fn managed_core_oversized_request_is_rejected_before_dispatch() {
+    isolated(
+        "managed_core_oversized_request_is_rejected_before_dispatch",
+        Case::Preflight,
+    );
+}
 #[test]
-fn managed_core_http_failures_never_replay_or_renew() { isolated("managed_core_http_failures_never_replay_or_renew", Case::HttpFailure); }
+fn managed_core_http_failures_never_replay_or_renew() {
+    isolated(
+        "managed_core_http_failures_never_replay_or_renew",
+        Case::HttpFailure,
+    );
+}
 #[test]
-fn managed_core_resource_requires_its_own_tls_trust() { isolated("managed_core_resource_requires_its_own_tls_trust", Case::UntrustedResource); }
+fn managed_core_resource_requires_its_own_tls_trust() {
+    isolated(
+        "managed_core_resource_requires_its_own_tls_trust",
+        Case::UntrustedResource,
+    );
+}
+#[test]
+fn managed_catalog_collects_all_pages_and_reuses_cache() {
+    isolated(
+        "managed_catalog_collects_all_pages_and_reuses_cache",
+        Case::CatalogPages,
+    );
+}
+#[test]
+fn managed_catalog_rejects_repeated_cursor_without_extra_post() {
+    isolated(
+        "managed_catalog_rejects_repeated_cursor_without_extra_post",
+        Case::CatalogRepeatedCursor,
+    );
+}
