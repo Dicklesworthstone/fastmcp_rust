@@ -37,6 +37,8 @@ use super::managed::{
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
 
+/// Bounded catalog traversal and explicitly enabled credential-local page caching.
+pub mod catalog;
 /// Explicit host-driven, bounded input-required continuation operations.
 pub mod interaction;
 
@@ -585,7 +587,7 @@ mod tests {
         let mut decoder = decoder("tools/list", json!({}));
         decoder.limits.total_bytes = notification.len();
         assert!(decoder.admit(notification, true).is_ok());
-        assert!(matches!(decoder.admit(notification, true), Err(ManagedCoreError::ResponseByteLimit)));
+        assert!(matches!(decoder.admit(&frame(r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}"#), true), Err(ManagedCoreError::ResponseByteLimit)));
         assert_eq!(decoder.notifications, 1);
     }
 
