@@ -956,8 +956,17 @@ mod tests {
         .expect("the bounded installed behavior registry is discoverable")
     }
 
+    // Deliberately NOT the frozen SRV-02 B acceptance ID. Those IDs must
+    // resolve to exactly one definition in the workspace: the frozen runner on
+    // bd-mcp-2026-07-28-support-ahet.17.2 is
+    // `cargo test --workspace --all-targets <id> -- --exact` and AC bullet 3
+    // forbids substituted rows. The shipped proof for SRV-02 B lives at the
+    // crate root of crates/fastmcp-server/tests/srv_02_b.rs, and this copy is a
+    // different crate's `cfg(test)` unit coverage, which AC bullet 4 and PL-3
+    // disqualify as proof of shipped behaviour. Renaming back would
+    // reintroduce the duplicate.
     #[test]
-    fn srv_02_b_positive() {
+    fn srv_02_b_unit_positive() {
         let result = ServerDiscoverResult::new(
             fully_installed_capabilities(),
             ServerInfo {
@@ -1342,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn srv_02_b_planted_negative() {
+    fn srv_02_b_unit_planted_negative() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
             ServerInfo {

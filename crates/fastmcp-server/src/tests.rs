@@ -8314,8 +8314,19 @@ mod helper_function_tests {
         .expect("public stateless catalog must serialize")
     }
 
+    // The four `srv_01_*_unit_*` names below deliberately do NOT match the
+    // frozen SRV-01 acceptance IDs. Those IDs must resolve to exactly one
+    // definition in the workspace, because the frozen runner on
+    // bd-mcp-2026-07-28-support-ahet.15.1/.15.2 is
+    // `cargo test --workspace --all-targets <id> -- --exact` and AC bullet 3
+    // forbids substituted rows. The shipped proof lives at the crate root of
+    // crates/fastmcp-server/tests/srv_01_stateless.rs; `cfg(test)` behaviour
+    // cannot prove shipped behaviour (AC bullet 4, PL-3), so these remain
+    // in-crate unit coverage under distinct names. Renaming them back would
+    // reintroduce the duplicate. Same convention as fnd_03_i_* and
+    // fnd_03_integration_*.
     #[test]
-    fn srv_01_a_positive() {
+    fn srv_01_a_unit_positive() {
         let server = Server::new("stateless-public-handler", "1.0.0")
             .tool(Greet)
             .build();
@@ -8356,7 +8367,7 @@ mod helper_function_tests {
     }
 
     #[test]
-    fn srv_01_a_planted_negative() {
+    fn srv_01_a_unit_planted_negative() {
         let server = Server::new("stateless-forbidden-mutation", "1.0.0")
             .tool(Greet)
             .build();
@@ -8414,7 +8425,7 @@ mod helper_function_tests {
     }
 
     #[test]
-    fn srv_01_b_positive() {
+    fn srv_01_b_unit_positive() {
         let server = Server::new("stateless-handler-result", "1.0.0")
             .tool(DeclinedTool)
             .build();
@@ -8458,7 +8469,7 @@ mod helper_function_tests {
     }
 
     #[test]
-    fn srv_01_b_planted_negative() {
+    fn srv_01_b_unit_planted_negative() {
         let server = Server::new("stateless-handler-refusal", "1.0.0")
             .tool(DeclinedTool)
             .build();
