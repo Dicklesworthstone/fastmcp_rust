@@ -18,6 +18,7 @@ enum WatchCase {
     Live, Resources, Templates, Prompts, DuringPage, ChangeOnPage, NarrowAck,
     Gap, Terminal, Malformed, RebuildLimit, RepeatedId, Cancel, SessionClose,
     Drop, Timeout, Expired, StopAck, Preflight, Revoked, CallbackOverrun, ScopedCache,
+    ClearPublication,
 }
 
 fn isolated_watch(name: &str, case: WatchCase) {
@@ -207,6 +208,10 @@ fn run_watch(case: WatchCase) {
                     return;
                 }
                 serve_page(&peer, method, 2, None, "first", None).await;
+                if matches!(case, WatchCase::ClearPublication) {
+                    closed(listen).await;
+                    return;
+                }
                 first_rx.recv(&cx).await.unwrap();
                 if matches!(case, WatchCase::Live | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts) {
                     // The first snapshot has already reached the host while the
@@ -273,6 +278,14 @@ fn run_watch(case: WatchCase) {
                         Ok(Control::Continue)
                     },
                 ));
+                if matches!(case, WatchCase::ClearPublication) {
+                    poll_fn(|task| {
+                        assert!(watching.as_mut().poll(task).is_pending());
+                        if client.cache_stats().unwrap().fills == 1 { Poll::Ready(()) } else { Poll::Pending }
+                    }).await;
+                    assert_eq!(snapshots.get(), 0, "completed pages remain private during the publication yield");
+                    client.clear().unwrap();
+                }
                 if matches!(case, WatchCase::Cancel | WatchCase::SessionClose | WatchCase::Drop) {
                     poll_fn(|task| {
                         assert!(watching.as_mut().poll(task).is_pending());
@@ -298,6 +311,11 @@ fn run_watch(case: WatchCase) {
                     WatchCase::Timeout | WatchCase::CallbackOverrun => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::TimedOut))))),
                     WatchCase::Cancel => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Core(ManagedCoreError::Cancelled))))),
                     WatchCase::Revoked => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked)))),
+                    WatchCase::ClearPublication => {
+                        assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::Invalidated))));
+                        assert_eq!(snapshots.get(), 0, "an externally invalidated candidate must never be published");
+                        assert_eq!(ids.get(), 2, "an external clear cannot trigger a hidden refetch");
+                    }
                     WatchCase::SessionClose => assert!(matches!(result,
                         Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked))
                         | Err(WatchError::Subscription(fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError::Session(OAuthSessionError::Closed)))
@@ -381,3 +399,5 @@ fn callback_revocation_prevents_further_watch_effects() { isolated_watch("callba
 fn overdue_acknowledgment_callback_cannot_start_a_catalog_fetch() { isolated_watch("overdue_acknowledgment_callback_cannot_start_a_catalog_fetch", WatchCase::CallbackOverrun); }
 #[test]
 fn closing_one_catalog_watch_does_not_flush_unrelated_catalogs() { isolated_watch("closing_one_catalog_watch_does_not_flush_unrelated_catalogs", WatchCase::ScopedCache); }
+#[test]
+fn external_clear_after_collection_prevents_snapshot_publication() { isolated_watch("external_clear_after_collection_prevents_snapshot_publication", WatchCase::ClearPublication); }
