@@ -1,10 +1,12 @@
 //! Explicit preregistered machine-to-machine OAuth (AUTHX-02).
 //!
-//! Supports explicitly selected RFC 6749 `client_secret_basic` and native
-//! external-signer `private_key_jwt`. No secret-post, dynamic registration,
-//! browser login, authentication fallback, or persistent custody is installed.
-//! The Basic branch follows the pinned Basic metadata/conformance case rather
-//! than the incompatible secret-body example.
+//! Supports explicitly selected RFC 6749 `client_secret_basic`,
+//! `client_secret_post`, and native external-signer `private_key_jwt`.
+//! Basic remains the default. Body-based secrets require an explicit host
+//! selection AND an exact `client_secret_post` metadata advertisement; the
+//! pinned draft's Basic metadata is never treated as permission for its
+//! incompatible secret-body example. No authentication fallback, dynamic
+//! registration, browser login or persistent custody is installed.
 //!
 //! Trusted resource/issuer discovery is shared with the native OAuth path.
 //! Every protected operation additionally verifies the official extension by
@@ -60,11 +62,25 @@ use crate::sse::SseLimits;
 pub const CLIENT_CREDENTIALS_EXTENSION: &str = "io.modelcontextprotocol/oauth-client-credentials";
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 const MAX_SECRET_BYTES: usize = 4096;
+const MAX_SECRET_GRANT_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ACQUISITIONS: usize = 64;
 
+/// A host-selected client-password method, fixed before issuer discovery.
+/// Both use HTTPS, but their wire encodings and metadata identities differ.
+/// RFC 6749 recommends Basic over body credentials; select Post only for an
+/// issuer/registration requiring it. Peer metadata never chooses this value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientSecretAuthenticationMethod {
+    /// Form-encode each credential component, then send HTTP Basic only.
+    Basic,
+    /// Form-encode client_id/client_secret into the POST body, with no
+    /// Authorization header. Credentials never enter a URI or discovery GET.
+    Post,
+}
+
 /// Fixed diagnostics never retain credentials, issuer bodies, request data,
-/// or transport errors that could reflect an Authorization header.
+/// or transport errors that could reflect an Authorization header or body.
 #[derive(Debug)]
 pub enum ClientCredentialsError {
     InvalidPolicy,
@@ -122,6 +138,7 @@ struct ClientSecret(String);
 #[derive(Clone)]
 enum MachineAuthentication {
     Basic(Arc<ClientSecret>),
+    Post(Arc<ClientSecret>),
     #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
     PrivateKeyJwt(Arc<private_key_jwt::PrivateKeyJwtAuthentication>),
 }
@@ -138,6 +155,7 @@ impl MachineAuthentication {
     fn method(&self) -> &'static str {
         match self {
             Self::Basic(_) => "client_secret_basic",
+            Self::Post(_) => "client_secret_post",
             #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(_) => "private_key_jwt",
         }
@@ -145,7 +163,7 @@ impl MachineAuthentication {
 
     fn check(&self) -> Result<(), ClientCredentialsError> {
         match self {
-            Self::Basic(_) => Ok(()),
+            Self::Basic(_) | Self::Post(_) => Ok(()),
             #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => authentication.check(),
         }
@@ -153,7 +171,7 @@ impl MachineAuthentication {
 
     fn token_expiry_limit(&self) -> Option<Instant> {
         match self {
-            Self::Basic(_) => None,
+            Self::Basic(_) | Self::Post(_) => None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => Some(authentication.valid_until()),
         }
@@ -166,12 +184,12 @@ impl MachineAuthentication {
         self.check()?;
         check_context(cx, deadline)?;
         match self {
-            Self::Basic(secret) => Ok(PreparedMachineGrant {
-                body: form(&[("grant_type", "client_credentials"), ("resource", resource.as_str()),
-                    ("scope", &scopes.join(" "))]).into_bytes(),
-                authorization: Some(basic(client_id, &secret.0)?),
-                deadline,
-            }),
+            Self::Basic(secret) => prepare_secret_grant(
+                ClientSecretAuthenticationMethod::Basic, client_id, &secret.0, resource, scopes, deadline,
+            ),
+            Self::Post(secret) => prepare_secret_grant(
+                ClientSecretAuthenticationMethod::Post, client_id, &secret.0, resource, scopes, deadline,
+            ),
             #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
             Self::PrivateKeyJwt(authentication) => {
                 authentication.prepare(cx, deadline, client_id, resource, scopes).await
@@ -180,10 +198,39 @@ impl MachineAuthentication {
     }
 }
 
+fn prepare_secret_grant(
+    method: ClientSecretAuthenticationMethod, client_id: &str, secret: &str,
+    resource: &CanonicalHttpUrl, scopes: &[String], deadline: Time,
+) -> Result<PreparedMachineGrant, ClientCredentialsError> {
+    let scope = scopes.join(" ");
+    let mut fields = vec![
+        ("grant_type", "client_credentials"),
+        ("resource", resource.as_str()),
+        ("scope", scope.as_str()),
+    ];
+    let authorization = match method {
+        ClientSecretAuthenticationMethod::Basic => Some(basic(client_id, secret)?),
+        ClientSecretAuthenticationMethod::Post => {
+            // Encode raw values once. Encoding components here and then again
+            // in form() would change literal '+', '%' and Unicode credentials.
+            // RFC 6749 forbids using two client-authentication methods together.
+            fields.push(("client_id", client_id));
+            fields.push(("client_secret", secret));
+            None
+        }
+    };
+    let body = form(&fields).into_bytes();
+    if body.len() > MAX_SECRET_GRANT_BYTES {
+        return Err(ClientCredentialsError::RequestTooLarge);
+    }
+    Ok(PreparedMachineGrant { body, authorization, deadline })
+}
+
 /// Administrator-selected resource, ONE issuer-bound registration and method.
 /// Extra token-endpoint origins and issuer roots are explicit host grants.
 /// Metadata cannot move the registration to a different issuer. `new` selects
-/// Basic; `private_key_jwt` selects an external signer without acquiring a secret.
+/// Basic; `with_secret_authentication` explicitly selects Post before discovery.
+/// `private_key_jwt` selects an external signer without acquiring a secret.
 pub struct ClientCredentialsPlan {
     discovery: OAuthDiscoveryPlan,
     authentication: MachineAuthentication,
@@ -208,6 +255,26 @@ impl ClientCredentialsPlan {
             maximum_lifetime: Duration::from_secs(3600),
             leeway: Duration::from_secs(30),
         })
+    }
+
+    /// Selects the exact password method before discovery and token acquisition.
+    /// No method can change on an already-discovered ClientCredentialsClient.
+    /// Selecting Post never accepts Basic-only metadata, and selecting Basic
+    /// never falls back to Post after an authentication failure or redirect.
+    /// A JWT registration cannot be converted into a password registration.
+    pub fn with_secret_authentication(
+        mut self, method: ClientSecretAuthenticationMethod,
+    ) -> Result<Self, ClientCredentialsError> {
+        let secret = match self.authentication {
+            MachineAuthentication::Basic(secret) | MachineAuthentication::Post(secret) => secret,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
+            MachineAuthentication::PrivateKeyJwt(_) => return Err(ClientCredentialsError::InvalidPolicy),
+        };
+        self.authentication = match method {
+            ClientSecretAuthenticationMethod::Basic => MachineAuthentication::Basic(secret),
+            ClientSecretAuthenticationMethod::Post => MachineAuthentication::Post(secret),
+        };
+        Ok(self)
     }
 
     /// Bounds each explicit discovery/acquisition/operation, including queued
@@ -850,5 +917,103 @@ mod tests {
         assert!(result.encode().unwrap().contains("1.20e+4"));
         assert!(decoded_result(&core(),&RequestId::Number(8),wire,4096).is_err());
         assert!(decoded_result(&core(),&RequestId::Number(7),wire,20).is_err());
+    }
+
+    #[test]
+    fn post_selection_is_explicit_and_never_reinterprets_basic_metadata() {
+        let basic = plan();
+        let post = plan().with_secret_authentication(ClientSecretAuthenticationMethod::Post).unwrap();
+        assert_eq!(basic.authentication.method(), "client_secret_basic");
+        assert_eq!(post.authentication.method(), "client_secret_post");
+        for (methods, basic_ok, post_ok) in [
+            (json!(["client_secret_basic"]), true, false),
+            (json!(["client_secret_post"]), false, true),
+            (json!(["private_key_jwt", "client_secret_post", "client_secret_basic"]), true, true),
+            (json!(["private_key_jwt"]), false, false),
+            (json!(["client_secret_post "]), false, false),
+        ] {
+            let mut document = issuer();
+            document["token_endpoint_auth_methods_supported"] = methods;
+            let bytes = serde_json::to_vec(&document).unwrap();
+            for (selected, expected) in [(&basic, basic_ok), (&post, post_ok)] {
+                assert_eq!(admit_machine_issuer(&selected.discovery, &selected.discovery.issuers[0],
+                    &bytes, &selected.authentication).is_ok(), expected);
+            }
+        }
+        assert_eq!(basic.authentication.method(), "client_secret_basic");
+        assert_eq!(post.authentication.method(), "client_secret_post");
+    }
+
+    #[test]
+    fn post_grant_uses_exactly_one_authentication_channel_and_one_encoding_pass() {
+        let resource = url("https://resource.example/mcp");
+        let deadline = Time::from_nanos(99);
+        let scopes = vec!["read".to_owned(), "write".to_owned()];
+        let post = prepare_secret_grant(ClientSecretAuthenticationMethod::Post,
+            "a:b +", "c/d=%é&scope=admin", &resource, &scopes, deadline).unwrap();
+        assert!(post.authorization.is_none());
+        assert_eq!(post.deadline, deadline);
+        assert_eq!(std::str::from_utf8(&post.body).unwrap(),
+            "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fmcp&scope=read+write&client_id=a%3Ab+%2B&client_secret=c%2Fd%3D%25%C3%A9%26scope%3Dadmin");
+        assert_eq!(post.body.iter().filter(|byte| **byte == b'&').count(), 4);
+        let basic = prepare_secret_grant(ClientSecretAuthenticationMethod::Basic,
+            "a:b +", "c/d=%é&scope=admin", &resource, &scopes, deadline).unwrap();
+        assert_eq!(basic.authorization, Some(super::basic("a:b +", "c/d=%é&scope=admin").unwrap()));
+        assert_eq!(std::str::from_utf8(&basic.body).unwrap(),
+            "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fmcp&scope=read+write");
+    }
+
+    #[test]
+    fn post_grant_omits_empty_scopes_and_enforces_the_encoded_body_bound() {
+        let resource = url("https://resource.example/mcp");
+        let deadline = Time::from_nanos(99);
+        let post = prepare_secret_grant(ClientSecretAuthenticationMethod::Post,
+            "service-client", "unit-secret", &resource, &[], deadline).unwrap();
+        assert_eq!(std::str::from_utf8(&post.body).unwrap(),
+            "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fmcp&client_id=service-client&client_secret=unit-secret");
+        let oversized = "%".repeat(MAX_SECRET_GRANT_BYTES);
+        assert!(matches!(prepare_secret_grant(ClientSecretAuthenticationMethod::Post,
+            "service-client", &oversized, &resource, &[], deadline), Err(ClientCredentialsError::RequestTooLarge)));
+    }
+
+    #[test]
+    fn switching_a_not_yet_discovered_secret_plan_preserves_its_authority_and_limits() {
+        let original = plan().with_timeout(Duration::from_secs(17)).unwrap()
+            .with_maximum_token_lifetime(Duration::from_secs(43)).unwrap();
+        let resource = original.discovery.resource.clone();
+        let scopes = original.discovery.scopes.clone();
+        let client_id = original.discovery.client_id.clone();
+        let post = original.with_secret_authentication(ClientSecretAuthenticationMethod::Post).unwrap();
+        assert_eq!(post.discovery.resource, resource);
+        assert_eq!(post.discovery.scopes, scopes);
+        assert_eq!(post.discovery.client_id, client_id);
+        assert_eq!(post.discovery.timeout, Duration::from_secs(17));
+        assert_eq!(post.maximum_lifetime, Duration::from_secs(43));
+        assert!(format!("{post:?}").contains("client_secret_post"));
+        assert!(!format!("{post:?}").contains("unit-secret"));
+        let basic = post.with_secret_authentication(ClientSecretAuthenticationMethod::Basic).unwrap();
+        assert_eq!(basic.authentication.method(), "client_secret_basic");
+    }
+
+    #[test]
+    fn post_metadata_keeps_issuer_scope_and_credential_destination_checks() {
+        let post = plan().with_secret_authentication(ClientSecretAuthenticationMethod::Post).unwrap();
+        let mut document = issuer();
+        document["token_endpoint_auth_methods_supported"] = json!(["client_secret_post"]);
+        let valid = document.clone();
+        for (key, value) in [
+            ("issuer", json!("https://issuer.example/other")),
+            ("token_endpoint", json!("http://issuer.example/token")),
+            ("token_endpoint", json!("https://other.example/token")),
+            ("scopes_supported", json!(["admin"])),
+            ("token_endpoint_auth_methods_supported", Value::Null),
+        ] {
+            document = valid.clone();
+            document[key] = value;
+            assert!(admit_machine_issuer(&post.discovery, &post.discovery.issuers[0],
+                &serde_json::to_vec(&document).unwrap(), &post.authentication).is_err());
+        }
+        assert!(admit_machine_issuer(&post.discovery, &post.discovery.issuers[0],
+            &serde_json::to_vec(&valid).unwrap(), &post.authentication).is_ok());
     }
 }
