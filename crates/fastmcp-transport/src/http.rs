@@ -1777,7 +1777,37 @@ impl GuardedHttpFetcher {
     }
 }
 
-fn guarded_admit_native_response(
+/// Admit one already-received HTTP response head and body, applying the whole
+/// guarded response policy: header/body bounds, content-coding enforcement, and
+/// **redirect interception**.
+///
+/// # Why this is public
+///
+/// FND-05 requires redirect interception to be proven from OUTSIDE this crate.
+/// A `#[cfg(test)]` proof cannot do that (PL-3): `cfg(test)` is set only when
+/// compiling this crate's own lib-test harness, so no integration test and no
+/// downstream consumer can reach it. This function is therefore shipped.
+///
+/// # The fence, stated as a mechanism rather than a convention
+///
+/// This function is **pure**. It takes a status, headers, a body and the
+/// provenance of a fetch that already happened, and returns typed data. It
+/// holds no socket, resolver, connector or policy; it cannot perform DNS, open
+/// a connection, or reach any address. Promoting it therefore grants a caller
+/// **zero networking capability** — there is no fence here to bypass, because
+/// every destination and TLS fence lives strictly upstream and has already run
+/// by the time these bytes exist. Contrast the two seams that remain test-only:
+/// `test_exchange` substitutes the wire itself and `test_loopback_authority`
+/// admits a non-public peer, and both of those DO defeat an upstream fence.
+///
+/// # What it does and does not establish about redirects
+///
+/// `provenance` is passed through unchanged, so a redirect is reported as data
+/// and never becomes the origin of the response — that is redirect-origin
+/// interception, and it is observable here. It does NOT establish that
+/// `fetch` declines to open a follow-up connection; that is a property of the
+/// caller of this function, not of this function.
+pub fn guarded_admit_native_response(
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
