@@ -2642,6 +2642,67 @@ fn split_point_golden() -> Vec<String> {
     .collect()
 }
 
+/// Builds the SSE terminal used by the NUL pair, splicing `raw_text` into the
+/// result's text field as RAW BYTES rather than serializing it.
+///
+/// `serde_json` escapes a control character into an escape sequence, which is
+/// perfectly legal JSON and would prove nothing. Splicing puts the byte on the
+/// wire unescaped, which is the thing under test.
+fn terminal_with_raw_text(raw_text: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":""#,
+    );
+    body.extend_from_slice(raw_text);
+    body.extend_from_slice(br#""}],"isError":false}}"#);
+    body
+}
+
+/// Runs one final core listener over an SSE stream carrying `body` verbatim and
+/// returns the first outcome the caller observes.
+async fn listen_to_sse_body(
+    cx: &Cx,
+    body: Vec<u8>,
+) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
+    let peer = Peer::bind().await;
+    let connection = connect(cx, &peer).await;
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, &body).await;
+            end_sse_stream(&mut io).await;
+        },
+        async {
+            let mut listener = connection
+                .open_final_core_listener(
+                    cx,
+                    "tools/call",
+                    tool_call_params("admission_tool"),
+                    RequestId::Number(2),
+                    limits(),
+                )
+                .await
+                .expect("the request must reach the peer");
+            listener.next_event(cx).await
+        },
+    )
+    .await;
+    // Admitted or refused, the client answers nothing on the wire.
+    peer.assert_no_further_connection();
+    outcome
+}
+
+/// Wraps `payload` as the single dispatched event of one SSE body.
+fn sse_event_carrying(payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(payload);
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
 async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -2724,6 +2785,35 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
             "a chunk boundary at byte {split} changed the dispatched events"
         );
     }
+    // -----------------------------------------------------------------------
+    // A NUL octet is VALID UTF-8 (U+0000), not a malformed sequence.
+    //
+    // The decoder must pass it through untouched. Proving that split matters:
+    // if the decoder replaced NUL, the planted negative below would still fail
+    // - but for the wrong reason, and the suite would be asserting a defect.
+    // -----------------------------------------------------------------------
+    let mut nul_value = Vec::new();
+    nul_value.extend_from_slice(b"pre");
+    nul_value.push(0x00);
+    nul_value.extend_from_slice(b"post");
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(cx, &peer, sse_event_carrying(&nul_value), limits())
+        .await
+        .expect("a NUL octet is well-formed UTF-8 and must not refuse the stream");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].as_bytes(), nul_value.as_slice());
+    assert!(
+        !payloads[0].contains('\u{FFFD}'),
+        "NUL is well-formed UTF-8 and must never be replacement-decoded"
+    );
+
+    // Admission control for the NUL negative: the same terminal, spliced the
+    // same way, carrying ordinary text.
+    let event = listen_to_sse_body(cx, sse_event_carrying(&terminal_with_raw_text(b"ok")))
+        .await
+        .expect("a spliced terminal with ordinary text must be admitted")
+        .expect("the terminal must arrive");
+    assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
 async fn negative_08_replacement_outside_json(cx: &Cx) {
@@ -2804,6 +2894,38 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
             "a chunk boundary at byte {split} changed the decode of the refused document"
         );
     }
+    // -----------------------------------------------------------------------
+    // The sole changed variable is ONE BYTE of the terminal's text value: the
+    // control's second character becomes a raw NUL.
+    //
+    // It decodes cleanly - the positive proves exactly that - so the decoder
+    // cannot be what refuses it. Only strict JSON admission can, and it must:
+    // an unescaped control character is not a legal byte inside a JSON string,
+    // and repairing it by escaping or dropping it would hand the caller a
+    // document the server never sent.
+    // -----------------------------------------------------------------------
+    let refusal = listen_to_sse_body(
+        cx,
+        sse_event_carrying(&terminal_with_raw_text(&[b'o', 0x00])),
+    )
+    .await
+    .err()
+    .expect("a raw NUL inside a JSON string must not be admitted");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpFinalCoreListenError::JsonRpcAdmission(_)
+                | ModernHttpFinalCoreListenError::NotificationAdmission(_)
+        ),
+        "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
+    );
+
+    // Unchanged state: the unmutated control text is admitted again afterwards.
+    let restored = listen_to_sse_body(cx, sse_event_carrying(&terminal_with_raw_text(b"ok")))
+        .await
+        .expect("the unmutated terminal must be admitted again")
+        .expect("the terminal must arrive");
+    assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3002,6 +3124,22 @@ async fn negative_09_uppercase_data_field(cx: &Cx) {
 // HTTP-03.10 — comments/empty-data/EOF and inert event/id/retry fields
 // ---------------------------------------------------------------------------
 
+/// The empty-data contrast bodies.
+///
+/// `leading_empty_data` is the single changed variable: one `data` line ahead
+/// of an otherwise byte-identical stream.
+fn blank_line_then_terminal(leading_empty_data: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    if leading_empty_data {
+        body.extend_from_slice(b"data\n");
+    }
+    body.extend_from_slice(b"\n");
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(&terminal_tool_result(2, "blank-no-data-ok"));
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
 async fn positive_10_comments_and_inert_fields(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -3135,6 +3273,17 @@ async fn positive_10_comments_and_inert_fields(cx: &Cx) {
         .expect("six mixed non-dispatching lines at a ceiling of six must be admitted"),
         vec!["mixed".to_owned()],
     );
+    // A blank line with NO data field produces no MCP message at all, so the
+    // terminal that follows it is still the first event the caller sees. This
+    // is the control for the empty-data negative, which adds exactly one line.
+    let event = listen_to_sse_body(cx, blank_line_then_terminal(false))
+        .await
+        .expect("a blank line with no data field must not refuse the stream")
+        .expect("the terminal must arrive");
+    assert!(
+        matches!(event, ModernHttpFinalCoreEvent::Terminal(_)),
+        "a blank no-data line dispatches nothing, so the terminal arrives first"
+    );
 }
 
 async fn negative_10_eof_without_blank_line(cx: &Cx) {
@@ -3250,6 +3399,34 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
             .expect("a dispatched event resets the consecutive budget"),
         vec!["alpha".to_owned(), "beta".to_owned()],
     );
+    // -----------------------------------------------------------------------
+    // The sole changed variable is ONE ADDED `data` LINE ahead of the identical
+    // blank line.
+    //
+    // An empty data field is not nothing. The blank line after it dispatches an
+    // EMPTY PAYLOAD, which must fail the MCP JSON decoder rather than be
+    // conflated with the no-data event of the control - and the terminal that
+    // follows must never be reached, because the empty event comes first.
+    // -----------------------------------------------------------------------
+    let refusal = listen_to_sse_body(cx, blank_line_then_terminal(true))
+        .await
+        .err()
+        .expect("an empty dispatched payload must fail JSON admission");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpFinalCoreListenError::JsonRpcAdmission(_)
+                | ModernHttpFinalCoreListenError::NotificationAdmission(_)
+        ),
+        "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
+    );
+
+    // Unchanged state: the control stream still delivers its terminal.
+    let restored = listen_to_sse_body(cx, blank_line_then_terminal(false))
+        .await
+        .expect("the control stream must be admitted again")
+        .expect("the terminal must arrive");
+    assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
 // ---------------------------------------------------------------------------
