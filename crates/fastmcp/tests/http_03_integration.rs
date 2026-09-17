@@ -699,6 +699,7 @@ fn normalize_lane(address: SocketAddr, value: String) -> String {
 #[derive(Debug, Clone)]
 struct LaneObservation {
     outcome: String,
+    followup_outcome: String,
     requests_during_call: usize,
     connections_after_return: usize,
     server_held_connection_open: bool,
@@ -721,6 +722,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
     let target = format!("http://{address}/mcp-lane");
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let (report_tx, report_rx) = mpsc::channel::<(usize, usize, bool)>();
+    let (drained_tx, drained_rx) = mpsc::channel::<usize>();
 
     let server = thread::spawn(move || {
         let mut requests = 0_usize;
@@ -753,8 +755,12 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
             false
         };
 
-        // 3. Drain the accept backlog. Any retry is already queued (see
-        //    `LaneObservation`), so this is a drain, not a poll.
+        // 3. Drain the accept backlog BEFORE anything else reaches this
+        //    listener. Any retry the client made is already queued, so this is a
+        //    drain, not a poll - and it must complete before the deliberate
+        //    follow-up below, or a caller-initiated request would be miscounted
+        //    as a client-initiated retry. That ordering is the whole reason the
+        //    count is published on its own channel first.
         listener
             .set_nonblocking(true)
             .expect("set the lane listener nonblocking for the backlog drain");
@@ -763,6 +769,25 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
             extra += 1;
             drop(stream);
         }
+        drained_tx.send(extra).expect("publish the retry count");
+
+        // 4. Serve one deliberate follow-up so the caller can establish that the
+        //    refusal left the connection usable rather than poisoned.
+        listener
+            .set_nonblocking(false)
+            .expect("restore blocking accept for the follow-up");
+        let mut followup = accept_bounded(&listener);
+        let _followup_request = read_request(&mut followup);
+        requests += 1;
+        write_bounded_response(
+            &mut followup,
+            200,
+            "application/json",
+            Some("identity"),
+            &ping_body(43),
+        );
+        drop(followup);
+
         report_tx
             .send((requests, extra, held))
             .expect("report lane observations");
@@ -789,7 +814,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
             .await
             .expect("the lane endpoint must connect through the public builder");
 
-        match connection
+        let first = match connection
             .request_json(
                 &cx,
                 "ping",
@@ -801,17 +826,45 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
         {
             Ok(response) => format!("unexpected-success id={:?}", response.id),
             Err(error) => render_connection_error(&error),
-        }
-    });
-    let outcome = normalize_lane(address, outcome);
+        };
 
-    release_tx.send(()).expect("release the lane fixture");
+        // Side four of the boundary shape: a refusal must leave the connection
+        // USABLE, not poisoned. Ordering matters - the fixture publishes its
+        // retry count before serving this, so a deliberate follow-up can never
+        // be miscounted as a client-initiated retry.
+        release_tx
+            .send(())
+            .expect("tell the lane fixture the call returned");
+        let drained = drained_rx
+            .recv()
+            .expect("the lane fixture publishes its retry count before the follow-up");
+
+        let followup = match connection
+            .request_json(
+                &cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(43),
+                65_536,
+            )
+            .await
+        {
+            Ok(response) => format!("followup-ok id={:?}", response.id),
+            Err(error) => format!("followup-refused::{}", render_connection_error(&error)),
+        };
+        (first, followup, drained)
+    });
+    let (outcome, followup_outcome, _drained) = outcome;
+    let outcome = normalize_lane(address, outcome);
+    let followup_outcome = normalize_lane(address, followup_outcome);
+
     let (requests_during_call, connections_after_return, server_held_connection_open) =
         report_rx.recv().expect("collect lane observations");
     server.join().expect("the lane fixture thread must not panic");
 
     LaneObservation {
         outcome,
+        followup_outcome,
         requests_during_call,
         connections_after_return,
         server_held_connection_open,
@@ -2979,10 +3032,23 @@ fn case_deadline_and_disconnect_races(builder: &mut CaseBuilder, wire: &WireObse
     builder.negative("idle-deadline-armed", &lane.outcome);
 
     assert_eq!(
-        lane.requests_during_call, 1,
-        "the deadline lane must post exactly once"
+        lane.requests_during_call, 2,
+        "the deadline lane posts twice on purpose: the refused call, then one deliberate \
+         follow-up establishing that the refusal did not poison the connection"
     );
-    builder.positive("deadline-requests", "1");
+    builder.positive("deadline-requests", "2 (refused + deliberate follow-up)");
+
+    // Side four of the boundary shape: a refusal must leave the connection
+    // USABLE. Without it, "it refused" is indistinguishable from "it refused and
+    // broke everything after it", and only the first is the contract. The
+    // fixture publishes its retry count before serving this, so a deliberate
+    // follow-up can never be miscounted as a client-initiated retry.
+    assert!(
+        lane.followup_outcome.starts_with("followup-ok"),
+        "a timed-out request must leave the connection usable; the follow-up observed {}",
+        lane.followup_outcome
+    );
+    builder.positive("deadline-refusal-is-recoverable", &lane.followup_outcome);
 
     assert_eq!(
         lane.connections_after_return, 0,
@@ -3002,10 +3068,23 @@ fn case_deadline_and_disconnect_races(builder: &mut CaseBuilder, wire: &WireObse
 fn case_uncertain_dispatch_no_retry(builder: &mut CaseBuilder, wire: &WireObservations) {
     let lane = &wire.uncertain_dispatch;
     assert_eq!(
-        lane.requests_during_call, 1,
-        "the uncertain-dispatch lane must post exactly once before the peer vanishes"
+        lane.requests_during_call, 2,
+        "the uncertain lane posts twice on purpose: the refused call, then one deliberate \
+         follow-up establishing that the refusal did not poison the connection"
     );
-    builder.positive("uncertain-requests", "1");
+    builder.positive("uncertain-requests", "2 (refused + deliberate follow-up)");
+
+    // Side four of the boundary shape: a refusal must leave the connection
+    // USABLE. Without it, "it refused" is indistinguishable from "it refused and
+    // broke everything after it", and only the first is the contract. The
+    // fixture publishes its retry count before serving this, so a deliberate
+    // follow-up can never be miscounted as a client-initiated retry.
+    assert!(
+        lane.followup_outcome.starts_with("followup-ok"),
+        "an uncertainly-dispatched request must leave the connection usable; the follow-up observed {}",
+        lane.followup_outcome
+    );
+    builder.positive("uncertain-refusal-is-recoverable", &lane.followup_outcome);
 
     assert!(
         !lane.outcome.starts_with("unexpected-success"),
