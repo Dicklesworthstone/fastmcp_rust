@@ -153,7 +153,7 @@ pub trait Transport {
     /// Close the transport gracefully.
     ///
     /// This flushes any pending data and releases resources.
-    fn close(&mut self) -> Result<(), TransportError>;
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError>;
 }
 
 /// Independently owned receive half of a full-duplex MCP transport.
@@ -166,7 +166,7 @@ pub trait TransportRecvHalf {
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError>;
 
     /// Closes the receive half.
-    fn close(&mut self) -> Result<(), TransportError>;
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError>;
 }
 
 /// One decoded inbound message paired with its exact transport source.
@@ -242,7 +242,7 @@ pub trait TransportSendHalf: Send {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError>;
 
     /// Closes the send half.
-    fn close(&mut self) -> Result<(), TransportError>;
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError>;
 }
 
 /// Transport error types.
@@ -514,7 +514,7 @@ mod tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.closed = true;
             Ok(())
         }
@@ -549,7 +549,7 @@ mod tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.terminal = true;
             Ok(())
         }

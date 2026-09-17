@@ -7542,7 +7542,7 @@ impl TransportRecvHalf for WebSocketBridgeRecv {
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.receiver.close();
         Ok(())
     }
@@ -7578,7 +7578,7 @@ impl TransportSendHalf for WebSocketBridgeSend {
         })
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -21339,7 +21339,7 @@ impl<R: TransportRecvHalf> SharedRecvHalf<R> {
             .recv(cx)
     }
 
-    fn close(&self) -> Result<(), TransportError> {
+    fn close(&self, cx: &Cx) -> Result<(), TransportError> {
         self.inner
             .lock()
             .map_err(|_| transport_lock_error())?
@@ -21373,7 +21373,7 @@ impl<S: TransportSendHalf> SharedSendHalf<S> {
             .send(cx, message)
     }
 
-    fn close(&self) -> Result<(), TransportError> {
+    fn close(&self, cx: &Cx) -> Result<(), TransportError> {
         self.inner
             .lock()
             .map_err(|_| transport_lock_error())?
@@ -21421,7 +21421,7 @@ impl<T: Transport> SharedTransport<T> {
             })
     }
 
-    fn close(&self) -> Result<(), TransportError> {
+    fn close(&self, cx: &Cx) -> Result<(), TransportError> {
         let transport = {
             let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
             guard.take()
@@ -32987,7 +32987,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -32999,7 +32999,7 @@ mod lib_unit_tests {
             Ok(())
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33030,7 +33030,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33604,7 +33604,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33619,7 +33619,7 @@ mod lib_unit_tests {
             Ok(())
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33736,7 +33736,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33822,7 +33822,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33913,7 +33913,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -33934,7 +33934,7 @@ mod lib_unit_tests {
                 .map_err(|_| TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -34466,7 +34466,7 @@ mod lib_unit_tests {
             Err(TransportError::Timeout)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -34649,7 +34649,7 @@ mod lib_unit_tests {
                 }
             }
 
-            fn close(&mut self) -> Result<(), TransportError> {
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
                 Ok(())
             }
         }
@@ -34887,7 +34887,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -34905,7 +34905,7 @@ mod lib_unit_tests {
             Ok(())
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -35257,7 +35257,7 @@ mod lib_unit_tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -35435,7 +35435,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.close_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_close {
                 Err(TransportError::Io(std::io::Error::new(
@@ -35459,7 +35459,7 @@ mod lib_unit_tests {
             Err(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.close_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_close {
                 Err(TransportError::Io(std::io::Error::other(
@@ -35485,7 +35485,7 @@ mod lib_unit_tests {
             self.next.take().ok_or(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -35504,7 +35504,7 @@ mod lib_unit_tests {
             self.inbound.pop_front().ok_or(TransportError::Closed)
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -45628,7 +45628,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -45755,7 +45755,7 @@ mod lib_unit_tests {
             }
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -45781,7 +45781,7 @@ mod lib_unit_tests {
             Ok(())
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             Ok(())
         }
     }
@@ -46071,7 +46071,7 @@ mod lib_unit_tests {
                 }
             }
 
-            fn close(&mut self) -> Result<(), TransportError> {
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
                 self.probe.receive_closes.fetch_add(1, Ordering::AcqRel);
                 Ok(())
             }
@@ -46105,7 +46105,7 @@ mod lib_unit_tests {
                 Ok(())
             }
 
-            fn close(&mut self) -> Result<(), TransportError> {
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
                 self.probe.send_closes.fetch_add(1, Ordering::AcqRel);
                 Ok(())
             }
@@ -47486,7 +47486,7 @@ mod lib_unit_tests {
                 }
             }
 
-            fn close(&mut self) -> Result<(), TransportError> {
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
                 self.close_calls.fetch_add(1, Ordering::AcqRel);
                 if !self.control.has_finished() {
                     self.closed_before_drain.store(true, Ordering::Release);

@@ -913,7 +913,7 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
         self.recv_with_completion(cx).map(|(message, _)| message)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             drop(self.writer.take());
             return Ok(());
@@ -993,7 +993,7 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
         result
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.terminal.store(true, Ordering::Release);
         self.partial_frame_deadline = None;
         self.transport.close()
@@ -1314,7 +1314,7 @@ impl<W: Write + Send> TransportSendHalf for StdioSendHalf<W> {
         self.reserve_send(cx)?.send(message)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.is_closed() {
             self.mark_closed();
             drop(self.writer.take());
@@ -1540,7 +1540,7 @@ impl Transport for AsyncStdioTransport {
         Ok(message)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }

@@ -144,7 +144,7 @@ impl Transport for ScriptedTransport {
             .ok_or(TransportError::Closed)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.state
             .lock()
             .expect("scripted transport mutex must not be poisoned")
@@ -237,7 +237,7 @@ impl TransportRecvHalf for ScriptedRecvHalf {
             .ok_or(TransportError::Closed)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.state
             .lock()
             .expect("scripted transport mutex must not be poisoned")
@@ -256,7 +256,7 @@ impl TransportSendHalf for ScriptedSendHalf {
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -658,7 +658,7 @@ impl TransportRecvHalf for WireRecv {
         read_wire(&mut self.0)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.0.get_ref().shutdown(Shutdown::Read)?;
         Ok(())
     }
@@ -693,7 +693,7 @@ impl TransportSendHalf for WireSend {
         result
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.0.shutdown(Shutdown::Write)?;
         Ok(())
     }
@@ -1377,7 +1377,7 @@ mod post_receive_failure {
             result
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.1.receive_closes.fetch_add(1, Ordering::Release);
             self.0.close()
         }
@@ -1422,7 +1422,7 @@ mod post_receive_failure {
             result
         }
 
-        fn close(&mut self) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.control.send_closes.fetch_add(1, Ordering::Release);
             self.stream.shutdown(Shutdown::Write)?;
             Ok(())

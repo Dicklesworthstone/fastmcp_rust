@@ -776,7 +776,7 @@ impl<W: Write> SseWriter<W> {
     }
 
     /// Closes the writer terminally, flushing any buffered output once.
-    pub fn close(&mut self) -> Result<(), TransportError> {
+    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
@@ -1322,7 +1322,7 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         Ok(())
     }
@@ -1371,7 +1371,7 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for LegacySseServer
         self.inner.recv(cx)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.inner.close()
     }
 }
@@ -1514,7 +1514,7 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         // SSE connections don't have a close frame; flush once and let the
         // connection drop. SseWriter makes this idempotent and terminal.
@@ -1552,7 +1552,7 @@ impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         Ok(())
     }
@@ -1589,7 +1589,7 @@ impl<W: Write + Send> TransportSendHalf for SseServerSendHalf<W> {
         self.writer.write_message(cx, message)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.writer.close()
     }
@@ -1733,7 +1733,7 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
