@@ -24,15 +24,18 @@ use fastmcp_xtask::plan_tracker::{
 
 fn usage() -> String {
     "usage: cargo xtask plan-tracker-check <all|snapshot|preclaim <issue-id>|preclose <issue-id>> \
-     [--reservations-json <path|->]"
+     [--reservations-json <path|->] [--declaration-json <path|->]"
         .to_owned()
 }
 
-/// Read the reservation snapshot from a path, or from stdin for `-`.
+/// Read a reservation input from a path, or from stdin for `-`.
+///
+/// Serves BOTH `--reservations-json` and `--declaration-json`; named for what
+/// it does rather than for the first caller that needed it.
 ///
 /// One parser serves both routes, so a snapshot cannot mean one thing through
 /// a file and another through a pipe.
-fn read_snapshot(source: &str) -> Result<String, String> {
+fn read_source(source: &str) -> Result<String, String> {
     if source == "-" {
         let mut buffer = String::new();
         std::io::stdin()
@@ -74,6 +77,20 @@ fn main() -> ExitCode {
         .and_then(|index| argv.get(index + 1))
         .cloned();
 
+    let declaration_source = argv
+        .iter()
+        .position(|argument| argument == "--declaration-json")
+        .and_then(|index| argv.get(index + 1))
+        .cloned();
+
+    // Both routes may read stdin, and stdin can only be consumed once. Two
+    // `-` arguments would silently give the second reader an empty string,
+    // which parses as a schema error and reads like a malformed file.
+    if snapshot_source.as_deref() == Some("-") && declaration_source.as_deref() == Some("-") {
+        eprintln!("--reservations-json and --declaration-json cannot both read stdin");
+        return ExitCode::FAILURE;
+    }
+
     let start = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let Some(root) = plan_tracker::find_root(&start) else {
         eprintln!(
@@ -91,8 +108,24 @@ fn main() -> ExitCode {
             .unwrap_or_default(),
         ..ReservationInputs::default()
     };
+    if let Some(source) = &declaration_source {
+        let text = match read_source(source) {
+            Ok(text) => text,
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match reservations::parse_declaration(&text, source) {
+            Ok(declaration) => inputs.declaration = Some(declaration),
+            Err(diagnostic) => {
+                eprintln!("{}", diagnostic.render());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     if let Some(source) = &snapshot_source {
-        let text = match read_snapshot(source) {
+        let text = match read_source(source) {
             Ok(text) => text,
             Err(message) => {
                 eprintln!("{message}");

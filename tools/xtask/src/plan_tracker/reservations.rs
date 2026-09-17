@@ -61,13 +61,43 @@ pub struct ReservationSnapshot {
 pub const SNAPSHOT_SCHEMA: &str = "fnd-02-reservation-snapshot-v1";
 
 /// What the issue declared it would reserve, before acquisition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Declaration {
+    pub schema: String,
     pub project_key: String,
     pub agent_name: String,
     pub issue_id: String,
     /// Exact narrow paths. No whole-crate or repository glob.
     pub paths: Vec<String>,
+}
+
+pub const DECLARATION_SCHEMA: &str = "fnd-02-reservation-declaration-v1";
+
+/// Parse a declaration from TOML bytes.
+///
+/// Mirrors [`parse_snapshot`] deliberately, schema guard included. A
+/// declaration and a snapshot share `project_key` and `agent_name`, so
+/// without the guard a file of the wrong kind that happened to satisfy the
+/// remaining fields would be accepted as the other — and the reservation
+/// subcases would then render a verdict over an input nobody meant to supply.
+/// One parser serves both the `--declaration-json <path>` and `-` stdin
+/// routes, so parity between them is structural rather than asserted.
+pub fn parse_declaration(text: &str, subject: &str) -> Result<Declaration, Diagnostic> {
+    let declaration: Declaration = toml::from_str(text).map_err(|error| {
+        Diagnostic::new(Code::SchemaInvalid, subject, "toml", error.to_string())
+    })?;
+    if declaration.schema != DECLARATION_SCHEMA {
+        return Err(Diagnostic::new(
+            Code::SchemaInvalid,
+            subject,
+            "schema",
+            format!(
+                "expected {DECLARATION_SCHEMA}, observed {}",
+                declaration.schema
+            ),
+        ));
+    }
+    Ok(declaration)
 }
 
 /// Parse a snapshot from TOML bytes.
@@ -332,11 +362,37 @@ mod tests {
 
     fn declaration() -> Declaration {
         Declaration {
+            schema: DECLARATION_SCHEMA.to_owned(),
             project_key: "/repo".to_owned(),
             agent_name: "MagentaOsprey".to_owned(),
             issue_id: "bd-x".to_owned(),
             paths: vec!["tools/xtask/**".to_owned()],
         }
+    }
+
+    #[test]
+    fn a_declaration_parses_and_carries_its_paths() {
+        let text = format!(
+            "schema = \"{DECLARATION_SCHEMA}\"\nproject_key = \"/repo\"\n\
+             agent_name = \"MagentaOsprey\"\nissue_id = \"bd-x\"\n\
+             paths = [\"tools/xtask/**\"]\n"
+        );
+        let parsed = parse_declaration(&text, "decl").expect("a conformant declaration parses");
+        assert_eq!(parsed.issue_id, "bd-x");
+        assert_eq!(parsed.paths, ["tools/xtask/**".to_owned()]);
+    }
+
+    /// The schema guard is the reason a wrong-kind file cannot be accepted.
+    /// Differs from the positive in exactly one token: the schema value.
+    #[test]
+    fn a_declaration_with_the_wrong_schema_is_refused() {
+        let text = format!(
+            "schema = \"{SNAPSHOT_SCHEMA}\"\nproject_key = \"/repo\"\n\
+             agent_name = \"MagentaOsprey\"\nissue_id = \"bd-x\"\n\
+             paths = [\"tools/xtask/**\"]\n"
+        );
+        let error = parse_declaration(&text, "decl").expect_err("the wrong schema must be refused");
+        assert_eq!(error.code, Code::SchemaInvalid);
     }
 
     fn lease() -> Lease {

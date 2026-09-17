@@ -19,7 +19,9 @@ use fastmcp_xtask::plan_tracker::{
     fingerprint,
     manifest::Outcome,
     plan::{self, Limits},
-    reservations::{Declaration, Lease, Renewal, ReservationSnapshot, SNAPSHOT_SCHEMA},
+    reservations::{
+        DECLARATION_SCHEMA, Declaration, Lease, Renewal, ReservationSnapshot, SNAPSHOT_SCHEMA,
+    },
 };
 
 fn repo_root() -> PathBuf {
@@ -91,6 +93,7 @@ const CLAIMED_AT: i64 = NOW - 3_600;
 
 fn declaration() -> Declaration {
     Declaration {
+        schema: DECLARATION_SCHEMA.to_owned(),
         project_key: "/repo".to_owned(),
         agent_name: "MagentaOsprey".to_owned(),
         issue_id: "bd-mcp-fnd-02-b-3srw".to_owned(),

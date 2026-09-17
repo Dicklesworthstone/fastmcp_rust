@@ -17,7 +17,9 @@ use fastmcp_xtask::plan_tracker::{
     diagnostics::Code,
     integration::{self, I_CONSUMER, I_SUBCASES, ManifestInput},
     manifest::Outcome,
-    reservations::{Declaration, Lease, Renewal, ReservationSnapshot, SNAPSHOT_SCHEMA},
+    reservations::{
+        DECLARATION_SCHEMA, Declaration, Lease, Renewal, ReservationSnapshot, SNAPSHOT_SCHEMA,
+    },
 };
 
 fn repo_root() -> PathBuf {
@@ -155,6 +157,7 @@ impl Drop for Fixture {
 fn reservation_inputs() -> ReservationInputs {
     ReservationInputs {
         declaration: Some(Declaration {
+            schema: DECLARATION_SCHEMA.to_owned(),
             project_key: "/repo".to_owned(),
             agent_name: "MagentaOsprey".to_owned(),
             issue_id: "bd-mcp-fnd-02-integration-8s4k".to_owned(),
