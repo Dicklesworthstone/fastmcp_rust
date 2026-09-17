@@ -197,6 +197,75 @@ excluded_exact_directories = ["evidence/fnd-01/integration", ".fnd01-run", ".git
 excluded_tracker_and_cache_state = true
 wildcard_exclusions_allowed = false
 
+# ---------------------------------------------------------------------------
+# SUPERSEDED BASELINE v1 — permanent provenance. Do not delete.
+#
+# On 2026-09-17 the six [[closed_child_binding]] rows below were re-authored at
+# the revision each owning child bead actually closed. This record preserves
+# what they were, why they were void, and how the replacements were derived, so
+# the act stays auditable from the repository alone. Nothing was silently
+# replaced.
+#
+# WHY THE PRIOR VALUES WERE VOID
+#   They were authored 2026-07-30T15:30:33-04:00, in the same commit batch
+#   (3d1d9a55) as the source files they bind. closed_child_handoff_contract
+#   declares these rows a handoff of implementation outputs owned by COMPLETED
+#   child beads, but at that instant NONE of the four owner children had
+#   closed: .1.11 closed 2026-08-03 (+4d), .1.9 and .1.8 closed 2026-08-22
+#   (+23d), .1.10 closed 2026-09-01 (+33d). The rows therefore froze
+#   work-in-progress bytes and labelled them a completed-child handoff. There
+#   was no revision at which they were any child's handoff, so the drift they
+#   reported could never be discharged. The prior registry was internally
+#   intact and untampered — it reproduced its own registry_sha256 exactly — so
+#   this was an authoring defect, never a tampering.
+#
+# DERIVATION METHOD (mechanical, re-runnable, no hand-entered values)
+#   closed_at   = owning bead's closed_at from the tracker
+#   closure_rev = last commit touching <path> with author time <= closed_at
+#   bytes       = git cat-file blob <closure_rev>:<path>
+#   byte_length = len(bytes);  sha256 = sha256(bytes)
+#   registry_sha256 recomputed over the new rows with the unchanged
+#   FND01CHILDv1 encoding declared below.
+#   Shipped code performs this same read: CLOSURE_REVISIONS and
+#   blob_at_revision() in crates/fastmcp/tests/fnd_01_a_evidence_binding.rs.
+#
+# AUTHORIZATION
+#   User-authorized 2026-09-17 via orchestrator WildMountain, for these SIX
+#   closed_child_binding rows on bead bd-mcp-2026-07-28-support-ahet.1.14 ONLY.
+#   The frozen-registry ban still binds bd-mcp-2026-07-28-support-ahet.1.1, it
+#   still binds [[workspace_binding]] (explicitly DECLINED: the tree at
+#   producer time has no immutable anchor, so re-deriving it would go green
+#   today and rot tomorrow), and it generalizes to no other frozen artifact.
+#
+# WHAT THIS DOES NOT DO
+#   It does not unblock FND-01. The gate goes from 6/6 red for a wrong reason
+#   to 5/6 red for the right one: five closed children's delivered outputs were
+#   modified after those children closed. That remaining red is the finding,
+#   and it must not be chased green by touching the bound files.
+#
+# PRIOR VALUES, verbatim (path | owner_scope | byte_length | sha256):
+#   crates/fastmcp-core/src/crypto.rs        | ahet.1.9  |  34133 | 025a1d1ddaaa9f66f45670a100a41e8cdc0e79855d7c0739f86cb51255b41b40
+#   crates/fastmcp-core/src/uri.rs           | ahet.1.8  |  73087 | 441f0f766cc10d401de3d660e619db7d2ad07d5239e0f27d1bcb1455c486eaa8
+#   crates/fastmcp-server/src/auth.rs        | ahet.1.11 |  37600 | dfe9e3c33dc0eb8b4c090d239be98580670bebc4a518bc3446340c6e4a866d72
+#   crates/fastmcp-server/src/oauth.rs       | ahet.1.10 | 137239 | fd45f31409f7bb0c647ee64390ab9864483df0e9888a742e227d0903667f10da
+#   crates/fastmcp-server/src/oidc.rs        | ahet.1.11 |  26980 | 7090485adcc43173ea10b22d9975df2fad61fb2e98674b0f119ff0830b1ca62c
+#   crates/fastmcp-transport/src/websocket.rs| ahet.1.10 |  63251 | f7cd2d1771eb91d7674fa4176898f1b2695ef2cbcdbae0f44550806eb326b224
+#   prior registry_sha256 = 93aec08a25abfa66fb6f7b8121cbe034ab6d2cf251e2c2a117b6d40859f11d61
+#
+# CLOSURE REVISIONS USED (path | owner closed_at | closure_rev):
+#   crypto.rs    | 2026-08-22T15:04:25Z | 7d79aa36
+#   uri.rs       | 2026-08-22T23:00:53Z | b2863887
+#   auth.rs      | 2026-08-03T18:54:42Z | 9007adce
+#   oauth.rs     | 2026-09-01T09:04:02Z | 00cb860c
+#   oidc.rs      | 2026-08-03T18:54:42Z | 9007adce
+#   websocket.rs | 2026-09-01T09:04:02Z | 00cb860c
+#
+# Recorded as comments, not as a sub-table, deliberately: the policy sets
+# deny_unknown_policy_fields = true and policy_shape_contract pins
+# closed_child_handoff_contract to exactly ten fields, so a new sub-table would
+# be rejected by the strict parser and would cascade into the shape registry.
+# Comments live inside the contract without altering its parsed shape.
+# ---------------------------------------------------------------------------
 [closed_child_handoff_contract]
 purpose = "immutable policy-authoring-time byte handoff for implementation outputs owned by completed child beads rather than the .1.1 integration producer; the later workspace snapshot is an additional final-state binding and may never replace or rebase this baseline"
 owner_excluded_from_integration_producer = "bd-mcp-2026-07-28-support-ahet.1.1"
@@ -207,7 +276,7 @@ baseline_rule = "before any integration-producer write or generated input, no-fo
 ownership_rule = "the .1.1 producer has no authority to create, rewrite, format, normalize, truncate, replace, move, or delete any bound path; byte drift is a terminal ownership violation even if sparse semantic surface rules and the final workspace snapshot would otherwise pass"
 closed_set_rule = "these six rows are the complete non-.1.1-owned implementation-output handoff set present outside the immutable 68-file evidence source tree; policy/verifier self-binding and .1.1-owned manifests, docs, workflows, facade wiring, and test integration remain governed by their explicit contracts rather than silently joining this set"
 registry_encoding = "ASCII FND01CHILDv1 followed by NUL and u32be binding_count, then each row in binding_order as u32be path length/path bytes, u32be owner_scope length/bytes, u64be byte_length, and raw 32-byte SHA-256"
-registry_sha256 = "93aec08a25abfa66fb6f7b8121cbe034ab6d2cf251e2c2a117b6d40859f11d61"
+registry_sha256 = "3393242140cde5187a543c4013304382f6c576794202e7af1a6f0c96efb3ee1f"
 
 [authoring_closure_contract]
 purpose = "non-circular immutable handoff for the three .1.14-owned files: this policy cannot contain its own digest, so the independent quiet-window reviewer/tracker record is the sole authority and .1.1/.1.15 may consume but never originate, replace, or rebase it"
@@ -226,38 +295,38 @@ claim_ceiling = "external orchestration binding of exact final policy, verifier,
 [[closed_child_binding]]
 path = "crates/fastmcp-core/src/crypto.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.9"
-byte_length = 34133
-sha256 = "025a1d1ddaaa9f66f45670a100a41e8cdc0e79855d7c0739f86cb51255b41b40"
+byte_length = 121377
+sha256 = "ad187dfd6405042a95b3be541f17d2d3b1d4904cf7ef679f85658772dd676419"
 
 [[closed_child_binding]]
 path = "crates/fastmcp-core/src/uri.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.8"
-byte_length = 73087
-sha256 = "441f0f766cc10d401de3d660e619db7d2ad07d5239e0f27d1bcb1455c486eaa8"
+byte_length = 93796
+sha256 = "ad2f2e587ae89fef395b9a6a2b80b7d1224e2f214cd0fe19c9c4123f9b76fac6"
 
 [[closed_child_binding]]
 path = "crates/fastmcp-server/src/auth.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.11"
-byte_length = 37600
-sha256 = "dfe9e3c33dc0eb8b4c090d239be98580670bebc4a518bc3446340c6e4a866d72"
+byte_length = 70271
+sha256 = "6220818ba1bf6e559e444e3b99f5f5009727a85b20e34c10201bbb7b6f8653a9"
 
 [[closed_child_binding]]
 path = "crates/fastmcp-server/src/oauth.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.10"
-byte_length = 137239
-sha256 = "fd45f31409f7bb0c647ee64390ab9864483df0e9888a742e227d0903667f10da"
+byte_length = 417882
+sha256 = "0c04614fd913f1a1bedf59da6a8a739a8c3612e52a5ad4ac75db3ecabb84aef6"
 
 [[closed_child_binding]]
 path = "crates/fastmcp-server/src/oidc.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.11"
-byte_length = 26980
-sha256 = "7090485adcc43173ea10b22d9975df2fad61fb2e98674b0f119ff0830b1ca62c"
+byte_length = 38316
+sha256 = "d1dd06b07a10fe5d89c8c45c31c45d1dcb730e2ae8eaf2c1fe0d30cfe54a391f"
 
 [[closed_child_binding]]
 path = "crates/fastmcp-transport/src/websocket.rs"
 owner_scope = "bd-mcp-2026-07-28-support-ahet.1.10"
-byte_length = 63251
-sha256 = "f7cd2d1771eb91d7674fa4176898f1b2695ef2cbcdbae0f44550806eb326b224"
+byte_length = 216421
+sha256 = "04382536b0b57f989e3b86274f4aa2e3ebdc8228bfdf93a27b57315c2027e7d9"
 
 [[workspace_binding]]
 path = ".github/dependabot.yml"

@@ -399,38 +399,35 @@ fn blob_at_revision(revision: &str, path: &str) -> Vec<u8> {
     output.stdout
 }
 
-/// Evaluates the **recorded** bindings against the bytes of the revision at
-/// which their owning child actually closed.
+/// Evaluates the **recorded** bindings against the LIVE WORKING TREE.
 ///
-/// SUBJECT CORRECTION (2026-09-17). This check previously compared each
-/// recorded row against the **current working tree**. That is not a gate, it is
-/// a clock: the working tree moves every day, so the check drifted further from
-/// green with every unrelated commit and could never distinguish tampering from
-/// the passage of time. The contract's own `closed_child_handoff_contract`
-/// calls these rows a handoff of outputs owned by **completed** children, so the
-/// subject each row describes is the bytes that child handed off at its own
-/// closure, which is a fixed historical revision. The subject is now that
-/// revision. Nothing about the recorded values changed.
+/// RE-AUTHORED BASELINE (2026-09-17, user-authorized). The six rows now record
+/// the bytes each owning child actually handed off at its own closure
+/// revision, derived mechanically via `git cat-file blob`. Before that, the
+/// rows were the 2026-07-30 policy-authoring snapshot, which predated every
+/// child closure by 4 to 33 days and so described nobody's handoff; the check
+/// was pointed at the closure revision purely to keep that failure stable and
+/// diagnosable. That workaround is now retired.
 ///
-/// Every value compared here is still read from the evidence document as
-/// written; none is recomputed or refreshed. A zero-row parse fails rather than
-/// passing vacuously.
+/// THE COMPARAND IS THE WORKING TREE, DELIBERATELY. `baseline_rule` requires
+/// the bound paths be re-opened and re-compared "after every producer
+/// command/write, immediately before directory publication, in ordinary
+/// read-only verification, and independently in final attestation". The row is
+/// the immutable anchor; the tree is the mutable thing under test. Comparing a
+/// row against the same revision it was derived from would pass by
+/// construction and prove nothing — see
+/// `fnd_01_a_closed_child_rows_match_their_closure_revisions`, which makes
+/// that provenance comparison separately and is labelled as a control.
 ///
-/// This test is EXPECTED TO FAIL, and the failure is now stable rather than
-/// drifting. All six rows are the policy-authoring snapshot of
-/// 2026-07-30 15:30:33, but the earliest child closure is 2026-08-03 and
-/// commit 9007adce had already landed on auth.rs and oidc.rs before it, so
-/// there is no revision at which these six values are any child's handoff. The
-/// baseline was authored 4 to 33 days before the children it claims to hand
-/// off had closed, which is an authoring defect in the freeze policy and not
-/// something any consumer of this document can repair.
+/// THIS TEST IS STILL EXPECTED TO FAIL, and the remaining failures are the
+/// finding. Five of the six closed children's delivered outputs were modified
+/// after those children closed; `uri.rs` was not, and passes. That 5-fire /
+/// 1-pass split is the proof this gate discriminates rather than being red by
+/// construction.
 ///
-/// The red is the mechanical proof of that defect and it is the correct result.
-/// It must not be inverted to `!is_bound()`, ignored, feature-gated, or
-/// repaired by regenerating the recorded values. Re-anchoring the recorded
-/// values to the closure revisions would make this green, but that is a
-/// re-authoring of a frozen registry and is reserved to the freeze-policy
-/// owner under an authorization that does not exist as of this revision.
+/// The correct response to a failure here is to adjudicate the post-closure
+/// modification it names — never to edit the bound file, and never to
+/// re-anchor a row to make it quiet.
 #[test]
 fn fnd_01_a_recorded_closed_child_bindings_hold() {
     let declared = declared_closed_child_bindings();
@@ -455,25 +452,19 @@ fn fnd_01_a_recorded_closed_child_bindings_hold() {
 
         let (revision, closed_at) = closure_revision(&row.path);
 
-        // THE CORRECTED SUBJECT: the bytes the owning child handed off at its
-        // own closure, read from immutable object storage rather than from the
-        // working tree.
-        let handoff = blob_at_revision(revision, &row.path);
-
-        let outcome = binding
-            .evaluate(&handoff)
-            .unwrap_or_else(|error| panic!("{}: {error}", row.path));
-
-        // Second axis, reported for attribution only: has the closed child's
-        // output been modified since it closed? This is what the contract
-        // actually exists to detect, and it is the question a re-anchored
-        // registry would ask. It does not decide this assertion.
+        // THE SUBJECT: the live working tree, which is what `baseline_rule`
+        // re-opens after every producer command/write.
         let working_tree = fs::read(workspace_root().join(&row.path))
             .unwrap_or_else(|error| panic!("{}: bound source unreadable: {error}", row.path));
-        let population = if working_tree == handoff {
-            "P1 premature-baseline only (UNMODIFIED since closure)"
+
+        let outcome = binding
+            .evaluate(&working_tree)
+            .unwrap_or_else(|error| panic!("{}: {error}", row.path));
+
+        let population = if outcome.is_bound() {
+            "UNMODIFIED since closure"
         } else {
-            "P2 modified after closure"
+            "MODIFIED AFTER CLOSURE - adjudicate the commits, do not edit the file"
         };
 
         if !outcome.is_bound() {
@@ -495,18 +486,69 @@ fn fnd_01_a_recorded_closed_child_bindings_hold() {
 
     assert!(
         drifted.is_empty(),
-        "{} of {} recorded closed-child bindings do not describe the handoff of the child that \
-         owns them.\n\nROOT CAUSE: the baseline was authored 2026-07-30 15:30:33, in the same \
-         instant as the source it binds, but closed_child_handoff_contract declares these rows a \
-         handoff of outputs owned by COMPLETED children and the owning children closed 4 to 33 \
-         days later (2026-08-03 .. 2026-09-01). The rows are the authoring snapshot, not anyone's \
-         handoff. This is an authoring defect in the freeze policy; it is NOT repairable by any \
-         consumer of this document, and it must not be repaired by regenerating the recorded \
-         values.\n\nThe registry itself is intact: the six rows still reproduce \
-         closed_child_handoff_contract.registry_sha256 exactly, so nothing was tampered with.\n\n{}",
+        "{} of {} closed-child bound paths no longer match the bytes their owning child \
+         handed off at closure.\n\nThis is the finding, not a nuisance: a CLOSED child's \
+         delivered output was modified after it closed. Adjudicate the commits named on each \
+         row - re-close the child at its true delivered revision, or accept the change and \
+         re-anchor that single row under explicit authorization. Do NOT edit the bound file to \
+         silence this, and do NOT re-anchor a row merely to make it quiet (RH-3).\n\nThe rows \
+         themselves are sound: they were re-authored 2026-09-17 at each child's closure \
+         revision by mechanical derivation, and they reproduce \
+         closed_child_handoff_contract.registry_sha256 exactly.\n\n{}",
         drifted.len(),
         declared.len(),
         drifted.join("\n"),
+    );
+}
+
+/// PROVENANCE CONTROL for the 2026-09-17 re-authored baseline.
+///
+/// Verifies that every recorded row really is the byte length and digest of
+/// its owning child's closure revision, recomputed here from Git rather than
+/// read from the document.
+///
+/// This is a CONTROL, not a drift gate, and it must never be cited as evidence
+/// that the closed-child capability is enforced. It compares a row against the
+/// same revision the row was derived from, so it is green by construction for
+/// any correctly derived registry — which is exactly its job: it fails if
+/// someone hand-edits a row, re-anchors one to a different revision, or tunes
+/// a value to quiet a failure (RH-3). The test that can actually observe drift
+/// is `fnd_01_a_recorded_closed_child_bindings_hold`, which compares against
+/// the live working tree.
+#[test]
+fn fnd_01_a_closed_child_rows_match_their_closure_revisions() {
+    let declared = declared_closed_child_bindings();
+    assert_eq!(
+        declared.len(),
+        CLOSURE_REVISIONS.len(),
+        "every declared row must have exactly one closure revision"
+    );
+    assert!(!declared.is_empty(), "a zero-row parse would prove nothing");
+
+    let mut wrong = Vec::new();
+    for row in &declared {
+        let (revision, _) = closure_revision(&row.path);
+        let handoff = blob_at_revision(revision, &row.path);
+        let digest = live_sha256_hex(&handoff);
+        if handoff.len() != row.byte_length || digest != row.sha256 {
+            wrong.push(format!(
+                "{} @{}: recorded {} bytes / {}, closure revision holds {} bytes / {}",
+                row.path,
+                revision,
+                row.byte_length,
+                row.sha256,
+                handoff.len(),
+                digest,
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} recorded row(s) are NOT the bytes of the closure revision they claim. The registry \
+         was hand-edited, re-anchored, or tuned rather than mechanically derived:\n{}",
+        wrong.len(),
+        wrong.join("\n"),
     );
 }
 
