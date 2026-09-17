@@ -233,9 +233,18 @@ fn admit_bytes(bytes: &[u8], limits: &Limits) -> Result<String, Diagnostic> {
             ));
         }
     }
-    String::from_utf8(bytes.to_vec()).map_err(|error| {
+    let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
         Diagnostic::new(Code::PlanEncodingInvalid, "plan", "utf8", error.to_string())
-    })
+    })?;
+
+    // CRLF is admissible and is normalized here, before any structural scan.
+    // Normalizing only inside `canonicalize_body` would be too late: the line
+    // scan splits on LF, so a CRLF document would carry a trailing CR on every
+    // line and no heading or `Dependencies:` line would ever match its exact
+    // spelling. The documented guarantee is that a CRLF plan and its LF twin
+    // produce byte-identical canonical streams, which requires normalizing
+    // before extraction rather than after it.
+    Ok(text.replace("\r\n", "\n"))
 }
 
 /// True for a CommonMark thematic break used as an interstitial separator.
@@ -393,7 +402,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Plan, Diagnostic> {
             return Err(Diagnostic::new(
                 Code::DependencySectionInvalid,
                 &id,
-                "Dependencies:",
+                "dependency_heading",
                 format!(
                     "expected exactly one outside-fence dependency heading, found {}",
                     dependency_indices.len()
@@ -680,15 +689,52 @@ mod tests {
             Code::PlanEncodingInvalid
         );
 
-        let cr = good.replace("Dependencies:", "Dependencies:\r");
-        assert_eq!(
-            parse(cr.as_bytes(), &limits()).unwrap_err().field,
-            "bare_cr"
-        );
+        // A bare CR is a CR *not* followed by LF. Injecting one before an
+        // existing LF would make a CRLF, which is admissible -- the first
+        // version of this test did exactly that and asserted the wrong thing,
+        // so the CR goes mid-line where it cannot pair.
+        let cr = good.replace("Freeze", "Free\rze");
+        assert!(!cr.contains("\r\n"), "the mutation must not form a CRLF");
+        let error = parse(cr.as_bytes(), &limits()).expect_err("a bare CR is rejected");
+        assert_eq!(error.code, Code::PlanEncodingInvalid);
+        assert_eq!(error.field, "bare_cr");
 
         let mut nul = good.clone().into_bytes();
         nul.push(0);
         assert_eq!(parse(&nul, &limits()).unwrap_err().field, "nul");
+    }
+
+    #[test]
+    fn crlf_is_admissible_and_yields_the_same_corpus_as_lf() {
+        // The documented normalization: a CRLF plan and its LF twin must
+        // parse identically and produce byte-identical canonical bodies.
+        let lf = TWO_PACKAGES;
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(crlf.contains("\r\n"));
+
+        let from_lf = parse(lf.as_bytes(), &limits()).expect("LF parses");
+        let from_crlf = parse(crlf.as_bytes(), &limits()).expect("CRLF parses");
+
+        assert_eq!(from_lf, from_crlf, "line endings must not change the corpus");
+        assert_eq!(from_crlf.ids(), ["FND-01", "FND-02"]);
+        for package in &from_crlf.packages {
+            assert!(
+                !package.canonical_body.contains(&b'\r'),
+                "{} retained a CR",
+                package.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_dependency_heading_names_the_violated_property() {
+        // `field` names what was violated, never the literal text of the
+        // thing that was missing. An evaluator joining on a defect label
+        // stops matching silently when a field carries section text instead.
+        let text = TWO_PACKAGES.replace("Dependencies:\n\n- None.", "No dependency section.");
+        let error = parse(text.as_bytes(), &limits()).expect_err("must be rejected");
+        assert_eq!(error.code, Code::DependencySectionInvalid);
+        assert_eq!(error.field, "dependency_heading");
     }
 
     #[test]
