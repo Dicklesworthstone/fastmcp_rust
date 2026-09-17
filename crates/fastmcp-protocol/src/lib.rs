@@ -98,9 +98,11 @@ pub use jsonrpc::{
     JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest,
     JsonRpcResponse, JsonRpcResponseAdmission, MAX_JSONRPC_STRING_ID_ENCODED_BYTES,
     MAX_RAW_JSON_AGGREGATE_NUMBER_BYTES, MAX_RAW_JSON_CONTAINER_ENTRIES, MAX_RAW_JSON_EXPONENT,
-    MAX_RAW_JSON_NESTING_DEPTH, MAX_RAW_JSON_NUMBER_BYTES, RawJsonAdmissionError,
-    RawJsonRpcDisposition, RequestId, UncorrelatedJsonRpcErrorResponse, admit_raw_jsonrpc_document,
-    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, dispose_raw_jsonrpc_failure,
+    MAX_RAW_JSON_NESTING_DEPTH, MAX_RAW_JSON_NUMBER_BYTES, MAX_RAW_JSON_PATH_SEGMENT_BYTES,
+    MAX_RAW_JSON_PATH_SEGMENTS, RawJsonAdmissionError, RawJsonAdmissionFailure,
+    RawJsonRpcDisposition, RawJsonTopLevel, RequestId, UncorrelatedJsonRpcErrorResponse,
+    admit_raw_json_document, admit_raw_jsonrpc_document, decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_response, dispose_raw_jsonrpc_failure,
 };
 #[cfg(feature = "apps")]
 pub use mcp_apps_bridge::*;

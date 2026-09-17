@@ -69,6 +69,98 @@ impl std::fmt::Display for RawJsonAdmissionError {
 
 impl std::error::Error for RawJsonAdmissionError {}
 
+/// Maximum retained bytes in one redacted raw-admission path segment.
+pub const MAX_RAW_JSON_PATH_SEGMENT_BYTES: usize = 64;
+/// Maximum rendered segments in one redacted raw-admission path.
+pub const MAX_RAW_JSON_PATH_SEGMENTS: usize = 16;
+
+/// Structural policy for the single top-level value a raw document may carry.
+///
+/// The bounded scanning pass itself is role-neutral: duplicate members,
+/// depth, container entries, number lexemes, decoded string bytes, strict
+/// UTF-8, and byte-order marks are enforced identically for every consumer.
+/// Only the admitted top-level shape differs, so a security document is never
+/// classified with JSON-RPC batch vocabulary and a JSON-RPC frame still
+/// refuses a batch by name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RawJsonTopLevel {
+    /// One top-level JSON object. A top-level array is reported as
+    /// [`RawJsonAdmissionError::TopLevelBatch`] because JSON-RPC ingress
+    /// refuses batches deliberately and by name.
+    JsonRpcObject,
+    /// One top-level JSON object for a security-bearing document such as
+    /// OAuth/OIDC/PRM/CIMD/DCR metadata, a token response, a JWKS or JWK, or
+    /// a decoded compact-JWS protected header or claims set. A top-level
+    /// array is an ordinary shape violation here, not a JSON-RPC batch.
+    SecurityDocumentObject,
+    /// One top-level JSON value of any kind, still fully bounded.
+    AnyValue,
+}
+
+/// One structural step in a redacted raw-admission path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RawJsonPathSegment {
+    Member(String),
+    Index(usize),
+}
+
+/// A raw admission failure together with the redacted structural path at
+/// which the bounded scanner detected it.
+///
+/// The path names only structure: object member names are reduced to
+/// `[A-Za-z0-9_.-]` with every other byte replaced by `*` and the segment
+/// truncated to [`MAX_RAW_JSON_PATH_SEGMENT_BYTES`], and array steps carry
+/// only their index. No admitted value, string content, or number lexeme is
+/// ever reproduced, so a rejection diagnostic cannot leak the document that
+/// caused it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawJsonAdmissionFailure {
+    error: RawJsonAdmissionError,
+    path: String,
+}
+
+impl RawJsonAdmissionFailure {
+    /// Returns the stable structural reason the document was refused.
+    #[must_use]
+    pub const fn error(&self) -> RawJsonAdmissionError {
+        self.error
+    }
+
+    /// Returns the redacted JSON-Pointer-style path of the refusal.
+    ///
+    /// The whole-document boundary — byte limit, byte-order mark, strict
+    /// UTF-8, and top-level shape — reports the empty root path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    const fn at_root(error: RawJsonAdmissionError) -> Self {
+        Self {
+            error,
+            path: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for RawJsonAdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.path.is_empty() {
+            self.error.fmt(formatter)
+        } else {
+            write!(formatter, "{} at {}", self.error, self.path)
+        }
+    }
+}
+
+impl std::error::Error for RawJsonAdmissionFailure {}
+
+impl From<RawJsonAdmissionFailure> for RawJsonAdmissionError {
+    fn from(failure: RawJsonAdmissionFailure) -> Self {
+        failure.error
+    }
+}
+
 /// Admission failure for a complete strict JSON-RPC document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JsonRpcAdmissionError {
@@ -100,23 +192,75 @@ pub fn admit_raw_jsonrpc_document(
     bytes: &[u8],
     document_byte_limit: usize,
 ) -> Result<(), RawJsonAdmissionError> {
+    admit_raw_json_document(bytes, document_byte_limit, RawJsonTopLevel::JsonRpcObject)
+        .map_err(RawJsonAdmissionFailure::into)
+}
+
+/// Admit one complete raw JSON document before any typed decoding.
+///
+/// This is the single bounded streaming pass every FastMCP JSON consumer
+/// shares. It is deliberately not a JSON-RPC-only serde hook: the caller
+/// selects the document byte bound and the admitted top-level shape, and
+/// every other rule — duplicate object members at every nesting level,
+/// nesting depth, aggregate container entries, per-number and aggregate
+/// numeric lexeme bytes, absolute exponent, decoded string bytes, strict
+/// UTF-8, and byte-order-mark rejection — is identical for JSON-RPC
+/// envelopes and for security-bearing documents such as OAuth/OIDC/PRM/CIMD/
+/// DCR metadata, token responses, JWKS and JWK documents, and decoded
+/// compact-JWS protected headers and claim sets.
+///
+/// Refusals carry a redacted structural path so two consumers of the same
+/// document receive the same stable diagnostic without either of them
+/// reproducing admitted content.
+pub fn admit_raw_json_document(
+    bytes: &[u8],
+    document_byte_limit: usize,
+    top_level: RawJsonTopLevel,
+) -> Result<(), RawJsonAdmissionFailure> {
     if bytes.len() > document_byte_limit {
-        return Err(RawJsonAdmissionError::DocumentTooLarge);
+        return Err(RawJsonAdmissionFailure::at_root(
+            RawJsonAdmissionError::DocumentTooLarge,
+        ));
     }
     if bytes.windows(3).any(|window| window == [0xef, 0xbb, 0xbf]) {
-        return Err(RawJsonAdmissionError::ByteOrderMark);
+        return Err(RawJsonAdmissionFailure::at_root(
+            RawJsonAdmissionError::ByteOrderMark,
+        ));
     }
-    let input = std::str::from_utf8(bytes).map_err(|_| RawJsonAdmissionError::InvalidUtf8)?;
+    let Ok(input) = std::str::from_utf8(bytes) else {
+        return Err(RawJsonAdmissionFailure::at_root(
+            RawJsonAdmissionError::InvalidUtf8,
+        ));
+    };
     let mut scanner = RawJsonScanner::new(input, document_byte_limit);
     scanner.skip_whitespace();
-    match scanner.peek() {
-        Some(b'{') => scanner.parse_object(0)?,
-        Some(b'[') => return Err(RawJsonAdmissionError::TopLevelBatch),
-        _ => return Err(RawJsonAdmissionError::TopLevelNotObject),
+    let scanned = match (scanner.peek(), top_level) {
+        (Some(b'{'), _) => scanner.parse_object(0),
+        (Some(b'['), RawJsonTopLevel::JsonRpcObject) => {
+            return Err(RawJsonAdmissionFailure::at_root(
+                RawJsonAdmissionError::TopLevelBatch,
+            ));
+        }
+        (Some(b'['), RawJsonTopLevel::SecurityDocumentObject) => {
+            return Err(RawJsonAdmissionFailure::at_root(
+                RawJsonAdmissionError::TopLevelNotObject,
+            ));
+        }
+        (Some(_), RawJsonTopLevel::AnyValue) => scanner.parse_value(0),
+        _ => {
+            return Err(RawJsonAdmissionFailure::at_root(
+                RawJsonAdmissionError::TopLevelNotObject,
+            ));
+        }
+    };
+    if let Err(error) = scanned {
+        return Err(scanner.failure(error));
     }
     scanner.skip_whitespace();
     if scanner.position != scanner.bytes.len() {
-        return Err(RawJsonAdmissionError::InvalidSyntax);
+        return Err(RawJsonAdmissionFailure::at_root(
+            RawJsonAdmissionError::InvalidSyntax,
+        ));
     }
     Ok(())
 }
@@ -259,6 +403,7 @@ struct RawJsonScanner<'a> {
     number_bytes: usize,
     decoded_string_bytes: usize,
     decoded_string_byte_limit: usize,
+    path: Vec<RawJsonPathSegment>,
 }
 
 impl<'a> RawJsonScanner<'a> {
@@ -271,6 +416,18 @@ impl<'a> RawJsonScanner<'a> {
             number_bytes: 0,
             decoded_string_bytes: 0,
             decoded_string_byte_limit,
+            path: Vec::new(),
+        }
+    }
+
+    /// Renders the structural path held at the moment of refusal.
+    ///
+    /// The scanner unwinds by returning early, so the stack still describes
+    /// the failing position when this runs.
+    fn failure(&self, error: RawJsonAdmissionError) -> RawJsonAdmissionFailure {
+        RawJsonAdmissionFailure {
+            error,
+            path: redact_raw_json_path(&self.path),
         }
     }
 
@@ -301,6 +458,10 @@ impl<'a> RawJsonScanner<'a> {
             let name = self
                 .parse_string(true)?
                 .ok_or(RawJsonAdmissionError::InvalidSyntax)?;
+            // The member joins the path before the duplicate check so a
+            // refusal names the member it refused, and stays on the path for
+            // the whole member value so a nested refusal is located exactly.
+            self.path.push(RawJsonPathSegment::Member(name.clone()));
             if !names.insert(name) {
                 return Err(RawJsonAdmissionError::DuplicateObjectMember);
             }
@@ -310,6 +471,7 @@ impl<'a> RawJsonScanner<'a> {
             }
             self.skip_whitespace();
             self.parse_value(nested_depth)?;
+            self.path.pop();
             self.skip_whitespace();
             if self.consume(b'}') {
                 return Ok(());
@@ -328,9 +490,13 @@ impl<'a> RawJsonScanner<'a> {
         if self.consume(b']') {
             return Ok(());
         }
+        let mut index = 0_usize;
         loop {
             self.charge_container_entry()?;
+            self.path.push(RawJsonPathSegment::Index(index));
             self.parse_value(nested_depth)?;
+            self.path.pop();
+            index = index.saturating_add(1);
             self.skip_whitespace();
             if self.consume(b']') {
                 return Ok(());
@@ -563,6 +729,43 @@ impl<'a> RawJsonScanner<'a> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.position).copied()
     }
+}
+
+/// Renders a scanner path as a redacted JSON-Pointer-style string.
+///
+/// Only structure survives. An object member keeps `[A-Za-z0-9_.-]` and every
+/// other byte becomes `*`, so an attacker-chosen member name can neither
+/// smuggle content into a log line nor change the shape of the diagnostic.
+/// Segment and path lengths are bounded, and array steps carry only indices.
+fn redact_raw_json_path(path: &[RawJsonPathSegment]) -> String {
+    let mut rendered = String::new();
+    for segment in path.iter().take(MAX_RAW_JSON_PATH_SEGMENTS) {
+        rendered.push('/');
+        match segment {
+            RawJsonPathSegment::Member(name) => {
+                let mut retained = 0_usize;
+                for character in name.chars() {
+                    if retained >= MAX_RAW_JSON_PATH_SEGMENT_BYTES {
+                        rendered.push('~');
+                        break;
+                    }
+                    if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+                        rendered.push(character);
+                    } else {
+                        rendered.push('*');
+                    }
+                    retained += 1;
+                }
+            }
+            RawJsonPathSegment::Index(index) => {
+                rendered.push_str(&index.to_string());
+            }
+        }
+    }
+    if path.len() > MAX_RAW_JSON_PATH_SEGMENTS {
+        rendered.push_str("/~");
+    }
+    rendered
 }
 
 fn exponent_exceeds_raw_limit(digits: &[u8]) -> bool {
