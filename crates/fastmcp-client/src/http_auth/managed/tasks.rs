@@ -503,7 +503,8 @@ mod tests {
     fn update_requires_the_current_input_ledger_not_a_syntactically_valid_map() {
         let answers = |key: &str| serde_json::from_value::<TaskInputResponses>(json!({key:{"roots":[]}})).unwrap();
         assert!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:answers("roots") }, ManagedTasksLimits::default()).is_ok());
-        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:answers("other") }, ManagedTasksLimits::default()), Err(ManagedTasksError::InvalidInputResponses)));
+        let wrong_kind = serde_json::from_value(json!({"roots":{"action":"accept"}})).unwrap();
+        assert!(matches!(prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:wrong_kind }, ManagedTasksLimits::default()), Err(ManagedTasksError::InvalidInputResponses)));
     }
 
     #[test]

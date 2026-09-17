@@ -152,7 +152,8 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 4, "discovery only, no Task operation");
                 }
                 TaskCase::Preflight => {
-                    assert!(matches!(client.request(&cx, ids(1), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:task_answers("other") }).await, Err(ManagedTasksError::InvalidInputResponses)));
+                    let wrong_kind = serde_json::from_value(json!({"roots":{"action":"accept"}})).unwrap();
+                    assert!(matches!(client.request(&cx, ids(1), ManagedTaskRequest::Update { task:Box::new(input_task()), input_responses:wrong_kind }).await, Err(ManagedTasksError::InvalidInputResponses)));
                     assert!(matches!(client.request(&cx, ids(3), ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:Some(Value::Null) }).await, Err(ManagedTasksError::InvalidRequest)));
                     let tiny = ManagedTasksClient::new(session.clone(), metadata, ManagedTasksLimits::new(1, 1024, 1, Duration::from_secs(1)).unwrap()).unwrap();
                     assert!(matches!(tiny.request(&cx, ids(5), ManagedTaskRequest::Cancel(task_id())).await, Err(ManagedTasksError::RequestTooLarge)));
