@@ -21,7 +21,7 @@ use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInput
 
 use super::{
     BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
-    ManagedTasksClient, ManagedTasksError, deadline_after, prepare,
+    ManagedTasksClient, ManagedTasksError, OAuthSessionError, deadline_after, prepare,
 };
 
 /// One finite budget for the entire poll/resolve/update lifecycle, including
@@ -205,7 +205,8 @@ impl ManagedTasksClient {
         self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
         let deadline = deadline_after(cx, policy.timeout).map_err(ManagedTasksError::from)?;
         // The outer guard includes host callbacks and sleeps as well as I/O.
-        // Keep application errors distinct from its cancellation/deadline errors.
+        // Explicit inner checks also stop a ready host callback that overruns
+        // its deadline before this composite future next returns Poll::Pending.
         self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(async {
                 let mut state = DriverState::default();
@@ -215,11 +216,12 @@ impl ManagedTasksClient {
                 loop {
                     if polls >= policy.maximum_polls { return Err(ManagedTaskDriverError::PollLimit); }
                     if cx.now() < due { Sleep::new(due).await; }
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let ids = next_ids()?;
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     state.reserve_ids(&ids, policy.maximum_state_bytes)?;
                     polls += 1;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let mut call = self.request_with_cancellation(cx, cancellation, ids,
                         ManagedTaskRequest::Get(task_id.clone())).await?;
                     let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
@@ -230,8 +232,9 @@ impl ManagedTasksClient {
                     // Keep the peer's relative polling hint anchored to receipt,
                     // not to the later completion of a potentially slow resolver.
                     due = next_poll_time(cx.now(), &task, policy.minimum_poll_interval)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     observe(&task)?;
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     if matches!(task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
                         return Ok(ManagedTaskRunOutcome::Terminal(Box::new(task)));
                     }
@@ -245,10 +248,11 @@ impl ManagedTasksClient {
                     if pending.is_empty() { continue; }
                     if updates >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit); }
                     admit_capabilities(&self.metadata, &pending)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let resolution = resolve(pending.clone());
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let action = resolution.await?;
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let ManagedTaskInputAction::Respond(responses) = action else {
                         return Ok(ManagedTaskRunOutcome::InputRequired(Box::new(task)));
                     };
@@ -260,23 +264,35 @@ impl ManagedTasksClient {
                     let provisional = fastmcp_protocol::RequestId::Number(0);
                     let _ = prepare(self.session.resource().as_str(), &self.metadata, &provisional,
                         update_for_validation(&update)?, self.limits)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let ids = next_ids()?;
-                    self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+                    self.check_driver(cx, cancellation, deadline)?;
                     state.reserve_ids(&ids, policy.maximum_state_bytes)?;
                     // Include the newly reserved IDs before verifying that an
                     // acknowledged update can fit our retained input ledger.
                     state.answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
                     updates += 1;
+                    self.check_driver(cx, cancellation, deadline)?;
                     let mut call = self.request_with_cancellation(cx, cancellation, ids, update).await?;
                     if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Updated(_))) {
                         return Err(ManagedTaskDriverError::UnexpectedResponse);
                     }
+                    self.check_driver(cx, cancellation, deadline)?;
                     // Only an admitted update acknowledgement advances local
                     // input state. Any error/drop before it exits this run.
                     state.record_answers(&answered, &fingerprints, policy.maximum_state_bytes)?;
                 }
             }.await)
         }).await.map_err(ManagedTasksError::from)?
+    }
+
+    fn check_driver(&self, cx: &Cx, cancellation: &McpRequestCancellation, deadline: Time) -> Result<(), ManagedTaskDriverError> {
+        self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
+        let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
+        if cx.now() >= deadline {
+            return Err(ManagedTasksError::from(OAuthSessionError::TimedOut).into());
+        }
+        Ok(())
     }
 }
 
