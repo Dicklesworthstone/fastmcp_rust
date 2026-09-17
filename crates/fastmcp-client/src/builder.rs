@@ -2038,6 +2038,13 @@ exec sleep 5
                 let mut connecting = Box::pin(builder.connect_stdio_with_cx("sh", &args, &cx));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(connecting.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "eager initialization must yield before the peer completes");
+                // (c) KNOWN LOAD-DEPENDENT SITE, kept deliberately. The
+                // property is real and nothing else covers it: is_pending()
+                // proves the poll did not complete, not that it did not
+                // block. The peer ends in `exec sleep 5`, so a blocking poll
+                // measures ~5s against this 250ms bound -- a 20x margin.
+                // Virtual time cannot replace it: the peer is a real `sh`
+                // child and no test clock controls its sleep.
                 assert!(started.elapsed() < Duration::from_millis(250), "one startup poll occupied the caller worker; elapsed: {:?}", started.elapsed());
                 let path = events.path.clone();
                 let release_path = release.path.clone();
@@ -2091,7 +2098,27 @@ exec sleep 5
                         assert!(client.child.is_none());
                     }
                 }
-                assert!(started.elapsed() < Duration::from_secs(3));
+                // (b) REMOVED: an upper bound on real wall time here was
+                // redundant by construction. Each loop iteration already
+                // takes exactly one of two typed paths, and both entail the
+                // timing this bound was asserting:
+                //   - the error path asserts the exact typed timeout
+                //     (RequestCancelled, or data timeoutSource="absolute"),
+                //     which can only be produced by the 400ms
+                //     RequestTimeoutPolicy firing, not by waiting out the
+                //     peer's `exec sleep 5`;
+                //   - the success path asserts is_initialized(), the exact
+                //     server_info name, the selected era, a completed ping
+                //     and a completed close, none of which the peer can
+                //     satisfy while still sleeping.
+                // So no iteration can reach here having blocked on the
+                // child, and the 3s bound added no property the branch
+                // assertions do not already entail. It was also unsound:
+                // an upper bound on Instant::now() asserts the host was
+                // fast enough, which is not a property of the code, and it
+                // covered a whole multi-iteration loop spawning real `sh`
+                // children.
+                // Do not reinstate an upper bound on wall time here.
                 let lines = events.lines();
                 let pids = lines.iter().filter_map(|line| line.strip_prefix("spawn:")).collect::<Vec<_>>();
                 let fallback = mode.starts_with("auto-");
@@ -2301,6 +2328,11 @@ exec sleep 5
                 let mut first_use = Box::pin(deferred_probe_request(&mut client, &cx, &cancellation, api));
                 let first = std::future::poll_fn(|task_cx| Poll::Ready(first_use.as_mut().poll(task_cx))).await;
                 assert!(first.is_pending(), "deferred first use must yield before initialization completes");
+                // (c) KNOWN LOAD-DEPENDENT SITE, kept deliberately. Same
+                // shape as the eager-startup case above: is_pending() proves
+                // the poll did not complete, this proves it did not block.
+                // 250ms against a real `sh` peer sleeping 5s, a 20x margin,
+                // and virtual time cannot control that child.
                 assert!(started.elapsed() < Duration::from_millis(250), "deferred initialization occupied the caller worker; elapsed: {:?}", started.elapsed());
                 let path = events.path.clone();
                 let release_path = release.path.clone();
@@ -2333,6 +2365,18 @@ exec sleep 5
                         if mode == "drop-sync" { client.ensure_initialized().unwrap(); }
                         let result = deferred_probe_request(&mut client, &cx, &cancellation, api).await;
                         if matches!(mode, "partial" | "silent") {
+                            // (c) KNOWN LOAD-DEPENDENT SITE, and the most
+                            // fragile of this file's: 250ms against a 400ms
+                            // handshake restart is only a 1.6x margin, where
+                            // the sibling sites have 20x. The property is
+                            // real -- resumption must reuse the in-flight
+                            // handshake rather than restart its deadline --
+                            // and next_id is a partial structural proxy
+                            // (asserted == 2 above), but it does not
+                            // distinguish reuse from a restart that mints no
+                            // new id. Narrow this margin only with a
+                            // structural assertion, never by raising the
+                            // bound.
                             assert!(resumed.elapsed() < Duration::from_millis(250), "resumption restarted the handshake deadline");
                         }
                         result
@@ -3999,6 +4043,13 @@ exit 73
         client
             .close()
             .expect("fresh legacy timeout-fallback cleanup");
+        // (c) KNOWN LOAD-DEPENDENT SITE. The era assertion proves the
+        // modern probe timed out and the legacy child was reopened; it does
+        // not prove the fallback happened PROMPTLY rather than waiting out
+        // the peer's `exec sleep 5`. That timing is the feature under test.
+        // Note the margin is the weakest here: the bound equals the child's
+        // sleep, so a fallback that did wait lands right at the boundary.
+        // Real `sh` child, so no virtual clock applies.
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -4105,6 +4156,11 @@ exit 73
             error.data,
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the idle
+        // deadline fired rather than the request succeeding; this proves it
+        // fired AT its deadline rather than late. For a timeout feature the
+        // timing is the property, so this is not redundant. The peer is a
+        // real `sh` child sleeping 5s, so virtual time cannot replace it.
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
@@ -4132,6 +4188,10 @@ exit 73
             Err(error) => error,
         };
         assert_eq!(error.message, "Connection retry elapsed limit exceeded");
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the retry
+        // elapsed cap was hit; this proves it was hit at the configured cap
+        // rather than after the peer's 5s sleep. Timing is the feature.
+        // Real `sh` child, so no virtual clock applies.
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

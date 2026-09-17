@@ -1649,6 +1649,10 @@ mod tests {
             error.data,
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the custom
+        // idle timeout fired; this proves it fired at that deadline rather
+        // than late. Timing is the property a custom-timeout test exists to
+        // assert. Real `sh` child, so virtual time cannot replace it.
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
