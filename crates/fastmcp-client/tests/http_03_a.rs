@@ -1250,6 +1250,77 @@ async fn negative_03_name_header_split(cx: &Cx) {
 // HTTP-03.04 — lowercase identity Accept-Encoding and no decompression
 // ---------------------------------------------------------------------------
 
+/// Mirrors the production private ceiling
+/// `MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS`
+/// (`http_executor.rs:345`). It is a design limit rather than a measurement, so
+/// a fixed literal is correct here; it is named only so the positive's run and
+/// its planted negative's N+1 cannot drift apart.
+const IGNORED_EMPTY_CODING_CEILING: usize = 16;
+
+/// Drives one response whose only variable is the `Content-Encoding` field
+/// value, and returns the admitted body or the typed refusal.
+async fn content_encoding_outcome(
+    cx: &Cx,
+    encoding: Option<&str>,
+) -> Result<Vec<u8>, ModernHttpExecutorError> {
+    const PAYLOAD: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{"note":"uncoded"}}"#;
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let mut headers = vec![("Content-Type", "application/json")];
+    if let Some(encoding) = encoding {
+        headers.push(("Content-Encoding", encoding));
+    }
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(&mut io, 200, &headers, PAYLOAD).await;
+            end_stream(&mut io).await;
+        },
+        async {
+            match post(cx, &request).await {
+                Ok(response) => response.read_to_end(cx, 64 * 1024).await,
+                Err(error) => Err(error),
+            }
+        },
+    )
+    .await;
+    outcome
+}
+
+/// Drives one response carrying `Content-Encoding` TWICE, which is a header
+/// cardinality violation rather than a coding violation.
+async fn duplicate_content_encoding_outcome(cx: &Cx) -> ModernHttpExecutorError {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), error) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(
+                &mut io,
+                200,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Content-Encoding", "identity"),
+                    ("Content-Encoding", "identity"),
+                ],
+                b"{}",
+            )
+            .await;
+            end_stream(&mut io).await;
+        },
+        async {
+            post(cx, &request)
+                .await
+                .err()
+                .expect("a repeated Content-Encoding must be refused")
+        },
+    )
+    .await;
+    error
+}
+
 async fn positive_04_identity_accept_encoding(cx: &Cx) {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
@@ -1296,6 +1367,41 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
         payload.to_vec(),
         "no decompression may be applied to an identity-coded body"
     );
+
+    // ---------------------------------------------------------------------
+    // The admitted RFC 9110 list grammar for a response content coding. Exactly
+    // one semantic coding, compared ASCII-case-insensitively against the
+    // canonical `identity` token, with bounded empty list elements ignored as
+    // framing noise. Every case below carries the SAME body, and the admitted
+    // bytes are asserted unchanged, so an accidental decompression on any of
+    // these forms would be visible.
+    // ---------------------------------------------------------------------
+    const PAYLOAD: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{"note":"uncoded"}}"#;
+    let mut ceiling_run = ",".repeat(IGNORED_EMPTY_CODING_CEILING);
+    ceiling_run.push_str("identity");
+
+    for encoding in [
+        None,
+        Some("identity"),
+        Some("IDENTITY"),
+        Some("Identity"),
+        Some("  identity  "),
+        Some(", identity"),
+        Some("identity,"),
+        Some(",,identity,,"),
+        Some(ceiling_run.as_str()),
+    ] {
+        let body = content_encoding_outcome(cx, encoding)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Content-Encoding {encoding:?} must be admitted, saw {error:?}")
+            });
+        assert_eq!(
+            body,
+            PAYLOAD.to_vec(),
+            "Content-Encoding {encoding:?} must deliver the body unchanged"
+        );
+    }
 }
 
 async fn negative_04_compressed_response(cx: &Cx) {
@@ -1336,6 +1442,67 @@ async fn negative_04_compressed_response(cx: &Cx) {
     // The refusal precedes any body lane, so no byte was ever decompressed:
     // `execute` returned an error instead of a response stream.
     peer.assert_no_further_connection();
+
+    // ---------------------------------------------------------------------
+    // Content-coding planted negatives. The accepted case is the bare
+    // `identity` token; each row below changes exactly ONE thing about that
+    // field value and must fail closed before any body byte is exposed.
+    // ---------------------------------------------------------------------
+    assert!(
+        content_encoding_outcome(cx, Some("identity")).await.is_ok(),
+        "the unmutated accepted coding must be admitted"
+    );
+
+    let mut over_ceiling = ",".repeat(IGNORED_EMPTY_CODING_CEILING + 1);
+    over_ceiling.push_str("identity");
+
+    for (encoding, why) in [
+        ("identity, identity", "two semantic codings"),
+        ("identity, gzip", "a second, compressed coding"),
+        (",", "present but all-empty, so no semantic coding at all"),
+        (",,,", "empty-element saturation with no coding"),
+        ("identity;q=1", "a parameterised coding token"),
+        (
+            "x-identity",
+            "a token that merely contains the canonical one",
+        ),
+        (
+            "identityx",
+            "a token that merely starts with the canonical one",
+        ),
+        (
+            over_ceiling.as_str(),
+            "one empty element past the ignored ceiling",
+        ),
+    ] {
+        let error = content_encoding_outcome(cx, Some(encoding))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("Content-Encoding {encoding:?} must be refused ({why})"));
+        assert!(
+            matches!(error, ModernHttpExecutorError::UnsupportedContentEncoding),
+            "{encoding:?} ({why}) must raise the typed coding refusal, saw {error:?}"
+        );
+    }
+
+    // A repeated field line is a header-cardinality violation, and is reported
+    // as such rather than being folded into the coding refusal - the two are
+    // different defects and a caller can tell them apart.
+    let duplicate = duplicate_content_encoding_outcome(cx).await;
+    assert!(
+        matches!(
+            duplicate,
+            ModernHttpExecutorError::DuplicateResponseHeader { name } if name == "Content-Encoding"
+        ),
+        "a repeated Content-Encoding must be a duplicate-header refusal, saw {duplicate:?}"
+    );
+
+    // Restored: the unmutated coding is admitted again, so every refusal above
+    // came from its own changed variable rather than a poisoned path.
+    assert!(
+        content_encoding_outcome(cx, Some("identity")).await.is_ok(),
+        "the unmutated accepted coding must be admitted again"
+    );
 }
 
 // ---------------------------------------------------------------------------
