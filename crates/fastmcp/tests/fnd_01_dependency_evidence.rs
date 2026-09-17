@@ -50175,9 +50175,47 @@ activate = 1\n";
         Ok(())
     }
 
+    // RE-ATTEST 2026-09-17, authorised by the batch-verification orchestrator.
+    //
+    // These two rows are FROZEN MEASUREMENTS OF MUTABLE CONTENT: the workspace
+    // manifest and its lockfile are active development surfaces, so their
+    // length/digest bindings rot as ordinary work lands. That is the category
+    // that legitimately rots. A declared design limit in this file never should,
+    // and none was touched here.
+    //
+    // THE PRIOR BINDINGS WERE SOUND WHEN FROZEN - they were not wrong-from-birth:
+    //   Cargo.toml  7_116 / def5fb70... matched EXACTLY at 7709c27b (2026-09-03),
+    //               both length AND digest. Verified by `git cat-file`.
+    //   Cargo.lock  97_891 matched at db1c1766 (2026-08-30).
+    // So this is decay from a real anchor, not a laundering of a bad constant.
+    //
+    // WHAT DRIFTED, enumerated so the re-attest can be audited rather than
+    // trusted. Cargo.toml across 7709c27b..HEAD, 15 commits, every hunk ordinary:
+    //   - workspace version 0.8.1 -> 0.10.0 and the nine internal path-dependency
+    //     versions with it (chore(release) 0.9.0, then 0.10.0);
+    //   - asupersync =0.4.9 -> =0.5.0 with its comment rewritten;
+    //   - flate2, console, toml, dirs, clap, trybuild pin bumps
+    //     (bd-refresh-direct-dependency-pins-*);
+    //   - members gains "tools/xtask", the FND-02 traceability checker.
+    // Cargo.lock across db1c1766..HEAD: 11 packages added, 2 removed, 87 version
+    // lines changed, and ZERO hunks outside name/version/checksum/source/
+    // dependencies - i.e. exactly what the manifest bumps above imply.
+    // No hunk in either file is unexplained by ordinary work.
+    //
+    // WHY BOTH ROWS AND NOT ONLY Cargo.toml: frozen constants measuring one
+    // artifact rot as a GROUP. A sweep of all ten bindings in this class found
+    // exactly these two stale and the other eight clean - rust-toolchain.toml and
+    // all seven evidence artifacts still match, because those are frozen
+    // artifacts nobody edits. Repairing one row and leaving its sibling stale
+    // would convert one honest red into a second, more confusing one, since the
+    // verifier reads workspace[1] (Cargo.lock) immediately after workspace[0].
+    //
+    // WHAT THIS RE-ATTEST DOES NOT DO: it re-binds a LENGTH AND DIGEST. It does
+    // not re-verify the CONTENT those values measure. Nothing here asserts that
+    // the dependency set is correct, only that it is the one now on disk.
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_116, "def5fb70059ea7824aaea260ce59e50e2bfeb374d10aad1ee51293411be7bd45"),
-        ("Cargo.lock", 97_891, "7ec9da6ae2797b1ea453aa97f8ca7c33046d8ce6fa4ffe355bae8d8aea3d0a44"),
+        ("Cargo.toml", 7_224, "e1b1ed5da8fe800f2f0f60ca351d0636a94653cb4fe98ff96a4f15ccd0a5ef80"),
+        ("Cargo.lock", 99_964, "6b1c351b9e1647396957c7bffb023cc9e488226cbdbb8a13ae52984fa7d0e82f"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
