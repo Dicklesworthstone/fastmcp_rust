@@ -402,7 +402,7 @@ impl ClientCredentialsClient {
 struct AcquisitionPermit<'a>(&'a AtomicUsize);
 impl<'a> AcquisitionPermit<'a> {
     fn new(pending: &'a AtomicUsize) -> Result<Self, ClientCredentialsError> {
-        pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACQUISITIONS).then(|| n + 1))
+        pending.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACQUISITIONS).then(|| n + 1))
             .map_err(|_| ClientCredentialsError::Saturated)?;
         Ok(Self(pending))
     }
