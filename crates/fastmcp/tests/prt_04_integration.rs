@@ -940,6 +940,31 @@ fn prt_04_i_planted_negative() {
         PRT_04_A_EVALUATOR_MANIFEST_V1.len(),
         "the planted copy differs only in that one name, not in length"
     );
+    // The substituted manifest must be OTHERWISE VALID, or the digest mismatch
+    // below is attributable to malformation rather than to the rename. Parsing
+    // it through the same reader the join uses, and requiring an identical case
+    // count, ids and floors, establishes that the rename is the only difference
+    // that could have moved the digest.
+    let renamed_cases = parse_published_half(&renamed, "A", "PRT-04-A evaluator manifest v1");
+    let published_a = parse_published_half(
+        PRT_04_A_EVALUATOR_MANIFEST_V1,
+        "A",
+        "PRT-04-A evaluator manifest v1",
+    );
+    assert_eq!(renamed_cases.len(), published_a.len());
+    let mut renamed_names = 0;
+    for (before, after) in published_a.iter().zip(&renamed_cases) {
+        assert_eq!(before.id, after.id, "the rename must not move an ordinal");
+        assert_eq!(before.floor, after.floor, "the rename must not move a floor");
+        if before.name != after.name {
+            renamed_names += 1;
+        }
+    }
+    assert_eq!(
+        renamed_names, 1,
+        "exactly one case name differs, so the digest can only have moved because of it"
+    );
+
     let renamed_digest = sha256_bounded(renamed.as_bytes(), MAX_PRT_04_MANIFEST_BYTES)
         .expect("within bound");
     assert_ne!(
