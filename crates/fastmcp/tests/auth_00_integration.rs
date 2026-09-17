@@ -212,6 +212,7 @@ fn run_ingress(
 fn descriptor_of(ingress: &AuthenticatedTransportIngress) -> PartitionDescriptor {
     SecurityPartitionDescriptor::from_verified_ingress(ingress.authentication())
         .to_partition_descriptor()
+        .expect("the verified descriptor projects onto admission input")
 }
 
 fn cache_key(descriptor: &PartitionDescriptor, token: &str) -> CachePartitionKey {
