@@ -4445,6 +4445,82 @@ async fn read_sse_twice(
     outcomes
 }
 
+/// A context whose deadline has already passed, with the cancellation bit never
+/// set. That is what makes the expiry limb distinct from the cancellation limb.
+fn expired_budget_context() -> Cx {
+    Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(asupersync::Time::ZERO))
+}
+
+/// A context cancelled outright, with no deadline involved.
+fn cancelled_budget_context() -> Cx {
+    let budget = Cx::for_testing();
+    budget.set_cancel_requested(true);
+    budget
+}
+
+/// Opens one SSE response, reads its first event under the ambient context, then
+/// reads twice more under `budget`, and returns those two outcomes.
+///
+/// When `endless` is set the server half RETURNS ITS STILL-OPEN SOCKET instead of
+/// closing it, so the response genuinely has no end for the caller to reach.
+/// That is what makes the refusal rows mean something: against a closed stream a
+/// budget refusal is indistinguishable from an ordinary disconnect, which is
+/// exactly the confusion that made me report this case unreachable before.
+///
+/// The budget is a SEPARATE context from the one driving the fixture. Cancelling
+/// the ambient one would take the server half down with the client and the test
+/// would be observing its own teardown.
+async fn stream_reads_under_budget(
+    cx: &Cx,
+    budget: &Cx,
+    endless: bool,
+) -> (
+    Result<Option<String>, ModernHttpExecutorError>,
+    Result<Option<String>, ModernHttpExecutorError>,
+) {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let (held, outcomes) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, b"data: first\n\n").await;
+            if endless {
+                // Deliberately held open: this response never ends.
+                Some(io)
+            } else {
+                end_sse_stream(&mut io).await;
+                None
+            }
+        },
+        async {
+            let response = post(cx, &request)
+                .await
+                .expect("the SSE response head must be admitted");
+            let mut stream = response
+                .into_sse_stream(limits())
+                .expect("an admitted SSE response must convert to an event stream");
+            // Precondition for every row below: the stream really did deliver
+            // before any budget was applied to it.
+            assert_eq!(
+                stream
+                    .next_event(cx)
+                    .await
+                    .expect("the first event must be admitted under a live context")
+                    .expect("the first event must arrive"),
+                "first"
+            );
+            let under_budget = stream.next_event(budget).await;
+            let again = stream.next_event(budget).await;
+            (under_budget, again)
+        },
+    )
+    .await;
+    drop(held);
+    outcomes
+}
+
 async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
     let peer = Peer::bind().await;
     let mut connection = connect(cx, &peer).await;
@@ -4573,6 +4649,32 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
         .await
         .expect("a stream that reaches its terminal must complete");
     assert_eq!(collected.progress_notifications.len(), 3);
+    // -----------------------------------------------------------------------
+    // The caller's budget, side 1 of 5: the LIVE CONTROL.
+    //
+    // A live budget on a stream that ends reports a clean end, and keeps
+    // reporting one. That is the control the two refusal limbs are measured
+    // against, and it is also the contrast for idempotency: a healthy ended
+    // stream repeats Ok(None), where a refused one must repeat a closure.
+    // -----------------------------------------------------------------------
+    let (ended, ended_again) = stream_reads_under_budget(cx, &Cx::for_testing(), false).await;
+    assert!(
+        matches!(ended, Ok(None)),
+        "a live budget on a terminated stream reports a clean end, saw {ended:?}"
+    );
+    assert!(
+        matches!(ended_again, Ok(None)),
+        "a cleanly ended stream keeps reporting a clean end, saw {ended_again:?}"
+    );
+
+    // Side 4 of 5: only the owning stream is affected. A sibling opened on its
+    // own connection still delivers while the endless stream above is being
+    // refused elsewhere in this same test.
+    let peer = Peer::bind().await;
+    let sibling = drain_sse(cx, &peer, b"data: sibling\n\n".to_vec(), limits())
+        .await
+        .expect("a sibling stream must be unaffected by another stream's budget");
+    assert_eq!(sibling, vec!["sibling".to_owned()]);
 }
 
 async fn negative_13_terminal_id_mismatch(cx: &Cx) {
@@ -4714,4 +4816,60 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
         .await
         .expect("the control stream must complete again");
     assert_eq!(restored.progress_notifications.len(), 3);
+    // -----------------------------------------------------------------------
+    // The caller's budget on an ENDLESS response - the criterion's "endless
+    // response without final result" in the form that never ends at all.
+    //
+    // The server holds its socket open, so there is no terminal and no EOF: the
+    // ONLY thing that can end this wait is the caller's own budget. Sides 2, 3
+    // and 5 of the five-sided shape; side 1 (live control) and side 4 (sibling
+    // unaffected) are in the positive.
+    //
+    // I previously reported this case unreachable. That was wrong, and the
+    // reason is worth keeping: I had assumed the only lever was cancelling the
+    // ambient context, which would have taken the fixture's server half down
+    // with the client. A SEPARATE context passed only to the read is the lever,
+    // and it leaves the fixture intact.
+    // -----------------------------------------------------------------------
+
+    // Side 2: the cancellation limb. The sole changed variable against the
+    // control is the budget's cancellation bit.
+    let (cancelled, _) = stream_reads_under_budget(cx, &cancelled_budget_context(), true).await;
+    let cancelled = cancelled
+        .err()
+        .expect("a cancelled budget must end the wait on an endless response");
+    assert!(
+        matches!(cancelled, ModernHttpExecutorError::Cancelled),
+        "cancellation maps to Cancelled, saw {cancelled:?}"
+    );
+
+    // Side 3: the other limb. No cancellation bit is set - only the deadline
+    // has passed - and it must NOT be reported as cancellation. A guard that
+    // read only the cancellation flag would collapse these two into one answer
+    // and a caller could not tell "someone cancelled me" from "I ran out of
+    // time".
+    let (expired, expired_again) =
+        stream_reads_under_budget(cx, &expired_budget_context(), true).await;
+    let expired = expired
+        .err()
+        .expect("an expired budget must end the wait on an endless response");
+    assert!(
+        matches!(expired, ModernHttpExecutorError::Transport(_)),
+        "an expired deadline is a transport-level deadline outcome, saw {expired:?}"
+    );
+    assert!(
+        !matches!(expired, ModernHttpExecutorError::Cancelled),
+        "the expiry limb must be distinguishable from the cancellation limb"
+    );
+
+    // Side 5: idempotency. The stream was closed by the refusal, so reading it
+    // again must keep saying so - never an event, and never the Ok(None) that
+    // the live control produces, which a caller reads as "the server finished".
+    let closed = expired_again
+        .err()
+        .expect("a budget-refused stream must not answer a second read with a clean end");
+    assert!(
+        matches!(closed, ModernHttpExecutorError::SseStreamClosed),
+        "a refused stream must report itself closed on every later read, saw {closed:?}"
+    );
 }
