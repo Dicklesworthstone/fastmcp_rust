@@ -367,7 +367,7 @@ mod tests {
 
     fn filter() -> SubscriptionFilter {
         serde_json::from_value(json!({
-            "resources": ["file:///tmp/watched", "file:///tmp/also-requested"],
+            "resourceSubscriptions": ["file:///tmp/watched", "file:///tmp/also-requested"],
             "toolsListChanged": true,
         }))
         .unwrap()
@@ -511,7 +511,7 @@ mod tests {
 
     const ACK: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",",
-        "\"params\":{\"requestId\":7,\"notifications\":{\"resources\":[\"file:///tmp/watched\"]}}}\n\n"
+        "\"params\":{\"requestId\":7,\"notifications\":{\"resourceSubscriptions\":[\"file:///tmp/watched\"]}}}\n\n"
     );
     const UPDATE: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
@@ -630,8 +630,11 @@ mod tests {
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
             let accepted = subscription.accepted_filter().unwrap();
-            assert_eq!(accepted.resources, vec!["file:///tmp/watched".to_owned()]);
-            assert!(!accepted.tools_list_changed);
+            assert_eq!(
+                accepted.resource_subscriptions,
+                Some(vec!["file:///tmp/watched".to_owned()])
+            );
+            assert_eq!(accepted.tools_list_changed, None);
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Notification { .. })));
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
@@ -785,8 +788,8 @@ mod tests {
             assert!(subscription.is_closed());
             assert!(matches!(subscription.next_event(&cx).await,
                 Err(ClientCredentialsCoreSubscriptionError::Closed)));
-            assert!(!subscription.cancellation.is_cancelled());
-            assert!(!subscription.owner.is_cancelled());
+            assert!(!subscription.cancellation.is_cancel_requested());
+            assert!(!subscription.owner.is_cancel_requested());
             peer.join().unwrap();
         });
     }
