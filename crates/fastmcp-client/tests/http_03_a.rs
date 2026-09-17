@@ -3210,6 +3210,37 @@ fn blank_line_then_terminal(leading_empty_data: bool) -> Vec<u8> {
     body
 }
 
+/// The text carried by the terminal the `event`-field pair uses.
+const EVENT_DECODER_TEXT: &[u8] = b"event-decoder-inert";
+
+/// Base64 of exactly the bytes `terminal_with_raw_text(EVENT_DECODER_TEXT)`
+/// produces. Computed offline and frozen here, because this crate has no base64
+/// dependency and adding one to host a fixture would be scope the bead did not
+/// ask for.
+///
+/// This is what makes the planted negative mean something. If the client ever
+/// selected a decoder from the `event` field, decoding this would yield an
+/// admissible, correctly correlated terminal and the negative would PASS. Its
+/// failure is therefore evidence that no decode happened, not merely that some
+/// bytes were unparseable.
+const EVENT_DECODER_BASE64: &[u8] =
+    b"eyJqc29ucnBjIjoiMi4wIiwiaWQiOjIsInJlc3VsdCI6eyJyZXN1bHRUeXBlIjoiY29tcGxldGUiLCJjb250ZW50Ijp\
+beyJ0eXBlIjoidGV4dCIsInRleHQiOiJldmVudC1kZWNvZGVyLWluZXJ0In1dLCJpc0Vycm9yIjpmYWxzZX19";
+
+/// Builds one event whose `event` field names an encoding and whose `data` line
+/// carries `payload`.
+///
+/// The `event` line is byte-identical across both halves of the pair, so the
+/// only thing that ever differs is the payload.
+fn event_typed_as_base64(payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"event: base64\n");
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(payload);
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
 async fn positive_10_comments_and_inert_fields(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -3354,6 +3385,25 @@ async fn positive_10_comments_and_inert_fields(cx: &Cx) {
         matches!(event, ModernHttpFinalCoreEvent::Terminal(_)),
         "a blank no-data line dispatches nothing, so the terminal arrives first"
     );
+    // -----------------------------------------------------------------------
+    // The `event` field selects nothing, part 1: it is inert, not harmful.
+    //
+    // A stream that declares `event: base64` and then sends ordinary JSON must
+    // still be admitted. Without this half, the negative below would also pass
+    // against a client that simply refused every stream carrying an `event`
+    // field it did not recognise.
+    // -----------------------------------------------------------------------
+    let plain = terminal_with_raw_text(EVENT_DECODER_TEXT);
+    assert_eq!(
+        EVENT_DECODER_BASE64.len(),
+        4 * plain.len().div_ceil(3),
+        "the frozen base64 literal must still correspond to the plain terminal it encodes"
+    );
+    let event = listen_to_sse_body(cx, event_typed_as_base64(&plain))
+        .await
+        .expect("an unrecognised event field must not refuse an ordinary JSON payload")
+        .expect("the terminal must arrive");
+    assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
 async fn negative_10_eof_without_blank_line(cx: &Cx) {
@@ -3496,6 +3546,44 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
         .await
         .expect("the control stream must be admitted again")
         .expect("the terminal must arrive");
+    assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
+    // -----------------------------------------------------------------------
+    // The `event` field selects nothing, part 2. The sole changed variable is
+    // the payload's ENCODING: the control's plain JSON becomes its own base64
+    // text, under a byte-identical `event: base64` line.
+    //
+    // The contract says the client must "never ... select a decoder from
+    // `event`". A client that honoured the field would decode this back into
+    // exactly the control's terminal - correlated, admissible, indistinguishable
+    // from a real result - and hand it to the caller as a completed call. That
+    // is a WRONG SUCCESS, so it cannot be caught by any case that only checks
+    // for refusals elsewhere.
+    //
+    // Admission must therefore fail on the base64 text as received.
+    // -----------------------------------------------------------------------
+    let refusal = listen_to_sse_body(cx, event_typed_as_base64(EVENT_DECODER_BASE64))
+        .await
+        .err()
+        .expect("a base64 payload must not be decoded because an event field named it");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpFinalCoreListenError::JsonRpcAdmission(_)
+                | ModernHttpFinalCoreListenError::NotificationAdmission(_)
+        ),
+        "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
+    );
+
+    // Unchanged state: the plain-JSON control is admitted again afterwards, so
+    // the refusal came from the payload's encoding and not from the event field
+    // having poisoned the stream.
+    let restored = listen_to_sse_body(
+        cx,
+        event_typed_as_base64(&terminal_with_raw_text(EVENT_DECODER_TEXT)),
+    )
+    .await
+    .expect("the plain-JSON control must be admitted again")
+    .expect("the terminal must arrive");
     assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
