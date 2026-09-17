@@ -51,25 +51,63 @@ pub struct SseLimits {
     line_bytes: usize,
     event_bytes: usize,
     keepalive_lines: usize,
+    data_lines: usize,
 }
 
 impl SseLimits {
     /// Constructs bounds. Every ceiling must be nonzero; a zero bound would
     /// make the parser silently reject all input rather than fail closed at
     /// configuration time.
+    ///
+    /// The data-line-per-event ceiling is left UNBOUNDED here, not defaulted to
+    /// LIMIT-01's floor. This type documents that its frozen numeric ceilings
+    /// "belong to the central bounds package and must be wired in explicitly by
+    /// the integration layer, never assumed ambiently by this parser", and
+    /// baking 4,096 into this constructor would be exactly that assumption - it
+    /// would also start refusing streams that every existing caller of this
+    /// three-argument form accepts today. Callers that want the bound ask for it
+    /// through [`Self::with_data_lines`].
     #[must_use]
     pub const fn new(
         max_line_bytes: usize,
         max_event_bytes: usize,
         max_keepalive_lines: usize,
     ) -> Option<Self> {
-        if max_line_bytes == 0 || max_event_bytes == 0 || max_keepalive_lines == 0 {
+        Self::with_data_lines(
+            max_line_bytes,
+            max_event_bytes,
+            max_keepalive_lines,
+            usize::MAX,
+        )
+    }
+
+    /// Constructs bounds including the maximum number of `data` fields one
+    /// event may carry.
+    ///
+    /// This is the bound LIMIT-01 names `sse-data-lines-per-event`
+    /// (guarded 4,096, hard 65,536, unit LINES). It is not redundant with the
+    /// event byte budget: 65,537 empty `data:` lines cost six octets each -
+    /// under 400 KiB - and sit far below any byte ceiling while assembling a
+    /// payload of 65,536 line feeds. Counting octets alone does not bound that.
+    #[must_use]
+    pub const fn with_data_lines(
+        max_line_bytes: usize,
+        max_event_bytes: usize,
+        max_keepalive_lines: usize,
+        max_data_lines: usize,
+    ) -> Option<Self> {
+        if max_line_bytes == 0
+            || max_event_bytes == 0
+            || max_keepalive_lines == 0
+            || max_data_lines == 0
+        {
             return None;
         }
         Some(Self {
             line_bytes: max_line_bytes,
             event_bytes: max_event_bytes,
             keepalive_lines: max_keepalive_lines,
+            data_lines: max_data_lines,
         })
     }
 
@@ -92,6 +130,13 @@ impl SseLimits {
     #[must_use]
     pub const fn max_keepalive_lines(&self) -> usize {
         self.keepalive_lines
+    }
+
+    /// Maximum `data` fields one assembled event may carry, counted in LINES
+    /// and enforced independently of both byte budgets.
+    #[must_use]
+    pub const fn max_data_lines(&self) -> usize {
+        self.data_lines
     }
 }
 
@@ -124,6 +169,11 @@ pub enum SseParseError {
     /// Too many consecutive non-dispatching lines arrived between events.
     KeepaliveFlood {
         /// The configured consecutive non-dispatching line ceiling.
+        limit_lines: usize,
+    },
+    /// One assembled event carried more `data` fields than its ceiling allows.
+    TooManyDataLines {
+        /// The configured `data`-fields-per-event ceiling, in lines.
         limit_lines: usize,
     },
     /// The parser already refused earlier input and holds no state.
@@ -159,6 +209,9 @@ impl fmt::Display for SseParseError {
                     "SSE stream exceeds {limit_lines} consecutive non-dispatching lines"
                 )
             }
+            Self::TooManyDataLines { limit_lines } => {
+                write!(formatter, "SSE event exceeds {limit_lines} data fields")
+            }
             Self::Poisoned => formatter.write_str("SSE parser already refused earlier input"),
         }
     }
@@ -187,6 +240,8 @@ pub struct BoundedSseParser {
     data: String,
     /// Raw octets contributed by the current event's `data` lines.
     event_raw_bytes: usize,
+    /// `data` fields accumulated into the current event, counted in lines.
+    event_data_lines: usize,
     /// Consecutive non-dispatching lines since the last dispatch/data line.
     keepalive_lines: usize,
     poisoned: bool,
@@ -203,6 +258,7 @@ impl BoundedSseParser {
             bom_window_open: true,
             data: String::new(),
             event_raw_bytes: 0,
+            event_data_lines: 0,
             keepalive_lines: 0,
             poisoned: false,
         }
@@ -314,6 +370,7 @@ impl BoundedSseParser {
         self.raw_line = Vec::new();
         self.data = String::new();
         self.event_raw_bytes = 0;
+        self.event_data_lines = 0;
         self.keepalive_lines = 0;
         self.poisoned = true;
         error
@@ -375,6 +432,7 @@ impl BoundedSseParser {
                 payload.pop();
             }
             self.event_raw_bytes = 0;
+            self.event_data_lines = 0;
             self.keepalive_lines = 0;
             return accept(payload)
                 .map_err(|error| {
@@ -406,9 +464,23 @@ impl BoundedSseParser {
                     },
                 )));
             }
+            // Counted in LINES, after the byte budgets, and independently of
+            // them. A byte overflow therefore keeps its own typed refusal, and
+            // this bound only decides events the byte budgets would admit -
+            // which is the whole reason it exists, since empty `data:` fields
+            // cost six octets each and never approach a byte ceiling.
+            let lines_after = self.event_data_lines.saturating_add(1);
+            if lines_after > self.limits.data_lines {
+                return Err(SsePushError::Parse(self.poison(
+                    SseParseError::TooManyDataLines {
+                        limit_lines: self.limits.data_lines,
+                    },
+                )));
+            }
             self.data.push_str(value);
             self.data.push('\n');
             self.event_raw_bytes = raw_after;
+            self.event_data_lines = lines_after;
             self.keepalive_lines = 0;
             return Ok(false);
         }

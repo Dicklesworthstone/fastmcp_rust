@@ -3757,6 +3757,35 @@ const LIMIT_01_SSE_LINE_HARD: usize = 33_554_440;
 const LIMIT_01_SSE_EVENT_GUARDED: usize = 9_437_184;
 const LIMIT_01_SSE_EVENT_HARD: usize = 37_748_736;
 
+/// LIMIT-01's `sse-data-lines-per-event` floors, transcribed. Unit is LINES.
+const LIMIT_01_SSE_DATA_LINES_GUARDED: usize = 4_096;
+const LIMIT_01_SSE_DATA_LINES_HARD: usize = 65_536;
+
+/// Raw octets of one `data:x` line including its terminator.
+const DATA_LINE_OCTETS: usize = 7;
+
+/// Builds one event carrying `data_lines` `data:x` fields.
+///
+/// Each line is six charged octets and contributes one decoded byte plus its
+/// appended LF, so a body built here stays far below every byte budget no
+/// matter how many lines it has. That is the point: only a line COUNT can
+/// refuse it.
+fn data_line_event(data_lines: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    for _ in 0..data_lines {
+        body.extend_from_slice(b"data:x\n");
+    }
+    body.extend_from_slice(b"\n");
+    body
+}
+
+/// The limits used by the data-line rows, with the ceiling under test supplied
+/// by the caller and every other bound held generous and identical.
+fn data_line_limits(max_data_lines: usize) -> SseLimits {
+    SseLimits::with_data_lines(4_096, 65_536, 64, max_data_lines)
+        .expect("data-line limits must construct")
+}
+
 async fn positive_11_bounds(cx: &Cx) {
     // Line ceiling, exactly N. A 4_090-octet payload makes a `data: ` line of
     // 4_096 raw octets against a 4_096-octet line ceiling: N+6 charged octets,
@@ -3946,6 +3975,78 @@ async fn positive_11_bounds(cx: &Cx) {
         assert_eq!(limits.max_line_bytes(), line);
         assert_eq!(limits.max_event_bytes(), event);
         assert_eq!(limits.max_keepalive_lines(), 64);
+    }
+    // -----------------------------------------------------------------------
+    // LIMIT-01 `sse-data-lines-per-event`, side 1 of 5: the LIVE CONTROL.
+    //
+    // This bound did not exist before this commit. It is not redundant with the
+    // byte budgets: an empty `data:` field costs six octets, so tens of
+    // thousands of them assemble a payload of pure line feeds while sitting far
+    // under any byte ceiling. Counting octets alone does not bound that.
+    // -----------------------------------------------------------------------
+    let guarded = data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED);
+    assert!(
+        guarded.len() < 65_536,
+        "the control body must stay under the event byte budget so only the \
+         line count can ever decide it"
+    );
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        guarded,
+        data_line_limits(LIMIT_01_SSE_DATA_LINES_GUARDED),
+    )
+    .await
+    .expect("an event at exactly the data-line ceiling must be admitted");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(
+        payloads[0].len(),
+        2 * LIMIT_01_SSE_DATA_LINES_GUARDED - 1,
+        "N data fields join with N-1 inserted line feeds and one removed at dispatch"
+    );
+
+    // Side 3 of 5: THE OTHER LIMB. The same N+1 body the negative refuses is
+    // ADMITTED once only the ceiling changes to LIMIT-01's hard floor. So the
+    // refusal there is the ceiling's doing and not the body's, and the byte
+    // budgets - which are identical across both rows - are not what decided it.
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED + 1),
+        data_line_limits(LIMIT_01_SSE_DATA_LINES_HARD),
+    )
+    .await
+    .expect("the guarded floor is not the hard floor");
+    assert_eq!(payloads.len(), 1);
+
+    // Non-regression, and the reason `new` was left alone: the three-argument
+    // constructor gained NO ambient bound. It reports the ceiling as unbounded
+    // and still admits a body that the guarded floor refuses, so no existing
+    // caller of `new` starts refusing a stream it accepts today.
+    assert_eq!(
+        limits().max_data_lines(),
+        usize::MAX,
+        "SseLimits::new must not assume LIMIT-01's floor ambiently"
+    );
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED + 1),
+        limits(),
+    )
+    .await
+    .expect("a stream admitted before this bound existed must still be admitted");
+    assert_eq!(payloads.len(), 1);
+
+    // The configuration surface carries both floors and reports them back.
+    for ceiling in [
+        LIMIT_01_SSE_DATA_LINES_GUARDED,
+        LIMIT_01_SSE_DATA_LINES_HARD,
+    ] {
+        assert_eq!(data_line_limits(ceiling).max_data_lines(), ceiling);
     }
 }
 
@@ -4140,6 +4241,96 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     assert_eq!(restored.max_line_bytes(), LIMIT_01_SSE_LINE_GUARDED);
     assert_eq!(restored.max_event_bytes(), LIMIT_01_SSE_EVENT_GUARDED);
     assert_eq!(restored.max_keepalive_lines(), 64);
+    // -----------------------------------------------------------------------
+    // LIMIT-01 `sse-data-lines-per-event`, sides 2, 4 and 5 of 5.
+    //
+    // Side 2 - THE REFUSAL. The sole changed variable against the control is ONE
+    // MORE `data` LINE. Every byte budget is identical and the body is nowhere
+    // near any of them, which the assertions below pin rather than assume, so
+    // the line count is the only thing that can have refused it.
+    // -----------------------------------------------------------------------
+    let over = data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED + 1);
+    assert_eq!(
+        over.len(),
+        (LIMIT_01_SSE_DATA_LINES_GUARDED + 1) * DATA_LINE_OCTETS + 1,
+        "the planted body is exactly one data line longer than the control"
+    );
+    assert!(
+        over.len() < 65_536,
+        "the planted body stays under the event byte budget"
+    );
+    let peer = Peer::bind().await;
+    let refusal = drain_sse(
+        cx,
+        &peer,
+        over,
+        data_line_limits(LIMIT_01_SSE_DATA_LINES_GUARDED),
+    )
+    .await
+    .err()
+    .expect("one data line over the ceiling must be refused");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::SseParse(SseParseError::TooManyDataLines { limit_lines })
+                if limit_lines == LIMIT_01_SSE_DATA_LINES_GUARDED
+        ),
+        "expected a typed data-line refusal naming the ceiling, saw {refusal:?}"
+    );
+    peer.assert_no_further_connection();
+
+    // Fail closed at construction, on the new dimension only: the accepted
+    // quadruple is LIMIT-01's guarded ceilings and the sole change is a zero
+    // data-line count.
+    assert!(
+        SseLimits::with_data_lines(4_096, 65_536, 64, LIMIT_01_SSE_DATA_LINES_GUARDED).is_some(),
+        "the unmutated quadruple must construct"
+    );
+    assert!(
+        SseLimits::with_data_lines(4_096, 65_536, 64, 0).is_none(),
+        "a zero data-line ceiling must be refused at construction, not carried into a parser"
+    );
+
+    // Side 5 - IDEMPOTENCY. The refusal closed the stream, so a later read must
+    // keep saying so rather than resuming or reporting the clean end that a
+    // caller reads as "the server finished".
+    let peer = Peer::bind().await;
+    let (first, second) = read_sse_twice(
+        cx,
+        &peer,
+        data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED + 1),
+        data_line_limits(LIMIT_01_SSE_DATA_LINES_GUARDED),
+    )
+    .await;
+    assert!(
+        matches!(
+            first.err().expect("the first read must refuse"),
+            ModernHttpExecutorError::SseParse(SseParseError::TooManyDataLines { .. })
+        ),
+        "the first read carries the typed data-line refusal"
+    );
+    assert!(
+        matches!(
+            second
+                .err()
+                .expect("the second read must not deliver a clean end"),
+            ModernHttpExecutorError::SseStreamClosed
+        ),
+        "a refused stream reports itself closed on every later read"
+    );
+
+    // Side 4 - STILL USABLE AFTER REFUSAL. A fresh stream at exactly the
+    // ceiling is admitted again, so the refusal closed only its own response.
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        data_line_event(LIMIT_01_SSE_DATA_LINES_GUARDED),
+        data_line_limits(LIMIT_01_SSE_DATA_LINES_GUARDED),
+    )
+    .await
+    .expect("the unmutated control must be admitted again");
+    assert_eq!(payloads.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
