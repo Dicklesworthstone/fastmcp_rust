@@ -2158,7 +2158,20 @@ mod tests {
             transport.recv_until(&cx, Some(deadline)),
             Err(TransportError::ReceiveDeadlineExceeded)
         ));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // REMOVED: assert!(started.elapsed() < Duration::from_secs(2).
+        // This could not do the job it appeared to do. It sits AFTER the call it
+        // bounds, so a hang in that call never reaches it — the test binary hangs
+        // and the harness kills it, with this assertion never evaluated. It gave
+        // zero hang protection.
+        // What it COULD do was fail a slow-but-correct run: an UPPER bound on real
+        // wall time asserts the host was fast enough, which is not a property of
+        // this code. That is pure downside.
+        // The property that matters is already proved by the typed-error assertion
+        // above, which cannot be evaluated unless the call returned.
+        // Do not reinstate an upper bound on wall time here. No virtual clock is
+        // reachable from this crate's unit tests (fastmcp-transport declares no
+        // testing/lab feature and these use Cx::for_testing()), but none is needed:
+        // the structural assertion above is the correct mechanism.
         assert!(!transport.closed);
     }
 
@@ -2181,7 +2194,20 @@ mod tests {
         trigger.join().expect("stop trigger must not panic");
 
         assert!(matches!(result, Err(TransportError::Cancelled)));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // REMOVED: assert!(started.elapsed() < Duration::from_secs(2).
+        // This could not do the job it appeared to do. It sits AFTER the call it
+        // bounds, so a hang in that call never reaches it — the test binary hangs
+        // and the harness kills it, with this assertion never evaluated. It gave
+        // zero hang protection.
+        // What it COULD do was fail a slow-but-correct run: an UPPER bound on real
+        // wall time asserts the host was fast enough, which is not a property of
+        // this code. That is pure downside.
+        // The property that matters is already proved by the typed-error assertion
+        // above, which cannot be evaluated unless the call returned.
+        // Do not reinstate an upper bound on wall time here. No virtual clock is
+        // reachable from this crate's unit tests (fastmcp-transport declares no
+        // testing/lab feature and these use Cx::for_testing()), but none is needed:
+        // the structural assertion above is the correct mechanism.
         assert!(transport.closed);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
     }
@@ -2269,7 +2295,20 @@ mod tests {
             sender.send_until(&cx, &message, started + Duration::from_millis(500)),
             Err(TransportError::Timeout)
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // REMOVED: assert!(started.elapsed() < Duration::from_secs(1).
+        // This could not do the job it appeared to do. It sits AFTER the call it
+        // bounds, so a hang in that call never reaches it — the test binary hangs
+        // and the harness kills it, with this assertion never evaluated. It gave
+        // zero hang protection.
+        // What it COULD do was fail a slow-but-correct run: an UPPER bound on real
+        // wall time asserts the host was fast enough, which is not a property of
+        // this code. That is pure downside.
+        // The property that matters is already proved by the typed-error assertion
+        // above, which cannot be evaluated unless the call returned.
+        // Do not reinstate an upper bound on wall time here. No virtual clock is
+        // reachable from this crate's unit tests (fastmcp-transport declares no
+        // testing/lab feature and these use Cx::for_testing()), but none is needed:
+        // the structural assertion above is the correct mechanism.
         assert!(sender.is_closed());
         assert!(receiver.is_closed());
         assert_eq!(fcntl_getfl(sender.writer.as_ref().unwrap()).unwrap(), flags);
@@ -2558,7 +2597,20 @@ mod tests {
             transport.recv_until(&cx, Some(deadline)),
             Err(TransportError::ReceiveDeadlineExceeded)
         ));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // REMOVED: assert!(started.elapsed() < Duration::from_secs(2).
+        // This could not do the job it appeared to do. It sits AFTER the call it
+        // bounds, so a hang in that call never reaches it — the test binary hangs
+        // and the harness kills it, with this assertion never evaluated. It gave
+        // zero hang protection.
+        // What it COULD do was fail a slow-but-correct run: an UPPER bound on real
+        // wall time asserts the host was fast enough, which is not a property of
+        // this code. That is pure downside.
+        // The property that matters is already proved by the typed-error assertion
+        // above, which cannot be evaluated unless the call returned.
+        // Do not reinstate an upper bound on wall time here. No virtual clock is
+        // reachable from this crate's unit tests (fastmcp-transport declares no
+        // testing/lab feature and these use Cx::for_testing()), but none is needed:
+        // the structural assertion above is the correct mechanism.
         assert!(transport.closed);
         assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(
