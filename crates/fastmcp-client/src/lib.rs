@@ -2735,8 +2735,16 @@ pub(crate) fn combine_operation_and_cleanup<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(mark_cleanup_unverified(cleanup_error)),
+        // A composed failure elects the OPERATION's terminal code. The operation
+        // is what the caller asked for, so its classification -- cancellation,
+        // timeout, protocol -- is the one that has to survive; a hardcoded
+        // InternalError erased it at the exact point where two failures meet,
+        // which is where the distinction matters most. This is the same election
+        // `execution.rs` already performs for deadlines. The cleanup failure is
+        // not demoted in exchange: it still owns the message, and the unverified
+        // marker below still tells the caller the teardown was never confirmed.
         (Err(operation_error), Err(cleanup_error)) => Err(McpError::with_data(
-            McpErrorCode::InternalError,
+            operation_error.code,
             format!("Client cleanup failed after an operation failure: {cleanup_error}"),
             serde_json::json!({
                 CLEANUP_UNVERIFIED_DATA_KEY: true,
