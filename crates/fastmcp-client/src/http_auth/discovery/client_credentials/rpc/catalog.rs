@@ -11,6 +11,9 @@
 //! fences in-flight collections after a subscription gap or local policy change.
 //! This is uncached discovery, not server-side snapshot isolation or replay.
 
+/// Subscription-driven, bounded reconciliation of complete machine catalogs.
+pub mod watch;
+
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
