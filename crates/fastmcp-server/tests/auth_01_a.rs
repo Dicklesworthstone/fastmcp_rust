@@ -734,6 +734,22 @@ fn auth_01_a_admission_does_not_license_a_later_in_band_credential() {
 ///
 /// The empty body is the discriminator. Asserting only the status would let a
 /// server collapse both limbs into one diagnostic and still pass.
+///
+/// DO NOT DELETE THIS AS UNREACHABLE. There are two independent defenses and
+/// this one is the inner. The wire codec (`fastmcp-transport/src/http.rs:2774`)
+/// lowercases every field name and then refuses a repeated one with
+/// `HttpError::InvalidHeader("duplicate header: ..")` — its comment is explicit
+/// that "duplicated singletons must remain an admission failure". So a request
+/// arriving over a socket never reaches the extractor's `singleton` check, and
+/// it is tempting to conclude this case cannot happen.
+///
+/// It can. `HttpRequest` is a public struct with public fields, and
+/// `handle_async` accepts one directly, so an in-process consumer composes the
+/// map without the codec ever running. That is a shipped path, not a synthetic
+/// one. Proving only the outer defense would leave the extractor free to start
+/// resolving ambiguity the day the codec's normalization changes — which is the
+/// same defense-in-depth argument that keeps a second check meaningful even
+/// when an earlier one usually fires first.
 #[test]
 fn auth_01_a_ambiguous_authorization_headers_are_refused_before_any_provider_call() {
     run_auth_01_scenario(|cx| async move {
