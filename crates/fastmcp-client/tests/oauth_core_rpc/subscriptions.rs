@@ -320,17 +320,37 @@ fn run_subscription(case: SubscriptionCase) {
                     }
                     let server = async {
                         let mut tls = subscription_stream(&peer, 41).await;
+                        chunk(&mut tls, &[r#"{"jsonrpc":"2.0","id":41,"error":{"code":-32603,"message":"peer-error-canary"}}"#.to_owned()], true).await;
+                    };
+                    let application = async {
+                        let mut listener = session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()).await.unwrap();
+                        let error = listener.next_event(&cx).await.err().unwrap();
+                        assert!(matches!(error, ManagedSubscriptionError::Remote { .. }), "unexpected subscription error: {error:?}");
+                        assert!(!format!("{error:?} {error}").contains("typed-access"));
+                        assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
+                        assert!(listener.accepted_filter().is_none());
+                        assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
+                    };
+                    pair(server, application).await;
+                    // The same peer error with the actual bearer must be withheld
+                    // by HTTP before it can become a subscription Remote error.
+                    let server = async {
+                        let mut tls = subscription_stream(&peer, 41).await;
                         chunk(&mut tls, &[r#"{"jsonrpc":"2.0","id":41,"error":{"code":-32603,"message":"typed-access peer-error-canary"}}"#.to_owned()], true).await;
                     };
                     let application = async {
                         let mut listener = session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()).await.unwrap();
                         let error = listener.next_event(&cx).await.err().unwrap();
-                        assert!(matches!(error, ManagedSubscriptionError::Remote { .. }));
+                        assert!(matches!(error, ManagedSubscriptionError::Session(
+                            OAuthSessionError::Http(fastmcp_client::http_executor::ModernHttpExecutorError::CredentialInPeerError)
+                        )));
                         assert!(!format!("{error:?} {error}").contains("typed-access"));
                         assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
+                        assert!(listener.accepted_filter().is_none());
+                        assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                     };
                     pair(server, application).await;
-                    assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 6);
+                    assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 7);
                 }
             } }).await;
             assert_eq!(peer.token_posts.load(Ordering::SeqCst), 1, "stream failures must not renew or replay a grant");
