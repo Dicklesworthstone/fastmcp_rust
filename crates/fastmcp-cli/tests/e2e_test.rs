@@ -1412,9 +1412,30 @@ fn loopback_fixture_timeout_acknowledges_before_settled_join() {
         completion.is_err(),
         "absent loopback client must fail the fixture"
     );
+    // ILLUSORY GUARD — retained deliberately, and it does NOT protect this path.
+    //
+    // This assertion sits AFTER the `.join()` above. In the failure it names — a
+    // fixture that never acknowledges and never settles — `.join()` blocks
+    // forever, the harness kills the binary, and this line is never evaluated.
+    // It is structurally incapable of observing that hang. What it CAN do is
+    // fail a slow-but-correct run, because 2500 ms of real wall time on a
+    // loaded host is not a property of this code.
+    //
+    // It is left here rather than removed because removing it would be
+    // technically accurate and would erase the only signal that somebody once
+    // judged protection necessary on this path. Nothing else bounds it: unlike
+    // the sibling fixture cases in this file, there is no `wait_until` behind
+    // the join.
+    //
+    // KNOWN GAP: this path needs a real bounded wait — a join with a deadline
+    // that distinguishes "the harness deadline expired" from "the fixture
+    // failed", as `run_with_deadline` does for the subprocess cases below.
+    // Until then this assertion is a marker, not a guard, and a green here does
+    // not mean the acknowledgement was bounded.
     assert!(
         started.elapsed() < LOOPBACK_FIXTURE_ACK_DEADLINE,
-        "absent loopback client must fail within the fixture deadline"
+        "absent loopback client must fail within the fixture deadline \
+         (ILLUSORY GUARD: cannot fire on a hang; see comment above)"
     );
 }
 
@@ -3032,13 +3053,18 @@ fn reality_check_regression_compiled_stdio_server_exits_when_worker_output_fails
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n")
         .expect("request reaches compiled fixture");
     stdin.flush().expect("request flushes");
-    let started = Instant::now();
     let status = guard
         .wait_until(Duration::from_secs(10))
         .unwrap_or_else(|timeout| panic!("compiled fixture did not stop: {timeout:?}"));
 
     assert!(!status.success());
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // No wall-clock upper bound here. `wait_until(Duration::from_secs(10))` above
+    // already bounds this: reaching this line at all entails it returned inside
+    // 10s, and a hang fires its `unwrap_or_else` panic instead — so an
+    // `assert!(started.elapsed() < …)` here was both redundant and structurally
+    // unable to observe the hang it named, while remaining able to fail a
+    // slow-but-correct run. The guard lives in `wait_until`. Do not reinstate an
+    // upper bound on wall time here.
     drop(stdin);
 }
 
@@ -3100,7 +3126,6 @@ fn reality_check_regression_compiled_stdio_server_bounds_unread_output_pipe() {
     }
     stdin.flush().expect("saturation requests flush");
 
-    let started = Instant::now();
     let wait_result = guard.wait_until(Duration::from_secs(10));
     let mut stdout = Vec::new();
     unread_stdout
@@ -3121,7 +3146,11 @@ fn reality_check_regression_compiled_stdio_server_bounds_unread_output_pipe() {
         "stdout saturation unexpectedly succeeded; stderr_error={stderr_error:?}; stderr={}",
         String::from_utf8_lossy(&stderr)
     );
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // No wall-clock upper bound here, for the same reason as the sibling case
+    // above: `guard.wait_until(Duration::from_secs(10))` already bounds this run
+    // and panics on a hang, so the removed assertion was redundant and could
+    // never observe the hang it named. The guard lives in `wait_until`. Do not
+    // reinstate an upper bound on wall time here.
     drop(stdin);
 }
 
