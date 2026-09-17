@@ -6,19 +6,24 @@
 #![recursion_limit = "256"]
 
 use asupersync::Cx;
-use fastmcp_core::{McpContext, McpOutcome, McpResult};
+use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult};
 use fastmcp_derive::tool;
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::JsonRpcMessage;
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
+    CompletionValues, Content, FinalCompletionParams, FinalCompletionValues,
+    LegacyCompletionParams, Prompt, PromptMessage, Role,
+};
+use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, SERVER_DISCOVER_METHOD,
 };
 use fastmcp_protocol::{JsonRpcRequest, MAX_SERVER_INSTRUCTIONS_BYTES, ServerDiscoverResult};
 use fastmcp_server::ServerHttpEndpointResponse;
 use fastmcp_server::{
-    FinalToolOutcome, InboundRequestContext, InboundRequestTransport, Server, ToolHandler,
+    CompletionHandler, FinalToolOutcome, InboundRequestContext, InboundRequestTransport,
+    PromptHandler, Server, ToolHandler,
 };
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_server::{HttpServerConfig, ServerHttpEndpointError};
@@ -203,6 +208,71 @@ impl ToolHandler for CallerRuntimeTool {
     }
 }
 
+/// Moves the prompts axis of the capability matrix and nothing else.
+struct MatrixPrompt;
+
+impl PromptHandler for MatrixPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: "matrix_prompt".to_owned(),
+            description: Some("SRV-02 capability-matrix fixture".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    /// Never dispatched by this test: the matrix exercises `prompts/list`, not
+    /// `prompts/get`. Returning one message rather than an error keeps an
+    /// accidental future call legible instead of turning it into a refusal.
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: std::collections::HashMap<String, String>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::text("SRV-02 capability-matrix fixture"),
+        }])
+    }
+}
+
+/// Moves the completions axis. Every `CompletionHandler` method has a default,
+/// so installing this is the smallest thing that can flip
+/// `has_final_completion_handler` and therefore the advertised capability.
+struct MatrixCompletions;
+
+impl CompletionHandler for MatrixCompletions {
+    /// Neither method is dispatched by this test — the completions axis is
+    /// advertisement-variance only, for the reason recorded at its assertions.
+    /// Both return an empty value set rather than an error so that an
+    /// accidental future call is legible instead of looking like a refusal.
+    fn complete_legacy(
+        &self,
+        _ctx: &McpContext,
+        _params: LegacyCompletionParams,
+    ) -> Result<CompletionValues, McpError> {
+        Ok(CompletionValues {
+            values: Vec::new(),
+            total: None,
+            has_more: None,
+        })
+    }
+
+    fn complete_final(
+        &self,
+        _ctx: &McpContext,
+        _params: FinalCompletionParams,
+    ) -> Result<FinalCompletionValues, McpError> {
+        Ok(FinalCompletionValues {
+            values: Vec::new(),
+            total: None,
+            has_more: None,
+        })
+    }
+}
+
 fn public_catalog_snapshot(server: &Server) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "info": server.info(),
@@ -366,6 +436,143 @@ fn srv_02_b_positive() {
         "a server that never advertised tools dispatched one anyway: \
          {unadvertised_names:?}"
     );
+
+    // FULL CAPABILITY-TO-BEHAVIOR MATRIX. The tools axis above established the
+    // principle; the plan's acceptance names completions and prompts
+    // explicitly, and each is a SEPARATE independent derivation inside
+    // server_discovery_behavior_registry, so proving one says nothing about the
+    // others.
+    //
+    // This belongs at the PUBLIC surface specifically. The router's own
+    // cfg(test) suite already asserts "discovery advertises completion only
+    // after the handler is installed" (crates/fastmcp-server/src/router.rs:17437,
+    // inside the cfg(test) region that begins at :9153). Under PL-3 a cfg(test)
+    // assertion cannot prove shipped behavior, which is exactly why the same
+    // property is re-established here through the public builder and the public
+    // discovery surface.
+    //
+    // `first_result` above is the baseline: the SAME name, the SAME instructions
+    // and the SAME registered tool. Only the prompt and completion handler are
+    // added, so each axis below varies alone against it.
+    let matrixed = Server::new("discoverable-server", "1.0.0")
+        .instructions("")
+        .tool(Discoverable)
+        .prompt(MatrixPrompt)
+        .completion_handler(MatrixCompletions)
+        .build();
+
+    // ServerBuilder only logs a rejected handler, so confirm registration
+    // really happened. Otherwise every assertion below passes vacuously.
+    let registered_prompts: Vec<String> = matrixed
+        .prompts()
+        .into_iter()
+        .map(|prompt| prompt.name)
+        .collect();
+    assert!(
+        registered_prompts
+            .iter()
+            .any(|name| name == "matrix_prompt"),
+        "the matrix prompt was not registered: {registered_prompts:?}"
+    );
+
+    let matrix_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 410, InboundRequestTransport::Stdio);
+    let matrix_discover = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        410_i64,
+    );
+    let matrix_result = matrixed
+        .dispatch_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &matrix_inbound,
+            &matrix_discover,
+        )
+        .expect("matrix discovery request has an id")
+        .result
+        .expect("matrix discovery succeeds");
+    let matrix_capabilities = &matrix_result["capabilities"];
+
+    // Prompts axis. Registering a prompt must both add the parent capability
+    // and its exact listChanged sub-capability, and the tool-only baseline must
+    // still omit it entirely rather than carry a false placeholder.
+    assert_eq!(
+        matrix_capabilities["prompts"]["listChanged"],
+        json!(true),
+        "a registered prompt must advertise its exact listChanged sub-capability"
+    );
+    assert!(
+        first_result["capabilities"].get("prompts").is_none(),
+        "the tool-only baseline must omit prompts entirely: {}",
+        first_result["capabilities"]
+    );
+
+    // Completions axis, same contrast against the same baseline.
+    assert!(
+        matrix_capabilities.get("completions").is_some(),
+        "installing a completion handler must advertise completions: {matrix_capabilities}"
+    );
+    assert!(
+        first_result["capabilities"].get("completions").is_none(),
+        "the baseline without a completion handler must omit completions"
+    );
+
+    // Advertised implies dispatchable, prompts edge: the advertisement above
+    // claimed prompts, so prompts/list must actually serve that exact prompt.
+    let prompts_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 411, InboundRequestTransport::Stdio);
+    let prompts_request = JsonRpcRequest::new(
+        "prompts/list",
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        411_i64,
+    );
+    let prompts_response = matrixed
+        .dispatch_with_protocol_policy(
+            ProtocolPolicy::ModernOnly,
+            &prompts_inbound,
+            &prompts_request,
+        )
+        .expect("prompts/list request has an id");
+    assert!(
+        prompts_response.error.is_none(),
+        "discovery advertised prompts but prompts/list refused: {:?}",
+        prompts_response.error
+    );
+    let listed_prompts: Vec<String> = prompts_response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("prompts"))
+        .and_then(serde_json::Value::as_array)
+        .map(|prompts| {
+            prompts
+                .iter()
+                .filter_map(|prompt| prompt.get("name"))
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        listed_prompts.iter().any(|name| name == "matrix_prompt"),
+        "discovery advertised prompts but prompts/list omitted the registered \
+         prompt: {listed_prompts:?}"
+    );
+
+    // Completions is deliberately advertisement-variance only, with no dispatch
+    // cross-check. A valid completion/complete request needs a populated `ref`
+    // naming a prompt or resource template, and building one would make this
+    // assertion about completion argument shapes rather than about the
+    // capability matrix. Recording the limit rather than implying coverage.
 
     let instructionless = Server::new("discoverable-server", "1.0.0")
         .tool(Discoverable)
