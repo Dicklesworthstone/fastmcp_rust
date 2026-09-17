@@ -12,6 +12,9 @@
 //! infer trusted reverse proxies. A proxy must preserve the configured public
 //! Host or pass through its own separately authenticated ingress boundary.
 
+/// Origin-bound entry point to the existing asynchronous HTTP dispatcher.
+pub mod endpoint;
+
 use std::fmt;
 
 use fastmcp_core::CanonicalHttpUrl;
@@ -58,7 +61,7 @@ impl fmt::Debug for HttpSecurityPolicy {
 
 /// Fixed security diagnostics do not reflect request headers, credentials,
 /// attacker-selected origins or body bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HttpSecurityError {
     InvalidPolicy,
     EndpointMismatch,
@@ -71,8 +74,13 @@ pub enum HttpSecurityError {
     InvalidPreflight,
     HeaderNotAllowed,
     BodyNotAllowed,
+    BodyTooLarge,
     ContentLengthMismatch,
     Protocol(ModernPostRejection),
+}
+
+impl fmt::Debug for HttpSecurityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
 }
 
 impl fmt::Display for HttpSecurityError {
@@ -89,6 +97,7 @@ impl fmt::Display for HttpSecurityError {
             Self::InvalidPreflight => "invalid HTTP preflight",
             Self::HeaderNotAllowed => "HTTP preflight header not allowed",
             Self::BodyNotAllowed => "HTTP preflight body not allowed",
+            Self::BodyTooLarge => "HTTP body bound exceeded",
             Self::ContentLengthMismatch => "HTTP content length does not match body",
             Self::Protocol(_) => "modern HTTP protocol admission failed",
         })
@@ -104,6 +113,7 @@ impl HttpSecurityError {
             Self::EndpointMismatch => 404,
             Self::MethodNotAllowed => 405,
             Self::HeaderLimit => 431,
+            Self::BodyTooLarge => 413,
             Self::HostNotAllowed | Self::OriginNotAllowed | Self::HeaderNotAllowed => 403,
             Self::InvalidPolicy => 500,
             _ => 400,
@@ -267,26 +277,33 @@ impl HttpSecurityPolicy {
         &self, method: &str, path: &str, headers: &[(String, String)], body: &[u8],
     ) -> Result<SecuredModernRequest, HttpSecurityError> {
         let head = self.admit_head(method, path, headers)?;
-        if matches!(&head, HttpSecurityHead::Preflight(_)) && !body.is_empty() {
-            return Err(HttpSecurityError::BodyNotAllowed);
-        }
-        if let Some(length) = field(headers, "content-length") {
-            if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit())
-                || length.parse::<usize>().ok() != Some(body.len())
-                || field(headers, "transfer-encoding").is_some()
-            { return Err(HttpSecurityError::ContentLengthMismatch); }
-        }
+        self.validate_body(matches!(&head, HttpSecurityHead::Preflight(_)), headers, body)?;
         match head {
-            HttpSecurityHead::Preflight(response) => {
-                if field(headers, "transfer-encoding").is_some() { return Err(HttpSecurityError::BodyNotAllowed); }
-                Ok(SecuredModernRequest::Preflight(response))
-            }
+            HttpSecurityHead::Preflight(response) => Ok(SecuredModernRequest::Preflight(response)),
             HttpSecurityHead::Post(cors) => {
                 let admitted = admit_modern_post(&self.endpoint, method, path, headers, body)
                     .map_err(HttpSecurityError::Protocol)?;
                 Ok(SecuredModernRequest::Post { admitted, cors })
             }
         }
+    }
+
+    // Shared with the real dispatcher adapter so it need not parse JSON twice
+    // or replace the existing protocol-specific HTTP/JSON-RPC error mapping.
+    fn validate_body(
+        &self, preflight: bool, headers: &[(String, String)], body: &[u8],
+    ) -> Result<(), HttpSecurityError> {
+        if preflight && (!body.is_empty() || field(headers, "transfer-encoding").is_some()) {
+            return Err(HttpSecurityError::BodyNotAllowed);
+        }
+        if body.len() > self.endpoint.limits().max_body_bytes() { return Err(HttpSecurityError::BodyTooLarge); }
+        if let Some(length) = field(headers, "content-length") {
+            if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit())
+                || length.parse::<usize>().ok() != Some(body.len())
+                || field(headers, "transfer-encoding").is_some()
+            { return Err(HttpSecurityError::ContentLengthMismatch); }
+        }
+        Ok(())
     }
 
     fn requested_headers(&self, value: Option<&str>) -> Result<Vec<String>, HttpSecurityError> {
