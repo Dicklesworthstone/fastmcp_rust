@@ -90,6 +90,19 @@ fn prt_03_a_positive() {
         nameless.protocol_version().as_str(),
         FINAL_PROTOCOL_VERSION
     );
+    // The complement, which makes the conditionality a real distinction rather
+    // than a single observation: the SAME absent name mirror that `tools/list`
+    // tolerates is refused for `tools/call`. Without this, "conditional" could
+    // be satisfied by a surface that never requires a name at all.
+    assert_eq!(
+        mismatch_reason(FinalHttpRequestMetadata {
+            header_name: None,
+            body_name: None,
+            ..admissible()
+        }),
+        HeaderMismatchReason::MissingNameHeader,
+        "a method that requires Mcp-Name must refuse the absent mirror that tools/list accepts"
+    );
 
     // Each version-stage mirror rule reports its own exact reason. These are
     // one-variable changes from `admissible()`, so each reason is attributable.
@@ -367,10 +380,18 @@ fn repair(
 
 /// Does the method mirror agree on a method that requires `Mcp-Name`?
 ///
-/// The oracle refuses to guess. It judges only the two methods these cases
-/// use, and both facts are proved independently by `prt_03_a_positive`, which
-/// admits `tools/list` with no name mirror at all and admits `tools/call` only
-/// with one.
+/// The oracle refuses to guess. It judges only the two methods these cases use,
+/// and both facts are proved independently in `prt_03_a_positive`: an absent
+/// name mirror is ADMITTED for `tools/list` and REFUSED with
+/// `MissingNameHeader` for `tools/call`, from the same baseline.
+///
+/// That attribution was wrong when first written: the comment claimed both
+/// facts were proved there while only the `tools/list` half was, and the
+/// `tools/call` half lived in `prt_03_b_positive`'s ladder. A hard-coded
+/// constant whose justification cites the wrong test is unfounded in the way
+/// that matters — a reader checking it looks in the named place, does not find
+/// it, and cannot tell an unproven constant from a misfiled one. Fixed by
+/// supplying the missing observation rather than by softening the claim.
 fn method_requires_name(metadata: &FinalHttpRequestMetadata<'_>) -> bool {
     let (Some(header), Some(body)) = (metadata.header_method, metadata.body_method) else {
         return false;
