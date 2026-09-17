@@ -25,6 +25,16 @@
 //! The inline unit tests at `src/auth.rs` remain in place and are untouched;
 //! they cover the same predicates at the unit level against crate internals.
 
+// Raised for the trait solver: coercing the nested async blocks this target
+// spawns through `Cx::spawn_via_gateway` to `Pin<Box<dyn Future + Send>>`
+// overflows the default limit of 128 on newer rustc. Without this the crate
+// emits a FUTURE-INCOMPATIBLE `recursion_depth_exceeding_limit` warning
+// (rust-lang/rust#159228) that rustc states will become a hard error, and the
+// lint is crate-attached so it cannot be silenced on the one test that trips
+// it. 256 matches the sibling target `srv_02_b.rs`; `fastmcp-server`'s and
+// `fastmcp-client`'s own `src/lib.rs` use 512 for the same reason.
+#![recursion_limit = "256"]
+
 use asupersync::Cx;
 use fastmcp_core::{AuthContext, McpContext, McpError, McpResult};
 use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolPolicy};
