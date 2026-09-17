@@ -104,6 +104,10 @@ pub enum Code {
     WorkspacePolicy,
     /// The checker is not decomposed into bounded, independently tested modules.
     ModuleInventory,
+    /// A supplied manifest digest does not match the manifest bytes.
+    ManifestBindingMismatch,
+    /// Two joined manifests disagree on a fact they must share.
+    ManifestJoinConflict,
 }
 
 impl Code {
@@ -153,6 +157,8 @@ impl Code {
             Self::PackageLabelMapping => "E_FND02_PACKAGE_LABEL_MAPPING",
             Self::WorkspacePolicy => "E_FND02_WORKSPACE_POLICY",
             Self::ModuleInventory => "E_FND02_MODULE_INVENTORY",
+            Self::ManifestBindingMismatch => "E_FND02_MANIFEST_BINDING_MISMATCH",
+            Self::ManifestJoinConflict => "E_FND02_MANIFEST_JOIN_CONFLICT",
         }
     }
 }
@@ -312,6 +318,8 @@ mod tests {
             Code::PackageLabelMapping,
             Code::WorkspacePolicy,
             Code::ModuleInventory,
+            Code::ManifestBindingMismatch,
+            Code::ManifestJoinConflict,
         ];
         let mut rendered: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
         let count = rendered.len();

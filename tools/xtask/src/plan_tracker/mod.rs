@@ -16,6 +16,7 @@ pub mod corpus;
 pub mod diagnostics;
 pub mod digest;
 pub mod fingerprint;
+pub mod integration;
 pub mod manifest;
 pub mod plan;
 pub mod policy;
