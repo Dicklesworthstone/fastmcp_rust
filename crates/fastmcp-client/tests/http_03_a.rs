@@ -1650,6 +1650,51 @@ async fn negative_04_compressed_response(cx: &Cx) {
 // HTTP-03.05 — protocol/method/name routing headers
 // ---------------------------------------------------------------------------
 
+/// The `resources/read` target used by the routing-header pair. The positive
+/// mirrors it; the planted negative empties it and changes nothing else.
+const ROUTING_RESOURCE_URI: &str = "file:///routing/resource.txt";
+
+/// Captures the request head one modern call puts on the wire.
+///
+/// The peer answers with a bounded HTTP failure rather than a result, so what
+/// is asserted never depends on the shape of a per-method result body. The
+/// routing headers are chosen when the request is BUILT; the response cannot
+/// change them.
+async fn capture_request_head(
+    cx: &Cx,
+    method: &str,
+    params: serde_json::Value,
+    request_id: u64,
+) -> Wire {
+    let peer = Peer::bind().await;
+    let mut connection = connect(cx, &peer).await;
+    let (wire, ()) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let wire = read_request(&mut io).await;
+            write_response(
+                &mut io,
+                503,
+                &[("Content-Type", "text/plain")],
+                b"unavailable",
+            )
+            .await;
+            end_stream(&mut io).await;
+            wire
+        },
+        async {
+            // The outcome is deliberately discarded: this fixture observes what
+            // was SENT, and a 503 is the cheapest answer that cannot be
+            // mistaken for a per-method result.
+            let _ = connection
+                .request_json(cx, method, params, RequestId::Number(request_id), 64 * 1024)
+                .await;
+        },
+    )
+    .await;
+    wire
+}
+
 async fn positive_05_routing_headers(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -1692,6 +1737,49 @@ async fn positive_05_routing_headers(cx: &Cx) {
     );
     assert_eq!(exactly_one_header(&wire.head, "Mcp-Method"), "tools/call");
     assert_eq!(exactly_one_header(&wire.head, "Mcp-Name"), "probe_tool");
+    // -----------------------------------------------------------------------
+    // "Method-specific" means the mirror is SELECTED BY METHOD, not bolted on.
+    // Two things the case above cannot show:
+    //
+    //   * a method with no mirror emits NO `Mcp-Name` field line at all - not
+    //     an empty one, not a placeholder;
+    //   * `resources/read` mirrors `uri`, a DIFFERENT body member, through that
+    //     same single header.
+    //
+    // A client that hardcoded `name` passes the tools/call case above and fails
+    // both of these.
+    // -----------------------------------------------------------------------
+    let listed = capture_request_head(cx, "tools/list", serde_json::json!({}), 5).await;
+    assert_eq!(
+        exactly_one_header(&listed.head, "MCP-Protocol-Version"),
+        "2026-07-28"
+    );
+    assert_eq!(exactly_one_header(&listed.head, "Mcp-Method"), "tools/list");
+    assert!(
+        header_values(&listed.head, "mcp-name").is_empty(),
+        "a method with no name mirror must emit no Mcp-Name field line at all"
+    );
+
+    let read = capture_request_head(
+        cx,
+        "resources/read",
+        serde_json::json!({"uri": ROUTING_RESOURCE_URI}),
+        6,
+    )
+    .await;
+    assert_eq!(
+        exactly_one_header(&read.head, "MCP-Protocol-Version"),
+        "2026-07-28"
+    );
+    assert_eq!(
+        exactly_one_header(&read.head, "Mcp-Method"),
+        "resources/read"
+    );
+    assert_eq!(
+        exactly_one_header(&read.head, "Mcp-Name"),
+        ROUTING_RESOURCE_URI,
+        "resources/read mirrors its own `uri` member, not a `name` member"
+    );
 }
 
 async fn negative_05_missing_name_mirror(cx: &Cx) {
@@ -1717,6 +1805,34 @@ async fn negative_05_missing_name_mirror(cx: &Cx) {
                 if method == "tools/call"
         ),
         "expected a typed missing-name refusal, saw {refusal:?}"
+    );
+    // -----------------------------------------------------------------------
+    // The sole changed variable is the mirrored member's value: the
+    // `resources/read` positive's `uri` becomes the empty string.
+    //
+    // The body still carries a perfectly good `name` member. A client that
+    // mirrored `name` regardless of method would route this request happily -
+    // that is precisely the defect this negative exists to catch - so the
+    // refusal has to name `resources/read`, the method whose own member is the
+    // one missing.
+    // -----------------------------------------------------------------------
+    let wrong_member = connection
+        .request_json(
+            cx,
+            "resources/read",
+            serde_json::json!({"uri": "", "name": "routing-resource"}),
+            RequestId::Number(6),
+            64 * 1024,
+        )
+        .await
+        .expect_err("an empty uri cannot be mirrored, and a `name` member must not rescue it");
+    assert!(
+        matches!(
+            &wrong_member,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::MissingRequestName { method })
+                if method == "resources/read"
+        ),
+        "expected a typed missing-name refusal naming resources/read, saw {wrong_member:?}"
     );
     peer.assert_no_further_connection();
 }
