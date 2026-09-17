@@ -8,6 +8,24 @@ use fastmcp_protocol::{
 };
 use serde_json::{Value, json};
 
+/// Projects one behavior registry through the same public construction path the
+/// positive uses, and returns just the advertised capabilities.
+fn capability_wire(behaviors: impl IntoIterator<Item = ServerBehavior>) -> Value {
+    let registry = ServerBehaviorRegistry::from_behaviors(behaviors);
+    let capabilities = ServerDiscoverCapabilities::from_registry(&registry, BTreeMap::new())
+        .expect("a bounded registry projects capabilities");
+    let result = ServerDiscoverResult::new(
+        capabilities,
+        ServerInfo {
+            name: "contract-server".to_owned(),
+            version: "1.0.0".to_owned(),
+        },
+        None,
+        DiscoveryCacheHints::private_ttl_ms(0),
+    );
+    serde_json::to_value(&result).expect("variant result encodes")["capabilities"].clone()
+}
+
 #[test]
 fn srv_02_a_positive() {
     let registry = ServerBehaviorRegistry::from_behaviors([
@@ -77,6 +95,71 @@ fn srv_02_a_positive() {
             .try_as_millis(),
         Ok(u64::MAX),
         "the typed cache-hint field admits its complete nonnegative wire domain"
+    );
+
+    // REGISTRY VARIANCE. Every assertion above runs against a registry holding
+    // EVERY behavior, so together they prove presence-mapping only: a
+    // projection that hard-coded this exact capability shape would satisfy all
+    // of them. These variants each drop one behavior and require the
+    // corresponding capability, or sub-capability, to follow it.
+    //
+    // This is the same defect shape that made the SRV-02 B advertisement
+    // assertions vacuous until they were varied against registration: an
+    // assertion that restates a derivation instead of testing it.
+    let full = wire["capabilities"].clone();
+
+    // A registry with no behaviors at all must advertise no known capability.
+    // Fails against any projection that emits a capability unconditionally.
+    let none = capability_wire([]);
+    for known in ["tools", "resources", "prompts", "completions", "logging"] {
+        assert!(
+            none.get(known).is_none(),
+            "an empty behavior registry advertised {known}: {none}"
+        );
+    }
+    assert_ne!(
+        none, full,
+        "the capability projection does not track the registry at all"
+    );
+
+    // tools/list WITHOUT its notification producer. The parent capability must
+    // appear and its listChanged sub-capability must not be true: each
+    // sub-capability tracks its OWN behavior, not merely the parent's presence.
+    let tools_without_notifications = capability_wire([ServerBehavior::ToolsList]);
+    assert!(
+        tools_without_notifications.get("tools").is_some(),
+        "ToolsList must still advertise the tools capability: {tools_without_notifications}"
+    );
+    assert_ne!(
+        tools_without_notifications["tools"]["listChanged"],
+        json!(true),
+        "listChanged must track its own notification producer rather than the \
+         parent capability: {tools_without_notifications}"
+    );
+
+    // resources WITHOUT subscribe. `resources.subscribe: true` is gated on
+    // subscriptions/listen being able to deliver individual resource updates,
+    // so a registry lacking that must not advertise it.
+    let resources_without_subscribe = capability_wire([
+        ServerBehavior::ResourcesList,
+        ServerBehavior::ResourcesListChangedNotification,
+    ]);
+    assert!(
+        resources_without_subscribe.get("resources").is_some(),
+        "ResourcesList must still advertise the resources capability: \
+         {resources_without_subscribe}"
+    );
+    assert_ne!(
+        resources_without_subscribe["resources"]["subscribe"],
+        json!(true),
+        "subscribe must track its own delivery behavior: {resources_without_subscribe}"
+    );
+
+    // Prompts absent while tools are present, so the two axes are independent
+    // rather than one flag turning on every known capability at once.
+    assert!(
+        tools_without_notifications.get("prompts").is_none(),
+        "a tools-only registry advertised prompts: {tools_without_notifications}"
     );
 
     let mut multi_version_peer = wire;
