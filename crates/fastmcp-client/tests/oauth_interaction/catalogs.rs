@@ -15,6 +15,7 @@ enum CatalogCase {
     AllMethods, CacheHit, Clear, ExternalInvalidation, Metadata, ZeroTtl, Invalidate, Unrelated,
     CursorLoop, Scope, PageLimit, ItemLimit, ByteLimit, NotificationLimit,
     RepeatedId, Cancel, Close, Drop, LateId, Preflight, Renewal,
+    RevokedCache, RevokeBeforePost, ClearBeforePost, RevokeInObserver,
 }
 
 fn isolated_catalog(name: &str, case: CatalogCase) {
@@ -346,6 +347,60 @@ fn run_catalog(case: CatalogCase) {
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
                     assert_eq!(peer.tokens.load(Ordering::SeqCst), 2);
                 }
+                CatalogCase::RevokedCache => {
+                    let ((), result) = pair(Box::pin(pages(&peer, method, 41, 60000, "public")), Box::pin(client.collect(
+                        &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                    ))).await;
+                    assert_complete(&result.unwrap(), method);
+                    let cached = client.collect(&cx, catalog_request(method), || panic!("warm pages need no POST"), |_| Ok(())).await.unwrap();
+                    assert_complete(&cached, method);
+                    let before = client.cache_stats().unwrap();
+                    assert_eq!(before.hits, 2);
+                    let credential = session.credential(&cx).await.unwrap();
+                    credential.credential().revoke();
+                    let result = client.collect(&cx, catalog_request(method), || panic!("revoked cache access must not attempt a POST"), |_| Ok(())).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::CredentialRevoked)));
+                    assert_eq!(client.cache_stats().unwrap(), before, "revocation is checked before lookup or fill");
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
+                }
+                CatalogCase::RevokeBeforePost | CatalogCase::ClearBeforePost => {
+                    let credential = session.credential(&cx).await.unwrap();
+                    let ids = Cell::new(0);
+                    let result = client.collect(&cx, catalog_request(method), || {
+                        ids.set(ids.get() + 1);
+                        if matches!(case, CatalogCase::RevokeBeforePost) { credential.credential().revoke(); }
+                        else { client.clone().clear().unwrap(); }
+                        Ok(RequestId::Number(41))
+                    }, |_| panic!("no peer event before dispatch")).await;
+                    if matches!(case, CatalogCase::RevokeBeforePost) {
+                        assert!(matches!(result, Err(ManagedCatalogError::CredentialRevoked)));
+                    } else {
+                        assert!(matches!(result, Err(ManagedCatalogError::Invalidated)));
+                    }
+                    assert_eq!(ids.get(), 1);
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
+                    assert_eq!(client.cache_stats().unwrap().fills, 0);
+                }
+                CatalogCase::RevokeInObserver => {
+                    let credential = session.credential(&cx).await.unwrap();
+                    let notices = Cell::new(0);
+                    let server = Box::pin(async {
+                        let (mut tls, _) = peer.request(false).await;
+                        sse_head(&mut tls).await;
+                        event(&mut tls, OTHER_CHANGED, false).await;
+                        let mut byte = [0];
+                        assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "revoked response is retired without awaiting its terminal");
+                    });
+                    let ((), result) = pair(server, Box::pin(client.collect(&cx, catalog_request(method), || next_id(&first), |_| {
+                        notices.set(notices.get() + 1);
+                        credential.credential().revoke();
+                        Ok(())
+                    }))).await;
+                    assert!(matches!(result, Err(ManagedCatalogError::CredentialRevoked)));
+                    assert_eq!(notices.get(), 1);
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+                    assert_eq!(client.cache_stats().unwrap().fills, 0);
+                }
             }
             if !matches!(case, CatalogCase::Renewal) { assert_eq!(peer.tokens.load(Ordering::SeqCst), 1); }
             peer.quiet();
@@ -397,3 +452,11 @@ fn late_id_callback_cannot_dispatch_after_the_collection_deadline() { isolated_c
 fn invalid_or_precancelled_collections_have_no_post_effects() { isolated_catalog("invalid_or_precancelled_collections_have_no_post_effects", CatalogCase::Preflight); }
 #[test]
 fn renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused() { isolated_catalog("renewal_rejects_mixed_pages_and_old_cache_entries_are_not_reused", CatalogCase::Renewal); }
+#[test]
+fn local_revocation_blocks_warm_catalog_cache_without_peer_effects() { isolated_catalog("local_revocation_blocks_warm_catalog_cache_without_peer_effects", CatalogCase::RevokedCache); }
+#[test]
+fn revocation_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("revocation_in_id_supplier_prevents_the_catalog_post", CatalogCase::RevokeBeforePost); }
+#[test]
+fn cache_clear_in_id_supplier_prevents_the_catalog_post() { isolated_catalog("cache_clear_in_id_supplier_prevents_the_catalog_post", CatalogCase::ClearBeforePost); }
+#[test]
+fn observer_revocation_retires_the_unfinished_page_without_a_fill() { isolated_catalog("observer_revocation_retires_the_unfinished_page_without_a_fill", CatalogCase::RevokeInObserver); }
