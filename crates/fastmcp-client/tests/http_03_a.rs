@@ -3372,6 +3372,39 @@ async fn collect_with_progress(
     collected
 }
 
+/// `U+FFFD` occupies three bytes where one malformed octet arrived.
+const REPLACEMENT_EXPANSION: usize = 3;
+
+/// The `data: ` field prefix, charged to the line budget on both sides.
+const DATA_FIELD_PREFIX: usize = 6;
+
+/// The event ceiling used by the replacement-expansion cases. Small enough
+/// that a decoded event can cross it while its raw feed stays a third of it.
+const EXPANDING_EVENT_CEILING: usize = 2_048;
+
+/// The malformed-octet counts that put the decoded budgets exactly on their
+/// ceilings. Each is paired with one ASCII filler octet in the positive and
+/// two in the planted negative; the filler is the only thing that changes.
+const DECODED_LINE_MALFORMED: usize = 1_363;
+const DECODED_EVENT_MALFORMED: usize = 682;
+
+/// Builds one `data: ` event whose value is `ascii_fill` ASCII octets followed
+/// by `malformed` lone `0xFF` octets.
+///
+/// `0xFF` is never a valid UTF-8 lead byte, so each one is a complete invalid
+/// sequence and replacement-mode decoding turns each into exactly one U+FFFD -
+/// three bytes where one arrived. That is the whole point of this fixture: raw
+/// length grows by one per octet while decoded length grows by three, so the
+/// two budgets can be driven apart as far as a case needs.
+fn replacement_expanding_event(ascii_fill: usize, malformed: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"data: ");
+    body.extend(std::iter::repeat_n(b'a', ascii_fill));
+    body.extend(std::iter::repeat_n(0xFF_u8, malformed));
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
 async fn positive_11_bounds(cx: &Cx) {
     // Line ceiling, exactly N. A 4_090-octet payload makes a `data: ` line of
     // 4_096 raw octets against a 4_096-octet line ceiling: N+6 charged octets,
@@ -3466,6 +3499,76 @@ async fn positive_11_bounds(cx: &Cx) {
     for (index, progress) in collected.progress_notifications.iter().enumerate() {
         assert_eq!(progress.progress.as_str(), (index + 1).to_string());
     }
+    // -----------------------------------------------------------------------
+    // Replacement-expanded DECODED-TEXT bounds, at exactly N.
+    //
+    // Every case above feeds ASCII, where the raw-octet and decoded-text
+    // budgets are the same number - so a parser that counted only one of them
+    // passes all of them. These drive the two apart. Each lone 0xFF octet costs
+    // one raw byte and three decoded bytes, so the raw feed sits at roughly a
+    // third of the ceiling while the decoded line lands exactly on it.
+    // -----------------------------------------------------------------------
+    let decoded_line = DATA_FIELD_PREFIX + 1 + REPLACEMENT_EXPANSION * DECODED_LINE_MALFORMED;
+    let raw_line = DATA_FIELD_PREFIX + 1 + DECODED_LINE_MALFORMED;
+    assert_eq!(
+        decoded_line, line_ceiling,
+        "the decoded line must land exactly on the line ceiling"
+    );
+    assert!(
+        raw_line * 2 < line_ceiling,
+        "the raw feed must stay far enough under the ceiling that only the \
+         decoded budget could ever refuse it"
+    );
+
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        replacement_expanding_event(1, DECODED_LINE_MALFORMED),
+        SseLimits::new(line_ceiling, 65_536, 64).expect("decoded-line limits"),
+    )
+    .await
+    .expect("a decoded line at exactly the ceiling must be admitted");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(
+        payloads[0].len(),
+        1 + REPLACEMENT_EXPANSION * DECODED_LINE_MALFORMED,
+        "the payload is measured in decoded bytes, not raw octets"
+    );
+    assert_eq!(
+        payloads[0]
+            .chars()
+            .filter(|character| *character == '\u{FFFD}')
+            .count(),
+        DECODED_LINE_MALFORMED,
+        "each malformed octet becomes exactly one replacement character"
+    );
+
+    // The same independence on the EVENT budget, which charges the decoded
+    // value plus its appended LF against one ceiling and the raw line against
+    // the same ceiling separately.
+    let decoded_event = 1 + REPLACEMENT_EXPANSION * DECODED_EVENT_MALFORMED + 1;
+    let raw_event = DATA_FIELD_PREFIX + 1 + DECODED_EVENT_MALFORMED;
+    assert_eq!(
+        decoded_event, EXPANDING_EVENT_CEILING,
+        "the decoded event must land exactly on the event ceiling"
+    );
+    assert!(raw_event * 2 < EXPANDING_EVENT_CEILING);
+
+    let peer = Peer::bind().await;
+    let payloads = drain_sse(
+        cx,
+        &peer,
+        replacement_expanding_event(1, DECODED_EVENT_MALFORMED),
+        SseLimits::new(line_ceiling, EXPANDING_EVENT_CEILING, 64).expect("decoded-event limits"),
+    )
+    .await
+    .expect("a decoded event at exactly the ceiling must be admitted");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(
+        payloads[0].len(),
+        1 + REPLACEMENT_EXPANSION * DECODED_EVENT_MALFORMED
+    );
 }
 
 async fn negative_11_one_byte_over_bounds(cx: &Cx) {
@@ -3533,6 +3636,95 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     assert!(
         matches!(refusal, ModernHttpFinalCoreListenError::ProgressQueueFull),
         "expected a typed progress-queue refusal, saw {refusal:?}"
+    );
+    // -----------------------------------------------------------------------
+    // Replacement-expanded decoded-text bounds, at N+1.
+    //
+    // The sole changed variable in each pair is ONE ASCII FILLER OCTET. The raw
+    // feed moves by one byte and stays near a third of the ceiling; only the
+    // decoded budget crosses it. A parser that charged raw octets alone admits
+    // both halves of both pairs, which is exactly the defect the contract's
+    // "counted independently" wording exists to exclude.
+    // -----------------------------------------------------------------------
+    assert_eq!(
+        DATA_FIELD_PREFIX + 2 + REPLACEMENT_EXPANSION * DECODED_LINE_MALFORMED,
+        line_ceiling + 1,
+        "the planted decoded line is exactly one byte over"
+    );
+    let peer = Peer::bind().await;
+    let refusal = drain_sse(
+        cx,
+        &peer,
+        replacement_expanding_event(2, DECODED_LINE_MALFORMED),
+        SseLimits::new(line_ceiling, 65_536, 64).expect("decoded-line limits"),
+    )
+    .await
+    .err()
+    .expect("a decoded line one byte over the ceiling must be refused");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::SseParse(SseParseError::LineTooLong { limit_bytes })
+                if limit_bytes == line_ceiling
+        ),
+        "expected a typed line-bound refusal from the decoded budget, saw {refusal:?}"
+    );
+    peer.assert_no_further_connection();
+
+    assert_eq!(
+        2 + REPLACEMENT_EXPANSION * DECODED_EVENT_MALFORMED + 1,
+        EXPANDING_EVENT_CEILING + 1,
+        "the planted decoded event is exactly one byte over"
+    );
+    let peer = Peer::bind().await;
+    let refusal = drain_sse(
+        cx,
+        &peer,
+        replacement_expanding_event(2, DECODED_EVENT_MALFORMED),
+        SseLimits::new(line_ceiling, EXPANDING_EVENT_CEILING, 64).expect("decoded-event limits"),
+    )
+    .await
+    .err()
+    .expect("a decoded event one byte over the ceiling must be refused");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::SseParse(SseParseError::EventTooLarge { limit_bytes })
+                if limit_bytes == EXPANDING_EVENT_CEILING
+        ),
+        "expected a typed event-bound refusal from the decoded budget, saw {refusal:?}"
+    );
+    peer.assert_no_further_connection();
+
+    // Unchanged state: both N cases are admitted again after both refusals, so
+    // each refusal came from its own single changed octet rather than from a
+    // parser or fixture left poisoned by the one before it.
+    let peer = Peer::bind().await;
+    assert_eq!(
+        drain_sse(
+            cx,
+            &peer,
+            replacement_expanding_event(1, DECODED_LINE_MALFORMED),
+            SseLimits::new(line_ceiling, 65_536, 64).expect("decoded-line limits"),
+        )
+        .await
+        .expect("the unmutated decoded line must be admitted again")
+        .len(),
+        1
+    );
+    let peer = Peer::bind().await;
+    assert_eq!(
+        drain_sse(
+            cx,
+            &peer,
+            replacement_expanding_event(1, DECODED_EVENT_MALFORMED),
+            SseLimits::new(line_ceiling, EXPANDING_EVENT_CEILING, 64)
+                .expect("decoded-event limits"),
+        )
+        .await
+        .expect("the unmutated decoded event must be admitted again")
+        .len(),
+        1
     );
 }
 
