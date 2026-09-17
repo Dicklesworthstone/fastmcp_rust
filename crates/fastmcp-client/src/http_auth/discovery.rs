@@ -34,6 +34,8 @@ use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 
 /// Explicit RFC 7591 native-public-client registration after trusted discovery.
 pub mod registration;
+/// Preregistered machine-to-machine authentication without browser or DCR fallback.
+pub mod client_credentials;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
