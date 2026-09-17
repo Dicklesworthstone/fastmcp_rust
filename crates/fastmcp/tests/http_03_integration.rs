@@ -657,6 +657,21 @@ fn classification_plan(policy: ProtocolPolicy) -> ClientProtocolPlan {
     .expect("the classification plan must be accepted for every policy")
 }
 
+/// Replaces a dedicated lane's own ephemeral authority with a stable placeholder.
+///
+/// Each lane binds `127.0.0.1:0`, so its address differs on every run AND between
+/// the accepted and planted passes of `evaluate_join`. `http_03_i_planted_negative`
+/// requires every case except the planted one to be byte-for-byte identical across
+/// those two passes, so any address that reached a recorded string would fail an
+/// unrelated case and look like a real regression. Normalizing at the point of
+/// capture makes the record stable by construction rather than by luck about
+/// whether a given typed error happens to embed its peer.
+fn normalize_lane(address: SocketAddr, value: String) -> String {
+    value
+        .replace(&address.to_string(), FIXTURE_AUTHORITY_PLACEHOLDER)
+        .replace(&address.port().to_string(), "<fixture-port>")
+}
+
 /// What a single dedicated real-socket scenario observed.
 ///
 /// `connections_after_return` is how the no-retry claim is made without any
@@ -772,6 +787,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
             Err(error) => render_connection_error(&error),
         }
     });
+    let outcome = normalize_lane(address, outcome);
 
     release_tx.send(()).expect("release the lane fixture");
     let (requests_during_call, connections_after_return, server_held_connection_open) =
@@ -905,7 +921,7 @@ fn observe_caller_cancellation() -> CancellationObservation {
             Ok(None) => "unexpected-clean-end".to_owned(),
             Err(error) => format!("listen::{error:?}"),
         };
-        (seen, outcome)
+        (seen, normalize_lane(address, outcome))
     });
 
     release_tx
@@ -1023,11 +1039,12 @@ fn observe_independent_server_request() -> ServerRequestObservation {
             .await
             .expect("the shipped SSE lane must open a request-owned listener");
 
-        match stream_listener.next_event(&cx).await {
+        let raw = match stream_listener.next_event(&cx).await {
             Ok(Some(event)) => format!("admitted::{event:?}"),
             Ok(None) => "clean-end".to_owned(),
             Err(error) => format!("rejected::{error:?}"),
-        }
+        };
+        normalize_lane(address, raw)
     });
 
     release_tx
@@ -1186,6 +1203,8 @@ fn observe_extension_notification() -> NotificationObservation {
                 Err(error) => format!("rejected::{error:?}"),
             };
             let era = connection.selected_protocol_era();
+            let first = normalize_lane(address, first);
+            let terminal = normalize_lane(address, terminal);
 
             // Release the stream borrow, then issue the SECOND request. This is
             // what gives HTTP-03.25's planted event id somewhere to leak to.
