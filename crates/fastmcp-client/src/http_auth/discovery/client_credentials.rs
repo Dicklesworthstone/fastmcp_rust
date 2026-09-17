@@ -11,6 +11,10 @@
 //! fresh authenticated MCP discovery using the SAME token as the operation.
 //! No failed POST is automatically retried. All work uses the caller's runtime.
 
+/// Explicit composition with official Tasks and typed incremental responses.
+#[cfg(feature = "tasks")]
+pub mod tasks;
+
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
@@ -611,8 +615,8 @@ impl ClientCredentialsResponse {
         }
         let Self { response, snapshot, owner, cancellation, request, request_id, deadline } = self;
         active(cx, deadline, &owner, &cancellation, Some(&snapshot), async {
-            let bytes = response.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes)
-                .await.map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
+            let bytes = response.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes).await
+                .map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
             decoded_result(&request, &request_id, &bytes, maximum_bytes)
         }).await
     }
