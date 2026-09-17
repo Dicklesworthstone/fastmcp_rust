@@ -752,7 +752,7 @@ impl<R: Read> StdioTransport<R, std::process::ChildStdin> {
         grace: std::time::Duration,
     ) -> Result<(std::process::ExitStatus, bool), TransportError> {
         stdio_checkpoint(cx)?;
-        let close_error = Transport::close(self).err();
+        let close_error = Transport::close(self, cx).err();
         let deadline = Instant::now()
             .checked_add(grace)
             .unwrap_or_else(Instant::now);
@@ -913,7 +913,7 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
         self.recv_with_completion(cx).map(|(message, _)| message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             drop(self.writer.take());
             return Ok(());
@@ -1314,7 +1314,7 @@ impl<W: Write + Send> TransportSendHalf for StdioSendHalf<W> {
         self.reserve_send(cx)?.send(message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.is_closed() {
             self.mark_closed();
             drop(self.writer.take());
@@ -1540,7 +1540,7 @@ impl Transport for AsyncStdioTransport {
         Ok(message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
@@ -3289,7 +3289,7 @@ mod tests {
                 Ok(JsonRpcMessage::Request(_))
             ));
             recv_half
-                .close()
+                .close(&cx)
                 .expect("explicit receive-half close succeeds");
             assert!(recv_half.is_closed());
             assert!(

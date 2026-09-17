@@ -3187,7 +3187,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         Ok(JsonRpcMessage::Request(json_rpc))
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.response_pending = false;
         self.response_origin = None;
@@ -5046,7 +5046,7 @@ impl Transport for StreamableHttpTransport {
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.close_queues();
         Ok(())
     }
@@ -6237,7 +6237,14 @@ impl DualEraHttpSession {
         self.closed = true;
         self.modern_ingress.close();
         self.modern_responses.terminate();
-        let _ = self.modern_transport.close();
+        // `Transport::close` now takes the caller's `&Cx`, and this method is
+        // reachable from `Drop for DualEraHttpSession` (below), where no `Cx`
+        // exists and none can be conjured. The trait method was never needed
+        // here: `StreamableHttpTransport::close` is exactly `close_queues()`
+        // plus `Ok(())`, and that type's own `Drop` already calls
+        // `close_queues()`. Calling it directly keeps the destructor path
+        // synchronous and loses no behaviour.
+        self.modern_transport.close_queues();
         let _lifecycle_guard = self
             .legacy_post_lifecycle_guard
             .lock()

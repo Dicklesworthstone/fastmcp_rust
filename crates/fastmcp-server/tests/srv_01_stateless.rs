@@ -86,7 +86,7 @@ impl Transport for RuntimeTransport {
             .ok_or(TransportError::Closed)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.state
             .lock()
             .expect("runtime transport state mutex must not be poisoned")
@@ -145,7 +145,7 @@ impl Transport for ProcessOwnedTransport {
         }
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.close_calls += 1;
         self.output.flush()?;
         serde_json::to_writer(

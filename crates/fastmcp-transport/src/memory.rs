@@ -322,7 +322,7 @@ impl Transport for MemoryTransport {
         recv_memory_message(&mut self.receiver, &mut self.closed, self.poll_interval, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.sender.take();
         self.receiver.close();
@@ -372,7 +372,7 @@ impl TransportRecvHalf for MemoryRecvHalf {
         recv_memory_message(receiver, &mut self.closed, self.poll_interval, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         close_memory_receiver(&mut self.receiver, &mut self.closed);
         Ok(())
     }
@@ -422,7 +422,7 @@ impl TransportSendHalf for MemorySendHalf {
         send_memory_message(&mut self.sender, &self.codec, &mut self.closed, cx, message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.sender.take();
         Ok(())
@@ -925,7 +925,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         // Close client
-        client.close().unwrap();
+        client.close(&cx).unwrap();
         drop(client);
 
         // Server should get closed error on recv
@@ -938,7 +938,7 @@ mod tests {
         let (mut client, _server) = create_memory_transport_pair();
         let cx = Cx::for_testing();
 
-        client.close().unwrap();
+        client.close(&cx).unwrap();
 
         let request = JsonRpcRequest::new("test", None, 1i64);
         let result = client.send_request(&cx, &request);
@@ -1027,7 +1027,8 @@ mod tests {
         assert!(!client.is_closed());
         assert!(!server.is_closed());
 
-        client.close().unwrap();
+        let cx = Cx::for_testing();
+        client.close(&cx).unwrap();
 
         assert!(client.is_closed());
         // Server doesn't know yet until recv fails
@@ -1055,7 +1056,8 @@ mod tests {
     #[test]
     fn test_debug_format_closed() {
         let (mut client, _server) = create_memory_transport_pair();
-        client.close().unwrap();
+        let cx = Cx::for_testing();
+        client.close(&cx).unwrap();
         let debug = format!("{client:?}");
         assert!(debug.contains("closed: true"));
     }
@@ -1165,10 +1167,11 @@ mod tests {
     #[test]
     fn test_close_is_idempotent() {
         let (mut client, _server) = create_memory_transport_pair();
-        client.close().unwrap();
+        let cx = Cx::for_testing();
+        client.close(&cx).unwrap();
         assert!(client.is_closed());
         // Close again - should not panic
-        client.close().unwrap();
+        client.close(&cx).unwrap();
         assert!(client.is_closed());
     }
 

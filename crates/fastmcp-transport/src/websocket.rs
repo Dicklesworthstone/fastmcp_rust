@@ -2359,7 +2359,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     /// # Errors
     ///
     /// Returns an error if I/O fails.
-    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    pub fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
@@ -2423,7 +2423,7 @@ impl<R: Read, W: Write> Transport for WsTransport<R, W> {
         WsTransport::recv(self, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         WsTransport::close(self)
     }
 }
@@ -2795,7 +2795,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
     /// # Errors
     ///
     /// Returns an error if I/O fails.
-    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    pub fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
@@ -2818,7 +2818,7 @@ impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
         WsClientTransport::recv(self, cx)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         WsClientTransport::close(self)
     }
 }
@@ -3149,7 +3149,7 @@ impl<R: Read, W: Write> TransportRecvHalf for WsServerRecvHalf<R, W> {
         )
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.fragment_buffer.clear();
         self.fragmented_text = false;
@@ -3170,7 +3170,7 @@ impl<W: Write + Send> TransportSendHalf for WsServerSendHalf<W> {
         send_split_message(&self.writer, &self.codec, cx, message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.writer.close_with_frame(WsFrame::close())
     }
 }
@@ -3202,7 +3202,7 @@ impl<R: Read, W: Write> TransportRecvHalf for WsClientRecvHalf<R, W> {
         )
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
         self.fragment_buffer.clear();
         self.fragmented_text = false;
@@ -3239,7 +3239,7 @@ impl<W: Write + Send> TransportSendHalf for WsClientSendHalf<W> {
         send_split_message(&self.writer, &self.codec, cx, message)
     }
 
-    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
         self.writer.close_with_frame(WsFrame::close())
     }
 }
