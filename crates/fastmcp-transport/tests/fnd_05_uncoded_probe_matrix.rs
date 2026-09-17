@@ -64,18 +64,52 @@ fn request_with_coding(handler: &HttpRequestHandler, coding: Option<&str>) -> Ht
     request.with_body(body())
 }
 
-/// True when admission refused this request for its content coding.
-fn refused_for_coding(coding: Option<&str>) -> bool {
+/// The admission outcome for one coding value, rendered for diagnosis.
+///
+/// Returns the outcome as a short string rather than a bool. A bool collapses
+/// three distinct results — admitted, refused FOR THE CODING, and refused for
+/// some unrelated reason — into two, and a negative that reports "admitted"
+/// when the request was actually refused for a different reason sends the
+/// reader hunting the wrong defect. This is the same conflated-assertion flaw
+/// that made `hostname refusal must precede HTTP bytes` unreadable from its
+/// left/right values alone.
+fn admission_outcome(coding: Option<&str>) -> String {
     let handler = HttpRequestHandler::new();
-    matches!(
-        handler.admit_modern_request(&request_with_coding(&handler, coding)),
-        Err(HttpError::UnsupportedContentEncoding(_))
-    )
+    match handler.admit_modern_request(&request_with_coding(&handler, coding)) {
+        Ok(_) => "ADMITTED".to_owned(),
+        Err(HttpError::UnsupportedContentEncoding(value)) => {
+            format!("refused-for-coding({value:?})")
+        }
+        Err(other) => format!("refused-for-OTHER-reason({other:?})"),
+    }
+}
+
+/// True when admission refused this request specifically for its content coding.
+fn refused_for_coding(coding: Option<&str>) -> bool {
+    admission_outcome(coding).starts_with("refused-for-coding")
 }
 
 /// `n` empty list elements followed by one `identity` token.
 fn empty_elements_then_identity(n: usize) -> String {
     format!("{}identity", ",".repeat(n))
+}
+
+/// Which admission guard is expected to refuse a given value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    /// Refused by content-coding list semantics.
+    Coding,
+    /// Refused earlier, by header-value validation, before list syntax applies.
+    HeaderValue,
+}
+
+impl Guard {
+    fn matches(self, outcome: &str) -> bool {
+        match self {
+            Self::Coding => outcome.starts_with("refused-for-coding"),
+            Self::HeaderValue => outcome.contains("InvalidHeader"),
+        }
+    }
 }
 
 /// POSITIVES: absent, case-varied singleton `identity`, and bounded
@@ -127,63 +161,115 @@ fn fnd_05_uncoded_request_matrix_positives() {
 }
 
 /// NEGATIVES: all-empty, empty-element N+1, parameterized, multi-semantic
-/// coding, and other codings.
+/// coding, and other codings. NONE may be admitted.
 ///
 /// This is the discriminator for the positives above. A handler that admitted
 /// everything would satisfy the positive test perfectly; these cases are what
 /// separate "admits uncoded requests" from "admits anything".
+///
+/// WHICH GUARD CATCHES EACH IS PART OF THE ASSERTION. Thirteen of these are
+/// content-coding violations and must reach the coding refusal. The all-empty
+/// value is caught EARLIER, by header-value validation, and never reaches
+/// coding semantics at all — a present field with an empty value is malformed
+/// before its list syntax is considered.
+///
+/// The first version of this test demanded `UnsupportedContentEncoding` for
+/// all fourteen and reported the all-empty case as "was ADMITTED" when it had
+/// in fact been refused by that earlier guard. That message was wrong in the
+/// most costly direction: it named a security-relevant admission that was not
+/// happening. Asserting the GUARD as well as the refusal is what makes the
+/// difference legible instead of alarming.
 #[test]
 fn fnd_05_uncoded_request_matrix_planted_negatives() {
+    // (value, label, expected guard) — Coding for list-syntax violations,
+    // HeaderValue for values malformed before list syntax applies.
     let seventeen = empty_elements_then_identity(17);
-    let cases: Vec<(String, &str)> = vec![
-        (String::new(), "all-empty value"),
-        (",".to_owned(), "all-empty, two elements"),
-        (",,,".to_owned(), "all-empty, four elements"),
-        (seventeen, "empty-element bound N+1 = 17, refused"),
-        ("identity;q=1".to_owned(), "parameterized token"),
-        ("identity ;q=1".to_owned(), "parameterized with whitespace"),
-        ("gzip".to_owned(), "other coding"),
-        ("br".to_owned(), "other coding"),
-        ("deflate".to_owned(), "other coding"),
-        ("identity, gzip".to_owned(), "two semantic codings"),
+    let cases: Vec<(String, &str, Guard)> = vec![
+        (String::new(), "all-empty value", Guard::HeaderValue),
+        (",".to_owned(), "all-empty, two elements", Guard::Coding),
+        (",,,".to_owned(), "all-empty, four elements", Guard::Coding),
+        (seventeen, "empty-element bound N+1 = 17", Guard::Coding),
+        (
+            "identity;q=1".to_owned(),
+            "parameterized token",
+            Guard::Coding,
+        ),
+        (
+            "identity ;q=1".to_owned(),
+            "parameterized with whitespace",
+            Guard::Coding,
+        ),
+        ("gzip".to_owned(), "other coding", Guard::Coding),
+        ("br".to_owned(), "other coding", Guard::Coding),
+        ("deflate".to_owned(), "other coding", Guard::Coding),
+        (
+            "identity, gzip".to_owned(),
+            "two semantic codings",
+            Guard::Coding,
+        ),
         (
             "gzip, identity".to_owned(),
             "two semantic codings, reordered",
+            Guard::Coding,
         ),
-        ("identity, identity".to_owned(), "duplicate semantic token"),
-        ("x-identity".to_owned(), "near-miss token"),
-        ("identityy".to_owned(), "near-miss token, one byte longer"),
+        (
+            "identity, identity".to_owned(),
+            "duplicate semantic token",
+            Guard::Coding,
+        ),
+        ("x-identity".to_owned(), "near-miss token", Guard::Coding),
+        (
+            "identityy".to_owned(),
+            "near-miss, one byte longer",
+            Guard::Coding,
+        ),
     ];
 
     let mut admitted = Vec::new();
-    for (value, label) in &cases {
-        if !refused_for_coding(Some(value)) {
+    let mut wrong_guard = Vec::new();
+    for (value, label, expected) in &cases {
+        let outcome = admission_outcome(Some(value));
+        if outcome == "ADMITTED" {
             admitted.push(format!("{label}: Content-Encoding: {value:?} was ADMITTED"));
+        } else if !expected.matches(&outcome) {
+            wrong_guard.push(format!(
+                "{label}: Content-Encoding: {value:?} expected {expected:?}, got {outcome}"
+            ));
         }
     }
 
+    // THE SECURITY PROPERTY: nothing coded or malformed is admitted.
     assert!(
         admitted.is_empty(),
-        "{} of {} coded or malformed request(s) were admitted. A present Content-Encoding must \
+        "{} of {} coded or malformed request(s) were ADMITTED. A present Content-Encoding must \
          reduce to exactly one semantic `identity` token; anything else must fail before body \
-         processing, or a coded body reaches JSON admission and fails there with a misleading \
-         diagnostic:\n{}",
+         processing:\n{}",
         admitted.len(),
         cases.len(),
         admitted.join("\n"),
     );
 
-    // THE ONE-VARIABLE CONTRAST, asserted rather than left implicit: the bound
-    // is exactly 16. N is admitted and N+1 is refused, and the two values
-    // differ by a single comma.
+    // THE ATTRIBUTION PROPERTY: each refusal comes from the guard that should
+    // own it. A case migrating between guards is a real change in where the
+    // boundary sits, and it should be noticed deliberately rather than absorbed.
+    assert!(
+        wrong_guard.is_empty(),
+        "{} case(s) were refused by a different guard than expected. The request was still \
+         refused, so this is NOT an admission defect — it means the boundary moved:\n{}",
+        wrong_guard.len(),
+        wrong_guard.join("\n"),
+    );
+
+    // THE ONE-VARIABLE CONTRAST, asserted rather than implicit: the bound is
+    // exactly 16, and the two values differ by a single comma.
     assert!(
         !refused_for_coding(Some(&empty_elements_then_identity(16))),
         "16 empty elements must be admitted"
     );
     assert!(
         refused_for_coding(Some(&empty_elements_then_identity(17))),
-        "17 empty elements must be refused; if both 16 and 17 behave alike the bound is not \
-         being enforced at the declared value"
+        "17 empty elements must be refused; if 16 and 17 behave alike the bound is not enforced \
+         at the declared value"
     );
 }
 
