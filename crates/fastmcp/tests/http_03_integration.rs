@@ -667,9 +667,12 @@ fn classification_plan(policy: ProtocolPolicy) -> ClientProtocolPlan {
 /// capture makes the record stable by construction rather than by luck about
 /// whether a given typed error happens to embed its peer.
 fn normalize_lane(address: SocketAddr, value: String) -> String {
-    value
-        .replace(&address.to_string(), FIXTURE_AUTHORITY_PLACEHOLDER)
-        .replace(&address.port().to_string(), "<fixture-port>")
+    // Only the full `host:port` authority is replaced. Replacing the bare port
+    // as well would be over-broad: an ephemeral port is an ordinary small
+    // integer and could collide with a legitimate number in the same string -
+    // `SseLimits::new(4_096, ..)` against a port of 4096 - silently corrupting
+    // the record this case is supposed to compare.
+    value.replace(&address.to_string(), FIXTURE_AUTHORITY_PLACEHOLDER)
 }
 
 /// What a single dedicated real-socket scenario observed.
