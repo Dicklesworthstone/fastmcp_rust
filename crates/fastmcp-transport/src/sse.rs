@@ -73,6 +73,35 @@ use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 use crate::{Codec, Transport, TransportRecvHalf, TransportSendHalf};
 use crate::{CodecError, TransportError};
 
+/// Observes the caller's budget, mapping an exhausted one to a typed refusal.
+///
+/// Mirrors `stdio_checkpoint` and `http_checkpoint` exactly, and is deliberately
+/// STRONGER than this module's older `cx.is_cancel_requested()` guard: that bit
+/// detects explicit cancellation only, so a caller whose DEADLINE has already
+/// expired passes it and proceeds into blocking I/O. `Cx::checkpoint` observes
+/// deadline exhaustion, cancellation, and poll/cost quota exhaustion, and
+/// distinguishes `Timeout` from `Cancelled` for the caller.
+///
+/// The ten remaining `is_cancel_requested` sites in this module still carry the
+/// weaker guard; converting them is separate work and is not done here.
+fn sse_checkpoint(cx: &Cx) -> Result<(), TransportError> {
+    cx.checkpoint().map_err(|error| {
+        use asupersync::{CancelKind, error::ErrorKind};
+
+        match cx.cancel_reason().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
+            Some(_) => TransportError::Cancelled,
+            None => match error.kind() {
+                ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => TransportError::Timeout,
+                ErrorKind::Cancelled
+                | ErrorKind::PollQuotaExhausted
+                | ErrorKind::CostQuotaExhausted => TransportError::Cancelled,
+                _ => TransportError::Cancelled,
+            },
+        }
+    })
+}
+
 /// Maximum wire-line size for SSE events.
 const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
 
@@ -776,10 +805,20 @@ impl<W: Write> SseWriter<W> {
     }
 
     /// Closes the writer terminally, flushing any buffered output once.
-    pub fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
+        // Observe the caller's budget BEFORE the terminal commit, so a cancelled
+        // or expired caller is not made to wait on the flush below. Refusing here
+        // leaves the writer non-terminal and retryable; placing the check after
+        // the already-closed branch keeps an idempotent close Ok, because
+        // terminal state performs no I/O and has no budget to spend.
+        //
+        // `sse_checkpoint` rather than this module's older
+        // `cx.is_cancel_requested()` guard: that bit would let an expired
+        // DEADLINE through into the blocking flush.
+        sse_checkpoint(cx)?;
         self.closed = true;
         self.writer.flush().map_err(TransportError::Io)
     }
