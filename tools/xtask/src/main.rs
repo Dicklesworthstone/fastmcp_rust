@@ -24,7 +24,8 @@ use fastmcp_xtask::plan_tracker::{
 
 fn usage() -> String {
     "usage: cargo xtask plan-tracker-check <all|snapshot|preclaim <issue-id>|preclose <issue-id>> \
-     [--reservations-json <path|->] [--declaration-json <path|->]"
+     [--reservations-json <path|->] [--declaration-json <path|->] \
+     [--claimed-at <unix-seconds>]"
         .to_owned()
 }
 
@@ -83,6 +84,27 @@ fn main() -> ExitCode {
         .and_then(|index| argv.get(index + 1))
         .cloned();
 
+    // When this issue acquired its leases. Deliberately an INPUT rather than
+    // a value derived from the snapshot's own history: the close pass checks
+    // that the history covers claim-to-now, and deriving the claim instant
+    // from that same history would make the earliest-gap half of the check
+    // unfalsifiable -- it could then only ever report interior and trailing
+    // gaps, never a missing claim-to-first-renewal interval.
+    let claimed_at = match argv
+        .iter()
+        .position(|argument| argument == "--claimed-at")
+        .and_then(|index| argv.get(index + 1))
+    {
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(seconds) => Some(seconds),
+            Err(error) => {
+                eprintln!("--claimed-at {raw:?}: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     // Both routes may read stdin, and stdin can only be consumed once. Two
     // `-` arguments would silently give the second reader an empty string,
     // which parses as a schema error and reads like a malformed file.
@@ -106,6 +128,7 @@ fn main() -> ExitCode {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs() as i64)
             .unwrap_or_default(),
+        claimed_at: claimed_at.unwrap_or_default(),
         ..ReservationInputs::default()
     };
     if let Some(source) = &declaration_source {
