@@ -2317,7 +2317,7 @@ mod tests {
         let (writer, mut peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let (mut receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
-        receiver.close().unwrap();
+        receiver.close(&Cx::for_testing()).unwrap();
         let message = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 2));
         assert!(matches!(
             sender.send_until(

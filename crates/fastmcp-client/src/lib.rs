@@ -9652,8 +9652,8 @@ impl TransportRecvHalf for SharedStdioRecv {
         self.0.lock().map_err(|_| TransportError::Closed)?.recv(cx)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        self.0.lock().map_err(|_| TransportError::Closed)?.close()
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.0.lock().map_err(|_| TransportError::Closed)?.close(cx)
     }
 }
 
@@ -9787,8 +9787,8 @@ impl TransportSendHalf for SharedStdioSend {
         send_child_frame(&mut sender, cx, message, deadline)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        self.0.lock().map_err(|_| TransportError::Closed)?.close()
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.0.lock().map_err(|_| TransportError::Closed)?.close(cx)
     }
 }
 
@@ -9833,7 +9833,7 @@ impl Transport for SelectedStdioTransport {
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        self.receiver.close()?;
+        self.receiver.close(cx)?;
         self.sender.close(cx)
     }
 }
@@ -15593,12 +15593,12 @@ impl Client {
             .transport
             .lock()
             .map_err(|_| TransportError::Closed)?
-            .close();
+            .close(&self.cx);
         let sender = self
             .response_sender
             .lock()
             .map_err(|_| TransportError::Closed)?
-            .close();
+            .close(&self.cx);
         receiver.and(sender)
     }
 

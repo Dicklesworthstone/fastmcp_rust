@@ -2423,8 +2423,8 @@ impl<R: Read, W: Write> Transport for WsTransport<R, W> {
         WsTransport::recv(self, cx)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        WsTransport::close(self)
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        WsTransport::close(self, cx)
     }
 }
 
@@ -2818,8 +2818,8 @@ impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
         WsClientTransport::recv(self, cx)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        WsClientTransport::close(self)
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        WsClientTransport::close(self, cx)
     }
 }
 
