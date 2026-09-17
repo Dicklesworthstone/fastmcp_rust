@@ -24,10 +24,11 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_client::http_executor::{
-    MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClientError,
+    HTTP_03_A_EVALUATOR_MANIFEST_V1, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
+    MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpErrorBodyAdmission,
     ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
-    HTTP_03_A_EVALUATOR_MANIFEST_V1, ModernHttpFinalCoreListenError, ModernHttpRequest,
-    ModernHttpResponseKind, ModernHttpResponseStream, http_03_a_manifest_digest,
+    ModernHttpFinalCoreListenError, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpResponseStream, http_03_a_manifest_digest,
 };
 use fastmcp_client::sse::{SseLimits, SseParseError};
 use fastmcp_client::{
@@ -310,7 +311,11 @@ fn assert_shipped_manifest() {
 
     for (index, row) in rows[4..].iter().enumerate() {
         let fields: Vec<&str> = row.split(' ').collect();
-        assert_eq!(fields.len(), 3, "case row {index} must be `<id> <name> floor=<N>`");
+        assert_eq!(
+            fields.len(),
+            3,
+            "case row {index} must be `<id> <name> floor=<N>`"
+        );
         assert_eq!(
             fields[0], MANIFEST_GROUP_ORDER[index],
             "the published case order is frozen"
@@ -517,7 +522,10 @@ async fn read_request(io: &mut TcpStream) -> Wire {
         let count = io.read(&mut buffer).await.expect("read request bytes");
         assert!(count > 0, "client closed before a complete request head");
         wire.extend_from_slice(&buffer[..count]);
-        assert!(wire.len() <= 1_048_576, "request head exceeded the fixture bound");
+        assert!(
+            wire.len() <= 1_048_576,
+            "request head exceeded the fixture bound"
+        );
         if let Some(index) = wire.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
             break index + 4;
         }
@@ -531,7 +539,10 @@ async fn read_request(io: &mut TcpStream) -> Wire {
         .unwrap_or(0);
     while wire.len() < head_end + length {
         let count = io.read(&mut buffer).await.expect("read request body bytes");
-        assert!(count > 0, "client closed before the advertised body arrived");
+        assert!(
+            count > 0,
+            "client closed before the advertised body arrived"
+        );
         wire.extend_from_slice(&buffer[..count]);
     }
     Wire {
@@ -567,12 +578,7 @@ fn status_reason(status: u16) -> &'static str {
     }
 }
 
-async fn write_response(
-    io: &mut TcpStream,
-    status: u16,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) {
+async fn write_response(io: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &[u8]) {
     let mut head = format!("HTTP/1.1 {status} {}\r\n", status_reason(status));
     for &(name, value) in headers {
         head.push_str(name);
@@ -624,7 +630,9 @@ async fn write_bytes(io: &mut TcpStream, bytes: &[u8]) {
     let mut chunk = format!("{:x}\r\n", bytes.len()).into_bytes();
     chunk.extend_from_slice(bytes);
     chunk.extend_from_slice(b"\r\n");
-    io.write_all(&chunk).await.expect("write one response chunk");
+    io.write_all(&chunk)
+        .await
+        .expect("write one response chunk");
     io.flush().await.expect("flush one response chunk");
 }
 
@@ -815,7 +823,10 @@ async fn negative_01_target_header_split(cx: &Cx) {
         None,
     );
     assert!(
-        matches!(planted, Err(ModernHttpExecutorError::InvalidRequestMetadata)),
+        matches!(
+            planted,
+            Err(ModernHttpExecutorError::InvalidRequestMetadata)
+        ),
         "a target carrying header controls must be refused before any socket"
     );
 
@@ -963,8 +974,14 @@ async fn positive_03_content_type_and_accept(cx: &Cx) {
     assert_eq!(accept, "application/json, text/event-stream");
     // Positive implicit quality: neither range carries a parameter or q-value,
     // and neither is replaced by a wildcard.
-    assert!(!accept.contains('*'), "no wildcard may stand in for a range");
-    assert!(!accept.contains(';'), "no media parameter may weaken a range");
+    assert!(
+        !accept.contains('*'),
+        "no wildcard may stand in for a range"
+    );
+    assert!(
+        !accept.contains(';'),
+        "no media parameter may weaken a range"
+    );
     assert!(
         accept.contains("application/json") && accept.contains("text/event-stream"),
         "both required response media types must be present"
@@ -1000,7 +1017,10 @@ async fn negative_03_name_header_split(cx: &Cx) {
         Some("probe_tool\r\nAccept: application/json;q=0".to_owned()),
     );
     assert!(
-        matches!(planted, Err(ModernHttpExecutorError::InvalidRequestMetadata)),
+        matches!(
+            planted,
+            Err(ModernHttpExecutorError::InvalidRequestMetadata)
+        ),
         "the public builder must refuse header injection rather than weaken Accept"
     );
 
@@ -1298,10 +1318,16 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
 async fn positive_07_response_content_type(cx: &Cx) {
     for (content_type, expected) in [
         ("application/json", ModernHttpResponseKind::Json),
-        ("application/json; charset=utf-8", ModernHttpResponseKind::Json),
+        (
+            "application/json; charset=utf-8",
+            ModernHttpResponseKind::Json,
+        ),
         ("APPLICATION/JSON", ModernHttpResponseKind::Json),
         ("text/event-stream", ModernHttpResponseKind::Sse),
-        ("text/event-stream; charset=UTF-8", ModernHttpResponseKind::Sse),
+        (
+            "text/event-stream; charset=UTF-8",
+            ModernHttpResponseKind::Sse,
+        ),
     ] {
         let peer = Peer::bind().await;
         let request = ping_request(&peer.target());
@@ -1328,6 +1354,122 @@ async fn positive_07_response_content_type(cx: &Cx) {
             "{content_type} must select exactly one body lane"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Status-specific error bodies. A non-success response is admitted for
+    // JSON-RPC error parsing only when its own declared content type is exactly
+    // JSON; every other non-success response stays an opaque bounded failure.
+    // The decision is taken from the head, before any body byte is read, so it
+    // cannot be reached by sniffing the payload - every case below sends the
+    // SAME JSON-RPC error bytes and only the declared type varies.
+    // ---------------------------------------------------------------------
+    for (status, content_type, expected) in [
+        (
+            400_u16,
+            Some("application/json"),
+            ModernHttpErrorBodyAdmission::JsonRpcError,
+        ),
+        (
+            401,
+            Some("application/json; charset=utf-8"),
+            ModernHttpErrorBodyAdmission::JsonRpcError,
+        ),
+        (
+            500,
+            Some("APPLICATION/JSON"),
+            ModernHttpErrorBodyAdmission::JsonRpcError,
+        ),
+        // Admitted for a success lane, but never as an error envelope.
+        (
+            503,
+            Some("text/event-stream"),
+            ModernHttpErrorBodyAdmission::Opaque,
+        ),
+        (
+            502,
+            Some("text/plain"),
+            ModernHttpErrorBodyAdmission::Opaque,
+        ),
+        // Conflicting, unknown-parameter and absent forms are not admitted.
+        (
+            400,
+            Some("application/json; charset=utf-16"),
+            ModernHttpErrorBodyAdmission::Opaque,
+        ),
+        (
+            429,
+            Some("application/json; boundary=x"),
+            ModernHttpErrorBodyAdmission::Opaque,
+        ),
+        (404, None, ModernHttpErrorBodyAdmission::Opaque),
+    ] {
+        let peer = Peer::bind().await;
+        let request = ping_request(&peer.target());
+        let headers: Vec<(&str, &str)> = content_type
+            .map(|value| vec![("Content-Type", value)])
+            .unwrap_or_default();
+        let ((), metadata) = pair(
+            async {
+                let mut io = peer.accept().await;
+                let _ = read_request(&mut io).await;
+                write_response(
+                    &mut io,
+                    status,
+                    &headers,
+                    br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied"}}"#,
+                )
+                .await;
+                end_stream(&mut io).await;
+            },
+            async {
+                post(cx, &request)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("status {status} must admit a response head, saw {error:?}")
+                    })
+                    .metadata()
+                    .clone()
+            },
+        )
+        .await;
+
+        assert_eq!(metadata.status(), status);
+        assert_eq!(
+            metadata.kind(),
+            ModernHttpResponseKind::HttpFailure,
+            "status {status} is a non-success response"
+        );
+        assert_eq!(
+            metadata.error_body_admission(),
+            Some(expected),
+            "status {status} with content type {content_type:?}"
+        );
+    }
+
+    // A successful response is not an error body at all, so it carries no
+    // admission rather than an opaque one.
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), admission) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(&mut io, 200, &[("Content-Type", "application/json")], b"{}").await;
+            end_stream(&mut io).await;
+        },
+        async {
+            post(cx, &request)
+                .await
+                .expect("a success response must be admitted")
+                .metadata()
+                .error_body_admission()
+        },
+    )
+    .await;
+    assert_eq!(
+        admission, None,
+        "a success response carries no error-body admission"
+    );
 }
 
 async fn negative_07_wrong_charset_parameter(cx: &Cx) {
@@ -1367,6 +1509,59 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
     // The refusal precedes body decoding: no lane was selected and the client
     // did not sniff the `{}` payload it never read.
     peer.assert_no_further_connection();
+
+    // ---------------------------------------------------------------------
+    // Status-specific error-body planted negative. The accepted case is a 400
+    // whose declared type is exactly JSON, so its bounded body may be read as
+    // one JSON-RPC error. The sole changed variable is that declared type; the
+    // status, the headers' cardinality and the body bytes are byte-for-byte
+    // identical across both halves.
+    // ---------------------------------------------------------------------
+    const ERROR_BODY: &[u8] =
+        br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied"}}"#;
+
+    async fn error_body_admission(
+        cx: &Cx,
+        content_type: &str,
+    ) -> Option<ModernHttpErrorBodyAdmission> {
+        let peer = Peer::bind().await;
+        let request = ping_request(&peer.target());
+        let ((), admission) = pair(
+            async {
+                let mut io = peer.accept().await;
+                let _ = read_request(&mut io).await;
+                write_response(&mut io, 400, &[("Content-Type", content_type)], ERROR_BODY).await;
+                end_stream(&mut io).await;
+            },
+            async {
+                post(cx, &request)
+                    .await
+                    .unwrap_or_else(|error| panic!("a 400 head must be admitted, saw {error:?}"))
+                    .metadata()
+                    .error_body_admission()
+            },
+        )
+        .await;
+        admission
+    }
+
+    assert_eq!(
+        error_body_admission(cx, "application/json").await,
+        Some(ModernHttpErrorBodyAdmission::JsonRpcError),
+        "the accepted error body declares exactly JSON"
+    );
+    assert_eq!(
+        error_body_admission(cx, "text/plain").await,
+        Some(ModernHttpErrorBodyAdmission::Opaque),
+        "the same bytes under a non-JSON declared type must stay opaque"
+    );
+    // Restored: the refusal came from the declared type, not from a poisoned
+    // admission path.
+    assert_eq!(
+        error_body_admission(cx, "application/json").await,
+        Some(ModernHttpErrorBodyAdmission::JsonRpcError),
+        "the unmutated declared type is admitted again"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,10 +1667,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
     .await;
 
     assert!(
-        matches!(
-            refusal,
-            ModernHttpFinalCoreListenError::JsonRpcAdmission(_)
-        ),
+        matches!(refusal, ModernHttpFinalCoreListenError::JsonRpcAdmission(_)),
         "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
     );
     // The client failed its own stream and posted nothing back to the server.
@@ -1573,11 +1765,13 @@ async fn positive_09_line_endings_and_data_fields(cx: &Cx) {
         by_chunking[1], by_chunking[2],
         "seven-byte and whole-body chunking must agree"
     );
-    let payloads = by_chunking
-        .pop()
-        .expect("three chunkings were collected");
+    let payloads = by_chunking.pop().expect("three chunkings were collected");
 
-    assert_eq!(payloads.len(), 7, "seven events must dispatch in wire order");
+    assert_eq!(
+        payloads.len(),
+        7,
+        "seven events must dispatch in wire order"
+    );
     // Line terminators are interchangeable: all three produce the same join.
     assert_eq!(payloads[0], "alpha\nbeta", "bare CR terminates a line");
     assert_eq!(payloads[1], "alpha\nbeta", "bare LF terminates a line");
@@ -1586,7 +1780,10 @@ async fn positive_09_line_endings_and_data_fields(cx: &Cx) {
     // removed exactly once at dispatch.
     assert!(!payloads[1].ends_with('\n'));
     // Field spellings: `data`, `data:`, `data: ` and `data:  `.
-    assert_eq!(payloads[3], "", "a bare `data` field contributes an empty value");
+    assert_eq!(
+        payloads[3], "",
+        "a bare `data` field contributes an empty value"
+    );
     assert_eq!(payloads[4], "x", "`data:x` keeps its value verbatim");
     assert_eq!(payloads[5], "x", "`data: x` removes exactly one U+0020");
     assert_eq!(
@@ -1832,7 +2029,11 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     let line_ceiling = 4_096_usize;
     let payload = case_bytes(&POSITIVE_CASES, "HTTP-03.11");
     let over_payload = case_bytes(&NEGATIVE_CASES, "HTTP-03.11");
-    assert_eq!(over_payload, payload + 1, "the planted negative is exactly N+1");
+    assert_eq!(
+        over_payload,
+        payload + 1,
+        "the planted negative is exactly N+1"
+    );
 
     // The sole changed variable is one payload byte: N becomes N+1, so the
     // `data: ` line occupies 4_097 raw octets against a 4_096 ceiling.

@@ -531,11 +531,28 @@ pub enum ModernHttpResponseKind {
     HttpFailure,
 }
 
+/// Whether a non-success response body may be read as one JSON-RPC error.
+///
+/// MCP admits a status-specific error body only when that response's own
+/// `Content-Type` is admitted as JSON. Every other non-success response stays
+/// opaque to this transport layer, including one whose body happens to contain
+/// JSON: the decision is made from the declared media type before any body byte
+/// is consumed, never by sniffing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModernHttpErrorBodyAdmission {
+    /// The declared content type is exactly JSON, so the bounded body may be
+    /// parsed as one JSON-RPC error envelope.
+    JsonRpcError,
+    /// The body is an opaque bounded HTTP failure and must not be parsed.
+    Opaque,
+}
+
 /// Response metadata fixed before any response-body bytes are consumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModernHttpResponseMetadata {
     status: u16,
     kind: ModernHttpResponseKind,
+    error_body: Option<ModernHttpErrorBodyAdmission>,
 }
 
 impl ModernHttpResponseMetadata {
@@ -549,6 +566,16 @@ impl ModernHttpResponseMetadata {
     #[must_use]
     pub const fn kind(&self) -> ModernHttpResponseKind {
         self.kind
+    }
+
+    /// Returns how a non-success body may be read, or `None` when the response
+    /// is not a non-success response at all.
+    ///
+    /// This is fixed from the response head, so a caller cannot be induced to
+    /// parse an error body by its contents.
+    #[must_use]
+    pub const fn error_body_admission(&self) -> Option<ModernHttpErrorBodyAdmission> {
+        self.error_body
     }
 }
 
@@ -9514,11 +9541,11 @@ pub fn validate_response_head(
     if (300..400).contains(&status) {
         return Err(ModernHttpExecutorError::Redirect { status });
     }
-    let kind = if (200..300).contains(&status) {
+    if (200..300).contains(&status) {
         let content_type = single_header(headers, "content-type", "Content-Type")?
             .map(normalize_success_content_type)
             .transpose()?;
-        match content_type {
+        let kind = match content_type {
             None if status == 202 => ModernHttpResponseKind::EmptyAcknowledgement,
             Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => {
                 ModernHttpResponseKind::Json
@@ -9527,11 +9554,44 @@ pub fn validate_response_head(
                 ModernHttpResponseKind::Sse
             }
             None | Some(_) => return Err(ModernHttpExecutorError::UnsupportedSuccessContentType),
-        }
-    } else {
-        ModernHttpResponseKind::HttpFailure
+        };
+        return Ok(ModernHttpResponseMetadata {
+            status,
+            kind,
+            error_body: None,
+        });
+    }
+    Ok(ModernHttpResponseMetadata {
+        status,
+        kind: ModernHttpResponseKind::HttpFailure,
+        error_body: Some(admit_error_body(headers)),
+    })
+}
+
+/// Decides, from a non-success response head alone, whether its bounded body
+/// may be read as one JSON-RPC error.
+///
+/// A malformed, duplicated, absent, parameterised or non-JSON content type is
+/// simply not admitted: the response stays an opaque bounded HTTP failure. That
+/// is deliberately not an executor error. A failing response must not be
+/// converted into a *different* typed failure because its own media type is
+/// unusable; the status is the outcome, and the body is either readable as a
+/// JSON-RPC error or it is not.
+fn admit_error_body(headers: &[(String, String)]) -> ModernHttpErrorBodyAdmission {
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    let (Some(value), None) = (values.next(), values.next()) else {
+        // Absent, or repeated with a fixed cardinality: not admitted.
+        return ModernHttpErrorBodyAdmission::Opaque;
     };
-    Ok(ModernHttpResponseMetadata { status, kind })
+    match normalize_success_content_type(value) {
+        Ok(essence) if essence.eq_ignore_ascii_case("application/json") => {
+            ModernHttpErrorBodyAdmission::JsonRpcError
+        }
+        Ok(_) | Err(_) => ModernHttpErrorBodyAdmission::Opaque,
+    }
 }
 
 fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernHttpExecutorError> {
