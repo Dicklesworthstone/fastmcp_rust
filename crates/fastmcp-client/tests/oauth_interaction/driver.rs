@@ -18,6 +18,9 @@ mod task_driver;
 #[path = "catalogs.rs"]
 mod catalogs;
 
+#[path = "catalog_watch.rs"]
+mod catalog_watch;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
