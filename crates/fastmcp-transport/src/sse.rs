@@ -1372,7 +1372,7 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for LegacySseServer
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        self.inner.close()
+        self.inner.close(cx)
     }
 }
 
@@ -1518,7 +1518,7 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
         self.closed = true;
         // SSE connections don't have a close frame; flush once and let the
         // connection drop. SseWriter makes this idempotent and terminal.
-        self.writer.close()
+        self.writer.close(cx)
     }
 }
 
@@ -1591,7 +1591,7 @@ impl<W: Write + Send> TransportSendHalf for SseServerSendHalf<W> {
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.closed = true;
-        self.writer.close()
+        self.writer.close(cx)
     }
 }
 
@@ -2271,8 +2271,8 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
             writer.write_event(&cx, &SseEvent::message("retry")),
             Err(TransportError::Closed)
         ));
-        assert!(writer.close().is_ok());
-        assert!(writer.close().is_ok());
+        assert!(writer.close(&cx).is_ok());
+        assert!(writer.close(&cx).is_ok());
     }
 
     #[test]
@@ -2780,8 +2780,9 @@ event: endpoint\ndata: http://localhost/post\n\n";
             SseServerTransport::new(buffer, requests.into_iter(), "http://localhost/post");
 
         // close() should succeed (flushes the underlying writer)
-        transport.close().unwrap();
-        transport.close().unwrap();
+        let cx = Cx::for_testing();
+        transport.close(&cx).unwrap();
+        transport.close(&cx).unwrap();
     }
 
     #[test]
@@ -2801,8 +2802,8 @@ event: endpoint\ndata: http://localhost/post\n\n";
         assert!(transport.closed);
         assert_ne!(transport.request_sink.bytes.len(), 0);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
-        assert!(transport.close().is_ok());
-        assert!(transport.close().is_ok());
+        assert!(transport.close(&cx).is_ok());
+        assert!(transport.close(&cx).is_ok());
     }
 
     #[test]

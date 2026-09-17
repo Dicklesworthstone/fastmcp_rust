@@ -351,7 +351,7 @@ impl TestClient {
 
     /// Closes the client connection.
     pub fn close(&mut self) {
-        let _ = self.transport.close();
+        let _ = self.transport.close(&self.cx);
     }
 
     /// Returns a reference to the transport for advanced testing.

@@ -1379,7 +1379,7 @@ mod post_receive_failure {
 
         fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.1.receive_closes.fetch_add(1, Ordering::Release);
-            self.0.close()
+            self.0.close(cx)
         }
     }
 

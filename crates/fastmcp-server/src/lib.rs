@@ -21429,7 +21429,7 @@ impl<T: Transport> SharedTransport<T> {
         let Some(mut transport) = transport else {
             return Ok(());
         };
-        transport.close()
+        transport.close(cx)
     }
 }
 
@@ -46778,7 +46778,8 @@ mod lib_unit_tests {
 
         assert!(transport.send(&Cx::for_testing(), &message).is_ok());
         assert_eq!(send_calls.load(Ordering::Acquire), 1);
-        assert!(transport.close().is_ok());
+        let cx = Cx::for_testing();
+        assert!(transport.close(&cx).is_ok());
         assert!(matches!(
             transport.send(&Cx::for_testing(), &message),
             Err(TransportError::Closed)
@@ -46787,7 +46788,7 @@ mod lib_unit_tests {
             transport.recv(&Cx::for_testing()),
             Err(TransportError::Closed)
         ));
-        assert!(transport.close().is_ok());
+        assert!(transport.close(&cx).is_ok());
         assert_eq!(send_calls.load(Ordering::Acquire), 1);
         assert_eq!(recv_calls.load(Ordering::Acquire), 0);
         assert_eq!(close_calls.load(Ordering::Acquire), 1);
@@ -46818,7 +46819,8 @@ mod lib_unit_tests {
 
         assert!(transport.send(&Cx::for_testing(), &message).is_ok());
         assert_eq!(send_calls.load(Ordering::Acquire), 1);
-        assert!(transport.close().is_err());
+        let cx = Cx::for_testing();
+        assert!(transport.close(&cx).is_err());
         assert!(matches!(
             transport.send(&Cx::for_testing(), &message),
             Err(TransportError::Closed)
@@ -46827,7 +46829,7 @@ mod lib_unit_tests {
             transport.recv(&Cx::for_testing()),
             Err(TransportError::Closed)
         ));
-        assert!(transport.close().is_ok());
+        assert!(transport.close(&cx).is_ok());
         assert_eq!(send_calls.load(Ordering::Acquire), 1);
         assert_eq!(recv_calls.load(Ordering::Acquire), 0);
         assert_eq!(close_calls.load(Ordering::Acquire), 1);

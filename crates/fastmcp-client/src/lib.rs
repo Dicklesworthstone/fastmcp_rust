@@ -4342,7 +4342,7 @@ where
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.receiver.close()?;
-        self.sender.close()
+        self.sender.close(cx)
     }
 }
 
@@ -9834,7 +9834,7 @@ impl Transport for SelectedStdioTransport {
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.receiver.close()?;
-        self.sender.close()
+        self.sender.close(cx)
     }
 }
 
@@ -32993,7 +32993,7 @@ exec sleep 30
             &cancelled,
             "dropped-client callback cancellation in its owner region",
         );
-        sibling.close().expect("sibling client cleanup");
+        sibling.close(&cx).expect("sibling client cleanup");
     }
 
     #[cfg(unix)]

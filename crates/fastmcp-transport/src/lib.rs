@@ -844,7 +844,8 @@ mod tests {
     fn recording_transport_close() {
         let mut transport = RecordingTransport::default();
         assert!(!transport.closed);
-        transport.close().unwrap();
+        let cx = Cx::for_testing();
+        transport.close(&cx).unwrap();
         assert!(transport.closed);
     }
 
@@ -1110,7 +1111,8 @@ mod tests {
     #[test]
     fn two_phase_fixture_close_succeeds() {
         let mut fixture = TwoPhaseFixture::default();
-        assert!(fixture.close().is_ok());
+        let cx = Cx::for_testing();
+        assert!(fixture.close(&cx).is_ok());
     }
 
     #[test]

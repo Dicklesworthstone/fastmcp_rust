@@ -2434,7 +2434,7 @@ where
             }
         }
         state.cancel_reverse_requests();
-        if let Err(error) = state.transport.close() {
+        if let Err(error) = state.transport.close(&cx) {
             let error = transport_error_to_mcp(error);
             state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
             cleanup_error.get_or_insert(error);

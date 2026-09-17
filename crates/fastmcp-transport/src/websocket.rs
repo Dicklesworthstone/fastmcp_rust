@@ -4523,7 +4523,7 @@ mod tests {
                 )),
             )
             .expect("server split response");
-        server_send.close().expect("server split close");
+        server_send.close(&cx).expect("server split close");
 
         let server_output = server_send
             .writer
@@ -4562,7 +4562,7 @@ mod tests {
                 &JsonRpcMessage::Request(JsonRpcRequest::new("client/split", None, 8_i64)),
             )
             .expect("client split request");
-        client_send.close().expect("client split close");
+        client_send.close(&cx).expect("client split close");
 
         let client_output = client_send
             .writer
@@ -4635,7 +4635,8 @@ mod tests {
         )
         .into_split();
 
-        send_half.close().expect("close split writer");
+        let cx = Cx::for_testing();
+        send_half.close(&cx).expect("close split writer");
         assert!(matches!(
             recv_half.recv(&Cx::for_testing()),
             Err(TransportError::Closed)
@@ -4646,7 +4647,8 @@ mod tests {
     fn websocket_split_terminal_close_wins_over_cancelled_context() {
         let (mut recv_half, mut send_half) =
             WsTransport::new(Cursor::new(Vec::new()), Vec::new()).into_split();
-        send_half.close().expect("close split writer");
+        let cx = Cx::for_testing();
+        send_half.close(&cx).expect("close split writer");
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
 
@@ -5839,8 +5841,9 @@ mod tests {
         let reader: &[u8] = &[];
         let mut output = Vec::new();
         let mut transport = WsTransport::new(reader, &mut output);
-        transport.close().unwrap();
-        transport.close().expect("close is idempotent");
+        let cx = Cx::for_testing();
+        transport.close(&cx).unwrap();
+        transport.close(&cx).expect("close is idempotent");
 
         let cx = Cx::for_testing();
         let request = JsonRpcRequest::new("after-close", None, 1_i64);
