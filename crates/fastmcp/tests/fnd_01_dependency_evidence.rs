@@ -55809,6 +55809,7 @@ original = "value"
     fn state_partition_rng_sealed_api_is_allowlisted(path: &str, api: &str) -> bool {
         match path {
             "crates/fastmcp-core/src/crypto.rs" | "crates/fastmcp-core/src/lib.rs" | "crates/fastmcp/src/lib.rs" => STATE_PARTITION_RNG_SEALED_APIS.contains(&api),
+            "crates/fastmcp-client/src/http_auth/oauth.rs" => matches!(api, "draw_hmac_sha256_key" | "draw_security_identifier"),
             "crates/fastmcp-core/src/state.rs"
             | "crates/fastmcp-server/src/oauth.rs"
             | "crates/fastmcp-server/src/bidirectional.rs"
@@ -55817,6 +55818,19 @@ original = "value"
             | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
             "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
             _ => false,
+        }
+    }
+
+    #[test]
+    fn fnd_01_state_partition_rng_oauth_client_sealed_api_allowlist_exact() {
+        let oauth_path = "crates/fastmcp-client/src/http_auth/oauth.rs";
+        let neighboring_path = "crates/fastmcp-client/src/http_auth/oauth_extra.rs";
+        for api in ["draw_hmac_sha256_key", "draw_security_identifier"] {
+            assert!(state_partition_rng_sealed_api_is_allowlisted(oauth_path, api), "the OAuth client must admit {api}");
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api), "the neighboring client path must not inherit permission for {api}");
+        }
+        for api in ["draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(oauth_path, api), "the OAuth client must reject {api}");
         }
     }
 
