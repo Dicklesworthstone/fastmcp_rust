@@ -46,8 +46,9 @@ use fastmcp_server::ServerBuilder;
 /// only and can never satisfy a 2026 or exact-2024 positive.
 const UNSUPPORTED_VERSION: &str = "2025-11-25";
 
-#[test]
-fn fnd_03_i_positive() {
+/// The whole positive assertion set, shared by both frozen IDs below so the
+/// two cannot drift apart.
+fn integration_positive_assertions() {
     // ---------------------------------------------------------------------
     // The era-pinned facade namespaces each expose exactly one immutable
     // policy. None of these wrappers has a policy setter, so the selection is
@@ -139,8 +140,8 @@ fn fnd_03_i_positive() {
     );
 }
 
-#[test]
-fn fnd_03_i_planted_negative() {
+/// The whole one-variable negative, shared by both frozen IDs below.
+fn integration_planted_negative_assertions() {
     // Accepted case, held for the unchanged-state comparison. Same call, same
     // facade path, same everything except the single changed variable below.
     let accepted = ProtocolVersion::parse(MODERN_PROTOCOL_VERSION)
@@ -211,4 +212,40 @@ fn fnd_03_i_planted_negative() {
         .expect("ModernOnly is available on every build");
     let server = modern.try_build().expect("the modern server still builds");
     assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+}
+
+// ---------------------------------------------------------------------------
+// Frozen test IDs.
+//
+// Two acceptance families name this capability and neither can be satisfied by
+// the other's spelling: the bridge acceptance freezes `fnd_03_i_*` and the
+// Bead's own acceptance item freezes `fnd_03_integration_*`. Both are declared
+// here, in the one location that is an external consumer of the packaged
+// facade and builds under default features, so each resolves to exactly one
+// definition workspace-wide and a no-flags `-- --exact` run discovers one row
+// per ID.
+//
+// They delegate to one shared assertion set rather than carrying two copies:
+// duplicated bodies drift, and a frozen pair that has quietly stopped
+// asserting the same thing is worse than a single test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fnd_03_i_positive() {
+    integration_positive_assertions();
+}
+
+#[test]
+fn fnd_03_i_planted_negative() {
+    integration_planted_negative_assertions();
+}
+
+#[test]
+fn fnd_03_integration_positive() {
+    integration_positive_assertions();
+}
+
+#[test]
+fn fnd_03_integration_planted_negative() {
+    integration_planted_negative_assertions();
 }

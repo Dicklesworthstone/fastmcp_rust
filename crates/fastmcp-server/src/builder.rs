@@ -3830,11 +3830,11 @@ mod tests {
 
     #[test]
     fn fnd_03_i_unit_positive() {
-        fnd_03_integration_positive();
+        fnd_03_integration_unit_positive();
     }
 
     #[test]
-    fn fnd_03_integration_positive() {
+    fn fnd_03_integration_unit_positive() {
         use fastmcp_protocol::protocol_policy::{ProtocolVersion, ProtocolVersionError};
 
         let builder = ServerBuilder::try_new("fnd03-integration", "1.0.0")
@@ -3879,11 +3879,11 @@ mod tests {
 
     #[test]
     fn fnd_03_i_unit_planted_negative() {
-        fnd_03_integration_planted_negative();
+        fnd_03_integration_unit_planted_negative();
     }
 
     #[test]
-    fn fnd_03_integration_planted_negative() {
+    fn fnd_03_integration_unit_planted_negative() {
         use fastmcp_protocol::protocol_policy::{ProtocolVersion, ProtocolVersionError};
 
         let mut builder = ServerBuilder::try_new("fnd03-integration-neg", "1.0.0")

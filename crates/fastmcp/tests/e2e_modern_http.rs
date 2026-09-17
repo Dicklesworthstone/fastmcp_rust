@@ -61687,11 +61687,11 @@ mod live_websocket_bind {
 
 #[test]
 fn fnd_03_i_e2e_positive() {
-    fnd_03_integration_positive();
+    fnd_03_integration_e2e_positive();
 }
 
 #[test]
-fn fnd_03_integration_positive() {
+fn fnd_03_integration_e2e_positive() {
     use fastmcp_rust::{ProtocolPolicy, ProtocolVersion};
 
     let builder = ServerBuilder::try_new("facade-fnd03-integration", "1.0.0")
@@ -61740,11 +61740,11 @@ fn fnd_03_integration_positive() {
 
 #[test]
 fn fnd_03_i_e2e_planted_negative() {
-    fnd_03_integration_planted_negative();
+    fnd_03_integration_e2e_planted_negative();
 }
 
 #[test]
-fn fnd_03_integration_planted_negative() {
+fn fnd_03_integration_e2e_planted_negative() {
     #[cfg(not(feature = "legacy-2024-11-05"))]
     use fastmcp_rust::ServerLaunchPolicyError;
     use fastmcp_rust::{ProtocolPolicy, ProtocolPolicyVersionError, ProtocolVersion};
