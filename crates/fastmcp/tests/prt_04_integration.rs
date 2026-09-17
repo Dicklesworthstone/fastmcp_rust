@@ -30,9 +30,11 @@ use fastmcp_protocol::{
     CompleteResultPayload, CoreResultDiscriminatorPolicy, DecodedResult,
     DeferringResultDiscriminatorPolicy, ExactJsonMember, ExactJsonObject, ExactJsonValue,
     MAX_PRT_04_MANIFEST_BYTES, PRT_04_A_EVALUATOR_MANIFEST_V1, PRT_04_B_EVALUATOR_MANIFEST_V1,
-    ResultDecodeError, ResultDecodeErrorKind, ResultMeta, ResultPeerDiagnostic, ResultPeerEra,
+    PeerCacheTtl, PeerCacheTtlDeviation, ResultDecodeError, ResultDecodeErrorKind, ResultMeta,
+    ResultPeerDiagnostic, ResultPeerEra,
     TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_typed_complete,
-    encode_complete_result, encode_result, prt_04_a_manifest_digest, prt_04_b_manifest_digest,
+    decode_peer_cache_ttl, encode_complete_result, encode_result, prt_04_a_manifest_digest,
+    prt_04_b_manifest_digest,
 };
 
 // ---------------------------------------------------------------------------
@@ -774,6 +776,103 @@ fn observe(case: &str) -> usize {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Integration-owned capability: tolerant peer cache TTL
+// ---------------------------------------------------------------------------
+//
+// This is NOT part of the A/B floor union and is deliberately not counted
+// against any producer's published floor — neither implementation slice owns
+// it. The PRT-04 package body mandates it and names its consumer ("the
+// tolerant peer client layer"), so under the orchestrator's in-scope rule it
+// lands here rather than falling between the two slices and quietly becoming
+// nobody's (RH-9). It is asserted directly instead of through `observe`.
+
+/// Exercises every branch the package body enumerates for a peer `ttlMs`.
+///
+/// The two tolerated deviations and the four protocol errors are checked
+/// together, because the whole point of the clause is that they are different
+/// answers: tolerating a deviation is only safe if the neighbouring malformed
+/// cases are still refused.
+fn assert_peer_cache_ttl_contract() {
+    // Conforming: a nonnegative integer is usable and carries no diagnostic.
+    let (ttl, diagnostic) = decode_peer_cache_ttl(Some(&ExactJsonValue::Number("60000".to_owned())))
+        .expect("a nonnegative peer ttlMs conforms");
+    assert_eq!(diagnostic, None);
+    assert_eq!(
+        ttl.conforming().map(fastmcp_protocol::CacheTtl::as_str),
+        Some("60000")
+    );
+    assert_eq!(ttl.freshness_millis(), Ok(60_000));
+    assert_eq!(ttl.deviation(), None);
+
+    // Tolerated deviation 1 — negative. Zero freshness, diagnosed, and it
+    // cannot be read back out as a server-constructible TTL.
+    let (negative, diagnostic) =
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("-1".to_owned())))
+            .expect("a negative peer ttlMs is tolerated, not fatal");
+    assert_eq!(
+        negative,
+        PeerCacheTtl::ImmediatelyStale {
+            reason: PeerCacheTtlDeviation::Negative
+        }
+    );
+    assert_eq!(diagnostic, Some(ResultPeerDiagnostic::PeerNegativeCacheTtl));
+    assert_eq!(negative.freshness_millis(), Ok(0));
+    assert!(
+        negative.conforming().is_none(),
+        "a tolerated deviation must never re-enter as a valid TTL"
+    );
+
+    // Tolerated deviation 2 — absent. Distinguished from explicit null below.
+    let (missing, diagnostic) =
+        decode_peer_cache_ttl(None).expect("an omitted peer ttlMs is tolerated");
+    assert_eq!(
+        missing,
+        PeerCacheTtl::ImmediatelyStale {
+            reason: PeerCacheTtlDeviation::Missing
+        }
+    );
+    assert_eq!(diagnostic, Some(ResultPeerDiagnostic::PeerMissingCacheTtl));
+    assert_eq!(missing.freshness_millis(), Ok(0));
+    assert!(missing.conforming().is_none());
+
+    // The two deviations stay distinguishable; collapsing them would lose the
+    // difference between a hostile peer and an old one.
+    assert_ne!(negative, missing);
+
+    // Explicit null is NOT absence. This is the presence-aware distinction the
+    // clause depends on, and it is the single most likely thing to regress.
+    let error = decode_peer_cache_ttl(Some(&ExactJsonValue::Null))
+        .expect_err("explicit null ttlMs is a protocol error, not a tolerated absence");
+    assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+    assert_eq!(error.path(), "$.ttlMs");
+
+    // Fractional, nonnumeric and overflowing values remain protocol errors.
+    for rejected in [
+        ExactJsonValue::Number("1.5".to_owned()),
+        ExactJsonValue::Number("-2.5".to_owned()),
+        ExactJsonValue::String("60000".to_owned()),
+        ExactJsonValue::Bool(true),
+        ExactJsonValue::Array(Vec::new()),
+        ExactJsonValue::Object(ExactJsonObject::default()),
+        ExactJsonValue::Number("123456789012345678901234567890".to_owned()),
+    ] {
+        let error = decode_peer_cache_ttl(Some(&rejected))
+            .expect_err("only a negative integer or an absent member is tolerated");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+        assert_eq!(error.path(), "$.ttlMs");
+    }
+
+    // An integral exponent spelling is a conforming integer, not a fraction.
+    let (exponent, diagnostic) = decode_peer_cache_ttl(Some(&ExactJsonValue::Number(
+        "6e4".to_owned(),
+    )))
+    .expect("an integral exponent spelling is still an integer");
+    assert_eq!(diagnostic, None);
+    assert_eq!(exponent.freshness_millis(), Ok(60_000));
+}
+
 /// The join's floor gate, as a fallible operation both entry points run.
 ///
 /// It is a function rather than an inline `assert!` so the planted negative can
@@ -809,6 +908,8 @@ fn prt_04_i_positive() {
     for case in &union {
         total += meets_floor(case, case.floor).unwrap_or_else(|failure| panic!("{failure}"));
     }
+
+    assert_peer_cache_ttl_contract();
     assert!(
         total >= union.iter().map(|case| case.floor).sum::<usize>(),
         "the join must meet the summed published floors"
@@ -889,6 +990,46 @@ fn prt_04_i_planted_negative() {
             .expect("the rejection preserves its raw envelope")
             .discriminator(),
         "x.example/stream"
+    );
+
+    // Planted mutation 4 — one TTL dimension: the peer's `ttlMs` sign. The
+    // accepted baseline is `60000`; the planted input is `-60000`, identical in
+    // every other respect. It must become a zero-freshness tolerated deviation
+    // that cannot be read back as a usable TTL, never a usable 60-second one.
+    let (accepted_ttl, accepted_diagnostic) =
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("60000".to_owned())))
+            .expect("baseline conforming ttlMs");
+    assert_eq!(accepted_ttl.freshness_millis(), Ok(60_000));
+    assert_eq!(accepted_diagnostic, None);
+    let (planted_ttl, planted_diagnostic) =
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("-60000".to_owned())))
+            .expect("a negative ttlMs is tolerated, not fatal");
+    assert_eq!(
+        planted_ttl,
+        PeerCacheTtl::ImmediatelyStale {
+            reason: PeerCacheTtlDeviation::Negative
+        }
+    );
+    assert_eq!(
+        planted_diagnostic,
+        Some(ResultPeerDiagnostic::PeerNegativeCacheTtl)
+    );
+    assert_eq!(
+        planted_ttl.freshness_millis(),
+        Ok(0),
+        "a negative peer TTL has exactly zero freshness and cannot cause cache reuse"
+    );
+    assert!(
+        planted_ttl.conforming().is_none(),
+        "the tolerated deviation must not expose a server-constructible TTL"
+    );
+    // And the accepted baseline is unaffected by having decoded the deviation.
+    assert_eq!(
+        decode_peer_cache_ttl(Some(&ExactJsonValue::Number("60000".to_owned())))
+            .expect("still conforming")
+            .0
+            .freshness_millis(),
+        Ok(60_000)
     );
 
     // Named state, byte-for-byte unchanged. In particular the producers' own
