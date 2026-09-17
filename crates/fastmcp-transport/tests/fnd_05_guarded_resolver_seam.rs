@@ -27,7 +27,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use asupersync::Cx;
-use fastmcp_transport::http::{
+// Imported from the CRATE ROOT, not `fastmcp_transport::http::*`, so the
+// re-export itself is load-bearing: if `pub use http::{...}` in lib.rs were
+// dropped, this external consumer would stop compiling. That is acceptance
+// item 1's "re-exported so an external consumer can reach it", demonstrated by
+// execution rather than by reading lib.rs.
+use fastmcp_transport::{
     GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetcher, GuardedHttpResolver,
     GuardedHttpsUrl,
 };

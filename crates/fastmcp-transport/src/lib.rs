@@ -62,7 +62,12 @@ pub use codec::{Codec, CodecError, InvalidMessageKind};
 /// finite request-scoped SSE response body. They do not start an HTTP listener
 /// or qualify turnkey HTTP serving.
 pub use http::{
-    GuardedHttpResolver, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
+    GuardedHttpFetchError, GuardedHttpFetchPolicy, GuardedHttpFetchResponse, GuardedHttpFetcher,
+    GuardedHttpPeerProvenance, GuardedHttpRedirect, GuardedHttpResolver, GuardedHttpsUrl,
+    guarded_admit_native_response,
+};
+pub use http::{
+    HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
     HttpResponse, HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
     ModernHttpSseCollector, ModernHttpSseCollectorError, NativeGuardedResolver,
     StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
