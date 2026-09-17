@@ -17,7 +17,7 @@ enum RunCase {
     Complete, ObserveOnly, Pause, InvalidReply, Capability, LostUpdate,
     CancelResolver, CloseResolver, TimeoutResolver, DropResolver, CancelSleep,
     LargeHint, RepeatId, PollLimit, UpdateLimit, InputReuse, ObserverRefusal,
-    Failed, Cancelled, PreCancelled,
+    Failed, Cancelled, PreCancelled, LateResolver,
 }
 
 fn isolated_run(name: &str, case: RunCase) {
@@ -76,12 +76,19 @@ struct Resolution<'a> {
     action: Option<Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
     entered: &'a Cell<bool>,
     dropped: &'a Cell<bool>,
+    overrun_deadline: bool,
 }
 impl Future for Resolution<'_> {
     type Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>;
     fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.entered.set(true);
+        if this.overrun_deadline {
+            this.overrun_deadline = false;
+            // Deliberately uncooperative TEST ONLY host callback. It returns
+            // Ready, never yielding to the outer deadline guard first.
+            std::thread::sleep(Duration::from_millis(1100));
+        }
         match this.action.take() { Some(action) => Poll::Ready(action), None => Poll::Pending }
     }
 }
@@ -104,7 +111,7 @@ fn run_task_driver(case: RunCase) {
             let client = ManagedTasksClient::new(session.clone(), FinalRequestMeta::new(capabilities), ManagedTasksLimits::default()).unwrap();
             let policy = ManagedTaskDriverPolicy::new(
                 Duration::from_millis(10),
-                if matches!(case, RunCase::LargeHint | RunCase::TimeoutResolver) { Duration::from_secs(1) } else { Duration::from_secs(15) },
+                if matches!(case, RunCase::LargeHint | RunCase::TimeoutResolver | RunCase::LateResolver) { Duration::from_secs(1) } else { Duration::from_secs(15) },
                 if matches!(case, RunCase::PollLimit) { 1 } else { 20 },
                 if matches!(case, RunCase::ObserveOnly) { 0 } else if matches!(case, RunCase::UpdateLimit) { 1 } else { 8 },
                 if matches!(case, RunCase::ObserveOnly) { 0 } else { 16 },
@@ -193,7 +200,7 @@ fn run_task_driver(case: RunCase) {
                             let responses: TaskInputResponses = serde_json::from_value(json!({key:{"roots":[]}})).unwrap();
                             Some(Ok(ManagedTaskInputAction::Respond(responses)))
                         };
-                        Resolution { action, entered: entered_ref, dropped: dropped_ref }
+                        Resolution { action, entered: entered_ref, dropped: dropped_ref, overrun_deadline: matches!(case, RunCase::LateResolver) }
                     },
                     |_| {
                         observations.set(observations.get() + 1);
@@ -251,6 +258,12 @@ fn run_task_driver(case: RunCase) {
                                 RunCase::CancelResolver | RunCase::CancelSleep | RunCase::PreCancelled => assert!(matches!(error, ManagedTaskDriverError::Task(ManagedTasksError::Session(OAuthSessionError::Cancelled)))),
                                 RunCase::CloseResolver => assert!(matches!(error, ManagedTaskDriverError::Task(ManagedTasksError::Session(OAuthSessionError::Closed)))),
                                 RunCase::TimeoutResolver | RunCase::LargeHint => assert!(matches!(error, ManagedTaskDriverError::Task(ManagedTasksError::Session(OAuthSessionError::TimedOut)))),
+                                RunCase::LateResolver => {
+                                    assert!(matches!(error, ManagedTaskDriverError::Task(ManagedTasksError::Session(OAuthSessionError::TimedOut))));
+                                    assert_eq!(resolutions.get(), 1);
+                                    assert_eq!(id_calls.get(), 1, "expired ready answers must not reach the next ID factory or POST");
+                                    assert!(dropped.get());
+                                }
                                 RunCase::RepeatId => assert!(matches!(error, ManagedTaskDriverError::RepeatedRequestId)),
                                 RunCase::PollLimit => assert!(matches!(error, ManagedTaskDriverError::PollLimit)),
                                 RunCase::UpdateLimit => { assert!(matches!(error, ManagedTaskDriverError::UpdateLimit)); assert_eq!(resolutions.get(), 1); },
@@ -315,3 +328,5 @@ fn failed_task_is_a_typed_terminal_not_a_success_projection() { isolated_run("fa
 fn remotely_cancelled_task_is_a_typed_terminal() { isolated_run("remotely_cancelled_task_is_a_typed_terminal", RunCase::Cancelled); }
 #[test]
 fn precancelled_driver_has_no_new_peer_effects() { isolated_run("precancelled_driver_has_no_new_peer_effects", RunCase::PreCancelled); }
+#[test]
+fn ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input() { isolated_run("ready_resolver_after_deadline_cannot_allocate_ids_or_submit_input", RunCase::LateResolver); }
