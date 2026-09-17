@@ -1150,6 +1150,26 @@ pub const MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The lower wire seam (`GuardedHttpTestExchange`) and the loopback-authority
 /// escape remain `#[cfg(test)]` deliberately: those DO bypass the address
 /// fence and real TLS, so publishing them would widen a production bound.
+///
+/// WHAT THAT GATING COSTS, stated where a reader meets it rather than left to
+/// be discovered. A test driving the wire seam takes `provenance` from its
+/// fixture; production DERIVES it from the live TLS session in
+/// `guarded_peer_provenance`. Such a test therefore asserts admission behaviour
+/// GIVEN a provenance, and can never prove that provenance was computed
+/// correctly from a peer.
+///
+/// Derivation is covered by the loopback-authority tests instead — but only
+/// PARTIALLY, and the remainder is an open gap rather than a documented
+/// boundary. `guarded_leaf_certificate_sha256`'s bounds are proven directly by
+/// `rh5_guarded_leaf_provenance_requires_admitted_certificate_and_valid_retry`:
+/// absent leaf, oversized leaf, and the unchanged-input proof on rejection. But
+/// the only test that derives provenance from a LIVE session is
+/// `guarded_loopback_real_wire_200_records_request_body_and_leaf_provenance`,
+/// and of the six fields it checks `leaf_certificate_sha256` only for being
+/// non-zero — which a constant or the wrong certificate would also satisfy —
+/// while `host` and `selected_address` are passed in rather than derived.
+/// `alpn` and `tls_protocol` are read from the live session and asserted
+/// NOWHERE in the crate. Those three are UNPROVEN, not merely unstated.
 pub trait GuardedHttpResolver: Send + Sync {
     /// Resolve all IP answers for the supplied canonical DNS host.
     ///
