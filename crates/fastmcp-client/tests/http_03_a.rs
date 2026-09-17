@@ -3108,6 +3108,49 @@ fn independent_server_request() -> Vec<u8> {
     .expect("the reverse-request fixture must serialize")
 }
 
+/// Runs one final core listener over an SSE stream whose single dispatched
+/// payload is exactly `payload`, and returns what the caller observed.
+///
+/// The HTTP and SSE framing is always well formed. The only thing that varies
+/// between the cases below is what the assembled payload contains, so a refusal
+/// can only come from JSON-RPC admission.
+async fn admit_dispatched_payload(
+    cx: &Cx,
+    payload: &[u8],
+) -> Result<(), ModernHttpFinalCoreListenError> {
+    let peer = Peer::bind().await;
+    let connection = connect(cx, &peer).await;
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, b"data: ").await;
+            write_bytes(&mut io, payload).await;
+            write_bytes(&mut io, b"\n\n").await;
+            end_sse_stream(&mut io).await;
+        },
+        async {
+            let mut listener = connection
+                .open_final_core_listener(
+                    cx,
+                    "tools/call",
+                    tool_call_params("admission_tool"),
+                    RequestId::Number(2),
+                    limits(),
+                )
+                .await
+                .expect("the admission request must reach the peer");
+            listener.next_event(cx).await.map(|_| ())
+        },
+    )
+    .await;
+    // Admitted or refused, the client answers nothing on the wire: a response
+    // back to the server would require opening another socket.
+    peer.assert_no_further_connection();
+    outcome
+}
+
 async fn positive_12_response_isolation(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -3172,6 +3215,13 @@ async fn positive_12_response_isolation(cx: &Cx) {
         },
     )
     .await;
+    // Exactly one JSON-RPC object in a dispatched payload is admitted. These
+    // bytes are the control for the concatenation negative, which reuses them
+    // verbatim so that the only thing changing there is that they appear twice.
+    let single = terminal_tool_result(2, "single-object");
+    admit_dispatched_payload(cx, &single)
+        .await
+        .expect("one complete JSON-RPC object must be admitted");
 }
 
 async fn negative_12_invalid_direction(cx: &Cx) {
@@ -3261,6 +3311,35 @@ async fn negative_12_invalid_direction(cx: &Cx) {
     // No JSON-RPC parse/invalid-request response was posted back to the
     // server: answering would require opening another socket.
     peer.assert_no_further_connection();
+    // The sole changed variable is concatenation: the byte-identical object the
+    // positive admits is followed, inside the same dispatched payload, by a
+    // second copy of itself.
+    //
+    // This is the failure a lenient reader produces rather than refuses. A
+    // decoder that stops at the first complete JSON value would hand the caller
+    // the first object and silently discard the trailing bytes - a terminal
+    // outcome that the server never sent as a single message. Strict admission
+    // has to refuse the whole payload instead.
+    let single = terminal_tool_result(2, "single-object");
+    let mut concatenated = single.clone();
+    concatenated.extend_from_slice(&single);
+    assert_eq!(
+        concatenated.len(),
+        single.len() * 2,
+        "the negative differs from the control by exactly one appended copy"
+    );
+    let refusal = admit_dispatched_payload(cx, &concatenated)
+        .await
+        .err()
+        .expect("concatenated JSON must not be admitted as one message");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpFinalCoreListenError::JsonRpcAdmission(_)
+                | ModernHttpFinalCoreListenError::NotificationAdmission(_)
+        ),
+        "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
