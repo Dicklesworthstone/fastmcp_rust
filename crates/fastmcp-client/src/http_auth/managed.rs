@@ -38,6 +38,9 @@ pub mod subscriptions;
 #[cfg(feature = "tasks")]
 pub mod tasks;
 
+#[cfg(test)]
+mod revocation_tests;
+
 /// Bounds shared renewal and response-head admission. Response bodies retain
 /// the native executor's separate idle/absolute limits after handoff, further
 /// constrained by the original access token's expiry and caller budget.
@@ -135,9 +138,10 @@ impl std::error::Error for OAuthSessionError {}
 /// must also bind session identity, resource and its own authorization policy;
 /// generation alone is not a cross-session cache key.
 ///
-/// Snapshots deliberately omit serde and Clone. A caller that extracts/clones
-/// the bound credential is responsible for that copy: session closure cannot
-/// recall already-issued credentials or headers.
+/// Snapshots deliberately omit serde and Clone. Extracted credential clones
+/// retain local token revocation and the session's closure signal, even after
+/// renewal or after the last session handle is dropped. Already-constructed
+/// header strings and already-sent bytes cannot be recalled.
 pub struct OAuthCredentialSnapshot {
     credential: BoundBearerCredential,
     scopes: Vec<String>,
@@ -146,6 +150,40 @@ pub struct OAuthCredentialSnapshot {
 }
 
 impl OAuthCredentialSnapshot {
+    fn new(
+        credential: &BoundBearerCredential,
+        scopes: &[String],
+        generation: u64,
+        expires_at: Instant,
+        owner: &McpRequestCancellation,
+    ) -> Result<Self, OAuthSessionError> {
+        let credential = credential.for_owner(owner).ok_or(OAuthSessionError::StateUnavailable)?;
+        if credential.is_revoked() || Instant::now() >= expires_at {
+            return Err(OAuthSessionError::LoginRequired);
+        }
+        Ok(Self {
+            credential,
+            scopes: scopes.to_vec(),
+            generation,
+            expires_at,
+        })
+    }
+
+    // Preserve authenticated intent even when the credential expires or is
+    // revoked between snapshot acquisition and header construction. The native
+    // request's optional-auth builder alone would silently omit the header.
+    fn authorize_request(&self, request: &ModernHttpRequest) -> Result<ModernHttpRequest, OAuthSessionError> {
+        admit_target(self.credential.resource(), request.target())?;
+        if self.credential.is_revoked() || Instant::now() >= self.expires_at {
+            return Err(OAuthSessionError::LoginRequired);
+        }
+        let request = request.clone().with_authorization(&self.credential);
+        if !request.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization")) {
+            return Err(OAuthSessionError::LoginRequired);
+        }
+        Ok(request)
+    }
+
     pub fn credential(&self) -> &BoundBearerCredential {
         &self.credential
     }
@@ -188,6 +226,15 @@ struct SessionInner {
     state: Arc<Mutex<Option<GrantState>>>,
     closed: McpRequestCancellation,
     pending: AtomicUsize,
+}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        // A credential snapshot does not keep the session owner alive. Its
+        // copied closure signal must become terminal when the last owner goes
+        // away, without a runtime, lock acquisition or detached cleanup work.
+        self.closed.cancel();
+    }
 }
 
 /// Shared login owner with on-demand, single-flight token renewal.
@@ -244,10 +291,12 @@ impl ManagedOAuthSession {
 
     /// Closes admission and wakes active credential and managed-response waits
     /// without cancelling the caller's Cx or sibling sessions. This is local
-    /// closure, NOT an OAuth token-revocation endpoint request. Already-issued
-    /// snapshots cannot be recalled. An unpolled response is released on its
-    /// next poll or drop; no background task is created to drive abandoned work.
-    /// Grant disposal is best effort while another caller retains its lock.
+    /// closure, NOT an OAuth token-revocation endpoint request. Issued snapshots
+    /// and their credential clones immediately withhold subsequent headers,
+    /// including snapshots of earlier generations; already-built headers cannot
+    /// be recalled. An unpolled response is released on its next poll or drop;
+    /// no background task is created to drive abandoned work. Grant disposal is
+    /// best effort while another caller retains its lock.
     pub fn close(&self) {
         self.inner.closed.cancel();
         if let Ok(mut state) = self.inner.state.try_lock_owned() {
@@ -277,7 +326,7 @@ impl ManagedOAuthSession {
             let mut guard = SessionGuard { guard, closed: &self.inner.closed };
             self.check(cx, cancellation)?;
             let state = guard.as_mut().ok_or(OAuthSessionError::Closed)?;
-            if state.renewal_failed {
+            if state.renewal_failed || state.credentials.bearer_credential().is_revoked() {
                 return Err(OAuthSessionError::LoginRequired);
             }
             if Instant::now() >= state.renew_after {
@@ -300,12 +349,13 @@ impl ManagedOAuthSession {
             if Instant::now() >= state.credentials.expires_at() {
                 return Err(OAuthSessionError::LoginRequired);
             }
-            Ok(OAuthCredentialSnapshot {
-                credential: state.credentials.bearer_credential().clone(),
-                scopes: state.credentials.scopes().to_vec(),
-                generation: state.generation,
-                expires_at: state.credentials.expires_at(),
-            })
+            OAuthCredentialSnapshot::new(
+                state.credentials.bearer_credential(),
+                state.credentials.scopes(),
+                state.generation,
+                state.credentials.expires_at(),
+                &self.inner.closed,
+            )
         }).await
     }
 
@@ -336,7 +386,7 @@ impl ManagedOAuthSession {
         self.check(cx, cancellation)?;
         admit_target(&self.inner.resource, request.target())?;
         let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
-        let request = request.clone().with_authorization(snapshot.credential());
+        let request = snapshot.authorize_request(request)?;
         let deadline = deadline_after(cx, self.inner.policy.response_head_timeout)?;
         let executor = ModernHttpExecutor::new();
         let response = self.await_active(cx, cancellation, deadline, Some(snapshot.expires_at), async {
