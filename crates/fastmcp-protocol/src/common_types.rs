@@ -2986,6 +2986,90 @@ pub fn prt_02_b_open_goldens_manifest_digest() -> fastmcp_core::Sha256Digest {
     .expect("the fixed PRT-02 B open-goldens manifest is within its exact byte bound")
 }
 
+/// The canonical `PRT02-I-PUBLIC-JOIN-v1` rows: ordered subcases
+/// `PRT-I-01.01` through `PRT-I-01.12`.
+///
+/// These are the rows the PRT-02 integration leaf must exercise through
+/// shipped public entrypoints only. Same row contract as the A and B
+/// manifests.
+pub const PRT_02_I_PUBLIC_JOIN_MANIFEST_V1: &str = concat!(
+    "PRT02-I-PUBLIC-JOIN-v1\n",
+    "producer-bead bd-mcp-prt-02-integration-n3ur\n",
+    "producer-revision 0689341b0b2f4a1c6d3e9f5a7b8c0d1e2f3a4b5c\n",
+    "entrypoint fastmcp_rust public facade\n",
+    "PRT-I-01.01 implementation-try-new floor=1\n",
+    "PRT-I-01.02 open-metadata-try-from-entries floor=1\n",
+    "PRT-I-01.03 absolute-uri-parse floor=1\n",
+    "PRT-I-01.04 opaque-cursor-from-presence floor=1\n",
+    "PRT-I-01.05 cancellation-notification-try-new floor=1\n",
+    "PRT-I-01.06 raw-icon-try-new floor=1\n",
+    "PRT-I-01.07 content-block-constructors floor=1\n",
+    "PRT-I-01.08 serde-to-value floor=1\n",
+    "PRT-I-01.09 serde-from-value floor=1\n",
+    "PRT-I-01.10 schema-validate floor=1\n",
+    "PRT-I-01.11 a-manifests-structurally-sound floor=3\n",
+    "PRT-I-01.12 b-manifests-structurally-sound floor=3\n",
+);
+
+/// The canonical `PRT02-I-OPEN-FINAL-JOIN-v1` rows: ordered subcases
+/// `PRT-I-02.01` through `PRT-I-02.08`.
+pub const PRT_02_I_OPEN_FINAL_JOIN_MANIFEST_V1: &str = concat!(
+    "PRT02-I-OPEN-FINAL-JOIN-v1\n",
+    "producer-bead bd-mcp-prt-02-integration-n3ur\n",
+    "producer-revision 0689341b0b2f4a1c6d3e9f5a7b8c0d1e2f3a4b5c\n",
+    "entrypoint fastmcp_rust public facade\n",
+    "PRT-I-02.01 final-known-metadata floor=1\n",
+    "PRT-I-02.02 valid-open-metadata-preserved floor=1\n",
+    "PRT-I-02.03 invalid-open-metadata-refused floor=1\n",
+    "PRT-I-02.04 uri-policy-classes floor=2\n",
+    "PRT-I-02.05 cursor-presence-three-states floor=3\n",
+    "PRT-I-02.06 cancellation-direction floor=1\n",
+    "PRT-I-02.07 icon-and-content floor=2\n",
+    "PRT-I-02.08 trace-propagation floor=1\n",
+);
+
+/// Returns the canonical `PRT02-I-PUBLIC-JOIN-v1` digest.
+#[must_use]
+pub fn prt_02_i_public_join_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_I_PUBLIC_JOIN_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 I public-join manifest is within its exact byte bound")
+}
+
+/// Returns the canonical `PRT02-I-OPEN-FINAL-JOIN-v1` digest.
+#[must_use]
+pub fn prt_02_i_open_final_join_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_I_OPEN_FINAL_JOIN_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 I open-final-join manifest is within its exact byte bound")
+}
+
+/// Every published PRT-02 manifest, in role order: the three A manifests, the
+/// three B manifests, then the two integration manifests.
+///
+/// An integrating consumer uses this to check properties that span the whole
+/// family — that no two manifests share a subcase identifier, that each row
+/// set is well formed, and that the eight canonical digests are distinct —
+/// rather than re-hashing bytes it already holds, which would only restate the
+/// hash function back to itself.
+#[must_use]
+pub const fn prt_02_all_manifests() -> [&'static str; 8] {
+    [
+        PRT_02_A_METADATA_MANIFEST_V1,
+        PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1,
+        PRT_02_A_ICON_CONTENT_MANIFEST_V1,
+        PRT_02_B_SERDE_SCHEMA_MANIFEST_V1,
+        PRT_02_B_BOUNDS_DIRECTION_MANIFEST_V1,
+        PRT_02_B_OPEN_GOLDENS_MANIFEST_V1,
+        PRT_02_I_PUBLIC_JOIN_MANIFEST_V1,
+        PRT_02_I_OPEN_FINAL_JOIN_MANIFEST_V1,
+    ]
+}
+
 /// Parses one published PRT-02 manifest into its ordered `(id, name, floor)`
 /// subcase rows.
 ///
