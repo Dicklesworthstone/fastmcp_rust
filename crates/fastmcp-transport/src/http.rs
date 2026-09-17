@@ -54,7 +54,9 @@ use std::io::{Read, Write};
 #[cfg(feature = "legacy-2024-11-05")]
 use std::net::TcpStream as StdTcpStream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(test)]
+// Not #[cfg(test)]: `GuardedHttpResolver` is a shipped public trait whose
+// method returns `Pin<Box<dyn Future<..>>>`, so `Pin` must be in scope in
+// ordinary builds too. It was test-gated while that trait was test-only.
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex, TryLockError,
