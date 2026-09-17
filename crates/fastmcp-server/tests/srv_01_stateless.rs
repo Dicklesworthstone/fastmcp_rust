@@ -10,11 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
-use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
+use asupersync::{CancelReason, Cx, PanicPayload};
+use fastmcp_core::{McpContext, McpError, McpErrorCode, McpOutcome, McpResult, Outcome};
 use fastmcp_derive::tool;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
-use fastmcp_server::{InboundRequestContext, InboundRequestTransport, Server};
+use fastmcp_protocol::{Content, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, Tool};
+use fastmcp_server::{
+    BoxFuture, FinalToolOutcome, InboundRequestContext, InboundRequestTransport, Server,
+    ToolHandler,
+};
 use fastmcp_transport::{Transport, TransportError};
 
 #[tool(name = "greet", description = "Greets a user by name")]
@@ -49,6 +52,87 @@ fn leak_probe(ctx: &McpContext) -> McpResult<String> {
     Ok(format!(
         "observed={observed} recorded={recorded} stored={stored} disabled={disabled}"
     ))
+}
+
+/// Marker the cancelled-arm handler hands to the framework.
+const OUTCOME_CANCEL_MARKER: &str = "srv01-b-handler-chose-cancelled";
+/// Payload text that must never reach the peer from either panic path.
+const OUTCOME_PANIC_SECRET: &str = "srv01-b-panic-payload-must-not-reach-the-peer";
+/// The exact sanitized text the server substitutes for a panic payload
+/// (`SANITIZED_HANDLER_PANIC_MESSAGE` in crates/fastmcp-server/src/router.rs).
+const SANITIZED_PANIC_MESSAGE: &str = "Internal server error";
+
+/// Which of the four-valued handler outcomes [`OutcomeArmTool`] produces.
+#[derive(Clone, Copy)]
+enum OutcomeArm {
+    /// Returns `Outcome::Cancelled` as a value.
+    ReturnsCancelled,
+    /// Returns `Outcome::Panicked` as a value.
+    ReturnsPanicked,
+    /// Actually unwinds while the handler future is polled.
+    Unwinds,
+}
+
+/// A hand-written [`ToolHandler`] that produces one chosen four-valued outcome.
+///
+/// `#[tool]` can only express `Ok` and `Err`, and the router intercepts a real
+/// cancellation and a real unwind *before* the outcome match: see
+/// `run_handler_in_request` in crates/fastmcp-server/src/router.rs, which tests
+/// `request_cx_cancellation_is_visible` on both sides of the await and wraps
+/// every poll in `catch_extension_unwind`. The `Outcome::Cancelled` and
+/// `Outcome::Panicked` arms of the conversion are therefore reachable only from
+/// a handler that *returns* those variants. `ToolHandler` is shipped public
+/// API, so this is the real consumer surface and not a `cfg(test)` back door.
+struct OutcomeArmTool {
+    name: &'static str,
+    arm: OutcomeArm,
+}
+
+impl ToolHandler for OutcomeArmTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: self.name.to_owned(),
+            description: Some("Produces one exact four-valued handler outcome".to_owned()),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // Unreachable in this test: the router calls the outcome hook below.
+        // Returning an error rather than panicking keeps an accidental
+        // regression legible instead of turning it into the panic arm.
+        Err(McpError::internal_error(
+            "the outcome-arm tool is invoked through its outcome hook",
+        ))
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        // One future, boxed once. The match selects an outcome *value*, so
+        // there is no per-arm future here. The box-every-arm rule applies to a
+        // dispatcher whose arms are themselves distinct async bodies, which
+        // would otherwise sum their state machines onto the test stack.
+        Box::pin(async move {
+            match self.arm {
+                OutcomeArm::ReturnsCancelled => {
+                    Outcome::Cancelled(CancelReason::user(OUTCOME_CANCEL_MARKER))
+                }
+                OutcomeArm::ReturnsPanicked => {
+                    Outcome::Panicked(PanicPayload::new(OUTCOME_PANIC_SECRET))
+                }
+                OutcomeArm::Unwinds => panic!("{OUTCOME_PANIC_SECRET}"),
+            }
+        })
+    }
 }
 
 /// Extracts the first text content block from a successful tool result.
@@ -776,6 +860,138 @@ fn srv_01_b_positive() {
         "a successful handler result must not carry an isError flag"
     );
     assert_eq!(success.id, success_request.id);
+
+    // The four-valued Outcome has two arms left, and they must NOT convert the
+    // way Outcome::Err did above. A handler-returned McpError became an isError
+    // *result*; cancellation and panic are framework-terminal and have to
+    // become typed JSON-RPC *errors* instead. Without these the B slice only
+    // ever proved one of four arms.
+    let arms_server = Server::new("stateless-handler-outcome-arms", "1.0.0")
+        .tool(Greet)
+        .tool(OutcomeArmTool {
+            name: "returns_cancelled",
+            arm: OutcomeArm::ReturnsCancelled,
+        })
+        .tool(OutcomeArmTool {
+            name: "returns_panicked",
+            arm: OutcomeArm::ReturnsPanicked,
+        })
+        .tool(OutcomeArmTool {
+            name: "unwinds",
+            arm: OutcomeArm::Unwinds,
+        })
+        .build();
+
+    // ServerBuilder::tool only logs a registration failure, so confirm the
+    // three handlers are really published. Otherwise a rejected schema would
+    // silently turn every assertion below into MethodNotFound.
+    let arm_names: Vec<String> = arms_server
+        .tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    for required in ["returns_cancelled", "returns_panicked", "unwinds"] {
+        assert!(
+            arm_names.iter().any(|name| name == required),
+            "outcome-arm handler {required} was not registered: {arm_names:?}"
+        );
+    }
+    let arms_catalog_before = stateless_public_catalog_snapshot(&arms_server);
+
+    // Outcome::Cancelled -> typed RequestCancelled JSON-RPC error.
+    let cancelled_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 91, InboundRequestTransport::Memory);
+    let cancelled = arms_server
+        .dispatch_stateless(
+            &cancelled_inbound,
+            &stateless_tool_call("returns_cancelled", 91_i64),
+        )
+        .expect("a cancelled handler outcome still answers a request carrying an id");
+    assert_eq!(
+        cancelled.error.as_ref().map(|error| error.code.clone()),
+        Some(McpErrorCode::RequestCancelled.into()),
+        "Outcome::Cancelled must convert to a typed RequestCancelled error"
+    );
+    assert!(
+        cancelled.result.is_none(),
+        "a cancelled handler must not also produce a result payload"
+    );
+
+    // Outcome::Panicked -> sanitized InternalError with the payload withheld.
+    let panicked_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 92, InboundRequestTransport::Memory);
+    let panicked = arms_server
+        .dispatch_stateless(
+            &panicked_inbound,
+            &stateless_tool_call("returns_panicked", 92_i64),
+        )
+        .expect("a panicked handler outcome still answers a request carrying an id");
+    assert_eq!(
+        panicked.error.as_ref().map(|error| error.code.clone()),
+        Some(McpErrorCode::InternalError.into()),
+        "Outcome::Panicked must convert to a typed InternalError"
+    );
+    assert_eq!(
+        panicked.error.as_ref().map(|error| error.message.as_str()),
+        Some(SANITIZED_PANIC_MESSAGE),
+        "the panic conversion must substitute the sanitized message"
+    );
+    let panicked_wire = serde_json::to_string(&panicked).expect("response must serialize");
+    assert!(
+        !panicked_wire.contains(OUTCOME_PANIC_SECRET),
+        "the panic payload reached the peer: {panicked_wire}"
+    );
+
+    // A handler that actually unwinds takes a different production path --
+    // catch_extension_unwind around the poll in run_handler_in_request -- and
+    // must land on the same sanitized error without killing the process.
+    let unwind_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 93, InboundRequestTransport::Memory);
+    let unwound = arms_server
+        .dispatch_stateless(&unwind_inbound, &stateless_tool_call("unwinds", 93_i64))
+        .expect("a real handler unwind still answers a request carrying an id");
+    assert_eq!(
+        unwound.error.as_ref().map(|error| error.code.clone()),
+        Some(McpErrorCode::InternalError.into()),
+        "a real handler unwind must be caught and converted, not propagated"
+    );
+    let unwound_wire = serde_json::to_string(&unwound).expect("response must serialize");
+    assert!(
+        !unwound_wire.contains(OUTCOME_PANIC_SECRET),
+        "the panic message reached the peer: {unwound_wire}"
+    );
+
+    // None of the three framework-terminal arms may disturb the catalog, and
+    // the server must still serve a normal request afterwards -- a caught
+    // unwind that poisoned the router would show up here.
+    assert_eq!(
+        stateless_public_catalog_snapshot(&arms_server),
+        arms_catalog_before,
+        "a framework-terminal handler outcome changed the published catalog"
+    );
+    let survivor_inbound =
+        InboundRequestContext::new(Cx::for_testing(), 94, InboundRequestTransport::Memory);
+    let survivor_request = JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "greet",
+            "arguments": {"name": "after the panic"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        94_i64,
+    );
+    let survivor = arms_server
+        .dispatch_stateless(&survivor_inbound, &survivor_request)
+        .expect("the server still answers after a caught handler unwind");
+    assert!(survivor.error.is_none());
+    assert_eq!(
+        stateless_tool_text(&survivor).as_deref(),
+        Some("Hello, after the panic!"),
+        "a caught handler unwind left the server unable to serve"
+    );
 }
 
 #[test]
