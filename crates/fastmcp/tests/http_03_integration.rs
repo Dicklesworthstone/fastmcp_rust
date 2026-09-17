@@ -1716,6 +1716,32 @@ struct JoinReceipt {
 }
 
 impl JoinReceipt {
+    /// One line naming how much was actually executed.
+    ///
+    /// `2 passed` does not tell a reader that 26 ordered cases ran inside those
+    /// two tests, and nothing else in the run output names a case. The count is
+    /// already ENFORCED - an unregistered id panics, `cases.len()` is pinned to
+    /// the ordered union, and every case must meet the producer's declared floor
+    /// by execution - so a short-circuiting case fails rather than passing
+    /// quietly. This makes the same fact legible instead of only guaranteed.
+    ///
+    /// `cargo test` captures stdout for passing tests, so this surfaces under
+    /// `--nocapture`. It is deliberately not wired into the frozen AC-7 runner,
+    /// which takes no flags.
+    fn execution_summary(&self) -> String {
+        let floors: usize = self.cases.iter().map(|case| case.floor).sum();
+        let positive = self.total_positive();
+        let negative = self.total_negative();
+        format!(
+            "HTTP-03 join executed {} ordered cases: {positive} positive + {negative} \
+             negative = {} observations against {floors} declared floor-observations \
+             (entrypoint {})",
+            self.cases.len(),
+            positive + negative,
+            self.joined_entrypoint,
+        )
+    }
+
     fn case(&self, id: &str) -> &CaseRecord {
         self.cases
             .iter()
@@ -3176,6 +3202,7 @@ fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
 #[test]
 fn http_03_i_positive() {
     let receipt = evaluate_join(false);
+    println!("{}", receipt.execution_summary());
 
     // Manifest half: the join consumed both producer inputs and their digests.
     assert_eq!(receipt.cases.len(), LAST_CASE_ORDINAL);
@@ -3241,6 +3268,8 @@ fn http_03_i_positive() {
 fn http_03_i_planted_negative() {
     let accepted = evaluate_join(false);
     let planted = evaluate_join(true);
+    println!("accepted: {}", accepted.execution_summary());
+    println!("planted:  {}", planted.execution_summary());
 
     // The one changed variable is the `/mcp-b` terminal response coding, which
     // lives in exactly one manifest case.
