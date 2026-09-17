@@ -56,6 +56,11 @@ struct ManifestCase {
     byte_floor: usize,
 }
 
+/// Consecutive non-dispatching SSE lines admitted between dispatched events.
+/// The comment-flood positive runs exactly this many; its planted negative runs
+/// exactly one more, so the two cannot drift apart.
+const KEEPALIVE_CEILING: usize = 8;
+
 /// The thirteen positives, in exact manifest order.
 const POSITIVE_CASES: [ManifestCase; 13] = [
     ManifestCase {
@@ -2155,6 +2160,58 @@ async fn positive_10_comments_and_inert_fields(cx: &Cx) {
         "no event-ID state may be retained across requests: {:?}",
         second_wire.head
     );
+
+    // ---------------------------------------------------------------------
+    // Comment flood. Keepalive traffic is bounded: a peer may hold a stream
+    // open with colon-comments, but only up to the configured ceiling of
+    // CONSECUTIVE non-dispatching lines. A dispatched event resets that budget,
+    // which is what lets a well-behaved long-lived stream stay open
+    // indefinitely while a silent one cannot.
+    // ---------------------------------------------------------------------
+    let flood_limits =
+        SseLimits::new(4_096, 65_536, KEEPALIVE_CEILING).expect("keepalive-bounded limits");
+
+    // Exactly the ceiling is admitted, twice over, because the dispatched event
+    // between the two runs resets the consecutive count to zero.
+    let peer = Peer::bind().await;
+    let mut body = Vec::new();
+    for run in ["alpha", "beta"] {
+        for index in 0..KEEPALIVE_CEILING {
+            body.extend_from_slice(format!(": keepalive {index}\n").as_bytes());
+        }
+        body.extend_from_slice(format!("data: {run}\n\n").as_bytes());
+    }
+    let payloads = drain_sse(cx, &peer, body, flood_limits)
+        .await
+        .expect("comment runs at exactly the ceiling must be admitted");
+    assert_eq!(
+        payloads,
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        "a dispatched event resets the consecutive keepalive budget"
+    );
+
+    // Inert fields and blank no-data lines spend the same budget as comments,
+    // so a mixed run of ceiling length is admitted on the same rule.
+    let peer = Peer::bind().await;
+    let mut mixed = Vec::new();
+    mixed.extend_from_slice(b": comment\n");
+    mixed.extend_from_slice(b"\n");
+    mixed.extend_from_slice(b"event: message\n");
+    mixed.extend_from_slice(b"id: 7\n");
+    mixed.extend_from_slice(b"retry: 1000\n");
+    mixed.extend_from_slice(b"unknown: ignored\n");
+    mixed.extend_from_slice(b"data: mixed\n\n");
+    assert_eq!(
+        drain_sse(
+            cx,
+            &peer,
+            mixed,
+            SseLimits::new(4_096, 65_536, 6).expect("mixed keepalive limits")
+        )
+        .await
+        .expect("six mixed non-dispatching lines at a ceiling of six must be admitted"),
+        vec!["mixed".to_owned()],
+    );
 }
 
 async fn negative_10_eof_without_blank_line(cx: &Cx) {
@@ -2207,6 +2264,69 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
         other => panic!("expected a typed end-of-stream refusal, saw {other:?}"),
     }
     peer.assert_no_further_connection();
+
+    // ---------------------------------------------------------------------
+    // Comment-flood planted negative. The accepted case is KEEPALIVE_CEILING
+    // consecutive colon-comments followed by a dispatching event. The sole
+    // changed variable is ONE additional comment line: same ceiling, same
+    // event, same ordering.
+    // ---------------------------------------------------------------------
+    let flood_limits =
+        SseLimits::new(4_096, 65_536, KEEPALIVE_CEILING).expect("keepalive-bounded limits");
+
+    let comment_run = |count: usize| {
+        let mut body = Vec::new();
+        for index in 0..count {
+            body.extend_from_slice(format!(": keepalive {index}\n").as_bytes());
+        }
+        body.extend_from_slice(b"data: alpha\n\n");
+        body
+    };
+
+    // Accepted at exactly the ceiling.
+    let peer = Peer::bind().await;
+    assert_eq!(
+        drain_sse(cx, &peer, comment_run(KEEPALIVE_CEILING), flood_limits)
+            .await
+            .expect("the ceiling itself must be admitted"),
+        vec!["alpha".to_owned()],
+    );
+
+    // One more comment line, and nothing else, must fail closed.
+    let peer = Peer::bind().await;
+    let refusal = drain_sse(cx, &peer, comment_run(KEEPALIVE_CEILING + 1), flood_limits)
+        .await
+        .err()
+        .expect("one comment line over the ceiling must fail closed");
+    assert!(
+        matches!(
+            refusal,
+            ModernHttpExecutorError::SseParse(SseParseError::KeepaliveFlood { limit_lines })
+                if limit_lines == KEEPALIVE_CEILING
+        ),
+        "expected a typed keepalive-flood refusal naming the ceiling, saw {refusal:?}"
+    );
+    peer.assert_no_further_connection();
+
+    // The refusal is about CONSECUTIVE lines, not a total: the same number of
+    // comments split by a dispatching event is still admitted, so the flood
+    // bound cannot be mistaken for a lifetime quota on keepalive traffic.
+    let peer = Peer::bind().await;
+    let mut split_run = Vec::new();
+    for index in 0..KEEPALIVE_CEILING {
+        split_run.extend_from_slice(format!(": keepalive {index}\n").as_bytes());
+    }
+    split_run.extend_from_slice(b"data: alpha\n\n");
+    for index in 0..KEEPALIVE_CEILING {
+        split_run.extend_from_slice(format!(": keepalive {index}\n").as_bytes());
+    }
+    split_run.extend_from_slice(b"data: beta\n\n");
+    assert_eq!(
+        drain_sse(cx, &peer, split_run, flood_limits)
+            .await
+            .expect("a dispatched event resets the consecutive budget"),
+        vec!["alpha".to_owned(), "beta".to_owned()],
+    );
 }
 
 // ---------------------------------------------------------------------------
