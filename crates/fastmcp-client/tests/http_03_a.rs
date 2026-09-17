@@ -24,11 +24,13 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_client::http_executor::{
-    HTTP_03_A_EVALUATOR_MANIFEST_V1, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
+    HTTP_03_A_EVALUATOR_MANIFEST_V1, MAX_MODERN_HTTP_PROBE_BODY_BYTES,
+    MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+    MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
     MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpErrorBodyAdmission,
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
-    ModernHttpFinalCoreListenError, ModernHttpRequest, ModernHttpResponseKind,
-    ModernHttpResponseStream, http_03_a_manifest_digest,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreCollector,
+    ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequest,
+    ModernHttpResponseKind, ModernHttpResponseStream, http_03_a_manifest_digest,
 };
 use fastmcp_client::sse::{SseLimits, SseParseError};
 use fastmcp_client::{
@@ -2634,6 +2636,109 @@ fn sized_event(payload_bytes: usize, data_lines: usize) -> Vec<u8> {
     body
 }
 
+/// The aggregate memory ceilings this target freezes, transcribed independently
+/// of the public constants they check.
+///
+/// Spelled as literals on purpose. `assert_eq!(MAX_X, MAX_X)` anchors the
+/// assertion to the value under test (RH-5) and can never fail: widening the
+/// progress queue from 64 to 4_096 would still pass. An independently
+/// transcribed literal fails on exactly that change, which is the failure this
+/// half of the criterion exists to catch.
+///
+/// Freezing them is legitimate because each one DECLARES A DESIGN LIMIT rather
+/// than MEASURING MUTABLE CONTENT. None of them moves as the crate grows, so
+/// none of them rots.
+const DECLARED_PENDING_SSE_EVENT_CEILING: usize = 128;
+const DECLARED_PENDING_SSE_EVENT_BYTE_CEILING: usize = 64 * 1024;
+const DECLARED_PROGRESS_QUEUE_CEILING: usize = 64;
+const DECLARED_PROBE_BODY_BYTE_CEILING: usize = 64 * 1024;
+
+/// Builds one SSE body carrying `progress_events` request-scoped progress
+/// notifications followed by exactly one terminal result.
+///
+/// The positive and the planted negative share this builder, so the only thing
+/// that differs between them is `progress_events`.
+fn progress_then_terminal_body(
+    marker: &ProgressMarker,
+    progress_events: usize,
+    request_id: u64,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for progress in 1..=progress_events {
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(&progress_notification(marker, progress as u64));
+        body.extend_from_slice(b"\n\n");
+    }
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(&terminal_tool_result(request_id, "progress-queue-terminal"));
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
+/// Runs one final core request whose SSE response carries `progress_events`
+/// progress notifications ahead of its terminal, and returns what the caller
+/// observed.
+///
+/// The whole body is written as a single chunk. That is deliberate on both
+/// counts: the progress queue is a per-request collector rather than a
+/// per-frame one, so it is invariant to chunk framing, and writing once keeps
+/// the server's remaining writes from racing the client's refusal on the
+/// planted-negative path.
+async fn collect_with_progress(
+    cx: &Cx,
+    progress_events: usize,
+) -> Result<ModernHttpFinalCoreCollector, ModernHttpFinalCoreListenError> {
+    const REQUEST_ID: u64 = 11;
+    let peer = Peer::bind().await;
+    let connection = connect(cx, &peer).await;
+    let marker = ProgressMarker::from("http-03-a-progress-queue");
+    let body = progress_then_terminal_body(&marker, progress_events, REQUEST_ID);
+
+    // The fixture stays strictly under both SSE aggregate ceilings, so an
+    // outcome here can only be the progress queue's and never a pending-event
+    // bound wearing its name.
+    assert!(
+        progress_events + 1 < DECLARED_PENDING_SSE_EVENT_CEILING,
+        "the fixture must not reach the pending-event count ceiling"
+    );
+    assert!(
+        body.len() < DECLARED_PENDING_SSE_EVENT_BYTE_CEILING,
+        "the fixture must not reach the pending-event byte ceiling"
+    );
+
+    let ((), collected) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, &body).await;
+            end_sse_stream(&mut io).await;
+        },
+        async {
+            connection
+                .open_final_core_listener(
+                    cx,
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "progress_tool",
+                        "arguments": {},
+                        // Cloned: `json!` serializes by value, and the marker is
+                        // still borrowed by the body built above.
+                        "_meta": {"progressToken": marker.clone()},
+                    }),
+                    RequestId::Number(REQUEST_ID),
+                    limits(),
+                )
+                .await
+                .expect("the progress request must reach the peer")
+                .collect(cx)
+                .await
+        },
+    )
+    .await;
+    collected
+}
+
 async fn positive_11_bounds(cx: &Cx) {
     // Line ceiling, exactly N. A 4_090-octet payload makes a `data: ` line of
     // 4_096 raw octets against a 4_096-octet line ceiling: N+6 charged octets,
@@ -2687,6 +2792,47 @@ async fn positive_11_bounds(cx: &Cx) {
         payload * 2 + 1,
         "two data lines join with exactly one LF"
     );
+    // -----------------------------------------------------------------------
+    // The aggregate memory ceilings, proved from outside the crate.
+    //
+    // All four are public and enforced on shipped paths, but every proof of
+    // them lived in `http_executor.rs`'s `#[cfg(test)]` module. A `cfg(test)`
+    // assertion cannot prove shipped behaviour (PL-3), and it cannot notice
+    // that a ceiling stopped being reachable by a consumer at all. This target
+    // is an external consumer, so it can.
+    // -----------------------------------------------------------------------
+    assert_eq!(
+        MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
+        DECLARED_PENDING_SSE_EVENT_CEILING
+    );
+    assert_eq!(
+        MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
+        DECLARED_PENDING_SSE_EVENT_BYTE_CEILING
+    );
+    assert_eq!(
+        MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS,
+        DECLARED_PROGRESS_QUEUE_CEILING
+    );
+    assert_eq!(
+        MAX_MODERN_HTTP_PROBE_BODY_BYTES,
+        DECLARED_PROBE_BODY_BYTE_CEILING
+    );
+
+    // Progress queue, exactly N. Sixty-four request-scoped progress
+    // notifications ahead of one terminal are all delivered, in order, to the
+    // caller that owns them, and the terminal still arrives.
+    let collected = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING)
+        .await
+        .expect("a progress queue at exactly the ceiling must be admitted");
+    assert_eq!(
+        collected.progress_notifications.len(),
+        DECLARED_PROGRESS_QUEUE_CEILING,
+        "every queued progress notification reaches its own caller"
+    );
+    assert_eq!(collected.request_id, RequestId::Number(11));
+    for (index, progress) in collected.progress_notifications.iter().enumerate() {
+        assert_eq!(progress.progress.as_str(), (index + 1).to_string());
+    }
 }
 
 async fn negative_11_one_byte_over_bounds(cx: &Cx) {
@@ -2743,6 +2889,18 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         "expected a typed event-bound refusal, saw {refusal:?}"
     );
     peer.assert_no_further_connection();
+    // The sole changed variable is one queued progress notification: N becomes
+    // N+1 ahead of a byte-identical terminal on an otherwise identical stream.
+    // The framing, the marker, the request ID, the chunking and the terminal
+    // are all unchanged.
+    let refusal = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING + 1)
+        .await
+        .err()
+        .expect("a progress queue one notification over the ceiling must be refused");
+    assert!(
+        matches!(refusal, ModernHttpFinalCoreListenError::ProgressQueueFull),
+        "expected a typed progress-queue refusal, saw {refusal:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
