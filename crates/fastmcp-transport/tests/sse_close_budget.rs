@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
 use fastmcp_transport::TransportError;
-use fastmcp_transport::sse::SseWriter;
+use fastmcp_transport::Transport;
+use fastmcp_transport::sse::{SseClientTransport, SseWriter};
 
 /// Records bytes written and how often the writer was flushed.
 ///
@@ -196,4 +197,108 @@ fn sse_close_stays_idempotent_under_a_cancelled_context() {
         1,
         "the idempotent close performs no second flush"
     );
+}
+
+// ===========================================================================
+// SseClientTransport::close - flushes the POST request sink.
+// ===========================================================================
+//
+// Same five-case shape as the SseWriter rows above and as both stdio closes.
+// `SseClientTransport<R, W>` is generic over its sink, so the flush count is
+// available here; it exposes no `is_closed()`, so the flush count carries every
+// observable rather than sharing the work with a terminal-state check.
+
+fn client_transport(sink: CountingWriter) -> SseClientTransport<std::io::Cursor<Vec<u8>>, CountingWriter> {
+    SseClientTransport::new(std::io::Cursor::new(Vec::new()), sink)
+}
+
+/// Control.
+#[test]
+fn sse_client_close_under_a_live_context_commits_and_flushes() {
+    let sink = CountingWriter::default();
+    let mut transport = client_transport(sink.clone());
+
+    transport
+        .close(&Cx::for_testing())
+        .expect("a live caller context permits the terminal commit");
+
+    assert_eq!(sink.flushes(), 1, "the committed path flushes the sink once");
+}
+
+/// Limb one: cancellation.
+#[test]
+fn sse_client_close_under_a_cancelled_context_refuses_before_the_flush() {
+    let sink = CountingWriter::default();
+    let mut transport = client_transport(sink.clone());
+
+    let error = transport
+        .close(&cancelled_context())
+        .expect_err("a cancelled caller context must refuse the close");
+
+    assert!(
+        matches!(error, TransportError::Cancelled),
+        "cancellation maps to Cancelled: {error:?}"
+    );
+    assert_eq!(sink.flushes(), 0, "a refused close performs no flush");
+}
+
+/// Limb two: an expired deadline with no cancellation bit set.
+#[test]
+fn sse_client_close_under_an_expired_deadline_refuses_as_timeout() {
+    let sink = CountingWriter::default();
+    let mut transport = client_transport(sink.clone());
+
+    let error = transport
+        .close(&expired_context())
+        .expect_err("an expired caller budget must refuse the close");
+
+    assert!(
+        matches!(error, TransportError::Timeout),
+        "an exhausted deadline is reported distinctly from cancellation: {error:?}"
+    );
+    assert_eq!(
+        sink.flushes(),
+        0,
+        "an out-of-budget caller is not made to wait on the flush"
+    );
+}
+
+/// A refusal is retryable, not a wedge.
+#[test]
+fn sse_client_close_refusal_leaves_the_transport_closable() {
+    let sink = CountingWriter::default();
+    let mut transport = client_transport(sink.clone());
+
+    transport
+        .close(&cancelled_context())
+        .expect_err("the cancelled attempt refuses");
+    assert_eq!(sink.flushes(), 0);
+
+    transport
+        .close(&Cx::for_testing())
+        .expect("a fresh budget still closes after a refusal");
+
+    assert_eq!(
+        sink.flushes(),
+        1,
+        "the retry performs the single flush the refusal skipped"
+    );
+}
+
+/// Terminal close performs no I/O, so it stays Ok under cancellation.
+#[test]
+fn sse_client_close_stays_idempotent_under_a_cancelled_context() {
+    let sink = CountingWriter::default();
+    let mut transport = client_transport(sink.clone());
+
+    transport
+        .close(&Cx::for_testing())
+        .expect("the first close commits");
+    assert_eq!(sink.flushes(), 1);
+
+    transport
+        .close(&cancelled_context())
+        .expect("closing an already-closed transport stays Ok under cancellation");
+
+    assert_eq!(sink.flushes(), 1, "no second flush");
 }

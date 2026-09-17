@@ -1777,10 +1777,15 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
         }
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
+        // Budget observed after the terminal branch and before the write-side
+        // commit, per the conversion template: an already-closed transport does
+        // no I/O and must stay Ok under cancellation, while a live one refuses
+        // before the blocking flush and stays retryable.
+        sse_checkpoint(cx)?;
         self.closed = true;
         self.request_sink.flush().map_err(TransportError::Io)
     }
