@@ -924,7 +924,7 @@ fn ping_request(target: &str) -> ModernHttpRequest {
         .expect("an ordinary modern MCP POST must be constructible")
 }
 
-fn terminal_tool_result(request_id: u64, text: &str) -> Vec<u8> {
+fn terminal_tool_result(request_id: i64, text: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -1671,7 +1671,7 @@ async fn capture_request_head(
     cx: &Cx,
     method: &str,
     params: serde_json::Value,
-    request_id: u64,
+    request_id: i64,
 ) -> Wire {
     let peer = Peer::bind().await;
     let mut connection = connect(cx, &peer).await;
@@ -3294,7 +3294,7 @@ const DECLARED_PROBE_BODY_BYTE_CEILING: usize = 64 * 1024;
 fn progress_then_terminal_body(
     marker: &ProgressMarker,
     progress_events: usize,
-    request_id: u64,
+    request_id: i64,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     for progress in 1..=progress_events {
@@ -3321,7 +3321,7 @@ async fn collect_with_progress(
     cx: &Cx,
     progress_events: usize,
 ) -> Result<ModernHttpFinalCoreCollector, ModernHttpFinalCoreListenError> {
-    const REQUEST_ID: u64 = 11;
+    const REQUEST_ID: i64 = 11;
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
     let marker = ProgressMarker::from("http-03-a-progress-queue");
