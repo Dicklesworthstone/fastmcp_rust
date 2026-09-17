@@ -2752,6 +2752,164 @@ impl FinalCommonTypesSchema {
     }
 }
 
+/// Maximum bytes accepted when digesting a PRT-02 evaluator manifest.
+pub const MAX_PRT_02_MANIFEST_BYTES: usize = 4 * 1024;
+
+/// The canonical `PRT02-A-METADATA-v1` rows: ordered subcases `PRT-A-01.01`
+/// through `PRT-A-01.08`.
+///
+/// This is an executable acceptance input, not a hash of this source file. It
+/// is LF-canonical and LF-terminated, carries no CR, no blank line and no
+/// trailing whitespace, and its header rows bind the producing Bead, the
+/// revision the rows were authored against, and the shipped public entrypoints
+/// this slice is proved through. Each subcase row is exactly
+/// `<id> <name> floor=<N>`, where `floor` is the minimum number of
+/// observations an integrating evaluator must actually perform for that
+/// subcase. The floors are this producer's own definitions and are never a
+/// count borrowed back from a consumer: a gate whose reference values come
+/// from the thing being gated confirms arithmetic rather than agreement.
+///
+/// `producer-revision` is a provenance record of where these rows were
+/// authored. Nothing asserts it equals HEAD, and it must never be rewritten to
+/// make a gate pass.
+pub const PRT_02_A_METADATA_MANIFEST_V1: &str = concat!(
+    "PRT02-A-METADATA-v1\n",
+    "producer-bead bd-mcp-prt-02-a-zaok\n",
+    "producer-revision 256f35155cbe8173ae759a43398774b7f4e7fd6a\n",
+    "entrypoint fastmcp_protocol::common_types::OpenMetadata::try_from_entries\n",
+    "entrypoint fastmcp_protocol::common_types::Implementation::try_new\n",
+    "entrypoint fastmcp_protocol::common_types::TraceContext::try_from_metadata\n",
+    "PRT-A-01.01 known-final-key floor=1\n",
+    "PRT-A-01.02 reserved-mcp-key floor=1\n",
+    "PRT-A-01.03 empty-key floor=1\n",
+    "PRT-A-01.04 unprefixed-extension-key floor=1\n",
+    "PRT-A-01.05 valid-reverse-dns-extension-key floor=1\n",
+    "PRT-A-01.06 malformed-reverse-dns-key floor=1\n",
+    "PRT-A-01.07 client-info floor=1\n",
+    "PRT-A-01.08 trace-context floor=1\n",
+);
+
+/// The canonical `PRT02-A-URI-CURSOR-CANCEL-v1` rows: ordered subcases
+/// `PRT-A-02.01` through `PRT-A-02.16`.
+///
+/// Same contract as [`PRT_02_A_METADATA_MANIFEST_V1`]. The cursor subcases are
+/// deliberately three, not two: absent, present-and-valid, and explicit null
+/// are three distinct wire states, and a matrix that omits the null row would
+/// look complete while proving nothing about null.
+pub const PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1: &str = concat!(
+    "PRT02-A-URI-CURSOR-CANCEL-v1\n",
+    "producer-bead bd-mcp-prt-02-a-zaok\n",
+    "producer-revision 256f35155cbe8173ae759a43398774b7f4e7fd6a\n",
+    "entrypoint fastmcp_protocol::common_types::AbsoluteUri::parse\n",
+    "entrypoint fastmcp_protocol::common_types::OpaqueCursor::from_presence\n",
+    "entrypoint fastmcp_protocol::common_types::CancellationNotification::try_new\n",
+    "PRT-A-02.01 uri-urn-opaque floor=1\n",
+    "PRT-A-02.02 uri-custom-scheme floor=1\n",
+    "PRT-A-02.03 uri-authority-userinfo-port floor=1\n",
+    "PRT-A-02.04 uri-ipv6-literal floor=1\n",
+    "PRT-A-02.05 uri-ipvfuture-literal floor=1\n",
+    "PRT-A-02.06 uri-percent-encoded-path floor=1\n",
+    "PRT-A-02.07 uri-query-and-fragment-preserved floor=1\n",
+    "PRT-A-02.08 uri-scheme-case-preserved floor=1\n",
+    "PRT-A-02.09 uri-https-simple-path floor=1\n",
+    "PRT-A-02.10 uri-byte-preserving-reencode floor=1\n",
+    "PRT-A-02.11 uri-relative-refused floor=1\n",
+    "PRT-A-02.12 uri-bound-enforced floor=1\n",
+    "PRT-A-02.13 subscription-id-non-uri-exception floor=1\n",
+    "PRT-A-02.14 cursor-absent floor=1\n",
+    "PRT-A-02.15 cursor-present-including-empty floor=2\n",
+    "PRT-A-02.16 cursor-explicit-null-refused floor=1\n",
+);
+
+/// The canonical `PRT02-A-ICON-CONTENT-v1` rows: ordered subcases
+/// `PRT-A-03.01` through `PRT-A-03.10`.
+///
+/// Same contract as [`PRT_02_A_METADATA_MANIFEST_V1`].
+pub const PRT_02_A_ICON_CONTENT_MANIFEST_V1: &str = concat!(
+    "PRT02-A-ICON-CONTENT-v1\n",
+    "producer-bead bd-mcp-prt-02-a-zaok\n",
+    "producer-revision 256f35155cbe8173ae759a43398774b7f4e7fd6a\n",
+    "entrypoint fastmcp_protocol::common_types::RawIcon::try_new\n",
+    "entrypoint fastmcp_protocol::common_types::ContentBlock::text\n",
+    "PRT-A-03.01 icon-source-absolute-uri floor=1\n",
+    "PRT-A-03.02 icon-data-uri-base64-image floor=1\n",
+    "PRT-A-03.03 icon-sizes floor=1\n",
+    "PRT-A-03.04 icon-theme floor=1\n",
+    "PRT-A-03.05 content-text floor=1\n",
+    "PRT-A-03.06 content-image-mime floor=1\n",
+    "PRT-A-03.07 content-audio-mime floor=1\n",
+    "PRT-A-03.08 content-resource-link floor=1\n",
+    "PRT-A-03.09 content-embedded-resource floor=1\n",
+    "PRT-A-03.10 content-annotations-and-meta floor=1\n",
+);
+
+/// Returns the canonical `PRT02-A-METADATA-v1` digest.
+///
+/// The digest binds the exact published bytes of the manifest. An integrating
+/// consumer recomputes it over those same bytes, so a digest that no longer
+/// reproduces means the published rows and the digest have drifted apart.
+#[must_use]
+pub fn prt_02_a_metadata_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_A_METADATA_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 A metadata manifest is within its exact byte bound")
+}
+
+/// Returns the canonical `PRT02-A-URI-CURSOR-CANCEL-v1` digest.
+#[must_use]
+pub fn prt_02_a_uri_cursor_cancel_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 A URI/cursor/cancel manifest is within its exact byte bound")
+}
+
+/// Returns the canonical `PRT02-A-ICON-CONTENT-v1` digest.
+#[must_use]
+pub fn prt_02_a_icon_content_manifest_digest() -> fastmcp_core::Sha256Digest {
+    fastmcp_core::sha256_bounded(
+        PRT_02_A_ICON_CONTENT_MANIFEST_V1.as_bytes(),
+        MAX_PRT_02_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-02 A icon/content manifest is within its exact byte bound")
+}
+
+/// Parses one published PRT-02 manifest into its ordered `(id, name, floor)`
+/// subcase rows.
+///
+/// Header rows are those before the first row whose identifier starts with
+/// `PRT-`. The parse is deliberately strict: a malformed row, a non-numeric
+/// floor, or a duplicate identifier returns `None`, so a consumer cannot
+/// silently evaluate a manifest it only partly understood.
+#[must_use]
+pub fn parse_prt_02_manifest_rows(manifest: &str) -> Option<Vec<(String, String, usize)>> {
+    let mut rows: Vec<(String, String, usize)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if !manifest.ends_with('\n') || manifest.contains('\r') || manifest.contains("\n\n") {
+        return None;
+    }
+    for line in manifest.lines() {
+        if !line.starts_with("PRT-") {
+            continue;
+        }
+        let mut parts = line.split(' ');
+        let (Some(id), Some(name), Some(floor), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let floor: usize = floor.strip_prefix("floor=")?.parse().ok()?;
+        if floor == 0 || !seen.insert(id.to_owned()) {
+            return None;
+        }
+        rows.push((id.to_owned(), name.to_owned(), floor));
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

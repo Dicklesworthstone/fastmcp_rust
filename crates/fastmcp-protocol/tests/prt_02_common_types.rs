@@ -5,11 +5,15 @@
 
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, CancellationNotification, CancellationRequestId, CommonTypeError,
-    CommonWireDirection, ContentBlock, EmbeddedResourceContents, FinalCommonTypesSchema,
+    CommonWireDirection, ContentBlock, EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme,
     Implementation, MAX_ABSOLUTE_URI_BYTES, MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES,
     MAX_ICON_DATA_URI_DECODED_BYTES, MAX_ICON_DATA_URI_ENCODED_BYTES,
     MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES, MAX_ICON_SIZE_ENTRIES,
-    MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata, RawIcon, TraceContext,
+    MAX_METADATA_ENTRIES, MAX_TRACE_FIELD_BYTES, OpaqueCursor, OpenMetadata,
+    PRT_02_A_ICON_CONTENT_MANIFEST_V1, PRT_02_A_METADATA_MANIFEST_V1,
+    PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1, RawIcon, TraceContext, parse_prt_02_manifest_rows,
+    prt_02_a_icon_content_manifest_digest, prt_02_a_metadata_manifest_digest,
+    prt_02_a_uri_cursor_cancel_manifest_digest,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -39,51 +43,226 @@ fn request_metadata() -> OpenMetadata {
     .expect("valid final request metadata")
 }
 
+/// Records observations against one published PRT-02 manifest.
+///
+/// The declared rows come from the shipped manifest, never from this test, so
+/// the matrix cannot silently shrink to whatever the test happens to exercise.
+/// `settle` fails if any declared subcase went unobserved, if any subcase fell
+/// below its declared floor, if an undeclared subcase was observed, or if the
+/// declared row count drifts from the acceptance item's numeric floor.
+struct SubcaseLedger {
+    manifest: &'static str,
+    observed: BTreeMap<String, usize>,
+}
+
+impl SubcaseLedger {
+    fn new(manifest: &'static str) -> Self {
+        Self {
+            manifest,
+            observed: BTreeMap::new(),
+        }
+    }
+
+    fn observe(&mut self, subcase: &str) {
+        *self.observed.entry(subcase.to_owned()).or_default() += 1;
+    }
+
+    fn settle(self, declared_rows: usize) {
+        let rows = parse_prt_02_manifest_rows(self.manifest)
+            .expect("the shipped manifest parses into ordered subcase rows");
+        assert_eq!(
+            rows.len(),
+            declared_rows,
+            "the manifest must declare exactly the acceptance item's numeric floor of rows",
+        );
+        let declared: BTreeMap<&str, usize> = rows
+            .iter()
+            .map(|(id, _, floor)| (id.as_str(), *floor))
+            .collect();
+        for (id, floor) in &declared {
+            let count = self.observed.get(*id).copied().unwrap_or_default();
+            assert!(
+                count >= *floor,
+                "subcase {id} observed {count} times, below its declared floor of {floor}",
+            );
+        }
+        for id in self.observed.keys() {
+            assert!(
+                declared.contains_key(id.as_str()),
+                "observed undeclared subcase {id}; the manifest is the closed set",
+            );
+        }
+    }
+}
+
 #[test]
 fn prt_02_a_positive() {
+    // Every declared row of all three PRT-02 A manifests is exercised here,
+    // including the rows whose declared outcome is refusal: a matrix row is
+    // exercised by observing its declared result, not only by accepting. The
+    // one-variable planted negatives with unchanged-state proofs live in
+    // `prt_02_a_planted_negative`.
+    let mut metadata_ledger = SubcaseLedger::new(PRT_02_A_METADATA_MANIFEST_V1);
+    let mut uri_ledger = SubcaseLedger::new(PRT_02_A_URI_CURSOR_CANCEL_MANIFEST_V1);
+    let mut icon_ledger = SubcaseLedger::new(PRT_02_A_ICON_CONTENT_MANIFEST_V1);
+
+    // --- PRT-A-01: final open metadata ---------------------------------
     let implementation = Implementation::try_new("fastmcp", "0.1.0").expect("implementation");
     let metadata = request_metadata();
+
     assert_eq!(
         metadata.protocol_version().expect("protocol version"),
         Some("2026-07-28")
     );
+    metadata_ledger.observe("PRT-A-01.01");
+
+    assert_eq!(
+        metadata.get("io.modelcontextprotocol/clientCapabilities"),
+        Some(&json!({"roots": {"listChanged": true}})),
+        "a reserved MCP key retains its exact typed value"
+    );
+    metadata_ledger.observe("PRT-A-01.02");
+
+    assert_eq!(
+        metadata.get(""),
+        None,
+        "the empty key is admissible but carries no value in this row set"
+    );
+    assert!(
+        OpenMetadata::try_from_entries([(String::new(), json!("empty name is valid"))]).is_ok(),
+        "an empty key is a valid open key"
+    );
+    metadata_ledger.observe("PRT-A-01.03");
+
+    assert_eq!(
+        metadata.get("traceparent"),
+        Some(&json!(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        )),
+        "an unprefixed extension key is retained verbatim"
+    );
+    metadata_ledger.observe("PRT-A-01.04");
+
+    assert_eq!(metadata.get("com.example/"), Some(&json!({"open": null})));
+    metadata_ledger.observe("PRT-A-01.05");
+
+    assert_eq!(
+        OpenMetadata::try_from_entries([("com..example/valid".to_owned(), json!(true))]),
+        Err(CommonTypeError::Invalid("metadata key")),
+        "a malformed reverse-DNS key is never retained"
+    );
+    metadata_ledger.observe("PRT-A-01.06");
+
     assert_eq!(
         metadata.client_info().expect("client info"),
         Some(implementation)
     );
-    assert_eq!(metadata.get("com.example/"), Some(&json!({"open": null})));
+    metadata_ledger.observe("PRT-A-01.07");
+
     let trace = TraceContext::try_from_metadata(&metadata).expect("trace context");
     assert_eq!(trace.tracestate.as_deref(), Some("vendor=value"));
     assert_eq!(trace.baggage.as_deref(), Some("user=opaque"));
+    metadata_ledger.observe("PRT-A-01.08");
 
+    // --- PRT-A-02: URI owners, cursor presence, cancellation -----------
     let uri_rows = [
-        "urn:example:opaque?query#fragment",
-        "custom:path?x#y",
-        "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment",
-        "scheme://[2001:db8::1]/resource",
-        "scheme://[vF.future:opaque]/resource",
+        ("PRT-A-02.01", "urn:example:opaque?query#fragment"),
+        ("PRT-A-02.02", "custom:path?x#y"),
+        (
+            "PRT-A-02.03",
+            "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment",
+        ),
+        ("PRT-A-02.04", "scheme://[2001:db8::1]/resource"),
+        ("PRT-A-02.05", "scheme://[vF.future:opaque]/resource"),
+        (
+            "PRT-A-02.06",
+            "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment",
+        ),
+        (
+            "PRT-A-02.07",
+            "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment",
+        ),
+        (
+            "PRT-A-02.08",
+            "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment",
+        ),
+        ("PRT-A-02.09", "https://example.test/resource"),
     ];
-    for uri in uri_rows {
+    for (subcase, uri) in uri_rows {
         let parsed = AbsoluteUri::parse(uri).expect("final URI row");
         assert_eq!(parsed.as_str(), uri, "wire URI must remain byte-preserving");
+        uri_ledger.observe(subcase);
     }
-    let authority_with_port = "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment";
+
+    // Byte-preserving re-encode through serde, not only through the accessor.
+    let round_tripped = "HTTPS://user@example.test:8443/a%2Fb?x=%FF#fragment";
+    let parsed = AbsoluteUri::parse(round_tripped).expect("byte-preserving URI");
     assert_eq!(
-        AbsoluteUri::parse(authority_with_port)
-            .expect("authority port is a valid byte-preserving URI")
-            .as_str(),
-        authority_with_port
+        serde_json::to_value(&parsed).expect("URI wire"),
+        json!(round_tripped),
+        "serialization preserves scheme case, percent-encoding, query and fragment"
     );
+    uri_ledger.observe("PRT-A-02.10");
+
+    assert_eq!(
+        AbsoluteUri::parse("relative/resource"),
+        Err(CommonTypeError::Invalid("URI scheme")),
+        "a relative reference is never an absolute URI"
+    );
+    uri_ledger.observe("PRT-A-02.11");
+
+    let prefix = "https://example.test/";
+    let at_bound = format!(
+        "{prefix}{}",
+        "a".repeat(MAX_ABSOLUTE_URI_BYTES - prefix.len())
+    );
+    assert_eq!(at_bound.len(), MAX_ABSOLUTE_URI_BYTES);
+    assert!(
+        AbsoluteUri::parse(at_bound.clone()).is_ok(),
+        "a URI exactly on its bound is admitted"
+    );
+    uri_ledger.observe("PRT-A-02.12");
+
+    // The subscription identifier is the documented non-URI exception: it is
+    // the one final identifier that is not required to be an absolute URI.
+    let subscription = OpenMetadata::try_from_entries([(
+        "io.modelcontextprotocol/subscriptionId".to_owned(),
+        json!(7),
+    )])
+    .expect("the subscription identifier is not a URI");
+    assert_eq!(
+        subscription.get("io.modelcontextprotocol/subscriptionId"),
+        Some(&json!(7))
+    );
+    uri_ledger.observe("PRT-A-02.13");
 
     assert_eq!(OpaqueCursor::from_presence(None).as_present(), None);
+    uri_ledger.observe("PRT-A-02.14");
+
+    // Present-and-valid is two rows, because an empty cursor is present.
     assert_eq!(
         OpaqueCursor::from_presence(Some(String::new())).as_present(),
         Some("")
     );
+    uri_ledger.observe("PRT-A-02.15");
     assert_eq!(
         OpaqueCursor::from_presence(Some("next".to_owned())).as_present(),
         Some("next")
     );
+    uri_ledger.observe("PRT-A-02.15");
+
+    // The third state. Absent and present-and-valid both succeed above; an
+    // explicit null is neither, and must be refused in both directions.
+    assert!(
+        serde_json::from_value::<OpaqueCursor>(Value::Null).is_err(),
+        "an explicit null cursor is not an absent cursor"
+    );
+    assert!(
+        serde_json::to_value(OpaqueCursor::from_presence(None)).is_err(),
+        "an absent cursor must be omitted, never serialized as null"
+    );
+    uri_ledger.observe("PRT-A-02.16");
+
     let present_cursor = OpaqueCursor::try_from_presence(Some(String::new())).expect("cursor");
     assert_eq!(
         serde_json::from_value::<OpaqueCursor>(
@@ -103,6 +282,7 @@ fn prt_02_a_positive() {
             .has_untrusted_reason()
     );
 
+    // --- PRT-A-03: icons and content blocks ----------------------------
     let icon = RawIcon::try_with_details(
         "https://example.test/icon.svg?variant=1#exact",
         Some("image/svg+xml".to_owned()),
@@ -110,11 +290,36 @@ fn prt_02_a_positive() {
         None,
     )
     .expect("raw icon");
+    assert_eq!(
+        icon.src.as_str(),
+        "https://example.test/icon.svg?variant=1#exact"
+    );
     let icon_wire = serde_json::to_value(&icon).expect("icon wire");
     assert_eq!(
         serde_json::from_value::<RawIcon>(icon_wire).expect("icon round trip"),
         icon
     );
+    icon_ledger.observe("PRT-A-03.01");
+    assert_eq!(
+        icon.sizes.as_deref(),
+        Some(&["any".to_owned(), "32x32".to_owned()][..])
+    );
+    icon_ledger.observe("PRT-A-03.03");
+
+    let themed = RawIcon::try_with_details(
+        "https://example.test/icon-dark.svg",
+        None,
+        None,
+        Some(IconTheme::Dark),
+    )
+    .expect("themed icon");
+    assert_eq!(
+        serde_json::to_value(&themed).expect("themed icon wire")["theme"],
+        json!("dark"),
+        "the theme discriminator is exactly its lowercase wire spelling"
+    );
+    icon_ledger.observe("PRT-A-03.04");
+
     let data_icon = RawIcon::try_new("DATA:image/png;base64,aGVsbG8=?cache=opaque#fragment")
         .expect("raw data icon with preserved query and fragment");
     assert_eq!(
@@ -131,30 +336,47 @@ fn prt_02_a_positive() {
         MAX_ICON_DATA_URI_ENCODED_BYTES,
         4 * MAX_ICON_DATA_URI_DECODED_BYTES.div_ceil(3) + MAX_ICON_DATA_URI_PREFIX_BYTES
     );
+    icon_ledger.observe("PRT-A-03.02");
 
     let content_rows = [
-        ContentBlock::text("text"),
-        ContentBlock::image("aGVsbG8=", "image/png").expect("image"),
-        ContentBlock::audio("aGVsbG8=", "audio/ogg").expect("audio"),
-        ContentBlock::resource_link("https://example.test/resource", "resource").expect("link"),
-        ContentBlock::Resource {
-            resource: EmbeddedResourceContents::Text {
-                uri: AbsoluteUri::parse("https://example.test/embedded").expect("embedded URI"),
-                text: "embedded".to_owned(),
-                mime_type: Some("text/plain".to_owned()),
-                meta: None,
+        ("PRT-A-03.05", ContentBlock::text("text")),
+        (
+            "PRT-A-03.06",
+            ContentBlock::image("aGVsbG8=", "image/png").expect("image"),
+        ),
+        (
+            "PRT-A-03.07",
+            ContentBlock::audio("aGVsbG8=", "audio/ogg").expect("audio"),
+        ),
+        (
+            "PRT-A-03.08",
+            ContentBlock::resource_link("https://example.test/resource", "resource").expect("link"),
+        ),
+        (
+            "PRT-A-03.09",
+            ContentBlock::Resource {
+                resource: EmbeddedResourceContents::Text {
+                    uri: AbsoluteUri::parse("https://example.test/embedded").expect("embedded URI"),
+                    text: "embedded".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    meta: None,
+                    additional: BTreeMap::new(),
+                },
+                annotations: None,
+                meta: Some(metadata),
                 additional: BTreeMap::new(),
             },
-            annotations: None,
-            meta: Some(metadata),
-            additional: BTreeMap::new(),
-        },
+        ),
     ];
-    for content in content_rows {
+    for (subcase, content) in content_rows {
         let wire = serde_json::to_value(&content).expect("content wire");
         if matches!(&content, ContentBlock::Resource { .. }) {
             assert_eq!(wire["resource"]["mimeType"], json!("text/plain"));
             assert!(wire["resource"].get("mime_type").is_none());
+            assert!(
+                wire.get("_meta").is_some(),
+                "icon-bearing metadata rides with the content block"
+            );
         }
         FinalCommonTypesSchema::validate(CommonWireDirection::Result, &wire)
             .expect("content schema");
@@ -162,7 +384,39 @@ fn prt_02_a_positive() {
             serde_json::from_value::<ContentBlock>(wire).expect("content round trip"),
             content
         );
+        icon_ledger.observe(subcase);
     }
+
+    let annotated = ContentBlock::Text {
+        text: "annotated".to_owned(),
+        annotations: Some(Annotations::default()),
+        meta: None,
+        additional: BTreeMap::new(),
+    };
+    let annotated_wire = serde_json::to_value(&annotated).expect("annotated content wire");
+    FinalCommonTypesSchema::validate(CommonWireDirection::Result, &annotated_wire)
+        .expect("annotated content schema");
+    assert_eq!(
+        serde_json::from_value::<ContentBlock>(annotated_wire).expect("annotated round trip"),
+        annotated
+    );
+    icon_ledger.observe("PRT-A-03.10");
+
+    // --- settle the three ordered matrices against their declared floors
+    metadata_ledger.settle(8);
+    uri_ledger.settle(16);
+    icon_ledger.settle(10);
+
+    // The three published digests are distinct, so no manifest is a copy of
+    // another and each acceptance item has its own canonical receipt.
+    let digests = [
+        prt_02_a_metadata_manifest_digest(),
+        prt_02_a_uri_cursor_cancel_manifest_digest(),
+        prt_02_a_icon_content_manifest_digest(),
+    ];
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[1], digests[2]);
+    assert_ne!(digests[0], digests[2]);
 }
 
 #[test]
