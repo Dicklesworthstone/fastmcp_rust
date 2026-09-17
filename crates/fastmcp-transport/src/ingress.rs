@@ -34,7 +34,7 @@
 //! nor the AUTH-00 aggregate, nor any aggregate MCP capability.
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::ingress::{AuthorizationRotationFacts, VerifiedIngressAuthentication};
@@ -258,22 +258,30 @@ impl fmt::Debug for AuthenticatedTransportIngress {
 /// downstream code, because downstream code accepts only
 /// [`AuthenticatedTransportIngress`] and this function is its only producer.
 ///
-/// The caller's context is checked before the provider is invoked, so a
-/// request already cancelled or past its deadline is refused without spending
-/// provider work on it.
+/// The caller's context and the supplied relative timeout are checked before
+/// provider work and again before admitting its verdict. Only the remaining
+/// timeout is passed to the provider. A successful verdict for a different
+/// canonical resource is refused without exposing the mismatched identity.
+///
+/// This synchronous boundary cannot preempt a blocking provider. Providers
+/// still have to enforce their own I/O deadlines; a late return is rejected,
+/// not a guarantee that the provider itself stopped on time.
 ///
 /// # Errors
 ///
 /// Returns [`IngressAuthenticationError::NoAuthenticatorRegistered`] when
 /// `authenticator` is `None`, [`IngressAuthenticationError::Cancelled`] when
-/// the caller's context is already cancelled, and whatever the authenticator
-/// returns otherwise.
+/// the caller's context is cancelled, and
+/// [`IngressAuthenticationError::DeadlineExceeded`] for an exhausted or
+/// unrepresentable timeout. Resource mismatches return the same
+/// [`IngressAuthenticationError::NotAuthenticated`] as provider refusals.
 pub fn authenticate_ingress(
     cx: &Cx,
     authenticator: Option<&dyn IngressAuthenticator>,
     request: &AuthRequestView<'_>,
     deadline: Duration,
 ) -> Result<AuthenticatedTransportIngress, IngressAuthenticationError> {
+    let started = Instant::now();
     let Some(authenticator) = authenticator else {
         return Err(IngressAuthenticationError::NoAuthenticatorRegistered);
     };
@@ -282,14 +290,27 @@ pub fn authenticate_ingress(
     if cx.checkpoint().is_err() {
         return Err(IngressAuthenticationError::Cancelled);
     }
+    let expires_at = started
+        .checked_add(deadline)
+        .ok_or(IngressAuthenticationError::DeadlineExceeded)?;
+    let remaining = expires_at.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(IngressAuthenticationError::DeadlineExceeded);
+    }
 
-    let outcome = authenticator.authenticate(cx, request, deadline)?;
-
-    // Re-check after the provider returns. A verdict that arrives after the
-    // caller gave up is not an admission; treating it as one would let a
-    // cancelled request enter verified ingress.
+    // Keep the result until local cancellation and timeout have been checked.
+    // Neither a success nor a provider-specific failure can revive an attempt
+    // whose owner or authentication budget expired during the call.
+    let outcome = authenticator.authenticate(cx, request, remaining);
     if cx.checkpoint().is_err() {
         return Err(IngressAuthenticationError::Cancelled);
+    }
+    if Instant::now() >= expires_at {
+        return Err(IngressAuthenticationError::DeadlineExceeded);
+    }
+    let outcome = outcome?;
+    if outcome.authentication.canonical_resource() != request.canonical_resource() {
+        return Err(IngressAuthenticationError::NotAuthenticated);
     }
 
     Ok(AuthenticatedTransportIngress {
@@ -300,4 +321,153 @@ pub fn authenticate_ingress(
         transport_provenance: request.transport_provenance().to_owned(),
         scheme: request.scheme().to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use asupersync::runtime::reactor::create_reactor;
+    use asupersync::runtime::{Runtime, RuntimeBuilder};
+    use fastmcp_core::ingress::{VerifiedAudienceBinding, VerifiedIdentityFacts};
+
+    const RESOURCE: &str = "https://resource.example/mcp";
+
+    struct Provider {
+        calls: AtomicUsize,
+        resource: &'static str,
+        delay: Duration,
+        refuse: bool,
+    }
+
+    impl Provider {
+        fn new(resource: &'static str, delay: Duration, refuse: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                resource,
+                delay,
+                refuse,
+            }
+        }
+    }
+
+    impl IngressAuthenticator for Provider {
+        fn authenticate(
+            &self,
+            _cx: &Cx,
+            _request: &AuthRequestView<'_>,
+            deadline: Duration,
+        ) -> Result<VerifiedIngressOutcome, IngressAuthenticationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert!(!deadline.is_zero());
+            std::thread::sleep(self.delay);
+            if self.refuse {
+                return Err(IngressAuthenticationError::NotAuthenticated);
+            }
+            let authentication = VerifiedIngressAuthentication::from_verified_provider_output(
+                VerifiedIdentityFacts {
+                    provider: "org.fastmcp.provider.ingress-test",
+                    configuration_generation: 1,
+                    issuer: "https://issuer.example/auth",
+                    canonical_resource: self.resource,
+                    verified_audience_binding: VerifiedAudienceBinding::OAuth {
+                        canonical_resource: self.resource.to_owned(),
+                        validated_audience: self.resource.to_owned(),
+                        audience_policy_id: "strict",
+                        audience_policy_revision: 1,
+                        provider: "org.fastmcp.provider.ingress-test".to_owned(),
+                        configuration_generation: 1,
+                    },
+                    tenant: "tenant",
+                    subject_or_principal: "subject",
+                    authorized_party_or_client: "client",
+                    verified_claims: &[("scope", "mcp.read")],
+                    auth_policy_revision: 1,
+                    trust_generation: 1,
+                },
+            )
+            .map_err(|_| IngressAuthenticationError::NotAuthenticated)?;
+            Ok(VerifiedIngressOutcome {
+                authentication,
+                rotation: None,
+            })
+        }
+    }
+
+    fn runtime() -> Runtime {
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("platform reactor"))
+            .blocking_threads(0, 2)
+            .build()
+            .expect("application-owned runtime")
+    }
+
+    fn run(
+        provider: &Provider,
+        timeout: Duration,
+    ) -> Result<AuthenticatedTransportIngress, IngressAuthenticationError> {
+        runtime().block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let request = AuthRequestView::new(b"secret", "Bearer", "tls", RESOURCE)?;
+            authenticate_ingress(&cx, Some(provider), &request, timeout)
+        })
+    }
+
+    #[test]
+    fn zero_timeout_refuses_before_provider_work() {
+        let provider = Provider::new(RESOURCE, Duration::ZERO, false);
+        assert_eq!(
+            run(&provider, Duration::ZERO).unwrap_err(),
+            IngressAuthenticationError::DeadlineExceeded
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn timely_matching_verdict_preserves_verified_ingress() {
+        let provider = Provider::new(RESOURCE, Duration::ZERO, false);
+        let ingress = run(&provider, Duration::from_secs(60)).expect("timely admission");
+        assert_eq!(ingress.authentication().canonical_resource(), RESOURCE);
+        assert_eq!(ingress.scheme(), "Bearer");
+        assert_eq!(ingress.transport_provenance(), "tls");
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn late_success_cannot_mint_authenticated_ingress() {
+        let provider = Provider::new(RESOURCE, Duration::from_millis(20), false);
+        assert_eq!(
+            run(&provider, Duration::from_millis(1)).unwrap_err(),
+            IngressAuthenticationError::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn late_provider_refusal_does_not_hide_deadline_exhaustion() {
+        let provider = Provider::new(RESOURCE, Duration::from_millis(20), true);
+        assert_eq!(
+            run(&provider, Duration::from_millis(1)).unwrap_err(),
+            IngressAuthenticationError::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn timely_provider_refusal_is_preserved() {
+        let provider = Provider::new(RESOURCE, Duration::ZERO, true);
+        assert_eq!(
+            run(&provider, Duration::from_secs(60)).unwrap_err(),
+            IngressAuthenticationError::NotAuthenticated
+        );
+    }
+
+    #[test]
+    fn verdict_for_another_resource_is_not_admitted() {
+        let provider = Provider::new("https://resource.example/other", Duration::ZERO, false);
+        assert_eq!(
+            run(&provider, Duration::from_secs(60)).unwrap_err(),
+            IngressAuthenticationError::NotAuthenticated
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
 }
