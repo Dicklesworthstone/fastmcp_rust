@@ -9652,7 +9652,7 @@ impl TransportRecvHalf for SharedStdioRecv {
         self.0.lock().map_err(|_| TransportError::Closed)?.recv(cx)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.0.lock().map_err(|_| TransportError::Closed)?.close()
     }
 }
@@ -9787,7 +9787,7 @@ impl TransportSendHalf for SharedStdioSend {
         send_child_frame(&mut sender, cx, message, deadline)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.0.lock().map_err(|_| TransportError::Closed)?.close()
     }
 }
@@ -22861,7 +22861,7 @@ mod tests {
                 .map(ReceivedTransportFrame::into_message)
         }
 
-        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.frames.clear();
             Ok(())
         }
@@ -22889,7 +22889,7 @@ mod tests {
             Ok(())
         }
 
-        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
             self.closed.store(true, Ordering::Release);
             Ok(())
         }

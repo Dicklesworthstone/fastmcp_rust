@@ -96,7 +96,7 @@ impl Transport for ScriptedTransport {
             .unwrap_or(Err(TransportError::Closed))
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.state.borrow_mut().closed = true;
         Ok(())
     }
