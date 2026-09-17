@@ -1,0 +1,41 @@
+# FND-02 authoritative source registry.
+#
+# Every input the traceability checker reads is bound here by its Git blob
+# identity -- `git hash-object <path>` -- and the checker re-derives that
+# identity from the bytes on disk on every run.
+#
+# Blob identity, not commit SHA, deliberately: `main` is rebased in this
+# repository, so a commit SHA stops resolving while the content it named is
+# untouched. A blob hash addresses the bytes themselves.
+#
+# When one of these files legitimately changes, the gate turns red. That is
+# the mechanism working, not a defect: a changed authority means the trace
+# rows derived from it must be re-reviewed before the binding is updated.
+# Never refresh a binding to force green -- that is precisely the failure
+# FND-01's six silently-stale bindings demonstrated.
+
+schema = "fnd-02-authoritative-sources-v1"
+
+[[source]]
+id = "campaign-plan"
+path = "COMPREHENSIVE_PLAN_TO_SUPPORT_MCP_2026-07-28_SPEC_IN_FASTMCP_RUST.md"
+blob_sha1 = "83defe4464066d1fac1280c319e99a6f23a26dcc"
+role = "canonical package corpus and work-package ownership"
+
+[[source]]
+id = "core-changelog-2026-07-28"
+path = "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx"
+blob_sha1 = "dc5c9a9cf3e6895504534cf3f300514394d8c6ae"
+role = "final changelog items requiring trace coverage"
+
+[[source]]
+id = "fnd-01-core-conformance"
+path = "evidence/fnd-01/core-conformance.toml"
+blob_sha1 = "3cfa5df560ac0179d6c875a1e4df16099625cfb4"
+role = "frozen conformance scenario and check inventory"
+
+[[source]]
+id = "fnd-01-auth-standards"
+path = "evidence/fnd-01/auth-standards.toml"
+blob_sha1 = "c3ee530e9d0b70fce8ca85393fd72736a559f168"
+role = "exact immutable authorization source revisions"

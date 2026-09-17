@@ -1,0 +1,382 @@
+# FND-02 requirement trace table.
+#
+# One row maps one observable requirement clause to the implementation and the
+# tests that are supposed to demonstrate it. Thirteen fields are recorded on
+# every row and all of them are checked.
+#
+# `covers_item` must name an item the authoritative corpus actually contains.
+# The corpus is parsed on every run -- the 2026-07-28 changelog's Major and
+# Minor items, plus the frozen upstream conformance scenarios -- rather than
+# frozen as a count, because a count is a measurement of mutable content and
+# measurements rot. Coverage is checked as an exact set in both directions, so
+# a row covering a vanished item and an item with no row are both failures.
+#
+# `source_revision` carries an exact immutable revision. An `auth:` prefix
+# routes the row through the authorization rule, where a floating "OAuth 2.1"
+# is rejected: a clause inherited from -13 is not the same clause in -14.
+#
+# `positive_test_id` and `negative_test_id` name the owning package's frozen
+# canonical test IDs. This table records the contract; it does not yet assert
+# that each named test exists and runs -- see the submission note on that gap.
+
+schema = "fnd-02-trace-table-v1"
+
+[[row]]
+clause_key = "core/2026-07-28/transport/http/no-protocol-sessions"
+strength = "MUST NOT"
+client_behavior = "does not send Mcp-Session-Id and does not rely on per-connection list results"
+server_behavior = "does not mint or require a protocol-level session and serves list endpoints identically on every connection"
+transport_applicability = "http"
+owner = "HTTP-02"
+positive_test_id = "http_02_a_positive"
+negative_test_id = "http_02_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/1"
+
+[[row]]
+clause_key = "core/2026-07-28/lifecycle/stateless-per-request-metadata"
+strength = "MUST"
+client_behavior = "carries io.modelcontextprotocol/protocolVersion and clientCapabilities in _meta on every request"
+server_behavior = "reads per-request _meta instead of handshake state and returns UnsupportedProtocolVersionError on mismatch"
+transport_applicability = "all"
+owner = "PRT-02"
+positive_test_id = "prt_02_a_positive"
+negative_test_id = "prt_02_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/2"
+
+[[row]]
+clause_key = "core/2026-07-28/server-discover/mandatory-rpc"
+strength = "MUST"
+client_behavior = "may call server/discover before any other request for up-front version selection"
+server_behavior = "implements server/discover and advertises supported protocol versions, capabilities, and identity"
+transport_applicability = "all"
+owner = "SRV-02"
+positive_test_id = "srv_02_a_positive"
+negative_test_id = "srv_02_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/3"
+
+[[row]]
+clause_key = "core/2026-07-28/subscriptions/listen-stream"
+strength = "MUST"
+client_behavior = "opts in to specific notification types on one long-lived POST-response stream"
+server_behavior = "acknowledges the opt-in and tags notifications with io.modelcontextprotocol/subscriptionId"
+transport_applicability = "http"
+owner = "SUB-01"
+positive_test_id = "sub_01_a_positive"
+negative_test_id = "sub_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/4"
+
+[[row]]
+clause_key = "core/2026-07-28/logging/no-unsolicited-message-notifications"
+strength = "MUST NOT"
+client_behavior = "sets io.modelcontextprotocol/logLevel per request rather than calling logging/setLevel"
+server_behavior = "emits no notifications/message for a request that did not carry the logLevel field"
+transport_applicability = "all"
+owner = "OBS-02"
+positive_test_id = "obs_02_a_positive"
+negative_test_id = "obs_02_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/5"
+
+[[row]]
+clause_key = "core/2026-07-28/tasks/extension-polling-model"
+strength = "MUST"
+client_behavior = "polls tasks/get and sends client input via tasks/update instead of blocking on tasks/result"
+server_behavior = "returns task handles without per-request opt-in and serves the tasks extension namespace"
+transport_applicability = "all"
+owner = "TASK-01"
+positive_test_id = "task_01_a_positive"
+negative_test_id = "task_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/6"
+
+[[row]]
+clause_key = "core/2026-07-28/mrtr/input-required-retry"
+strength = "MUST"
+client_behavior = "answers inputRequests by retrying the original request with inputResponses"
+server_behavior = "returns InputRequiredResult with resultType input_required carrying inputRequests"
+transport_applicability = "all"
+owner = "MRTR-01"
+positive_test_id = "mrtr_01_a_positive"
+negative_test_id = "mrtr_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/7"
+
+[[row]]
+clause_key = "core/2026-07-28/results/result-type-required"
+strength = "MUST"
+client_behavior = "treats a result from an earlier-protocol server that omits resultType as complete"
+server_behavior = "sets resultType to complete or input_required on every result it returns"
+transport_applicability = "all"
+owner = "PRT-04"
+positive_test_id = "prt_04_a_positive"
+negative_test_id = "prt_04_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/8"
+
+[[row]]
+clause_key = "core/2026-07-28/transport/http/no-stream-resumability"
+strength = "MUST"
+client_behavior = "re-issues a broken response stream as a new request with a new request ID"
+server_behavior = "does not emit SSE event IDs and does not honour Last-Event-ID"
+transport_applicability = "http"
+owner = "HTTP-04"
+positive_test_id = "http_04_a_positive"
+negative_test_id = "http_04_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/major/9"
+
+[[row]]
+clause_key = "core/2026-07-28/capabilities/extensions-map"
+strength = "MAY"
+client_behavior = "declares namespaced extensions in ClientCapabilities"
+server_behavior = "declares namespaced extensions in ServerCapabilities"
+transport_applicability = "all"
+owner = "PRT-03"
+positive_test_id = "prt_03_a_positive"
+negative_test_id = "prt_03_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/1"
+
+[[row]]
+clause_key = "core/2026-07-28/observability/trace-context-meta"
+strength = "MAY"
+client_behavior = "propagates traceparent, tracestate, and baggage through _meta"
+server_behavior = "reads the OpenTelemetry _meta keys without treating them as protocol fields"
+transport_applicability = "all"
+owner = "OBS-01"
+positive_test_id = "obs_01_a_positive"
+negative_test_id = "obs_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "upstream documents conventions without stating a conformance oracle"
+covers_item = "core-changelog/minor/2"
+
+[[row]]
+clause_key = "core/2026-07-28/tools/deterministic-list-order"
+strength = "SHOULD"
+client_behavior = "may cache tools/list results keyed on the deterministic order"
+server_behavior = "returns tools from tools/list in a deterministic order"
+transport_applicability = "all"
+owner = "TOOL-01"
+positive_test_id = "tool_01_a_positive"
+negative_test_id = "tool_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/3"
+
+[[row]]
+clause_key = "core/2026-07-28/headers/required-request-headers"
+strength = "MUST"
+client_behavior = "sends Mcp-Method and Mcp-Name on every Streamable HTTP POST"
+server_behavior = "rejects a modern POST whose required routing headers are absent or mismatched"
+transport_applicability = "http"
+owner = "HDR-01"
+positive_test_id = "hdr_01_a_positive"
+negative_test_id = "hdr_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/4"
+
+[[row]]
+clause_key = "core/2026-07-28/cache/cacheable-result-fields"
+strength = "MUST"
+client_behavior = "honours ttlMs as a freshness hint and cacheScope when sharing an intermediary cache"
+server_behavior = "sets ttlMs and cacheScope on every CacheableResult-bearing response"
+transport_applicability = "all"
+owner = "CACHE-01"
+positive_test_id = "cache_01_a_positive"
+negative_test_id = "cache_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/5"
+
+[[row]]
+clause_key = "core/2026-07-28/errors/resource-not-found-invalid-params"
+strength = "MUST"
+client_behavior = "treats resource-not-found as -32602 rather than -32002"
+server_behavior = "returns -32602 Invalid Params for a resource that does not exist"
+transport_applicability = "all"
+owner = "PRT-03"
+positive_test_id = "prt_03_a_positive"
+negative_test_id = "prt_03_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/6"
+
+[[row]]
+clause_key = "core/2026-07-28/authorization/iss-parameter-validation"
+strength = "MUST"
+client_behavior = "validates a present iss against the recorded issuer before redeeming the authorization code"
+server_behavior = "includes the iss parameter in authorization responses"
+transport_applicability = "http"
+owner = "AUTH-02"
+positive_test_id = "auth_02_a_positive"
+negative_test_id = "auth_02_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "auth:rfc-9207"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/7"
+
+[[row]]
+clause_key = "core/2026-07-28/authorization/dcr-application-type"
+strength = "MUST"
+client_behavior = "specifies an appropriate application_type during Dynamic Client Registration"
+server_behavior = "honours the registered application_type when validating redirect URIs"
+transport_applicability = "http"
+owner = "AUTH-03"
+positive_test_id = "auth_03_a_positive"
+negative_test_id = "auth_03_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "auth:oidc-dynamic-registration-errata2"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/8"
+
+[[row]]
+clause_key = "core/2026-07-28/authorization/credentials-bound-to-issuer"
+strength = "MUST NOT"
+client_behavior = "keys persisted credentials by issuer, never reuses them with a different authorization server, and re-registers when it changes"
+server_behavior = "treats credentials issued by another authorization server as unknown"
+transport_applicability = "http"
+owner = "AUTH-05"
+positive_test_id = "auth_05_a_positive"
+negative_test_id = "auth_05_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "auth:oauth-2.1-13"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/9"
+
+[[row]]
+clause_key = "core/2026-07-28/schema/json-schema-2020-12"
+strength = "MUST"
+client_behavior = "accepts any JSON Schema 2020-12 keyword set in inputSchema and outputSchema"
+server_behavior = "resolves $ref within the declared composition-keyword resource bounds"
+transport_applicability = "all"
+owner = "SCH-01"
+positive_test_id = "sch_01_a_positive"
+negative_test_id = "sch_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/10"
+
+[[row]]
+clause_key = "core/2026-07-28/elicitation/no-completion-notification"
+strength = "MUST NOT"
+client_behavior = "learns an out-of-band outcome by retrying the original request, not from a completion notification"
+server_behavior = "emits no notifications/elicitation/complete and carries no elicitationId"
+transport_applicability = "all"
+owner = "MRTR-01"
+positive_test_id = "mrtr_01_a_positive"
+negative_test_id = "mrtr_01_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/11"
+
+[[row]]
+clause_key = "core/2026-07-28/errors/allocation-policy-partition"
+strength = "MUST"
+client_behavior = "accepts the renumbered -32020, -32021, and -32022 codes"
+server_behavior = "allocates specification errors only within -32020 to -32099 and leaves -32000 to -32019 implementation-defined"
+transport_applicability = "all"
+owner = "PRT-03"
+positive_test_id = "prt_03_a_positive"
+negative_test_id = "prt_03_a_planted_negative"
+scenario_check_id = "none"
+source_revision = "core_2026_git:5f5440bb26a62e2cf3440b92da5a667efa03b267"
+unobservable_prose = false
+ambiguity = "none"
+covers_item = "core-changelog/minor/12"
+
+[[row]]
+clause_key = "ext/enterprise-managed-authorization/complete-flow"
+strength = "MUST"
+client_behavior = "completes the enterprise-managed token-exchange flow against the advertised issuer"
+server_behavior = "advertises and honours the enterprise-managed authorization profile"
+transport_applicability = "http"
+owner = "AUTHX-01"
+positive_test_id = "authx_01_a_positive"
+negative_test_id = "authx_01_a_planted_negative"
+scenario_check_id = "auth/enterprise-managed-authorization#complete-flow-token-exchange"
+source_revision = "auth:id-jag-04"
+unobservable_prose = false
+ambiguity = "upstream scenario is a multi-cause policy negative and is not a production positive oracle"
+covers_item = "conformance-scenario/auth/enterprise-managed-authorization"
+
+[[row]]
+clause_key = "ext/oauth-client-credentials/jwt-assertion"
+strength = "MUST"
+client_behavior = "presents a JWT client assertion with the exact grant and assertion types"
+server_behavior = "verifies the client assertion issuer and subject before issuing a token"
+transport_applicability = "http"
+owner = "AUTHX-02"
+positive_test_id = "authx_02_a_positive"
+negative_test_id = "authx_02_a_planted_negative"
+scenario_check_id = "auth/client-credentials-jwt#client-credentials-jwt-verified"
+source_revision = "auth:rfc-7523"
+unobservable_prose = false
+ambiguity = "draft profile only; it is not final-core authority"
+covers_item = "conformance-scenario/auth/client-credentials-jwt"
+
+[[row]]
+clause_key = "ext/oauth-client-credentials/basic-auth"
+strength = "MUST"
+client_behavior = "presents client credentials using HTTP Basic authentication"
+server_behavior = "accepts Basic client authentication on the token endpoint for the draft profile"
+transport_applicability = "http"
+owner = "AUTHX-02"
+positive_test_id = "authx_02_a_positive"
+negative_test_id = "authx_02_a_planted_negative"
+scenario_check_id = "auth/client-credentials-basic#client-credentials-basic-auth"
+source_revision = "auth:rfc-6749"
+unobservable_prose = false
+ambiguity = "draft profile only; it is not final-core authority"
+covers_item = "conformance-scenario/auth/client-credentials-basic"

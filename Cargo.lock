@@ -1108,6 +1108,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastmcp-xtask"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

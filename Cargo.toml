@@ -10,6 +10,8 @@ members = [
     "crates/fastmcp-macros",
     "crates/fastmcp-console",
     "crates/fastmcp-cli",
+    # Non-publishable workspace tooling (FND-02 traceability checker).
+    "tools/xtask",
 ]
 
 [workspace.package]

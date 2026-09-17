@@ -1,0 +1,26 @@
+# FND-02 normative traceability checker.
+#
+# Non-publishable workspace tool. It must never depend on a publishable
+# FastMCP facade/server/client crate, a network client, Agent Mail, `br`,
+# `bv`, GitHub, or a production feature. Its only edges are the exact
+# workspace serialization crates needed for offline parsing.
+[package]
+name = "fastmcp-xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[[bin]]
+name = "fastmcp-xtask"
+path = "src/main.rs"
+
+[lib]
+name = "fastmcp_xtask"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+serde_json = { workspace = true }

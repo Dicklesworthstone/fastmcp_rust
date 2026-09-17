@@ -7,3 +7,11 @@ fingerprint = "content"
 
 [unstable]
 checksum-freshness = true
+
+# FND-02: resolve the traceability checker by package so the command never
+# depends on an ambient `cargo-xtask` executable or on PATH.
+# `cargo xtask plan-tracker-check all` and
+# `cargo run --locked --quiet -p fastmcp-xtask -- plan-tracker-check all`
+# are the same invocation.
+[alias]
+xtask = "run --locked --quiet -p fastmcp-xtask --"
