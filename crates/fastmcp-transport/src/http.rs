@@ -7545,7 +7545,31 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"ok");
-        assert_ne!(response.provenance.leaf_certificate_sha256, [0; 32]);
+        // The digest must be OF THE PEER'S LEAF, not merely non-zero. The old
+        // `!= [0; 32]` here was the weakest predicate available: a constant, a
+        // digest of the issuing CA, or a digest of the wrong certificate
+        // entirely all satisfied it. Comparing against the fixture leaf's own
+        // DER is what makes this prove derivation rather than presence.
+        let fixture_chain = Certificate::from_pem(GUARDED_LOOPBACK_CHAIN_PEM)
+            .expect("bounded loopback certificate chain");
+        let fixture_leaf_digest =
+            guarded_leaf_certificate_sha256(Some(fixture_chain[0].as_der().to_vec()))
+                .expect("fixture leaf digest");
+        assert_eq!(
+            response.provenance.leaf_certificate_sha256, fixture_leaf_digest,
+            "recorded provenance must carry the digest of the PEER'S LEAF certificate"
+        );
+        // And not simply some certificate from the chain: the issuer is present
+        // in the same PEM, so an implementation digesting the wrong chain
+        // element would still have passed the equality above by accident had we
+        // not pinned which element.
+        let fixture_issuer_digest =
+            guarded_leaf_certificate_sha256(Some(fixture_chain[1].as_der().to_vec()))
+                .expect("fixture issuer digest");
+        assert_ne!(
+            response.provenance.leaf_certificate_sha256, fixture_issuer_digest,
+            "the leaf digest must not be the issuing certificate's digest"
+        );
         assert_eq!(response.provenance.host, "foobar.com");
         assert!(response.provenance.selected_address.ip().is_loopback());
         assert_eq!(requests.len(), 1);
