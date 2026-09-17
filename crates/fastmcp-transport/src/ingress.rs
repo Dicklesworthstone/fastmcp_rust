@@ -374,7 +374,7 @@ mod tests {
                     verified_audience_binding: VerifiedAudienceBinding::OAuth {
                         canonical_resource: self.resource.to_owned(),
                         validated_audience: self.resource.to_owned(),
-                        audience_policy_id: "strict",
+                        audience_policy_id: "strict".to_owned(),
                         audience_policy_revision: 1,
                         provider: "org.fastmcp.provider.ingress-test".to_owned(),
                         configuration_generation: 1,
