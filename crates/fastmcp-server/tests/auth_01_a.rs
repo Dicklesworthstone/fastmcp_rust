@@ -630,3 +630,86 @@ fn auth_01_a_planted_negative() {
         assert_admitted(&probe, &response, 0);
     });
 }
+
+/// Supplementary external-consumer proof. Deliberately **not** one of the two
+/// frozen AUTH-01 A IDs, and named so that no `--exact` selection of either can
+/// match it; it adds a side, it does not restate one.
+///
+/// Both frozen tests refuse BEFORE they admit. That ordering cannot observe the
+/// failure it most matters to exclude: a session that, having once admitted a
+/// valid `Authorization` credential, starts honouring an in-band credential
+/// afterwards because it cached the principal. A server that authenticated only
+/// the first request of a session and then trusted the connection would pass
+/// both frozen tests and fail this one. Reversing the order is the whole test.
+///
+/// `provider_calls` is the load-bearing observable rather than the status code:
+/// it separates "refused before the provider ran" from "ran the provider and
+/// reported a refusal afterwards", which the response alone cannot distinguish.
+#[test]
+fn auth_01_a_admission_does_not_license_a_later_in_band_credential() {
+    run_auth_01_scenario(|cx| async move {
+        let probe = Auth01Probe::new();
+        let endpoint = auth_01_endpoint(&probe);
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("the public HTTP session must open");
+
+        // Side one, the control: a native header credential is admitted, so the
+        // session has now seen a verified principal.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("the public HTTP session must complete the admitted request"),
+        );
+        assert_admitted(&probe, &response, 0);
+        let admitted = probe.snapshot();
+        let admitted_bytes = admitted.canonical_bytes();
+
+        // Side two, the one variable: same session, same credential, same
+        // principal, same tool, same arguments, same request id - only the
+        // credential's location changes. The earlier admission licenses nothing.
+        for placement in [
+            CredentialPlacement::AuthorizationHeaderPlusBodyCredential,
+            CredentialPlacement::BodyCredentialOnly,
+            CredentialPlacement::AuthorizationHeaderPlusQueryCredential,
+        ] {
+            let response = immediate(
+                session
+                    .handle_async(&cx, auth_01_http_request(&probe.token, placement))
+                    .await
+                    .expect("a credential-location refusal is an ordinary HTTP response"),
+            );
+            assert_credential_location_refusal(&probe, &response);
+
+            let after = probe.snapshot();
+            assert_eq!(
+                after, admitted,
+                "{placement:?} moved named AUTH-01 state after an earlier admission"
+            );
+            assert_eq!(
+                after.canonical_bytes(),
+                admitted_bytes,
+                "{placement:?} left AUTH-01 state that is not byte-for-byte the \
+                 post-admission state"
+            );
+        }
+
+        // Side three: the refusals are a no-op, not a wedge. The session still
+        // admits the permitted placement, and admits it at sequence 1 - which is
+        // what proves the three refusals contributed no admission of their own.
+        let response = immediate(
+            session
+                .handle_async(
+                    &cx,
+                    auth_01_http_request(&probe.token, CredentialPlacement::AuthorizationHeader),
+                )
+                .await
+                .expect("a refused credential location must not wedge the session"),
+        );
+        assert_admitted(&probe, &response, 1);
+    });
+}
