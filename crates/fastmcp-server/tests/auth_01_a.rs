@@ -845,23 +845,26 @@ fn auth_01_a_ambiguous_authorization_headers_are_refused_before_any_provider_cal
 /// trusted the session would admit this, and it would pass every other case in
 /// this file.
 ///
-/// It also reaches a THIRD refusal ground, distinct from both transport limbs.
-/// A missing header is not rejected at the transport boundary - `AuthRequest`
-/// is still built with `transport_authorization: None` (`router.rs:113/126`)
-/// and the provider IS invoked. So unlike `:738` and the frozen negative,
-/// `provider_calls` is expected to MOVE here. Asserting "state unchanged" would
-/// be false of this subject, so it is not asserted; the observable that carries
-/// the proof is the recorded credential observation instead.
+/// `AuthRequest` is still BUILT for this request, with
+/// `transport_authorization: None` (`router.rs:113/126`) - but it is refused
+/// before the provider sees it, by the transport guard at `lib.rs:19893`,
+/// eleven lines ahead of the provider call at `lib.rs:19904`. So
+/// `provider_calls` does NOT move for the uncredentialed request: it stays at
+/// the single consultation the earlier credentialed request caused.
 ///
-/// `observed_credentials` gaining exactly `absent:false` is the load-bearing
-/// assertion: it shows the shipped extractor reported ABSENCE to the provider
-/// rather than replaying the credential it had already seen on this session.
+/// The load-bearing assertion is therefore the UNAUTHORIZED refusal SHAPE -
+/// status, `www-authenticate: Bearer`, and an empty body together - which
+/// shows the request was refused by that guard rather than admitted on a
+/// cached principal.
+///
+/// REVISED 2026-09-17. Until then this paragraph said the provider IS invoked,
+/// that `provider_calls` was expected to MOVE, and that `observed_credentials`
+/// gaining `absent:false` was load-bearing. All three described the pre-75099bf1
+/// mechanism and are now false: since 2026-09-05 the server refuses first, so
+/// `absent:false` is never recorded. The prose is corrected with the assertions
+/// rather than left arguing for a contract the server no longer implements.
 ///
 /// Deliberately NOT asserted, with reasons, rather than guessed:
-/// - The exact HTTP status. A provider denial is remapped to a fixed
-///   `ResourceForbidden` (`lib.rs:20109`) and I did not establish which status
-///   the endpoint renders for it by reading. Asserting a guessed constant would
-///   be invented evidence, so this asserts only that it is not an admission.
 /// - `middleware_calls`. Whether middleware runs before or after authentication
 ///   is not part of the AUTH-01 contract, and pinning it here would couple this
 ///   proof to an unrelated design choice that is free to change.
@@ -909,11 +912,29 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
                 .expect("an uncredentialed request is an ordinary HTTP response"),
         );
 
-        assert_ne!(
+        // The refusal SHAPE, not merely "not 200". `assert_ne!(status, OK)`
+        // also passes on a 500, so it cannot distinguish a fail-closed refusal
+        // from a crash -- and with the mechanism counts below relaxed to match
+        // the shipped guard, this is now the assertion carrying the property.
+        // Strengthened to the three-part idiom this file already uses for the
+        // ambiguity refusal at :792-804, matching what
+        // `native_http_authentication_rejection` produces (`lib.rs:9650`).
+        assert_eq!(
             response.status,
-            HttpStatus::OK,
+            HttpStatus::UNAUTHORIZED,
             "a request carrying no credential was admitted after an earlier one succeeded, so \
              the session is honouring a cached principal"
+        );
+        assert_eq!(
+            response.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer"),
+            "the uncredentialed refusal must remain a bounded bearer challenge"
+        );
+        assert!(
+            response.body.is_empty(),
+            "an empty body is what separates the authentication refusal from the \
+             credential-location refusal (`lib.rs:9656`), which renders the same status and \
+             header but carries an `invalid_request` diagnostic"
         );
 
         let state = probe.snapshot();
@@ -921,14 +942,42 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
             state.handler_calls, 1,
             "the tool ran for an uncredentialed request"
         );
+        // REPAIRED 2026-09-17, authorised by WildMountain after a contract
+        // ruling. These two read `provider_calls == 2` and
+        // `observed_credentials == ["Bearer:true", "absent:false"]`, asserting
+        // that the server consults the auth provider for an uncredentialed
+        // request. The shipped design refuses BEFORE the provider:
+        // `lib.rs:19893` returns `native_http_authentication_rejection()`
+        // eleven lines ahead of the provider call at `lib.rs:19904`.
+        //
+        // The guard is DELIBERATE, not a regression. It landed in 75099bf1 on
+        // 2026-09-05, "feat(auth): require Authorization header and reject
+        // query/body credentials for HTTP transport". Refusing without
+        // consulting the provider is fail-closed and strictly stronger than
+        // consulting it and refusing afterwards. This test asserted the
+        // pre-change mechanism; the security property it is named for never
+        // stopped holding and is asserted above by the UNAUTHORIZED check.
+        // Only the mechanism counts were stale.
+        //
+        // WHY `== 1` IS A REAL ASSERTION AND NOT MERELY A SMALLER NUMBER: it
+        // excludes both worthless implementations at once.
+        //   - never-consult cannot reach 1, because the FIRST (credentialed)
+        //     request must consult the provider in order to be admitted;
+        //   - always-consult reaches 2, because it would also consult for the
+        //     uncredentialed request.
+        // Only "consulted for the credentialed request and NOT for the
+        // uncredentialed one" satisfies it, which is exactly the guarantee
+        // 75099bf1 introduced.
         assert_eq!(
-            state.provider_calls, 2,
-            "the provider must be consulted for the uncredentialed request rather than skipped"
+            state.provider_calls, 1,
+            "the provider was consulted for the uncredentialed request; the shipped guard at \
+             lib.rs:19893 must refuse it before any user-supplied provider code runs"
         );
         assert_eq!(
             state.observed_credentials,
-            vec!["Bearer:true".to_owned(), "absent:false".to_owned()],
-            "the extractor replayed a previously seen credential instead of reporting absence"
+            vec!["Bearer:true".to_owned()],
+            "the extractor observed a second credential, so the uncredentialed request reached \
+             the provider instead of being refused at the transport guard"
         );
         assert_eq!(
             state.observed_subjects,
@@ -939,6 +988,14 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
 
         // No oracle: the refusal must not disclose the credential, the
         // principal, or which provider check failed.
+        //
+        // NOTE 2026-09-17: both checks below are now SUBSUMED by the
+        // `body.is_empty()` assertion above -- an empty body cannot contain the
+        // token, the subject, or the provider's denial text, so neither can
+        // fail while that assertion holds. Retained deliberately rather than
+        // deleted: they name WHICH strings are forbidden, where `is_empty()`
+        // only says none are present, so they are the checks that must keep
+        // passing if the refusal ever grows a diagnostic body.
         let rendered = String::from_utf8_lossy(&response.body);
         assert!(
             !rendered.contains(&probe.token) && !rendered.contains(&probe.subject),
