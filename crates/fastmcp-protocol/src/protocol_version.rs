@@ -545,10 +545,21 @@ fn requires_mcp_name(method: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The frozen `prt_03_a_*` / `prt_03_b_*` pairs live in the external
+    // public-surface consumer at
+    // `crates/fastmcp-protocol/tests/prt_03_contract.rs`. These keep the same
+    // coverage as in-crate unit rehearsals under distinct names.
+    //
+    // Being inside a `mod` already qualifies these as
+    // `protocol_version::tests::…`, so `--exact <bare name>` would not have
+    // matched them. They are renamed anyway: the campaign invariant is one
+    // definition per frozen ID workspace-wide, and singularity that depends on
+    // a caller remembering to pass `--exact` is a property of the invocation,
+    // not of the tree.
     use super::*;
 
     #[test]
-    fn prt_03_a_positive() {
+    fn prt_03_a_unit_positive() {
         let admission = admit_final_http_request(FinalHttpRequestMetadata {
             version: RequestVersionMetadata {
                 header_version: Some(FINAL_PROTOCOL_VERSION),
@@ -571,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_03_a_planted_negative() {
+    fn prt_03_a_unit_planted_negative() {
         let body_name = Some("weather");
         let error = admit_final_http_request(FinalHttpRequestMetadata {
             version: RequestVersionMetadata {
@@ -670,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_03_b_positive() {
+    fn prt_03_b_unit_positive() {
         let admission = admit_final_request(RequestVersionMetadata {
             header_version: Some(FINAL_PROTOCOL_VERSION),
             body_version: Some(FINAL_PROTOCOL_VERSION),
@@ -685,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn prt_03_b_planted_negative() {
+    fn prt_03_b_unit_planted_negative() {
         let body_version = Some(FINAL_PROTOCOL_VERSION);
         let changed_header_version = Some("2025-11-25");
 

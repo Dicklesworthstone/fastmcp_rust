@@ -231,9 +231,24 @@ fn fnd_03_b_unit_planted_negative() {
     protocol_policy::tests::fnd_03_era_classification_planted_negative();
 }
 
+// The frozen `prt_03_i_positive` / `prt_03_i_planted_negative` pair lives in the
+// external public-surface consumer at
+// `crates/fastmcp-protocol/tests/prt_03_integration.rs`, matching the
+// `fnd_03_b_*` arrangement above. These two keep the same coverage as an
+// in-crate unit rehearsal under distinct names.
+//
+// They were renamed rather than removed because their content is substantive,
+// not vestigial. What made the original names wrong was placement: at the crate
+// root they took the BARE libtest names `prt_03_i_positive` /
+// `prt_03_i_planted_negative`, so `--exact <bare name>` would have matched both
+// them and the external pair — two discovered tests for one required ID. They
+// also could not satisfy the bead's own predicate, which requires the behaviour
+// to be present "through the shipped, non-`cfg(test)` public surface". Nothing
+// here needs crate-internal access: every symbol below is publicly re-exported,
+// so the external consumer runs this same content as a genuine downstream user.
 #[cfg(test)]
 #[test]
-fn prt_03_i_positive() {
+fn prt_03_i_unit_positive() {
     let required_capabilities = ClientCapabilities {
         roots: Some(RootsCapability { list_changed: true }),
         ..ClientCapabilities::default()
@@ -273,7 +288,7 @@ fn prt_03_i_positive() {
 
 #[cfg(test)]
 #[test]
-fn prt_03_i_planted_negative() {
+fn prt_03_i_unit_planted_negative() {
     let metadata = FinalRequestMeta::new(ClientCapabilities {
         roots: Some(RootsCapability { list_changed: true }),
         ..ClientCapabilities::default()
