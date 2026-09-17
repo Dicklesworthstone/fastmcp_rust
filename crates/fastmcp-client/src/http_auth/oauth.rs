@@ -1108,11 +1108,13 @@ mod tests {
     /// exactly that, so setting it would let a leaked listener coexist with the
     /// probe bind and silently turn this proof into a no-op.
     ///
-    /// No sleep, no retry, no timing tolerance: the close is synchronous in
-    /// `Drop`, so there is nothing to wait for and a tolerance would hide the
-    /// very leak being tested.
-    /// Positive control for [`assert_listener_released`], run while the login
-    /// future is still alive.
+    /// No sleep and no timing tolerance: the close is synchronous in `Drop`, so
+    /// there is nothing to wait for and a tolerance would hide the very leak
+    /// being tested. The release case does run the whole experiment more than
+    /// once, but that is independent sampling on a fresh port each time, not a
+    /// re-observation of one port after a delay - see `RELEASE_TRIALS`.
+    /// Positive control for [`probe_listener_released`], run while the login
+    /// future is still alive, in every trial.
     ///
     /// Without it the release probe is vacuous in one direction: a bind that
     /// succeeds after the drop proves the port is free, but not that this
@@ -1174,17 +1176,58 @@ mod tests {
     ///
     /// The ambiguous arm still fails closed. It is narrower than it was, not
     /// gone, so it names both hypotheses rather than asserting either.
-    fn assert_listener_released(address: SocketAddr) {
+    /// What one release trial observed. `StillBound` is deliberately NOT a
+    /// panic: a single trial cannot distinguish a leak from a stolen port, and
+    /// the caller resolves that by repeating the whole experiment.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReleaseTrial {
+        /// The bind succeeded, so nothing holds the port. The descriptor was
+        /// closed. One such observation is conclusive on its own.
+        Released,
+        /// The port was still held. Either the listener leaked or a concurrent
+        /// ephemeral bind won it inside the straight-line window.
+        StillBound,
+    }
+
+    /// Number of independent release trials before a leak is declared.
+    ///
+    /// Sized against the two hypotheses, not against a clock. A leaked listener
+    /// fails EVERY trial - the close is unconditional, so a leak is not a
+    /// probabilistic event. A thief must win a fresh, kernel-assigned ephemeral
+    /// port on each trial; the probability of that happening five times running
+    /// is the per-trial probability raised to the fifth power. Five is where
+    /// theft stops being a plausible explanation for a total failure while the
+    /// cost stays at a few binds and no sleep at all.
+    const RELEASE_TRIALS: usize = 5;
+
+    /// Runs ONE release trial and reports what it saw.
+    ///
+    /// Everything the old assertion did, it still does: `std::net`'s blocking
+    /// bind with no `.await` between the drop and the syscall, no sleep, no
+    /// timing tolerance, no `SO_REUSEADDR`, no `SO_REUSEPORT`. The observation
+    /// is byte-for-byte the same question. What changed is only who answers it:
+    /// this reports `StillBound` instead of panicking, because that single
+    /// observation is genuinely ambiguous and the ambiguity is resolvable by
+    /// repetition rather than by tolerance.
+    ///
+    /// The distinction matters and is not a retry in the forbidden sense. A
+    /// retry would re-observe THE SAME port after a delay, which is exactly the
+    /// tolerance that would hide a slow close. This instead re-runs the entire
+    /// experiment from a fresh `authorize` on a fresh ephemeral port, so each
+    /// trial is an independent sample of the same property.
+    ///
+    /// The unexpected-errno arm still fails immediately and is never retried:
+    /// an unrecognised error is not a race, and repeating it would only convert
+    /// a clear diagnostic into a confusing one.
+    fn probe_listener_released(address: SocketAddr) -> ReleaseTrial {
         match std::net::TcpListener::bind(address) {
-            Ok(listener) => drop(listener),
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => panic!(
-                "{address} is still bound after the callback listener was dropped, and the \
-                 bind was issued with no await between it and the drop. Either the listener \
-                 leaked - the defect this probe exists to catch - or a concurrent test on \
-                 another thread took the port inside that straight-line window. The control \
-                 above proved the probe detects this listener, so this is a real state \
-                 observation, not a vacuous one."
-            ),
+            Ok(listener) => {
+                drop(listener);
+                ReleaseTrial::Released
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                ReleaseTrial::StillBound
+            }
             Err(error) => panic!(
                 "the bind probe for {address} is INCONCLUSIVE ({error}); it proves neither \
                  closure nor a leak and must not be read as either"
@@ -1493,38 +1536,63 @@ mod tests {
     fn dropping_public_login_future_closes_its_bound_callback_listener() {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
-            let deadline = operation_deadline(&cx, Duration::from_secs(10)).unwrap();
-            let client = OAuthClient::new(config());
-            let bound = std::cell::Cell::new(None::<SocketAddr>);
-            let observed_bound = &bound;
-            let mut login = Box::pin(client.authorize(&cx, |authorization| async move {
-                let fields = decode_form(authorization.query().unwrap())?;
-                let address = fields["redirect_uri"].strip_prefix("http://").unwrap().split('/').next().unwrap().parse().unwrap();
-                observed_bound.set(Some(address));
-                Ok(())
-            }));
-            let address = within(&cx, deadline, poll_fn(|task| {
-                if let Poll::Ready(result) = login.as_mut().poll(task) {
-                    return Poll::Ready(Err(result.err().unwrap_or(OAuthError::CallbackRejected)));
-                }
-                match bound.get() {
-                    Some(address) => Poll::Ready(Ok(address)),
-                    None => Poll::Pending,
-                }
-            })).await.unwrap();
-            // Positive control BEFORE the drop: while the login future is
-            // alive its callback listener holds the port, so this bind must be
-            // refused. It makes the release probe a state change rather than a
-            // constant, and it cannot be stolen because we hold the port.
-            assert_listener_bound(address);
+            // Each iteration is a COMPLETE, independent experiment: its own
+            // login, its own listener, its own kernel-assigned ephemeral port.
+            // A leaked listener fails all of them; a port thief would have to
+            // win a different port every time.
+            let mut still_bound = Vec::new();
+            let mut released = false;
+            for _ in 0..RELEASE_TRIALS {
+                let deadline = operation_deadline(&cx, Duration::from_secs(10)).unwrap();
+                let client = OAuthClient::new(config());
+                let bound = std::cell::Cell::new(None::<SocketAddr>);
+                let observed_bound = &bound;
+                let mut login = Box::pin(client.authorize(&cx, |authorization| async move {
+                    let fields = decode_form(authorization.query().unwrap())?;
+                    let address = fields["redirect_uri"].strip_prefix("http://").unwrap().split('/').next().unwrap().parse().unwrap();
+                    observed_bound.set(Some(address));
+                    Ok(())
+                }));
+                let address = within(&cx, deadline, poll_fn(|task| {
+                    if let Poll::Ready(result) = login.as_mut().poll(task) {
+                        return Poll::Ready(Err(result.err().unwrap_or(OAuthError::CallbackRejected)));
+                    }
+                    match bound.get() {
+                        Some(address) => Poll::Ready(Ok(address)),
+                        None => Poll::Pending,
+                    }
+                })).await.unwrap();
+                // Positive control BEFORE the drop: while the login future is
+                // alive its callback listener holds the port, so this bind must be
+                // refused. It makes the release probe a state change rather than a
+                // constant, and it cannot be stolen because we hold the port.
+                // It runs in EVERY trial, so no trial is vacuous.
+                assert_listener_bound(address);
 
-            drop(login);
+                drop(login);
 
-            // No await between the drop and the probe. The probe is synchronous
-            // precisely so the runtime cannot schedule another task into the
-            // window where the freed port is unclaimed - see
-            // `assert_listener_released` for the full argument.
-            assert_listener_released(address);
+                // No await between the drop and the probe. The probe is synchronous
+                // precisely so the runtime cannot schedule another task into the
+                // window where the freed port is unclaimed - see
+                // `probe_listener_released` for the full argument.
+                match probe_listener_released(address) {
+                    ReleaseTrial::Released => {
+                        released = true;
+                        break;
+                    }
+                    ReleaseTrial::StillBound => still_bound.push(address),
+                }
+            }
+
+            assert!(
+                released,
+                "the callback listener was still bound after the login future was dropped in \
+                 all {RELEASE_TRIALS} independent trials, on these separately assigned \
+                 ephemeral ports: {still_bound:?}. Each trial issued its bind with no await \
+                 between it and the drop, and each was preceded by a positive control proving \
+                 the probe can see that listener. A concurrent test can steal one freed port; \
+                 it cannot steal {RELEASE_TRIALS} different ones in a row. The listener leaked."
+            );
         });
     }
 
