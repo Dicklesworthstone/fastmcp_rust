@@ -1326,12 +1326,20 @@ impl<W: Write + Send> TransportSendHalf for StdioSendHalf<W> {
         self.reserve_send(cx)?.send(message)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.is_closed() {
             self.mark_closed();
             drop(self.writer.take());
             return Ok(());
         }
+        // Observe the caller's budget before the write-side commit, matching
+        // `StdioTransport::close`. The already-closed branch above runs first so
+        // a terminal half stays idempotent under cancellation: it performs no
+        // I/O and so has no budget to spend.
+        //
+        // The flush below is real blocking I/O on the owned write end. Refusing
+        // here leaves the half non-terminal and retryable rather than wedged.
+        stdio_checkpoint(cx)?;
         self.mark_closed();
         let Some(mut writer) = self.writer.take() else {
             return Ok(());

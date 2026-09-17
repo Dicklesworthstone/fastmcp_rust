@@ -24,7 +24,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use fastmcp_transport::{StdioTransport, Transport, TransportError};
+use fastmcp_transport::{StdioTransport, Transport, TransportError, TransportSendHalf};
 
 /// A writer that records the bytes it received and how often it was flushed.
 ///
@@ -175,6 +175,131 @@ fn stdio_close_stays_idempotent_under_a_cancelled_context() {
         .expect("closing an already-closed transport stays Ok under cancellation");
 
     assert!(transport.is_closed());
+    assert_eq!(
+        writer.flushes(),
+        1,
+        "the idempotent close performs no second flush"
+    );
+}
+
+// ===========================================================================
+// StdioSendHalf::close - the flush-on-take path on the owned write end.
+// ===========================================================================
+//
+// The send half is reached through the public `StdioTransport::into_split`, so
+// these remain external-consumer rows. Unlike `SseWriter`, `StdioSendHalf` is not
+// behind an opt-in feature, so this proof runs in a DEFAULT-feature gate.
+//
+// These rows prove BOTH limbs of the budget - cancellation and expiry - where the
+// `StdioTransport::close` rows above still prove only cancellation. Back-porting
+// the expiry limb to those rows is the next separate unit.
+
+/// A context whose deadline has already passed, with the cancellation bit never
+/// set. That is what makes the expiry row distinct from the cancellation row.
+fn expired_context() -> Cx {
+    Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(asupersync::Time::ZERO))
+}
+
+fn split_send_half(writer: CountingWriter) -> impl TransportSendHalf {
+    let (_receiver, sender) = StdioTransport::new(Cursor::new(Vec::new()), writer).into_split();
+    sender
+}
+
+/// Control: a live context commits and flushes the owned write end once.
+#[test]
+fn stdio_send_half_close_under_a_live_context_commits_and_flushes() {
+    let writer = CountingWriter::default();
+    let mut sender = split_send_half(writer.clone());
+
+    sender
+        .close(&Cx::for_testing())
+        .expect("a live caller context permits the write-side commit");
+
+    assert_eq!(
+        writer.flushes(),
+        1,
+        "the committed path flushes the owned write end exactly once"
+    );
+}
+
+/// Variable one: only the cancellation bit differs from the control.
+#[test]
+fn stdio_send_half_close_under_a_cancelled_context_refuses_before_the_flush() {
+    let writer = CountingWriter::default();
+    let mut sender = split_send_half(writer.clone());
+
+    let error = sender
+        .close(&cancelled_context())
+        .expect_err("a cancelled caller context must refuse the close");
+
+    assert!(
+        matches!(error, TransportError::Cancelled),
+        "cancellation maps to Cancelled, not an I/O error: {error:?}"
+    );
+    assert_eq!(writer.flushes(), 0, "a refused close performs no flush");
+}
+
+/// Variable two: no cancellation bit, only an exhausted deadline. This limb is
+/// reported as Timeout rather than Cancelled, and a guard that only read the
+/// cancellation flag would have flushed here.
+#[test]
+fn stdio_send_half_close_under_an_expired_deadline_refuses_as_timeout() {
+    let writer = CountingWriter::default();
+    let mut sender = split_send_half(writer.clone());
+
+    let error = sender
+        .close(&expired_context())
+        .expect_err("an expired caller budget must refuse the close");
+
+    assert!(
+        matches!(error, TransportError::Timeout),
+        "an exhausted deadline is reported distinctly from cancellation: {error:?}"
+    );
+    assert_eq!(
+        writer.flushes(),
+        0,
+        "an out-of-budget caller is not made to wait on the flush"
+    );
+}
+
+/// A refusal is retryable, not a wedge.
+#[test]
+fn stdio_send_half_close_refusal_leaves_the_half_closable() {
+    let writer = CountingWriter::default();
+    let mut sender = split_send_half(writer.clone());
+
+    sender
+        .close(&cancelled_context())
+        .expect_err("the cancelled attempt refuses");
+    assert_eq!(writer.flushes(), 0);
+
+    sender
+        .close(&Cx::for_testing())
+        .expect("a fresh budget still closes after a refusal");
+
+    assert_eq!(
+        writer.flushes(),
+        1,
+        "the retry performs the single flush the refusal skipped"
+    );
+}
+
+/// A terminal half performs no I/O, so it has no budget to spend and must stay
+/// Ok under cancellation.
+#[test]
+fn stdio_send_half_close_stays_idempotent_under_a_cancelled_context() {
+    let writer = CountingWriter::default();
+    let mut sender = split_send_half(writer.clone());
+
+    sender
+        .close(&Cx::for_testing())
+        .expect("the first close commits");
+    assert_eq!(writer.flushes(), 1);
+
+    sender
+        .close(&cancelled_context())
+        .expect("closing an already-closed half stays Ok under cancellation");
+
     assert_eq!(
         writer.flushes(),
         1,
