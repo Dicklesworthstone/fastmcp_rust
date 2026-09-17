@@ -578,6 +578,8 @@ struct WireObservations {
     b_lane_refusal: String,
     method_count: BTreeMap<String, usize>,
     legacy_get_count: usize,
+    uncertain_dispatch: LaneObservation,
+    deadline_race: LaneObservation,
 }
 
 impl WireObservations {
@@ -632,6 +634,135 @@ fn classification_plan(policy: ProtocolPolicy) -> ClientProtocolPlan {
         0,
     )
     .expect("the classification plan must be accepted for every policy")
+}
+
+/// What a single dedicated real-socket scenario observed.
+///
+/// `connections_after_return` is how the no-retry claim is made without any
+/// timing tolerance. A retry, if the client performed one, is issued *inside*
+/// the failing call, so by the time that call has returned its connection is
+/// already sitting in the listener's accept backlog. Draining the backlog after
+/// the call returns therefore observes a retry that happened, and cannot
+/// observe one that has not happened yet. No sleep, no deadline, no tolerance.
+#[derive(Debug, Clone)]
+struct LaneObservation {
+    outcome: String,
+    requests_during_call: usize,
+    connections_after_return: usize,
+    server_held_connection_open: bool,
+}
+
+/// Drives one request against a dedicated fixture whose behaviour after reading
+/// the POST is chosen by `stall_then_hold`.
+///
+/// `stall_then_hold == false`: the fixture reads the whole POST and closes
+/// without answering - the request certainly arrived, and the client cannot
+/// know whether it was dispatched (HTTP-03.16).
+///
+/// `stall_then_hold == true`: the fixture reads the whole POST and then holds
+/// the connection OPEN, sending nothing, until the driver releases it. The
+/// connection never breaks, so a timeout here is the deadline winning rather
+/// than a disconnect being misreported (HTTP-03.15).
+fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservation {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the lane fixture");
+    let address = listener.local_addr().expect("read the lane fixture address");
+    let target = format!("http://{address}/mcp-lane");
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (report_tx, report_rx) = mpsc::channel::<(usize, usize, bool)>();
+
+    let server = thread::spawn(move || {
+        let mut requests = 0_usize;
+
+        // 1. Answer the one-shot discovery probe normally so the connection
+        //    classifies modern before the lane under test is exercised.
+        let mut probe = accept_bounded(&listener);
+        let _probe_request = read_request(&mut probe);
+        write_bounded_response(
+            &mut probe,
+            200,
+            "application/json",
+            Some("identity"),
+            &discovery_body(1, "lane"),
+        );
+        drop(probe);
+
+        // 2. Read the request POST in full, then either close or hold.
+        let mut call = accept_bounded(&listener);
+        let _call_request = read_request(&mut call);
+        requests += 1;
+        let held = if stall_then_hold {
+            // Hold the socket open and send nothing. `call` stays alive across
+            // the wait, so the peer observes an open, silent connection.
+            release_rx.recv().expect("driver releases the stalled lane");
+            true
+        } else {
+            drop(call);
+            release_rx.recv().expect("driver reports the call returned");
+            false
+        };
+
+        // 3. Drain the accept backlog. Any retry is already queued (see
+        //    `LaneObservation`), so this is a drain, not a poll.
+        listener
+            .set_nonblocking(true)
+            .expect("set the lane listener nonblocking for the backlog drain");
+        let mut extra = 0_usize;
+        while let Ok((stream, _)) = listener.accept() {
+            extra += 1;
+            drop(stream);
+        }
+        report_tx
+            .send((requests, extra, held))
+            .expect("report lane observations");
+    });
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("the lane scenario owns its caller runtime");
+    let outcome = runtime.block_on(async {
+        let cx = Cx::current().expect("the caller runtime must install a current Cx");
+        let mut connection = ClientBuilder::new()
+            .client_info("http-03-integration-client", "1.0.0")
+            .protocol_plan(canonical_plan(
+                &target,
+                ProtocolPolicy::ModernOnly,
+                "security-partition-http-03-integration",
+            ))
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(idle_timeout, Duration::from_secs(20))
+                    .expect("the lane timeout policy must be valid")
+                    .reset_idle_on_matching_progress(true),
+            )
+            .connect_http_with_cx(&cx)
+            .await
+            .expect("the lane endpoint must connect through the public builder");
+
+        match connection
+            .request_json(
+                &cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(41),
+                65_536,
+            )
+            .await
+        {
+            Ok(response) => format!("unexpected-success id={:?}", response.id),
+            Err(error) => render_connection_error(&error),
+        }
+    });
+
+    release_tx.send(()).expect("release the lane fixture");
+    let (requests_during_call, connections_after_return, server_held_connection_open) =
+        report_rx.recv().expect("collect lane observations");
+    server.join().expect("the lane fixture thread must not panic");
+
+    LaneObservation {
+        outcome,
+        requests_during_call,
+        connections_after_return,
+        server_held_connection_open,
+    }
 }
 
 fn integration_builder(target: &str) -> ClientBuilder {
@@ -986,6 +1117,12 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         }
     }
 
+    // Two dedicated real-socket lanes. They are separate fixtures on purpose:
+    // each needs the server to misbehave in a specific way after reading the
+    // POST, which the shared A/B fixture above must not do.
+    let uncertain_dispatch = observe_lane(false, Duration::from_secs(5));
+    let deadline_race = observe_lane(true, Duration::from_millis(50));
+
     WireObservations {
         fixture_authority: authority,
         a_probe,
@@ -1010,6 +1147,8 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
         b_lane_refusal,
         method_count,
         legacy_get_count,
+        uncertain_dispatch,
+        deadline_race,
     }
 }
 
@@ -2230,11 +2369,82 @@ fn case_endpoint_instance_key_partition(builder: &mut CaseBuilder, wire: &WireOb
 /// HTTP-03.14 `caller-cancellation-response-close` (floor 5). UNPROVEN.
 fn case_caller_cancellation_close(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
 
-/// HTTP-03.15 `deadline-and-disconnect-races` (floor 4). UNPROVEN.
-fn case_deadline_and_disconnect_races(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+/// HTTP-03.15 `deadline-and-disconnect-races` (floor 4).
+///
+/// The discrimination B names is which of the two racing conditions actually
+/// fired. A stalled-but-OPEN connection is the only way to tell them apart: the
+/// socket never breaks, so a transport error here would mean the client
+/// misreported a deadline as a disconnect, and a timeout means the deadline
+/// genuinely won. `server_held_connection_open` is what makes that claim
+/// checkable rather than asserted.
+fn case_deadline_and_disconnect_races(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let lane = &wire.deadline_race;
+    assert!(
+        lane.server_held_connection_open,
+        "the deadline lane must hold its connection open, otherwise a timeout and a \
+         disconnect are indistinguishable and this case proves nothing"
+    );
+    builder.positive("deadline-connection-held-open", "true");
 
-/// HTTP-03.16 `uncertain-dispatch-no-retry` (floor 4). UNPROVEN.
-fn case_uncertain_dispatch_no_retry(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+    assert!(
+        lane.outcome.starts_with("executor::Timeout("),
+        "an armed idle deadline over an open, silent connection must surface a typed \
+         timeout; observed {}",
+        lane.outcome
+    );
+    builder.positive("deadline-outcome", &lane.outcome);
+
+    assert_eq!(
+        lane.requests_during_call, 1,
+        "the deadline lane must post exactly once"
+    );
+    builder.positive("deadline-requests", "1");
+
+    assert_eq!(
+        lane.connections_after_return, 0,
+        "a timed-out request must not be replayed; {} retry connection(s) were queued",
+        lane.connections_after_return
+    );
+    builder.positive("deadline-retry-connections", "0");
+}
+
+/// HTTP-03.16 `uncertain-dispatch-no-retry` (floor 4).
+///
+/// The fixture reads the whole POST and then closes without answering. The
+/// request certainly arrived; whether the server acted on it is unknowable to
+/// the client. A non-idempotent request in that state must NOT be replayed, and
+/// the outcome must stay a transport failure rather than being resolved into a
+/// decided refusal the client is not entitled to claim.
+fn case_uncertain_dispatch_no_retry(builder: &mut CaseBuilder, wire: &WireObservations) {
+    let lane = &wire.uncertain_dispatch;
+    assert_eq!(
+        lane.requests_during_call, 1,
+        "the uncertain-dispatch lane must post exactly once before the peer vanishes"
+    );
+    builder.positive("uncertain-requests", "1");
+
+    assert!(
+        !lane.outcome.starts_with("unexpected-success"),
+        "a request whose peer closed without answering cannot succeed; observed {}",
+        lane.outcome
+    );
+    builder.positive("uncertain-outcome", &lane.outcome);
+
+    assert!(
+        !lane.outcome.starts_with("executor::Timeout("),
+        "a peer that closed is a disconnect, not a deadline; reporting {} here would be \
+         the mirror of the HTTP-03.15 confusion",
+        lane.outcome
+    );
+    builder.positive("uncertain-not-a-deadline", "true");
+
+    assert_eq!(
+        lane.connections_after_return, 0,
+        "an uncertain dispatch must not be retried; {} retry connection(s) were queued",
+        lane.connections_after_return
+    );
+    builder.positive("uncertain-retry-connections", "0");
+}
 
 /// HTTP-03.23 `extension-activation-proof-notification` (floor 4). UNPROVEN.
 fn case_extension_activation_notification(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
