@@ -8,6 +8,8 @@
 
 /// Authenticated Tasks subscriptions, optionally composed with core filters.
 pub mod subscriptions;
+/// Bounded lifecycle polling with machine-owner and caller cancellation.
+pub mod driver;
 
 use std::fmt;
 use std::io::{self, Write};
