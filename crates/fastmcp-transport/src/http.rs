@@ -1126,11 +1126,29 @@ pub const MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Test-only resolver seam whose complete answer set is checked before any connection.
 ///
-/// Production fetchers own the cancel-safe native resolver. Tests use this seam
-/// to prove address fencing and cancellation without replacing the production
-/// resolver's custody guarantees.
-#[cfg(test)]
-trait GuardedHttpResolver: Send + Sync {
+/// The DNS seam every guarded fetch resolves through, production included.
+///
+/// SHIPPED PUBLIC SEAM (bd-ho7of, 2026-09-17). This was previously
+/// `#[cfg(test)]`, which made DNS-hook behavior unprovable through the public
+/// surface and left two resolution code paths where there should be one.
+/// `GuardedHttpFetcher` now holds an `Arc<dyn GuardedHttpResolver>` and both
+/// production and tests travel the same path.
+///
+/// CUSTODY IS NOT WIDENED BY THIS SEAM, and that is why it can be public.
+/// Answers returned here are not trusted: every address is fenced downstream
+/// by `guarded_select_address`, which canonicalizes it, rejects an empty set,
+/// rejects more than `MAX_GUARDED_RESOLVED_ADDRESSES`, and requires
+/// `is_public_guarded_ip`. TLS then verifies the certificate against the
+/// ORIGINAL request host, not against whatever address was returned. A
+/// supplied resolver can therefore choose only among addresses the fence
+/// already admits, and it cannot reach a private or loopback peer, cannot
+/// weaken WebPKI root custody, and cannot cause a certificate for another
+/// name to be accepted.
+///
+/// The lower wire seam (`GuardedHttpTestExchange`) and the loopback-authority
+/// escape remain `#[cfg(test)]` deliberately: those DO bypass the address
+/// fence and real TLS, so publishing them would widen a production bound.
+pub trait GuardedHttpResolver: Send + Sync {
     /// Resolve all IP answers for the supplied canonical DNS host.
     ///
     /// The future receives the fetch phase's child context and therefore must
@@ -1144,6 +1162,50 @@ trait GuardedHttpResolver: Send + Sync {
         cx: Cx,
         host: String,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>;
+}
+
+/// The production resolver: the cancel-safe native DNS resolver, reached
+/// through the same public seam any caller-supplied resolver uses.
+///
+/// This is the "thin wrapper" half of the one-code-path requirement. It adds
+/// only the two cancellation checkpoints the fetcher has always applied around
+/// a lookup; it changes no bound and no policy.
+pub struct NativeGuardedResolver {
+    inner: Arc<NativeDnsResolver>,
+}
+
+impl NativeGuardedResolver {
+    /// Wrap a configured native resolver.
+    #[must_use]
+    pub fn new(inner: Arc<NativeDnsResolver>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Debug for NativeGuardedResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NativeGuardedResolver").finish()
+    }
+}
+
+impl GuardedHttpResolver for NativeGuardedResolver {
+    fn resolve_all(
+        &self,
+        cx: Cx,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
+    {
+        let resolver = Arc::clone(&self.inner);
+        Box::pin(async move {
+            guarded_fetch_checkpoint(&cx)?;
+            let lookup = resolver
+                .lookup_ip(&host)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Resolution(error.to_string()))?;
+            guarded_fetch_checkpoint(&cx)?;
+            Ok(lookup.into_iter().collect())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1440,11 +1502,9 @@ impl std::error::Error for GuardedHttpFetchError {}
 
 /// A fresh-connection, WebPKI-rooted HTTPS fetcher with resolver-answer fencing.
 pub struct GuardedHttpFetcher {
-    resolver: Arc<NativeDnsResolver>,
+    resolver: Arc<dyn GuardedHttpResolver>,
     policy: GuardedHttpFetchPolicy,
     connector: TlsConnector,
-    #[cfg(test)]
-    test_resolver: Option<Arc<dyn GuardedHttpResolver>>,
     #[cfg(test)]
     test_loopback_authority: Option<SocketAddr>,
     #[cfg(test)]
@@ -1507,22 +1567,44 @@ impl GuardedHttpFetcher {
             .handshake_timeout(policy.tls_handshake_timeout)
             .build()
             .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
-        Ok(Self {
-            resolver: Arc::new(NativeDnsResolver::with_config(ResolverConfig {
+        let resolver = Arc::new(NativeGuardedResolver::new(Arc::new(
+            NativeDnsResolver::with_config(ResolverConfig {
                 timeout: policy.deadline,
                 retries: 0,
                 happy_eyeballs: false,
                 ..ResolverConfig::default()
-            })),
+            }),
+        )));
+        Ok(Self {
+            resolver,
             policy,
             connector,
-            #[cfg(test)]
-            test_resolver: None,
             #[cfg(test)]
             test_loopback_authority: None,
             #[cfg(test)]
             test_exchange: None,
         })
+    }
+
+    /// Build a fetcher that resolves through a caller-supplied resolver.
+    ///
+    /// SHIPPED PUBLIC SEAM (bd-ho7of). Every other guarantee is unchanged: the
+    /// supplied resolver's answers are fenced by `guarded_select_address`
+    /// exactly as the native resolver's are, so a resolver cannot reach a
+    /// private or loopback peer, cannot exceed
+    /// `MAX_GUARDED_RESOLVED_ADDRESSES`, and cannot return an empty set that
+    /// is then used. TLS still validates the certificate against the original
+    /// request host with WebPKI roots and early data disabled, so choosing a
+    /// different admitted address cannot cause a certificate for another name
+    /// to be accepted. This widens no production bound; it only makes the
+    /// resolution seam reachable, and it is the same seam production uses.
+    pub fn with_resolver(
+        policy: GuardedHttpFetchPolicy,
+        resolver: Arc<dyn GuardedHttpResolver>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let mut fetcher = Self::new(policy)?;
+        fetcher.resolver = resolver;
+        Ok(fetcher)
     }
 
     #[cfg(test)]
@@ -1531,8 +1613,11 @@ impl GuardedHttpFetcher {
         policy: GuardedHttpFetchPolicy,
         test_exchange: Arc<dyn GuardedHttpTestExchange>,
     ) -> Result<Self, GuardedHttpFetchError> {
-        let mut fetcher = Self::new(policy)?;
-        fetcher.test_resolver = Some(resolver);
+        // Thin wrapper over the shipped seam: resolution now goes through
+        // `with_resolver`, so there is no second resolution path. Only the
+        // lower wire exchange stays test-only, because it bypasses the address
+        // fence and real TLS.
+        let mut fetcher = Self::with_resolver(policy, resolver)?;
         fetcher.test_exchange = Some(test_exchange);
         Ok(fetcher)
     }
@@ -1562,12 +1647,13 @@ impl GuardedHttpFetcher {
             .build()
             .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
         Ok(Self {
-            resolver: Arc::new(NativeDnsResolver::new()),
+            // Uses the shipped seam like everything else; only the loopback
+            // authority escape below is test-only.
+            resolver: Arc::new(StaticGuardedResolverForLoopback {
+                address: loopback_authority.ip(),
+            }),
             policy,
             connector,
-            test_resolver: Some(Arc::new(StaticGuardedResolverForLoopback {
-                address: loopback_authority.ip(),
-            })),
             test_loopback_authority: Some(loopback_authority),
             test_exchange: None,
         })
@@ -1679,24 +1765,11 @@ impl GuardedHttpFetcher {
         deadline: asupersync::Time,
         host: String,
     ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
-        #[cfg(test)]
-        if let Some(resolver) = self.test_resolver.as_ref() {
-            let resolver = Arc::clone(resolver);
-            return guarded_await_phase(cx, deadline, move |phase_cx| {
-                resolver.resolve_all(phase_cx, host)
-            })
-            .await;
-        }
-
+        // ONE resolution path. Production and any caller-supplied resolver both
+        // arrive here, and both are fenced by `guarded_select_address` after.
         let resolver = Arc::clone(&self.resolver);
-        guarded_await_phase(cx, deadline, move |phase_cx| async move {
-            guarded_fetch_checkpoint(&phase_cx)?;
-            let lookup = resolver
-                .lookup_ip(&host)
-                .await
-                .map_err(|error| GuardedHttpFetchError::Resolution(error.to_string()))?;
-            guarded_fetch_checkpoint(&phase_cx)?;
-            Ok(lookup.into_iter().collect())
+        guarded_await_phase(cx, deadline, move |phase_cx| {
+            resolver.resolve_all(phase_cx, host)
         })
         .await
     }
