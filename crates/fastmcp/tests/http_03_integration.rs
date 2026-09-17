@@ -77,6 +77,19 @@ const MINIMUM_NEGATIVE_CASES: usize = 26;
 /// The manifest case whose single variable the planted-negative test changes.
 const PLANTED_CASE_ID: &str = "HTTP-03.11";
 
+/// The clock regime this join runs under (PL-5 records clocks).
+///
+/// These are the single source for both the shipped `RequestTimeoutPolicy` the
+/// join installs AND the value the receipt reports, so the recorded regime
+/// cannot drift from the one actually executed. They are DECLARED bounds, not
+/// measured elapsed time: a declared limit is stable across runs, whereas a
+/// measurement would differ between the accepted and planted passes and break
+/// the byte-for-byte case equality `http_03_i_planted_negative` depends on.
+const JOIN_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const JOIN_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The idle bound HTTP-03.15 arms against a held-open, silent peer.
+const DEADLINE_LANE_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Bound used for every manifest digest recomputation.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
@@ -768,7 +781,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
                 "security-partition-http-03-integration",
             ))
             .request_timeout_policy(
-                RequestTimeoutPolicy::new(idle_timeout, Duration::from_secs(20))
+                RequestTimeoutPolicy::new(idle_timeout, JOIN_ABSOLUTE_TIMEOUT)
                     .expect("the lane timeout policy must be valid")
                     .reset_idle_on_matching_progress(true),
             )
@@ -1256,7 +1269,7 @@ fn integration_builder(target: &str) -> ClientBuilder {
             "security-partition-http-03-integration",
         ))
         .request_timeout_policy(
-            RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(20))
+            RequestTimeoutPolicy::new(JOIN_IDLE_TIMEOUT, JOIN_ABSOLUTE_TIMEOUT)
                 .expect("integration request timeout policy must be valid")
                 .reset_idle_on_matching_progress(true),
         )
@@ -1603,7 +1616,7 @@ fn run_fixture(plant_case_11: bool) -> WireObservations {
     // each needs the server to misbehave in a specific way after reading the
     // POST, which the shared A/B fixture above must not do.
     let uncertain_dispatch = observe_lane(false, Duration::from_secs(5));
-    let deadline_race = observe_lane(true, Duration::from_millis(50));
+    let deadline_race = observe_lane(true, DEADLINE_LANE_IDLE_TIMEOUT);
     let caller_cancellation = observe_caller_cancellation();
     let independent_server_request = observe_independent_server_request();
     let extension_notification = observe_extension_notification();
@@ -1699,6 +1712,7 @@ impl CaseBuilder {
 #[derive(Debug, Clone)]
 struct JoinReceipt {
     joined_entrypoint: String,
+    clock_regime: String,
     producer_a_revision: String,
     producer_a_tree: String,
     producer_a_entrypoint: String,
@@ -1735,10 +1749,11 @@ impl JoinReceipt {
         format!(
             "HTTP-03 join executed {} ordered cases: {positive} positive + {negative} \
              negative = {} observations against {floors} declared floor-observations \
-             (entrypoint {})",
+             (entrypoint {}; clocks: {})",
             self.cases.len(),
             positive + negative,
             self.joined_entrypoint,
+            self.clock_regime,
         )
     }
 
@@ -1902,6 +1917,13 @@ fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
 
     JoinReceipt {
         joined_entrypoint: JOINED_PUBLIC_ENTRYPOINT.to_owned(),
+        clock_regime: format!(
+            "join idle={}ms absolute={}ms reset_idle_on_matching_progress=true; \
+             deadline-lane idle={}ms",
+            JOIN_IDLE_TIMEOUT.as_millis(),
+            JOIN_ABSOLUTE_TIMEOUT.as_millis(),
+            DEADLINE_LANE_IDLE_TIMEOUT.as_millis(),
+        ),
         producer_a_revision: manifest.a.producer_revision.clone(),
         producer_a_tree: manifest.a.producer_tree.clone(),
         producer_a_entrypoint: manifest.a.entrypoint.clone(),
@@ -3206,6 +3228,18 @@ fn http_03_i_positive() {
 
     // Manifest half: the join consumed both producer inputs and their digests.
     assert_eq!(receipt.cases.len(), LAST_CASE_ORDINAL);
+    // PL-5 clocks: the regime is RECORDED, deliberately not re-asserted here.
+    //
+    // An assertion comparing `receipt.clock_regime` against a string rebuilt
+    // from the same constants cannot fail - both sides read
+    // JOIN_IDLE_TIMEOUT and friends - so it would be ceremony, not evidence.
+    // Drift is prevented structurally instead: those constants are the single
+    // source for both the RequestTimeoutPolicy the join installs and the string
+    // the receipt reports, so there is no second place to forget to update.
+    //
+    // The behavioural proof that the recorded regime is the one in force lives
+    // in HTTP-03.15, which only reaches `executor::Timeout(Idle)` if the armed
+    // idle bound genuinely expires against a held-open, silent peer.
     assert_eq!(receipt.a_digest.len(), 64);
     assert_eq!(receipt.b_digest.len(), 64);
     assert_ne!(receipt.a_digest, receipt.b_digest);
