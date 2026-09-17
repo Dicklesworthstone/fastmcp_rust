@@ -1507,6 +1507,49 @@ pub const PRT_04_A_EVALUATOR_MANIFEST_V1: &str = concat!(
     "PRT-04.09 foreign-composition-names-inert floor=3\n",
 );
 
+/// The canonical `prt_04_evaluator_manifest_v1` rows owned by PRT-04
+/// implementation B: ordered cases `PRT-04.10` through `PRT-04.18`.
+///
+/// Same contract as the A half: LF-canonical, LF-terminated, no CR, no blank
+/// line, no trailing whitespace, four header rows binding the producer
+/// revision, the producer tree, and the shipped public entrypoint, then one
+/// `<id> <name> floor=<N>` row per case. The ordinals continue the A half
+/// without gap or overlap and the case names are unique across both halves, so
+/// the integration join can check that the ordered union is contiguous.
+///
+/// The `A` half (`PRT-04.01`..`PRT-04.09`) is owned by the PRT-04 A slice and
+/// is deliberately not declared here.
+pub const PRT_04_B_EVALUATOR_MANIFEST_V1: &str = concat!(
+    "PRT-04-B evaluator manifest v1\n",
+    "producer-revision 7d078d2cbd277fb763a40cd7350722dcfceeca68\n",
+    "producer-tree 2510ce26ee519d056daacb1f8c1bddbd0e5cd317\n",
+    "entrypoint fastmcp_protocol::decode_typed_complete\n",
+    "PRT-04.10 typed-known-member-selection floor=2\n",
+    "PRT-04.11 unknown-preserved-through-typed-decode floor=6\n",
+    "PRT-04.12 typed-reencode-byte-faithful floor=2\n",
+    "PRT-04.13 invalid-known-member-not-smuggled-into-extras floor=3\n",
+    "PRT-04.14 undeclared-name-unconsumable floor=2\n",
+    "PRT-04.15 payload-declaration-collision-refused floor=3\n",
+    "PRT-04.16 wrong-core-composition-refused floor=2\n",
+    "PRT-04.17 local-extra-collision-refused floor=3\n",
+    "PRT-04.18 absent-meta-and-server-info-valid floor=3\n",
+);
+
+/// Returns the canonical PRT-04 B evaluator manifest digest.
+///
+/// The digest binds the exact published bytes of
+/// [`PRT_04_B_EVALUATOR_MANIFEST_V1`]. An integrating consumer recomputes it
+/// over those same bytes, so a digest that no longer reproduces means the
+/// published rows and the digest have drifted apart.
+#[must_use]
+pub fn prt_04_b_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        PRT_04_B_EVALUATOR_MANIFEST_V1.as_bytes(),
+        MAX_PRT_04_MANIFEST_BYTES,
+    )
+    .expect("the fixed PRT-04 B manifest is within its exact byte bound")
+}
+
 /// Returns the canonical PRT-04 A evaluator manifest digest.
 ///
 /// The digest binds the exact published bytes of
