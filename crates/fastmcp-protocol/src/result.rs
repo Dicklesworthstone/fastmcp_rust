@@ -937,6 +937,126 @@ fn cache_ttl_runtime_millis(lexeme: &str) -> Result<u64, CacheTtlConversionError
         .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)
 }
 
+/// Why a peer's required cache TTL carried no usable value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerCacheTtlDeviation {
+    /// The peer sent a mathematically negative JSON integer.
+    Negative,
+    /// The peer omitted the required member entirely.
+    Missing,
+}
+
+/// A peer-supplied `ttlMs` on a result family that requires cache hints.
+///
+/// This is the tolerant *ingestion* type and has no server-side counterpart.
+/// Safe modern constructors and every FastMCP server emission require a
+/// nonnegative [`CacheTtl`]; that strictness is not relaxed here. What this
+/// type adds is an explicit place to put two documented peer deviations —
+/// the dated caching prose says a client SHOULD treat a received negative TTL
+/// as zero and SHOULD assume zero when an older server omits the field, while
+/// the generated schema requires a nonnegative value.
+///
+/// Both deviations land in [`Self::ImmediatelyStale`], carry a bounded
+/// conformance diagnostic, and grant exactly zero freshness. Crucially there
+/// is deliberately **no** conversion from `ImmediatelyStale` into a
+/// [`CacheTtl`]: a tolerated deviation can never re-enter the system as a
+/// valid server-constructible TTL, so it cannot cause cache reuse.
+///
+/// Fractional, nonnumeric, explicit-null and overflowing values are *not*
+/// tolerated deviations — they remain protocol errors. This rule covers
+/// final-core cache hints only; TASK-01 still rejects a missing required Task
+/// TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerCacheTtl {
+    /// A conforming nonnegative peer TTL.
+    Conforming(CacheTtl),
+    /// A tolerated deviation with exactly zero freshness.
+    ImmediatelyStale {
+        /// Which documented deviation was tolerated.
+        reason: PeerCacheTtlDeviation,
+    },
+}
+
+impl PeerCacheTtl {
+    /// Returns the usable TTL, and only when the peer actually conformed.
+    ///
+    /// This is the sole accessor that can yield a [`CacheTtl`]. A tolerated
+    /// deviation returns `None` here by construction, which is what keeps it
+    /// out of every server-constructible path.
+    #[must_use]
+    pub const fn conforming(&self) -> Option<&CacheTtl> {
+        match self {
+            Self::Conforming(ttl) => Some(ttl),
+            Self::ImmediatelyStale { .. } => None,
+        }
+    }
+
+    /// Returns the tolerated deviation, if this value is one.
+    #[must_use]
+    pub const fn deviation(&self) -> Option<PeerCacheTtlDeviation> {
+        match self {
+            Self::Conforming(_) => None,
+            Self::ImmediatelyStale { reason } => Some(*reason),
+        }
+    }
+
+    /// Returns the freshness this TTL grants, in milliseconds.
+    ///
+    /// A tolerated deviation grants exactly zero, so an entry admitted under
+    /// one is already stale and can never be served from cache.
+    pub fn freshness_millis(&self) -> Result<u64, CacheTtlConversionError> {
+        match self {
+            Self::Conforming(ttl) => ttl.try_as_millis(),
+            Self::ImmediatelyStale { .. } => Ok(0),
+        }
+    }
+}
+
+/// Decodes one peer `ttlMs` for a result family that requires cache hints.
+///
+/// Pass the member as admitted, using `None` for an absent member and
+/// `Some(&ExactJsonValue::Null)` for an explicit null — the two are different
+/// facts on the wire and are answered differently here: absence is a tolerated
+/// earlier-era deviation, explicit null is a protocol error.
+pub fn decode_peer_cache_ttl(
+    member: Option<&ExactJsonValue>,
+) -> Result<(PeerCacheTtl, Option<ResultPeerDiagnostic>), ResultDecodeError> {
+    let invalid = || ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$.ttlMs");
+    let Some(value) = member else {
+        return Ok((
+            PeerCacheTtl::ImmediatelyStale {
+                reason: PeerCacheTtlDeviation::Missing,
+            },
+            Some(ResultPeerDiagnostic::PeerMissingCacheTtl),
+        ));
+    };
+    // Explicit null, booleans, strings, arrays and objects are nonconforming
+    // in a way the dated prose never blessed; only a JSON number continues.
+    let ExactJsonValue::Number(lexeme) = value else {
+        return Err(invalid());
+    };
+    let number: serde_json::Number = serde_json::from_str(lexeme).map_err(|_| invalid())?;
+    // Rejects a fractional value while accepting integral spellings such as
+    // `6e4`, matching how every other final integer member is admitted.
+    let integer = JsonInteger::try_from_number(number).map_err(|_| invalid())?;
+    match CacheTtl::try_from(integer) {
+        Ok(ttl) => {
+            // An overflowing value is a protocol error, not a tolerated
+            // deviation: nothing in the dated prose licenses assuming zero for
+            // a TTL the peer genuinely meant.
+            ttl.try_as_millis().map_err(|_| invalid())?;
+            Ok((PeerCacheTtl::Conforming(ttl), None))
+        }
+        Err(CacheTtlConversionError::Negative) => Ok((
+            PeerCacheTtl::ImmediatelyStale {
+                reason: PeerCacheTtlDeviation::Negative,
+            },
+            Some(ResultPeerDiagnostic::PeerNegativeCacheTtl),
+        )),
+        Err(CacheTtlConversionError::RuntimeOutOfRange) => Err(invalid()),
+    }
+}
+
 /// Peer cache scope. `Public` is a wire value, not an authority grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheScope {
@@ -1086,6 +1206,14 @@ pub enum ResultPeerDiagnostic {
     /// compatibility rule, but locally authored modern results always emit the
     /// discriminator explicitly.
     ModernMissingResultType,
+    /// A peer sent a mathematically negative `ttlMs` on a result family that
+    /// requires cache hints. The dated caching prose says a client SHOULD
+    /// treat it as zero; the generated schema requires a nonnegative value, so
+    /// the deviation is recorded rather than silently normalised.
+    PeerNegativeCacheTtl,
+    /// An earlier-era peer omitted a required `ttlMs` entirely. The dated
+    /// prose says a client SHOULD assume zero.
+    PeerMissingCacheTtl,
 }
 
 /// Core or deferred result decoded from a peer envelope.
