@@ -913,11 +913,23 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
         self.recv_with_completion(cx).map(|(message, _)| message)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             drop(self.writer.take());
             return Ok(());
         }
+        // The caller's budget is observed BEFORE the write-side commit, which is
+        // the contract `close_and_reap_child` already states above: cancellation
+        // before that commit leaves the transport untouched, so the caller may
+        // retry or escalate. Placing it here rather than at the top of the
+        // function is deliberate - an already-closed transport performs no I/O,
+        // and an idempotent close must not begin failing merely because the
+        // request that once owned it was cancelled.
+        //
+        // This is the first close in the workspace to CONSUME the budget rather
+        // than forward it. `flush()` below is real blocking I/O on a pipe that
+        // a cancelled caller should not be made to wait for.
+        stdio_checkpoint(cx)?;
         self.closed = true;
         let Some(mut writer) = self.writer.take() else {
             return Ok(());
