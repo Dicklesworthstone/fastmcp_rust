@@ -66,6 +66,11 @@ impl Default for ManagedCoreLimits {
 }
 
 impl ManagedCoreLimits {
+    pub(crate) fn request_bytes(self) -> usize { self.request_bytes }
+    pub(crate) fn frame_bytes(self) -> usize { self.frame_bytes }
+    pub(crate) fn total_bytes(self) -> usize { self.total_bytes }
+    pub(crate) fn timeout(self) -> Duration { self.timeout }
+
     /// A notification limit of zero intentionally requires a terminal-only
     /// response. The deadline includes credential acquisition, HTTP headers,
     /// all body reads, and time spent by the caller between successive reads.
@@ -284,7 +289,7 @@ impl ManagedCoreCall {
     }
 }
 
-struct CoreDecoder {
+pub(crate) struct CoreDecoder {
     request: CoreRequest,
     request_id: RequestId,
     progress_marker: Option<ProgressMarker>,
@@ -318,9 +323,6 @@ fn prepare(
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
-    let progress_marker = metadata.get("progressToken").map(|value| {
-        serde_json::from_value(value.clone()).map_err(|_| ManagedCoreError::InvalidRequest)
-    }).transpose()?;
     let name = if matches!(request.method(), "tools/call" | "prompts/get") {
         params.get("name").and_then(serde_json::Value::as_str).map(str::to_owned)
     } else { None };
@@ -331,13 +333,61 @@ fn prepare(
     serde_json::to_writer(&mut encoded, &envelope).map_err(|_| ManagedCoreError::RequestTooLarge)?;
     let wire = ModernHttpRequest::new(target, encoded.bytes, FINAL_PROTOCOL_VERSION, request.method(), name)
         .map_err(|_| ManagedCoreError::InvalidRequest)?;
-    Ok((wire, CoreDecoder {
-        request, request_id, progress_marker, last_progress: None, limits, bytes: 0, notifications: 0,
-    }))
+    Ok((wire, CoreDecoder::for_request(request, request_id, limits)?))
 }
 
 impl CoreDecoder {
-    fn admit(&mut self, frame: &[u8], allow_notification: bool) -> Result<ManagedCoreEvent, ManagedCoreError> {
+    // Profile negotiation belongs to the authenticated dispatch owner. This
+    // constructor shares only the core method/result/notification contract;
+    // an auth extension stamp never activates Tasks or any other result family.
+    pub(crate) fn for_request(
+        request: CoreRequest,
+        request_id: RequestId,
+        limits: ManagedCoreLimits,
+    ) -> Result<Self, ManagedCoreError> {
+        if request.era() != ProtocolEra::Modern2026 || !matches!(request.method(),
+            "server/discover" | "tools/list" | "tools/call" | "resources/list"
+            | "resources/templates/list" | "resources/read" | "prompts/list"
+            | "prompts/get" | "completion/complete"
+        ) {
+            return Err(ManagedCoreError::UnsupportedRequest);
+        }
+        request_id.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let params = request.encode_params().map_err(|_| ManagedCoreError::InvalidRequest)?
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        let metadata = params.get("_meta").and_then(serde_json::Value::as_object)
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        let progress_marker = metadata.get("progressToken").map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| ManagedCoreError::InvalidRequest)
+        }).transpose()?;
+        Ok(Self {
+            request, request_id, progress_marker, last_progress: None, limits,
+            bytes: 0, notifications: 0,
+        })
+    }
+
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        (self.bytes, self.notifications)
+    }
+
+    // Only a fresh round decoder can inherit an interaction's cumulative work.
+    // A previously active decoder must never have its counters rewound.
+    pub(crate) fn resume_usage(&mut self, bytes: usize, notifications: usize) -> Result<(), ManagedCoreError> {
+        if self.bytes != 0 || self.notifications != 0 {
+            return Err(ManagedCoreError::InvalidResponse);
+        }
+        if bytes >= self.limits.total_bytes {
+            return Err(ManagedCoreError::ResponseByteLimit);
+        }
+        if notifications > self.limits.notifications {
+            return Err(ManagedCoreError::NotificationLimit);
+        }
+        self.bytes = bytes;
+        self.notifications = notifications;
+        Ok(())
+    }
+
+    pub(crate) fn admit(&mut self, frame: &[u8], allow_notification: bool) -> Result<ManagedCoreEvent, ManagedCoreError> {
         if frame.len() > self.limits.frame_bytes
             || frame.len() > self.limits.total_bytes.saturating_sub(self.bytes)
         {

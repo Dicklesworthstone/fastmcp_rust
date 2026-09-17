@@ -54,6 +54,8 @@ impl Default for ManagedInteractionLimits {
 }
 
 impl ManagedInteractionLimits {
+    pub(crate) fn core(self) -> ManagedCoreLimits { self.core }
+
     /// Zero continuations explicitly requires completion on the first POST.
     /// A zero input budget still permits bounded, explicitly resumed state-only
     /// rounds. Hard ceilings bound the retained ID ledger and input work.
@@ -406,7 +408,7 @@ impl ManagedInteraction {
     }
 }
 
-fn validate_initial(request: &CoreRequest) -> Result<(), ManagedInteractionError> {
+pub(crate) fn validate_initial(request: &CoreRequest) -> Result<(), ManagedInteractionError> {
     let initial = match request {
         CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) => {
             params.input_responses.is_none() && params.request_state.is_none()
@@ -422,7 +424,7 @@ fn validate_initial(request: &CoreRequest) -> Result<(), ManagedInteractionError
     if initial { Ok(()) } else { Err(ManagedInteractionError::InvalidInitialRequest) }
 }
 
-fn input_required(result: &CoreResult) -> Option<&InputRequiredResult> {
+pub(crate) fn input_required(result: &CoreResult) -> Option<&InputRequiredResult> {
     match result {
         CoreResult::Final(
             FinalCoreResult::ToolsCallInputRequired { result, .. }
@@ -433,7 +435,7 @@ fn input_required(result: &CoreResult) -> Option<&InputRequiredResult> {
     }
 }
 
-fn admit_fresh_id(previous: &[RequestId], next: &RequestId) -> Result<(), ManagedInteractionError> {
+pub(crate) fn admit_fresh_id(previous: &[RequestId], next: &RequestId) -> Result<(), ManagedInteractionError> {
     next.validate().map_err(|_| ManagedCoreError::InvalidRequest)?;
     if previous.iter().any(|id| id.correlates_with(next)) {
         return Err(ManagedInteractionError::RepeatedRequestId);
@@ -441,7 +443,7 @@ fn admit_fresh_id(previous: &[RequestId], next: &RequestId) -> Result<(), Manage
     Ok(())
 }
 
-fn admit_challenge(
+pub(crate) fn admit_challenge(
     original: &CoreRequest,
     input: &InputRequiredResult,
     limits: ManagedInteractionLimits,
@@ -484,7 +486,7 @@ fn admit_challenge(
     Ok(())
 }
 
-fn continuation_request(
+pub(crate) fn continuation_request(
     original: &CoreRequest,
     input: &InputRequiredResult,
     responses: Option<FinalInputResponses>,
