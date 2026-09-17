@@ -11,12 +11,15 @@
 //! database, Agent Mail reservations, the worktree, or Git state.
 
 pub mod authority;
+pub mod b_eval;
 pub mod corpus;
 pub mod diagnostics;
 pub mod digest;
 pub mod fingerprint;
 pub mod manifest;
 pub mod plan;
+pub mod policy;
+pub mod projection;
 pub mod reservations;
 pub mod sources;
 pub mod trace;

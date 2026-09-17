@@ -98,6 +98,12 @@ pub enum Code {
     ReservationDeclarationMismatch,
     /// Lease coverage lapsed between claim and close.
     ReservationRenewalGap,
+    /// Plan package identifiers and tracker labels are not the same set.
+    PackageLabelMapping,
+    /// A workspace membership, publish, alias, or unsafe-code invariant fails.
+    WorkspacePolicy,
+    /// The checker is not decomposed into bounded, independently tested modules.
+    ModuleInventory,
 }
 
 impl Code {
@@ -144,6 +150,9 @@ impl Code {
             Self::ReservationPathTooBroad => "E_FND02_RESERVATION_PATH_TOO_BROAD",
             Self::ReservationDeclarationMismatch => "E_FND02_RESERVATION_DECLARATION_MISMATCH",
             Self::ReservationRenewalGap => "E_FND02_RESERVATION_RENEWAL_GAP",
+            Self::PackageLabelMapping => "E_FND02_PACKAGE_LABEL_MAPPING",
+            Self::WorkspacePolicy => "E_FND02_WORKSPACE_POLICY",
+            Self::ModuleInventory => "E_FND02_MODULE_INVENTORY",
         }
     }
 }
@@ -300,6 +309,9 @@ mod tests {
             Code::ReservationPathTooBroad,
             Code::ReservationDeclarationMismatch,
             Code::ReservationRenewalGap,
+            Code::PackageLabelMapping,
+            Code::WorkspacePolicy,
+            Code::ModuleInventory,
         ];
         let mut rendered: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
         let count = rendered.len();
