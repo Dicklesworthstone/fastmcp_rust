@@ -46,7 +46,7 @@ enum Case {
     Complete, Renew, WrongIssuer, WrongEndpoint, UnsupportedAuth, BadToken,
     TokenRedirect, LostGrant, Negotiation, LostMutation, DeniedMutation,
     Preflight, CancelGrant, CloseGrant, DropGrant, TimeoutGrant,
-    Streaming, CancelRead, CloseRead, DropRead, ExpireRead, DropOwner,
+    Streaming, CancelRead, CloseRead, DropRead, ExpireRead, DropOwner, InputRequired,
 }
 
 struct RootFile(std::path::PathBuf);
@@ -447,6 +447,18 @@ fn run(case: Case) {
                     assert!(bearer.authorization_for_target(&resource).is_none());
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1); peer.quiet(); return;
                 }
+                Case::InputRequired => {
+                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    let challenge=r#"{"resultType":"input_required","requestState":"opaque-state","x-exact":1.20e+4}"#;
+                    let ((),response)=pair(peer.operation(1,"tools/call","access-one",challenge),
+                        client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2))).await;
+                    let result=response.unwrap().read_json_result(&cx,4096).await.unwrap();
+                    assert!(matches!(&result,CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { .. })));
+                    let encoded=result.encode().unwrap();
+                    assert!(encoded.contains("opaque-state") && encoded.contains("1.20e+4"));
+                    assert_eq!(peer.rpcs.load(Ordering::SeqCst),2,"input-required is not an implicit continuation or browser trigger");
+                    assert_eq!(peer.grants.load(Ordering::SeqCst),1);
+                }
                 Case::WrongIssuer|Case::WrongEndpoint|Case::UnsupportedAuth => unreachable!(),
             }
             assert!(cx.checkpoint().is_ok(),"local interruption does not cancel the caller context");
@@ -501,3 +513,5 @@ fn abandoned_sse_read_drops_its_socket() { isolated("abandoned_sse_read_drops_it
 fn live_service_response_cannot_outlive_its_opening_token() { isolated("live_service_response_cannot_outlive_its_opening_token",Case::ExpireRead); }
 #[test]
 fn dropping_last_client_owner_revokes_previously_issued_snapshots() { isolated("dropping_last_client_owner_revokes_previously_issued_snapshots",Case::DropOwner); }
+#[test]
+fn machine_call_input_required_is_typed_without_automatic_resubmission() { isolated("machine_call_input_required_is_typed_without_automatic_resubmission",Case::InputRequired); }
