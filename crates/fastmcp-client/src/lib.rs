@@ -32388,6 +32388,26 @@ exec sleep 6
                 let params = if callback { serde_json::json!({}) } else { serde_json::json!({"payload": "x".repeat(2 * 1024 * 1024)}) };
                 let started = Instant::now();
                 let result = client.request_with_cx(&cx, "test/large", Some(params)).await;
+                // KNOWN LOAD-DEPENDENT SITE — deliberately retained, not overlooked.
+                // This is an UPPER bound on real wall time, so it is unsound in the
+                // usual way: it asserts the host was fast enough. It is kept because
+                // the property is REAL and nothing else covers it — the peer script
+                // ends in `exec sleep 6`, so "the commit finished before the
+                // nonreading peer exited" is an ordering fact about an external `sh`
+                // process whose exit this test cannot currently observe. Removing it
+                // would lose the only check on that ordering; replacing it needs the
+                // peer to signal its exit observably, which is a change to the script
+                // contract rather than to this assertion.
+                //
+                // OPEN QUESTION for whoever owns this test, flagged not resolved:
+                // the `!drains` branch below EXPECTS a timeout ("timed out"), and the
+                // client is built with RequestTimeoutPolicy::new(4s, 4s). A 4s policy
+                // firing from this same `started` point would make elapsed >= 4s and
+                // fail this bound, so either the refusal arrives by a faster path than
+                // the 4s policy, or this bound is tighter than the branch it guards.
+                // That should be established before anyone tunes or removes it.
+                //
+                // No virtual clock is reachable here to fix the mechanism properly.
                 assert!(started.elapsed() < Duration::from_secs(4), "commit must finish before the nonreading peer exits");
                 assert_eq!(calls.load(Ordering::SeqCst), usize::from(callback));
                 if drains {
