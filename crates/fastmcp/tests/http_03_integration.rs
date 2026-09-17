@@ -1139,19 +1139,19 @@ const PREDICATE_SUBJECTS: &[(&str, &str)] = &[
     ("HTTP-03.11", "response-content-encoding"),
     ("HTTP-03.12", "bounded-sse-parse"),
     ("HTTP-03.13", "terminal-outcome-and-stream-close"),
-    ("HTTP-03.14", "one-shot-discover-probe"),
-    ("HTTP-03.15", "modern-era-selection"),
-    ("HTTP-03.16", "discovery-frame-per-instance"),
-    ("HTTP-03.17", "bearer-bound-https-target"),
-    ("HTTP-03.18", "bearer-not-forwarded-cross-target"),
-    ("HTTP-03.19", "bearer-never-cleartext"),
-    ("HTTP-03.20", "bearer-token-bytes"),
-    ("HTTP-03.21", "credential-redaction"),
-    ("HTTP-03.22", "redirect-rejected-no-replay"),
-    ("HTTP-03.23", "endpoint-instance-partition"),
-    ("HTTP-03.24", "security-partition-identity"),
-    ("HTTP-03.25", "configuration-generation-identity"),
-    ("HTTP-03.26", "no-downgrade-status-body-matrix"),
+    ("HTTP-03.14", "caller-cancellation-response-close"),
+    ("HTTP-03.15", "deadline-and-disconnect-races"),
+    ("HTTP-03.16", "uncertain-dispatch-no-retry"),
+    ("HTTP-03.17", "authorization-redaction"),
+    ("HTTP-03.18", "https-only-bearer-attachment"),
+    ("HTTP-03.19", "redirect-no-follow-no-replay"),
+    ("HTTP-03.20", "discover-preclassification-frame"),
+    ("HTTP-03.21", "fresh-probe-identity-after-authorization"),
+    ("HTTP-03.22", "endpoint-instance-key-partition"),
+    ("HTTP-03.23", "extension-activation-proof-notification"),
+    ("HTTP-03.24", "independent-server-request-rejection"),
+    ("HTTP-03.25", "no-event-id-retry-resumption-state"),
+    ("HTTP-03.26", "modern-observation-table-and-no-downgrade"),
 ];
 
 /// Refuses to evaluate a case whose producer-declared name does not match the
@@ -1199,18 +1199,20 @@ fn evaluate_join(plant_case_11: bool) -> JoinReceipt {
             "HTTP-03.11" => case_content_encoding(&mut builder, &wire, plant_case_11),
             "HTTP-03.12" => case_bounded_sse_parse(&mut builder, &wire),
             "HTTP-03.13" => case_terminal_and_close(&mut builder, &wire),
-            "HTTP-03.14" => case_one_shot_probe(&mut builder, &wire),
-            "HTTP-03.15" => case_modern_era_selection(&mut builder, &wire),
-            "HTTP-03.16" => case_discovery_frames(&mut builder, &wire),
-            "HTTP-03.17" => case_bearer_bound_target(&mut builder),
-            "HTTP-03.18" => case_bearer_not_forwarded(&mut builder),
-            "HTTP-03.19" => case_bearer_never_cleartext(&mut builder),
-            "HTTP-03.20" => case_bearer_token_bytes(&mut builder),
-            "HTTP-03.21" => case_credential_redaction(&mut builder, &wire),
-            "HTTP-03.22" => case_redirects_rejected(&mut builder),
-            "HTTP-03.23" => case_endpoint_instance_partition(&mut builder, &wire),
-            "HTTP-03.24" => case_security_partition(&mut builder, &wire),
-            "HTTP-03.25" => case_configuration_generation(&mut builder, &wire),
+            // --- B half. Each arm is keyed to the subject B DECLARES for that
+            // --- ordinal, not to the subject this join used to assume.
+            "HTTP-03.14" => case_caller_cancellation_close(&mut builder, &wire),
+            "HTTP-03.15" => case_deadline_and_disconnect_races(&mut builder, &wire),
+            "HTTP-03.16" => case_uncertain_dispatch_no_retry(&mut builder, &wire),
+            "HTTP-03.17" => case_authorization_redaction(&mut builder, &wire),
+            "HTTP-03.18" => case_https_only_bearer_attachment(&mut builder),
+            "HTTP-03.19" => case_redirect_no_follow_no_replay(&mut builder),
+            "HTTP-03.20" => case_discover_preclassification_frame(&mut builder, &wire),
+            "HTTP-03.21" => case_fresh_probe_identity_after_authorization(&mut builder, &wire),
+            "HTTP-03.22" => case_endpoint_instance_key_partition(&mut builder, &wire),
+            "HTTP-03.23" => case_extension_activation_notification(&mut builder, &wire),
+            "HTTP-03.24" => case_independent_server_request_rejection(&mut builder, &wire),
+            "HTTP-03.25" => case_no_event_id_retry_resumption(&mut builder, &wire),
             "HTTP-03.26" => case_no_downgrade_matrix(&mut builder, &matrix),
             other => panic!("the joined evaluator has no registered predicate for {other}"),
         }
@@ -2138,6 +2140,114 @@ fn no_downgrade_matrix() -> Vec<MatrixCell> {
     assert_eq!(cells.len(), 9);
     cells
 }
+
+// ---------------------------------------------------------------------------
+// B-half predicates, keyed to the subjects HTTP_03_B_EVALUATOR_MANIFEST_V1
+// DECLARES.
+//
+// This join previously assigned its own subjects to ordinals 14..26 and
+// disagreed with B on all thirteen. The A half matched 13/13, and B's names map
+// onto the frozen package contract's `Tests:` bullets while three of this
+// join's did not appear there at all - so the stale side was this file. The
+// floor gate could never have caught it: B derived its floors from this
+// evaluator's own observation counts, so the numbers agreed while the meanings
+// did not. `assert_predicate_matches_declared_case` is what caught it.
+//
+// Where an existing predicate already observed B's declared subject it is
+// reused verbatim rather than rewritten, and where B's subject is broader than
+// one old predicate the related observations are folded in - they were always
+// real observations of real behaviour, only recorded under the wrong name.
+// ---------------------------------------------------------------------------
+
+/// HTTP-03.17 `authorization-redaction` (floor 3).
+fn case_authorization_redaction(builder: &mut CaseBuilder, wire: &WireObservations) {
+    case_credential_redaction(builder, wire);
+}
+
+/// HTTP-03.18 `https-only-bearer-attachment` (floor 3).
+///
+/// B's subject is the attachment rule itself, which is exactly what the
+/// bound-target, never-cleartext and token-byte observations prove between
+/// them: a bearer reaches an HTTPS target, never an `http:` one, and its bytes
+/// are bound rather than copied.
+fn case_https_only_bearer_attachment(builder: &mut CaseBuilder) {
+    case_bearer_bound_target(builder);
+    case_bearer_never_cleartext(builder);
+    case_bearer_token_bytes(builder);
+}
+
+/// HTTP-03.19 `redirect-no-follow-no-replay` (floor 4).
+fn case_redirect_no_follow_no_replay(builder: &mut CaseBuilder) {
+    case_redirects_rejected(builder);
+}
+
+/// HTTP-03.20 `discover-preclassification-frame` (floor 3).
+///
+/// The era selection folded in here is the classification the discovery frame
+/// feeds; B names the frame, and the selected era is the observable it produces.
+fn case_discover_preclassification_frame(builder: &mut CaseBuilder, wire: &WireObservations) {
+    case_discovery_frames(builder, wire);
+    case_modern_era_selection(builder, wire);
+}
+
+/// HTTP-03.21 `fresh-probe-identity-after-authorization` (floor 7).
+///
+/// The one-shot probe proves the probe is issued exactly once per connection;
+/// the not-forwarded observation proves the credential from one target does not
+/// ride along on the next probe. Together they are the identity claim B names.
+fn case_fresh_probe_identity_after_authorization(
+    builder: &mut CaseBuilder,
+    wire: &WireObservations,
+) {
+    case_one_shot_probe(builder, wire);
+    case_bearer_not_forwarded(builder);
+}
+
+/// HTTP-03.22 `endpoint-instance-key-partition` (floor 6).
+///
+/// The endpoint-instance, security-partition and configuration-generation
+/// observations are the three components of the bundle key B names.
+fn case_endpoint_instance_key_partition(builder: &mut CaseBuilder, wire: &WireObservations) {
+    case_endpoint_instance_partition(builder, wire);
+    case_security_partition(builder, wire);
+    case_configuration_generation(builder, wire);
+}
+
+// --- Not yet proven. ---------------------------------------------------------
+//
+// B declares these four subjects and this join does not yet exercise them. They
+// need fixture scenarios that do not exist here yet: a cancelled caller, an
+// armed deadline racing a disconnect, a mid-flight disconnect whose dispatch is
+// uncertain, an extension activation notification, an independent server->client
+// request, and an SSE stream carrying no event id.
+//
+// They deliberately record NOTHING. The floor gate below then fails the case by
+// its declared floor and names the shortfall, which is the honest state: the
+// behaviour is unproven, and a predicate that recorded a placeholder observation
+// to reach a floor would be exactly the unevidenced box this evaluator exists to
+// prevent. A check that cannot fail is not evidence.
+
+/// HTTP-03.14 `caller-cancellation-response-close` (floor 5). UNPROVEN.
+fn case_caller_cancellation_close(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+
+/// HTTP-03.15 `deadline-and-disconnect-races` (floor 4). UNPROVEN.
+fn case_deadline_and_disconnect_races(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+
+/// HTTP-03.16 `uncertain-dispatch-no-retry` (floor 4). UNPROVEN.
+fn case_uncertain_dispatch_no_retry(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+
+/// HTTP-03.23 `extension-activation-proof-notification` (floor 4). UNPROVEN.
+fn case_extension_activation_notification(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
+
+/// HTTP-03.24 `independent-server-request-rejection` (floor 2). UNPROVEN.
+fn case_independent_server_request_rejection(
+    _builder: &mut CaseBuilder,
+    _wire: &WireObservations,
+) {
+}
+
+/// HTTP-03.25 `no-event-id-retry-resumption-state` (floor 2). UNPROVEN.
+fn case_no_event_id_retry_resumption(_builder: &mut CaseBuilder, _wire: &WireObservations) {}
 
 fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
     for cell in matrix {
