@@ -1644,6 +1644,13 @@ async fn negative_04_compressed_response(cx: &Cx) {
         ),
         "a truncated body must reach a typed body-read failure, saw {refusal:?}"
     );
+    // Unchanged state: the same lane still delivers a complete body verbatim
+    // after the truncated one failed, so the refusal closed only its own
+    // response.
+    let restored = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY)
+        .await
+        .expect("a complete body must still be delivered after a truncation refusal");
+    assert_eq!(restored.as_slice(), COMPLETE_RESPONSE_BODY);
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,6 +1842,38 @@ async fn negative_05_missing_name_mirror(cx: &Cx) {
         "expected a typed missing-name refusal naming resources/read, saw {wrong_member:?}"
     );
     peer.assert_no_further_connection();
+    // Unchanged state after refusal. Both negatives above failed during request
+    // CONSTRUCTION, so neither reached the wire - the assertion directly above
+    // is what proves that. This third call goes out over the SAME connection
+    // and must still succeed, so the refusals left behind no request state, no
+    // endpoint rebinding and no credential state.
+    let ((), ()) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_json_response(
+                &mut io,
+                br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            end_stream(&mut io).await;
+        },
+        async {
+            let response = connection
+                .request_json(
+                    cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    RequestId::Number(7),
+                    64 * 1024,
+                )
+                .await
+                .expect("the connection must still serve an ordinary request");
+            assert_eq!(response.id, Some(RequestId::Number(7)));
+            assert!(response.error.is_none());
+        },
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2445,6 +2484,15 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
             "{content_type}: expected a typed content-type refusal, saw {refusal:?}"
         );
     }
+    // Unchanged state: the unmutated `application/json` selects its lane again,
+    // so every refusal above came from its own changed variable rather than
+    // from a path some earlier refusal poisoned.
+    assert_eq!(
+        success_content_type_outcome(cx, 200, &["application/json"], b"{}")
+            .await
+            .expect("the unmutated content type must be admitted again"),
+        ModernHttpResponseKind::Json
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3736,6 +3784,12 @@ async fn negative_12_invalid_direction(cx: &Cx) {
         ),
         "expected a typed JSON-RPC admission refusal, saw {refusal:?}"
     );
+    // Unchanged state: the single object is admitted again on a fresh stream,
+    // so the concatenation refusal poisoned neither the admission path nor the
+    // fixture that drives it.
+    admit_dispatched_payload(cx, &single)
+        .await
+        .expect("one complete object must still be admitted after the refusal");
 }
 
 // ---------------------------------------------------------------------------
