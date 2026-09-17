@@ -2141,6 +2141,63 @@ fn replacement_stream(inside_json_string: bool) -> Vec<u8> {
     body
 }
 
+/// The golden corpus for the every-split-point sweep.
+///
+/// One body carrying, in order: a leading BOM; a comment; CR-, LF- and
+/// CRLF-terminated multi-data events; the four `data` field spellings the
+/// standard distinguishes; the inert `event`/`id`/`retry` fields and an unknown
+/// field; a lone malformed octet inside a data value; and a final blank line
+/// with nothing pending.
+///
+/// Every construct the criterion names is present in one body on purpose: the
+/// sweep below then places a boundary inside each of them without needing a
+/// separate stream per construct.
+fn split_point_corpus() -> Vec<u8> {
+    let mut body = vec![0xEF, 0xBB, 0xBF];
+    body.extend_from_slice(b": comment\n");
+    body.extend_from_slice(b"data: alpha\rdata: beta\r\r");
+    body.extend_from_slice(b"data: alpha\ndata: beta\n\n");
+    body.extend_from_slice(b"data: alpha\r\ndata: beta\r\n\r\n");
+    body.extend_from_slice(b"data\n\n");
+    body.extend_from_slice(b"data:x\n\n");
+    body.extend_from_slice(b"data: x\n\n");
+    body.extend_from_slice(b"data:  x\n\n");
+    body.extend_from_slice(b"event: custom\nid: 7\nretry: 5000\nunknown: z\ndata: inert\n\n");
+    body.extend_from_slice(b"data: pre");
+    body.push(0xFF);
+    body.extend_from_slice(b"post\n\n");
+    body.extend_from_slice(b"\n");
+    body
+}
+
+/// The exact payloads `split_point_corpus` must dispatch, in wire order.
+///
+/// Written out rather than derived from a run: a golden computed by the code
+/// under test would agree with any behaviour it happened to have.
+fn split_point_golden() -> Vec<String> {
+    [
+        // Bare CR, bare LF and CRLF are interchangeable terminators, and two
+        // data lines join with exactly one inserted LF.
+        "alpha\nbeta",
+        "alpha\nbeta",
+        "alpha\nbeta",
+        // A bare `data` field contributes an empty value, and the blank line
+        // after it dispatches an empty payload rather than no event.
+        "",
+        // `data:x`, `data: x`, `data:  x` - exactly one U+0020 is removed.
+        "x",
+        "x",
+        " x",
+        // `event`, `id`, `retry` and an unknown field are framed and ignored.
+        "inert",
+        // One malformed octet becomes exactly one U+FFFD in place.
+        "pre\u{FFFD}post",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -2180,6 +2237,49 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
         },
     )
     .await;
+    // -----------------------------------------------------------------------
+    // Every-split-point golden.
+    //
+    // The HTTP-03.09 sweep uses a fixed stride (1, 7, whole body). A stride can
+    // never place a boundary inside a chosen two-byte sequence, so it cannot
+    // split the BOM, a CRLF pair, or the bytes around the malformed octet. This
+    // places a boundary at every interior offset, which does.
+    //
+    // A decoder that reset its state per chunk, or a line splitter that treated
+    // a CR ending one chunk and an LF opening the next as two terminators,
+    // passes the stride sweep and fails here.
+    // -----------------------------------------------------------------------
+    let corpus = split_point_corpus();
+    let golden = split_point_golden();
+    let sweep_peer = Peer::bind().await;
+
+    let whole = drain_sse(cx, &sweep_peer, corpus.clone(), limits())
+        .await
+        .expect("the golden corpus must assemble when delivered whole");
+    assert_eq!(
+        whole, golden,
+        "the whole-body decode must be the declared golden"
+    );
+
+    let byte_by_byte = drain_sse_in_chunks(cx, &sweep_peer, corpus.clone(), limits(), 1)
+        .await
+        .expect("the golden corpus must assemble one byte at a time");
+    assert_eq!(
+        byte_by_byte, golden,
+        "byte-by-byte delivery must not change the dispatched events"
+    );
+
+    for split in 1..corpus.len() {
+        let observed = drain_sse_split_at(cx, &sweep_peer, &corpus, limits(), split)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
+            });
+        assert_eq!(
+            observed, golden,
+            "a chunk boundary at byte {split} changed the dispatched events"
+        );
+    }
 }
 
 async fn negative_08_replacement_outside_json(cx: &Cx) {
@@ -2223,6 +2323,43 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
     );
     // The client failed its own stream and posted nothing back to the server.
     peer.assert_no_further_connection();
+    // The same one changed variable, now swept across every chunk boundary.
+    // The refused document still DECODES identically wherever the boundary
+    // falls - it is JSON admission that rejects it, never the decoder - so no
+    // split may launder the malformed octet into different text. A decoder that
+    // reset per chunk would emit two replacement characters, or drop the octet,
+    // at exactly the boundaries that straddle it, and that altered text is what
+    // a permissive admission step could then accept.
+    let sweep_peer = Peer::bind().await;
+    let whole = drain_sse(cx, &sweep_peer, body.clone(), limits())
+        .await
+        .expect("the refused document still decodes; admission is what rejects it");
+    assert_eq!(
+        whole.len(),
+        1,
+        "one event dispatches regardless of its admissibility"
+    );
+    assert_eq!(
+        whole[0].matches('\u{FFFD}').count(),
+        1,
+        "the lone malformed octet becomes exactly one U+FFFD"
+    );
+    assert!(
+        !whole[0].as_bytes().contains(&0xFF),
+        "no raw malformed octet may survive the decoder"
+    );
+
+    for split in 1..body.len() {
+        let observed = drain_sse_split_at(cx, &sweep_peer, &body, limits(), split)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
+            });
+        assert_eq!(
+            observed, whole,
+            "a chunk boundary at byte {split} changed the decode of the refused document"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2282,6 +2419,58 @@ async fn drain_sse(
 ) -> Result<Vec<String>, ModernHttpExecutorError> {
     let chunk_bytes = body.len().max(1);
     drain_sse_in_chunks(cx, peer, body, sse_limits, chunk_bytes).await
+}
+
+/// Delivers one SSE body as exactly two chunks with the boundary at `split`.
+///
+/// `drain_sse_in_chunks` places boundaries at a fixed stride, which can never
+/// put one inside a chosen two-byte sequence. This places the boundary at an
+/// exact offset, so sweeping `1..body.len()` covers every split point in the
+/// body: inside the leading BOM, between the CR and the LF of one terminator,
+/// and on either side of a malformed octet.
+async fn drain_sse_split_at(
+    cx: &Cx,
+    peer: &Peer,
+    body: &[u8],
+    sse_limits: SseLimits,
+    split: usize,
+) -> Result<Vec<String>, ModernHttpExecutorError> {
+    assert!(
+        split > 0 && split < body.len(),
+        "an interior split must leave both chunks non-empty"
+    );
+    let head = body[..split].to_vec();
+    let tail = body[split..].to_vec();
+    let request = ping_request(&peer.target());
+    let ((), payloads) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            begin_sse(&mut io).await;
+            write_bytes(&mut io, &head).await;
+            write_bytes(&mut io, &tail).await;
+            end_sse_stream(&mut io).await;
+        },
+        async {
+            let response = post(cx, &request)
+                .await
+                .expect("the SSE response head must be admitted");
+            assert_eq!(response.metadata().kind(), ModernHttpResponseKind::Sse);
+            let mut stream = response
+                .into_sse_stream(sse_limits)
+                .expect("an admitted SSE response must convert to an event stream");
+            let mut payloads = Vec::new();
+            loop {
+                match stream.next_event(cx).await {
+                    Ok(Some(payload)) => payloads.push(payload),
+                    Ok(None) => return Ok(payloads),
+                    Err(error) => return Err(error),
+                }
+            }
+        },
+    )
+    .await;
+    payloads
 }
 
 async fn positive_09_line_endings_and_data_fields(cx: &Cx) {
