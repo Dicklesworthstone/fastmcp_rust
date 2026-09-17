@@ -6437,7 +6437,6 @@ mod tests {
         let mut meta = FinalRequestMeta::new(ClientCapabilities {
             roots: Some(crate::types::RootsCapability { list_changed: true }),
             ..ClientCapabilities::default()
-            ..Default::default()
         });
         meta.additional_metadata
             .insert("example.com/trace".to_owned(), serde_json::json!(null));

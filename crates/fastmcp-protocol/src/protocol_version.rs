@@ -776,7 +776,6 @@ mod tests {
             MissingRequiredClientCapabilityError::from_client_capabilities(&ClientCapabilities {
                 roots: Some(crate::RootsCapability { list_changed: true }),
                 ..ClientCapabilities::default()
-                ..Default::default()
             })
             .expect("typed capabilities serialize as a bounded required-capabilities object");
         assert_eq!(

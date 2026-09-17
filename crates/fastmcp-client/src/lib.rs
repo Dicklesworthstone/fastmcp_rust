@@ -22808,7 +22808,6 @@ mod tests {
             &ClientCapabilities {
                 sampling: Some(SamplingCapability::default()),
                 ..ClientCapabilities::default()
-                ..Default::default()
             },
         )
         .expect("sampling overlay must keep already-stamped Tasks");

@@ -29090,7 +29090,6 @@ fn e2e_public_http_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_i
         .capabilities(ClientCapabilities {
             roots: Some(legacy_2024::RootsCapability { list_changed: true }),
             ..ClientCapabilities::default()
-            ..Default::default()
         })
         .reverse_request_handlers(
             legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
@@ -47939,7 +47938,6 @@ mod live_websocket_bind {
                     .capabilities(ClientCapabilities {
                         roots: Some(legacy_2024::RootsCapability { list_changed: true }),
                         ..ClientCapabilities::default()
-                        ..Default::default()
                     })
                     .reverse_request_handlers(
                         legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(

@@ -34,7 +34,6 @@ fn required_roots() -> ClientCapabilities {
     ClientCapabilities {
         roots: Some(RootsCapability { list_changed: true }),
         ..ClientCapabilities::default()
-        ..Default::default()
     }
 }
 

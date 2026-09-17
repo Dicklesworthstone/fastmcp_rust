@@ -2703,7 +2703,6 @@ exec sleep 5
                 list_changed: false,
             }),
             ..ClientCapabilities::default()
-            ..Default::default()
         });
         let legacy_error = missing_handler
             .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(

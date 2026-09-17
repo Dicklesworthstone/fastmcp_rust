@@ -1389,7 +1389,6 @@ mod tests {
                 list_changed: false,
             }),
             ..ServerCapabilities::default()
-            ..Default::default()
         };
         let session = Session::new(make_server_info(), caps);
         assert!(session.server_capabilities().tools.is_some());
