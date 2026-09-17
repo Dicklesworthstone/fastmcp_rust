@@ -16,8 +16,12 @@
 //!   `None` rather than a downgraded or redirected credential.
 //! - The token is redacted from `Debug` output so credentials cannot leak
 //!   through diagnostics, and header-hostile bytes are refused at binding.
+//! - Local revocation is shared by every clone. It stops subsequent header
+//!   construction without changing another independently bound credential.
 
 use core::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Protected-resource and issuer discovery for preregistered native clients.
@@ -62,11 +66,15 @@ impl fmt::Display for BearerBindingError {
 impl std::error::Error for BearerBindingError {}
 
 /// A bearer token bound to exactly one admitted HTTPS resource.
+///
+/// Clones share local revocation state. Dropping one clone does not revoke
+/// the others; explicit [`Self::revoke`] is irreversible for this lineage.
 #[derive(Clone)]
 pub struct BoundBearerCredential {
     resource: CanonicalHttpUrl,
     token: String,
     expires_at: Option<Instant>,
+    revoked: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for BoundBearerCredential {
@@ -105,7 +113,12 @@ impl BoundBearerCredential {
         {
             return Err(BearerBindingError::InvalidTokenBytes);
         }
-        Ok(Self { resource, token, expires_at: None })
+        Ok(Self {
+            resource,
+            token,
+            expires_at: None,
+            revoked: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Binds a token with a monotonic deadline. At and after this instant,
@@ -133,13 +146,33 @@ impl BoundBearerCredential {
         self.expires_at
     }
 
+    /// Irreversibly withholds this credential from subsequent header
+    /// construction through this value and all existing or future clones.
+    ///
+    /// This is local capability revocation, not an OAuth revocation-endpoint
+    /// request. Already-created header strings, requests that captured such
+    /// strings, and bytes already sent cannot be recalled. A header operation
+    /// concurrent with revocation may have completed its admission first.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
+    /// Returns whether this credential lineage has been locally revoked.
+    /// Expiry is a separate condition and does not set this flag.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
     /// Returns the `Authorization` header value for `target`, or `None`
     /// when the target is not canonically identical to the bound resource or
-    /// the credential has expired.
+    /// the credential has expired or been revoked.
     ///
     /// A `None` is not an error: the request simply proceeds without a
     /// credential, so a mismatched, downgraded, or redirected target can
-    /// never observe the token.
+    /// never observe the token. Consumers requiring authenticated dispatch
+    /// must reject a withheld credential rather than silently sending a
+    /// request without authorization.
     #[must_use]
     pub fn authorization_for_target(&self, target: &CanonicalHttpUrl) -> Option<String> {
         self.authorization_at(target, Instant::now())
@@ -148,8 +181,13 @@ impl BoundBearerCredential {
     fn authorization_at(&self, target: &CanonicalHttpUrl, now: Instant) -> Option<String> {
         if target.as_str() == self.resource.as_str()
             && self.expires_at.is_none_or(|deadline| now < deadline)
+            && !self.is_revoked()
         {
-            Some(format!("Bearer {}", self.token))
+            let authorization = format!("Bearer {}", self.token);
+            // Revocation during allocation must not be ignored. As with any
+            // admission check, revocation after this load cannot recall the
+            // header returned to its caller.
+            (!self.is_revoked()).then_some(authorization)
         } else {
             None
         }
@@ -282,5 +320,63 @@ mod tests {
         }
         let expired = BoundBearerCredential::bind_with_expiry(resource.clone(), "expired", Instant::now()).unwrap();
         assert_eq!(expired.authorization_for_target(&resource), None);
+    }
+
+    #[test]
+    fn revocation_withholds_existing_and_future_clones_without_affecting_another_binding() {
+        let resource = url("https://mcp.example/api");
+        let credential = BoundBearerCredential::bind(resource.clone(), "shared-secret").unwrap();
+        let clone = credential.clone();
+        // Even identical token bytes do not create a process-global identity.
+        let independent = BoundBearerCredential::bind(resource.clone(), "shared-secret").unwrap();
+        for candidate in [&credential, &clone, &independent] {
+            assert!(!candidate.is_revoked());
+            assert_eq!(candidate.authorization_for_target(&resource), Some("Bearer shared-secret".to_owned()));
+        }
+
+        clone.revoke();
+        clone.revoke();
+        for candidate in [credential.clone(), clone.clone(), credential, clone] {
+            assert!(candidate.is_revoked());
+            assert_eq!(candidate.authorization_for_target(&resource), None);
+            assert_eq!(candidate.resource(), &resource);
+            assert_eq!(candidate.expires_at(), None);
+            assert!(!format!("{candidate:?}").contains("shared-secret"));
+        }
+        assert!(!independent.is_revoked());
+        assert_eq!(independent.authorization_for_target(&resource), Some("Bearer shared-secret".to_owned()));
+    }
+
+    #[test]
+    fn revocation_does_not_depend_on_expiry_or_clone_drop() {
+        use std::time::{Duration, Instant};
+
+        let resource = url("https://mcp.example/api");
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(60);
+        let credential = BoundBearerCredential::bind_with_expiry(resource.clone(), "secret", deadline).unwrap();
+        drop(credential.clone());
+        assert_eq!(credential.authorization_at(&resource, now), Some("Bearer secret".to_owned()));
+        assert_eq!(credential.authorization_at(&resource, deadline), None);
+        assert!(!credential.is_revoked(), "expiry is not local revocation");
+        credential.revoke();
+        assert_eq!(credential.authorization_at(&resource, now), None);
+        assert_eq!(credential.expires_at(), Some(deadline));
+    }
+
+    #[test]
+    fn revocation_is_visible_to_a_credential_moved_to_another_thread() {
+        let resource = url("https://mcp.example/api");
+        let credential = BoundBearerCredential::bind(resource.clone(), "secret").unwrap();
+        let worker = credential.clone();
+        let (revoked, observe) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            observe.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(worker.is_revoked());
+            assert_eq!(worker.authorization_for_target(&resource), None);
+        });
+        credential.revoke();
+        revoked.send(()).unwrap();
+        thread.join().unwrap();
     }
 }
