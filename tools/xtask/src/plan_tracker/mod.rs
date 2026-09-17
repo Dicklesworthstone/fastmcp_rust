@@ -61,17 +61,43 @@ pub const A_SUBCASES: [(&str, &str); 4] = [
 ];
 
 /// Checker modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `preclaim` and `preclose` carry the issue they are validating; the
+/// reservation snapshot itself arrives from the execution layer, because the
+/// checker has neither network nor mutation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     All,
     Snapshot,
+    Preclaim(String),
+    Preclose(String),
 }
 
 impl Mode {
-    pub fn parse(raw: &str) -> Option<Self> {
+    /// Parse a mode word and its optional issue argument.
+    pub fn parse(raw: &str, argument: Option<&str>) -> Option<Self> {
         match raw {
             "all" => Some(Self::All),
             "snapshot" => Some(Self::Snapshot),
+            "preclaim" => argument.map(|issue| Self::Preclaim(issue.to_owned())),
+            "preclose" => argument.map(|issue| Self::Preclose(issue.to_owned())),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Snapshot => "snapshot",
+            Self::Preclaim(_) => "preclaim",
+            Self::Preclose(_) => "preclose",
+        }
+    }
+
+    /// The issue this mode validates, when it has one.
+    pub fn issue_id(&self) -> Option<&str> {
+        match self {
+            Self::Preclaim(issue) | Self::Preclose(issue) => Some(issue.as_str()),
             _ => None,
         }
     }
@@ -341,10 +367,33 @@ mod tests {
 
     #[test]
     fn mode_parses_only_declared_modes() {
-        assert_eq!(Mode::parse("all"), Some(Mode::All));
-        assert_eq!(Mode::parse("snapshot"), Some(Mode::Snapshot));
-        assert_eq!(Mode::parse("ALL"), None);
-        assert_eq!(Mode::parse(""), None);
+        assert_eq!(Mode::parse("all", None), Some(Mode::All));
+        assert_eq!(Mode::parse("snapshot", None), Some(Mode::Snapshot));
+        assert_eq!(Mode::parse("ALL", None), None);
+        assert_eq!(Mode::parse("", None), None);
+    }
+
+    #[test]
+    fn preclaim_and_preclose_require_an_issue_argument() {
+        assert_eq!(Mode::parse("preclaim", None), None);
+        assert_eq!(Mode::parse("preclose", None), None);
+        assert_eq!(
+            Mode::parse("preclaim", Some("bd-x")),
+            Some(Mode::Preclaim("bd-x".to_owned()))
+        );
+        assert_eq!(
+            Mode::parse("preclose", Some("bd-x")).and_then(|m| m.issue_id().map(str::to_owned)),
+            Some("bd-x".to_owned())
+        );
+    }
+
+    #[test]
+    fn mode_names_are_the_documented_words() {
+        assert_eq!(Mode::All.name(), "all");
+        assert_eq!(Mode::Snapshot.name(), "snapshot");
+        assert_eq!(Mode::Preclaim("i".to_owned()).name(), "preclaim");
+        assert_eq!(Mode::Preclose("i".to_owned()).name(), "preclose");
+        assert_eq!(Mode::All.issue_id(), None);
     }
 
     #[test]
