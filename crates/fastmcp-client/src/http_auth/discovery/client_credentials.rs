@@ -1,31 +1,29 @@
 //! Explicit preregistered machine-to-machine OAuth (AUTHX-02).
 //!
-//! This implements `client_secret_basic`, not `private_key_jwt`, dynamic
-//! registration, browser login, or persistent credential custody. It reuses the
-//! native discovery transport and issuer/resource policy. Each protected MCP
-//! operation first checks the official extension through authenticated discovery
-//! using the SAME access-token snapshot as the operation. No failed POST is
-//! automatically retried or downgraded to interactive authentication.
+//! Implements RFC 6749 `client_secret_basic`, not `private_key_jwt`, secret-post,
+//! dynamic registration, browser login, or persistent credential custody. The
+//! pinned draft's secret-body example differs from its Basic metadata: this
+//! explicit API follows the Basic method and the pinned Basic conformance case,
+//! never guessing or falling back to another way of transmitting the secret.
 //!
-//! The pinned draft's secret-body example and its `client_secret_basic` metadata
-//! are different methods. This API explicitly implements RFC 6749 HTTP Basic,
-//! matching the pinned Basic conformance scenario; it never guesses/falls back
-//! to putting a secret in a request body. JWT and secret-post remain separate
-//! unimplemented selections rather than aliases for this method.
+//! Trusted resource/issuer discovery is shared with the native OAuth path.
+//! Every protected operation additionally verifies the official extension by
+//! fresh authenticated MCP discovery using the SAME token as the operation.
+//! No failed POST is automatically retried. All work uses the caller's runtime.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
+use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, Request, RetryPolicy};
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::tls::Certificate;
 use asupersync::types::Time;
-use base64::Engine;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -52,14 +50,16 @@ pub const CLIENT_CREDENTIALS_EXTENSION: &str = "io.modelcontextprotocol/oauth-cl
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACQUISITIONS: usize = 64;
 
-/// Fixed diagnostics never retain client secrets, bearer tokens, issuer bodies,
-/// request data, or transport errors that might reflect an Authorization header.
+/// Fixed diagnostics never retain credentials, issuer bodies, request data,
+/// or transport errors that could reflect an Authorization header.
 #[derive(Debug)]
 pub enum ClientCredentialsError {
     InvalidPolicy,
     Closed,
     Expired,
+    Saturated,
     StateUnavailable,
     GenerationExhausted,
     UnsupportedAuthentication,
@@ -73,13 +73,13 @@ pub enum ClientCredentialsError {
     UnexpectedResponse,
     Discovery(OAuthDiscoveryError),
 }
-
 impl fmt::Display for ClientCredentialsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidPolicy => "invalid client-credentials policy",
             Self::Closed => "client-credentials owner is closed",
             Self::Expired => "client-credentials access token is expired or revoked",
+            Self::Saturated => "client-credentials acquisition capacity exhausted",
             Self::StateUnavailable => "client-credentials state unavailable",
             Self::GenerationExhausted => "client-credentials generation exhausted",
             Self::UnsupportedAuthentication => "issuer does not admit client_credentials with client_secret_basic",
@@ -100,20 +100,19 @@ impl From<OAuthDiscoveryError> for ClientCredentialsError {
     fn from(error: OAuthDiscoveryError) -> Self { Self::Discovery(error) }
 }
 
-// Neither secrets nor token bodies derive Debug, Display or serde.
+// Process-local secrets are not serialized or formatted. Ordinary allocator
+// memory is used; protected persistence and zeroized-memory custody are not claimed.
 struct ClientSecret(String);
 
 /// Administrator-selected resource, ONE issuer-bound registration and secret.
-/// Peer metadata cannot move the secret to another issuer. Extra token-endpoint
-/// origins and private roots must be explicitly granted on TrustedOAuthIssuer.
-/// Resource roots are separate and never inherited from the token issuer.
+/// Extra token-endpoint origins and issuer roots are explicit host grants.
+/// Metadata cannot move the registration to a different issuer.
 pub struct ClientCredentialsPlan {
     discovery: OAuthDiscoveryPlan,
     secret: Arc<ClientSecret>,
     maximum_lifetime: Duration,
     leeway: Duration,
 }
-
 impl ClientCredentialsPlan {
     pub fn new(
         resource: CanonicalHttpUrl,
@@ -134,14 +133,14 @@ impl ClientCredentialsPlan {
         })
     }
 
-    /// Bounds each explicit discovery/acquisition/operation, including waiting
-    /// behind another token acquisition. A tighter Cx budget always wins.
+    /// Bounds each explicit discovery/acquisition/operation, including queued
+    /// acquisition time and response reads. A tighter Cx budget always wins.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, ClientCredentialsError> {
         self.discovery = self.discovery.with_timeout(timeout)?;
         Ok(self)
     }
 
-    /// Local reuse ceiling, also applied when the issuer omits expires_in.
+    /// Local reuse ceiling, also applied when expires_in is absent.
     pub fn with_maximum_token_lifetime(mut self, lifetime: Duration) -> Result<Self, ClientCredentialsError> {
         if lifetime.is_zero() || lifetime > Duration::from_secs(86_400) {
             return Err(ClientCredentialsError::InvalidPolicy);
@@ -149,23 +148,22 @@ impl ClientCredentialsPlan {
         self.maximum_lifetime = lifetime;
         Ok(self)
     }
-
     pub fn with_renewal_leeway(mut self, leeway: Duration) -> Result<Self, ClientCredentialsError> {
         if leeway > Duration::from_secs(300) { return Err(ClientCredentialsError::InvalidPolicy); }
         self.leeway = leeway;
         Ok(self)
     }
 
-    /// Grants private trust to resource metadata AND protected MCP requests for
-    /// this explicitly configured resource, never to an issuer/token endpoint.
+    /// Adds private trust for resource-METADATA retrieval only. Protected MCP
+    /// dispatch uses the native executor's bundled roots or explicit build-time
+    /// native-tls-roots policy, just like the managed browser-login client.
     pub fn with_resource_root_certificate(mut self, root: Certificate) -> Result<Self, ClientCredentialsError> {
         admit_root(&mut self.discovery.resource_roots, root)?;
         Ok(self)
     }
 
-    /// Resolves trusted resource/issuer metadata without transmitting the secret.
-    /// No DCR or browser fallback is reachable from this machine-only path.
-    /// A later credential() call owns a separate explicit grant attempt.
+    /// Discovers endpoints without transmitting the secret. A later credential
+    /// call owns an explicit grant attempt. No DCR/browser branch is reachable.
     pub async fn discover(&self, cx: &Cx) -> Result<ClientCredentialsClient, ClientCredentialsError> {
         let deadline = discovery_deadline(cx, self.discovery.timeout)?;
         let (issuer, body) = self.discovery.discover_issuer_document(cx, deadline).await?;
@@ -173,23 +171,17 @@ impl ClientCredentialsPlan {
         check_context(cx, deadline)?;
         Ok(ClientCredentialsClient {
             inner: Arc::new(ClientInner {
-                resource: self.discovery.resource.clone(),
-                token_endpoint,
+                resource: self.discovery.resource.clone(), token_endpoint,
                 client_id: self.discovery.client_id.clone().ok_or(ClientCredentialsError::InvalidPolicy)?,
-                scopes: self.discovery.scopes.clone(),
-                secret: Arc::clone(&self.secret),
-                issuer_roots: issuer.roots.clone(),
-                resource_roots: self.discovery.resource_roots.clone(),
-                timeout: self.discovery.timeout,
-                maximum_lifetime: self.maximum_lifetime,
-                leeway: self.leeway,
-                closed: McpRequestCancellation::new(),
+                scopes: self.discovery.scopes.clone(), secret: Arc::clone(&self.secret),
+                issuer_roots: issuer.roots.clone(), timeout: self.discovery.timeout,
+                maximum_lifetime: self.maximum_lifetime, leeway: self.leeway,
+                closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
                 state: Arc::new(Mutex::new(TokenState::default())),
             }),
         })
     }
 }
-
 impl fmt::Debug for ClientCredentialsPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientCredentialsPlan").field("authentication", &"client_secret_basic")
@@ -210,12 +202,9 @@ struct MachineIssuerMetadata {
     #[serde(default, deserialize_with = "present")]
     signed_metadata: Option<String>,
 }
-
-fn admit_machine_issuer(
-    plan: &OAuthDiscoveryPlan,
-    issuer: &TrustedOAuthIssuer,
-    body: &[u8],
-) -> Result<CanonicalHttpUrl, ClientCredentialsError> {
+fn admit_machine_issuer(plan: &OAuthDiscoveryPlan, issuer: &TrustedOAuthIssuer, body: &[u8])
+    -> Result<CanonicalHttpUrl, ClientCredentialsError>
+{
     let metadata: MachineIssuerMetadata = decode_metadata(body)?;
     if metadata.issuer != issuer.identifier { return Err(OAuthDiscoveryError::IssuerMismatch.into()); }
     if metadata.signed_metadata.is_some() { return Err(OAuthDiscoveryError::SignedMetadataUnsupported.into()); }
@@ -239,21 +228,18 @@ struct ClientInner {
     scopes: Vec<String>,
     secret: Arc<ClientSecret>,
     issuer_roots: Vec<Certificate>,
-    resource_roots: Vec<Certificate>,
     timeout: Duration,
     maximum_lifetime: Duration,
     leeway: Duration,
     closed: McpRequestCancellation,
+    pending: AtomicUsize,
     state: Arc<Mutex<TokenState>>,
 }
 impl Drop for ClientInner {
     fn drop(&mut self) { self.closed.cancel(); }
 }
 #[derive(Default)]
-struct TokenState {
-    current: Option<ServiceToken>,
-    generation: u64,
-}
+struct TokenState { current: Option<ServiceToken>, generation: u64 }
 struct ServiceToken {
     bearer: BoundBearerCredential,
     scopes: Vec<String>,
@@ -261,9 +247,10 @@ struct ServiceToken {
     renew_after: Instant,
 }
 
-/// Clones share a single token acquisition and credential cache. An expired
-/// token causes a NEW client_credentials grant, never a refresh_token exchange.
-/// There is no background task and no automatic retry after a failed grant.
+/// Clones share single-flight token acquisition. Expiry causes a new
+/// client_credentials grant, never refresh_token. No background task is used.
+/// After failure another caller may explicitly request a new acquisition; the
+/// failing call itself does not retry or overwrite the previously admitted token.
 #[derive(Clone)]
 pub struct ClientCredentialsClient { inner: Arc<ClientInner> }
 impl fmt::Debug for ClientCredentialsClient {
@@ -273,8 +260,7 @@ impl fmt::Debug for ClientCredentialsClient {
     }
 }
 
-/// One expiring, owner-bound snapshot. Generation is local to this client and
-/// is NOT a globally unique cache partition. Debug never contains token bytes.
+/// Expiring, owner-bound snapshot. Generation is local, not a global cache key.
 pub struct ClientCredentialsSnapshot {
     bearer: BoundBearerCredential,
     scopes: Vec<String>,
@@ -297,21 +283,20 @@ impl fmt::Debug for ClientCredentialsSnapshot {
 impl ClientCredentialsClient {
     pub fn resource(&self) -> &CanonicalHttpUrl { &self.inner.resource }
 
-    /// Local irreversible closure, not an issuer revocation request. Existing
-    /// snapshots and clones withhold new headers; sent bytes cannot be recalled.
+    /// Irreversible local closure, not an issuer revocation request. Old
+    /// snapshots withhold new headers. Already-sent bytes cannot be recalled.
     pub fn close(&self) {
         self.inner.closed.cancel();
         if let Ok(mut state) = self.inner.state.try_lock_owned() { state.current = None; }
     }
-
     pub async fn credential(&self, cx: &Cx) -> Result<ClientCredentialsSnapshot, ClientCredentialsError> {
         self.credential_with_cancellation(cx, &McpRequestCancellation::new()).await
     }
-
     pub async fn credential_with_cancellation(
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
     ) -> Result<ClientCredentialsSnapshot, ClientCredentialsError> {
         let deadline = discovery_deadline(cx, self.inner.timeout)?;
+        let _permit = AcquisitionPermit::new(&self.inner.pending)?;
         active(cx, deadline, &self.inner.closed, cancellation, None, async {
             let mut state = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx).await
                 .map_err(|_| ClientCredentialsError::StateUnavailable)?;
@@ -328,11 +313,9 @@ impl ClientCredentialsClient {
                     ("Accept".to_owned(), "application/json".to_owned()),
                     ("Accept-Encoding".to_owned(), "identity".to_owned()),
                     ("Connection".to_owned(), "close".to_owned()),
-                    ("Authorization".to_owned(), basic(&self.inner.client_id, &self.inner.secret.0)),
+                    ("Authorization".to_owned(), basic(&self.inner.client_id, &self.inner.secret.0)?),
                 ];
-                let transport = transport(&self.inner.issuer_roots);
-                // No response/error is retained before admission, and the
-                // previous valid token remains unchanged if acquisition fails.
+                let transport = token_transport(&self.inner.issuer_roots);
                 let response = transport.request(cx, Method::Post, self.inner.token_endpoint.as_str(), headers, body.into_bytes())
                     .await.map_err(|_| ClientCredentialsError::Transport)?;
                 if response.status != 200 { return Err(ClientCredentialsError::TokenEndpointRejected); }
@@ -340,8 +323,12 @@ impl ClientCredentialsClient {
                 if !response.trailers.is_empty() { return Err(ClientCredentialsError::InvalidToken); }
                 let token = admit_token(&self.inner, &response.body, started)?;
                 check_context(cx, deadline)?;
-                if self.inner.closed.is_cancel_requested() || cancellation.is_cancel_requested() {
-                    return Err(ClientCredentialsError::Closed);
+                if self.inner.closed.is_cancel_requested() { return Err(ClientCredentialsError::Closed); }
+                if cancellation.is_cancel_requested() { return Err(OAuthDiscoveryError::Cancelled.into()); }
+                // Revocation while renewal was pending must not be reversed by
+                // installing a fresh token after the revocation decision.
+                if state.current.as_ref().is_some_and(|old| old.bearer.is_revoked()) {
+                    return Err(ClientCredentialsError::Expired);
                 }
                 state.current = Some(token);
                 state.generation = generation;
@@ -356,20 +343,20 @@ impl ClientCredentialsClient {
     }
 
     /// Executes one core operation after fresh same-token extension discovery.
-    /// Both request documents are validated before token acquisition. Existing
-    /// metadata is retained; the explicit constructor adds only its own empty
-    /// auth-extension declaration. Other extensions require a separate composed
-    /// client and are rejected here, rather than inferred from compiled codecs.
+    /// Both request documents are validated before token acquisition. Metadata
+    /// is retained and only this explicit client's empty auth declaration is
+    /// added. Other extension compositions are refused, not inferred.
     ///
-    /// The returned response is caller-owned. JSON/SSE reads retain cancellation,
-    /// local closure, token expiry and native parser/body limits. No tool call is
-    /// replayed after 401, redirect, lost reply or expired authentication.
+    /// No tool POST is replayed after a 401, redirect, lost reply or expiry.
+    /// Response reads retain cancellation, closure and the opening token expiry.
+    /// This path requires JSON server/discover; the operation can return JSON
+    /// or SSE. It does not alter the browser ManagedOAuthSession API or negotiate
+    /// Tasks, Apps, or subscription extension filters.
     pub async fn execute_core(
         &self, cx: &Cx, request: CoreRequest, discovery_id: RequestId, request_id: RequestId,
     ) -> Result<ClientCredentialsResponse, ClientCredentialsError> {
         self.execute_core_with_cancellation(cx, &McpRequestCancellation::new(), request, discovery_id, request_id).await
     }
-
     pub async fn execute_core_with_cancellation(
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
         request: CoreRequest, discovery_id: RequestId, request_id: RequestId,
@@ -384,7 +371,7 @@ impl ClientCredentialsClient {
         let deadline = discovery_deadline(cx, self.inner.timeout)?;
         active(cx, deadline, &self.inner.closed, cancellation, None, async {
             let snapshot = self.credential_with_cancellation(cx, cancellation).await?;
-            let executor = resource_executor(&self.inner.resource_roots);
+            let executor = ModernHttpExecutor::new();
             let discovery_wire = authorize(&snapshot, discovery_wire)?;
             let response = active(cx, deadline, &self.inner.closed, cancellation, Some(&snapshot), async {
                 executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await
@@ -412,17 +399,22 @@ impl ClientCredentialsClient {
     }
 }
 
-fn transport(roots: &[Certificate]) -> HttpClient {
+struct AcquisitionPermit<'a>(&'a AtomicUsize);
+impl<'a> AcquisitionPermit<'a> {
+    fn new(pending: &'a AtomicUsize) -> Result<Self, ClientCredentialsError> {
+        pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_ACQUISITIONS).then(|| n + 1))
+            .map_err(|_| ClientCredentialsError::Saturated)?;
+        Ok(Self(pending))
+    }
+}
+impl Drop for AcquisitionPermit<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+fn token_transport(roots: &[Certificate]) -> HttpClient {
     let mut builder = HttpClient::builder().redirect_policy(RedirectPolicy::None).retry_policy(RetryPolicy::None)
         .no_proxy().no_cookie_store().max_body_size(MAX_TOKEN_BYTES).max_total_connections(1);
     for root in roots { builder = builder.add_root_certificate(root.clone()); }
     builder.build()
-}
-
-// The native executor supports an explicitly supplied client while retaining
-// its own redirect/status/header/body checks; no alternate HTTP stack is used.
-fn resource_executor(roots: &[Certificate]) -> ModernHttpExecutor {
-    ModernHttpExecutor::with_client(transport(roots))
 }
 
 #[derive(Deserialize)]
@@ -438,7 +430,6 @@ struct TokenDocument {
     #[serde(default, deserialize_with = "present")]
     error: Option<String>,
 }
-
 fn admit_token(inner: &ClientInner, bytes: &[u8], started: Instant) -> Result<ServiceToken, ClientCredentialsError> {
     let token: TokenDocument = decode_metadata(bytes).map_err(|_| ClientCredentialsError::InvalidToken)?;
     if !token.token_type.eq_ignore_ascii_case("Bearer") || token.access_token.len() > 16 * 1024
@@ -457,8 +448,8 @@ fn admit_token(inner: &ClientInner, bytes: &[u8], started: Instant) -> Result<Se
         .for_owner(&inner.closed).ok_or(ClientCredentialsError::StateUnavailable)?;
     let remaining = expires_at.saturating_duration_since(Instant::now());
     let renew_after = expires_at.checked_sub(inner.leeway.min(remaining / 2)).ok_or(ClientCredentialsError::InvalidToken)?;
-    // A refresh_token, registration URI, or other extension in this document
-    // remains ignored. It cannot change the preregistered acquisition method.
+    // Refresh tokens and registration URLs remain ignored, never persisted or
+    // used to change this issuer-bound preregistered acquisition method.
     Ok(ServiceToken { bearer, scopes, expires_at, renew_after })
 }
 
@@ -478,13 +469,18 @@ fn form(fields: &[(&str, &str)]) -> String {
     fields.iter().filter(|(name, value)| *name != "scope" || !value.is_empty())
         .map(|(name, value)| format!("{}={}", component(name), component(value))).collect::<Vec<_>>().join("&")
 }
-fn basic(id: &str, secret: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", component(id), component(secret)));
-    format!("Basic {encoded}")
+fn basic(id: &str, secret: &str) -> Result<String, ClientCredentialsError> {
+    // Reuse asupersync's Basic encoder after the OAuth-specific form encoding
+    // of each component. This builder constructs data only; it performs no I/O.
+    Request::post("/").basic_auth(component(id), Some(&component(secret))).build()
+        .headers.into_iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value).ok_or(ClientCredentialsError::StateUnavailable)
 }
-
 fn prepare(resource: &CanonicalHttpUrl, request: &CoreRequest, id: &RequestId) -> Result<(ModernHttpRequest, CoreRequest), ClientCredentialsError> {
-    if request.era() != ProtocolEra::Modern2026 { return Err(ClientCredentialsError::InvalidRequest); }
+    if request.era() != ProtocolEra::Modern2026 || !matches!(request.method(),
+        "server/discover" | "tools/list" | "tools/call" | "resources/list" | "resources/templates/list"
+        | "resources/read" | "prompts/list" | "prompts/get" | "completion/complete"
+    ) { return Err(ClientCredentialsError::InvalidRequest); }
     id.validate().map_err(|_| ClientCredentialsError::InvalidRequest)?;
     let mut params = request.encode_params().map_err(|_| ClientCredentialsError::InvalidRequest)?
         .ok_or(ClientCredentialsError::InvalidRequest)?;
@@ -525,20 +521,26 @@ fn authorize(snapshot: &ClientCredentialsSnapshot, wire: ModernHttpRequest) -> R
     }
     Ok(wire)
 }
-fn admit_resource(request: &CoreRequest, id: &RequestId, bytes: &[u8]) -> Result<(), ClientCredentialsError> {
-    let admission = decode_strict_jsonrpc_response(bytes, MAX_TOKEN_BYTES).map_err(|_| ClientCredentialsError::Negotiation)?;
+fn decoded_result(request: &CoreRequest, id: &RequestId, bytes: &[u8], maximum: usize) -> Result<CoreResult, ClientCredentialsError> {
+    let admission = decode_strict_jsonrpc_response(bytes, maximum).map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
     let (response, source) = admission.into_parts();
     if response.error.is_some() || !response.id.as_ref().is_some_and(|actual| actual.correlates_with(id)) {
-        return Err(ClientCredentialsError::Negotiation);
+        return Err(ClientCredentialsError::UnexpectedResponse);
     }
-    let result = request.decode_response_result(&response, &source.ok_or(ClientCredentialsError::Negotiation)?)
-        .map_err(|_| ClientCredentialsError::Negotiation)?;
+    if response.result.as_ref().and_then(|result| result.get("resultType")).and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "complete" | "input_required"))
+    { return Err(ClientCredentialsError::UnexpectedResponse); }
+    request.decode_response_result(&response, &source.ok_or(ClientCredentialsError::UnexpectedResponse)?)
+        .map_err(|_| ClientCredentialsError::UnexpectedResponse)
+}
+fn admit_resource(request: &CoreRequest, id: &RequestId, bytes: &[u8]) -> Result<(), ClientCredentialsError> {
+    let result = decoded_result(request, id, bytes, MAX_TOKEN_BYTES).map_err(|_| ClientCredentialsError::Negotiation)?;
     let CoreResult::Final(FinalCoreResult::Discover(discovery)) = &result else { return Err(ClientCredentialsError::Negotiation) };
     if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
         return Err(ClientCredentialsError::Negotiation);
     }
-    // Inspect the admitted typed result's own capability field, never an inert
-    // unknown sibling or a raw object whose duplicate fields were collapsed.
+    // Inspect the method-admitted typed result, not an unknown sibling or an
+    // unvalidated raw Value whose duplicate security fields could be collapsed.
     let document: Value = serde_json::from_str(&result.encode().map_err(|_| ClientCredentialsError::Negotiation)?)
         .map_err(|_| ClientCredentialsError::Negotiation)?;
     if !document.get("capabilities").and_then(|value| value.get("extensions"))
@@ -551,15 +553,13 @@ fn check_token(token: &BoundBearerCredential, expiry: Instant) -> Result<(), Cli
     if token.is_revoked() || Instant::now() >= expiry { return Err(ClientCredentialsError::Expired); }
     Ok(())
 }
-
 async fn active<T>(
     cx: &Cx, deadline: Time, owner: &McpRequestCancellation, cancellation: &McpRequestCancellation,
     token: Option<&ClientCredentialsSnapshot>, future: impl Future<Output = Result<T, ClientCredentialsError>>,
 ) -> Result<T, ClientCredentialsError> {
     let expiry_deadline = token.map(|token| {
         check_token(&token.bearer, token.expires_at)?;
-        let remaining = token.expires_at.saturating_duration_since(Instant::now());
-        discovery_deadline(cx, remaining).map_err(ClientCredentialsError::from)
+        discovery_deadline(cx, token.expires_at.saturating_duration_since(Instant::now())).map_err(ClientCredentialsError::from)
     }).transpose()?;
     let deadline = expiry_deadline.map_or(deadline, |expiry| deadline.min(expiry));
     let mut stopped = std::pin::pin!(owner.cancelled());
@@ -568,21 +568,19 @@ async fn active<T>(
     within(cx, deadline, async {
         Ok(poll_fn(|task| {
             if owner.is_cancel_requested() || stopped.as_mut().poll(task).is_ready() { return Poll::Ready(Err(ClientCredentialsError::Closed)); }
-            if cancellation.is_cancel_requested() || cancelled.as_mut().poll(task).is_ready() {
-                return Poll::Ready(Err(ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)));
-            }
+            if cancellation.is_cancel_requested() || cancelled.as_mut().poll(task).is_ready() { return Poll::Ready(Err(OAuthDiscoveryError::Cancelled.into())); }
             if let Some(token) = token { check_token(&token.bearer, token.expires_at)?; }
             let result = future.as_mut().poll(task);
             if owner.is_cancel_requested() { return Poll::Ready(Err(ClientCredentialsError::Closed)); }
-            if cancellation.is_cancel_requested() { return Poll::Ready(Err(ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled))); }
+            if cancellation.is_cancel_requested() { return Poll::Ready(Err(OAuthDiscoveryError::Cancelled.into())); }
             if let Some(token) = token { check_token(&token.bearer, token.expires_at)?; }
             result
         }).await)
     }).await?
 }
 
-/// A protected response tied to its original service token and request decoder.
-/// No API can turn a partially read body into a silently retried operation.
+/// Protected response tied to the original service token and typed decoder.
+/// A polled read that is dropped owns socket cleanup; it cannot replay the POST.
 pub struct ClientCredentialsResponse {
     response: ModernHttpResponseStream,
     snapshot: ClientCredentialsSnapshot,
@@ -605,6 +603,21 @@ impl ClientCredentialsResponse {
         }).await
     }
 
+    /// Decodes terminal JSON with the original method's strict codec, preserving
+    /// exact unknown members and input_required. No result triggers another POST.
+    pub async fn read_json_result(self, cx: &Cx, maximum_bytes: usize) -> Result<CoreResult, ClientCredentialsError> {
+        if self.metadata().status() != 200 || self.metadata().kind() != ModernHttpResponseKind::Json {
+            return Err(ClientCredentialsError::UnexpectedResponse);
+        }
+        let Self { response, snapshot, owner, cancellation, request, request_id, deadline } = self;
+        active(cx, deadline, &owner, &cancellation, Some(&snapshot), async {
+            let bytes = response.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes)
+                .await.map_err(|_| ClientCredentialsError::UnexpectedResponse)?;
+            decoded_result(&request, &request_id, &bytes, maximum_bytes)
+        }).await
+    }
+
+    /// Raw bounded SSE data records, not an implicit Tasks/subscription decoder.
     pub fn into_sse_stream(self, limits: SseLimits) -> Result<ClientCredentialsSseStream, ClientCredentialsError> {
         Ok(ClientCredentialsSseStream {
             stream: Some(self.response.into_sse_stream(limits).map_err(|_| ClientCredentialsError::UnexpectedResponse)?),
@@ -613,7 +626,6 @@ impl ClientCredentialsResponse {
         })
     }
 }
-
 pub struct ClientCredentialsSseStream {
     stream: Option<ModernHttpSseResponseStream>,
     snapshot: ClientCredentialsSnapshot,
@@ -653,8 +665,9 @@ mod tests {
         let plan = plan();
         ClientInner { resource:plan.discovery.resource, token_endpoint:url("https://issuer.example/token"),
             client_id:"service-client".to_owned(), scopes:vec!["read".to_owned(),"write".to_owned()], secret:plan.secret,
-            issuer_roots:vec![], resource_roots:vec![], timeout:Duration::from_secs(30), maximum_lifetime:Duration::from_secs(60),
-            leeway:Duration::from_secs(30), closed:McpRequestCancellation::new(), state:Arc::new(Mutex::new(TokenState::default())) }
+            issuer_roots:vec![], timeout:Duration::from_secs(30), maximum_lifetime:Duration::from_secs(60),
+            leeway:Duration::from_secs(30), closed:McpRequestCancellation::new(), pending:AtomicUsize::new(0),
+            state:Arc::new(Mutex::new(TokenState::default())) }
     }
     fn core() -> CoreRequest {
         CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", Some(&json!({"_meta":{
@@ -674,10 +687,10 @@ mod tests {
     }
     #[test]
     fn basic_credentials_encode_components_before_encoding_the_pair() {
-        assert_eq!(basic("service", "secret"), "Basic c2VydmljZTpzZWNyZXQ=");
-        let header=basic("a:b +", "c/d=\u{e9}");
-        let decoded=base64::engine::general_purpose::STANDARD.decode(header.strip_prefix("Basic ").unwrap()).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), "a%3Ab+%2B:c%2Fd%3D%C3%A9");
+        assert_eq!(basic("service", "secret").unwrap(), "Basic c2VydmljZTpzZWNyZXQ=");
+        assert_eq!(basic("a:b +", "c/d=\u{e9}").unwrap(), "Basic YSUzQWIrJTJCOmMlMkZkJTNEJUMzJUE5");
+        assert_eq!(component("a:b +"), "a%3Ab+%2B");
+        assert_eq!(component("c/d=\u{e9}"), "c%2Fd%3D%C3%A9");
         assert_eq!(form(&[("scope",""),("grant_type","client_credentials")]), "grant_type=client_credentials");
     }
     #[test]
@@ -719,10 +732,29 @@ mod tests {
     }
     #[test]
     fn secrets_are_not_retained_by_debug_or_error_diagnostics() {
-        let plan=plan();
-        assert!(!format!("{plan:?}").contains("unit-secret"));
+        let policy=plan();
+        assert!(!format!("{policy:?}").contains("unit-secret"));
         assert!(ClientCredentialsPlan::new(url("https://resource.example/mcp"),TrustedOAuthIssuer::new("https://issuer.example").unwrap(),
             "service","bad\r\nsecret",vec![]).is_err());
         assert!(plan().with_maximum_token_lifetime(Duration::ZERO).is_err());
+    }
+    #[test]
+    fn shared_acquisition_bound_releases_capacity_when_work_is_dropped() {
+        let pending=AtomicUsize::new(0);
+        let permits:Vec<_>=(0..MAX_ACQUISITIONS).map(|_| AcquisitionPermit::new(&pending).unwrap()).collect();
+        assert!(matches!(AcquisitionPermit::new(&pending),Err(ClientCredentialsError::Saturated)));
+        drop(permits);
+        assert_eq!(pending.load(Ordering::Acquire),0);
+        let permit=AcquisitionPermit::new(&pending).unwrap();
+        drop(async move { let _permit=permit; std::future::pending::<()>().await; });
+        assert_eq!(pending.load(Ordering::Acquire),0);
+    }
+    #[test]
+    fn typed_json_admission_preserves_exact_members_and_refuses_foreign_ids() {
+        let wire=br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","x-exact":1.20e+4}}"#;
+        let result=decoded_result(&core(),&RequestId::Number(7),wire,4096).unwrap();
+        assert!(result.encode().unwrap().contains("1.20e+4"));
+        assert!(decoded_result(&core(),&RequestId::Number(8),wire,4096).is_err());
+        assert!(decoded_result(&core(),&RequestId::Number(7),wire,20).is_err());
     }
 }
