@@ -7,6 +7,10 @@ use fastmcp_client::http_auth::rpc::interaction::ManagedInputReply;
 #[path = "tasks.rs"]
 mod tasks;
 
+#[cfg(feature = "tasks")]
+#[path = "task_subscriptions.rs"]
+mod task_subscriptions;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
