@@ -27,10 +27,10 @@ use fastmcp_client::http_executor::{
     HTTP_03_A_EVALUATOR_MANIFEST_V1, MAX_MODERN_HTTP_PROBE_BODY_BYTES,
     MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
     MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
-    MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpErrorBodyAdmission,
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreCollector,
-    ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequest,
-    ModernHttpResponseKind, ModernHttpResponseStream, http_03_a_manifest_digest,
+    MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpErrorBody,
+    ModernHttpErrorBodyAdmission, ModernHttpExecutor, ModernHttpExecutorError,
+    ModernHttpFinalCoreCollector, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+    ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream, http_03_a_manifest_digest,
 };
 use fastmcp_client::sse::{SseLimits, SseParseError};
 use fastmcp_client::{
@@ -2133,6 +2133,42 @@ async fn success_content_type_outcome(
     outcome
 }
 
+/// One well-formed JSON-RPC error, correlated to the request the fixture sends.
+/// Byte-identical across every row below; only the response HEAD ever varies.
+const CLASSIFIED_ERROR_BODY: &[u8] =
+    br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"denied"}}"#;
+
+/// Drives one response and returns what the SHIPPED error-body classifier made
+/// of it.
+async fn classified_error_body(
+    cx: &Cx,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Option<ModernHttpErrorBody> {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), classified) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(&mut io, status, &[("Content-Type", content_type)], body).await;
+            end_stream(&mut io).await;
+        },
+        async {
+            post(cx, &request)
+                .await
+                .expect("the response head must be admitted")
+                .read_error_body(cx, 64 * 1024)
+                .await
+                .expect("the bounded body must be readable")
+        },
+    )
+    .await;
+    peer.assert_no_further_connection();
+    classified
+}
+
 async fn positive_07_response_content_type(cx: &Cx) {
     for (content_type, expected) in [
         ("application/json", ModernHttpResponseKind::Json),
@@ -2330,6 +2366,71 @@ async fn positive_07_response_content_type(cx: &Cx) {
             .expect("a 202 acknowledgement with no Content-Type must be admitted"),
         ModernHttpResponseKind::EmptyAcknowledgement
     );
+    // -----------------------------------------------------------------------
+    // The status-specific error-body path, now that it HAS a shipped consumer.
+    //
+    // Until this commit the client decided which non-success bodies were
+    // JSON-RPC and then nothing read the decision: the contract clause "a
+    // non-success path parses a JSON-RPC error body only when its content type
+    // is admitted as JSON" had no implementation. `read_error_body` is that
+    // path, and it is purely additive - callers that classify by status alone
+    // are unchanged.
+    //
+    // FOUR sides, not five. Idempotency is DROPPED, with the reason: the method
+    // takes `self` by value, so a second call is unrepresentable. A body is
+    // read once, and asserting a second read would require a method that does
+    // not and should not exist.
+    // -----------------------------------------------------------------------
+
+    // Side 1, the live control: declared JSON on a non-success status parses.
+    let classified = classified_error_body(cx, 500, "application/json", CLASSIFIED_ERROR_BODY)
+        .await
+        .expect("a non-success response has an error body to classify");
+    match classified {
+        ModernHttpErrorBody::JsonRpcError(response) => {
+            let error = response
+                .error
+                .expect("an admitted JSON-RPC error body carries its error");
+            assert_eq!(error.message, "denied");
+            assert_eq!(response.id, Some(RequestId::Number(1)));
+            assert!(
+                response.result.is_none(),
+                "an error envelope carries no result"
+            );
+        }
+        other => panic!("declared JSON on a non-success status must parse, saw {other:?}"),
+    }
+
+    // Side 3, the other limb: a SUCCESS never enters this path, even when its
+    // payload is byte-identical to the error body above. The classification is
+    // taken from the head, so nothing a body contains can promote it.
+    assert!(
+        classified_error_body(cx, 200, "application/json", CLASSIFIED_ERROR_BODY)
+            .await
+            .is_none(),
+        "a 2xx has no error body to classify, whatever its payload looks like"
+    );
+
+    // Side 4, still usable afterwards: an ordinary request still completes.
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let ((), ()) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_json_response(&mut io, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#).await;
+            end_stream(&mut io).await;
+        },
+        async {
+            post(cx, &request)
+                .await
+                .expect("an ordinary request must still complete")
+                .read_to_end(cx, 64 * 1024)
+                .await
+                .expect("its body must still be readable");
+        },
+    )
+    .await;
 }
 
 async fn negative_07_wrong_charset_parameter(cx: &Cx) {
@@ -2493,6 +2594,43 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
             .expect("the unmutated content type must be admitted again"),
         ModernHttpResponseKind::Json
     );
+    // -----------------------------------------------------------------------
+    // Side 2 of the error-body path: the one changed variable.
+    //
+    // The status is the same 500 and the body is byte-identical to the control
+    // the positive parses. ONLY the declared type changes, and the body must
+    // stay opaque - returned verbatim, never parsed - even though it is a
+    // perfectly well-formed JSON-RPC error. A client that sniffed the payload
+    // would parse it here and hand the caller a structured error the server
+    // never declared as one.
+    // -----------------------------------------------------------------------
+    let opaque = classified_error_body(cx, 500, "text/plain", CLASSIFIED_ERROR_BODY)
+        .await
+        .expect("a non-success response has an error body to classify");
+    match opaque {
+        ModernHttpErrorBody::Opaque(bytes) => assert_eq!(
+            bytes.as_slice(),
+            CLASSIFIED_ERROR_BODY,
+            "an opaque body reaches the caller byte for byte"
+        ),
+        other => panic!("an undeclared type must not be parsed, saw {other:?}"),
+    }
+
+    // Declared JSON but malformed: it stays opaque rather than being repaired,
+    // and no JSON-RPC error is invented for it. The sole changed variable is
+    // one truncated byte sequence in the body; the head is the control's.
+    const MALFORMED: &[u8] = br#"{"jsonrpc":"2.0","id":1,"error":{"code":"#;
+    let unrepaired = classified_error_body(cx, 500, "application/json", MALFORMED)
+        .await
+        .expect("a non-success response has an error body to classify");
+    match unrepaired {
+        ModernHttpErrorBody::Opaque(bytes) => assert_eq!(
+            bytes.as_slice(),
+            MALFORMED,
+            "a declared-JSON body that does not admit stays opaque and unrepaired"
+        ),
+        other => panic!("a malformed error body must not be repaired, saw {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

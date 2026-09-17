@@ -538,6 +538,21 @@ pub enum ModernHttpResponseKind {
 /// opaque to this transport layer, including one whose body happens to contain
 /// JSON: the decision is made from the declared media type before any body byte
 /// is consumed, never by sniffing.
+/// One non-success response body, classified by the DECLARED content type.
+///
+/// Which arm a body lands in is decided from the response head, by
+/// [`ModernHttpResponseMetadata::error_body_admission`], before any body byte
+/// is read. A payload can therefore never promote itself into the parsed arm by
+/// looking like a JSON-RPC error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModernHttpErrorBody {
+    /// The declared type was admitted as JSON and the bounded body decoded to
+    /// one strictly admitted JSON-RPC response.
+    JsonRpcError(JsonRpcResponse),
+    /// Everything else: bounded bytes, never parsed and never repaired.
+    Opaque(Vec<u8>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModernHttpErrorBodyAdmission {
     /// The declared content type is exactly JSON, so the bounded body may be
@@ -1000,6 +1015,51 @@ impl ModernHttpResponseStream {
     /// This consumes the stream. It is appropriate for the disposable modern
     /// connection probe and ordinary JSON responses; callers expecting an SSE
     /// stream should use [`Self::into_sse_stream`] instead.
+    /// Reads the bounded body of a NON-SUCCESS response and classifies it.
+    ///
+    /// This is the shipped consumer of
+    /// [`ModernHttpResponseMetadata::error_body_admission`] and the path the
+    /// package contract describes: a status-specific non-success path parses a
+    /// JSON-RPC error body only when its content type is admitted as JSON, and
+    /// otherwise the response remains an opaque bounded HTTP failure.
+    ///
+    /// Returns `Ok(None)` for a success response. A 2xx has no error body to
+    /// classify, and because the classification comes from the head, a success
+    /// whose payload happens to be a JSON-RPC error cannot enter this path.
+    ///
+    /// A body whose declared type IS admitted as JSON but which does not decode
+    /// to a strictly admitted JSON-RPC response stays [`Opaque`]. It is never
+    /// repaired, and a JSON-RPC error is never invented for it.
+    ///
+    /// This is purely additive: it changes no existing outcome. Callers that
+    /// classify a non-success response by status alone keep doing exactly what
+    /// they do today.
+    ///
+    /// [`Opaque`]: ModernHttpErrorBody::Opaque
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded body-read failures as [`Self::read_to_end`].
+    pub async fn read_error_body(
+        self,
+        cx: &Cx,
+        maximum_bytes: usize,
+    ) -> Result<Option<ModernHttpErrorBody>, ModernHttpExecutorError> {
+        let Some(admission) = self.metadata().error_body_admission() else {
+            return Ok(None);
+        };
+        let body = self.read_to_end(cx, maximum_bytes).await?;
+        Ok(Some(match admission {
+            ModernHttpErrorBodyAdmission::JsonRpcError => {
+                match decode_strict_jsonrpc_response(&body, maximum_bytes) {
+                    Ok(admitted) => ModernHttpErrorBody::JsonRpcError(admitted.response().clone()),
+                    Err(_) => ModernHttpErrorBody::Opaque(body),
+                }
+            }
+            ModernHttpErrorBodyAdmission::Opaque => ModernHttpErrorBody::Opaque(body),
+        }))
+    }
+
     pub async fn read_to_end(
         self,
         cx: &Cx,
