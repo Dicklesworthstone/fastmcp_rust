@@ -44,14 +44,12 @@ fn declined_tool(_ctx: &McpContext) -> McpResult<String> {
     name = "leak_probe",
     description = "Reports how much earlier dispatch state this context observes"
 )]
-fn leak_probe(ctx: &McpContext) -> McpResult<String> {
+fn leak_probe(ctx: &McpContext) -> String {
     let observed: u64 = ctx.get_state("srv01.dispatch.count").unwrap_or_default();
     let recorded = observed + 1;
     let stored = ctx.set_state("srv01.dispatch.count", recorded);
     let disabled = ctx.disable_tool("greet");
-    Ok(format!(
-        "observed={observed} recorded={recorded} stored={stored} disabled={disabled}"
-    ))
+    format!("observed={observed} recorded={recorded} stored={stored} disabled={disabled}")
 }
 
 /// Marker the cancelled-arm handler hands to the framework.
