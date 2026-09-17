@@ -161,6 +161,14 @@ name = "echo_server"
 path = "examples/echo_server.rs"
 # The CLI integration target launches an explicit freshly built instance of
 # this shipped executable rather than a scripted fixture.
+#
+# COUPLING, deliberately noted here rather than left to be rediscovered: the
+# README documents `cargo run -p fastmcp-rust --bin echo_server` with no
+# `--features`. That command works ONLY because this required set is exactly
+# equal to the package `default`. Narrow either one and the README does not
+# fail with a missing-target error — it fails with a required-features refusal,
+# which reads like a different bug entirely. If you change `default`, change
+# the README in the same commit.
 required-features = ["legacy-2024-11-05", "tasks"]
 
 [[example]]

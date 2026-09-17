@@ -398,13 +398,18 @@ macOS provide `x86_64` and `aarch64` archives (`fastmcp-linux-x86_64`,
 `fastmcp-linux-aarch64`, `fastmcp-darwin-x86_64`,
 `fastmcp-darwin-aarch64`); Windows provides `fastmcp-windows-x86_64` (MSVC).
 There are no `amd64`/`arm64` alias names. Every archive has a `.sha256`
-sibling and the release carries a `SHA256SUMS` file. The checked-in release
-workflow is currently a quarantined verification surface and does not publish
-new GitHub Releases.
+sibling and the release carries a `SHA256SUMS` file.
+
+The checked-in release workflow is currently a quarantined verification surface
+and does not publish new GitHub Releases. v0.10.0 and its archives were
+published before that quarantine, so the download below pins that tag
+explicitly rather than using `releases/latest` — under a workflow that does not
+publish, `latest` is a moving pointer whose meaning is not stated anywhere, and
+a pinned tag is what the surrounding text actually asserts is available.
 
 ```bash
 # Example: macOS Apple Silicon
-curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/latest/download/fastmcp-darwin-aarch64.tar.xz
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.10.0/fastmcp-darwin-aarch64.tar.xz
 tar -xJf fastmcp-darwin-aarch64.tar.xz
 ./fastmcp --version
 ```
