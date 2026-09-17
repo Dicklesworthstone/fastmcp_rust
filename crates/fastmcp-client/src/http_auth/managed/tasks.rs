@@ -37,6 +37,9 @@ use super::{
 use crate::http_executor::{ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
 
+/// Opt-in bounded Task polling and host input resolution.
+pub mod driver;
+
 /// Independent wire and lifetime bounds for discovery plus one Task operation.
 /// Native HTTP body/idle bounds still apply and may be tighter. Record count
 /// includes the terminal; it bounds total streamed work without collecting it.
