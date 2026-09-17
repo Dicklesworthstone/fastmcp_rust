@@ -33,9 +33,11 @@ use fastmcp_client::http_executor::{
 use fastmcp_client::sse::{SseLimits, SseParseError};
 use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
+    ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientProtocolPlan, ProtocolPolicy, RequestTimeoutPolicy,
 };
 use fastmcp_core::sha256_bounded;
+use fastmcp_protocol::protocol_policy::{HttpModernProbe, HttpProbeBody};
 use fastmcp_protocol::{JsonRpcAdmissionError, ProgressMarker, RawJsonAdmissionError, RequestId};
 
 // ---------------------------------------------------------------------------
@@ -359,6 +361,117 @@ fn http_03_a_positive() {
             execute_positive(&cx, case).await;
         }
     });
+
+    // No-downgrade status matrix. Era classification is synchronous and needs
+    // no socket, so it runs outside the runtime block.
+    //
+    // An ordinary failure is never a downgrade signal. Authentication, payment,
+    // permission, rate-limit, conflict and every 5xx status must leave the
+    // negotiation with no legacy authorization and no selected era.
+    for status in [
+        401_u16, 402, 403, 407, 409, 410, 418, 422, 429, 500, 501, 502, 503, 504,
+    ] {
+        for body in [HttpProbeBody::Empty, HttpProbeBody::Unrecognized] {
+            let (outcome, authorized, era) = observe_once(ProtocolPolicy::Auto, status, body);
+            assert_eq!(
+                outcome,
+                Err(
+                    ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                        status,
+                        body
+                    }
+                ),
+                "status {status} with {body:?} must not authorize a legacy fallback"
+            );
+            assert!(
+                !authorized,
+                "status {status} with {body:?} left a legacy authorization"
+            );
+            assert_eq!(era, None, "status {status} with {body:?} selected an era");
+        }
+    }
+
+    // A transport failure is not a status at all and is never a downgrade
+    // signal, under either era-capable policy.
+    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::ModernOnly] {
+        let (outcome, authorized, era) = observe_once(policy, 0, HttpProbeBody::TransportFailure);
+        assert_eq!(
+            outcome,
+            Err(ClientHttpNegotiationError::ModernProbeTransportFailure),
+            "{policy:?} downgraded on a transport failure"
+        );
+        assert!(!authorized);
+        assert_eq!(era, None);
+    }
+
+    // ModernOnly never downgrades, whatever the status - including the one
+    // status that authorizes a fallback under Auto.
+    for status in [400_u16, 401, 429, 500] {
+        let (outcome, authorized, era) = observe_once(
+            ProtocolPolicy::ModernOnly,
+            status,
+            HttpProbeBody::Unrecognized,
+        );
+        assert_eq!(
+            outcome,
+            Err(
+                ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                    status,
+                    body: HttpProbeBody::Unrecognized
+                }
+            ),
+            "ModernOnly must never authorize a fallback, saw status {status}"
+        );
+        assert!(
+            !authorized,
+            "ModernOnly authorized a fallback at status {status}"
+        );
+        assert_eq!(era, None);
+    }
+
+    // A recognized modern JSON-RPC body selects modern regardless of the status
+    // that carried it, so a failing status cannot suppress a valid modern peer.
+    for status in [200_u16, 400, 401, 500] {
+        let (outcome, authorized, era) = observe_once(
+            ProtocolPolicy::Auto,
+            status,
+            HttpProbeBody::RecognizedModernJsonRpc,
+        );
+        assert_eq!(
+            outcome,
+            Ok(ClientHttpNegotiationDecision::ModernSelected),
+            "a recognized modern body at status {status} must select modern"
+        );
+        assert!(
+            !authorized,
+            "selecting modern must not also authorize legacy"
+        );
+        assert_eq!(
+            era,
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+    }
+
+    // The probe is never replayed: a second observation is refused whatever it
+    // carries, so no status sequence can walk the client into a downgrade.
+    let mut negotiation = negotiation_for(ProtocolPolicy::Auto);
+    assert!(
+        negotiation
+            .observe_modern_probe(HttpModernProbe {
+                status: 500,
+                body: HttpProbeBody::Unrecognized
+            })
+            .is_err()
+    );
+    assert_eq!(
+        negotiation.observe_modern_probe(HttpModernProbe {
+            status: 400,
+            body: HttpProbeBody::Empty
+        }),
+        Err(ClientHttpNegotiationError::ModernProbeAlreadyDispatched),
+        "a refused probe must not leave the attempt open to a second, downgrading probe"
+    );
+    assert!(!negotiation.state().legacy_sse_fallback_authorized());
 }
 
 #[test]
@@ -376,6 +489,85 @@ fn http_03_a_planted_negative() {
             execute_negative(&cx, case).await;
         }
     });
+
+    // No-downgrade planted negative. The accepted case is the one status that
+    // authorizes a legacy fallback under Auto: 400 with an unrecognized body.
+    // Each mutation below changes exactly ONE variable of that accepted case and
+    // must lose the authorization.
+    let accepted = observe_once(ProtocolPolicy::Auto, 400, HttpProbeBody::Unrecognized);
+    assert_eq!(
+        accepted.0,
+        Ok(ClientHttpNegotiationDecision::LegacySseFallbackAuthorized),
+        "the accepted downgrade case is 400 with an unrecognized body under Auto"
+    );
+    assert!(
+        accepted.1,
+        "the accepted case authorizes the legacy fallback"
+    );
+
+    // (a) One variable: the policy. Auto becomes ModernOnly.
+    let (outcome, authorized, era) =
+        observe_once(ProtocolPolicy::ModernOnly, 400, HttpProbeBody::Unrecognized);
+    assert_eq!(
+        outcome,
+        Err(
+            ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                status: 400,
+                body: HttpProbeBody::Unrecognized
+            }
+        ),
+        "changing only the policy must withdraw the authorization"
+    );
+    assert!(!authorized);
+    assert_eq!(era, None);
+
+    // (b) One variable: the status. 400 becomes 500.
+    let (outcome, authorized, _) =
+        observe_once(ProtocolPolicy::Auto, 500, HttpProbeBody::Unrecognized);
+    assert_eq!(
+        outcome,
+        Err(
+            ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                status: 500,
+                body: HttpProbeBody::Unrecognized
+            }
+        ),
+        "changing only the status must withdraw the authorization"
+    );
+    assert!(!authorized);
+
+    // (c) One variable: the body class. Unrecognized becomes a recognized
+    //     modern JSON-RPC body, which selects modern rather than downgrading.
+    let (outcome, authorized, _) = observe_once(
+        ProtocolPolicy::Auto,
+        400,
+        HttpProbeBody::RecognizedModernJsonRpc,
+    );
+    assert_eq!(
+        outcome,
+        Ok(ClientHttpNegotiationDecision::ModernSelected),
+        "changing only the body class must select modern"
+    );
+    assert!(!authorized, "selecting modern must not authorize legacy");
+
+    // (d) One variable: the body class becomes a transport failure.
+    let (outcome, authorized, _) =
+        observe_once(ProtocolPolicy::Auto, 400, HttpProbeBody::TransportFailure);
+    assert_eq!(
+        outcome,
+        Err(ClientHttpNegotiationError::ModernProbeTransportFailure),
+        "a transport failure is never a downgrade signal"
+    );
+    assert!(!authorized);
+
+    // Restored: the unmutated accepted case still authorizes, so each refusal
+    // above came from its single changed variable and not a poisoned path.
+    let restored = observe_once(ProtocolPolicy::Auto, 400, HttpProbeBody::Unrecognized);
+    assert_eq!(
+        restored.0,
+        Ok(ClientHttpNegotiationDecision::LegacySseFallbackAuthorized)
+    );
+    assert!(restored.1);
 }
 
 async fn execute_positive(cx: &Cx, case: ManifestCase) {
@@ -1562,6 +1754,70 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
         Some(ModernHttpErrorBodyAdmission::JsonRpcError),
         "the unmutated declared type is admitted again"
     );
+}
+
+// ---------------------------------------------------------------------------
+// No-downgrade status matrix
+//
+// Era classification must never be talked into the legacy adapter by an
+// ordinary failure. These helpers drive the shipped public
+// `ClientHttpNegotiation` surface, one fresh negotiation per cell, because a
+// negotiation admits exactly one probe and must not be replayed.
+//
+// DELIBERATE OMISSION: statuses 404 and 405 are NOT asserted here. The frozen
+// package contract says "Do not interpret 404/405 as this adapter; those
+// statuses participate only in the excluded deprecated HTTP+SSE GET fallback",
+// but `negotiation.rs` currently authorizes a downgrade on 400 | 404 | 405 and
+// three other live targets encode that same behaviour. Asserting either way
+// here would either contradict the shipped client or add a fourth site
+// cementing a contract violation. The conflict is reported for a ruling rather
+// than resolved inside a test.
+// ---------------------------------------------------------------------------
+
+/// Builds a fresh negotiation for one policy against a loopback-shaped plan.
+fn negotiation_for(policy: ProtocolPolicy) -> ClientHttpNegotiation {
+    let modern =
+        CanonicalHttpUrl::parse("https://downgrade.example.test/mcp").expect("modern target");
+    let legacy_sse =
+        CanonicalHttpUrl::parse("https://downgrade.example.test/sse").expect("legacy sse target");
+    let legacy_message = CanonicalHttpUrl::parse("https://downgrade.example.test/messages")
+        .expect("legacy message target");
+    let plan = ClientProtocolPlan::http(
+        policy,
+        (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(modern),
+        (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_sse),
+        (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_message),
+        "credential-partition-http-03-a".to_owned(),
+        "security-partition-http-03-a".to_owned(),
+        "native-h1-http-03-a".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("the downgrade-matrix plan must be accepted");
+    ClientHttpNegotiation::from_protocol_plan(&plan)
+        .expect("the plan creates a negotiation attempt")
+}
+
+/// Observes one probe on a fresh negotiation and returns both the outcome and
+/// the post-state, so a caller can prove no legacy authorization leaked.
+fn observe_once(
+    policy: ProtocolPolicy,
+    status: u16,
+    body: HttpProbeBody,
+) -> (
+    Result<ClientHttpNegotiationDecision, ClientHttpNegotiationError>,
+    bool,
+    Option<fastmcp_protocol::protocol_policy::ProtocolEra>,
+) {
+    let mut negotiation = negotiation_for(policy);
+    let outcome = negotiation.observe_modern_probe(HttpModernProbe { status, body });
+    let state = negotiation.state();
+    (
+        outcome,
+        state.legacy_sse_fallback_authorized(),
+        state.selected_era(),
+    )
 }
 
 // ---------------------------------------------------------------------------
