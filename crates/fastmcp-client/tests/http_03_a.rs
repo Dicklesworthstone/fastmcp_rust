@@ -3740,6 +3740,19 @@ fn replacement_expanding_event(ascii_fill: usize, malformed: usize) -> Vec<u8> {
     body
 }
 
+/// LIMIT-01's declared SSE ceilings, transcribed from the frozen floors that
+/// `leg_http_01.rs:70-71` already publishes for the legacy lane.
+///
+/// These are the criterion's "9/36 MiB success ceilings" and the line ceilings
+/// that accompany them. They are caller-supplied here rather than shipped
+/// constants - `SseLimits` takes its bounds from whoever constructs it - so a
+/// transcribed literal is the only form available, and there is no constant
+/// under test for the assertion to be anchored to.
+const LIMIT_01_SSE_LINE_GUARDED: usize = 8_388_616;
+const LIMIT_01_SSE_LINE_HARD: usize = 33_554_440;
+const LIMIT_01_SSE_EVENT_GUARDED: usize = 9_437_184;
+const LIMIT_01_SSE_EVENT_HARD: usize = 37_748_736;
+
 async fn positive_11_bounds(cx: &Cx) {
     // Line ceiling, exactly N. A 4_090-octet payload makes a `data: ` line of
     // 4_096 raw octets against a 4_096-octet line ceiling: N+6 charged octets,
@@ -3904,6 +3917,32 @@ async fn positive_11_bounds(cx: &Cx) {
         payloads[0].len(),
         1 + REPLACEMENT_EXPANSION * DECODED_EVENT_MALFORMED
     );
+    // -----------------------------------------------------------------------
+    // The configuration surface can carry LIMIT-01's declared ceilings.
+    //
+    // SCOPE, stated plainly: this admits and round-trips the 9/36 MiB bounds.
+    // It does NOT stream a 36 MiB event. Re-running the boundary logic already
+    // proved at 4 096/8 192 and at the decoded ceilings, but three orders of
+    // magnitude larger, costs real wall-clock in a frozen runner and proves
+    // only that the same arithmetic has no size-specific bug. What is genuinely
+    // missing at 9/36 MiB is that nothing DECLARES them as this lane's
+    // ceilings, and that is a manifest gap, not a behavioural one.
+    // -----------------------------------------------------------------------
+    assert_eq!(LIMIT_01_SSE_LINE_GUARDED, 8 * 1024 * 1024 + 8);
+    assert_eq!(LIMIT_01_SSE_LINE_HARD, 32 * 1024 * 1024 + 8);
+    assert_eq!(LIMIT_01_SSE_EVENT_GUARDED, 9 * 1024 * 1024);
+    assert_eq!(LIMIT_01_SSE_EVENT_HARD, 36 * 1024 * 1024);
+
+    for (line, event) in [
+        (LIMIT_01_SSE_LINE_GUARDED, LIMIT_01_SSE_EVENT_GUARDED),
+        (LIMIT_01_SSE_LINE_HARD, LIMIT_01_SSE_EVENT_HARD),
+    ] {
+        let limits = SseLimits::new(line, event, 64)
+            .expect("LIMIT-01's declared ceilings must be expressible");
+        assert_eq!(limits.max_line_bytes(), line);
+        assert_eq!(limits.max_event_bytes(), event);
+        assert_eq!(limits.max_keepalive_lines(), 64);
+    }
 }
 
 async fn negative_11_one_byte_over_bounds(cx: &Cx) {
@@ -4061,6 +4100,42 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         .len(),
         1
     );
+    // -----------------------------------------------------------------------
+    // Fail closed at CONFIGURATION time. The accepted triple is LIMIT-01's
+    // guarded ceilings; each row below changes exactly ONE of its three
+    // arguments to zero and nothing else.
+    //
+    // A zero ceiling is not a small ceiling. `SseLimits::new` must refuse it
+    // outright, because a parser holding one would reject every input it was
+    // ever given while looking perfectly configured - a stream that silently
+    // yields nothing rather than an error anyone can see.
+    // -----------------------------------------------------------------------
+    let accepted = SseLimits::new(LIMIT_01_SSE_LINE_GUARDED, LIMIT_01_SSE_EVENT_GUARDED, 64);
+    assert!(accepted.is_some(), "the unmutated triple must construct");
+
+    for (line, event, keepalive, dimension) in [
+        (0, LIMIT_01_SSE_EVENT_GUARDED, 64, "line ceiling"),
+        (LIMIT_01_SSE_LINE_GUARDED, 0, 64, "event ceiling"),
+        (
+            LIMIT_01_SSE_LINE_GUARDED,
+            LIMIT_01_SSE_EVENT_GUARDED,
+            0,
+            "keepalive ceiling",
+        ),
+    ] {
+        assert!(
+            SseLimits::new(line, event, keepalive).is_none(),
+            "a zero {dimension} must be refused at construction, not carried into a parser"
+        );
+    }
+
+    // Unchanged state: the unmutated triple still constructs and still
+    // round-trips, so each refusal came from its own zeroed dimension.
+    let restored = SseLimits::new(LIMIT_01_SSE_LINE_GUARDED, LIMIT_01_SSE_EVENT_GUARDED, 64)
+        .expect("the unmutated triple must construct again");
+    assert_eq!(restored.max_line_bytes(), LIMIT_01_SSE_LINE_GUARDED);
+    assert_eq!(restored.max_event_bytes(), LIMIT_01_SSE_EVENT_GUARDED);
+    assert_eq!(restored.max_keepalive_lines(), 64);
 }
 
 // ---------------------------------------------------------------------------
