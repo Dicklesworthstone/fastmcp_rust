@@ -359,7 +359,11 @@ fn run_catalog(case: CatalogCase) {
                     let credential = session.credential(&cx).await.unwrap();
                     credential.credential().revoke();
                     let result = client.collect(&cx, catalog_request(method), || panic!("revoked cache access must not attempt a POST"), |_| Ok(())).await;
-                    assert!(matches!(result, Err(ManagedCatalogError::CredentialRevoked)));
+                    // Acquisition refuses an already-revoked login before the
+                    // collector receives a snapshot or touches its cache.
+                    assert!(matches!(result, Err(ManagedCatalogError::Core(
+                        fastmcp_client::http_auth::rpc::ManagedCoreError::Session(OAuthSessionError::LoginRequired)
+                    ))));
                     assert_eq!(client.cache_stats().unwrap(), before, "revocation is checked before lookup or fill");
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
