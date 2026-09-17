@@ -40,6 +40,64 @@ pub enum Code {
     /// An authorization row cites an exact revision that is not the one the
     /// dated core page actually links.
     AuthRevisionWrong,
+    /// The plan exceeds a declared parser limit.
+    PlanLimitExceeded,
+    /// The plan bytes are not admissible: bare CR, BOM, NUL, or invalid UTF-8.
+    PlanEncodingInvalid,
+    /// The canonical region boundary headings were not found outside a fence.
+    PlanRegionMissing,
+    /// A fence opened inside the region and never closed.
+    PlanFenceUnclosed,
+    /// A package heading does not match the exact structural grammar.
+    PackageHeadingInvalid,
+    /// A package identifier does not match the ASCII grammar.
+    PackageIdInvalid,
+    /// Two packages share one identifier.
+    PackageDuplicate,
+    /// A canonical package body exceeds the declared limit.
+    PackageBodyTooLarge,
+    /// The `Dependencies:` section is missing, duplicated, or malformed.
+    DependencySectionInvalid,
+    /// A dependency bullet does not match the exact bullet grammar.
+    DependencyBulletInvalid,
+    /// A dependency list mixes the `- None.` sentinel with identifiers.
+    DependencyMixedSentinel,
+    /// A dependency names a package the corpus does not define.
+    DependencyUnresolved,
+    /// A package depends on itself.
+    DependencySelfEdge,
+    /// One dependency edge is declared twice.
+    DependencyDuplicate,
+    /// Text between packages that is neither blank, a separator, nor a
+    /// level-one or level-two structural heading.
+    InterstitialProse,
+    /// A v2 byte stream has a wrong magic, version, count, length, or order,
+    /// is truncated, or carries trailing bytes.
+    StreamMalformed,
+    /// A canonical re-encode of a decoded stream is not byte-identical.
+    StreamReencodeMismatch,
+    /// A pass that requires a reservation snapshot did not get one.
+    ReservationSnapshotMissing,
+    /// The snapshot is older than the freshness window, or future-dated.
+    ReservationSnapshotStale,
+    /// The snapshot names a different project.
+    ReservationWrongProject,
+    /// The snapshot names a different agent.
+    ReservationWrongAgent,
+    /// A lease was taken for a different issue.
+    ReservationWrongIssue,
+    /// A lease has already expired.
+    ReservationExpired,
+    /// A claim-time lease has too little remaining time to cover the work.
+    ReservationInsufficientRemaining,
+    /// One lease id or path appears twice.
+    ReservationDuplicate,
+    /// A lease covers more than the declaration asked for.
+    ReservationPathTooBroad,
+    /// Declared and observed reservation sets are not equal.
+    ReservationDeclarationMismatch,
+    /// Lease coverage lapsed between claim and close.
+    ReservationRenewalGap,
 }
 
 impl Code {
@@ -58,6 +116,34 @@ impl Code {
             Self::ConformanceReferenceStale => "E_FND02_CONFORMANCE_REFERENCE_STALE",
             Self::AuthRevisionFloating => "E_FND02_AUTH_REVISION_FLOATING",
             Self::AuthRevisionWrong => "E_FND02_AUTH_REVISION_WRONG",
+            Self::PlanLimitExceeded => "E_FND02_PLAN_LIMIT_EXCEEDED",
+            Self::PlanEncodingInvalid => "E_FND02_PLAN_ENCODING_INVALID",
+            Self::PlanRegionMissing => "E_FND02_PLAN_REGION_MISSING",
+            Self::PlanFenceUnclosed => "E_FND02_PLAN_FENCE_UNCLOSED",
+            Self::PackageHeadingInvalid => "E_FND02_PACKAGE_HEADING_INVALID",
+            Self::PackageIdInvalid => "E_FND02_PACKAGE_ID_INVALID",
+            Self::PackageDuplicate => "E_FND02_PACKAGE_DUPLICATE",
+            Self::PackageBodyTooLarge => "E_FND02_PACKAGE_BODY_TOO_LARGE",
+            Self::DependencySectionInvalid => "E_FND02_DEPENDENCY_SECTION_INVALID",
+            Self::DependencyBulletInvalid => "E_FND02_DEPENDENCY_BULLET_INVALID",
+            Self::DependencyMixedSentinel => "E_FND02_DEPENDENCY_MIXED_SENTINEL",
+            Self::DependencyUnresolved => "E_FND02_DEPENDENCY_UNRESOLVED",
+            Self::DependencySelfEdge => "E_FND02_DEPENDENCY_SELF_EDGE",
+            Self::DependencyDuplicate => "E_FND02_DEPENDENCY_DUPLICATE",
+            Self::InterstitialProse => "E_FND02_INTERSTITIAL_PROSE",
+            Self::StreamMalformed => "E_FND02_STREAM_MALFORMED",
+            Self::StreamReencodeMismatch => "E_FND02_STREAM_REENCODE_MISMATCH",
+            Self::ReservationSnapshotMissing => "E_FND02_RESERVATION_SNAPSHOT_MISSING",
+            Self::ReservationSnapshotStale => "E_FND02_RESERVATION_SNAPSHOT_STALE",
+            Self::ReservationWrongProject => "E_FND02_RESERVATION_WRONG_PROJECT",
+            Self::ReservationWrongAgent => "E_FND02_RESERVATION_WRONG_AGENT",
+            Self::ReservationWrongIssue => "E_FND02_RESERVATION_WRONG_ISSUE",
+            Self::ReservationExpired => "E_FND02_RESERVATION_EXPIRED",
+            Self::ReservationInsufficientRemaining => "E_FND02_RESERVATION_INSUFFICIENT_REMAINING",
+            Self::ReservationDuplicate => "E_FND02_RESERVATION_DUPLICATE",
+            Self::ReservationPathTooBroad => "E_FND02_RESERVATION_PATH_TOO_BROAD",
+            Self::ReservationDeclarationMismatch => "E_FND02_RESERVATION_DECLARATION_MISMATCH",
+            Self::ReservationRenewalGap => "E_FND02_RESERVATION_RENEWAL_GAP",
         }
     }
 }
@@ -186,6 +272,34 @@ mod tests {
             Code::ConformanceReferenceStale,
             Code::AuthRevisionFloating,
             Code::AuthRevisionWrong,
+            Code::PlanLimitExceeded,
+            Code::PlanEncodingInvalid,
+            Code::PlanRegionMissing,
+            Code::PlanFenceUnclosed,
+            Code::PackageHeadingInvalid,
+            Code::PackageIdInvalid,
+            Code::PackageDuplicate,
+            Code::PackageBodyTooLarge,
+            Code::DependencySectionInvalid,
+            Code::DependencyBulletInvalid,
+            Code::DependencyMixedSentinel,
+            Code::DependencyUnresolved,
+            Code::DependencySelfEdge,
+            Code::DependencyDuplicate,
+            Code::InterstitialProse,
+            Code::StreamMalformed,
+            Code::StreamReencodeMismatch,
+            Code::ReservationSnapshotMissing,
+            Code::ReservationSnapshotStale,
+            Code::ReservationWrongProject,
+            Code::ReservationWrongAgent,
+            Code::ReservationWrongIssue,
+            Code::ReservationExpired,
+            Code::ReservationInsufficientRemaining,
+            Code::ReservationDuplicate,
+            Code::ReservationPathTooBroad,
+            Code::ReservationDeclarationMismatch,
+            Code::ReservationRenewalGap,
         ];
         let mut rendered: Vec<&str> = all.iter().map(|c| c.as_str()).collect();
         let count = rendered.len();

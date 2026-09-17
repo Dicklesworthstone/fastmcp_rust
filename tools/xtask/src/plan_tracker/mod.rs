@@ -14,7 +14,10 @@ pub mod authority;
 pub mod corpus;
 pub mod diagnostics;
 pub mod digest;
+pub mod fingerprint;
 pub mod manifest;
+pub mod plan;
+pub mod reservations;
 pub mod sources;
 pub mod trace;
 
