@@ -4341,7 +4341,7 @@ where
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        self.receiver.close()?;
+        self.receiver.close(cx)?;
         self.sender.close(cx)
     }
 }
@@ -32489,7 +32489,8 @@ exec sleep 6
         drop(held);
         success.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
-        sender.lock().unwrap().close().unwrap();
+        let cx = Cx::for_testing();
+        sender.lock().unwrap().close(&cx).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
     }
@@ -32993,7 +32994,7 @@ exec sleep 30
             &cancelled,
             "dropped-client callback cancellation in its owner region",
         );
-        sibling.close(&cx).expect("sibling client cleanup");
+        sibling.close().expect("sibling client cleanup");
     }
 
     #[cfg(unix)]
