@@ -15,6 +15,9 @@ mod task_subscriptions;
 #[path = "task_driver.rs"]
 mod task_driver;
 
+#[path = "catalogs.rs"]
+mod catalogs;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
