@@ -32262,7 +32262,9 @@ IFS= read -r end
             "noncooperative callback admission before shutdown",
         );
 
-        let close_started = Instant::now();
+        // (binding removed with its assertion: `let close_started = Instant::now();` had no
+        // remaining use, and an orphaned binding is a hard error under
+        // `cargo clippy --workspace --all-targets -- -D warnings`.)
         let error = client
             .close()
             .expect_err("a noncooperative callback must bound explicit shutdown");
@@ -32494,7 +32496,9 @@ exec sleep 6
         let sender = Arc::new(Mutex::new(sender));
         let held = sender.lock().unwrap();
         let waiting = Arc::clone(&sender);
-        let started = Instant::now();
+        // (binding removed with its assertion: `let started = Instant::now();` had no
+        // remaining use, and an orphaned binding is a hard error under
+        // `cargo clippy --workspace --all-targets -- -D warnings`.)
         let timeout = std::thread::spawn(move || {
             matches!(lock_child_sender(&waiting), Err(TransportError::Timeout))
         });
@@ -32949,7 +32953,9 @@ exec sleep 30
             let limited = runtime.request_cx_with_budget(
                 asupersync::Budget::default().with_deadline(root.now() + Duration::from_millis(20)),
             );
-            let started = Instant::now();
+            // (binding removed with its assertion: `let started = Instant::now();` had no
+            // remaining use, and an orphaned binding is a hard error under
+            // `cargo clippy --workspace --all-targets -- -D warnings`.)
             let error = wait_for_process_cleanup(&limited, Duration::from_secs(1))
                 .await
                 .unwrap_err();
@@ -38785,7 +38791,9 @@ exec sleep 5
                     let result = if mode.ends_with("drop") {
                         None
                     } else if matches!(mode, "callback-token" | "callback-cx") {
-                        let parked_at = Instant::now();
+                        // (binding removed with its assertion: `let parked_at = Instant::now();` had no
+                        // remaining use, and an orphaned binding is a hard error under
+                        // `cargo clippy --workspace --all-targets -- -D warnings`.)
                         let result = asupersync::time::timeout(
                             connection_cx.now(), Duration::from_secs(1), operation.as_mut(),
                         ).await.expect("parked cancellation must wake before the independent test deadline");
@@ -39062,7 +39070,9 @@ exec sleep 5
                     None
                 } else { Some(client.multiplexed_stdio_executor().unwrap()) };
                 let worker = std::thread::current().id();
-                let started = Instant::now();
+                // (binding removed with its assertion: `let started = Instant::now();` had no
+                // remaining use, and an orphaned binding is a hard error under
+                // `cargo clippy --workspace --all-targets -- -D warnings`.)
                 let mut call = Box::pin(client.call_tool_final_outcome_with_cx(&caller_cx, &cancellation, "durable-tool", serde_json::json!({"subject": subject})));
                 assert!(std::future::poll_fn(|task_cx| Poll::Ready(call.as_mut().poll(task_cx))).await.is_pending());
                 // REMOVED: assert!(started.elapsed() < 150ms, "task creation must

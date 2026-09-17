@@ -2187,7 +2187,9 @@ mod tests {
             stop_for_thread.store(true, Ordering::Release);
         });
         let cx = Cx::for_testing();
-        let started = Instant::now();
+        // (binding removed with its assertion: `let started = Instant::now();` had no
+        // remaining use, and an orphaned binding is a hard error under
+        // `cargo clippy --workspace --all-targets -- -D warnings`.)
 
         let result = cx
             .masked(|| transport.recv_until_or_stopped(&cx, None, || stop.load(Ordering::Acquire)));
