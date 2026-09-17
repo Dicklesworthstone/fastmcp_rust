@@ -1802,6 +1802,43 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
 // HTTP-03.07 — exact response Content-Type selection
 // ---------------------------------------------------------------------------
 
+/// Drives one success-lane response whose only variables are its status and its
+/// `Content-Type` field lines, and returns the selected body lane or the typed
+/// refusal.
+///
+/// Every outcome below is decided from the response head. The refusal cases all
+/// send a body that reads as JSON and is never fetched, so no case here can be
+/// reached by sniffing a payload.
+async fn success_content_type_outcome(
+    cx: &Cx,
+    status: u16,
+    content_types: &[&str],
+    body: &[u8],
+) -> Result<ModernHttpResponseKind, ModernHttpExecutorError> {
+    let peer = Peer::bind().await;
+    let request = ping_request(&peer.target());
+    let headers: Vec<(&str, &str)> = content_types
+        .iter()
+        .map(|value| ("Content-Type", *value))
+        .collect();
+    let ((), outcome) = pair(
+        async {
+            let mut io = peer.accept().await;
+            let _ = read_request(&mut io).await;
+            write_response(&mut io, status, &headers, body).await;
+            end_stream(&mut io).await;
+        },
+        async {
+            post(cx, &request)
+                .await
+                .map(|response| response.metadata().kind())
+        },
+    )
+    .await;
+    peer.assert_no_further_connection();
+    outcome
+}
+
 async fn positive_07_response_content_type(cx: &Cx) {
     for (content_type, expected) in [
         ("application/json", ModernHttpResponseKind::Json),
@@ -1957,6 +1994,48 @@ async fn positive_07_response_content_type(cx: &Cx) {
         admission, None,
         "a success response carries no error-body admission"
     );
+    // -----------------------------------------------------------------------
+    // The Content-Type grammar is PARSED, not string-matched.
+    //
+    // Optional whitespace around the parameter and the parameter NAME's case
+    // are both insignificant per RFC 9110. A reader that compared the field
+    // against one canonical spelling would reject all three of these
+    // admissible forms while still passing every case above.
+    // -----------------------------------------------------------------------
+    for (content_type, expected) in [
+        (
+            "application/json;charset=utf-8",
+            ModernHttpResponseKind::Json,
+        ),
+        (
+            "application/json ; charset=utf-8",
+            ModernHttpResponseKind::Json,
+        ),
+        (
+            "text/event-stream; CHARSET=UTF-8",
+            ModernHttpResponseKind::Sse,
+        ),
+    ] {
+        let kind = success_content_type_outcome(cx, 200, &[content_type], b"{}")
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{content_type} must select a body lane, saw {error:?}")
+            });
+        assert_eq!(
+            kind, expected,
+            "{content_type} must select exactly one body lane"
+        );
+    }
+
+    // The one admitted ABSENT form. A 202 acknowledgement declares no content
+    // type because it carries no body to type, and that is a distinct lane
+    // rather than a JSON or SSE selection.
+    assert_eq!(
+        success_content_type_outcome(cx, 202, &[], b"")
+            .await
+            .expect("a 202 acknowledgement with no Content-Type must be admitted"),
+        ModernHttpResponseKind::EmptyAcknowledgement
+    );
 }
 
 async fn negative_07_wrong_charset_parameter(cx: &Cx) {
@@ -2049,6 +2128,68 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
         Some(ModernHttpErrorBodyAdmission::JsonRpcError),
         "the unmutated declared type is admitted again"
     );
+    // -----------------------------------------------------------------------
+    // The sole changed variable is the STATUS. A 202 with no `Content-Type` is
+    // the one admitted absent form, proved in the positive. The same absent
+    // field at 200 declares a body it never typed, and must be refused rather
+    // than defaulted to either lane.
+    // -----------------------------------------------------------------------
+    let absent = success_content_type_outcome(cx, 200, &[], b"{}")
+        .await
+        .err()
+        .expect("a 200 with no Content-Type must be refused");
+    assert!(
+        matches!(
+            absent,
+            ModernHttpExecutorError::UnsupportedSuccessContentType
+        ),
+        "expected a typed content-type refusal, saw {absent:?}"
+    );
+
+    // The sole changed variable is CARDINALITY: the admitted value appears
+    // twice. Both copies are exactly `application/json`, so this cannot be
+    // mistaken for an unsupported type - it is the duplicate field line itself
+    // that is refused, and it carries its own distinct typed error.
+    let duplicate =
+        success_content_type_outcome(cx, 200, &["application/json", "application/json"], b"{}")
+            .await
+            .err()
+            .expect("duplicate Content-Type field lines must be refused");
+    assert!(
+        matches!(
+            duplicate,
+            ModernHttpExecutorError::DuplicateResponseHeader {
+                name: "Content-Type"
+            }
+        ),
+        "expected a typed duplicate-header refusal, saw {duplicate:?}"
+    );
+
+    // One changed variable each, all measured against the admitted
+    // `application/json`: a structured JSON suffix, a parameter with no value,
+    // and a second parameter.
+    //
+    // The suffix case is the anti-sniffing one. `application/vnd.mcp+json` is
+    // a JSON media type by RFC 6839's suffix convention and its body here IS
+    // valid JSON, yet the contract admits only the exact essence. Nothing may
+    // promote it - not the suffix, and not the payload, which is never read.
+    for content_type in [
+        "application/vnd.mcp+json",
+        "application/json; charset",
+        "application/json; charset=utf-8; boundary=x",
+    ] {
+        let refusal = success_content_type_outcome(cx, 200, &[content_type], b"{}")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{content_type} must not select a body lane"));
+        assert!(
+            matches!(
+                refusal,
+                ModernHttpExecutorError::UnsupportedSuccessContentType
+            ),
+            "{content_type}: expected a typed content-type refusal, saw {refusal:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
