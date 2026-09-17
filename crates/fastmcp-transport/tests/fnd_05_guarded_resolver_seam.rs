@@ -138,7 +138,20 @@ fn fnd_05_guarded_resolver_seam_planted_negative() {
     let control = vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")];
     let (control_outcome, control_calls) = fetch_with(control.clone());
     assert_eq!(control_calls, 1);
-    assert!(control_outcome.is_err(), "the control must be refused");
+
+    // NAME THE GUARD, do not merely require an error. `is_err()` here was the
+    // weakness in this pair: both arms of this negative are refusals, so a
+    // fetcher that returned ONE error for every input satisfied it and the
+    // mutation had no shape it could fail. Requiring the specific typed variant
+    // means a refusal arriving from any other guard - or from a later stage the
+    // address should never have reached - fails this assertion.
+    assert!(
+        matches!(
+            &control_outcome,
+            Err(GuardedHttpFetchError::DisallowedResolvedAddress(_))
+        ),
+        "the control must be refused BY THE ADDRESS FENCE, got {control_outcome:?}"
+    );
 
     // --- Mutation: exactly one address, private -> loopback ----------------
     let mut mutated = control.clone();
@@ -151,9 +164,25 @@ fn fnd_05_guarded_resolver_seam_planted_negative() {
 
     let (mutated_outcome, mutated_calls) = fetch_with(mutated);
     assert!(
-        mutated_outcome.is_err(),
-        "a loopback address supplied through the public seam must be refused; admitting it \
-         would mean the seam widened the production address fence"
+        matches!(
+            &mutated_outcome,
+            Err(GuardedHttpFetchError::DisallowedResolvedAddress(_))
+        ),
+        "a loopback address supplied through the public seam must be refused BY THE ADDRESS \
+         FENCE; admitting it, or refusing it from a later stage, would mean the seam widened \
+         the production fence. got {mutated_outcome:?}"
+    );
+
+    // THE MUTATION NOW HAS A SHAPE IT CAN FAIL, which a pair of bare `is_err()`
+    // checks did not. Both arms must be refused by the SAME guard: the control
+    // is private and the mutation is loopback, and the address fence owns both.
+    // If one arm migrated to a different variant, the fence boundary moved, and
+    // that is reported here as a boundary change rather than as an admission.
+    assert_eq!(
+        std::mem::discriminant(control_outcome.as_ref().unwrap_err()),
+        std::mem::discriminant(mutated_outcome.as_ref().unwrap_err()),
+        "both non-public addresses must be refused by the same typed guard; \
+         control {control_outcome:?} vs mutation {mutated_outcome:?}"
     );
 
     // Unchanged-state proof: the seam is still consulted exactly once, and the
@@ -163,7 +192,7 @@ fn fnd_05_guarded_resolver_seam_planted_negative() {
         "the mutation must not change how often the resolver is consulted"
     );
     assert!(!matches!(
-        mutated_outcome,
+        &mutated_outcome,
         Err(GuardedHttpFetchError::ResolutionEmpty)
     ));
 }
