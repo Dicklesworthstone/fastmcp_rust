@@ -2703,6 +2703,20 @@ fn sse_event_carrying(payload: &[u8]) -> Vec<u8> {
     body
 }
 
+/// Prefixes one SSE body with `boms` UTF-8 byte order marks.
+///
+/// The event-stream algorithm strips AT MOST ONE leading BOM. A second one is
+/// ordinary text, and because it lands ahead of the field name it makes that
+/// line's field `\u{FEFF}data` rather than `data`.
+fn bom_prefixed(boms: usize, body: &[u8]) -> Vec<u8> {
+    let mut prefixed = Vec::new();
+    for _ in 0..boms {
+        prefixed.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    prefixed.extend_from_slice(body);
+    prefixed
+}
+
 async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
@@ -2813,6 +2827,16 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
         .await
         .expect("a spliced terminal with ordinary text must be admitted")
         .expect("the terminal must arrive");
+    assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
+    // Exactly ONE leading BOM is stripped. This is the control for the
+    // double-BOM negative: same terminal, same framing, one BOM.
+    let event = listen_to_sse_body(
+        cx,
+        bom_prefixed(1, &sse_event_carrying(&terminal_with_raw_text(b"ok"))),
+    )
+    .await
+    .expect("one leading BOM must be stripped, leaving an admissible terminal")
+    .expect("the terminal must arrive");
     assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
@@ -2925,6 +2949,52 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
         .await
         .expect("the unmutated terminal must be admitted again")
         .expect("the terminal must arrive");
+    assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
+    // -----------------------------------------------------------------------
+    // The sole changed variable is ONE ADDED LEADING BOM.
+    //
+    // The algorithm strips at most one. The second is ordinary text, and
+    // because it sits ahead of the field name the line's field becomes
+    // `\u{FEFF}data` rather than `data` - an unknown field, which is framed and
+    // ignored. So nothing dispatches and the stream must end having delivered
+    // no terminal.
+    //
+    // A reader that skipped a fixed three-byte prefix, or that stripped every
+    // leading BOM instead of one, admits this stream and hands the caller a
+    // terminal. That is a wrong success, which is why the assertion is on the
+    // end-of-stream framing rather than merely on "not a terminal": nothing was
+    // discarded either, because nothing was ever pending.
+    // -----------------------------------------------------------------------
+    let refusal = listen_to_sse_body(
+        cx,
+        bom_prefixed(2, &sse_event_carrying(&terminal_with_raw_text(b"ok"))),
+    )
+    .await
+    .err()
+    .expect("a second BOM must not be stripped into an admissible terminal");
+    match refusal {
+        ModernHttpFinalCoreListenError::EndOfStream { framing } => {
+            let framing = framing.expect("end-of-stream framing must be reported");
+            assert!(
+                !framing.discarded_pending_event,
+                "the unrecognized field dispatched nothing, so nothing was pending to discard"
+            );
+            assert!(
+                !framing.discarded_partial_line,
+                "the body is correctly terminated; only the field name differs"
+            );
+        }
+        other => panic!("expected a typed end-of-stream refusal, saw {other:?}"),
+    }
+
+    // Unchanged state: the single-BOM control still delivers its terminal.
+    let restored = listen_to_sse_body(
+        cx,
+        bom_prefixed(1, &sse_event_carrying(&terminal_with_raw_text(b"ok"))),
+    )
+    .await
+    .expect("the single-BOM control must be admitted again")
+    .expect("the terminal must arrive");
     assert!(matches!(restored, ModernHttpFinalCoreEvent::Terminal(_)));
 }
 
