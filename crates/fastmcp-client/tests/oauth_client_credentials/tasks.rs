@@ -2,6 +2,9 @@
 //! isolated trust, resource/issuer discovery and the actual Basic token grant.
 //! This is client interoperability against a local peer, not server conformance.
 
+#[path = "subscriptions.rs"]
+mod subscriptions;
+
 use super::*;
 use fastmcp_client::http_auth::discovery::client_credentials::tasks::{
     ClientCredentialsTasksClient, ClientCredentialsTasksError as TaskError,
