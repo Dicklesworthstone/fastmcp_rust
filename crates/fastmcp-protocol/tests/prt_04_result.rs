@@ -800,6 +800,17 @@ const TYPED_CANONICAL_COMPLETE: &str = concat!(
 
 /// The same composition with no `_meta` at all. A modern result may omit it,
 /// and re-encoding must not synthesize it back onto the wire.
+/// A frame that is well formed under **both** core compositions.
+///
+/// Read as `complete`, `requestState` is an inert open sibling. Read as
+/// `input_required`, it is that composition's required member. That dual
+/// validity is what lets the discriminator be the only thing that differs
+/// between an accepted and a refused decode: without it, flipping the
+/// discriminator also flips whether the frame is structurally valid for the
+/// composition it names, and the refusal arrives from the wrong check.
+const DUAL_VALID_COMPOSITION: &str =
+    r#"{"resultType":"complete","status":"ready","record":{},"requestState":"retry-1"}"#;
+
 const TYPED_NO_META_COMPLETE: &str = concat!(
     r#"{"resultType":"complete","#,
     r#""status":"ready","#,
@@ -1129,16 +1140,51 @@ fn prt_04_b_planted_negative() {
     assert_eq!(error.path(), "$.status");
 
     // Planted mutation 2 — the forbidden dimension is the composition the
-    // discriminator selects. The discriminator stays a string of a core value;
-    // only which core value it names changes.
-    let planted_composition = TYPED_CANONICAL_COMPLETE.replacen(
+    // discriminator selects. The discriminator stays a string naming a core
+    // value; only WHICH core value it names changes.
+    //
+    // The baseline is deliberately well formed under both compositions. An
+    // earlier version of this case mutated a frame carrying neither
+    // `inputRequests` nor `requestState`, so flipping the discriminator also
+    // made the frame invalid for the composition it now named. It was still
+    // refused — but by `MissingInputRequest` from the input-required arm,
+    // which returns before the typed decoder ever reaches its composition
+    // check. A refusal arriving from a different check than the one a negative
+    // names proves only that *something* rejected the input, not that the
+    // forbidden dimension caused the rejection.
+    let accepted_composition =
+        decode_typed_complete::<LookupResult>(DUAL_VALID_COMPOSITION, ResultPeerEra::Modern)
+            .expect("the baseline is a valid complete composition")
+            .0;
+    assert_eq!(accepted_composition.payload.status, "ready");
+    assert_eq!(
+        extra_names(&accepted_composition.extras),
+        ["requestState"],
+        "read as `complete`, the input-required member is an inert sibling"
+    );
+    let planted_composition = DUAL_VALID_COMPOSITION.replacen(
         r#""resultType":"complete""#,
         r#""resultType":"input_required""#,
         1,
     );
-    assert_ne!(planted_composition, TYPED_CANONICAL_COMPLETE);
+    assert_ne!(planted_composition, DUAL_VALID_COMPOSITION);
+    // Prove the mutated frame is a WELL-FORMED input-required result before
+    // asking the typed decoder about it. This is what makes the refusal below
+    // attributable to the composition mismatch and nothing else.
+    let (untyped, _) = decode_peer_result(
+        &planted_composition,
+        ResultPeerEra::Modern,
+        &CoreResultDiscriminatorPolicy,
+    )
+    .expect("the mutated frame is a valid input-required result, not a malformed one");
+    let DecodedResult::InputRequired(untyped) = untyped else {
+        panic!("the mutated discriminator selects the input-required composition");
+    };
+    assert_eq!(untyped.request_state(), Some("retry-1"));
+    // Only now is the refusal attributable: the frame is valid, the decoder
+    // simply is not the one this composition belongs to.
     let error = decode_typed_complete::<LookupResult>(&planted_composition, ResultPeerEra::Modern)
-        .expect_err("only the selected core composition changed");
+        .expect_err("a typed complete decoder must refuse a well-formed non-complete composition");
     assert_eq!(error.kind(), ResultDecodeErrorKind::UnexpectedResultType);
     assert_eq!(error.path(), "$.resultType");
 
