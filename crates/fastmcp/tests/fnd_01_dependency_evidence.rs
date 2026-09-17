@@ -55811,6 +55811,7 @@ original = "value"
             "crates/fastmcp-core/src/crypto.rs" | "crates/fastmcp-core/src/lib.rs" | "crates/fastmcp/src/lib.rs" => STATE_PARTITION_RNG_SEALED_APIS.contains(&api),
             "crates/fastmcp-client/src/http_auth/oauth.rs" => matches!(api, "draw_hmac_sha256_key" | "draw_security_identifier"),
             "crates/fastmcp-core/src/state.rs"
+            | "crates/fastmcp-core/src/runtime.rs"
             | "crates/fastmcp-server/src/oauth.rs"
             | "crates/fastmcp-server/src/bidirectional.rs"
             | "crates/fastmcp-server/src/tasks.rs"
@@ -55831,6 +55832,19 @@ original = "value"
         }
         for api in ["draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
             assert!(!state_partition_rng_sealed_api_is_allowlisted(oauth_path, api), "the OAuth client must reject {api}");
+        }
+    }
+
+    #[test]
+    fn fnd_01_state_partition_rng_runtime_caller_sealed_api_allowlist_exact() {
+        let runtime_path = "crates/fastmcp-core/src/runtime.rs";
+        let neighboring_path = "crates/fastmcp-core/src/context.rs";
+        assert!(state_partition_rng_sealed_api_is_allowlisted(runtime_path, "draw_security_identifier"), "the runtime process-generation caller must admit draw_security_identifier");
+        for api in ["draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(runtime_path, api), "the runtime process-generation caller must reject {api}");
+        }
+        for api in ["draw_security_identifier", "draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask"] {
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api), "the neighboring core path must not inherit permission for {api}");
         }
     }
 
@@ -57935,7 +57949,7 @@ original = "value"
 
             for (label, anchor, replacement) in [
                 ("raw-crate-positive", root_module_route, "pub use r#fastmcp_core::{crypto, uri};"),
-                ("raw-module-positive", "pub mod core {", "pub mod r#core {"),
+                ("raw-module-positive", "\npub mod core {", "\npub mod r#core {"),
                 ("raw-private-module-positive", "pub mod __private {", "pub mod r#__private {"),
             ] {
                 let mut planted = baseline.clone();
