@@ -1473,8 +1473,108 @@ pub struct SubscriptionFilter {
     pub tools_list_changed: Option<bool>,
     /// Future notification categories accepted by the final schema and
     /// retained without activating any extension behavior.
+    ///
+    /// Absorption here is deliberate and required: the authoritative
+    /// 2026-07-28 schema declares `SubscriptionFilter` with no
+    /// `additionalProperties`, so unknown members are permitted, and no
+    /// definition in that schema is closed. Rejecting them would refuse wire
+    /// messages the specification allows.
+    ///
+    /// Absorption is also SILENT, which is the hazard: a misspelled canonical
+    /// key lands here, the typed field stays `None`, and the subscription is
+    /// narrowed to nothing without any party being in error. Call
+    /// [`SubscriptionFilter::suspected_key_typos`] to make that observable.
+    ///
+    /// Do NOT "fix" this by adding `deny_unknown_fields` to this struct. It
+    /// would contradict the schema, and it would also do nothing: serde emits
+    /// its deny check over the residual left AFTER flatten targets
+    /// deserialize, and a `BTreeMap<String, Value>` catch-all consumes every
+    /// entry, so the check can never fire. (Contrast `GetTaskParams` in
+    /// `tasks_extension`, where the same pair of attributes DOES reject,
+    /// because it flattens a typed struct that leaves unknown keys behind.)
     #[serde(flatten, default)]
     pub additional: BTreeMap<String, Value>,
+}
+
+/// An unrecognized [`SubscriptionFilter`] key that closely resembles a
+/// canonical field, and is therefore more likely a misspelling than a
+/// forward-compatible extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspectedFilterKeyTypo {
+    /// The unrecognized key exactly as it arrived on the wire.
+    pub received: String,
+    /// The canonical field it most closely resembles.
+    pub resembles: &'static str,
+}
+
+/// Case-folded edit distance, used only to rank short wire key names.
+fn folded_edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, lc) in left.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, rc) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(lc != rc);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+impl SubscriptionFilter {
+    /// Canonical wire names of the typed filter fields, in declaration order.
+    pub const CANONICAL_FIELDS: [&'static str; 4] = [
+        "promptsListChanged",
+        "resourceSubscriptions",
+        "resourcesListChanged",
+        "toolsListChanged",
+    ];
+
+    /// Unrecognized keys in [`Self::additional`] that resemble a canonical
+    /// field closely enough to be probable misspellings.
+    ///
+    /// This never rejects and never mutates: the schema permits unknown
+    /// members, so an extension must keep working. It only lets a caller see
+    /// what a silent absorption cost it.
+    ///
+    /// A key is reported when, case-folded, it equals a canonical field, is a
+    /// prefix of one, has one as a prefix, or is within an edit distance of
+    /// two. **The prefix rules are load-bearing, not decoration.** The
+    /// misspelling this accessor exists for is `resources` in place of
+    /// `resourceSubscriptions`: that is thirteen edits away and differs by far
+    /// more than capitalization, so a case-folding or edit-distance test alone
+    /// would miss the very defect that motivated this code.
+    ///
+    /// Genuine extensions are unaffected: a key like `experimentalFooBar`
+    /// matches none of the four rules against any canonical field.
+    #[must_use]
+    pub fn suspected_key_typos(&self) -> Vec<SuspectedFilterKeyTypo> {
+        let mut reported = Vec::new();
+        for key in self.additional.keys() {
+            let folded = key.to_lowercase();
+            let best = Self::CANONICAL_FIELDS
+                .iter()
+                .filter_map(|canonical| {
+                    let canonical_folded = canonical.to_lowercase();
+                    let distance = folded_edit_distance(&folded, &canonical_folded);
+                    let resembles = folded == canonical_folded
+                        || folded.starts_with(&canonical_folded)
+                        || canonical_folded.starts_with(&folded)
+                        || distance <= 2;
+                    resembles.then_some((distance, *canonical))
+                })
+                .min_by_key(|(distance, canonical)| (*distance, *canonical));
+            if let Some((_, resembles)) = best {
+                reported.push(SuspectedFilterKeyTypo {
+                    received: key.clone(),
+                    resembles,
+                });
+            }
+        }
+        reported
+    }
 }
 
 /// Final `subscriptions/listen` request parameters.
