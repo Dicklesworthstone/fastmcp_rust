@@ -272,6 +272,56 @@ impl MissingRequiredClientCapabilityError {
     }
 }
 
+/// One rule in the frozen final request-admission precedence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalAdmissionRule {
+    /// A header/body mirror condition, identified by its exact reason.
+    HeaderMismatch(HeaderMismatchReason),
+    /// The mirror was well formed but named an unsupported version.
+    UnsupportedProtocolVersion,
+}
+
+/// The exact order in which final request admission evaluates its rules.
+///
+/// Precedence is wire-visible contract, not an implementation detail. A peer
+/// that sends a request violating several rules at once must get the same
+/// refusal from every conforming implementation, or it cannot diagnose itself:
+/// a client told `EmptyHeader` when it also mismatched its method mirror will
+/// fix the header, resend, and be refused again for a reason it was never told
+/// about.
+///
+/// This order was always real, but until it was written down here it was
+/// *emergent* — a consequence of the statement order inside
+/// [`admit_final_request`] and [`admit_final_http_request`], unnamed, unpinned,
+/// and silently reorderable by any refactor that moved a `?`. Naming it makes
+/// a reorder a visible edit to a declared contract.
+///
+/// Reading order is evaluation order: rule `i` is evaluated strictly before
+/// rule `j` for every `i < j`, so a request violating both is refused by `i`.
+/// The three stages run version, then method, then name; the name stage is
+/// reached only for a method that requires `Mcp-Name`.
+pub const FINAL_ADMISSION_PRECEDENCE: &[FinalAdmissionRule] = &[
+    // Version stage.
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingBodyVersion),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyBodyVersion),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::HeaderBodyVersionMismatch),
+    FinalAdmissionRule::UnsupportedProtocolVersion,
+    // Method stage.
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingMethodHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingBodyMethod),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyMethodHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyBodyMethod),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::HeaderBodyMethodMismatch),
+    // Name stage, reached only when the method requires `Mcp-Name`.
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingNameHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::MissingBodyName),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyNameHeader),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::EmptyBodyName),
+    FinalAdmissionRule::HeaderMismatch(HeaderMismatchReason::HeaderBodyNameMismatch),
+];
+
 /// Typed failure from final request version admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestAdmissionError {
@@ -282,6 +332,20 @@ pub enum RequestAdmissionError {
 }
 
 impl RequestAdmissionError {
+    /// Returns the precedence rule that refused this request.
+    ///
+    /// This is the join between a refusal and
+    /// [`FINAL_ADMISSION_PRECEDENCE`]: it lets a caller — and the acceptance
+    /// harness — ask *which declared rule fired* rather than inferring it from
+    /// the error's shape.
+    #[must_use]
+    pub const fn rule(&self) -> FinalAdmissionRule {
+        match self {
+            Self::HeaderMismatch(error) => FinalAdmissionRule::HeaderMismatch(error.reason()),
+            Self::UnsupportedProtocolVersion(_) => FinalAdmissionRule::UnsupportedProtocolVersion,
+        }
+    }
+
     /// Returns the HTTP status required by this final request-admission failure.
     #[must_use]
     pub const fn http_status(&self) -> u16 {
