@@ -1325,8 +1325,35 @@ fn connect_modern_stdio_to_shipped_echo_server_with_env(
     block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
 }
 
+// LIVENESS bounds, not performance budgets. These are handed to the product's
+// `RequestTimeoutPolicy` by the connect helpers below, and what they enclose is a
+// subprocess spawn plus a live stdio handshake. They exist so a hung spawn cannot
+// block the suite forever; they are NOT an expectation about how fast that work
+// completes.
+//
+// They were `STDIO_COMPLETION_*`, 2s idle and 4s absolute, and under parallel test
+// load the product correctly enforced the idle bound and returned a typed error on
+// the connect. Nothing was misbehaving: the constant encoded an expectation nobody
+// holds. Everything comparable in this workspace sits at 10-20s for real-subprocess
+// work (e2e_cli readiness helpers 10s/15s, LIVE_HTTP_TEST_TIMEOUT 10s,
+// run_live_split_transport 10s/20s); these sat an order of magnitude tighter.
+//
+// DO NOT TIGHTEN THESE TO EXPRESS A PERFORMANCE EXPECTATION. Enforcement of the
+// timeout policy is already proved structurally, on the TYPED source rather than on
+// elapsed time, in crates/fastmcp-client/tests/http_03_b_runtime.rs: :3177
+// (RequestTimeoutSource::Idle), :2937 (::Absolute), :2776 and :2860 for the
+// progress-reset positive and its planted negative. That property does not live here.
 #[cfg(unix)]
-const STDIO_COMPLETION_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const STDIO_CONNECT_LIVENESS_IDLE_BOUND: Duration = Duration::from_secs(15);
+#[cfg(unix)]
+const STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND: Duration = Duration::from_secs(30);
+// Deliberately NOT renamed or resized. One constant was serving three unrelated roles:
+// the connect helpers' injected policy (split out above), the two `elapsed() <=`
+// assertions in the completion and MRTR positives, and the four `Instant::now() + ..`
+// polling deadlines for input-required, cancellation and notifications. Splitting the
+// liveness role out leaves those six uses exactly as they were. Deliberately described
+// by role rather than by line, because a line number is invalidated by the next edit
+// above it -- this comment block already moved them all by 24.
 #[cfg(unix)]
 const STDIO_COMPLETION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(4);
 #[cfg(unix)]
@@ -1353,8 +1380,8 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
         .env("FASTMCP_PROTOCOL_POLICY", server_policy)
         .request_timeout_policy(
             RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
             )
             .expect("the public completion timeout policy is valid"),
         );
@@ -1407,8 +1434,8 @@ fn connect_bounded_modern_stdio_with_mrtr(
             .env("FASTMCP_PROTOCOL_POLICY", server_policy)
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(
-                    STDIO_COMPLETION_IDLE_TIMEOUT,
-                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                    STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                    STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
                 )
                 .expect("the public completion timeout policy is valid"),
             )
@@ -1790,8 +1817,8 @@ fn connect_bounded_modern_stdio_with_client_title(
         .env("FASTMCP_PROTOCOL_POLICY", server_policy)
         .request_timeout_policy(
             RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
             )
             .expect("the public completion timeout policy is valid"),
         );
@@ -1864,8 +1891,8 @@ fn connect_legacy_stdio_with_client_name(
             .env("FASTMCP_PROTOCOL_POLICY", server_policy)
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(
-                    STDIO_COMPLETION_IDLE_TIMEOUT,
-                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                    STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                    STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
                 )
                 .expect("the public completion timeout policy is valid"),
             )
@@ -3045,8 +3072,8 @@ fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler(
             .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(
-                    STDIO_COMPLETION_IDLE_TIMEOUT,
-                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                    STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                    STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
                 )
                 .expect("the public follow timeout policy is valid"),
             )
@@ -4409,8 +4436,8 @@ fn e2e_public_stdio_legacy_handler_timeout_refuses_late_tool_and_admits_fast_pee
             .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(
-                    STDIO_COMPLETION_IDLE_TIMEOUT,
-                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                    STDIO_CONNECT_LIVENESS_IDLE_BOUND,
+                    STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND,
                 )
                 .expect("the public handler-timeout client policy is valid"),
             )
