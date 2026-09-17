@@ -249,6 +249,10 @@ impl ManagedCatalogClient {
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if attempts >= limits.maximum_collections { return Err(ManagedCatalogWatchError::CollectionLimit); }
                         let Some(local_cancel) = signal.begin(revision)? else { continue };
+                        // Capture the shared cache epoch independently of this
+                        // stream's revision. Another clone may clear it without
+                        // delivering a notification through this watch.
+                        let cache_generation = self.cache()?.begin_fetch(&kind.result_set());
                         attempts += 1;
                         let result = self.collect_with_cancellation(
                             cx, &local_cancel, request.clone(),
@@ -291,6 +295,9 @@ impl ManagedCatalogClient {
                         yield_once().await;
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if signal.revision()? != revision { continue; }
+                        // An external clear during the publication yield is
+                        // terminal, not a reason to override host policy by retry.
+                        self.require_generation(&kind.result_set(), cache_generation)?;
                         last_published = Some(revision);
                         let continuing = observer.emit(ManagedCatalogWatchEvent::Snapshot(catalog))?;
                         check_binding(cx, cancellation, deadline, &binding)?;
@@ -300,8 +307,10 @@ impl ManagedCatalogClient {
                 // Monitor-first polling makes an already-ready gap/notification
                 // win over a ready snapshot. Both losing futures remain owned
                 // until the WHOLE watch finishes, not merely until a page wins.
-                let mut monitor = std::pin::pin!(monitor);
-                let mut reconcile = std::pin::pin!(reconcile);
+                // Box the independently large HTTP state machines rather than
+                // multiplying their stack footprint inside the caller's future.
+                let mut monitor = Box::pin(monitor);
+                let mut reconcile = Box::pin(reconcile);
                 poll_fn(|task| {
                     check_binding(cx, cancellation, deadline, &binding)?;
                     if let Poll::Ready(result) = monitor.as_mut().poll(task) { return Poll::Ready(result); }
