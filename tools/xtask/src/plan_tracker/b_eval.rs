@@ -345,11 +345,14 @@ pub fn run(root: &Path, reservations_input: &ReservationInputs) -> Result<BRun, 
     // B-13 xtask-package-alias.
     reports.push(policy::check_xtask_package(root));
 
-    // B-14 workspace-unsafe-policy.
-    reports.push(policy::check_unsafe_policy(
+    // B-14 workspace-unsafe-policy: the crate roots carry the attribute and
+    // every workspace member inherits the root lint policy.
+    let mut b14 = policy::check_unsafe_policy(
         root,
         &["tools/xtask/src/lib.rs", "tools/xtask/src/main.rs"],
-    ));
+    );
+    b14.extend(policy::check_workspace_unsafe_policy(root));
+    reports.push(b14);
 
     // B-15 generated-inventory-closure: canonical package/label mapping
     // parity, generated from the parsed graph and the tracker export.

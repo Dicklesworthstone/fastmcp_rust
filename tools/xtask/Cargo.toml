@@ -24,3 +24,9 @@ path = "src/lib.rs"
 serde = { workspace = true }
 toml = { workspace = true }
 serde_json = { workspace = true }
+
+# Every workspace member inherits the root policy, which sets
+# unsafe_code = "forbid". A member that omits this table opts itself out
+# silently, so the checker rejects one that does.
+[lints]
+workspace = true

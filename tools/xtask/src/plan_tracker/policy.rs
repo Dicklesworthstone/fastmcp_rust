@@ -153,6 +153,127 @@ pub fn check_unsafe_policy(root: &Path, crate_roots: &[&str]) -> Report {
     report
 }
 
+/// The root workspace lint that every member must inherit.
+pub const WORKSPACE_UNSAFE_LINT: &str = "unsafe_code = \"forbid\"";
+
+/// Every workspace member, read from the root manifest's `members` list.
+///
+/// Parsed from the manifest rather than discovered on the filesystem: a
+/// directory that is not a declared member is not built, and a member whose
+/// directory is missing is a different defect than one that opts out of the
+/// lint policy.
+pub fn workspace_members(root: &Path) -> Result<Vec<String>, Diagnostic> {
+    let text = fs::read_to_string(root.join("Cargo.toml")).map_err(|error| {
+        Diagnostic::new(Code::SourceUnreadable, "Cargo.toml", "path", error.to_string())
+    })?;
+
+    let mut members = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("members") && trimmed.contains('[') {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if trimmed.starts_with(']') {
+                break;
+            }
+            if let Some(start) = trimmed.find('"')
+                && let Some(end) = trimmed.rfind('"')
+                && end > start
+            {
+                members.push(trimmed[start + 1..end].to_owned());
+            }
+        }
+    }
+
+    if members.is_empty() {
+        return Err(Diagnostic::new(
+            Code::WorkspacePolicy,
+            "Cargo.toml",
+            "members",
+            "the workspace declares no members",
+        ));
+    }
+    Ok(members)
+}
+
+/// FND-02-B-14, repository scope: the root forbids unsafe code and **every**
+/// member inherits that policy.
+///
+/// A member manifest without `[lints] workspace = true` opts itself out
+/// silently: nothing fails, no warning appears, and the invariant is simply
+/// not applied to that crate. That is the shape a policy regression takes
+/// here, so it is checked per member rather than assumed from the root.
+pub fn check_workspace_unsafe_policy(root: &Path) -> Report {
+    let mut report = Report::new();
+
+    match fs::read_to_string(root.join("Cargo.toml")) {
+        Err(error) => report.push(Diagnostic::new(
+            Code::SourceUnreadable,
+            "Cargo.toml",
+            "path",
+            error.to_string(),
+        )),
+        Ok(text) => {
+            if !text.contains(WORKSPACE_UNSAFE_LINT) {
+                report.push(Diagnostic::new(
+                    Code::WorkspacePolicy,
+                    "Cargo.toml",
+                    "workspace.lints.rust",
+                    format!("the root workspace must declare {WORKSPACE_UNSAFE_LINT}"),
+                ));
+            }
+        }
+    }
+
+    let members = match workspace_members(root) {
+        Ok(members) => members,
+        Err(diagnostic) => {
+            report.push(diagnostic);
+            return report;
+        }
+    };
+
+    for member in &members {
+        let manifest_path = root.join(member).join("Cargo.toml");
+        let Ok(manifest) = fs::read_to_string(&manifest_path) else {
+            report.push(Diagnostic::new(
+                Code::SourceUnreadable,
+                member,
+                "Cargo.toml",
+                "member manifest is unreadable",
+            ));
+            continue;
+        };
+
+        let inherits = manifest
+            .lines()
+            .skip_while(|line| line.trim() != "[lints]")
+            .any(|line| line.trim() == "workspace = true");
+        if !inherits {
+            report.push(Diagnostic::new(
+                Code::WorkspacePolicy,
+                member,
+                "lints",
+                "member manifest omits [lints] workspace = true and so does not \
+                 inherit the unsafe-code policy",
+            ));
+        }
+        if manifest.contains("unsafe_code = \"allow\"") || manifest.contains("unsafe_code = \"warn\"") {
+            report.push(Diagnostic::new(
+                Code::WorkspacePolicy,
+                member,
+                "lints",
+                "member manifest weakens the unsafe-code policy",
+            ));
+        }
+    }
+
+    report
+}
+
 /// A module in the checker, with its source size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSize {
@@ -298,6 +419,87 @@ mod tests {
         assert!(modules.iter().all(|m| m.lines <= MAX_MODULE_LINES));
         // The inventory is measured, not asserted: every module must be real.
         assert!(modules.iter().all(|m| m.bytes > 0));
+    }
+
+    #[test]
+    fn the_live_workspace_declares_every_member() {
+        let members = workspace_members(&repo_root()).expect("members parse");
+        assert!(members.contains(&"tools/xtask".to_owned()));
+        assert!(members.contains(&"crates/fastmcp".to_owned()));
+        assert!(members.len() >= 10, "observed {members:?}");
+    }
+
+    #[test]
+    fn every_live_workspace_member_inherits_the_unsafe_policy() {
+        let report = check_workspace_unsafe_policy(&repo_root());
+        assert!(report.is_clean(), "{}", report.render());
+    }
+
+    #[test]
+    fn a_member_that_omits_lint_inheritance_is_detected() {
+        // The predicate must be able to fail. Build a workspace whose single
+        // member has no [lints] table and require the omission to be named.
+        let root = std::env::temp_dir().join(format!(
+            "fnd-02-lints-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let member = root.join("crates/opted-out");
+        fs::create_dir_all(&member).expect("scratch");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/opted-out\",\n]\n\n\
+             [workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+        )
+        .expect("root manifest");
+        fs::write(member.join("Cargo.toml"), "[package]\nname = \"opted-out\"\n")
+            .expect("member manifest");
+
+        let report = check_workspace_unsafe_policy(&root);
+        assert!(report.has(Code::WorkspacePolicy));
+        assert!(
+            report
+                .diagnostics()
+                .iter()
+                .any(|d| d.subject == "crates/opted-out" && d.field == "lints")
+        );
+
+        // The same workspace passes once the member inherits.
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"opted-out\"\n\n[lints]\nworkspace = true\n",
+        )
+        .expect("member manifest");
+        assert!(check_workspace_unsafe_policy(&root).is_clean());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_root_without_the_forbid_lint_is_detected() {
+        let root = std::env::temp_dir().join(format!(
+            "fnd-02-noforbid-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let member = root.join("m");
+        fs::create_dir_all(&member).expect("scratch");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"m\",\n]\n",
+        )
+        .expect("root manifest");
+        fs::write(member.join("Cargo.toml"), "[lints]\nworkspace = true\n")
+            .expect("member manifest");
+
+        let report = check_workspace_unsafe_policy(&root);
+        assert!(
+            report
+                .diagnostics()
+                .iter()
+                .any(|d| d.field == "workspace.lints.rust")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

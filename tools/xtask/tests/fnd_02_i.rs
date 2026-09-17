@@ -126,6 +126,20 @@ impl Fixture {
         // small one, so the real plan is copied to that bound path instead.
         fs::copy(source.join(PLAN_PATH), root.join("real-plan.md")).expect("plan is copyable");
 
+
+        // Every declared workspace member's manifest, because the unsafe-code
+        // policy check reads each one. Only the manifests are needed; the
+        // crate sources are irrelevant to the policy subcase.
+        for member in fastmcp_xtask::plan_tracker::policy::workspace_members(&source)
+            .expect("the live workspace declares members")
+        {
+            let target = root.join(&member).join("Cargo.toml");
+            fs::create_dir_all(target.parent().expect("has a parent"))
+                .expect("scratch member directory");
+            fs::copy(source.join(&member).join("Cargo.toml"), &target)
+                .expect("member manifest is copyable");
+        }
+
         Self { root }
     }
 }
