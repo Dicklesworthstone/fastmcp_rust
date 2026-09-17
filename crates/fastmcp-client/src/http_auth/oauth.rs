@@ -1161,7 +1161,10 @@ mod tests {
     /// the bind become straight-line code in one task with no yield between
     /// them. This does not make theft impossible, since other OS threads still
     /// run, but it removes the structural cause instead of tolerating the
-    /// symptom, and it costs no sleep, no retry and no timing tolerance. The
+    /// symptom, and it costs no sleep and no timing tolerance. What remains of
+    /// the theft window is closed by independent repetition, not by waiting -
+    /// see `RELEASE_TRIALS`, and note that repeating the whole experiment on a
+    /// new port is a different thing from re-observing this one. The
     /// close is synchronous: the listener is a local of the dropped `authorize`
     /// future, asupersync's `TcpListener` has no `Drop` of its own, and its
     /// `std::net::TcpListener` closes the descriptor in `Drop`. There is

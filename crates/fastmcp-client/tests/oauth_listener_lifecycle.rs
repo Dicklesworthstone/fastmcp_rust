@@ -120,9 +120,10 @@ fn callback_address(authorization: &CanonicalHttpUrl) -> SocketAddr {
 /// setting it would let a leaked listener coexist with the probe bind and
 /// silently turn this proof into a no-op.
 ///
-/// No sleep, no retry, no timing tolerance: the close is synchronous in `Drop`,
-/// so there is nothing to wait for and a tolerance would hide the very leak this
-/// exists to catch.
+/// No sleep and no timing tolerance: the close is synchronous in `Drop`, so
+/// there is nothing to wait for and a tolerance would hide the very leak this
+/// exists to catch. The release case repeats the whole experiment on a fresh
+/// port instead - independent sampling, not a re-observation after a delay.
 /// SYNCHRONOUS ON PURPOSE. The previous form awaited asupersync's `bind`, and
 /// that `.await` is a scheduling point: between `drop(login)` closing the
 /// descriptor and the bind reaching the kernel, the runtime polls other tasks
@@ -132,7 +133,8 @@ fn callback_address(authorization: &CanonicalHttpUrl) -> SocketAddr {
 /// lies in every wave. `std::net`'s blocking bind removes the await, making the
 /// drop and the bind straight-line code with no yield between them. Theft is
 /// not impossible - other OS threads still run - but the structural cause is
-/// gone rather than tolerated, at no cost in sleep, retry or timing tolerance.
+/// gone rather than tolerated, at no cost in sleep or timing tolerance. The
+/// residual window is handled by independent trials, never by waiting longer.
 ///
 /// DO NOT reintroduce an `.await` between the drop and this bind.
 ///
