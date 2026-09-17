@@ -50218,6 +50218,91 @@ activate = 1\n";
         ("Cargo.lock", 99_964, "6b1c351b9e1647396957c7bffb023cc9e488226cbdbb8a13ae52984fa7d0e82f"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
+    /// bd-veqqv: MACHINE-CHECKED PROVENANCE for `TOOLCHAIN_WORKSPACE_INPUTS`.
+    ///
+    /// THE DEFECT THIS CLOSES. Dependency-pin refresh and FND-01's input freeze
+    /// have opposed mandates and no interlock: a refresh regenerates the lockfile
+    /// and moves the manifest, and nothing obliges it to re-attest, while the
+    /// freeze has no way to notice. The failure then surfaces as a byte-length
+    /// mismatch in a file nobody associates with a dependency bump.
+    ///
+    /// WHY A BOOLEAN WOULD NOT DO. FND-01 already records three authorization
+    /// concepts and enforces exactly one of them — `release_pin_change_authorized`,
+    /// a bare bool checked for `== true`. `supersession_authority`, which names WHO
+    /// authorized a move and WHICH commit carried it, has zero readers. So the one
+    /// enforced field carries no information, and a re-attest that merely updates a
+    /// number is indistinguishable from a regeneration-to-get-green (RH-3).
+    ///
+    /// WHAT THIS RECORDS: for each bound path, the commit that PRODUCED the
+    /// attested bytes. Three properties are then checkable, and together they
+    /// separate a repair from a regeneration:
+    ///   1. every bound path has an anchor, and every anchor a bound path;
+    ///   2. the blob at that anchor equals the recorded length AND digest — so a
+    ///      hand-edited number fails even when it matches the working tree;
+    ///   3. the anchor is the LATEST commit touching that path — so a later,
+    ///      unaccounted mover (exactly what a pin refresh is) fails and the
+    ///      message NAMES it, instead of surfacing as a bare length mismatch.
+    ///
+    /// The category split this deliberately preserves: these rows are
+    /// MEASUREMENTS of mutable content and are re-attestable by the mover with the
+    /// drift enumerated. The asupersync RELEASE PIN is a QUALIFICATION claim and is
+    /// NOT in this table — it is never mover-re-attestable and requires an operator
+    /// ruling. This mechanism must not become the route by which a pin move is
+    /// sanctioned.
+    const TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE: [(&str, &str); 3] = [
+        ("Cargo.toml", "a7109f655a3c10a661c76cddce6727ca339863c1"),
+        ("Cargo.lock", "a7109f655a3c10a661c76cddce6727ca339863c1"),
+        ("rust-toolchain.toml", "6a7e856662ce8607fb35b9f5670cef9ffbecc203"),
+    ];
+
+    /// bd-veqqv, PARTIAL AND SAYING SO: the half of the interlock that is
+    /// checkable on this pipeline's execution hosts.
+    ///
+    /// *** WHY ONLY A HALF. *** The designed mechanism verifies against git that
+    /// each anchor really produced the attested bytes, and that nothing touched
+    /// the path since. MEASURED: that cannot run here. RCH syncs the WORKING TREE
+    /// on top of a worker `.git` it never updates, so the execution host's history
+    /// is stale and divergent - worker HEAD 99822635 over 2017 commits, while
+    /// `a7109f65`, the commit that actually produced the current Cargo.toml bytes,
+    /// is "not a valid object name" there at all. A git assertion on a worker
+    /// measures THE WORKER'S history, not this repository's.
+    ///
+    /// THE TRAP THAT HIDES IT: old revisions still resolve. Such a test passes
+    /// until the revision it cites becomes newer than the worker's last fetch, so
+    /// it is a latent failure with a drifting, host-dependent trigger rather than
+    /// an honest red.
+    ///
+    /// SO THIS ENFORCES PROPERTY 1 ONLY - every frozen workspace input names a
+    /// producing commit, and every recorded anchor names a frozen input. That
+    /// alone makes an UNANCHORED binding impossible, which is the state the
+    /// pin-refresh collision produced. Properties 2 and 3 - blob-at-anchor
+    /// equality, and "no unaccounted mover since" - remain UNPROVEN HERE,
+    /// deliberately and visibly, rather than skipped into a false green.
+    #[test]
+    fn fnd_01_every_frozen_workspace_input_names_a_producing_commit() {
+        let bound: std::collections::BTreeSet<&str> =
+            TOOLCHAIN_WORKSPACE_INPUTS.iter().map(|(path, _, _)| *path).collect();
+        let anchored: std::collections::BTreeSet<&str> =
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE.iter().map(|(path, _)| *path).collect();
+        assert_eq!(
+            bound, anchored,
+            "every frozen workspace input must name the commit that produced it, \
+             and every recorded anchor must name a frozen input"
+        );
+        for (path, revision) in TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE {
+            assert_eq!(
+                revision.len(),
+                40,
+                "{path}: the producing commit must be a full 40-hex revision, not \
+                 an abbreviation that grows ambiguous as history does"
+            );
+            assert!(
+                revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{path}: producing commit {revision} is not a hexadecimal revision"
+            );
+        }
+    }
+
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
         ("s05", "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml", FileFamily::Toml, 10_446, "e892edd804f93e09ba03bcc9042d0628f5e149c3ee48c24b184af4814eeb3aed"),
         ("s06", "evidence/fnd-01/probes/asupersync/features-0.3.10.json", FileFamily::Json, 5_062, "df71c73a9e6ef657e612465afbfe907567f94f75bf3687c95fc5a73316fc7943"),
