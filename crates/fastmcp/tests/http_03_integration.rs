@@ -57,7 +57,8 @@ use fastmcp_rust::client::{
 };
 use fastmcp_rust::{
     CanonicalHttpUrl, FinalCoreResult, HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody,
-    ProgressMarker, ProtocolEra, ProtocolPolicy, RequestId, Sha256Digest, sha256_bounded,
+    JsonRpcRequest, ProgressMarker, ProtocolEra, ProtocolPolicy, RequestId, ServerNotification,
+    Sha256Digest, sha256_bounded,
 };
 
 /// The join's own public entrypoint, recorded in the receipt (PL-3).
@@ -457,6 +458,23 @@ fn write_sse_event(stream: &mut TcpStream, payload: &serde_json::Value) {
 }
 
 /// Closes a chunked SSE body with its terminating zero-length chunk.
+/// Writes one SSE event carrying an explicit `id:` field.
+///
+/// Used only to PLANT resumption bait. A stream that publishes an event id is
+/// the one condition under which a client could plausibly start carrying
+/// resumption state into later requests, so HTTP-03.25's negative creates that
+/// condition deliberately rather than asserting an absence that nothing ever
+/// challenged.
+fn write_sse_event_with_id(stream: &mut TcpStream, id: &str, payload: &serde_json::Value) {
+    let body = format!("id: {id}\ndata: {payload}\n\n").into_bytes();
+    write!(stream, "{:x}\r\n", body.len()).expect("write fixture chunk length");
+    stream
+        .write_all(&body)
+        .expect("write fixture chunk payload");
+    write!(stream, "\r\n").expect("write fixture chunk terminator");
+    stream.flush().expect("flush fixture SSE event");
+}
+
 fn end_sse_response(stream: &mut TcpStream) {
     write!(stream, "0\r\n\r\n").expect("write fixture terminating chunk");
     stream.flush().expect("flush fixture terminating chunk");
@@ -1033,6 +1051,7 @@ fn observe_independent_server_request() -> ServerRequestObservation {
 #[derive(Debug, Clone)]
 struct NotificationObservation {
     first_event: String,
+    second_request_resumption_header: Option<String>,
     terminal_after_notification: String,
     era_after_notification: ProtocolEra,
     requests_during_call: usize,
@@ -1065,7 +1084,7 @@ fn observe_extension_notification() -> NotificationObservation {
         .expect("read the notification fixture address");
     let target = format!("http://{address}/mcp-notification");
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    let (report_tx, report_rx) = mpsc::channel::<(usize, usize)>();
+    let (report_tx, report_rx) = mpsc::channel::<(usize, usize, Option<String>)>();
 
     let server = thread::spawn(move || {
         let mut probe = accept_bounded(&listener);
@@ -1090,13 +1109,29 @@ fn observe_extension_notification() -> NotificationObservation {
                 "method": "notifications/tools/list_changed",
             }),
         );
-        // The caller's own terminal still follows it.
-        write_sse_event(&mut call, &terminal_tool_event(71));
+        // The caller's own terminal still follows it - and it PUBLISHES AN
+        // EVENT ID, which is HTTP-03.25's planted variable.
+        write_sse_event_with_id(&mut call, "planted-event-id-25", &terminal_tool_event(71));
         end_sse_response(&mut call);
+        drop(call);
+
+        // A SECOND request on a fresh connection. If the client retained any
+        // resumption state from the id above, this is where it would surface as
+        // a Last-Event-ID header.
+        let mut second = accept_bounded(&listener);
+        let second_request = read_request(&mut second);
+        write_bounded_response(
+            &mut second,
+            200,
+            "application/json",
+            Some("identity"),
+            &ping_body(72),
+        );
+        drop(second);
+
         release_rx
             .recv()
             .expect("driver reports the notification call returned");
-        drop(call);
 
         listener
             .set_nonblocking(true)
@@ -1107,7 +1142,7 @@ fn observe_extension_notification() -> NotificationObservation {
             drop(stream);
         }
         report_tx
-            .send((1, extra))
+            .send((2, extra, second_request.header("Last-Event-ID")))
             .expect("report notification observations");
     });
 
@@ -1118,7 +1153,7 @@ fn observe_extension_notification() -> NotificationObservation {
         runtime.block_on(async {
             let cx = Cx::current().expect("the caller runtime must install a current Cx");
             let limits = SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits are nonzero");
-            let connection = integration_builder(&target)
+            let mut connection = integration_builder(&target)
                 .connect_http_with_cx(&cx)
                 .await
                 .expect("the notification endpoint must connect through the public builder");
@@ -1151,21 +1186,38 @@ fn observe_extension_notification() -> NotificationObservation {
                 Err(error) => format!("rejected::{error:?}"),
             };
             let era = connection.selected_protocol_era();
+
+            // Release the stream borrow, then issue the SECOND request. This is
+            // what gives HTTP-03.25's planted event id somewhere to leak to.
+            drop(stream_listener);
+            connection
+                .request_json(
+                    &cx,
+                    "ping",
+                    serde_json::json!({}),
+                    RequestId::Number(72),
+                    65_536,
+                )
+                .await
+                .expect("the follow-up request must still succeed");
+
             (first, terminal, era)
         });
 
     release_tx
         .send(())
         .expect("release the notification fixture");
-    let (requests_during_call, connections_after_return) = report_rx
-        .recv()
-        .expect("collect notification observations");
+    let (requests_during_call, connections_after_return, second_request_resumption_header) =
+        report_rx
+            .recv()
+            .expect("collect notification observations");
     server
         .join()
         .expect("the notification fixture thread must not panic");
 
     NotificationObservation {
         first_event,
+        second_request_resumption_header,
         terminal_after_notification,
         era_after_notification,
         requests_during_call,
@@ -2803,7 +2855,10 @@ fn case_caller_cancellation_close(builder: &mut CaseBuilder, wire: &WireObservat
         "a cancelled caller must observe a typed listen refusal; observed {}",
         cancel.post_cancel_outcome
     );
-    builder.positive("cancel-outcome", &cancel.post_cancel_outcome);
+    // One variable: the caller cancelled. Everything else - the fixture, the
+    // request, the stream - is identical to the live case above, and the
+    // observed outcome is the typed refusal that variable produces.
+    builder.negative("caller-cancelled", &cancel.post_cancel_outcome);
 
     assert!(
         cancel.server_saw_stream_close,
@@ -2849,7 +2904,9 @@ fn case_deadline_and_disconnect_races(builder: &mut CaseBuilder, wire: &WireObse
          timeout; observed {}",
         lane.outcome
     );
-    builder.positive("deadline-outcome", &lane.outcome);
+    // One variable: the idle bound is armed short while the peer stays silent.
+    // The connection is never broken, so this refusal is the deadline's.
+    builder.negative("idle-deadline-armed", &lane.outcome);
 
     assert_eq!(
         lane.requests_during_call, 1,
@@ -2885,7 +2942,8 @@ fn case_uncertain_dispatch_no_retry(builder: &mut CaseBuilder, wire: &WireObserv
         "a request whose peer closed without answering cannot succeed; observed {}",
         lane.outcome
     );
-    builder.positive("uncertain-outcome", &lane.outcome);
+    // One variable: the peer closes after reading the POST and never answers.
+    builder.negative("peer-closed-unanswered", &lane.outcome);
 
     assert!(
         !lane.outcome.starts_with("executor::Timeout("),
@@ -2942,10 +3000,19 @@ fn case_extension_activation_notification(builder: &mut CaseBuilder, wire: &Wire
         observed.connections_after_return
     );
     assert_eq!(
-        observed.requests_during_call, 1,
-        "the notification lane must post exactly once"
+        observed.requests_during_call, 2,
+        "the notification lane posts twice on purpose: the streamed call, then the \
+         follow-up that gives HTTP-03.25's planted event id somewhere to leak to"
     );
-    builder.positive("notification-no-replay", "1 post, 0 retries");
+    builder.positive("notification-no-replay", "2 posts, 0 retries");
+
+    // One variable: the notification method is not one of the eight a final
+    // server may originate. Everything else about the frame is well formed.
+    // Driven through the facade-exported public decode, not a private parser.
+    let undeclared = JsonRpcRequest::notification("notifications/not_a_real_method", None);
+    let refusal = ServerNotification::decode(&undeclared)
+        .expect_err("a method outside the declared set must not be admitted");
+    builder.negative("notification-method=undeclared", &format!("{refusal:?}"));
 }
 
 /// HTTP-03.24 `independent-server-request-rejection` (floor 2).
@@ -2958,7 +3025,9 @@ fn case_independent_server_request_rejection(builder: &mut CaseBuilder, wire: &W
          must not be handed back as the caller's event; observed {}",
         observed.outcome
     );
-    builder.positive("independent-server-request-outcome", &observed.outcome);
+    // One variable: the frame carries `id` AND `method`, making it a request
+    // rather than a response or notification. The rejection is the boundary.
+    builder.negative("frame-is-a-server-request", &observed.outcome);
 
     assert_eq!(
         observed.connections_after_return, 0,
@@ -3011,6 +3080,18 @@ fn case_no_event_id_retry_resumption(builder: &mut CaseBuilder, wire: &WireObser
         "terminal-delivered-without-event-ids",
         &wire.normalize(&wire.a_terminal),
     );
+
+    // One variable: a stream DID publish `id: planted-event-id-25`, and the
+    // client then issued a second request. That is the only condition under
+    // which resumption state could plausibly appear, so the negative creates it
+    // rather than resting on an absence nothing ever challenged.
+    let leaked = &wire.extension_notification.second_request_resumption_header;
+    assert!(
+        leaked.is_none(),
+        "a published event id must not become resumption state on a later request; the \
+         follow-up request carried Last-Event-ID: {leaked:?}"
+    );
+    builder.negative("stream-published-event-id", "no Last-Event-ID on the next request");
 }
 
 fn case_no_downgrade_matrix(builder: &mut CaseBuilder, matrix: &[MatrixCell]) {
