@@ -11,6 +11,10 @@
 //! fresh authenticated MCP discovery using the SAME token as the operation.
 //! No failed POST is automatically retried. All work uses the caller's runtime.
 
+/// Typed incremental core calls over the same machine authentication owner.
+pub mod rpc;
+/// Core resource and catalog subscriptions without enabling Tasks.
+pub mod subscriptions;
 /// Explicit composition with official Tasks and typed incremental responses.
 #[cfg(feature = "tasks")]
 pub mod tasks;
