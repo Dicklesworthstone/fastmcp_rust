@@ -3298,21 +3298,37 @@ fn http_03_i_planted_negative() {
     );
 
     // Credential, cache, endpoint-selection, and era state are unchanged.
-    assert_eq!(
-        planted.case("HTTP-03.21").record,
-        accepted.case("HTTP-03.21").record,
-        "no credential state may change on a refused response"
-    );
-    assert_eq!(
-        planted.case("HTTP-03.15").record,
-        accepted.case("HTTP-03.15").record,
-        "era selection must be unchanged"
-    );
-    assert_eq!(
-        planted.case("HTTP-03.23").record,
-        accepted.case("HTTP-03.23").record,
-        "endpoint selection must be unchanged"
-    );
+    //
+    // Each of AC-4's named categories is checked twice: that the case still
+    // CARRIES the evidence for that category, and that the record is identical
+    // across both passes. The containment half matters - the ordered loop above
+    // already proves every non-planted case equal, so an equality assertion
+    // alone could never fail on its own and would silently keep passing even if
+    // it named a case that had nothing to do with the category. That is exactly
+    // how these four came to point at the wrong cases after the B-half re-key:
+    // numbers agreeing while meanings drifted.
+    for (category, id, evidence) in [
+        ("credential", "HTTP-03.17", "credential-debug"),
+        ("era selection", "HTTP-03.20", "mcp-a-era"),
+        ("endpoint selection", "HTTP-03.22", "mcp-a-identity-deterministic"),
+        // The cache claim is the endpoint bundle key: a changed security
+        // partition or configuration generation must not share a cache entry,
+        // and both of those observations live in HTTP-03.22.
+        ("cache partition (security)", "HTTP-03.22", "security_partition=<other>"),
+        ("cache partition (generation)", "HTTP-03.22", "configuration_generation=2"),
+    ] {
+        let planted_record = &planted.case(id).record;
+        assert!(
+            planted_record.contains(evidence),
+            "{category} state is claimed unchanged against {id}, but that case records no \
+             `{evidence}` - the claim would be unfalsifiable"
+        );
+        assert_eq!(
+            planted_record,
+            &accepted.case(id).record,
+            "{category} state must be unchanged by a plant in {PLANTED_CASE_ID}"
+        );
+    }
     assert_eq!(
         planted.no_downgrade_matrix, accepted.no_downgrade_matrix,
         "the 3x3 no-downgrade observation state must be unchanged"
@@ -3320,16 +3336,21 @@ fn http_03_i_planted_negative() {
     assert_eq!(planted.discovery_frames, accepted.discovery_frames);
 
     // An ineligible observation performs zero legacy GET and zero era mutation.
+    //
+    // The count is recorded by the one-shot probe, which the re-key folded into
+    // HTTP-03.21. This previously read HTTP-03.14, which after the re-key is
+    // caller cancellation and records no such field - so it asserted the
+    // presence of a string that case never writes.
     assert!(
         planted
-            .case("HTTP-03.14")
+            .case("HTTP-03.21")
             .record
             .contains("legacy-get-count = 0"),
         "the planted run must issue no legacy GET"
     );
     assert_eq!(
-        planted.case("HTTP-03.14").record,
-        accepted.case("HTTP-03.14").record
+        planted.case("HTTP-03.21").record,
+        accepted.case("HTTP-03.21").record
     );
 
     // Producer identity is bound to both runs.
