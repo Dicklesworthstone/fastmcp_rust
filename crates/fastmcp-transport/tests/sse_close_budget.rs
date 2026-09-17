@@ -1,3 +1,9 @@
+#![cfg(feature = "legacy-2024-11-05")]
+// `SseWriter` exists only under this opt-in feature, so this proof compiles
+// to nothing without it - matching `leg_http_01_a.rs`. Run it with
+// `--features legacy-2024-11-05`; a default-feature run reports zero tests
+// here, which is absence of the capability, not evidence about it.
+
 //! B-03 capability proof: `SseWriter::close` CONSUMES the caller's budget.
 //!
 //! The second blocking-I/O close to observe a budget rather than merely receive

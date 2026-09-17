@@ -84,6 +84,11 @@ use crate::{CodecError, TransportError};
 ///
 /// The ten remaining `is_cancel_requested` sites in this module still carry the
 /// weaker guard; converting them is separate work and is not done here.
+// Gated to match its only caller: `SseWriter` and its impl are behind
+// `legacy-2024-11-05`, and so is this file's `Cx` import. An ungated helper
+// naming `Cx` fails to resolve in the default feature set - that is exactly how
+// this broke the transport lib, and the lib break reached every downstream crate.
+#[cfg(feature = "legacy-2024-11-05")]
 fn sse_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
         use asupersync::{CancelKind, error::ErrorKind};
