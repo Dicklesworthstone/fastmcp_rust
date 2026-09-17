@@ -313,17 +313,124 @@ fn declared_closed_child_bindings() -> Vec<DeclaredRow> {
         .collect()
 }
 
-/// Evaluates the **recorded** bindings against the bytes they claim to bind.
+/// The revision at which each owning child bead actually closed.
 ///
-/// This is the case the module exists for. Every value compared here is read
-/// from the evidence document as written; none is recomputed. A zero-row parse
-/// fails rather than passing vacuously, because a check that silently examines
-/// nothing is the exact defect this capability was added to remove.
+/// Derived mechanically, not chosen: for each row, the owning bead's `closed_at`
+/// was read from the tracker and the closure revision is the last commit
+/// touching that exact path with author time at or before it. These are
+/// immutable historical revisions, so unlike a working-tree measurement they
+/// cannot rot. They are named here rather than hashed here so that every digest
+/// below stays computed from the repository instead of copied into source.
 ///
-/// This test is expected to FAIL while the recorded bindings are drifted. That
-/// red is the mechanical proof of the drift, and it is the correct result. It
-/// must not be inverted to `!is_bound()`, ignored, feature-gated, or repaired
-/// by regenerating the recorded values.
+/// path, owner_scope, closure revision, owning bead's closed_at (UTC).
+const CLOSURE_REVISIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "crates/fastmcp-core/src/crypto.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.9",
+        "7d79aa36",
+        "2026-08-22T15:04:25Z",
+    ),
+    (
+        "crates/fastmcp-core/src/uri.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.8",
+        "b2863887",
+        "2026-08-22T23:00:53Z",
+    ),
+    (
+        "crates/fastmcp-server/src/auth.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.11",
+        "9007adce",
+        "2026-08-03T18:54:42Z",
+    ),
+    (
+        "crates/fastmcp-server/src/oauth.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.10",
+        "00cb860c",
+        "2026-09-01T09:04:02Z",
+    ),
+    (
+        "crates/fastmcp-server/src/oidc.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.11",
+        "9007adce",
+        "2026-08-03T18:54:42Z",
+    ),
+    (
+        "crates/fastmcp-transport/src/websocket.rs",
+        "bd-mcp-2026-07-28-support-ahet.1.10",
+        "00cb860c",
+        "2026-09-01T09:04:02Z",
+    ),
+];
+
+/// Looks up the closure revision for a bound path.
+fn closure_revision(path: &str) -> (&'static str, &'static str) {
+    CLOSURE_REVISIONS
+        .iter()
+        .find(|(candidate, ..)| *candidate == path)
+        .map(|(_, _, revision, closed_at)| (*revision, *closed_at))
+        .unwrap_or_else(|| {
+            panic!(
+                "{path}: no closure revision is recorded for this bound path. A row was added to \
+                 the evidence document without a corresponding closure revision here, which \
+                 would leave it silently unchecked."
+            )
+        })
+}
+
+/// Reads the bytes of `path` as of `revision`, straight from Git object storage.
+///
+/// Fails closed. A missing `git`, a detached object store, or an unknown
+/// revision is a hard failure rather than a skip, because a check that
+/// silently examines nothing is the exact defect this capability exists to
+/// remove.
+fn blob_at_revision(revision: &str, path: &str) -> Vec<u8> {
+    let output = std::process::Command::new("git")
+        .args(["cat-file", "blob", &format!("{revision}:{path}")])
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("{path}: cannot run `git cat-file blob {revision}:{path}`: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "{path}: `git cat-file blob {revision}:{path}` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    output.stdout
+}
+
+/// Evaluates the **recorded** bindings against the bytes of the revision at
+/// which their owning child actually closed.
+///
+/// SUBJECT CORRECTION (2026-09-17). This check previously compared each
+/// recorded row against the **current working tree**. That is not a gate, it is
+/// a clock: the working tree moves every day, so the check drifted further from
+/// green with every unrelated commit and could never distinguish tampering from
+/// the passage of time. The contract's own `closed_child_handoff_contract`
+/// calls these rows a handoff of outputs owned by **completed** children, so the
+/// subject each row describes is the bytes that child handed off at its own
+/// closure, which is a fixed historical revision. The subject is now that
+/// revision. Nothing about the recorded values changed.
+///
+/// Every value compared here is still read from the evidence document as
+/// written; none is recomputed or refreshed. A zero-row parse fails rather than
+/// passing vacuously.
+///
+/// This test is EXPECTED TO FAIL, and the failure is now stable rather than
+/// drifting. All six rows are the policy-authoring snapshot of
+/// 2026-07-30 15:30:33, but the earliest child closure is 2026-08-03 and
+/// commit 9007adce had already landed on auth.rs and oidc.rs before it, so
+/// there is no revision at which these six values are any child's handoff. The
+/// baseline was authored 4 to 33 days before the children it claims to hand
+/// off had closed, which is an authoring defect in the freeze policy and not
+/// something any consumer of this document can repair.
+///
+/// The red is the mechanical proof of that defect and it is the correct result.
+/// It must not be inverted to `!is_bound()`, ignored, feature-gated, or
+/// repaired by regenerating the recorded values. Re-anchoring the recorded
+/// values to the closure revisions would make this green, but that is a
+/// re-authoring of a frozen registry and is reserved to the freeze-policy
+/// owner under an authorization that does not exist as of this revision.
 #[test]
 fn fnd_01_a_recorded_closed_child_bindings_hold() {
     let declared = declared_closed_child_bindings();
@@ -333,39 +440,148 @@ fn fnd_01_a_recorded_closed_child_bindings_hold() {
          an empty parse would let this check pass while examining nothing"
     );
 
+    assert_eq!(
+        declared.len(),
+        CLOSURE_REVISIONS.len(),
+        "every declared closed-child row must have exactly one closure revision; a row without \
+         one would go unchecked, and a closure revision without a row would check nothing"
+    );
+
     let mut drifted = Vec::new();
     for row in &declared {
         let binding =
             ClosedChildBinding::declare(&row.path, &row.owner_scope, row.byte_length, &row.sha256)
                 .unwrap_or_else(|error| panic!("{}: malformed declaration: {error}", row.path));
 
-        let actual = fs::read(workspace_root().join(&row.path))
-            .unwrap_or_else(|error| panic!("{}: bound source unreadable: {error}", row.path));
+        let (revision, closed_at) = closure_revision(&row.path);
+
+        // THE CORRECTED SUBJECT: the bytes the owning child handed off at its
+        // own closure, read from immutable object storage rather than from the
+        // working tree.
+        let handoff = blob_at_revision(revision, &row.path);
 
         let outcome = binding
-            .evaluate(&actual)
+            .evaluate(&handoff)
             .unwrap_or_else(|error| panic!("{}: {error}", row.path));
+
+        // Second axis, reported for attribution only: has the closed child's
+        // output been modified since it closed? This is what the contract
+        // actually exists to detect, and it is the question a re-anchored
+        // registry would ask. It does not decide this assertion.
+        let working_tree = fs::read(workspace_root().join(&row.path))
+            .unwrap_or_else(|error| panic!("{}: bound source unreadable: {error}", row.path));
+        let population = if working_tree == handoff {
+            "P1 premature-baseline only (UNMODIFIED since closure)"
+        } else {
+            "P2 modified after closure"
+        };
 
         if !outcome.is_bound() {
             drifted.push(format!(
-                "{} [{}] {:?}: recorded {} bytes / {}, actual {} bytes / {}",
+                "{} [{}]\n    {:?}: recorded {} bytes / {}\n              handoff @ {} ({}) {} bytes / {}\n    {}",
                 row.path,
                 row.owner_scope,
                 outcome.drift(),
                 binding.byte_length(),
                 binding.sha256(),
+                revision,
+                closed_at,
                 outcome.actual_byte_length(),
                 outcome.actual_sha256(),
+                population,
             ));
         }
     }
 
     assert!(
         drifted.is_empty(),
-        "{} of {} recorded closed-child bindings no longer bind the files they name:\n{}",
+        "{} of {} recorded closed-child bindings do not describe the handoff of the child that \
+         owns them.\n\nROOT CAUSE: the baseline was authored 2026-07-30 15:30:33, in the same \
+         instant as the source it binds, but closed_child_handoff_contract declares these rows a \
+         handoff of outputs owned by COMPLETED children and the owning children closed 4 to 33 \
+         days later (2026-08-03 .. 2026-09-01). The rows are the authoring snapshot, not anyone's \
+         handoff. This is an authoring defect in the freeze policy; it is NOT repairable by any \
+         consumer of this document, and it must not be repaired by regenerating the recorded \
+         values.\n\nThe registry itself is intact: the six rows still reproduce \
+         closed_child_handoff_contract.registry_sha256 exactly, so nothing was tampered with.\n\n{}",
         drifted.len(),
         declared.len(),
         drifted.join("\n"),
+    );
+}
+
+/// Proves the corrected subject can actually fire.
+///
+/// The check above is red for a reason outside its own control, so on its own
+/// it cannot demonstrate that a closure-revision binding is capable of
+/// distinguishing anything. This does: it takes a row whose recorded digest is
+/// genuinely the digest of its closure-revision bytes (constructed here from
+/// the real handoff so no constant is copied), confirms it binds, then changes
+/// exactly one byte of those bytes and requires the typed refusal — proving
+/// every other observed field byte-for-byte unchanged (RH-5).
+#[test]
+fn fnd_01_a_closure_revision_subject_planted_negative() {
+    const SUBJECT: &str = "crates/fastmcp-core/src/uri.rs";
+    let (revision, _) = closure_revision(SUBJECT);
+    let handoff = blob_at_revision(revision, SUBJECT);
+    assert!(
+        !handoff.is_empty(),
+        "the closure-revision handoff must be non-empty, or the mutation below would be vacuous"
+    );
+
+    let owner_scope = CLOSURE_REVISIONS
+        .iter()
+        .find(|(path, ..)| *path == SUBJECT)
+        .map(|(_, owner, ..)| *owner)
+        .expect("the subject has a recorded owner scope");
+
+    // A correctly anchored row: digest computed from the handoff bytes here,
+    // never copied from the artifact under test.
+    let digest = live_sha256_hex(&handoff);
+    let binding = ClosedChildBinding::declare(SUBJECT, owner_scope, handoff.len(), &digest)
+        .expect("a correctly anchored declaration is admitted");
+
+    let control = binding
+        .evaluate(&handoff)
+        .expect("the handoff is inside the hashing bound");
+    assert!(
+        control.is_bound(),
+        "a row anchored at its own closure revision must bind those bytes"
+    );
+    assert_eq!(control.drift(), BindingDrift::Bound);
+
+    // --- Mutation: exactly one byte of the handoff, length preserved --------
+    let mut mutated = handoff.clone();
+    let last = mutated.len() - 1;
+    mutated[last] ^= 0x01;
+
+    let outcome = binding
+        .evaluate(&mutated)
+        .expect("the mutated subject is inside the hashing bound");
+
+    assert!(
+        !outcome.is_bound(),
+        "a one-byte change to the handoff must not bind"
+    );
+    assert_eq!(outcome.drift(), BindingDrift::ContentOnly);
+    assert!(outcome.length_matches(), "the mutation preserved length");
+    assert!(!outcome.digest_matches());
+
+    // Every other observed field is unchanged by the mutation.
+    assert_eq!(binding.path(), SUBJECT);
+    assert_eq!(binding.owner_scope(), owner_scope);
+    assert_eq!(binding.byte_length(), handoff.len());
+    assert_eq!(binding.sha256(), digest);
+    assert_eq!(outcome.declared_byte_length(), handoff.len());
+    assert_eq!(outcome.actual_byte_length(), handoff.len());
+    assert_ne!(outcome.actual_sha256(), digest);
+    assert_eq!(outcome.actual_sha256().len(), SHA256_HEX_LENGTH);
+
+    // The control is unaffected by having evaluated the mutation.
+    assert_eq!(
+        binding.evaluate(&handoff).expect("re-evaluates"),
+        control,
+        "evaluating a mutation must not disturb the accepting outcome"
     );
 }
 
@@ -566,5 +782,169 @@ fn fnd_01_a_policy_describes_this_repository() {
         divergences.len(),
         compared,
         divergences.join("\n"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// workspace_snapshot: the same defect as the closed-child rows, at 24x scale
+// ---------------------------------------------------------------------------
+
+/// Collects every regular file beneath `root`, skipping the directories the
+/// contract excludes, and returns repository-relative slash-separated paths.
+fn walk_regular_files(root: &Path, base: &Path, found: &mut Vec<String>) {
+    const EXCLUDED_DIRECTORIES: &[&str] = &["target", ".git", ".fnd01-run"];
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(_) => continue,
+        };
+        if kind.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if EXCLUDED_DIRECTORIES.contains(&name.as_ref()) {
+                continue;
+            }
+            walk_regular_files(&path, base, found);
+        } else if kind.is_file() {
+            if let Ok(relative) = path.strip_prefix(base) {
+                found.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+/// Every declared `[[workspace_binding]]` path.
+fn declared_workspace_binding_paths(document: &toml::Value) -> Vec<String> {
+    document
+        .get("workspace_binding")
+        .and_then(toml::Value::as_array)
+        .expect("the evidence document declares a workspace_binding array")
+        .iter()
+        .map(|row| {
+            row.get("path")
+                .and_then(toml::Value::as_str)
+                .expect("workspace_binding.path is a string")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Enforces `closed_scan_root_rule` and `required_absent_path_rule`.
+///
+/// SUBJECT CORRECTION (2026-09-17), same reasoning as the closed-child rows
+/// above and applied in the same pass. This is the identical defect at 24x
+/// scale: `[[workspace_binding]]` is a frozen measurement of a mutable tree,
+/// authored once and never re-authored, while the campaign kept adding files
+/// beneath the scan roots. Previously the failure surfaced as a bare count
+/// through the policy-owned verifier; here every offending path is enumerated
+/// so the red is attributable instead of merely large.
+///
+/// This test is EXPECTED TO FAIL. The registries themselves are intact — the
+/// declared row count matches the contract and no bound path is missing — so
+/// every failure below is an ADDITION that postdates the freeze, not a
+/// deletion or a tampering. Re-authoring the registry to absorb them is
+/// reserved to the freeze-policy owner and is not licensed here; weakening
+/// either rule to match reality would be RH-1/RH-3.
+#[test]
+fn fnd_01_a_workspace_snapshot_describes_this_repository() {
+    let root = workspace_root();
+    let document: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("evidence/fnd-01/dependency-verification.toml"))
+            .expect("the FND-01 evidence document is readable"),
+    )
+    .expect("the FND-01 evidence document parses as a TOML document");
+
+    let snapshot = document
+        .get("workspace_snapshot")
+        .expect("the evidence document declares workspace_snapshot");
+    let scan_roots: Vec<String> = snapshot
+        .get("closed_scan_roots")
+        .and_then(toml::Value::as_array)
+        .expect("workspace_snapshot declares closed_scan_roots")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("closed_scan_roots entries are strings")
+                .to_owned()
+        })
+        .collect();
+    assert!(
+        !scan_roots.is_empty(),
+        "an empty closed_scan_roots would let this check pass while walking nothing"
+    );
+
+    let bound = declared_workspace_binding_paths(&document);
+    assert!(
+        !bound.is_empty(),
+        "an empty workspace_binding array would let this check pass while examining nothing"
+    );
+
+    let mut unbound = Vec::new();
+    let mut missing = Vec::new();
+    for scan_root in &scan_roots {
+        let mut found = Vec::new();
+        walk_regular_files(&root.join(scan_root), &root, &mut found);
+        let prefix = format!("{scan_root}/");
+        let bound_here: Vec<&String> = bound.iter().filter(|p| p.starts_with(&prefix)).collect();
+        for path in &found {
+            if !bound_here.iter().any(|bound_path| *bound_path == path) {
+                unbound.push(path.clone());
+            }
+        }
+        for bound_path in bound_here {
+            if !found.contains(bound_path) {
+                missing.push(bound_path.clone());
+            }
+        }
+    }
+    unbound.sort();
+    missing.sort();
+
+    // `required_absent_path_rule`: a present node fails rather than being ignored.
+    let mut present_forbidden = Vec::new();
+    for value in snapshot
+        .get("required_absent_paths")
+        .and_then(toml::Value::as_array)
+        .expect("workspace_snapshot declares required_absent_paths")
+    {
+        let declared = value
+            .as_str()
+            .expect("required_absent_paths entries are strings");
+        if root.join(declared).exists() {
+            present_forbidden.push(declared.to_owned());
+        }
+    }
+
+    assert!(
+        unbound.is_empty() && missing.is_empty() && present_forbidden.is_empty(),
+        "workspace_snapshot no longer describes this repository.\n\n\
+         {} unlisted regular file(s) beneath closed_scan_roots {:?} (closed_scan_root_rule: \"an \
+         unlisted regular file, symlink, hardlink, special file, missing row, or extra row \
+         fails\").\n{} bound path(s) missing from the tree.\n{} required-absent path(s) present \
+         (required_absent_path_rule).\n\n\
+         ROOT CAUSE: same as the closed-child rows — a frozen measurement of a mutable tree. The \
+         registry itself is intact ({} declared rows, {} missing), so every entry below is an \
+         ADDITION that postdates the freeze, produced by legitimate campaign work in other \
+         lanes.\n\n\
+         NOTE: a present `.cargo` is additionally a NORMATIVE conflict, not mere rot — FND-02's \
+         package contract mandates a checked-in .cargo/config.toml carrying the xtask alias while \
+         this rule forbids .cargo existing at all, and FND-02 depends on FND-01. That collision \
+         crosses lanes and is escalated, not resolvable here. Do not delete the file.\n\n\
+         UNLISTED:\n{}\n\nMISSING:\n{}\n\nPRESENT BUT REQUIRED ABSENT:\n{}",
+        unbound.len(),
+        scan_roots,
+        missing.len(),
+        present_forbidden.len(),
+        bound.len(),
+        missing.len(),
+        unbound.join("\n"),
+        missing.join("\n"),
+        present_forbidden.join("\n"),
     );
 }
