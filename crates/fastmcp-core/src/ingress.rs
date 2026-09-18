@@ -61,7 +61,7 @@ pub const DEFAULT_MAXIMUM_STALENESS: Duration = Duration::from_secs(30);
 ///
 /// Beyond this a "revalidated" authorization is an assertion about the past,
 /// not about now, so the ceiling is enforced rather than advisory.
-pub const HARD_MAXIMUM_STALENESS: Duration = Duration::from_secs(5 * 60);
+pub const HARD_MAXIMUM_STALENESS: Duration = Duration::from_mins(5);
 
 // ===========================================================================
 // Errors
