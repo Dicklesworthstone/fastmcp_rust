@@ -1,7 +1,8 @@
 //! Secured connection dispatch using native authentication, JSON and SSE owners.
 
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use asupersync::Cx;
@@ -215,7 +216,7 @@ async fn sse(
     let cancellation = sender.request_cancellation();
     let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
     let (gate, mut election) = ModernSseOutcomeGate::new();
-    let (_reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = stream.into_split();
     let task = spawn_modern_sse_dispatch(cx, Arc::clone(&server), generation, inbound, request,
         raw_params, receipt, sender, Arc::clone(&terminal), Some(gate)).map_err(|_| ())?;
     let dispatch = OwnedModernHttpDispatch {
@@ -228,7 +229,12 @@ async fn sse(
         sessions.retain_retired_dispatches(vec![dispatch.task]);
         return Err(());
     }
-    let result = async {
+    // Keep the read half live throughout representation election and response
+    // delivery, including periods with no queued SSE events. A reset or late
+    // pipelined request must retire this request, not wait for another event or
+    // a write timeout. EOF is only a request write-half close and remains legal.
+    let mut peer_byte = [0_u8; 1];
+    let result = monitor_response_peer(&cancellation, reader.read(&mut peer_byte), async {
         match await_modern_sse_dispatch_election(cx, &cancellation, &mut election).await? {
             ModernSseDispatchElection::Stream => {},
             ModernSseDispatchElection::Immediate(mut response) => {
@@ -270,7 +276,7 @@ async fn sse(
             }
         }
         write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io).await
-    }.await;
+    }).await;
     if result.is_err() {
         terminal.mark_failed();
         sessions.retain_retired_dispatches(live.cancel_modern_dispatch(generation));
@@ -281,6 +287,62 @@ async fn sse(
     result
 }
 
+/// Poll the one outstanding peer read before the response, without a spawned
+/// task or repeatedly cancelling/recreating a partially completed write.
+///
+/// Read EOF only disables this monitor: HTTP permits a client to half-close its
+/// request and continue reading the response. That case still relies on native
+/// response deadlines/write errors to discover a later loss of the receiver.
+/// Any received byte is unsupported pipelining; read errors retire the request.
+/// The existing caller performs dispatch settlement and marks failed terminal
+/// delivery. In particular, a reset never becomes a successful terminal drain.
+async fn monitor_response_peer<P, F, T>(
+    cancellation: &McpRequestCancellation,
+    peer: P,
+    response: F,
+) -> Result<T, ()>
+where
+    P: Future<Output = std::io::Result<usize>>,
+    F: Future<Output = Result<T, ()>>,
+{
+    let mut owner = CancelAbandonedResponse {
+        cancellation: cancellation.clone(),
+        armed: true,
+    };
+    let mut peer = std::pin::pin!(peer);
+    let mut response = std::pin::pin!(response);
+    let mut half_closed = false;
+    let result = poll_fn(|task| {
+        if !half_closed {
+            match peer.as_mut().poll(task) {
+                Poll::Ready(Ok(0)) => half_closed = true,
+                Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+                    cancellation.cancel();
+                    return Poll::Ready(Err(()));
+                }
+                Poll::Pending => {},
+            }
+        }
+        // Do not reject solely because the request token was cancelled: a
+        // committed graceful terminal may still need to drain on this socket.
+        // The native response/election state machine owns that distinction.
+        response.as_mut().poll(task)
+    }).await;
+    if result.is_ok() { owner.armed = false; }
+    result
+}
+
+struct CancelAbandonedResponse {
+    cancellation: McpRequestCancellation,
+    armed: bool,
+}
+
+impl Drop for CancelAbandonedResponse {
+    fn drop(&mut self) {
+        if self.armed { self.cancellation.cancel(); }
+    }
+}
+
 async fn write_parts<W: asupersync::io::AsyncWrite + Unpin>(
     cx: &Cx, writer: &mut W, parts: &[&[u8]], io: SecuredHttpIoLimits,
 ) -> Result<(), ()> {
@@ -288,4 +350,205 @@ async fn write_parts<W: asupersync::io::AsyncWrite + Unpin>(
         for part in parts { writer.write_all(part).await.map_err(|_| ())?; }
         writer.flush().await.map_err(|_| ())
     }).await.map_err(|_| ())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::{pending, ready};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    // These tests drive the production response/peer arbitration directly.
+    // They test ownership and scheduling, not TLS or kernel reset behavior.
+    struct Tracked<F> {
+        future: Pin<Box<F>>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl<F> Tracked<F> {
+        fn new(future: F) -> Self {
+            Self {
+                future: Box::pin(future),
+                polls: Arc::new(AtomicUsize::new(0)),
+                drops: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl<F: Future> Future for Tracked<F> {
+        type Output = F::Output;
+        fn poll(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::SeqCst);
+            this.future.as_mut().poll(task)
+        }
+    }
+
+    impl<F> Drop for Tracked<F> {
+        fn drop(&mut self) { self.drops.fetch_add(1, Ordering::SeqCst); }
+    }
+
+    #[test]
+    fn secured_sse_ready_reset_wins_over_a_ready_response() {
+        let cancellation = McpRequestCancellation::new();
+        let sibling = McpRequestCancellation::new();
+        let peer = ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)));
+        let response = Tracked::new(ready(Ok::<_, ()>(7)));
+        let polls = Arc::clone(&response.polls);
+        let drops = Arc::clone(&response.drops);
+        let mut work = Box::pin(monitor_response_peer(&cancellation, peer, response));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+        drop(work);
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "no response write after observed reset");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(cancellation.is_cancel_requested());
+        assert!(!sibling.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_late_request_data_is_not_a_second_dispatch() {
+        let cancellation = McpRequestCancellation::new();
+        let response = Tracked::new(ready(Ok::<_, ()>(7)));
+        let polls = Arc::clone(&response.polls);
+        let mut work = Box::pin(monitor_response_peer(&cancellation, ready(Ok(1)), response));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_half_close_allows_the_ready_terminal_response() {
+        let cancellation = McpRequestCancellation::new();
+        let mut work = Box::pin(monitor_response_peer(
+            &cancellation, ready(Ok(0)), ready(Ok::<_, ()>(7)),
+        ));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        drop(work);
+        assert!(!cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_half_closed_read_is_never_polled_after_completion() {
+        let cancellation = McpRequestCancellation::new();
+        let peer = Tracked::new(ready(Ok(0)));
+        let reads = Arc::clone(&peer.polls);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let response = poll_fn(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 { Poll::Pending }
+            else { Poll::Ready(Ok::<_, ()>(7)) }
+        });
+        let mut work = Box::pin(monitor_response_peer(&cancellation, peer, response));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(work.as_mut().poll(&mut task).is_pending());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        drop(work);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_success_releases_a_pending_peer_read_without_cancellation() {
+        let cancellation = McpRequestCancellation::new();
+        let peer = Tracked::new(pending::<io::Result<usize>>());
+        let drops = Arc::clone(&peer.drops);
+        let mut work = Box::pin(monitor_response_peer(&cancellation, peer, ready(Ok::<_, ()>(7))));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        drop(work);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_abandoned_wait_cancels_request_and_drops_both_futures() {
+        let cancellation = McpRequestCancellation::new();
+        let sibling = McpRequestCancellation::new();
+        let peer = Tracked::new(pending::<io::Result<usize>>());
+        let response = Tracked::new(pending::<Result<(), ()>>());
+        let peer_drops = Arc::clone(&peer.drops);
+        let response_drops = Arc::clone(&response.drops);
+        let mut work = Box::pin(monitor_response_peer(&cancellation, peer, response));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(work.as_mut().poll(&mut task).is_pending());
+        assert!(!cancellation.is_cancel_requested());
+        drop(work);
+        assert!(cancellation.is_cancel_requested());
+        assert!(!sibling.is_cancel_requested());
+        assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(response_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn secured_sse_failed_write_retires_the_request() {
+        let cancellation = McpRequestCancellation::new();
+        let mut work = Box::pin(monitor_response_peer(
+            &cancellation, pending::<io::Result<usize>>(), ready(Err::<(), _>(())),
+        ));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+        drop(work);
+        assert!(cancellation.is_cancel_requested());
+    }
+
+    #[test]
+    fn secured_sse_peer_monitor_does_not_short_circuit_graceful_terminal_drain() {
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        // Request cancellation alone does not establish whether a committed
+        // terminal must drain. The existing native writer makes that election.
+        let mut work = Box::pin(monitor_response_peer(
+            &cancellation, pending::<io::Result<usize>>(), ready(Ok::<_, ()>(7)),
+        ));
+        let mut task = Context::from_waker(Waker::noop());
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Ok(7)));
+        assert!(cancellation.is_cancel_requested(), "success never reverses cancellation");
+    }
+
+    #[test]
+    fn secured_sse_peer_wakeup_interrupts_an_idle_response() {
+        use std::sync::Mutex;
+        struct WakeFlag(AtomicBool);
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let cancelled = McpRequestCancellation::new();
+        let reset = Arc::new(AtomicBool::new(false));
+        let waiter = Arc::new(Mutex::new(None::<Waker>));
+        let peer_reset = Arc::clone(&reset);
+        let peer_waiter = Arc::clone(&waiter);
+        let peer = poll_fn(move |task| {
+            if peer_reset.load(Ordering::SeqCst) {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+            } else {
+                *peer_waiter.lock().unwrap() = Some(task.waker().clone());
+                Poll::Pending
+            }
+        });
+        let response = Tracked::new(pending::<Result<(), ()>>());
+        let polls = Arc::clone(&response.polls);
+        let drops = Arc::clone(&response.drops);
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut task = Context::from_waker(&waker);
+        let mut work = Box::pin(monitor_response_peer(&cancelled, peer, response));
+        assert!(work.as_mut().poll(&mut task).is_pending());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        reset.store(true, Ordering::SeqCst);
+        waiter.lock().unwrap().take().unwrap().wake();
+        assert!(flag.0.load(Ordering::SeqCst));
+        assert_eq!(work.as_mut().poll(&mut task), Poll::Ready(Err(())));
+        drop(work);
+        assert!(cancelled.is_cancel_requested());
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "idle response is not polled after reset");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }
