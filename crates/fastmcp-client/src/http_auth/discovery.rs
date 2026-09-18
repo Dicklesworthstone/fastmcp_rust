@@ -36,6 +36,8 @@ use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 pub mod registration;
 /// Preregistered machine-to-machine authentication without browser or DCR fallback.
 pub mod client_credentials;
+/// Resource-bound Bearer challenges and explicitly trusted metadata relocation.
+pub mod challenge;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
