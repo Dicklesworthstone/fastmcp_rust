@@ -38845,10 +38845,24 @@ activate = 1\n";
     /// Package names of every workspace member, read from the member manifests.
     ///
     /// BASENAME IS NOT THE PACKAGE NAME, which is why this opens each manifest
-    /// instead of mapping the member path: `crates/fastmcp` is `fastmcp-rust`
-    /// and `crates/fastmcp-macros` is `fastmcp-derive`. A path-derived name
-    /// would be wrong for two of ten, and wrong *plausibly*, so nothing would
-    /// catch it.
+    /// instead of mapping the member path. It differs for THREE of the ten
+    /// members:
+    ///
+    ///     crates/fastmcp          basename `fastmcp`         is `fastmcp-rust`
+    ///     crates/fastmcp-macros   basename `fastmcp-macros`  is `fastmcp-derive`
+    ///     tools/xtask             basename `xtask`           is `fastmcp-xtask`
+    ///
+    /// The third is the member this check exists for, and it is the one a
+    /// reader skips: a prefix addition does not look like a rename the way
+    /// `fastmcp-macros` -> `fastmcp-derive` does.
+    ///
+    /// Such a fallback WOULD be caught — the lock comparison below would reject
+    /// the set — but it would be caught WRONGLY. It surfaces as
+    /// `E_SUPPLY_LOCK_LOCAL_PACKAGE`, the exact diagnostic this bead already
+    /// produced once, so it reads as that defect returning and sends the next
+    /// reader to `PACKAGE_IDS`, where the fault would not be.
+    /// `fnd_01_workspace_member_names_come_from_manifests_not_paths` exists to
+    /// fail first and name the real cause.
     ///
     /// Derived from `Cargo.toml`, the AUTHORED declaration, and never from
     /// `Cargo.lock`, which is the generated artifact under test. Taking both
@@ -38898,6 +38912,61 @@ activate = 1\n";
     /// for `fastmcp-xtask`, which inherits it too despite not being published.
     fn workspace_member_local_packages(root: &Path) -> VResult<BTreeSet<(String, String)>> {
         Ok(workspace_member_package_names(root)?.into_iter().map(|name| (name, env!("CARGO_PKG_VERSION").to_owned())).collect())
+    }
+
+    /// The member-name derivation must read manifests, never member paths.
+    ///
+    /// NAME THE WORTHLESS IMPLEMENTATION: `members.map(basename).collect()`. It
+    /// is shorter, it reads as obviously equivalent, and it returns a TEN-element
+    /// set — so every count, arity and length assertion in this file still
+    /// passes while three of the names are wrong.
+    ///
+    /// It is NOT true that nothing would catch it. The lockfile comparison would,
+    /// because the live lock carries the real names. The problem is WHERE and
+    /// WITH WHAT MESSAGE: it fails as `E_SUPPLY_LOCK_LOCAL_PACKAGE|unexpected
+    /// source-less package set`, which is precisely the diagnostic this bead
+    /// already produced, so it reads as a regression of the set defect and
+    /// points at `PACKAGE_IDS`. This test fails earlier and says what actually
+    /// happened, which is the whole of its value — a correct diagnosis is not a
+    /// lesser thing than a detection when the detection misdirects.
+    #[test]
+    fn fnd_01_workspace_member_names_come_from_manifests_not_paths() {
+        let root = repository_root();
+        let names = workspace_member_package_names(&root).verified();
+
+        // The three members whose directory basename is not their package name.
+        for (member_path, basename, package_name) in [
+            ("crates/fastmcp", "fastmcp", "fastmcp-rust"),
+            ("crates/fastmcp-macros", "fastmcp-macros", "fastmcp-derive"),
+            ("tools/xtask", "xtask", "fastmcp-xtask"),
+        ] {
+            assert!(
+                names.contains(package_name),
+                "{member_path} must contribute its manifest package name {package_name}; got {names:?}"
+            );
+            assert!(
+                !names.contains(basename),
+                "{member_path} contributed its directory basename {basename} instead of {package_name}: \
+                 the derivation fell back to the member path"
+            );
+        }
+
+        // The member set is the published set plus the non-publishable members.
+        for published in PACKAGE_IDS {
+            assert!(names.contains(*published), "member set must contain published package {published}");
+        }
+        assert!(
+            names.len() > PACKAGE_IDS.len(),
+            "the member set must be strictly larger than the published set, or the two have been \
+             conflated again; got {} members against {} published",
+            names.len(),
+            PACKAGE_IDS.len()
+        );
+        assert!(
+            names.contains("fastmcp-xtask"),
+            "fastmcp-xtask is publish = false and so correctly absent from PACKAGE_IDS, but it IS a \
+             workspace member and IS in Cargo.lock; it is the entire difference between the two sets"
+        );
     }
 
     fn singleton_lock_local_package(name: &str, version: &str) -> BTreeSet<(String, String)> {
