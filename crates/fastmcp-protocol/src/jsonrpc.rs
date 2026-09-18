@@ -743,8 +743,19 @@ fn redact_raw_json_path(path: &[RawJsonPathSegment]) -> String {
         rendered.push('/');
         match segment {
             RawJsonPathSegment::Member(name) => {
-                let mut retained = 0_usize;
-                for character in name.chars() {
+                // `retained` counts CHARACTERS and is compared against a BYTE
+                // budget. That is correct here only because every branch below
+                // pushes exactly one ASCII byte: the first is guarded to ASCII
+                // alphanumerics plus `_ . -`, and the second is a literal '*'.
+                // So character count and byte count are equal for this loop.
+                //
+                // The equivalence is invisible from the constant's name and
+                // depends on the sanitiser immediately below. If either branch
+                // ever pushes a multi-byte character -- a Unicode replacement
+                // or an ellipsis, say -- this stops bounding bytes and the
+                // truncation boundary moves silently. Count bytes explicitly if
+                // that happens; do not widen the budget.
+                for (retained, character) in name.chars().enumerate() {
                     if retained >= MAX_RAW_JSON_PATH_SEGMENT_BYTES {
                         rendered.push('~');
                         break;
@@ -754,7 +765,6 @@ fn redact_raw_json_path(path: &[RawJsonPathSegment]) -> String {
                     } else {
                         rendered.push('*');
                     }
-                    retained += 1;
                 }
             }
             RawJsonPathSegment::Index(index) => {
