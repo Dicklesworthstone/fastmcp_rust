@@ -152,13 +152,20 @@ impl SseAuthorizationLease {
 
     /// Check before the response head, before consuming each queued event, and
     /// during idle waits. A cached verdict is valid only until the earlier clock
-    /// bound. Failure is irreversible even if the host later restores a token.
+    /// bound and never bypasses the current caller's cancellation or deadline.
+    /// Failure is irreversible even if the host later restores a token.
     pub(super) fn check(&mut self, cx: &Cx) -> Result<(), SseAuthorizationError> {
         if self.closed { return Err(SseAuthorizationError::Closed); }
-        if cx.now() < self.next_check && Instant::now() < self.wall_expiry {
-            return Ok(());
-        }
-        let result = self.revalidate(cx);
+        // Credential freshness and execution liveness are independent. In
+        // particular, a cached success cannot authorize a write after caller
+        // cancellation, or when a later read supplies a shorter deadline.
+        let result = check_context(cx).and_then(|()| {
+            if cx.now() < self.next_check && Instant::now() < self.wall_expiry {
+                Ok(())
+            } else {
+                self.revalidate(cx)
+            }
+        });
         if result.is_err() {
             self.closed = true;
             // Dispose of retained credential/request data as soon as the
@@ -314,6 +321,55 @@ mod tests {
         assert_eq!(lease.checks, 1);
         lease.check(&cx).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn cached_verdict_cancellation_is_terminal_without_provider_work_or_sibling_effects() {
+        let (cx, provider, mut lease) = fixture(SseRevalidationPolicy::default());
+        let (sibling_cx, sibling_provider, mut sibling) = fixture(SseRevalidationPolicy::default());
+        assert_eq!(lease.check(&cx), Ok(()));
+        assert!(lease.facts.is_some());
+        let freshness = (lease.next_check, lease.wall_expiry);
+        assert!(cx.now() < freshness.0 && Instant::now() < freshness.1);
+
+        cx.set_cancel_requested(true);
+        assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Cancelled));
+        assert!(lease.closed);
+        assert!(lease.facts.is_none());
+        assert_eq!(lease.checks, 0);
+        assert_eq!((lease.next_check, lease.wall_expiry), freshness);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        cx.set_cancel_requested(false);
+        assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Closed));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sibling.check(&sibling_cx), Ok(()));
+        assert!(!sibling.closed);
+        assert_eq!(sibling_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_verdict_obeys_a_later_readers_exact_deadline_boundary() {
+        for expired in [false, true] {
+            let (_, provider, mut lease) = fixture(SseRevalidationPolicy::default());
+            let deadline = Time::from_nanos(u64::from(!expired));
+            let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(deadline));
+            assert_eq!(cx.now(), Time::ZERO);
+            assert!(cx.now() < lease.next_check && Instant::now() < lease.wall_expiry);
+            let result = lease.check(&cx);
+            if expired {
+                assert!(matches!(result, Err(SseAuthorizationError::TimedOut | SseAuthorizationError::Cancelled)));
+                assert!(lease.closed);
+                assert!(lease.facts.is_none());
+                assert_eq!(lease.check(&Cx::for_testing()), Err(SseAuthorizationError::Closed));
+            } else {
+                assert_eq!(result, Ok(()));
+                assert!(!lease.closed);
+                assert!(lease.facts.is_some());
+            }
+            assert_eq!(lease.checks, 0, "local liveness never spends provider work");
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
