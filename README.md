@@ -401,11 +401,15 @@ There are no `amd64`/`arm64` alias names. Every archive has a `.sha256`
 sibling and the release carries a `SHA256SUMS` file.
 
 The checked-in release workflow is currently a quarantined verification surface
-and does not publish new GitHub Releases. v0.10.0 and its archives were
-published before that quarantine, so the download below pins that tag
-explicitly rather than using `releases/latest` — under a workflow that does not
-publish, `latest` is a moving pointer whose meaning is not stated anywhere, and
-a pinned tag is what the surrounding text actually asserts is available.
+and does not publish new GitHub Releases: it has held `contents: read` since
+2026-08-02, and that permission cannot create a Release. The v0.10.0 tag
+postdates it (2026-09-12), so **this repository does not establish whether the
+archives named above are downloadable**, and nothing in it can. The command
+below pins the tag rather than `releases/latest` — under a workflow that does
+not publish, `latest` is a moving pointer whose meaning is not stated anywhere —
+but treat it as the address of an artifact whose existence is unverified here.
+**If it does not resolve, build from source as shown above; that path is
+verified by this repository and the download is not.**
 
 ```bash
 # Example: macOS Apple Silicon
