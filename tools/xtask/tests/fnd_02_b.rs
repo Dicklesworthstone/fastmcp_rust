@@ -287,10 +287,39 @@ fn fnd_02_b_planted_negative() {
 
     fixture.mutate_once(PLAN_PATH, "- FND-01.\n- FND-02.", "- FND-99.\n- FND-02.");
 
+    // Snapshot the fixture's own inputs AFTER the deliberate mutation and
+    // BEFORE the run, so the comparison below isolates what the EVALUATOR did
+    // from what the test did.
+    //
+    // `run` returns Result<BRun, Diagnostic>, so a rejection discards the
+    // manifest and the ledger with it: write_counters cannot be observed on
+    // this path at all, and both existing `write_counters == [0; 6]`
+    // assertions are on PASSING runs. Acceptance item 5 is specifically about
+    // what a REJECTION leaves behind, so the filesystem is the only witness
+    // available here.
+    let inputs_before: Vec<(PathBuf, Vec<u8>)> =
+        [PLAN_PATH, BEADS_EXPORT_PATH, ".cargo/config.toml"]
+            .iter()
+            .map(|relative| {
+                let path = fixture.root.join(relative);
+                let bytes = fs::read(&path).expect("fixture input is readable");
+                (path, bytes)
+            })
+            .collect();
+
     let error = b_eval::run(&fixture.root, &inputs())
         .expect_err("an unresolved edge must be rejected");
     assert_eq!(error.code, Code::DependencyUnresolved);
     assert_eq!(error.subject, "PRT-01");
+
+    // The rejecting path wrote nothing to what it read.
+    for (path, bytes) in inputs_before {
+        assert_eq!(
+            bytes,
+            fs::read(&path).expect("fixture input is readable"),
+            "a rejection must not modify its own inputs: {path:?}"
+        );
+    }
 
     // The rejection changed nothing.
     assert_eq!(
