@@ -1,9 +1,9 @@
 //! Default-deny scope admission before application middleware and dispatch.
 //!
-//! These are method-wide permissions, not named-tool/resource visibility rules.
-//! For example, tools/list may be public while every tools/call requires both
-//! an execution grant and an audit grant. Names, URIs, arguments and request
-//! metadata cannot select or replace a rule. Unlisted methods are denied.
+//! Method rules may be used alone or intersected with exact named-operation
+//! rules via ScopeRequestPolicy::for_operations. Every execution path must use
+//! authorize_request_verified when named rules are installed; the method-only
+//! evaluator refuses such policies rather than silently dropping restrictions.
 //!
 //! Install with Server::with_scope_authorization after building the server and
 //! before sharing it or opening a listener. The server inserts the private gate
@@ -11,10 +11,9 @@
 //! Authentication still runs first. The gate reads its verified facts without
 //! expanding or mutating them; implication is evaluated against the pinned graph.
 //!
-//! This is an additional request gate, not a replacement for catalog visibility,
-//! named-operation authorization, or continuous authorization of streams/Tasks.
-//! It does not convert a JSON-RPC policy refusal into an HTTP OAuth challenge.
-//! No token, HTTP authentication field or OAuth profile is added to stdio.
+//! This is an additional request gate, not a replacement for catalog visibility
+//! or continuous authorization of streams/Tasks. No token, HTTP authentication
+//! field or OAuth profile is added to stdio.
 
 /// Exact named-operation rules intersected with the method policy.
 pub mod operation;
@@ -42,6 +41,7 @@ pub enum ScopeRequestPolicyError {
     InvalidMethod,
     DuplicateMethod,
     PolicyTooLarge,
+    NestedOperationPolicy,
 }
 
 impl fmt::Display for ScopeRequestPolicyError {
@@ -52,6 +52,7 @@ impl fmt::Display for ScopeRequestPolicyError {
             Self::InvalidMethod => "request scope policy contains an invalid method",
             Self::DuplicateMethod => "request scope policy repeats a method",
             Self::PolicyTooLarge => "request scope policy exceeds its byte bound",
+            Self::NestedOperationPolicy => "operation scope policies must use a method-only base",
         })
     }
 }
@@ -84,23 +85,25 @@ struct CompiledRules {
     fingerprint: Sha256Digest,
 }
 
-/// Immutable method-wide all-of scope requirements and their implication graph.
+/// Immutable scope requirements, optionally including exact named operations.
 ///
-/// Absence of a rule denies a method; an explicitly present empty requirement
-/// permits anonymous access to this gate only. Authentication and downstream
-/// policy may still refuse it. Empty configuration is a valid deny-all policy.
-/// Exact, case-sensitive method lookup uses a bounded sorted table. At most
-/// 64 methods and 64 KiB of length-framed configuration are retained.
+/// Absence of a method rule denies a method; an explicitly empty requirement
+/// permits anonymous access to that method gate only. Named rules, authentication
+/// and downstream policy may still refuse it. Empty configuration is deny-all.
+/// Method lookup uses a bounded sorted table of at most 64 methods and 64 KiB.
+/// Named policy adds its own bounded table, never a recursive policy chain.
 #[derive(Clone)]
 pub struct ScopeRequestPolicy {
     inner: Arc<CompiledRules>,
+    operations: Option<operation::OperationScopePolicy>,
 }
 
 impl fmt::Debug for ScopeRequestPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScopeRequestPolicy")
-            .field("revision", &self.inner.revision)
+            .field("revision", &self.revision())
             .field("method_count", &self.inner.methods.len())
+            .field("named_operations", &self.operations.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -148,28 +151,46 @@ impl ScopeRequestPolicy {
         }
         let fingerprint = sha256_bounded(&identity, MAX_RULE_BYTES)
             .map_err(|_| ScopeRequestPolicyError::PolicyTooLarge)?;
-        Ok(Self { inner: Arc::new(CompiledRules { revision, implications, methods, fingerprint }) })
+        Ok(Self { inner: Arc::new(CompiledRules { revision, implications, methods, fingerprint }), operations: None })
     }
 
-    pub fn revision(&self) -> u64 { self.inner.revision }
-    pub fn fingerprint(&self) -> Sha256Digest { self.inner.fingerprint }
+    /// Adapts exact operation rules for every existing request-scope consumer,
+    /// including secured HTTP pre-dispatch admission and SSE revalidation.
+    /// Install this with HttpSecurityPolicy::with_scope_authorization for native
+    /// HTTP 401/403 handling, or Server::with_scope_authorization for ordinary
+    /// transport dispatch. The complete semantic fingerprint is retained.
+    /// Nested operation bases are rejected to keep evaluation depth bounded;
+    /// separately installed server gates still intersect their restrictions.
+    pub fn for_operations(policy: operation::OperationScopePolicy) -> Result<Self, ScopeRequestPolicyError> {
+        let methods = policy.method_policy();
+        if methods.operations.is_some() { return Err(ScopeRequestPolicyError::NestedOperationPolicy); }
+        Ok(Self { inner: Arc::clone(&methods.inner), operations: Some(policy) })
+    }
 
-    /// Trusted-host inspection of a complete method-wide requirement. This is
-    /// not a named-operation visibility decision or a wire challenge formatter.
+    pub fn revision(&self) -> u64 {
+        self.operations.as_ref().map_or(self.inner.revision, operation::OperationScopePolicy::revision)
+    }
+    pub fn fingerprint(&self) -> Sha256Digest {
+        self.operations.as_ref().map_or(self.inner.fingerprint, operation::OperationScopePolicy::fingerprint)
+    }
+    pub(crate) fn has_operation_rules(&self) -> bool { self.operations.is_some() }
+
+    /// Trusted-host inspection of a method-wide requirement only. Named rules
+    /// may impose additional requirements; this is never visibility authority.
     pub fn required_scopes(&self, method: &str) -> Option<&RequiredScopes> {
         self.inner.methods.binary_search_by(|entry| entry.0.as_str().cmp(method))
             .ok().map(|index| &self.inner.methods[index].1)
     }
 
-    /// Evaluates facts already admitted by the host's authentication provider.
-    /// This pure evaluator never verifies credentials, creates identity, changes
-    /// claims/scopes, caches a decision, or inspects application request fields.
-    /// The server adapter below calls it with the request's committed context.
+    /// Evaluates a method-only policy against already verified provider facts.
+    /// An operation-scoped policy cannot be authorized without its request and
+    /// therefore fails closed here; use authorize_request_verified instead.
     pub fn authorize_verified(
         &self,
         method: &str,
         facts: Option<&AuthContext>,
     ) -> Result<(), ScopeRequestRejection> {
+        if self.operations.is_some() { return Err(ScopeRequestRejection::InsufficientScope); }
         let required = self.required_scopes(method)
             .ok_or(ScopeRequestRejection::UnconfiguredMethod)?;
         let grants = facts.map_or(&[][..], |facts| facts.scopes.as_slice());
@@ -187,6 +208,25 @@ impl ScopeRequestPolicy {
             Err(ScopeRequestRejection::InsufficientScope)
         }
     }
+
+    /// Evaluates the complete pinned request policy without modifying facts or
+    /// trusting request-provided grants. Missing, malformed or unconfigured named
+    /// operations share the insufficient-permission outcome; no target discovery
+    /// or required-scope disclosure is authorized by this result.
+    pub fn authorize_request_verified(
+        &self,
+        request: &JsonRpcRequest,
+        facts: Option<&AuthContext>,
+    ) -> Result<(), ScopeRequestRejection> {
+        match &self.operations {
+            None => self.authorize_verified(&request.method, facts),
+            Some(policy) => policy.authorize_verified(request, facts).map_err(|rejection| match rejection {
+                operation::OperationScopeRejection::Method(error) => error,
+                operation::OperationScopeRejection::UnconfiguredOperation
+                    | operation::OperationScopeRejection::InsufficientScope => ScopeRequestRejection::InsufficientScope,
+            }),
+        }
+    }
 }
 
 // Private so the supported installation cannot accidentally place this gate
@@ -197,7 +237,7 @@ impl Middleware for ScopeAdmissionMiddleware {
     fn on_request(&self, ctx: &McpContext, request: &JsonRpcRequest) -> McpResult<MiddlewareDecision> {
         Server::enforce_request_context(ctx)?;
         let facts = ctx.auth();
-        let decision = self.0.authorize_verified(&request.method, facts.as_ref());
+        let decision = self.0.authorize_request_verified(request, facts.as_ref());
         Server::enforce_request_context(ctx)?;
         match decision {
             Ok(()) => Ok(MiddlewareDecision::Continue),
@@ -210,7 +250,7 @@ impl Middleware for ScopeAdmissionMiddleware {
 }
 
 impl Server {
-    /// Installs an immutable, default-deny method gate at the front of the
+    /// Installs an immutable, default-deny request gate at the front of the
     /// server's existing middleware chain, before caches and early Respond hooks.
     /// Build first, call this method, then open an endpoint/listener. Installation
     /// fails if middleware ownership has already been shared; no shared instance
@@ -225,12 +265,12 @@ impl Server {
     ///
     /// Rules cover methods that enter ordinary request dispatch. Transport
     /// preflight, public resource metadata and protocol control handled before
-    /// that dispatch retain their own admission. Method permissions do not hide
-    /// selected catalog entries or authorize individual tool names/resource URIs.
-    /// Configure those policies independently. A subscription grant is checked
-    /// on opening only; its native lease and revocation contract is unchanged.
-    /// JSON-RPC policy failures retain the native error mapping, not a fabricated
-    /// OAuth HTTP status/challenge inferred from application error data.
+    /// that dispatch retain their own admission. Policies created by
+    /// ScopeRequestPolicy::for_operations also enforce their exact named rules.
+    /// Neither form filters catalogs. A subscription grant is checked on opening
+    /// only; its native lease and revocation contract is unchanged. JSON-RPC
+    /// policy failures retain the native error mapping, not a fabricated OAuth
+    /// HTTP status/challenge inferred from application error data.
     pub fn with_scope_authorization(mut self, policy: ScopeRequestPolicy) -> McpResult<Self> {
         let middleware = Arc::get_mut(&mut self.middleware)
             .ok_or_else(|| McpError::invalid_request("scope authorization must be installed before sharing the server"))?;
@@ -371,5 +411,33 @@ mod tests {
         let diagnostic = format!("{policy:?} {error:?} {error}");
         assert!(!diagnostic.contains("canary"));
         assert!(!diagnostic.contains("verified-owner"));
+    }
+
+    #[test]
+    fn operation_adapter_preserves_identity_and_refuses_method_only_authorization() {
+        let operations = operation::OperationScopePolicy::new(9, rules(&[]), vec![
+            (operation::ScopedOperation::ToolCall("allowed".into()), required(&["specific"])),
+        ]).unwrap();
+        let expected = operations.fingerprint();
+        let policy = ScopeRequestPolicy::for_operations(operations).unwrap();
+        assert_eq!(policy.fingerprint(), expected);
+        assert_eq!(policy.clone().fingerprint(), expected);
+        assert_eq!(policy.revision(), 9);
+        let facts = facts(&["read", "write", "specific"]);
+        let mut request = JsonRpcRequest::new("tools/call", Some(serde_json::json!({"name":"allowed"})), fastmcp_protocol::RequestId::Number(1));
+        assert!(policy.authorize_request_verified(&request, Some(&facts)).is_ok());
+        assert_eq!(policy.authorize_verified("tools/call", Some(&facts)), Err(ScopeRequestRejection::InsufficientScope));
+        request.params = Some(serde_json::json!({"name":"other"}));
+        assert_eq!(policy.authorize_request_verified(&request, Some(&facts)), Err(ScopeRequestRejection::InsufficientScope));
+    }
+
+    #[test]
+    fn operation_adapter_rejects_recursive_composition_without_changing_existing_policy() {
+        let operations = operation::OperationScopePolicy::new(1, rules(&[]), vec![]).unwrap();
+        let policy = ScopeRequestPolicy::for_operations(operations).unwrap();
+        let before = policy.fingerprint();
+        let nested = operation::OperationScopePolicy::new(2, policy.clone(), vec![]).unwrap();
+        assert!(matches!(ScopeRequestPolicy::for_operations(nested), Err(ScopeRequestPolicyError::NestedOperationPolicy)));
+        assert_eq!(policy.fingerprint(), before);
     }
 }

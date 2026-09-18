@@ -1,7 +1,7 @@
-//! Native method-scope admission for the secured modern HTTP endpoint.
+//! Native request-scope admission for the secured modern HTTP endpoint.
 //!
 //! Authentication produces the existing request-bound receipt exactly once.
-//! The method policy examines those admitted facts before an era is selected,
+//! The complete policy examines those admitted facts before an era is selected,
 //! a transport request is enqueued, or an SSE response body is allocated. The
 //! same receipt then enters the existing native dispatcher. No application
 //! error code, message, response body or metadata is interpreted as an OAuth
@@ -28,24 +28,26 @@ use crate::{
 };
 
 impl HttpSecurityPolicy {
-    /// Requires method-wide scopes on the secured modern HTTP execution path.
+    /// Requires scopes on the secured modern HTTP execution path. Use
+    /// ScopeRequestPolicy::for_operations to include exact named-operation rules.
     ///
     /// Both `ServerHttpEndpoint::handle_secured_async` and the secured socket
     /// listener use this policy. Strict protocol admission and the server's
     /// installed authentication provider run before scope evaluation. A valid
-    /// principal lacking permissions receives an empty, uncacheable HTTP 403
-    /// and a Bearer `insufficient_scope` challenge containing the complete
-    /// configured requirement, not only its missing subset. Anonymous denial
-    /// remains HTTP 401; an unconfigured method discloses no scope names.
+    /// principal lacking permissions receives an empty, uncacheable HTTP 403.
+    /// Method-only policy challenges contain the complete configured requirement.
+    /// Named-operation policies omit scope names: this boundary has not established
+    /// catalog visibility, and unknown/forbidden targets must be indistinguishable.
+    /// Anonymous denial remains HTTP 401 without required-scope disclosure.
     ///
     /// Public metadata GET and browser preflight remain unauthenticated. The
     /// head-only and structural `admit` helpers do not execute authentication
     /// or scope checks. Plain HTTP entry points that are not supplied this
     /// security policy, stdio, WebSocket and the exact-2024 adapter are unchanged.
-    /// This method does not replace `Server::with_scope_authorization` for those
-    /// ordinary dispatch paths or authorize individual tool/resource names.
-    /// Additional server middleware restrictions still apply, but their errors
-    /// are not reclassified as OAuth. Revalidation is a separate explicit choice.
+    /// Install the same request policy on Server::with_scope_authorization for
+    /// those ordinary dispatch paths. Additional server middleware restrictions
+    /// still apply, but their errors are not reclassified as OAuth. Revalidation
+    /// is a separate explicit choice and retains the full named request policy.
     ///
     /// Configuration is immutable after installation. A second installation
     /// fails rather than replacing or widening the previous scope policy.
@@ -61,7 +63,7 @@ impl HttpSecurityPolicy {
     }
 
     /// Revalidates the original credential throughout secured SSE delivery.
-    /// Install method scopes first and supply a real authentication provider.
+    /// Install request scopes first and supply a real authentication provider.
     /// A changed principal, scope set or claim closes the stream rather than
     /// updating a handler that began with different facts. Revocation is observed
     /// within the configured cached-verdict interval plus caller scheduling and
@@ -128,7 +130,7 @@ fn prepare(
     check_admission(cx, cancellation)?;
     let receipt = session.preauthenticate_modern_http_request(cx, &admitted, authorization)?;
     check_admission(cx, cancellation)?;
-    let rejection = scope_rejection(policy, &admitted.method, receipt.authenticated.as_ref());
+    let rejection = scope_rejection(policy, &admitted, receipt.authenticated.as_ref());
     check_admission(cx, cancellation)?;
     if let Some(response) = rejection { return Err(response); }
     let lease = revalidation.filter(|_| crate::http_request_accepts_sse(&request)).map(|config| {
@@ -268,14 +270,14 @@ fn refusal(status: u16) -> HttpResponse {
     HttpResponse::new(HttpStatus(status)).with_header("cache-control", "no-store")
 }
 
-/// Only server policy and admitted facts enter this formatter. RequiredScopes
-/// has already bounded and validated every token before HTTP serialization.
+/// Only server policy and admitted facts enter this formatter. Named-operation
+/// failures do not disclose configuration before catalog visibility is proven.
 fn scope_rejection(
     policy: &ScopeRequestPolicy,
-    method: &str,
+    request: &JsonRpcRequest,
     facts: Option<&AuthContext>,
 ) -> Option<HttpResponse> {
-    let rejected = match policy.authorize_verified(method, facts) {
+    let rejected = match policy.authorize_request_verified(request, facts) {
         Ok(()) => return None,
         Err(rejected) => rejected,
     };
@@ -286,7 +288,10 @@ fn scope_rejection(
     });
     if !authenticated { return Some(refusal(401).with_header("www-authenticate", "Bearer")); }
     match rejected {
-        ScopeRequestRejection::InsufficientScope => Some(match policy.required_scopes(method) {
+        ScopeRequestRejection::InsufficientScope if policy.has_operation_rules() => Some(
+            refusal(403).with_header("www-authenticate", "Bearer error=\"insufficient_scope\""),
+        ),
+        ScopeRequestRejection::InsufficientScope => Some(match policy.required_scopes(&request.method) {
             Some(required) => refusal(403).with_header(
                 "www-authenticate",
                 format!("Bearer error=\"insufficient_scope\", scope=\"{}\"", required.challenge_scope()),
@@ -313,6 +318,9 @@ mod tests {
             ("tools/list".to_owned(), RequiredScopes::new(vec![]).unwrap()),
         ]).unwrap()
     }
+    fn method_request(method: &str) -> JsonRpcRequest {
+        JsonRpcRequest::new(method, None, fastmcp_protocol::RequestId::Number(1))
+    }
     fn facts(scopes: &[&str]) -> AuthContext {
         let mut facts = AuthContext::with_subject("private-principal-canary");
         facts.scopes = scopes.iter().map(|scope| (*scope).to_owned()).collect();
@@ -321,7 +329,7 @@ mod tests {
 
     #[test]
     fn challenge_contains_the_complete_sorted_requirement_not_only_missing_scopes() {
-        let response = scope_rejection(&policy(), "tools/call", Some(&facts(&["read"]))).unwrap();
+        let response = scope_rejection(&policy(), &method_request("tools/call"), Some(&facts(&["read"]))).unwrap();
         assert_eq!(response.status.0, 403);
         assert_eq!(response.headers["www-authenticate"], "Bearer error=\"insufficient_scope\", scope=\"read write\"");
         assert_eq!(response.headers["cache-control"], "no-store");
@@ -333,7 +341,7 @@ mod tests {
     fn transitive_permission_is_accepted_without_rewriting_provider_facts() {
         let facts = facts(&["admin"]);
         let before = serde_json::to_vec(&facts).unwrap();
-        assert!(scope_rejection(&policy(), "tools/call", Some(&facts)).is_none());
+        assert!(scope_rejection(&policy(), &method_request("tools/call"), Some(&facts)).is_none());
         assert_eq!(serde_json::to_vec(&facts).unwrap(), before);
     }
 
@@ -341,18 +349,18 @@ mod tests {
     fn anonymous_denial_is_401_without_scope_disclosure_and_public_is_explicit() {
         for method in ["tools/call", "unconfigured"] {
             for facts in [None, Some(AuthContext::anonymous())] {
-                let response = scope_rejection(&policy(), method, facts.as_ref()).unwrap();
+                let response = scope_rejection(&policy(), &method_request(method), facts.as_ref()).unwrap();
                 assert_eq!(response.status.0, 401);
                 assert_eq!(response.headers["www-authenticate"], "Bearer");
                 assert!(response.body.is_empty());
             }
         }
-        assert!(scope_rejection(&policy(), "tools/list", None).is_none());
+        assert!(scope_rejection(&policy(), &method_request("tools/list"), None).is_none());
     }
 
     #[test]
     fn unconfigured_method_has_no_scope_or_application_error_oracle() {
-        let response = scope_rejection(&policy(), "private-method-canary", Some(&facts(&["admin"]))).unwrap();
+        let response = scope_rejection(&policy(), &method_request("private-method-canary"), Some(&facts(&["admin"]))).unwrap();
         assert_eq!(response.status.0, 403);
         assert!(!response.headers.contains_key("www-authenticate"));
         assert!(response.body.is_empty());
@@ -361,7 +369,7 @@ mod tests {
 
     #[test]
     fn malformed_provider_facts_are_not_an_insufficient_scope_challenge() {
-        let response = scope_rejection(&policy(), "tools/call", Some(&facts(&["bad scope"]))).unwrap();
+        let response = scope_rejection(&policy(), &method_request("tools/call"), Some(&facts(&["bad scope"]))).unwrap();
         assert_eq!(response.status.0, 500);
         assert!(!response.headers.contains_key("www-authenticate"));
         assert!(response.body.is_empty());
@@ -402,5 +410,31 @@ mod tests {
             .with_sse_revalidation(SseRevalidationPolicy::default()).unwrap();
         assert!(security.clone().with_sse_revalidation(SseRevalidationPolicy::default()).is_err());
         assert_eq!(security.sse_revalidation.unwrap().interval(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn named_http_denials_do_not_disclose_existence_or_scope_configuration() {
+        use super::super::super::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+        let named = ScopeRequestPolicy::for_operations(OperationScopePolicy::new(2, policy(), vec![
+            (ScopedOperation::ToolCall("hidden-canary".into()), RequiredScopes::new(vec!["secret-scope-canary".into()]).unwrap()),
+        ]).unwrap()).unwrap();
+        let mut request = method_request("tools/call");
+        request.params = Some(serde_json::json!({"name":"hidden-canary"}));
+        let forbidden = scope_rejection(&named, &request, Some(&facts(&["admin"]))).unwrap();
+        request.params = Some(serde_json::json!({"name":"unknown-canary"}));
+        let unknown = scope_rejection(&named, &request, Some(&facts(&["admin"]))).unwrap();
+        assert_eq!(forbidden.status.0, 403);
+        assert_eq!(unknown.status.0, 403);
+        assert_eq!(unknown.headers, forbidden.headers);
+        assert_eq!(unknown.body, forbidden.body);
+        assert_eq!(forbidden.headers["www-authenticate"], "Bearer error=\"insufficient_scope\"");
+        assert_eq!(forbidden.headers["cache-control"], "no-store");
+        assert!(forbidden.body.is_empty());
+        assert!(!format!("{:?}", forbidden.headers).contains("canary"));
+        request.params = Some(serde_json::json!({"name":"hidden-canary"}));
+        assert!(scope_rejection(&named, &request, Some(&facts(&["admin", "secret-scope-canary"]))).is_none());
+        let anonymous = scope_rejection(&named, &request, None).unwrap();
+        assert_eq!(anonymous.status.0, 401);
+        assert_eq!(anonymous.headers["www-authenticate"], "Bearer");
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! This owner never renews a token or adopts changed identity, scopes or claims.
 //! A fresh provider verdict must reproduce the opening facts and still satisfy
-//! the pinned method policy. Failure is terminal for this response only.
+//! the pinned request policy, including any exact named-operation rules.
+//! Failure is terminal for this response only.
 //!
 //! The interval is an explicit maximum cached-verdict age, not an instantaneous
 //! revocation guarantee. Both the caller clock and monotonic wall clock bound
@@ -129,7 +130,7 @@ impl SseAuthorizationLease {
         if receipt.method != request.method || receipt.request_id != request.id {
             return Err(SseAuthorizationError::Rejected);
         }
-        scopes.authorize_verified(&request.method, receipt.authenticated.as_ref())
+        scopes.authorize_request_verified(request, receipt.authenticated.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
         let started = Instant::now();
         let next_check = fresh_until(cx, cx.now(), config.interval)?;
@@ -200,7 +201,7 @@ impl SseAuthorizationLease {
         {
             return Err(SseAuthorizationError::FactsChanged);
         }
-        self.scopes.authorize_verified(&self.request.method, receipt.authenticated.as_ref())
+        self.scopes.authorize_request_verified(&self.request, receipt.authenticated.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
         self.next_check = next_check;
         self.wall_expiry = started.checked_add(self.config.interval)
@@ -485,5 +486,41 @@ mod tests {
         assert_eq!(admit_verdict_time(before, deadline, just_before, config.check_timeout()), Ok(()));
         assert_eq!(admit_verdict_time(deadline, deadline, Duration::ZERO, config.check_timeout()), Err(SseAuthorizationError::TimedOut));
         assert_eq!(admit_verdict_time(started, deadline, config.check_timeout(), config.check_timeout()), Err(SseAuthorizationError::TimedOut));
+    }
+
+    #[test]
+    fn named_operation_lease_rechecks_the_exact_request_not_only_its_method() {
+        use super::super::super::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+        let cx = Cx::for_testing();
+        let mut facts = AuthContext::with_subject("named-lease-owner");
+        facts.scopes = vec!["read".into()];
+        let verifier = crate::StaticTokenVerifier::new([("named-lease-token".to_owned(), facts)]).unwrap();
+        let server = Arc::new(Server::new("named-lease", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .auth_provider(crate::TokenAuthProvider::new(verifier.clone())).build());
+        let authorization = TransportAuthorization::from_singleton_header(Some("Bearer named-lease-token"));
+        let methods = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::exact(1).unwrap(), vec![
+            ("tools/call".into(), RequiredScopes::new(vec!["read".into()]).unwrap()),
+        ]).unwrap();
+        let scopes = ScopeRequestPolicy::for_operations(OperationScopePolicy::new(1, methods, vec![
+            (ScopedOperation::ToolCall("allowed".into()), RequiredScopes::new(vec!["read".into()]).unwrap()),
+        ]).unwrap()).unwrap();
+        let mut request = JsonRpcRequest::new("tools/call", Some(serde_json::json!({"name":"allowed"})), RequestId::Number(9));
+        let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
+        let mut lease = SseAuthorizationLease::new(&cx, Arc::clone(&server), &request,
+            &authorization, &receipt, scopes.clone(), SseRevalidationPolicy::default()).unwrap();
+        due(&mut lease, &cx);
+        assert_eq!(lease.check(&cx), Ok(()));
+        assert_eq!(lease.checks, 1);
+        request.params = Some(serde_json::json!({"name":"forbidden"}));
+        let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
+        assert!(matches!(SseAuthorizationLease::new(&cx, server, &request, &authorization,
+            &receipt, scopes, SseRevalidationPolicy::default()), Err(SseAuthorizationError::Rejected)));
+        assert!(!lease.closed, "a refused new target cannot close the admitted sibling");
+        assert!(verifier.revoke_token("named-lease-token").unwrap());
+        due(&mut lease, &cx);
+        assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Rejected));
+        assert!(lease.closed);
+        assert!(lease.facts.is_none());
     }
 }
