@@ -16,7 +16,8 @@ use asupersync::types::Time;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CoreRequest, FINAL_PROTOCOL_VERSION, FinalRequestMeta, JsonInteger, RequestId, SubscriptionFilter,
+    CoreRequest, FINAL_PROTOCOL_VERSION, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta,
+    JsonInteger, RequestId, SubscriptionFilter,
 };
 use serde_json::json;
 
@@ -509,10 +510,28 @@ mod tests {
             .unwrap()
     }
 
-    const ACK: &str = concat!(
-        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",",
-        "\"params\":{\"requestId\":7,\"notifications\":{\"resourceSubscriptions\":[\"file:///tmp/watched\"]}}}\n\n"
-    );
+    /// The one subscription id this harness threads through BOTH the fixture and
+    /// the subscription under test. A literal on each side would let the
+    /// correlation check compare two constants that happen to agree, which
+    /// passes whether or not the id is actually carried.
+    const SUBSCRIPTION_ID: i64 = 7;
+
+    /// Builds an acknowledgment carrying its subscription id in `_meta`, which
+    /// is where `validate_http_subscription_acknowledgement` reads it from. The
+    /// id is a PARAMETER so a wrong one can be planted; see
+    /// `native_core_acknowledgment_with_a_foreign_subscription_id_is_refused`.
+    fn ack(id: i64) -> String {
+        // The `data: ` prefix and the blank-line terminator are the SSE framing,
+        // not decoration: without them the stream parser rejects the frame and
+        // EVERY test using it fails with InvalidResponse -- including the ones
+        // whose assertions are `is_err()`, which then pass for the wrong reason.
+        format!(
+            "data: {}\n\n",
+            json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+                "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY): id},
+                          "notifications":{"resourceSubscriptions":["file:///tmp/watched"]}}})
+        )
+    }
     const UPDATE: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
         "\"params\":{\"requestId\":7,\"uri\":\"file:///tmp/watched\"}}\n\n"
@@ -610,7 +629,7 @@ mod tests {
         };
         (ClientCredentialsCoreSubscription {
             listener: Some(Box::new(listener)), snapshot, owner, cancellation,
-            request_id: RequestId::Number(7), accepted_filter: None,
+            request_id: RequestId::Number(SUBSCRIPTION_ID), accepted_filter: None,
             deadline: discovery_deadline(cx, Duration::from_secs(5)).unwrap(),
             limits, records: 0, finished: false,
         }, peer)
@@ -621,11 +640,11 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ACK, UPDATE, TERMINAL].concat(), false,
+                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
             ).await;
             assert!(subscription.accepted_filter().is_none());
-            assert_eq!(subscription.request_id(), &RequestId::Number(7));
+            assert_eq!(subscription.request_id(), &RequestId::Number(SUBSCRIPTION_ID));
             assert_eq!(subscription.credential_generation(), 1);
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
@@ -646,13 +665,43 @@ mod tests {
         });
     }
 
+    /// The positive above passes whenever the acknowledgment's id AGREES with the
+    /// subscription's, which is exactly what a correlation check exists to
+    /// enforce -- so a harness writing the same literal on both sides cannot
+    /// distinguish a live check from an absent one. It would pass against an
+    /// implementation that never read the id at all.
+    ///
+    /// This plants a FOREIGN id and changes nothing else: same filter, same
+    /// stream, same limits, one value different. It fails if and only if the id
+    /// is genuinely carried from the subscribe request through to validation.
+    #[test]
+    fn native_core_acknowledgment_with_a_foreign_subscription_id_is_refused() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (mut subscription, peer) = native_subscription(
+                &cx,
+                [ack(SUBSCRIPTION_ID + 1).as_str(), UPDATE, TERMINAL].concat(),
+                false,
+                ClientCredentialsCoreSubscriptionLimits::default(),
+            )
+            .await;
+            assert!(subscription.next_event(&cx).await.is_err());
+            // The refused acknowledgment must not have been published either:
+            // rejecting the event while retaining its filter would leave the
+            // subscription claiming a narrowing no peer ever granted.
+            assert!(subscription.accepted_filter().is_none());
+            assert_eq!(subscription.records_delivered(), 0);
+            peer.join().unwrap();
+        });
+    }
+
     #[test]
     fn native_core_terminal_requires_prior_acknowledgment_and_correlation() {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             for (body, has_ack) in [
                 (TERMINAL.to_owned(), false),
-                ([ACK, &TERMINAL.replace("\"id\":7", "\"id\":8")].concat(), true),
+                ([ack(SUBSCRIPTION_ID).as_str(), &TERMINAL.replace("\"id\":7", "\"id\":8")].concat(), true),
             ] {
                 let (mut subscription, peer) = native_subscription(
                     &cx, body, false, ClientCredentialsCoreSubscriptionLimits::default(),
@@ -676,7 +725,7 @@ mod tests {
             let cx = Cx::current().unwrap();
             let outside = UPDATE.replace("file:///tmp/watched", "file:///tmp/also-requested");
             let (mut subscription, peer) = native_subscription(
-                &cx, [ACK, &outside, TERMINAL].concat(), false,
+                &cx, [ack(SUBSCRIPTION_ID).as_str(), &outside, TERMINAL].concat(), false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
             ).await;
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
@@ -693,7 +742,7 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ACK, UPDATE].concat(), false,
+                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE].concat(), false,
                 ClientCredentialsCoreSubscriptionLimits::default(),
             ).await;
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
@@ -713,7 +762,7 @@ mod tests {
                 65_536, 65_536, 2, Duration::from_secs(5),
             ).unwrap();
             let (mut subscription, peer) = native_subscription(
-                &cx, [ACK, UPDATE, TERMINAL].concat(), false, limits,
+                &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false, limits,
             ).await;
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
             assert!(subscription.next_event(&cx).await.unwrap().is_some());
@@ -731,7 +780,7 @@ mod tests {
             let cx = Cx::current().unwrap();
             for case in 0..5 {
                 let (mut subscription, peer) = native_subscription(
-                    &cx, [ACK, UPDATE, TERMINAL].concat(), false,
+                    &cx, [ack(SUBSCRIPTION_ID).as_str(), UPDATE, TERMINAL].concat(), false,
                     ClientCredentialsCoreSubscriptionLimits::default(),
                 ).await;
                 match case {
