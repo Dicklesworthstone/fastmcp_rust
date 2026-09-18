@@ -2715,19 +2715,24 @@ fn fnd_04_b_positive() {
     // Forty lowercase hex characters admits neither sentinel nor emptiness, and
     // matches this file's idiom for the adjacent tree identity.
     //
-    // ONE CONJUNCTION, deliberately, and not two sequential assertions.
-    // `chars().all(..)` is VACUOUSLY TRUE on an empty string -- and "" is
-    // exactly what the absent-`.git` path produces -- so the hex predicate
-    // alone would admit the failure this check exists to reject. The length
-    // operand is what rejects it.
+    // ONE CONJUNCTION, deliberately. `chars().all(..)` is VACUOUSLY TRUE on an
+    // empty string -- and "" is exactly what the absent-`.git` path produces --
+    // so THE HEX OPERAND ALONE ADMITS THE FAILURE THIS CHECK EXISTS TO REJECT.
+    // It also admits a 39-character hex string. The length operand rejects both.
     //
-    // As two `assert!` statements that fact is load-bearing on their ORDER and
-    // survives only as a comment; a later editor dropping the length check as
-    // "redundant to the stricter-looking hex check" silently reopens the hole.
-    // As a single `&&` the two operands are visibly one predicate, order is
-    // irrelevant because both must hold, and neither half can be removed
-    // without changing the predicate on its face. Structure over commentary --
-    // the same reason FND-02's digest validator is one conjunction.
+    // THE HAZARD IS REMOVAL, NOT ORDERING. As two statements a later editor may
+    // drop the length assert as "redundant to the stricter-looking hex check".
+    // As a single `&&` the operands are visibly one predicate and neither can be
+    // removed without changing it on its face. Structure over commentary -- the
+    // same reason FND-02's digest validator is one conjunction.
+    //
+    // An earlier revision of this comment claimed the ORDER of two sequential
+    // asserts was load-bearing. That is FALSE and was measured so: `assert!(a);
+    // assert!(b);` fails iff `!a || !b`, which is exactly when `assert!(a && b)`
+    // fails. Both asserts always run, so a vacuously-true operand cannot consume
+    // the other. Order changes only which message fires first, never the
+    // rejection set. Corrected rather than deleted so the false rule does not
+    // get re-derived from the code's shape.
     assert!(
         manifest.revision.len() == 40
             && manifest
