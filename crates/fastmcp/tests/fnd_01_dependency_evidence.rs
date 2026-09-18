@@ -38830,8 +38830,74 @@ activate = 1\n";
         source: Option<&'a str>,
     }
 
+    /// The PUBLISHED package set — the nine packages the archive contract covers.
+    ///
+    /// This is NOT the workspace member set. `tools/xtask` is `publish = false`,
+    /// so it is never packaged and correctly absent here; but `Cargo.lock` lists
+    /// every member regardless of `publish`, so a lockfile comparison needs TEN.
+    /// Use [`workspace_member_local_packages`] for anything reading a real
+    /// repository `Cargo.lock`. The two sets were equal until `tools/xtask` was
+    /// added at a7109f65 and are now permanently different.
     fn workspace_lock_local_packages() -> BTreeSet<(String, String)> {
         PACKAGE_IDS.iter().map(|package_id| ((*package_id).to_owned(), PACKAGE_VERSION.to_owned())).collect()
+    }
+
+    /// Package names of every workspace member, read from the member manifests.
+    ///
+    /// BASENAME IS NOT THE PACKAGE NAME, which is why this opens each manifest
+    /// instead of mapping the member path: `crates/fastmcp` is `fastmcp-rust`
+    /// and `crates/fastmcp-macros` is `fastmcp-derive`. A path-derived name
+    /// would be wrong for two of ten, and wrong *plausibly*, so nothing would
+    /// catch it.
+    ///
+    /// Derived from `Cargo.toml`, the AUTHORED declaration, and never from
+    /// `Cargo.lock`, which is the generated artifact under test. Taking both
+    /// sides of that comparison from the lock would make it pass on any lock at
+    /// all — including one silently missing a member, which is the defect the
+    /// comparison exists to catch.
+    fn workspace_member_package_names(root: &Path) -> VResult<BTreeSet<String>> {
+        let manifest_text =
+            fs::read_to_string(root.join("Cargo.toml")).map_err(|_| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", "Cargo.toml"))?;
+        let manifest =
+            toml::from_str::<toml::Value>(&manifest_text).map_err(|_| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", "Cargo.toml"))?;
+        let members = manifest
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("members"))
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", "Cargo.toml").at("workspace.members"))?;
+        let mut names = BTreeSet::new();
+        for member in members {
+            let member = member
+                .as_str()
+                .ok_or_else(|| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", "Cargo.toml").at("workspace.members"))?;
+            let member_text = fs::read_to_string(root.join(member).join("Cargo.toml"))
+                .map_err(|_| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", member).at("member manifest"))?;
+            let member_manifest =
+                toml::from_str::<toml::Value>(&member_text).map_err(|_| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", member))?;
+            let name = member_manifest
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", member).at("package.name"))?;
+            if !names.insert(name.to_owned()) {
+                return Err(Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", member).at("duplicate member package name"));
+            }
+        }
+        if names.len() < PACKAGE_IDS.len() {
+            return Err(Diagnostic::error("E_WORKSPACE_MANIFEST_PARSE", "Cargo.toml").at("member set smaller than the published package set"));
+        }
+        Ok(names)
+    }
+
+    /// Expected source-less package set for a real repository `Cargo.lock`.
+    ///
+    /// Every member inherits `version.workspace = true`, and this test ships in
+    /// one of them, so `CARGO_PKG_VERSION` is that shared version — including
+    /// for `fastmcp-xtask`, which inherits it too despite not being published.
+    fn workspace_member_local_packages(root: &Path) -> VResult<BTreeSet<(String, String)>> {
+        Ok(workspace_member_package_names(root)?.into_iter().map(|name| (name, env!("CARGO_PKG_VERSION").to_owned())).collect())
     }
 
     fn singleton_lock_local_package(name: &str, version: &str) -> BTreeSet<(String, String)> {
@@ -50631,7 +50697,9 @@ activate = 1\n";
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("workspace selection"));
         }
         let lock = parse_cargo_lock_strict(&workspace[1], &policy.bounds, "Cargo.lock")?;
-        let packages = registry_packages_from_lock(&lock, &policy.bounds, &workspace_lock_local_packages(), "Cargo.lock")?;
+        // `workspace[1]` is the repository's own Cargo.lock, which lists every
+        // member including the non-publishable one, so this needs the member set.
+        let packages = registry_packages_from_lock(&lock, &policy.bounds, &workspace_member_local_packages(root)?, "Cargo.lock")?;
         let selected = packages.iter().filter(|package| package.name == "asupersync").collect::<Vec<_>>();
         if selected.len() != 1 || selected[0].version != RELEASE_PIN || selected[0].checksum != RELEASE_SHA {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release selection"));
@@ -52427,7 +52495,9 @@ version = "0.0.0"
 
         let current_lock_bytes = fs::read(root.join("Cargo.lock")).expect("current Cargo.lock must be readable");
         let current_lock = parse_cargo_lock_strict(&current_lock_bytes, &policy.bounds, "current Cargo.lock").verified();
-        let current_local_packages = PACKAGE_IDS.iter().map(|name| ((*name).to_owned(), env!("CARGO_PKG_VERSION").to_owned())).collect::<BTreeSet<_>>();
+        // The LIVE repository lockfile, so this is the member set (ten), not the
+        // published set (nine). PACKAGE_IDS omits fastmcp-xtask by design.
+        let current_local_packages = workspace_member_local_packages(&root).verified();
         let accepted = registry_packages_from_lock(&current_lock, &policy.bounds, &current_local_packages, "current Cargo.lock").verified();
         assert!(!accepted.is_empty());
 
