@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn an_unclosed_fence_is_rejected() {
-        let text = format!("### FND-01 \u{2014} Freeze\n\n```\nunclosed\n");
+        let text = "### FND-01 \u{2014} Freeze\n\n```\nunclosed\n";
         assert_eq!(
             parse(text.as_bytes(), &limits()).unwrap_err().code,
             Code::PlanFenceUnclosed

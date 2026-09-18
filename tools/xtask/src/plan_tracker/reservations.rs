@@ -214,7 +214,7 @@ pub fn validate(
     }
 
     let age = now.saturating_sub(snapshot.generated_at);
-    if age > MAX_SNAPSHOT_AGE_SECONDS || age < 0 {
+    if !(0..=MAX_SNAPSHOT_AGE_SECONDS).contains(&age) {
         report.push(Diagnostic::new(
             Code::ReservationSnapshotStale,
             &declaration.issue_id,

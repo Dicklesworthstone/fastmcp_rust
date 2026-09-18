@@ -91,6 +91,10 @@ pub struct TraceRow {
 /// The number of fields the evaluator observes on every row.
 pub const OBSERVED_FIELDS_PER_ROW: usize = 13;
 
+/// FND-02 A item 3 fixes the floor at twelve observed fields per row.
+/// A build that lowers the constant below it must not compile.
+const _: () = assert!(OBSERVED_FIELDS_PER_ROW >= 12);
+
 /// The explicit sentinel for "upstream declares no conformance check here".
 /// An empty string is a missing field; `none` is a recorded decision.
 pub const NONE_SENTINEL: &str = "none";
@@ -298,10 +302,19 @@ mod tests {
         assert!(!Strength::May.is_mandatory());
     }
 
+    /// The AC floor is checked at COMPILE time, not here.
+    ///
+    /// `OBSERVED_FIELDS_PER_ROW >= 12` is evaluatable by the compiler, so as a
+    /// runtime `assert!` it was reachable only by running the test -- and
+    /// clippy flagged it as constant. Lowering the constant should not produce
+    /// a test failure, it should produce a BUILD failure: the floor is a
+    /// declared design limit, not a measurement. Moved to a `const` assertion
+    /// beside the constant itself, where the next person to edit it is looking.
+    /// What remains here is the real runtime claim -- that an actual row
+    /// produces exactly that many observed fields.
     #[test]
     fn a_complete_row_observes_the_declared_field_cardinality() {
         assert_eq!(row("k").observed_field_count(), OBSERVED_FIELDS_PER_ROW);
-        assert!(OBSERVED_FIELDS_PER_ROW >= 12);
     }
 
     #[test]

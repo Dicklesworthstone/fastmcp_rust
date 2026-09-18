@@ -40,6 +40,14 @@ const SHA256_K: [u32; 64] = [
 /// Truncation, uppercase rendering, double hashing, and hashing a textual hex
 /// rendering are all distinct wrong answers; callers get the raw digest and
 /// render it through [`hex`].
+// The working variables are named a..h exactly as FIPS 180-4 names them.
+// `many_single_char_names` is a READABILITY lint and cannot conceal a
+// correctness defect; renaming these away from the standard's own
+// identifiers would satisfy the linter by degrading the one property
+// that matters here -- that a human can check this against the
+// specification by reading it side by side. Narrow on purpose: this
+// allow covers one function, not the module.
+#[allow(clippy::many_single_char_names)]
 pub fn sha256(input: &[u8]) -> [u8; 32] {
     let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -56,7 +64,13 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 64];
-    for chunk in padded.chunks_exact(64) {
+    // `padded` is a whole number of 64-byte blocks by construction: the loop
+    // above pads to `len % 64 == 56` and then appends exactly 8 length bytes.
+    // `as_chunks` therefore yields an empty remainder, asserted below rather
+    // than assumed.
+    let (blocks, remainder) = padded.as_chunks::<64>();
+    debug_assert!(remainder.is_empty(), "padding must produce whole 64-byte blocks");
+    for chunk in blocks {
         for (index, word) in w.iter_mut().enumerate().take(16) {
             let base = index * 4;
             *word = u32::from_be_bytes([chunk[base], chunk[base + 1], chunk[base + 2], chunk[base + 3]]);
@@ -106,6 +120,14 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
 }
 
 /// Full 20-byte SHA-1. Used only to reproduce Git's blob object identity.
+// The working variables are named a..h exactly as FIPS 180-4 names them.
+// `many_single_char_names` is a READABILITY lint and cannot conceal a
+// correctness defect; renaming these away from the standard's own
+// identifiers would satisfy the linter by degrading the one property
+// that matters here -- that a human can check this against the
+// specification by reading it side by side. Narrow on purpose: this
+// allow covers one function, not the module.
+#[allow(clippy::many_single_char_names)]
 pub fn sha1(input: &[u8]) -> [u8; 20] {
     let mut state: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
 
@@ -119,7 +141,13 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 80];
-    for chunk in padded.chunks_exact(64) {
+    // `padded` is a whole number of 64-byte blocks by construction: the loop
+    // above pads to `len % 64 == 56` and then appends exactly 8 length bytes.
+    // `as_chunks` therefore yields an empty remainder, asserted below rather
+    // than assumed.
+    let (blocks, remainder) = padded.as_chunks::<64>();
+    debug_assert!(remainder.is_empty(), "padding must produce whole 64-byte blocks");
+    for chunk in blocks {
         for (index, word) in w.iter_mut().enumerate().take(16) {
             let base = index * 4;
             *word = u32::from_be_bytes([chunk[base], chunk[base + 1], chunk[base + 2], chunk[base + 3]]);
