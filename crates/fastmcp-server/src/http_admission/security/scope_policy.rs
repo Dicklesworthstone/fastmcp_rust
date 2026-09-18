@@ -12,6 +12,9 @@
 //! audience itself and does not create an authorization lease. Existing catalog
 //! visibility and operation authorization must still run after authentication.
 
+/// Default-deny method scope enforcement before application middleware.
+pub mod request;
+
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
