@@ -140,12 +140,12 @@ pub(super) async fn serve(
                 buffered(cx, &shutdown, &mut framed, HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE), Some(&cors), io).await;
                 return;
             }
+            let _body_owner = RegisteredResponseBody {
+                sessions: Arc::clone(&sessions), generation,
+            };
             let _ = sse(cx, &shutdown, framed.into_inner(), Arc::clone(&endpoint.server), &live,
                 &sessions, next_modern_http_stream_generation(), inbound, request, raw_params,
                 Some(receipt), response, &cors, lease, io).await;
-            if let Some(live) = sessions.take_response_body(generation) {
-                close_detached_modern_http_session(&sessions, live);
-            }
         }
         Ok(Err(response)) => {
             buffered(cx, &shutdown, &mut framed, http_endpoint_response_to_static(cx, response), Some(&cors), io).await;
@@ -154,6 +154,25 @@ pub(super) async fn serve(
         Err(error) => {
             buffered(cx, &shutdown, &mut framed, http_endpoint_error_response(&request, error, body_limit), Some(&cors), io).await;
             close_detached_modern_http_session(&sessions, live);
+        }
+    }
+}
+
+/// Own the registry entry across every suspension of the response driver.
+/// Cancellation or abandonment must retire dispatches even when execution never
+/// reaches the code after `sse().await`. The registry keeps unsettled handles.
+struct RegisteredResponseBody {
+    sessions: LiveModernHttpSessionRegistry,
+    generation: u64,
+}
+
+impl Drop for RegisteredResponseBody {
+    fn drop(&mut self) {
+        // Phase-one listener shutdown may already have evacuated this entry.
+        // In that case its terminal-drain owner, not this guard, must perform
+        // destructive phase-two close. TTL removal is similarly idempotent.
+        if let Some(live) = self.sessions.take_response_body(self.generation) {
+            close_detached_modern_http_session(&self.sessions, live);
         }
     }
 }
@@ -410,6 +429,96 @@ mod tests {
 
     impl<F> Drop for Tracked<F> {
         fn drop(&mut self) { self.drops.fetch_add(1, Ordering::SeqCst); }
+    }
+
+    async fn registered_body(cx: &Cx) -> (crate::BoundHttpServer, Arc<LiveModernHttpSession>, u64) {
+        let bound = Server::new("secured-body-lifetime", "1")
+            .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+            .build().bind_http(cx, "127.0.0.1:0").await.unwrap();
+        let live = Arc::new(LiveModernHttpSession::new(bound.endpoint.open_session(cx).unwrap()));
+        let generation = next_live_modern_http_response_body_generation();
+        assert!(bound.modern_sessions.register_response_body(generation, Arc::clone(&live)).is_ok());
+        (bound, live, generation)
+    }
+
+    #[test]
+    fn secured_sse_abandoned_body_releases_registry_and_retains_cancelled_dispatch() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let (bound, live, generation) = registered_body(&cx).await;
+                let registry = Arc::clone(&bound.modern_sessions);
+                let sibling = Arc::new(LiveModernHttpSession::new(bound.endpoint.open_session(&cx).unwrap()));
+                let sibling_generation = next_live_modern_http_response_body_generation();
+                assert!(registry.register_response_body(sibling_generation, Arc::clone(&sibling)).is_ok());
+                let sibling_owner = RegisteredResponseBody {
+                    sessions: Arc::clone(&registry), generation: sibling_generation,
+                };
+                let cancellation = McpRequestCancellation::new();
+                let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+                let task = cx.spawn(move |child_cx| async move {
+                    let _ = receiver.recv(&child_cx).await;
+                }).unwrap();
+                assert!(live.register_modern_dispatch(OwnedModernHttpDispatch {
+                    owner_generation: next_modern_http_stream_generation(),
+                    request_cancellation: cancellation.clone(), task,
+                }).is_ok());
+                let owner = RegisteredResponseBody { sessions: Arc::clone(&registry), generation };
+                let response = Tracked::new(pending::<()>());
+                let drops = Arc::clone(&response.drops);
+                let mut waiting = Box::pin(async move {
+                    let _owner = owner;
+                    response.await;
+                });
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                }).await;
+                assert_eq!(registry.sessions.lock().unwrap().len(), 2);
+                assert!(!live.is_closing());
+                assert!(!cancellation.is_cancel_requested());
+
+                drop(waiting);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert_eq!(registry.sessions.lock().unwrap().len(), 1);
+                assert!(!registry.sessions.lock().unwrap().contains_key(&generation));
+                assert!(registry.sessions.lock().unwrap().contains_key(&sibling_generation));
+                assert!(live.finalized.load(Ordering::Acquire));
+                assert!(cancellation.is_cancel_requested());
+                assert!(!sibling.is_closing());
+                let mut retired = registry.take_retired_dispatches();
+                assert_eq!(retired.len(), 1, "aborted child custody remains with the listener");
+                let _ = retired[0].join(&cx).await;
+                drop(sender);
+                drop(sibling_owner);
+                assert!(sibling.finalized.load(Ordering::Acquire));
+                assert!(registry.sessions.lock().unwrap().is_empty());
+            });
+    }
+
+    #[test]
+    fn secured_sse_body_owner_preserves_listener_terminal_drain_custody() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let (bound, live, generation) = registered_body(&cx).await;
+                let registry = Arc::clone(&bound.modern_sessions);
+                let owner = RegisteredResponseBody { sessions: Arc::clone(&registry), generation };
+                let expiry = *live.expires_at.lock().unwrap();
+                let closing = crate::detach_live_modern_http_sessions(&registry);
+                assert_eq!(closing.len(), 1);
+                assert!(live.is_closing());
+                assert!(!live.finalized.load(Ordering::Acquire));
+                drop(owner);
+                assert!(!live.finalized.load(Ordering::Acquire), "response drop cannot steal phase-two close");
+                assert_eq!(*live.expires_at.lock().unwrap(), expiry);
+                let unsettled = crate::finish_live_modern_http_sessions(&registry, closing).await;
+                assert!(unsettled.is_empty());
+                assert!(live.finalized.load(Ordering::Acquire));
+                assert!(registry.sessions.lock().unwrap().is_empty());
+            });
     }
 
     #[test]
