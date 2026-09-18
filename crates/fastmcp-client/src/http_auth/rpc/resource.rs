@@ -35,6 +35,9 @@ use crate::cache::{
 };
 use crate::http_auth::managed::OAuthCredentialSnapshot;
 
+/// Subscribe-before-read reconciliation with bounded rereads and explicit input handoff.
+pub mod watch;
+
 /// Input/frame/response/notification/time limits come from the shared core
 /// limits. Contents count additionally bounds the complete read's item vector.
 #[derive(Clone, Copy, Debug)]
