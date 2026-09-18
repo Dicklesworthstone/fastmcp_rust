@@ -56044,6 +56044,16 @@ original = "value"
             | "crates/fastmcp-server/src/bidirectional.rs"
             | "crates/fastmcp-server/src/tasks.rs"
             | "crates/fastmcp-transport/src/http.rs"
+            // The private_key_jwt assertion builder draws its JWT `jti` nonce
+            // THROUGH the sealed API (`draw_security_identifier()`), which is
+            // the approved path and the exact opposite of the shape the owner
+            // check exists to catch: that file contains zero `getrandom`
+            // references. Its subsystem sibling `http_auth/oauth.rs` is already
+            // admitted for the same API and the same purpose class. Narrow
+            // single-API form deliberately — it needs one draw, not oauth.rs's
+            // two, and an allowlist entry wider than its use is a permission
+            // nobody is checking.
+            | "crates/fastmcp-client/src/http_auth/discovery/client_credentials/private_key_jwt.rs"
             | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
             "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
             _ => false,
@@ -56073,6 +56083,28 @@ original = "value"
         }
         for api in ["draw_security_identifier", "draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask"] {
             assert!(!state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api), "the neighboring core path must not inherit permission for {api}");
+        }
+    }
+
+    /// The allowlist is PATH-EXACT by design, and this is what makes that
+    /// design testable for the private_key_jwt entry rather than merely stated.
+    ///
+    /// A relaxation that admits one file must not quietly admit its directory.
+    /// `rpc.rs` is a real sibling in the same `client_credentials/` module, so
+    /// a future change that widened the match to a prefix — or that moved the
+    /// entry into the crypto.rs-style "all five APIs" arm — fails here rather
+    /// than passing silently. The neighbouring assertions are the half that
+    /// would be lost if someone later "simplified" this entry.
+    #[test]
+    fn fnd_01_state_partition_rng_private_key_jwt_sealed_api_allowlist_exact() {
+        let private_key_jwt_path = "crates/fastmcp-client/src/http_auth/discovery/client_credentials/private_key_jwt.rs";
+        let neighboring_path = "crates/fastmcp-client/src/http_auth/discovery/client_credentials/rpc.rs";
+        assert!(state_partition_rng_sealed_api_is_allowlisted(private_key_jwt_path, "draw_security_identifier"), "the private_key_jwt assertion builder must admit draw_security_identifier");
+        for api in ["draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(private_key_jwt_path, api), "the private_key_jwt assertion builder must reject {api}");
+        }
+        for api in ["draw_security_identifier", "draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask"] {
+            assert!(!state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api), "the neighboring client-credentials path must not inherit permission for {api}");
         }
     }
 
