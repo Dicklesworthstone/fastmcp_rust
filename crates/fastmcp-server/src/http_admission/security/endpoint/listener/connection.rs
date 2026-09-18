@@ -616,6 +616,40 @@ mod tests {
     }
 
     #[test]
+    fn secured_json_ready_result_channel_preserves_half_close_and_reset_priority() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                for reset in [false, true] {
+                    let registry = Arc::new(crate::LiveModernHttpSessionRegistryState::new());
+                    let cancellation = McpRequestCancellation::new();
+                    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+                    let task = cx.spawn(move |_| async move {
+                        let _ = sender.send_blocking(HttpResponse::new(HttpStatus(201)));
+                    }).unwrap();
+                    let mut owner = OwnedJsonDispatch {
+                        task: Some(task), sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                    };
+                    assert!(owner.finish(&cx).await, "the result is queued before peer arbitration");
+                    let peer = if reset { Err(io::Error::from(io::ErrorKind::ConnectionReset)) } else { Ok(0) };
+                    let result = monitor_response_peer(&cancellation, ready(peer), async {
+                        receiver.recv(&cx).await.map_err(|_| ())
+                    }).await;
+                    if reset {
+                        assert!(result.is_err());
+                        assert_eq!(receiver.try_recv().unwrap().status.0, 201, "reset must not consume the queued result");
+                    } else {
+                        assert_eq!(result.unwrap().status.0, 201);
+                    }
+                    drop(owner);
+                    assert_eq!(cancellation.is_cancel_requested(), reset);
+                    assert!(registry.retired_dispatches.lock().unwrap().is_empty());
+                }
+            });
+    }
+
+    #[test]
     fn secured_sse_ready_reset_wins_over_a_ready_response() {
         let cancellation = McpRequestCancellation::new();
         let sibling = McpRequestCancellation::new();
@@ -704,7 +738,7 @@ mod tests {
         assert!(work.as_mut().poll(&mut task).is_pending());
         assert!(!cancellation.is_cancel_requested());
         drop(work);
-        assert!(cancelled_or_requested(&cancellation));
+        assert!(cancellation.is_cancel_requested());
         assert!(!sibling.is_cancel_requested());
         assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
         assert_eq!(response_drops.load(Ordering::SeqCst), 1);
