@@ -26,16 +26,11 @@ jobs:
           set -euo pipefail
           git rev-parse HEAD > SOURCE_HEAD
           tar --exclude=.git -czf "$RUNNER_TEMP/source-snapshot.tar.gz" .
-          cp SOURCE_HEAD "$RUNNER_TEMP/SOURCE_HEAD"
-          (cd "$RUNNER_TEMP" && sha256sum source-snapshot.tar.gz > source-snapshot.sha256)
 
       - name: Upload exact checkout
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: fastmcp-source-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/source-snapshot.tar.gz
-            ${{ runner.temp }}/source-snapshot.sha256
-            ${{ runner.temp }}/SOURCE_HEAD
+          path: ${{ runner.temp }}/source-snapshot.tar.gz
           if-no-files-found: error
           retention-days: 1
