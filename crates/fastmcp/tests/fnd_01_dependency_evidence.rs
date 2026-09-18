@@ -20561,7 +20561,26 @@ mod ordinary {
         (ACTION_GITHUB_RELEASE, 0, 0),
     ];
     const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 36;
-    const PACKAGE_VERSION: &str = "0.8.1";
+    /// The version every workspace package carries, DERIVED rather than frozen.
+    ///
+    /// All nine `PACKAGE_IDS` inherit `version.workspace = true` and this test
+    /// ships in `fastmcp-rust`, so `CARGO_PKG_VERSION` IS the workspace version.
+    ///
+    /// It stood frozen at `"0.8.1"` while the tree was at `0.10.0`. The literal
+    /// reads like a fixture and is not one: the archives it names are BUILT
+    /// during verification — `package_argv` runs `cargo package --workspace
+    /// --locked --offline` against a staged manifest that the policy defines as
+    /// a copy of the live workspace snapshot — so every `<package-id>-<version>`
+    /// path built from this names whatever the tree holds now, never an
+    /// attestation of a published release. A measurement of mutable content must
+    /// be derived; only a declared design limit may be frozen. Re-freezing this
+    /// at the current number would buy exactly one release.
+    ///
+    /// `dependency-verification.toml` still spells `0.3.2` into
+    /// `archive_root_formula` and its siblings. That is the same defect on the
+    /// frozen side of the boundary, no lane may edit that file, and it is
+    /// recorded on the owning bead rather than worked around here.
+    const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!("cargo-1.99.0-nightly-", "59800466c5c41c444d264b1010b4d57e85a7117f-", "summaries-cache-v3-index-v2-fnd01-hardening-v1",);
     const ACQUISITION_CRATE_CACHE_PREFIX: &str = "registry/cache/index.crates.io-1949cf8c6b5b557f/";
