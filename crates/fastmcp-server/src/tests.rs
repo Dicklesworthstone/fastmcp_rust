@@ -1679,16 +1679,17 @@ mod router_tests {
             reason: Some("test cancellation".to_string()),
             meta: None,
         };
-        let start = Instant::now();
         server.handle_cancelled_notification(session_id, params);
 
+        // bd-mvpne: an `assert!(start.elapsed() < Duration::from_secs(1))` stood here and was
+        // removed, with its `Instant::now()` binding. It ran AFTER the call it bounded, so a
+        // genuine block never reached it -- it could not detect the defect its own message
+        // named -- while still being able to fail because the machine was merely slow. The
+        // three assertions below carry everything recoverable. Do not re-add a wall-clock
+        // bound here; the property is structural, not temporal.
         assert!(!completion.is_done());
         assert!(cancellation.is_cancel_requested());
         assert!(!cx.is_cancel_requested());
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "a cancellation notification must not block the receive path"
-        );
     }
 
     #[test]

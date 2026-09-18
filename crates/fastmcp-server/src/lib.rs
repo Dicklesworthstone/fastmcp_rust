@@ -29868,7 +29868,6 @@ mod lib_unit_tests {
         )
         .expect("request should register");
         let cancellation = guard.cancellation();
-        let start = Instant::now();
 
         server.handle_cancelled_notification(
             11,
@@ -29879,12 +29878,14 @@ mod lib_unit_tests {
             },
         );
 
+        // bd-mvpne: an `assert!(start.elapsed() < Duration::from_secs(1))` stood here and was
+        // removed, with its `Instant::now()` binding. It ran AFTER the call it bounded, so a
+        // genuine block never reached it -- it could not detect the defect its own message
+        // named -- while still being able to fail because the machine was merely slow. The
+        // two assertions below carry everything recoverable. Do not re-add a wall-clock
+        // bound here; the property is structural, not temporal.
         assert!(cancellation.is_cancel_requested());
         assert!(!guard.completion.is_done());
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "the receive path must not wait for request cleanup"
-        );
     }
 
     #[test]
