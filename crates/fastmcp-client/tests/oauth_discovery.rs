@@ -2,6 +2,9 @@
 //! POSTs, with an in-process browser-callback simulator. No external IdP/browser
 //! is exercised. All registration writes are confined to the local TLS fixture.
 
+#[path = "oauth_discovery/resource_metadata.rs"]
+mod resource_metadata;
+
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -400,6 +403,7 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
 
 #[test]
 fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
+    use fastmcp_client::http_auth::discovery::{ResourceMetadataCause, ResourceMetadataFailureClass};
     for trusted in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -411,14 +415,19 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
             } else {
                 document["authorization_servers"] = json!(["https://127.0.0.1:9/forbidden"]);
             }
-            let application = plan.discover(&cx);
-            let ((), result) = pair(peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &document.to_string()), application).await;
-            if trusted {
-                assert!(matches!(result, Err(OAuthDiscoveryError::ResourceMismatch)));
-            } else {
-                assert!(matches!(result, Err(OAuthDiscoveryError::NoTrustedIssuer)));
-            }
-            assert_eq!(peer.paths.lock().unwrap().len(), 1);
+            let server = async {
+                for path in ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"] {
+                    peer.serve(path, 200, &document.to_string()).await;
+                }
+            };
+            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+                panic!("both unusable resource candidates must retain their admission causes");
+            };
+            let expected = if trusted { ResourceMetadataCause::ResourceMismatch } else { ResourceMetadataCause::NoTrustedIssuer };
+            assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
+            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [expected, expected]);
+            assert_eq!(peer.paths.lock().unwrap().len(), 2);
             peer.assert_no_extra_connections();
         });
     }
@@ -426,6 +435,7 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
 
 #[test]
 fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
+    use fastmcp_client::http_auth::discovery::ResourceMetadataCause;
     for trust_resource in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -435,11 +445,23 @@ fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
                 if trust_resource {
                     peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
                 }
-                let (socket, _) = peer.listener.accept().await.unwrap();
-                assert!(peer.acceptor.accept(socket).await.is_err(), "untrusted certificate cannot become an HTTP stream");
+                // Neither resource candidate may send a GET without trusted TLS.
+                // Once PRM succeeds, issuer trust is still a separate boundary.
+                for _ in 0..if trust_resource { 1 } else { 2 } {
+                    let (socket, _) = peer.listener.accept().await.unwrap();
+                    assert!(peer.acceptor.accept(socket).await.is_err(), "untrusted certificate cannot become an HTTP stream");
+                }
             };
             let ((), result) = pair(server, plan.discover(&cx)).await;
-            assert!(matches!(result, Err(OAuthDiscoveryError::TransportFailed)));
+            if trust_resource {
+                assert!(matches!(result, Err(OAuthDiscoveryError::TransportFailed)));
+            } else {
+                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+                    panic!("both resource TLS failures must remain visible");
+                };
+                assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
+                    [ResourceMetadataCause::TransportFailed, ResourceMetadataCause::TransportFailed]);
+            }
             assert_eq!(peer.paths.lock().unwrap().len(), usize::from(trust_resource));
             peer.assert_no_extra_connections();
         });
