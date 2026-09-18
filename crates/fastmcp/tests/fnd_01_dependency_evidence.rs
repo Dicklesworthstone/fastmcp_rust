@@ -50278,29 +50278,95 @@ activate = 1\n";
     /// pin-refresh collision produced. Properties 2 and 3 - blob-at-anchor
     /// equality, and "no unaccounted mover since" - remain UNPROVEN HERE,
     /// deliberately and visibly, rather than skipped into a false green.
+    ///
+    /// The positive and the negative both drive
+    /// `fnd_01_check_workspace_input_anchoring`, so weakening the checker breaks
+    /// BOTH. A negative that re-implements the predicate instead of calling it
+    /// proves the predicate discriminates, not that the positive uses it — and
+    /// would keep passing if the positive were reduced to `assert!(true)`.
+    fn fnd_01_check_workspace_input_anchoring(
+        bindings: &[(&str, u64, &str)],
+        provenance: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let bound: std::collections::BTreeSet<&str> =
+            bindings.iter().map(|(path, _, _)| *path).collect();
+        let anchored: std::collections::BTreeSet<&str> =
+            provenance.iter().map(|(path, _)| *path).collect();
+        if bound != anchored {
+            return Err(format!(
+                "every frozen workspace input must name the commit that produced it, and \
+                 every recorded anchor must name a frozen input; bound={bound:?} \
+                 anchored={anchored:?}"
+            ));
+        }
+        for (path, revision) in provenance {
+            if revision.len() != 40 {
+                return Err(format!(
+                    "{path}: producing commit must be a full 40-hex revision, not an \
+                     abbreviation that grows ambiguous as history does; got {revision:?}"
+                ));
+            }
+            if !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("{path}: producing commit {revision} is not hexadecimal"));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn fnd_01_every_frozen_workspace_input_names_a_producing_commit() {
-        let bound: std::collections::BTreeSet<&str> =
-            TOOLCHAIN_WORKSPACE_INPUTS.iter().map(|(path, _, _)| *path).collect();
-        let anchored: std::collections::BTreeSet<&str> =
-            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE.iter().map(|(path, _)| *path).collect();
-        assert_eq!(
-            bound, anchored,
-            "every frozen workspace input must name the commit that produced it, \
-             and every recorded anchor must name a frozen input"
-        );
-        for (path, revision) in TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE {
-            assert_eq!(
-                revision.len(),
-                40,
-                "{path}: the producing commit must be a full 40-hex revision, not \
-                 an abbreviation that grows ambiguous as history does"
-            );
-            assert!(
-                revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "{path}: producing commit {revision} is not a hexadecimal revision"
-            );
-        }
+        fnd_01_check_workspace_input_anchoring(
+            &TOOLCHAIN_WORKSPACE_INPUTS,
+            &TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE,
+        )
+        .expect("every frozen workspace input must be anchored to its producing commit");
+    }
+
+    /// bd-veqqv PLANTED NEGATIVE. Each mutation isolates ONE clause and leaves
+    /// the others satisfied: a mutation that breaks everything fires on whichever
+    /// clause is checked first and SHADOWS the rest, leaving them as unproven as
+    /// before while the red makes the whole thing look verified.
+    #[test]
+    fn fnd_01_workspace_input_provenance_rejects_an_unanchored_binding() {
+        // MUTATION 1 — a bound path with NO producing commit. This is exactly the
+        // state a dependency-pin refresh produces: the binding moves and nobody
+        // records why.
+        fnd_01_check_workspace_input_anchoring(
+            &TOOLCHAIN_WORKSPACE_INPUTS,
+            &TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[1..],
+        )
+        .expect_err("an UNANCHORED binding must be refused");
+
+        // MUTATION 2 — the opposite direction: an anchor naming a path that is
+        // not bound, i.e. a stale row asserting provenance for nothing.
+        let orphaned = [
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[0],
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[1],
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[2],
+            ("crates/fastmcp/Cargo.toml", "a7109f655a3c10a661c76cddce6727ca339863c1"),
+        ];
+        fnd_01_check_workspace_input_anchoring(&TOOLCHAIN_WORKSPACE_INPUTS, &orphaned)
+            .expect_err("an anchor naming an unbound path must be refused");
+
+        // MUTATION 3 — an ABBREVIATED revision. Seven hex characters is a valid
+        // git revision today and grows ambiguous as history does.
+        let abbreviated = [
+            ("Cargo.toml", "a7109f65"),
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[1],
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[2],
+        ];
+        fnd_01_check_workspace_input_anchoring(&TOOLCHAIN_WORKSPACE_INPUTS, &abbreviated)
+            .expect_err("an abbreviated revision must be refused");
+
+        // MUTATION 4 — correct WIDTH, wrong ALPHABET, checked separately because
+        // a 40-character non-revision satisfies clause 3.
+        let not_hex = [
+            ("Cargo.toml", "a7109f65-not-a-revision-0000000000000000"),
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[1],
+            TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE[2],
+        ];
+        fnd_01_check_workspace_input_anchoring(&TOOLCHAIN_WORKSPACE_INPUTS, &not_hex)
+            .expect_err("a 40-character non-revision must be refused");
     }
 
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
