@@ -919,6 +919,146 @@ fn limit_01_integration_lifecycle_join() {
 // Bridge quartet — frozen positive and its one-variable planted negative
 // ---------------------------------------------------------------------------
 
+/// The number of upstream LIMIT-A / LIMIT-B evidence rows this leaf emits ahead
+/// of its own LIMIT-I content, in the order `AC-LIMIT-V-01` enumerates them.
+const UPSTREAM_EVIDENCE_ROWS: usize = 6;
+
+/// The six upstream LIMIT-A / LIMIT-B acceptance evidence groups, bound into
+/// this leaf's receipt by name.
+///
+/// `AC-LIMIT-V-01` requires the verification leaf to find ordered evidence IDs
+/// `LIMIT-A-01`..`LIMIT-A-03` and `LIMIT-B-01`..`LIMIT-B-03` in this receipt
+/// alongside this leaf's own `LIMIT-I-01`..`LIMIT-I-02` — eight groups against
+/// its declared floor of eight. Before this binding existed the receipt carried
+/// only its own two, so a change to an upstream row could not move the
+/// integration digest and the join certified "whatever A and B happen to be
+/// now".
+///
+/// EVERY FIELD BELOW IS DERIVED, never a literal. Each row folds over the source
+/// collection this leaf already re-derives, so deleting or substituting a source
+/// row changes that row's text and therefore the digest. A hand-written row set
+/// would be a count that survives the deletion of what it counts, which is the
+/// defect this binding exists to prevent rather than to re-create.
+fn upstream_evidence_rows(
+    accepted: &ProtocolLimits,
+    public_rows: &[PublicJoinRow],
+    lifecycle_rows: &[LifecycleRow],
+) -> Vec<String> {
+    // LIMIT-A-01 — the configured catalog, folded per row so a removed bound
+    // changes both the count and the text.
+    let bounds: Vec<String> = configured_bound_rows()
+        .into_iter()
+        .map(|(limit, units)| {
+            let ceiling =
+                ProtocolLimits::hard_ceiling(limit).expect("a countable catalog row has a ceiling");
+            format!("{limit}={units}/{ceiling}")
+        })
+        .collect();
+
+    // LIMIT-A-02 — the three shipped domains, each re-probed through its public
+    // constructor rather than named. A domain that stopped being distinct moves
+    // its own field.
+    let domains: Vec<String> = [
+        PartitionKind::PreAuth,
+        PartitionKind::Verified,
+        PartitionKind::AuthorizationFlow,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let partition = partition_for(kind);
+        format!(
+            "{kind:?}=pre_auth:{},verified:{}",
+            partition.is_pre_auth(),
+            partition.is_verified()
+        )
+    })
+    .collect();
+
+    // LIMIT-A-03 — checked arithmetic at N-1 / N / N+1 over the same catalog, so
+    // this row is sensitive to the bound rows as well as to the arithmetic.
+    let arithmetic: Vec<String> = configured_bound_rows()
+        .into_iter()
+        .map(|(limit, units)| {
+            let below = accepted.try_charge(limit, 0, units - 1).is_ok();
+            let at = accepted.try_charge(limit, 0, units).is_ok();
+            let above = accepted.try_charge(limit, 0, units + 1).is_err();
+            format!("{limit}={below}/{at}/{above}")
+        })
+        .collect();
+
+    // LIMIT-B-01 — the executed reserve outcomes.
+    let reserve: Vec<String> = public_rows
+        .iter()
+        .map(|row| {
+            let outcome = if row.result.is_ok() {
+                "admitted"
+            } else {
+                "refused"
+            };
+            format!("{}={}:{outcome}", row.id, row.requested)
+        })
+        .collect();
+
+    // LIMIT-B-02 — the terminal disposition and discharge counters per row.
+    let lifecycle: Vec<String> = lifecycle_rows
+        .iter()
+        .map(|row| {
+            let observed = row.final_observed();
+            format!(
+                "{}={:?}:released:{}:committed:{}",
+                row.id, row.terminal, observed.release_count, observed.committed_work
+            )
+        })
+        .collect();
+
+    // LIMIT-B-03 — cross-partition isolation as this leaf actually exercises it:
+    // the prefill charges peer partitions, so a subject whose own partition
+    // counter stays zero while global is occupied is the fairness property.
+    let fairness: Vec<String> = public_rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}=peer_global:{}:subject_partition:{}",
+                row.id, row.before.global_in_use, row.before.partition_in_use
+            )
+        })
+        .collect();
+
+    vec![
+        format!(
+            "LIMIT-A-01 LIMIT01-A-BOUNDS-v1 rows={} generation={} {}",
+            bounds.len(),
+            accepted.generation(),
+            bounds.join(" ")
+        ),
+        format!(
+            "LIMIT-A-02 LIMIT01-A-PARTITIONS-v1 rows={} {}",
+            domains.len(),
+            domains.join(" ")
+        ),
+        format!(
+            "LIMIT-A-03 LIMIT01-A-ARITHMETIC-v1 rows={} {}",
+            arithmetic.len(),
+            arithmetic.join(" ")
+        ),
+        format!(
+            "LIMIT-B-01 LIMIT01-B-RESERVE-v1 rows={} global={GLOBAL_CAPACITY} partition={PARTITION_CAPACITY} {}",
+            reserve.len(),
+            reserve.join(" ")
+        ),
+        format!(
+            "LIMIT-B-02 LIMIT01-B-LIFECYCLE-v1 rows={} {}",
+            lifecycle.len(),
+            lifecycle.join(" ")
+        ),
+        format!(
+            "LIMIT-B-03 LIMIT01-B-FAIRNESS-v1 rows={} {}",
+            fairness.len(),
+            fairness.join(" ")
+        ),
+    ]
+}
+
 /// The ordered joined receipt over the LIMIT-A bound rows, the LIMIT-B public
 /// join rows, and the LIMIT-B lifecycle rows.
 fn joined_receipt(
@@ -926,7 +1066,7 @@ fn joined_receipt(
     public_rows: &[PublicJoinRow],
     lifecycle_rows: &[LifecycleRow],
 ) -> Vec<String> {
-    let mut receipt = Vec::new();
+    let mut receipt = upstream_evidence_rows(accepted, public_rows, lifecycle_rows);
     receipt.push(format!(
         "LIMIT01-I-PUBLIC-JOIN-v1 generation={}",
         accepted.generation()
@@ -1102,11 +1242,86 @@ fn limit_01_i_positive() {
     let receipt = joined_receipt(&accepted, &public_rows, &lifecycle_rows);
     assert_eq!(
         receipt.len(),
-        1 + 6 + 6 + 1 + 5,
-        "the joined receipt must carry both digest headers, six bound rows, six public-join rows and five lifecycle rows"
+        UPSTREAM_EVIDENCE_ROWS + 1 + 6 + 6 + 1 + 5,
+        "the joined receipt must carry the six upstream LIMIT-A/LIMIT-B evidence rows, both digest headers, six bound rows, six public-join rows and five lifecycle rows"
     );
-    assert!(receipt[0].starts_with("LIMIT01-I-PUBLIC-JOIN-v1 generation=1"));
-    assert_eq!(receipt[13], "LIMIT01-I-LIFECYCLE-JOIN-v1");
+    // AC-LIMIT-V-01 requires EIGHT ordered evidence groups in this receipt:
+    // LIMIT-A-01..03, LIMIT-B-01..03, then this leaf's own LIMIT-I-01..02.
+    // Six of the eight were absent before this binding existed, which also made
+    // that criterion's one-variable negative vacuous: with six already missing,
+    // removing a seventh and observing a rejection proved nothing.
+    for (index, (group, digest)) in [
+        ("LIMIT-A-01", "LIMIT01-A-BOUNDS-v1"),
+        ("LIMIT-A-02", "LIMIT01-A-PARTITIONS-v1"),
+        ("LIMIT-A-03", "LIMIT01-A-ARITHMETIC-v1"),
+        ("LIMIT-B-01", "LIMIT01-B-RESERVE-v1"),
+        ("LIMIT-B-02", "LIMIT01-B-LIFECYCLE-v1"),
+        ("LIMIT-B-03", "LIMIT01-B-FAIRNESS-v1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            receipt[index].starts_with(&format!("{group} {digest} rows=")),
+            "upstream evidence row {index} must be {group} carrying {digest}, got {:?}",
+            receipt[index]
+        );
+        // A group that folded over an empty collection would satisfy the prefix
+        // above while binding nothing, so require a non-zero row count too.
+        assert!(
+            !receipt[index].contains("rows=0 "),
+            "{group}: an empty source collection binds nothing"
+        );
+    }
+    // DISCONFIRMER: a binding that cannot move is decorative, and the counts
+    // above would not notice. Prove each half is sensitive to its own source.
+    //
+    // B side, by PERTURBATION: drop one row from each source collection and
+    // require the corresponding evidence row to change.
+    assert!(!public_rows.is_empty() && !lifecycle_rows.is_empty());
+    let short_public = &public_rows[..public_rows.len() - 1];
+    let short_lifecycle = &lifecycle_rows[..lifecycle_rows.len() - 1];
+    let perturbed = upstream_evidence_rows(&accepted, short_public, short_lifecycle);
+    for index in [3usize, 4, 5] {
+        assert_ne!(
+            perturbed[index], receipt[index],
+            "evidence row {index} did not move when a source row was removed, so it \
+             binds nothing"
+        );
+    }
+    // A side, by CONTENT: these fold over `configured_bound_rows()`, a fixed
+    // array with no runtime shorter form, so instead require every element to be
+    // named. A removed bound necessarily changes both the count and the text.
+    for (limit, _) in configured_bound_rows() {
+        let named = format!("{limit}=");
+        assert!(
+            receipt[0].contains(&named),
+            "LIMIT-A-01 must name every configured bound; {limit} is absent"
+        );
+        assert!(
+            receipt[2].contains(&named),
+            "LIMIT-A-03 must exercise arithmetic on every configured bound; {limit} is absent"
+        );
+    }
+    // LIMIT-A-02 folds over the three shipped domains, which are likewise fixed
+    // at compile time, so it gets the same content treatment: a dropped domain
+    // removes its name from the row.
+    for kind in [
+        PartitionKind::PreAuth,
+        PartitionKind::Verified,
+        PartitionKind::AuthorizationFlow,
+    ] {
+        assert!(
+            receipt[1].contains(&format!("{kind:?}=")),
+            "LIMIT-A-02 must name every shipped admission domain; {kind:?} is absent"
+        );
+    }
+
+    assert!(receipt[UPSTREAM_EVIDENCE_ROWS].starts_with("LIMIT01-I-PUBLIC-JOIN-v1 generation=1"));
+    assert_eq!(
+        receipt[UPSTREAM_EVIDENCE_ROWS + 13],
+        "LIMIT01-I-LIFECYCLE-JOIN-v1"
+    );
     for (index, id) in [
         "LIMIT-I-01.01",
         "LIMIT-I-01.02",
@@ -1119,9 +1334,9 @@ fn limit_01_i_positive() {
     .enumerate()
     {
         assert!(
-            receipt[7 + index].starts_with(id),
+            receipt[UPSTREAM_EVIDENCE_ROWS + 7 + index].starts_with(id),
             "receipt row {} must be {id}",
-            7 + index
+            UPSTREAM_EVIDENCE_ROWS + 7 + index
         );
     }
     for (index, id) in [
@@ -1135,13 +1350,13 @@ fn limit_01_i_positive() {
     .enumerate()
     {
         assert!(
-            receipt[14 + index].starts_with(id),
+            receipt[UPSTREAM_EVIDENCE_ROWS + 14 + index].starts_with(id),
             "receipt row {} must be {id}",
-            14 + index
+            UPSTREAM_EVIDENCE_ROWS + 14 + index
         );
     }
     // Every lifecycle row lands on the same fully-discharged terminal tuple.
-    for index in 14..19 {
+    for index in (UPSTREAM_EVIDENCE_ROWS + 14)..(UPSTREAM_EVIDENCE_ROWS + 19) {
         assert!(
             receipt[index].ends_with("global=0 partition=0 committed=0 released=1"),
             "lifecycle receipt row {index} must show exact-once release and zero retained occupancy"
