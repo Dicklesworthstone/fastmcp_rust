@@ -16,6 +16,8 @@
 pub mod endpoint;
 /// Explicit resource-bound OAuth discovery and Bearer challenge publication.
 pub mod resource_metadata;
+/// Revisioned scope implication selected by an authentication provider's host.
+pub mod scope_policy;
 
 use std::fmt;
 use std::sync::Arc;
