@@ -11,13 +11,13 @@ use asupersync::stream::StreamExt;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_transport::{TransportError, http::{HttpRequest, HttpResponse, HttpStatus}};
 
-use super::{SecuredHttpIoLimits, ingress::{Ingress, SecuredCodec}};
+use super::{SecuredHttpIoLimits, ingress::{Ingress, SecuredCodec}, tls::ConnectionIo};
 use super::super::{scope, guard_response};
 use super::super::revalidation::SseAuthorizationLease;
 use super::super::super::{CorsResponseHeaders, HttpSecurityPolicy};
 use super::super::super::scope_policy::request::ScopeRequestPolicy;
 use crate::{
-    AsyncTcpStream, AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
+    AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
     FinalSubscriptionTerminalDelivery, Framed, HTTP_ACCEPT_CANCEL_POLL, HttpListenerShutdown,
     InboundRequestContext, InboundRequestTransport, JsonRpcRequest, LiveModernHttpSession,
     LiveModernHttpSessionRegistry, ModernSseDispatchElection, ModernSseOutcomeGate,
@@ -34,7 +34,7 @@ use crate::{
 
 pub(super) async fn serve(
     cx: &Cx,
-    stream: AsyncTcpStream,
+    stream: ConnectionIo,
     endpoint: Arc<ServerHttpEndpoint>,
     sessions: LiveModernHttpSessionRegistry,
     shutdown: HttpListenerShutdown,
@@ -188,7 +188,7 @@ async fn buffered<T: asupersync::io::AsyncWrite + Unpin>(
 
 #[allow(clippy::too_many_arguments)]
 async fn json(
-    cx: &Cx, stream: AsyncTcpStream, endpoint: Arc<ServerHttpEndpoint>,
+    cx: &Cx, stream: ConnectionIo, endpoint: Arc<ServerHttpEndpoint>,
     sessions: LiveModernHttpSessionRegistry, shutdown: HttpListenerShutdown,
     request: HttpRequest, authorization: TransportAuthorization,
     cors: CorsResponseHeaders, scopes: Option<ScopeRequestPolicy>, io: SecuredHttpIoLimits,
@@ -272,7 +272,7 @@ impl Drop for OwnedJsonDispatch {
 // path cancels the request and retains children for ordinary session settlement.
 #[allow(clippy::too_many_arguments)]
 async fn sse(
-    cx: &Cx, shutdown: &HttpListenerShutdown, stream: AsyncTcpStream,
+    cx: &Cx, shutdown: &HttpListenerShutdown, stream: ConnectionIo,
     server: Arc<Server>, live: &LiveModernHttpSession, sessions: &LiveModernHttpSessionRegistry,
     generation: u64, inbound: InboundRequestContext, request: JsonRpcRequest,
     raw_params: Option<Arc<str>>, receipt: Option<AuthDispatchCustody>,
