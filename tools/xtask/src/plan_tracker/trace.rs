@@ -7,6 +7,7 @@
 //! from an absent row when a reviewer is counting coverage.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::Deserialize;
 
@@ -116,14 +117,40 @@ impl TraceRow {
         ]
     }
 
-    /// Count of observed fields. Constant by construction, but returned from
-    /// the value so the cardinality assertion measures the row rather than
-    /// restating the constant.
+    /// The observed fields that are not part of [`Self::required_fields`].
+    ///
+    /// Each entry BORROWS its field, and that is the entire point of this
+    /// method existing at all. Delete any of these from `TraceRow` and this
+    /// array stops compiling, which forces the array — and therefore
+    /// [`Self::observed_field_count`] — to shrink with it.
+    ///
+    /// The previous form was three bare `+ 1` literals whose comments named
+    /// fields they did not reference, so the count kept reporting a field that
+    /// no longer existed: a number that survives the disappearance of what it
+    /// counts. Nothing detected that, because the count and the constant it is
+    /// checked against were both constants and agreed with each other.
+    ///
+    /// `unobservable_prose` is a `bool`, which is why these three cannot
+    /// simply join `required_fields()`'s `(&str, &str)` pairs. `&dyn Debug` is
+    /// the narrowest bound that admits all three while still borrowing each
+    /// one — and borrowing is the requirement, not the rendering. An array of
+    /// bare name literals would read as derived and would not be: it would
+    /// still compile with the field gone.
+    fn additional_observed_fields(&self) -> [&dyn fmt::Debug; 3] {
+        [
+            &self.unobservable_prose,
+            &self.ambiguity,
+            &self.covers_item,
+        ]
+    }
+
+    /// Count of observed fields, derived from the fields themselves.
+    ///
+    /// Both operands are array lengths, so neither can drift from the struct.
+    /// Removing a field breaks compilation at its array and the count falls by
+    /// construction rather than by anyone remembering to edit a literal.
     pub fn observed_field_count(&self) -> usize {
-        self.required_fields().len()
-            + 1 // unobservable_prose
-            + 1 // ambiguity
-            + 1 // covers_item
+        self.required_fields().len() + self.additional_observed_fields().len()
     }
 
     pub fn strength(&self) -> Option<Strength> {
