@@ -40,6 +40,7 @@ enum Case {
     UntrustedIssuer, MissingHintDocument, RedirectHint, InvalidMetadata,
     Ambiguous, BodyOnly, Non401, CancelProbe, DropProbe, TimeoutProbe,
     CancelMetadata, DropMetadata, TimeoutMetadata, UntrustedTls, Preflight,
+    OtherScheme, OtherOnly, DuplicateHint, Token68, CancelLogin, DropLogin,
 }
 
 struct RootFile(std::path::PathBuf);
@@ -194,17 +195,26 @@ impl Peer {
     async fn challenge(&self, case: Case, hint: &str) {
         let mut tls = self.probe_request().await;
         let challenge = match case {
-            Case::Ambiguous => "WWW-Authenticate: Bearer realm=one\r\nWWW-Authenticate: Bearer realm=two\r\n".to_owned(),
+            Case::Ambiguous => "WWW-Authenticate: Bearer scope=read\r\nWWW-Authenticate: Bearer scope=write\r\n".to_owned(),
+            Case::DuplicateHint => format!("WWW-Authenticate: Other resource_metadata=\"{hint}\"\r\nWWW-Authenticate: Bearer resource_metadata=\"{hint}\"\r\n"),
             Case::BodyOnly => String::new(),
             Case::NoHint => "WWW-Authenticate: Bearer scope=admin\r\n".to_owned(),
+            Case::OtherScheme => format!("WWW-Authenticate: Basic realm=\"not,this\", resource_metadata=\"{hint}\", scope=admin\r\nWWW-Authenticate: Bearer scope=read\r\n"),
+            Case::OtherOnly => format!("WWW-Authenticate: Other resource_metadata=\"{hint}\", scope=admin\r\n"),
+            Case::Token68 => format!("WWW-Authenticate: Bearer YWJjZA==\r\nWWW-Authenticate: Basic resource_metadata=\"{hint}\"\r\n"),
             _ => format!("WWW-Authenticate: Basic realm=\"not,this\", Bearer realm=primary\r\nwww-authenticate: resource_metadata=\"{hint}\", scope=\"read admin\"\r\n"),
         };
         let (status, other) = if matches!(case, Case::Non401) {
             ("302 Found", format!("Location: {}/must-not-follow\r\n", self.origin()))
         } else { ("401 Unauthorized", String::new()) };
+        let forged_body = if matches!(case, Case::BodyOnly) {
+            json!({"resource_metadata":hint,"www-authenticate":format!("Bearer resource_metadata=\"{hint}\"")}).to_string()
+        } else { String::new() };
         // Deliberately unfinished. Discovery must use the head, close the body
         // and proceed; waiting for EOF would deadlock this real peer exchange.
-        tls.write_all(format!("HTTP/1.1 {status}\r\n{challenge}{other}Content-Length: 1000\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        // A forged body cannot stand in for the missing header in BodyOnly.
+        assert!(forged_body.len() < 1000);
+        tls.write_all(format!("HTTP/1.1 {status}\r\n{challenge}{other}Content-Length: 1000\r\nConnection: close\r\n\r\n{forged_body}").as_bytes()).await.unwrap();
         tls.flush().await.unwrap();
         closed(tls).await;
     }
@@ -345,17 +355,18 @@ fn run(case: Case) {
                 assert_eq!(peer.tokens.load(Ordering::SeqCst), 0);
                 peer.quiet(); metadata.quiet(); return;
             }
-            if matches!(case, Case::Ambiguous | Case::BodyOnly | Case::Non401) {
+            if matches!(case, Case::Ambiguous | Case::BodyOnly | Case::Non401 | Case::DuplicateHint) {
                 let ((), result) = pair(peer.challenge(case, &peer.hint()),
                     ResourceMetadataChallenge::probe(&cx, peer.resource(), RequestId::Number(7), Duration::from_secs(10))).await;
                 match case {
                     Case::Ambiguous => assert!(matches!(result, Err(Error::AmbiguousBearerChallenge))),
+                    Case::DuplicateHint => assert!(matches!(result, Err(Error::AmbiguousMetadataLocation))),
                     Case::BodyOnly => assert!(matches!(result, Err(Error::MissingBearerChallenge))),
                     _ => assert!(matches!(result, Err(Error::UnsupportedStatus { status: 302 }))),
                 }
                 assert_eq!(peer.gets.load(Ordering::SeqCst), 0); peer.quiet(); return;
             }
-            let challenge = if matches!(case, Case::NoHint) {
+            let challenge = if matches!(case, Case::NoHint | Case::OtherScheme | Case::OtherOnly | Case::Token68) {
                 let ((), result) = pair(peer.challenge(case, &peer.hint()),
                     ResourceMetadataChallenge::probe(&cx, peer.resource(), RequestId::Number(7), Duration::from_secs(10))).await;
                 result.unwrap()
@@ -365,6 +376,8 @@ fn run(case: Case) {
                 assert_eq!(challenge.metadata_url().unwrap().as_str(), peer.hint());
                 assert_eq!(peer.gets.load(Ordering::SeqCst), 0); peer.quiet(); return;
             }
+            if matches!(case, Case::OtherOnly | Case::Token68) { assert!(challenge.scope_hint().is_none()); }
+            if matches!(case, Case::OtherScheme) { assert_eq!(challenge.scope_hint(), Some("read")); }
             let timeout = if matches!(case, Case::TimeoutMetadata) { Duration::from_millis(100) } else { Duration::from_secs(10) };
             let plan = ChallengedOAuthDiscovery::new(peer.plan(timeout), challenge).unwrap();
             if matches!(case, Case::CancelMetadata | Case::DropMetadata | Case::TimeoutMetadata) {
@@ -391,6 +404,41 @@ fn run(case: Case) {
                 };
                 pair(server, application).await;
                 assert_eq!(peer.gets.load(Ordering::SeqCst), 1); peer.quiet(); return;
+            }
+            if matches!(case, Case::CancelLogin | Case::DropLogin) {
+                let cancellation = McpRequestCancellation::new();
+                let bound = std::cell::Cell::new(None::<std::net::SocketAddr>);
+                let server = async {
+                    peer.metadata(case, &peer.resource(), &peer.issuer()).await;
+                    peer.issuer_metadata().await;
+                };
+                let application = async {
+                    let mut pending = Box::pin(plan.authorize_managed_with_cancellation(
+                        &cx, &cancellation, OAuthSessionPolicy::default(), |authorization| {
+                            let fields = form(authorization.query().unwrap());
+                            let address = fields["redirect_uri"].strip_prefix("http://").unwrap()
+                                .split('/').next().unwrap().parse().unwrap();
+                            bound.set(Some(address));
+                            std::future::pending::<Result<(), OAuthError>>()
+                        },
+                    ));
+                    let address = poll_fn(|task| {
+                        assert!(pending.as_mut().poll(task).is_pending());
+                        match bound.get() { Some(address) => Poll::Ready(address), None => Poll::Pending }
+                    }).await;
+                    if matches!(case, Case::DropLogin) { drop(pending); }
+                    else {
+                        cancellation.cancel();
+                        assert!(matches!(pending.await, Err(Error::Discovery(OAuthDiscoveryError::Cancelled))));
+                    }
+                    assert!(TcpStream::connect(address).await.is_err(), "cancelled login releases its bound listener");
+                    assert!(cx.checkpoint().is_ok());
+                };
+                pair(server, application).await;
+                assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+                assert_eq!(peer.tokens.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.probes.load(Ordering::SeqCst), 1);
+                peer.quiet(); return;
             }
             if matches!(case, Case::WrongResource | Case::UntrustedIssuer | Case::MissingHintDocument | Case::RedirectHint | Case::InvalidMetadata) {
                 let launched = AtomicUsize::new(0);
@@ -426,10 +474,12 @@ fn run(case: Case) {
                 assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
                 assert_eq!(peer.probes.load(Ordering::SeqCst), 1, "explicit login never repeats the original resource POST");
             } else {
-                assert!(matches!(case, Case::NoHint));
+                assert!(matches!(case, Case::NoHint | Case::OtherScheme | Case::OtherOnly | Case::Token68));
                 let server = async { peer.metadata(case, &peer.resource(), &peer.issuer()).await; peer.issuer_metadata().await; };
                 let ((), result) = pair(server, plan.discover(&cx)).await;
                 assert_eq!(result.unwrap(), peer.expected());
+                assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+                assert_eq!(peer.tokens.load(Ordering::SeqCst), 0, "discovery is not authentication-method selection or a grant");
             }
             assert!(cx.checkpoint().is_ok()); peer.quiet();
         });
@@ -480,3 +530,15 @@ fn challenged_metadata_deadline_prevents_later_effects() { isolated("challenged_
 fn untrusted_resource_tls_cannot_supply_a_challenge() { isolated("untrusted_resource_tls_cannot_supply_a_challenge", Case::UntrustedTls); }
 #[test]
 fn invalid_or_precancelled_probes_have_no_network_effect() { isolated("invalid_or_precancelled_probes_have_no_network_effect", Case::Preflight); }
+#[test]
+fn metadata_on_basic_is_used_without_taking_its_scope_or_authentication() { isolated("metadata_on_basic_is_used_without_taking_its_scope_or_authentication", Case::OtherScheme); }
+#[test]
+fn metadata_on_another_scheme_preserves_the_host_selected_oauth_flow() { isolated("metadata_on_another_scheme_preserves_the_host_selected_oauth_flow", Case::OtherOnly); }
+#[test]
+fn identical_hints_on_different_schemes_are_still_ambiguous() { isolated("identical_hints_on_different_schemes_are_still_ambiguous", Case::DuplicateHint); }
+#[test]
+fn bearer_token68_does_not_hide_another_schemes_metadata_hint() { isolated("bearer_token68_does_not_hide_another_schemes_metadata_hint", Case::Token68); }
+#[test]
+fn cancellation_spans_challenged_discovery_and_pending_browser_launch() { isolated("cancellation_spans_challenged_discovery_and_pending_browser_launch", Case::CancelLogin); }
+#[test]
+fn dropping_challenged_login_releases_its_loopback_listener() { isolated("dropping_challenged_login_releases_its_loopback_listener", Case::DropLogin); }
