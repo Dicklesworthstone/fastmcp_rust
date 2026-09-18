@@ -193,7 +193,16 @@ impl Peer {
         let issuer = if matches!(case,Case::WrongIssuer) { "https://unknown.example/issuer".to_owned() } else { self.issuer() };
         json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":[issuer],"scopes_supported":["read"]}).to_string()).await;
         drop(tls);
-        if matches!(case,Case::WrongIssuer) { return; }
+        if matches!(case,Case::WrongIssuer) {
+            // The second constructed PRM must be tried, but it must not turn
+            // the same untrusted issuer into a token endpoint or a secret sink.
+            let (mut tls,start,headers,body) = self.request().await;
+            assert_eq!(start,"GET /.well-known/oauth-protected-resource HTTP/1.1");
+            assert!(!headers.contains_key("authorization") && body.is_empty());
+            self.gets.fetch_add(1,Ordering::SeqCst);
+            json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":["https://unknown.example/issuer"],"scopes_supported":["read"]}).to_string()).await;
+            return;
+        }
         let (mut tls,start,headers,body) = self.request().await;
         assert_eq!(start,"GET /.well-known/oauth-authorization-server/issuer HTTP/1.1");
         assert!(!headers.contains_key("authorization") && body.is_empty());
@@ -265,7 +274,19 @@ fn run(case: Case) {
             if matches!(case,Case::WrongIssuer|Case::WrongEndpoint|Case::UnsupportedAuth) {
                 let error = discovered.err().unwrap();
                 match case {
-                    Case::WrongIssuer => assert!(matches!(error,Error::Discovery(OAuthDiscoveryError::NoTrustedIssuer))),
+                    Case::WrongIssuer => {
+                        use fastmcp_client::http_auth::discovery::{ResourceMetadataCause, ResourceMetadataFailureClass, ResourceMetadataLocation};
+                        let Error::Discovery(OAuthDiscoveryError::ResourceMetadataExhausted(failure)) = error else {
+                            panic!("both untrusted PRM candidates must be reported");
+                        };
+                        assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
+                        assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
+                            (ResourceMetadataLocation::PathSpecific, ResourceMetadataCause::NoTrustedIssuer),
+                            (ResourceMetadataLocation::OriginRoot, ResourceMetadataCause::NoTrustedIssuer),
+                        ]);
+                        assert_eq!(peer.gets.load(Ordering::SeqCst),2);
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
+                    }
                     Case::WrongEndpoint => assert!(matches!(error,Error::Discovery(OAuthDiscoveryError::EndpointNotTrusted))),
                     _ => assert!(matches!(error,Error::UnsupportedAuthentication)),
                 }
