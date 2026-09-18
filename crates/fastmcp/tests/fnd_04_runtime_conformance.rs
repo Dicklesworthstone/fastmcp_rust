@@ -2415,6 +2415,23 @@ struct Fnd04BManifest {
 /// The evaluator must not shell out to git for its own identity: a receipt
 /// that depends on an external process is not reproducible from the tree it
 /// claims to describe. `.git/HEAD` and the ref it names are enough.
+/// Resolves `reference` from `.git/packed-refs`, the table `git gc` writes.
+///
+/// Format is one `<sha> <refname>` per line, with `#` comment lines and
+/// `^<sha>` peel lines for annotated tags; only the direct mapping is wanted.
+/// Callers must try the loose ref FIRST -- this table is a snapshot and a
+/// later loose write supersedes it.
+fn packed_ref(git: &std::path::Path, reference: &str) -> Option<String> {
+    let packed = std::fs::read_to_string(git.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (sha, name) = line.split_once(' ')?;
+        (name.trim() == reference).then(|| sha.trim().to_owned())
+    })
+}
+
 fn revision_and_tree() -> (String, String) {
     let git = workspace_root().join(".git");
     let head = std::fs::read_to_string(git.join("HEAD")).unwrap_or_default();
@@ -2422,6 +2439,20 @@ fn revision_and_tree() -> (String, String) {
         std::fs::read_to_string(git.join(reference))
             .ok()
             .map(|value| value.trim().to_owned())
+            // bd-gizte: a loose ref file is only ONE of the two places git
+            // keeps a ref. `git gc` and many clones PACK refs into
+            // `.git/packed-refs`, so a perfectly healthy repository can have no
+            // loose file to read and would otherwise report "<unresolved>" as
+            // though the host were broken.
+            //
+            // ORDER IS LOAD-BEARING HERE, unlike the assertion pair below, and
+            // it is git's own: LOOSE WINS. `packed-refs` is a snapshot taken at
+            // the last pack and goes stale the moment a loose ref is written --
+            // measured in this very workspace, where the packed entry and the
+            // loose file name different commits. Consulting packed first would
+            // bind a stale revision, which is strictly worse than reporting
+            // none.
+            .or_else(|| packed_ref(&git, reference))
             .unwrap_or_else(|| "<unresolved>".to_owned())
     } else {
         head.trim().to_owned()
