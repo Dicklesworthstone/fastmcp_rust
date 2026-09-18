@@ -16,8 +16,8 @@ use asupersync::types::Time;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CoreRequest, FINAL_PROTOCOL_VERSION, FINAL_SUBSCRIPTION_ID_META_KEY, FinalRequestMeta,
-    JsonInteger, RequestId, SubscriptionFilter,
+    CoreRequest, FINAL_PROTOCOL_VERSION, FinalRequestMeta, JsonInteger, RequestId,
+    SubscriptionFilter,
 };
 use serde_json::json;
 
@@ -353,7 +353,11 @@ fn subscription_error(error: ModernHttpSubscriptionListenError) -> ClientCredent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_protocol::ClientCapabilities;
+    // Test-only: the production paths in this module build `_meta` through
+    // `FinalRequestMeta`, so the subscription-id key is referenced only by the
+    // fixtures below. Importing it at module scope makes it an unused import in
+    // a non-test build, which fails a `-D warnings` gate.
+    use fastmcp_protocol::{ClientCapabilities, FINAL_SUBSCRIPTION_ID_META_KEY};
     use serde_json::Value;
 
     use super::super::CLIENT_CREDENTIALS_EXTENSION;
