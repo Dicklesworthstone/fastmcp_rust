@@ -33,7 +33,7 @@ use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, RequestId, FINAL_PR
 
 use super::{
     OAuthDiscoveryError, OAuthDiscoveryPlan, admit_root, check_context,
-    discovery_deadline, fetch_metadata, issuer_metadata_urls, origin_of, validate_https,
+    discovery_deadline, fetch_metadata, origin_of, validate_https,
 };
 use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
 use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
@@ -287,10 +287,11 @@ impl ChallengedOAuthDiscovery {
     }
 
     /// Fetches the explicit hint once, without redirect or well-known fallback
-    /// on failure. A valid Bearer challenge WITHOUT a hint uses the existing
-    /// well-known path. All metadata GETs share one deadline. Every document
-    /// still passes exact resource identity, local issuer selection and native
-    /// flow admission. Scope/realm/error parameters do not change the plan.
+    /// on failure. A valid Bearer challenge WITHOUT a hint uses the constructed
+    /// PRM candidates. Once a resource document selects an issuer, both paths
+    /// use the same ordered issuer resolver and full native-flow admission.
+    /// All metadata GETs share one deadline. Scope/realm/error parameters do not
+    /// change the plan, and a failed issuer never selects another resource hint.
     pub async fn discover_with_cancellation(
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
     ) -> Result<OAuthClientConfiguration, OAuthChallengeError> {
@@ -306,15 +307,7 @@ impl ChallengedOAuthDiscovery {
             // RFC 9728 3.3: the metadata resource must identify the ORIGINAL
             // challenged request URL, not the URL/host serving this document.
             let issuer = self.plan.select_issuer(&body)?;
-            for location in issuer_metadata_urls(&issuer.url)? {
-                check_context(cx, deadline)?;
-                if let Some(body) = fetch_metadata(cx, deadline, &location, &issuer.roots).await? {
-                    let configuration = self.plan.admit_issuer(issuer, &body)?;
-                    check_context(cx, deadline)?;
-                    return Ok(configuration);
-                }
-            }
-            Err(OAuthDiscoveryError::MetadataNotFound.into())
+            Ok(self.plan.discover_selected_issuer(cx, deadline, issuer).await?)
         }).await
     }
 
