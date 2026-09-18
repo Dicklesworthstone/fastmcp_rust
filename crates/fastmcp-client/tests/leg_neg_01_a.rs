@@ -223,6 +223,55 @@ fn assert_no_credential_on_the_wire(record: &StdioClassificationRecord) {
     }
 }
 
+/// Asserts the cache half of AC-LEG-NEG-01-A-PREDICATES clause 2 on a denied
+/// case: zero cache mutation.
+///
+/// WHY THERE IS NOTHING TO READ. The credential half at least had a field to
+/// assert on, vacuous though it was. The cache half has none:
+/// `StdioClassificationRecord` models NO CACHE BOUNDARY AT ALL, and
+/// `grep -i cache leg_neg_stdio.rs` returns nothing. So a reader looking for
+/// the required proof finds neither an assertion nor a field, and might
+/// reasonably conclude clause 2 is inexpressible here. It is not.
+///
+/// THE ZERO IS STRUCTURAL, and in a stronger form than the credential one --
+/// there is no object to mutate rather than no path to it:
+///   * `FinalResultCache` is a PLAIN OWNED FIELD on `Client`
+///     (`lib.rs:14120  final_result_cache: FinalResultCache`), constructed by
+///     `FinalResultCache::default()`. It sits behind no `Arc`, `static`,
+///     `OnceCell`, `Mutex` or `RwLock` -- I searched for shared-ownership
+///     wrappers specifically, because per-client versus shared IS the whole
+///     question. So a cache lives and dies with its `Client`.
+///   * On a denied case `Client::stdio_with_protocol_plan_with_cx` returns
+///     `Err` and yields no `Client`. `try_connect_auto` has exactly three
+///     terminal shapes -- `Connected`, `Fallback` (the frozen ELIGIBLE
+///     signal), and `Err` -- and `StdioConnectionAttempt::Fallback` has
+///     exactly ONE construction site (`builder.rs:1819`), gated on the
+///     eligible signal. Ineligible therefore cannot reach `Fallback`; it is
+///     `Err`.
+///   * The Auto probe DOES build a transient client inside the builder, so
+///     "no client exists" is too strong. But that transient drops there,
+///     taking its per-client cache with it, and nothing shared survives it.
+/// There is no cache that outlives a denied stdio classification.
+///
+/// A structural zero still deserves a proof that CAN be wrong, so this
+/// asserts the observable that the argument rests on: that NO CLIENT ESCAPED.
+/// If the product ever returned a live client from a denied path, a cache
+/// would exist, `connected` would be true, and this fires. That is the
+/// falsifiable half; the reasoning above is why it suffices.
+fn assert_no_cache_escaped(record: &StdioClassificationRecord) {
+    assert!(
+        !record.connected,
+        "{}: a denied case must yield no live client -- a returned client owns \
+         a FinalResultCache, which is exactly the cache mutation clause 2 forbids",
+        record.case_id
+    );
+    assert_eq!(
+        record.selected_era, None,
+        "{}: a denied case must select no era",
+        record.case_id
+    );
+}
+
 /// Asserts no child beyond the disposable probe was ever started.
 fn assert_no_legacy_child(record: &StdioClassificationRecord) {
     assert_trace_conclusive(record);
@@ -451,13 +500,12 @@ fn leg_neg_01_a_positive() {
         LEGACY_ERA,
     );
     let ineligible = run(&ineligible_case);
-    assert!(
-        !ineligible.connected,
-        "an uncorrelated refusal must not produce a live client"
-    );
-    assert_eq!(ineligible.selected_era, None);
+    // Covers clause 2's cache half as well as the live-client one; see
+    // `assert_no_cache_escaped` for why no-client-returned is the cache proof.
+    assert_no_cache_escaped(&ineligible);
     assert_first_wire(&ineligible, 0, "\"method\":\"server/discover\"");
     assert_no_legacy_child(&ineligible);
+    assert_no_credential_on_the_wire(&ineligible);
 
     // The pair differs in exactly one declared field.
     assert_eq!(eligible_case.policy(), ineligible_case.policy());
