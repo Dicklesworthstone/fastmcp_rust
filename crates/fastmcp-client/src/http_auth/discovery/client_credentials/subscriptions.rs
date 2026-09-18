@@ -536,9 +536,25 @@ mod tests {
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
         "\"params\":{\"requestId\":7,\"uri\":\"file:///tmp/watched\"}}\n\n"
     );
+    /// The listen terminal must satisfy TWO independent requirements, and they are
+    /// checked in this order -- derived from source, not measured:
+    ///   messages.rs:4260  decode_final_complete(..)        requires resultType
+    ///                     "complete"; "empty" yields UnexpectedFinalResultType
+    ///   messages.rs:4261  subscription_id_from_result(..)? requires
+    ///                     _meta[subscriptionId]; absent yields InvalidResult
+    ///                     (messages.rs:4806)
+    /// Because :4260 runs first, a fixture fixing only the resultType would then
+    /// fail on the absent _meta -- both are needed, neither alone suffices.
+    ///
+    /// The literal 7 must equal SUBSCRIPTION_ID; a const cannot interpolate it.
+    /// It is left as a literal so the mismatch negative below can keep using
+    /// `.replace("\"id\":7", ..)` to perturb ONLY the JSON-RPC response id. That
+    /// substring does not occur inside the _meta member, whose key ends `...Id`
+    /// with no quote before it, so the perturbation stays surgical.
     const TERMINAL: &str = concat!(
         "id: cursor-final\n",
-        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"empty\"}}\n\n"
+        "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",",
+        "\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}\n\n"
     );
 
     async fn native_subscription(
