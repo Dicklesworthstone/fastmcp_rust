@@ -80,6 +80,9 @@ pub struct IntegrationManifest {
     /// Content-addressed revision binding, carried through from A and B.
     pub source_tree_sha256: String,
     pub plan_blob_sha1: String,
+    /// Carried through from B, which binds the tracker export it actually
+    /// read. Without it the joined receipt inherits B's blind spot.
+    pub beads_blob_sha1: String,
     pub input_manifest_count: usize,
     pub subcases: Vec<SubcaseOutcome>,
     pub consumer_id: String,
@@ -107,6 +110,7 @@ impl IntegrationManifest {
         .into_iter()
         .all(|value| is_lowercase_hex(value, 64))
             && is_lowercase_hex(&self.plan_blob_sha1, 40)
+            && is_lowercase_hex(&self.beads_blob_sha1, 40)
     }
 
     pub fn all_subcases_passed(&self) -> bool {
@@ -232,6 +236,7 @@ pub fn join(
         ("joined_trace_table_sha256", &a.canonical_trace_table_sha256, 64),
         ("source_tree_sha256", &a.source_tree_sha256, 64),
         ("plan_blob_sha1", &b.plan_blob_sha1, 40),
+        ("beads_blob_sha1", &b.beads_blob_sha1, 40),
     ] {
         if !is_lowercase_hex(value, width) {
             fourth.push(Diagnostic::new(
@@ -292,6 +297,7 @@ pub fn join(
         toolchain: a.toolchain.clone(),
         source_tree_sha256: a.source_tree_sha256.clone(),
         plan_blob_sha1: b.plan_blob_sha1.clone(),
+        beads_blob_sha1: b.beads_blob_sha1.clone(),
         input_manifest_count: 2,
         subcases,
         consumer_id: I_CONSUMER.to_owned(),

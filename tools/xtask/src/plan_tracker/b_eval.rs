@@ -60,6 +60,14 @@ pub struct BManifest {
     pub features: String,
     pub toolchain: String,
     pub plan_blob_sha1: String,
+    /// Content binding for the tracker export.
+    ///
+    /// B reads TWO inputs and used to bind only the plan. The export feeds
+    /// `projected`, which decides subcase B-15 generated-inventory-closure,
+    /// so two runs could produce byte-identical receipts while having
+    /// evaluated B-15 against different tracker exports. Neither the graph
+    /// nor the corpus digest covers it: both derive from the parsed PLAN.
+    pub beads_blob_sha1: String,
     pub package_count: usize,
     pub edge_count: usize,
     pub module_count: usize,
@@ -81,6 +89,7 @@ impl BManifest {
         is_lowercase_hex(&self.canonical_graph_sha256, 64)
             && is_lowercase_hex(&self.canonical_corpus_sha256, 64)
             && is_lowercase_hex(&self.plan_blob_sha1, 40)
+            && is_lowercase_hex(&self.beads_blob_sha1, 40)
     }
 
     pub fn all_subcases_passed(&self) -> bool {
@@ -141,6 +150,11 @@ pub fn run(root: &Path, reservations_input: &ReservationInputs) -> Result<BRun, 
         )
     })?;
     ledger.record_read();
+    // Bound from the bytes THIS RUN read, never re-read from disk. A second
+    // read could observe different content and would bind a version the
+    // evaluation never saw. `read_to_string` validates UTF-8 without
+    // transforming, so `as_bytes()` is the file's bytes exactly.
+    let beads_blob = super::digest::git_blob_hex(export.as_bytes());
     let projected = projection::parse_export(&export, BEADS_EXPORT_PATH)?;
 
     let graph_stream = fingerprint::encode_graph(&parsed);
@@ -399,6 +413,7 @@ pub fn run(root: &Path, reservations_input: &ReservationInputs) -> Result<BRun, 
         features: super::FEATURES.to_owned(),
         toolchain: super::TOOLCHAIN.to_owned(),
         plan_blob_sha1: plan_blob,
+        beads_blob_sha1: beads_blob,
         package_count: parsed.packages.len(),
         edge_count: parsed.edges.len(),
         module_count: modules.len(),
@@ -448,6 +463,7 @@ mod tests {
             features: String::new(),
             toolchain: String::new(),
             plan_blob_sha1: "c".repeat(40),
+            beads_blob_sha1: "d".repeat(40),
             package_count: 1,
             edge_count: 1,
             module_count: 1,

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use fastmcp_xtask::plan_tracker::{
     b_eval::{self, BEADS_EXPORT_PATH, B_SUBCASES, PLAN_PATH, ReservationInputs},
     diagnostics::Code,
+    digest::git_blob_hex,
     fingerprint,
     manifest::Outcome,
     plan::{self, Limits},
@@ -523,6 +524,52 @@ fn fnd_02_b_06_strict_read_only() {
     for (path, bytes) in before {
         assert_eq!(bytes, fs::read(&path).expect("input is readable"), "{path:?}");
     }
+}
+
+/// The tracker export is BOUND by the receipt, not merely read.
+///
+/// B reads two inputs. Until the `beads_blob_sha1` field existed it bound only
+/// the plan, so two runs could produce byte-identical receipts while having
+/// evaluated B-15 generated-inventory-closure against different tracker
+/// exports. Neither the graph nor the corpus digest covers the export: both
+/// derive from the parsed plan.
+#[test]
+fn fnd_02_b_binds_the_tracker_export_it_read() {
+    let fixture = Fixture::new("beads-binding");
+    let run = b_eval::run(&fixture.root, &inputs()).expect("fixture loads");
+
+    let bytes = fs::read(fixture.root.join(BEADS_EXPORT_PATH)).expect("export is readable");
+    assert_eq!(
+        run.manifest.beads_blob_sha1,
+        git_blob_hex(&bytes),
+        "the receipt must bind the blob id of the export it read"
+    );
+    assert_ne!(
+        run.manifest.beads_blob_sha1, run.manifest.plan_blob_sha1,
+        "the two inputs must not collapse onto one binding"
+    );
+
+    // And it TRACKS content. Without this the field could be any fixed string
+    // and every assertion above would still hold.
+    let mutated = Fixture::new("beads-binding-mutated");
+    mutated.mutate_once(BEADS_EXPORT_PATH, r#""id":"bd-a""#, r#""id":"bd-a1""#);
+    let after = b_eval::run(&mutated.root, &inputs()).expect("fixture loads");
+
+    assert!(
+        after.passed(),
+        "the mutation must leave a PASSING run, or the digest difference is \
+         confounded by a failure:\n{}",
+        after.report.render()
+    );
+    assert_ne!(
+        after.manifest.beads_blob_sha1, run.manifest.beads_blob_sha1,
+        "a different export must bind differently"
+    );
+    assert_eq!(
+        after.manifest.plan_blob_sha1, run.manifest.plan_blob_sha1,
+        "only the export changed, so the plan binding must be identical -- \
+         this is what makes the difference above attributable"
+    );
 }
 
 /// The live repository parses under the same grammar the fixture uses.
