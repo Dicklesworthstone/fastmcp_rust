@@ -300,8 +300,7 @@ pub(crate) fn run_partition_rows() -> Vec<PartitionObservation> {
 
     // LIMIT-A-02.04 — a raw identifier cannot mint a quota partition key.
     let key_refusal = QuotaPartitionKey::try_from_request_identifier("raw-request-id")
-        .err()
-        .expect("a request-supplied identifier must refuse");
+        .expect_err("a request-supplied identifier must refuse");
     rows.push(PartitionObservation {
         id: "LIMIT-A-02.04",
         discriminant: "refused",
@@ -312,8 +311,7 @@ pub(crate) fn run_partition_rows() -> Vec<PartitionObservation> {
 
     // LIMIT-A-02.05 — nor can it manufacture a Verified partition.
     let partition_refusal = AdmissionPartition::try_from_request_identifier("raw-request-id")
-        .err()
-        .expect("a request-supplied identifier must refuse");
+        .expect_err("a request-supplied identifier must refuse");
     rows.push(PartitionObservation {
         id: "LIMIT-A-02.05",
         discriminant: "refused",
