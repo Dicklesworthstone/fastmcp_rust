@@ -239,6 +239,20 @@ fn fnd_02_a_planted_negative() {
     assert_eq!(failed, vec!["FND-02-A-04"]);
 
     // The rejection changed no state the acceptance names.
+    //
+    // The plan digest is the direct evidence for "changes only ONE variable":
+    // the mutation was to the trace table, so the plan side must be bit-stable
+    // across the two runs. The trace-table digest is deliberately NOT compared
+    // here — it MUST move, because that is the variable that changed.
+    assert_eq!(
+        run.manifest.canonical_plan_sha256, baseline.manifest.canonical_plan_sha256,
+        "the plan was not mutated, so its digest must be identical"
+    );
+    assert_ne!(
+        run.manifest.canonical_trace_table_sha256, baseline.manifest.canonical_trace_table_sha256,
+        "the trace table WAS mutated; an unchanged digest would mean the \
+         mutation never reached the evaluator"
+    );
     assert_eq!(run.manifest.trace_row_count, baseline.manifest.trace_row_count);
     assert_eq!(run.manifest.write_counters, [0; 6]);
     assert!(run.ledger.is_read_only());
