@@ -12,7 +12,9 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_transport::{TransportError, http::{HttpRequest, HttpResponse, HttpStatus}};
 
 use super::{SecuredHttpIoLimits, ingress::{Ingress, SecuredCodec}};
+use super::super::scope;
 use super::super::super::{CorsResponseHeaders, HttpSecurityPolicy};
+use super::super::super::scope_policy::request::ScopeRequestPolicy;
 use crate::{
     AsyncTcpStream, AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
     FinalSubscriptionTerminalDelivery, Framed, HTTP_ACCEPT_CANCEL_POLL, HttpListenerShutdown,
@@ -39,7 +41,7 @@ pub(super) async fn serve(
     io: SecuredHttpIoLimits,
 ) {
     let body_limit = endpoint.server.http_config.handler_config.max_body_size;
-    let mut framed = Framed::new(stream, SecuredCodec::new(policy, body_limit));
+    let mut framed = Framed::new(stream, SecuredCodec::new(Arc::clone(&policy), body_limit));
     let read = async {
         loop {
             if shutdown.is_requested() || cx.checkpoint().is_err() { return None; }
@@ -98,7 +100,8 @@ pub(super) async fn serve(
         }
     };
     if !http_request_accepts_sse(&request) {
-        json(cx, framed.into_inner(), endpoint, sessions, shutdown, request, authorization, cors, io).await;
+        json(cx, framed.into_inner(), endpoint, sessions, shutdown, request, authorization,
+            cors, policy.scope_authorization.clone(), io).await;
         return;
     }
     if request.header("mcp-session-id").is_some() {
@@ -112,7 +115,11 @@ pub(super) async fn serve(
             return;
         }
     };
-    let opened = match session.begin_modern_sse(cx, request.clone(), authorization.clone()).await {
+    let opening = match &policy.scope_authorization {
+        Some(scopes) => scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone()).await,
+        None => session.begin_modern_sse(cx, request.clone(), authorization.clone()).await,
+    };
+    let opened = match opening {
         Ok(Ok((request, response, raw_params, receipt))) => Ok(Ok((
             InboundRequestContext::with_modern_connection_and_transport_authorization(
                 cx.clone(), request_id_to_u64(request.id.as_ref()), InboundRequestTransport::Http,
@@ -163,7 +170,7 @@ async fn json(
     cx: &Cx, stream: AsyncTcpStream, endpoint: Arc<ServerHttpEndpoint>,
     sessions: LiveModernHttpSessionRegistry, shutdown: HttpListenerShutdown,
     request: HttpRequest, authorization: TransportAuthorization,
-    cors: CorsResponseHeaders, io: SecuredHttpIoLimits,
+    cors: CorsResponseHeaders, scopes: Option<ScopeRequestPolicy>, io: SecuredHttpIoLimits,
 ) {
     let (mut reader, writer) = stream.into_split();
     let cancellation = McpRequestCancellation::new();
@@ -183,9 +190,15 @@ async fn json(
     let dispatch_endpoint = Arc::clone(&endpoint);
     let dispatch_cancellation = cancellation.clone();
     let dispatch = cx.spawn(move |request_cx| async move {
-        dispatch_modern_http_request_with_cancellation_and_transport_authorization(
-            &request_cx, &dispatch_endpoint, &sessions, request, authorization, Some(dispatch_cancellation),
-        ).await
+        match scopes {
+            Some(scopes) => scope::dispatch_socket_json(
+                &request_cx, &dispatch_endpoint, &sessions, &scopes,
+                request, authorization, dispatch_cancellation,
+            ).await,
+            None => dispatch_modern_http_request_with_cancellation_and_transport_authorization(
+                &request_cx, &dispatch_endpoint, &sessions, request, authorization, Some(dispatch_cancellation),
+            ).await,
+        }
     });
     let response = match dispatch {
         Ok(mut dispatch) => dispatch.join(cx).await.unwrap_or_else(|_| HttpResponse::internal_error()),

@@ -7,15 +7,24 @@
 //! error code, message, response body or metadata is interpreted as an OAuth
 //! challenge, and no authentication result is cached for a later POST.
 
+use std::sync::Arc;
+
 use asupersync::Cx;
-use fastmcp_core::AuthContext;
+use fastmcp_core::{AuthContext, McpRequestCancellation};
+use fastmcp_protocol::JsonRpcRequest;
 use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
+use fastmcp_transport::TransportError;
 use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus};
 
 use super::{SecuredHttpEndpointError, checkpoint};
 use super::super::{HttpSecurityError, HttpSecurityPolicy};
 use super::super::scope_policy::request::{ScopeRequestPolicy, ScopeRequestRejection};
-use crate::{AuthDispatchCustody, ServerHttpEndpointResponse, ServerHttpSession};
+use crate::{
+    AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpEndpointResponse,
+    DualEraHttpSseResponse, LiveModernHttpSessionRegistry, ServerHttpEndpoint,
+    ServerHttpEndpointError, ServerHttpEndpointResponse, ServerHttpSession,
+    TransportAuthorization, http_endpoint_error_response, http_endpoint_response_to_static,
+};
 
 impl HttpSecurityPolicy {
     /// Requires method-wide scopes on the secured modern HTTP execution path.
@@ -51,20 +60,37 @@ impl HttpSecurityPolicy {
     }
 }
 
-/// Called only with the fresh session owned by `handle_secured_async`, after
-/// route, origin, framing and body-size checks. This is the native modern
-/// admission sequence with a scope decision inserted between authentication
-/// and transport admission; all actual execution remains in `handle_modern`.
-pub(super) async fn dispatch(
+// A private, request-owned handoff, never a credential cache or a public permit.
+// All three consumers use this single preparation path. Neither the socket
+// JSON branch nor the SSE opener re-runs authentication after scope admission.
+struct PreparedScopedPost {
+    request: HttpRequest,
+    raw_params: Option<Arc<str>>,
+    receipt: AuthDispatchCustody,
+}
+
+fn check_admission(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+) -> Result<(), HttpResponse> {
+    if checkpoint(cx).is_err()
+        || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+    {
+        return Err(refusal(503));
+    }
+    Ok(())
+}
+
+fn prepare(
     session: &mut ServerHttpSession,
     cx: &Cx,
     policy: &ScopeRequestPolicy,
     request: HttpRequest,
-) -> Result<ServerHttpEndpointResponse, SecuredHttpEndpointError> {
-    checkpoint(cx)?;
-    if session.closed {
-        return Err(SecuredHttpEndpointError::SessionUnavailable);
-    }
+    authorization: &TransportAuthorization,
+    cancellation: Option<&McpRequestCancellation>,
+) -> Result<PreparedScopedPost, HttpResponse> {
+    check_admission(cx, cancellation)?;
+    if session.closed { return Err(refusal(503)); }
     session.reap_modern_dispatches();
     if request.method != HttpMethod::Post
         || request.path != session.server.http_config.handler_config.base_path
@@ -72,40 +98,130 @@ pub(super) async fn dispatch(
         || session.selected_era.is_some_and(|era| era != ProtocolEra::Modern2026)
         || request.header("mcp-session-id").is_some()
     {
-        return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request()));
+        return Err(HttpResponse::bad_request());
     }
-    let transport_authorization = match crate::transport_authorization_from_http_request(&request) {
+    let (request, admitted, raw_params) = session.prepare_modern_http_request(request)?;
+    check_admission(cx, cancellation)?;
+    let receipt = session.preauthenticate_modern_http_request(cx, &admitted, authorization)?;
+    check_admission(cx, cancellation)?;
+    let rejection = scope_rejection(policy, &admitted.method, receipt.authenticated.as_ref());
+    check_admission(cx, cancellation)?;
+    if let Some(response) = rejection { return Err(response); }
+    Ok(PreparedScopedPost { request, raw_params, receipt: AuthDispatchCustody::Http(receipt) })
+}
+
+/// Embedding keeps its existing outer deadline guard and SSE/session owner.
+pub(super) async fn dispatch(
+    session: &mut ServerHttpSession,
+    cx: &Cx,
+    policy: &ScopeRequestPolicy,
+    request: HttpRequest,
+) -> Result<ServerHttpEndpointResponse, SecuredHttpEndpointError> {
+    checkpoint(cx)?;
+    let authorization = match crate::transport_authorization_from_http_request(&request) {
         Ok(authorization) => authorization,
         Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
     };
-    let (request, admitted, raw_params) = match session.prepare_modern_http_request(request) {
+    dispatch_with_authorization(session, cx, policy, request, authorization, None)
+        .await.map_err(|_| SecuredHttpEndpointError::DispatchFailed)
+}
+
+async fn dispatch_with_authorization(
+    session: &mut ServerHttpSession,
+    cx: &Cx,
+    policy: &ScopeRequestPolicy,
+    request: HttpRequest,
+    authorization: TransportAuthorization,
+    cancellation: Option<McpRequestCancellation>,
+) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+    let prepared = match prepare(session, cx, policy, request, &authorization, cancellation.as_ref()) {
         Ok(prepared) => prepared,
         Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
     };
-    let receipt = match session.preauthenticate_modern_http_request(cx, &admitted, &transport_authorization) {
-        Ok(receipt) => receipt,
-        Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
-    };
-    checkpoint(cx)?;
-    let rejection = scope_rejection(policy, &admitted.method, receipt.authenticated.as_ref());
-    checkpoint(cx)?;
-    if let Some(response) = rejection {
-        return Ok(ServerHttpEndpointResponse::Immediate(response));
-    }
-
-    // Only successful authentication AND authorization may mutate the native
-    // transport namespace. Keep the original request/body and opaque receipt;
-    // dispatch commits those same provider facts, never a second evaluation.
+    // Only a fully admitted request can pin an era or enter transport state.
     session.selected_era.get_or_insert(ProtocolEra::Modern2026);
     let endpoint_response = {
         let mut endpoint = session.endpoint_session.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        endpoint.handle(cx, request).map_err(|_| SecuredHttpEndpointError::DispatchFailed)?
+        endpoint.handle(cx, prepared.request)?
     };
     session.handle_modern(
-        cx, endpoint_response, transport_authorization, raw_params,
-        Some(AuthDispatchCustody::Http(receipt)), None,
-    ).await.map_err(|_| SecuredHttpEndpointError::DispatchFailed)
+        cx, endpoint_response, authorization, prepared.raw_params,
+        Some(prepared.receipt), cancellation,
+    ).await
+}
+
+/// The socket's joined JSON dispatch child supplies its existing cancellation
+/// token. Keep native error projection and fresh-session ownership; no second
+/// middleware pipeline or asynchronous worker is introduced here.
+pub(super) async fn dispatch_socket_json(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    sessions: &LiveModernHttpSessionRegistry,
+    policy: &ScopeRequestPolicy,
+    request: HttpRequest,
+    authorization: TransportAuthorization,
+    cancellation: McpRequestCancellation,
+) -> HttpResponse {
+    let error_request = request.clone();
+    sessions.reap_retired_dispatches();
+    let mut session = match endpoint.open_session(cx) {
+        Ok(session) => session,
+        Err(_) => return HttpResponse::internal_error(),
+    };
+    dispatch_with_authorization(&mut session, cx, policy, request, authorization, Some(cancellation))
+        .await
+        .map_err(ServerHttpEndpointError::from_internal)
+        .map(|response| http_endpoint_response_to_static(cx, response))
+        .unwrap_or_else(|error| http_endpoint_error_response(
+            &error_request, error, endpoint.server.http_config.handler_config.max_body_size,
+        ))
+}
+
+type ScopedSseOpening = Result<
+    (JsonRpcRequest, DualEraHttpSseResponse, Option<Arc<str>>, AuthDispatchCustody),
+    ServerHttpEndpointResponse,
+>;
+
+/// Scope-aware native SSE opening. The socket retains its existing peer
+/// monitor, response-body registry, representation election and terminal drain.
+/// Refusals return before an SSE body exists, so a 403 never follows a 200 head.
+pub(super) async fn begin_sse(
+    session: &mut ServerHttpSession,
+    cx: &Cx,
+    policy: &ScopeRequestPolicy,
+    request: HttpRequest,
+    authorization: TransportAuthorization,
+) -> Result<ScopedSseOpening, DualEraHttpEndpointError> {
+    let prepared = match prepare(session, cx, policy, request, &authorization, None) {
+        Ok(prepared) => prepared,
+        Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+    };
+    let endpoint_response = {
+        let mut endpoint = session.endpoint_session.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match endpoint.handle(cx, prepared.request) {
+            Ok(response) => response,
+            Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
+                if error.kind() == std::io::ErrorKind::InvalidInput =>
+            {
+                return Ok(Err(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request())));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
+        return session.handle_modern(
+            cx, endpoint_response, authorization, prepared.raw_params,
+            Some(prepared.receipt), None,
+        ).await.map(Err);
+    };
+    let request = session.endpoint_session.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner).recv_modern_request(cx)?;
+    if request.method == "notifications/cancelled" {
+        return Ok(Err(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request())));
+    }
+    Ok(Ok((request, sse, prepared.raw_params, prepared.receipt)))
 }
 
 fn refusal(status: u16) -> HttpResponse {
@@ -228,5 +344,17 @@ mod tests {
         assert!(matches!(security.clone().with_scope_authorization(policy()), Err(HttpSecurityError::InvalidPolicy)));
         assert_eq!(security.scope_authorization.as_ref().unwrap().fingerprint(), before);
         assert_eq!(security.clone().scope_authorization.as_ref().unwrap().fingerprint(), before);
+    }
+
+    #[test]
+    fn cancelled_socket_request_cannot_enter_authentication_or_scope_work() {
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        let cx = Cx::for_testing();
+        let response = check_admission(&cx, Some(&cancellation)).unwrap_err();
+        assert_eq!(response.status.0, 503);
+        assert!(!response.headers.contains_key("www-authenticate"));
+        assert!(response.body.is_empty());
+        assert!(cx.checkpoint().is_ok());
     }
 }
