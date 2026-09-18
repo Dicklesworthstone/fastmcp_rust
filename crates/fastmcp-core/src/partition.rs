@@ -82,7 +82,7 @@ pub const DEFAULT_ATTEMPTS_PER_MINUTE_PER_PROVIDER: u32 = 10_000;
 pub const HARD_ATTEMPTS_PER_MINUTE_PER_PROVIDER: u32 = 100_000;
 
 /// The attempt-rate accounting window.
-pub const ATTEMPT_RATE_WINDOW: Duration = Duration::from_secs(60);
+pub const ATTEMPT_RATE_WINDOW: Duration = Duration::from_mins(1);
 
 // ---------------------------------------------------------------------------
 // Verified descriptor
