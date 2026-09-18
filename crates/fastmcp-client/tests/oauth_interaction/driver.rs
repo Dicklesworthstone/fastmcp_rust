@@ -21,6 +21,9 @@ mod catalogs;
 #[path = "catalog_watch.rs"]
 mod catalog_watch;
 
+#[path = "resources.rs"]
+mod resources;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 

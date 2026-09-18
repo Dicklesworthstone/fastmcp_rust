@@ -41,6 +41,8 @@ use crate::sse::SseLimits;
 pub mod catalog;
 /// Explicit host-driven, bounded input-required continuation operations.
 pub mod interaction;
+/// Bounded resource reads and explicitly enabled credential-local result caching.
+pub mod resource;
 
 /// Independent request, frame, cumulative payload, notification and time bounds.
 /// Native HTTP/SSE bounds continue to apply and may be tighter than these limits.
