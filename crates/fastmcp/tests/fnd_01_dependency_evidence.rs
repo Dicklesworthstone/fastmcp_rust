@@ -20576,10 +20576,12 @@ mod ordinary {
     /// be derived; only a declared design limit may be frozen. Re-freezing this
     /// at the current number would buy exactly one release.
     ///
-    /// `dependency-verification.toml` still spells `0.3.2` into
-    /// `archive_root_formula` and its siblings. That is the same defect on the
-    /// frozen side of the boundary, no lane may edit that file, and it is
-    /// recorded on the owning bead rather than worked around here.
+    /// As observed on 2026-09-18, `dependency-verification.toml` spelled a
+    /// frozen `0.3.2` into `archive_root_formula` and its siblings — the same
+    /// defect on the frozen side of the boundary. No lane may edit that file,
+    /// so it is recorded on the owning bead rather than worked around here.
+    /// Stated as a dated observation, not a standing claim: this comment records
+    /// what was seen, so repairing the policy cannot make it false.
     const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!("cargo-1.99.0-nightly-", "59800466c5c41c444d264b1010b4d57e85a7117f-", "summaries-cache-v3-index-v2-fnd01-hardening-v1",);
