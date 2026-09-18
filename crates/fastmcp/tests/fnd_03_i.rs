@@ -54,8 +54,17 @@ fn integration_positive_assertions() {
     // policy. None of these wrappers has a policy setter, so the selection is
     // immutable by construction rather than by convention.
     // ---------------------------------------------------------------------
-    let auto_builder = fastmcp_rust::auto::ServerBuilder::new("fnd03-i-auto", "1.0.0");
-    assert_eq!(auto_builder.protocol_policy(), ProtocolPolicy::Auto);
+    // `auto` is gated on `legacy-2024-11-05` exactly as `legacy_2024` below
+    // is: negotiating between eras requires the legacy era to exist. This use
+    // was previously ungated, which made the whole target fail to compile with
+    // `--no-default-features` (E0433), so the ModernOnly branch of the
+    // configured-default assertion further down had never been built, let
+    // alone run.
+    #[cfg(feature = "legacy-2024-11-05")]
+    {
+        let auto_builder = fastmcp_rust::auto::ServerBuilder::new("fnd03-i-auto", "1.0.0");
+        assert_eq!(auto_builder.protocol_policy(), ProtocolPolicy::Auto);
+    }
 
     // The modern namespace does not return a `ProtocolPolicy` at all: its
     // accessor is typed `ModernOnly`, a unit marker, so a modern builder
@@ -148,7 +157,14 @@ fn integration_planted_negative_assertions() {
         .expect("the supported revision parses through the facade");
     assert_eq!(accepted, ProtocolVersion::MODERN_2026);
 
+    // Gated for the same reason as the positive's `auto` use above, but as
+    // STATEMENTS rather than a block: `auto_builder` is read again after the
+    // refusal, as part of the unchanged-state comparison. A block here would
+    // scope the binding away from that later assertion and silently drop half
+    // of the before/after pair.
+    #[cfg(feature = "legacy-2024-11-05")]
     let auto_builder = fastmcp_rust::auto::ServerBuilder::new("fnd03-i-neg-auto", "1.0.0");
+    #[cfg(feature = "legacy-2024-11-05")]
     assert_eq!(auto_builder.protocol_policy(), ProtocolPolicy::Auto);
 
     let builder = ServerBuilder::try_new("fnd03-i-integration-neg", "1.0.0")
@@ -199,6 +215,7 @@ fn integration_planted_negative_assertions() {
         ProtocolVersion::parse(MODERN_PROTOCOL_VERSION),
         Ok(accepted)
     );
+    #[cfg(feature = "legacy-2024-11-05")]
     assert_eq!(auto_builder.protocol_policy(), ProtocolPolicy::Auto);
     assert_eq!(builder.configured_protocol_policy(), initial_policy);
 
