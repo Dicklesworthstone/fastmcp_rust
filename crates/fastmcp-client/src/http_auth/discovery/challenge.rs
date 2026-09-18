@@ -1,4 +1,4 @@
-//! Resource-bound RFC 9728 Bearer challenges for explicit native OAuth login.
+//! Resource-bound RFC 9728 challenges for explicit native OAuth login.
 //!
 //! A challenge selects a metadata LOCATION, never a trusted issuer, client
 //! registration, requested scope set, or permission to replay a failed call.
@@ -7,11 +7,13 @@
 //! A 401 head is sufficient: its response body is dropped without consumption.
 //!
 //! The generic parser follows RFC 9110 challenge/auth-param syntax, preserving
-//! repeated field lines and quoted commas. Exactly one Bearer challenge is
-//! required. Other schemes are parsed but never activated. Ambiguous Bearer
-//! alternatives and duplicate case-insensitive parameter names fail closed.
-//! These APIs do not implement 403 scope escalation, DPoP, DCR, automatic login,
-//! automatic retry, DNS address pinning, or authentication of an OIDC identity.
+//! repeated field lines and quoted commas. RFC 9728 resource_metadata can occur
+//! on ANY admitted scheme; exactly one occurrence may select a location. A
+//! Bearer scope is admitted separately, at most once across the entire set.
+//! Token68 challenges provide neither parameter, even on the Bearer scheme.
+//! This does not activate unsupported authentication schemes or splice their
+//! parameters into another challenge. No 403 escalation, DPoP, DCR, automatic
+//! login/retry, DNS pinning, or OIDC identity authentication is installed.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -41,6 +43,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CHALLENGE_BYTES: usize = 16 * 1024;
 const MAX_CHALLENGES: usize = 16;
 const MAX_PARAMETERS: usize = 32;
+const MAX_NAME_BYTES: usize = 128;
 const MAX_VALUE_BYTES: usize = 4096;
 const MAX_PROBE_BYTES: usize = 16 * 1024;
 
@@ -50,7 +53,11 @@ const MAX_PROBE_BYTES: usize = 16 * 1024;
 pub enum OAuthChallengeError {
     InvalidPolicy,
     InvalidChallenge,
+    /// Multiple Bearer scope parameters, including identical values.
     AmbiguousBearerChallenge,
+    /// Multiple metadata parameters, including identical values or other schemes.
+    AmbiguousMetadataLocation,
+    /// No metadata hint and no Bearer challenge permitting the no-hint path.
     MissingBearerChallenge,
     UnsupportedStatus { status: u16 },
     ResourceMismatch,
@@ -65,8 +72,9 @@ impl fmt::Display for OAuthChallengeError {
         f.write_str(match self {
             Self::InvalidPolicy => "invalid OAuth challenge policy",
             Self::InvalidChallenge => "malformed OAuth challenge",
-            Self::AmbiguousBearerChallenge => "multiple Bearer challenges require an explicit selection policy",
-            Self::MissingBearerChallenge => "response has no Bearer challenge",
+            Self::AmbiguousBearerChallenge => "multiple Bearer scope parameters are ambiguous",
+            Self::AmbiguousMetadataLocation => "multiple challenged metadata locations are ambiguous",
+            Self::MissingBearerChallenge => "response has neither a metadata hint nor a Bearer challenge",
             Self::UnsupportedStatus { .. } => "response is not an OAuth 401 challenge",
             Self::ResourceMismatch => "OAuth challenge belongs to another resource",
             Self::MetadataOriginNotTrusted => "challenged metadata origin requires an explicit host grant",
@@ -107,6 +115,8 @@ impl ResourceMetadataChallenge {
     /// that a caller-provided head came from a network peer; use probe() when
     /// FastMCP should own that association. Proxy challenges and bodies are not
     /// inspected. Statuses other than 401 are deliberately not login triggers.
+    /// A metadata hint on another scheme does not select that scheme: the host's
+    /// preregistered OAuth plan remains the authentication authority.
     pub fn from_response(
         resource: CanonicalHttpUrl,
         status: u16,
@@ -135,25 +145,33 @@ impl ResourceMetadataChallenge {
             combined.push_str(value);
         }
         let mut parser = ChallengeParser { text: &combined, offset: 0, count: 0 };
-        let mut bearer = None;
-        while let Some(challenge) = parser.next()? {
-            if !challenge.scheme.eq_ignore_ascii_case("bearer") { continue; }
-            if bearer.is_some() { return Err(OAuthChallengeError::AmbiguousBearerChallenge); }
-            // RFC 6750 Bearer challenges use auth-params, not token68. In
-            // particular resource_metadata= must not masquerade as a token68
-            // challenge and cause fallback to the well-known location.
-            if challenge.token68 { return Err(OAuthChallengeError::InvalidChallenge); }
-            bearer = Some(challenge.parameters);
-        }
-        let parameters = bearer.ok_or(OAuthChallengeError::MissingBearerChallenge)?;
+        let mut saw_bearer = false;
         let mut metadata_url = None;
         let mut scope_hint = None;
-        for (name, value) in parameters {
-            match name.as_str() {
-                "resource_metadata" => metadata_url = Some(metadata_url_from_text(&value)?),
-                "scope" => scope_hint = Some(value),
-                _ => {},
+        while let Some(challenge) = parser.next()? {
+            let bearer = challenge.scheme.eq_ignore_ascii_case("bearer");
+            saw_bearer |= bearer;
+            // Token68 is structurally distinct from auth-params, even when its
+            // opaque characters look like an empty name= parameter. It supplies
+            // neither a metadata location nor a scope hint.
+            if challenge.token68 { continue; }
+            for (name, value) in challenge.parameters {
+                match name.as_str() {
+                    "resource_metadata" => {
+                        if metadata_url.is_some() { return Err(OAuthChallengeError::AmbiguousMetadataLocation); }
+                        metadata_url = Some(metadata_url_from_text(&value)?);
+                    }
+                    "scope" if bearer => {
+                        if scope_hint.is_some() { return Err(OAuthChallengeError::AmbiguousBearerChallenge); }
+                        validate_scope_hint(&value)?;
+                        scope_hint = Some(value);
+                    }
+                    _ => {},
+                }
             }
+        }
+        if metadata_url.is_none() && !saw_bearer {
+            return Err(OAuthChallengeError::MissingBearerChallenge);
         }
         Ok(Self { resource, metadata_url, scope_hint })
     }
@@ -164,8 +182,8 @@ impl ResourceMetadataChallenge {
     pub fn scope_hint(&self) -> Option<&str> { self.scope_hint.as_deref() }
 
     /// Performs ONE unauthenticated modern server/discover POST. It returns
-    /// only a validated 401 challenge; 2xx, redirects, 403 and transport errors
-    /// are terminal and never select another era or authentication method.
+    /// only an admitted 401 challenge set; 2xx, redirects, 403 and transport
+    /// errors are terminal and never select another era or authentication.
     /// No body is read and no subsequent discovery, login or replay is started.
     /// The native client's bundled/native-root policy validates resource TLS;
     /// a metadata-only root grant does not alter this probe's trust policy.
@@ -308,9 +326,26 @@ impl ChallengedOAuthDiscovery {
     ) -> Result<ManagedOAuthSession, OAuthChallengeError>
     where L: FnOnce(CanonicalHttpUrl) -> F, F: Future<Output = Result<(), OAuthError>>,
     {
-        let configuration = self.discover(cx).await?;
-        ManagedOAuthSession::authorize(cx, OAuthClient::new(configuration), policy, launch_browser)
-            .await.map_err(|error| OAuthDiscoveryError::Login(error).into())
+        self.authorize_managed_with_cancellation(cx, &McpRequestCancellation::new(), policy, launch_browser).await
+    }
+
+    /// The same request-owned cancellation domain spans discovery, browser
+    /// launch, callback admission and token redemption. It never cancels the
+    /// caller's Cx or another session. Dropping a polled operation releases the
+    /// pending fetch/listener; a launched browser cannot be recalled. The login
+    /// driver's finite deadline still applies independently of discovery time.
+    pub async fn authorize_managed_with_cancellation<L, F>(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        policy: OAuthSessionPolicy, launch_browser: L,
+    ) -> Result<ManagedOAuthSession, OAuthChallengeError>
+    where L: FnOnce(CanonicalHttpUrl) -> F, F: Future<Output = Result<(), OAuthError>>,
+    {
+        let configuration = self.discover_with_cancellation(cx, cancellation).await?;
+        let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
+        active(cx, cancellation, deadline, async {
+            ManagedOAuthSession::authorize(cx, OAuthClient::new(configuration), policy, launch_browser)
+                .await.map_err(|error| OAuthDiscoveryError::Login(error).into())
+        }).await
     }
 }
 
@@ -323,6 +358,13 @@ fn metadata_url_from_text(text: &str) -> Result<CanonicalHttpUrl, OAuthChallenge
         return Err(OAuthChallengeError::InvalidChallenge);
     }
     Ok(url)
+}
+
+fn validate_scope_hint(scope: &str) -> Result<(), OAuthChallengeError> {
+    if scope.is_empty() || scope.split(' ').any(|part| part.is_empty() || !part.bytes().all(|b| {
+        b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b)
+    })) { return Err(OAuthChallengeError::InvalidChallenge); }
+    Ok(())
 }
 
 // Unlike issuer/resource identity URLs, a metadata location MAY have a query.
@@ -385,18 +427,15 @@ impl<'a> ChallengeParser<'a> {
         self.ows();
         while self.byte() == Some(b',') { self.offset += 1; self.ows(); }
     }
-    fn token(&mut self) -> Result<&'a str, OAuthChallengeError> {
+    fn token(&mut self, maximum: usize) -> Result<&'a str, OAuthChallengeError> {
         let start = self.offset;
         while self.byte().is_some_and(is_token) { self.offset += 1; }
         if self.offset == start { return Err(OAuthChallengeError::InvalidChallenge); }
+        if self.offset - start > maximum { return Err(OAuthChallengeError::LimitExceeded); }
         Ok(&self.text[start..self.offset])
     }
     fn value(&mut self) -> Result<String, OAuthChallengeError> {
-        if self.byte() != Some(b'"') {
-            let value = self.token()?;
-            if value.len() > MAX_VALUE_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
-            return Ok(value.to_owned());
-        }
+        if self.byte() != Some(b'"') { return Ok(self.token(MAX_VALUE_BYTES)?.to_owned()); }
         self.offset += 1;
         let mut value = Vec::new();
         loop {
@@ -410,12 +449,15 @@ impl<'a> ChallengeParser<'a> {
                         return Err(OAuthChallengeError::InvalidChallenge);
                     }
                     self.offset += 1;
+                    if value.len() >= MAX_VALUE_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
                     value.push(escaped);
                 }
-                b'\t' | 0x20..=0x21 | 0x23..=0x5b | 0x5d..=0xff => value.push(byte),
+                b'\t' | 0x20..=0x21 | 0x23..=0x5b | 0x5d..=0xff => {
+                    if value.len() >= MAX_VALUE_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
+                    value.push(byte);
+                }
                 _ => return Err(OAuthChallengeError::InvalidChallenge),
             }
-            if value.len() > MAX_VALUE_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
         }
         String::from_utf8(value).map_err(|_| OAuthChallengeError::InvalidChallenge)
     }
@@ -424,7 +466,7 @@ impl<'a> ChallengeParser<'a> {
         if self.offset == self.text.len() { return Ok(None); }
         self.count += 1;
         if self.count > MAX_CHALLENGES { return Err(OAuthChallengeError::LimitExceeded); }
-        let scheme = self.token()?;
+        let scheme = self.token(MAX_NAME_BYTES)?;
         let mut parsed = ParsedChallenge { scheme, token68: false, parameters: Vec::new() };
         if self.byte().is_none() || self.byte() == Some(b',') { return Ok(Some(parsed)); }
         if self.byte() != Some(b' ') { return Err(OAuthChallengeError::InvalidChallenge); }
@@ -433,13 +475,14 @@ impl<'a> ChallengeParser<'a> {
         let end = self.text[self.offset..].find(',').map_or(self.text.len(), |n| self.offset + n);
         let candidate = self.text[self.offset..end].trim_end_matches([' ', '\t']);
         if AccessToken::is_valid_token68(candidate) {
+            if candidate.len() > MAX_VALUE_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
             self.offset = end;
             parsed.token68 = true;
             return Ok(Some(parsed));
         }
         let mut names = BTreeSet::new();
         loop {
-            let name = self.token()?.to_ascii_lowercase();
+            let name = self.token(MAX_NAME_BYTES)?.to_ascii_lowercase();
             if names.len() >= MAX_PARAMETERS { return Err(OAuthChallengeError::LimitExceeded); }
             if !names.insert(name.clone()) { return Err(OAuthChallengeError::InvalidChallenge); }
             self.ows();
@@ -453,7 +496,7 @@ impl<'a> ChallengeParser<'a> {
             self.commas();
             if self.byte().is_none() { break; }
             let next = self.offset;
-            self.token()?;
+            self.token(MAX_NAME_BYTES)?;
             self.ows();
             let same_challenge = self.byte() == Some(b'=');
             self.offset = next;
@@ -497,27 +540,32 @@ mod tests {
         assert!(parse(", , Bearer realm=primary, ,").is_ok());
     }
     #[test]
-    fn duplicate_case_insensitive_parameters_and_multiple_bearer_alternatives_fail() {
+    fn duplicate_parameters_and_multiple_bearer_scopes_fail() {
         for value in [
             "Bearer realm=a, REALM=b", "Bearer scope=read, Scope=write",
             "Bearer resource_metadata=\"https://resource.example/a\", RESOURCE_METADATA=\"https://resource.example/a\"",
         ] { assert!(matches!(parse(value), Err(OAuthChallengeError::InvalidChallenge))); }
-        assert!(matches!(parse("Bearer realm=a, Bearer realm=b"), Err(OAuthChallengeError::AmbiguousBearerChallenge)));
-        assert!(matches!(parse("Bearer, bearer"), Err(OAuthChallengeError::AmbiguousBearerChallenge)));
+        for value in ["Bearer scope=read, Bearer scope=read", "Bearer scope=read, Bearer scope=write"] {
+            assert!(matches!(parse(value), Err(OAuthChallengeError::AmbiguousBearerChallenge)));
+        }
+        // Distinct realms alone are not metadata or scope ambiguity. The host
+        // plan selects authentication; realms cannot pick an issuer or grant.
+        assert!(parse("Bearer realm=a, Bearer realm=b").is_ok());
     }
     #[test]
     fn malformed_hints_never_turn_into_well_known_fallback() {
         for value in [
-            "Bearer resource_metadata=", "Bearer resource_metadata=\"\"", "Bearer abc==",
-            "Bearer resource_metadata=\"/relative\"", "Bearer resource_metadata=\"http://resource.example/meta\"",
+            "Bearer resource_metadata=\"\"", "Bearer resource_metadata=\"/relative\"",
+            "Bearer resource_metadata=\"http://resource.example/meta\"",
             "Bearer resource_metadata=\"https://user@resource.example/meta\"",
             "Bearer resource_metadata=\"https://resource.example/meta#fragment\"",
             "Bearer resource_metadata=\"https://resource.example/meta", "Bearer realm=\"bad\\",
             "Bearer realm=\"bad\r\nvalue\"", "Bearer scope=read trailing",
+            "Basic resource_metadata=\"http://resource.example/meta\", Bearer",
         ] { assert!(parse(value).is_err(), "malformed challenge must fail"); }
     }
     #[test]
-    fn status_proxy_headers_and_other_schemes_cannot_initiate_bearer_login() {
+    fn status_proxy_headers_and_unrelated_scheme_data_do_not_initiate_login() {
         for status in [200, 302, 400, 403, 407, 500] {
             assert!(matches!(ResourceMetadataChallenge::from_response(url("https://resource.example/mcp"), status,
                 &[("WWW-Authenticate".to_owned(), "Bearer".to_owned())]), Err(OAuthChallengeError::UnsupportedStatus { .. })));
@@ -525,7 +573,7 @@ mod tests {
         assert!(matches!(ResourceMetadataChallenge::from_response(url("https://resource.example/mcp"), 401,
             &[("Proxy-Authenticate".to_owned(), "Bearer resource_metadata=\"https://evil.example/meta\"".to_owned())]),
             Err(OAuthChallengeError::MissingBearerChallenge)));
-        assert!(matches!(parse("DPoP resource_metadata=\"https://evil.example/meta\""), Err(OAuthChallengeError::MissingBearerChallenge)));
+        assert!(matches!(parse("Other scope=admin"), Err(OAuthChallengeError::MissingBearerChallenge)));
     }
     #[test]
     fn hinted_scopes_never_change_the_registered_request() {
@@ -558,6 +606,8 @@ mod tests {
         assert!(matches!(parse(&" ".repeat(MAX_CHALLENGE_BYTES + 1)), Err(OAuthChallengeError::LimitExceeded)));
         let oversized_value = format!("Bearer realm=\"{}\"", "x".repeat(MAX_VALUE_BYTES + 1));
         assert!(matches!(parse(&oversized_value), Err(OAuthChallengeError::LimitExceeded)));
+        assert!(matches!(parse(&format!("Bearer {}=v", "x".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
+        assert!(matches!(parse(&format!("{} realm=v, Bearer", "X".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
         let fields = (0..MAX_PARAMETERS + 1).map(|n| format!("p{n}=v")).collect::<Vec<_>>().join(",");
         assert!(matches!(parse(&format!("Bearer {fields}")), Err(OAuthChallengeError::LimitExceeded)));
         let schemes = format!("{}Bearer", "Other, ".repeat(MAX_CHALLENGES));
@@ -585,5 +635,39 @@ mod tests {
         assert_eq!(body.0.len(), MAX_PROBE_BYTES - 1);
         body.write_all(b"a").unwrap();
         assert_eq!(body.0.len(), MAX_PROBE_BYTES);
+    }
+    #[test]
+    fn metadata_location_is_selected_across_schemes_without_splicing_scope() {
+        for text in [
+            "Basic resource_metadata=\"https://resource.example/meta\", scope=admin, Bearer scope=read",
+            "Bearer scope=read, Other scope=admin, resource_metadata=\"https://resource.example/meta\"",
+        ] {
+            let challenge = parse(text).unwrap();
+            assert_eq!(challenge.metadata_url().unwrap().as_str(), "https://resource.example/meta");
+            assert_eq!(challenge.scope_hint(), Some("read"));
+        }
+        let challenge = parse("Other resource_metadata=\"https://resource.example/meta\", scope=admin").unwrap();
+        assert!(challenge.metadata_url().is_some());
+        assert!(challenge.scope_hint().is_none());
+        for text in [
+            "Bearer resource_metadata=\"https://resource.example/meta\", Basic resource_metadata=\"https://resource.example/meta\"",
+            "Basic resource_metadata=\"https://resource.example/meta\", Bearer resource_metadata=\"https://resource.example/other\"",
+        ] { assert!(matches!(parse(text), Err(OAuthChallengeError::AmbiguousMetadataLocation))); }
+    }
+    #[test]
+    fn bearer_token68_has_neither_metadata_nor_scope_parameters() {
+        for token in ["YWJjZA==", "resource_metadata=", "scope="] {
+            let challenge = parse(&format!("Bearer {token}")).unwrap();
+            assert!(challenge.metadata_url().is_none() && challenge.scope_hint().is_none());
+        }
+        let challenge = parse("Bearer YWJjZA==, Basic resource_metadata=\"https://resource.example/meta\"").unwrap();
+        assert!(challenge.metadata_url().is_some() && challenge.scope_hint().is_none());
+    }
+    #[test]
+    fn bearer_scope_preserves_order_but_rejects_invalid_scope_token_syntax() {
+        assert_eq!(parse("Bearer scope=\"write read\"").unwrap().scope_hint(), Some("write read"));
+        for scope in ["", " read", "read ", "read  write", "read\twrite", "réad"] {
+            assert!(matches!(parse(&format!("Bearer scope=\"{scope}\"")), Err(OAuthChallengeError::InvalidChallenge)));
+        }
     }
 }
