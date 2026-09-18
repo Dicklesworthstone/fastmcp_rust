@@ -392,29 +392,30 @@ cargo build --release
 
 The latest published release, v0.10.0, provides prebuilt `fastmcp` binaries on
 GitHub Releases. The `fastmcp-cli` source package is also available from
-crates.io for Cargo-based installation. Its archives use
-`fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on Windows). Linux and
-macOS provide `x86_64` and `aarch64` archives (`fastmcp-linux-x86_64`,
-`fastmcp-linux-aarch64`, `fastmcp-darwin-x86_64`,
-`fastmcp-darwin-aarch64`); Windows provides `fastmcp-windows-x86_64` (MSVC).
-There are no `amd64`/`arm64` alias names. Every archive has a `.sha256`
-sibling and the release carries a `SHA256SUMS` file.
+crates.io for Cargo-based installation. Archives follow a `fastmcp-<os>-<arch>`
+pattern (`.tar.xz` on Unix, `.zip` on Windows).
 
-The checked-in release workflow is currently a quarantined verification surface
-and does not publish new GitHub Releases: it has held `contents: read` since
-2026-08-02, and that permission cannot create a Release. The v0.10.0 tag
-postdates it (2026-09-12), so **this repository does not establish whether the
-archives named above are downloadable**, and nothing in it can. The command
-below pins the tag rather than `releases/latest` — under a workflow that does
-not publish, `latest` is a moving pointer whose meaning is not stated anywhere —
-but treat it as the address of an artifact whose existence is unverified here.
-**If it does not resolve, build from source as shown above; that path is
-verified by this repository and the download is not.**
+**This repository does not establish what the published archives are named.**
+The checked-in release workflow is a quarantined verification surface and does
+not publish new GitHub Releases: it has held `contents: read` since 2026-08-02,
+and that permission cannot create a Release. The v0.10.0 tag postdates it
+(2026-09-12), so this repository does not establish whether those archives are
+downloadable either, and nothing in it can. That workflow's build matrix — the
+`SURF-RELEASE-ASSET-CLOSURE` rows in
+`evidence/fnd-01/dependency-verification.toml` — describes what the quarantined
+workflow *would* produce, which is not evidence of what the release contains;
+do not read it as the published filenames.
+
+Take the exact filename from the v0.10.0 release page. The command below pins
+the tag rather than `releases/latest` — under a workflow that does not publish,
+`latest` is a moving pointer whose meaning is not stated anywhere.
+**If the download does not resolve, build from source as shown above; that path
+is verified by this repository and the download is not.**
 
 ```bash
-# Example: macOS Apple Silicon
-curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.10.0/fastmcp-darwin-aarch64.tar.xz
-tar -xJf fastmcp-darwin-aarch64.tar.xz
+# Replace <asset> with the exact filename listed on the v0.10.0 release page.
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.10.0/<asset>
+tar -xJf <asset>
 ./fastmcp --version
 ```
 
