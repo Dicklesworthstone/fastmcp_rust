@@ -38,6 +38,8 @@ pub mod registration;
 pub mod client_credentials;
 /// Resource-bound Bearer challenges and explicitly trusted metadata relocation.
 pub mod challenge;
+/// Ordered same-issuer metadata retrieval and bounded aggregate diagnostics.
+pub mod issuer;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
@@ -67,6 +69,8 @@ pub enum OAuthDiscoveryError {
     /// Neither constructed resource-metadata location was usable. Diagnostics
     /// retain every attempted location's safe tag and cause, never peer bytes.
     ResourceMetadataExhausted(ResourceMetadataFailure),
+    /// No permitted location of the selected issuer passed candidate admission.
+    IssuerMetadataExhausted(issuer::IssuerMetadataFailure),
     Login(OAuthSessionError),
 }
 
@@ -90,6 +94,7 @@ impl fmt::Display for OAuthDiscoveryError {
             Self::UnsupportedScopes => "OAuth metadata does not admit the requested scopes",
             Self::SignedMetadataUnsupported => "signed OAuth metadata requires a separate verifier",
             Self::ResourceMetadataExhausted(_) => "no constructed resource-metadata location passed admission",
+            Self::IssuerMetadataExhausted(_) => "no permitted issuer-metadata location passed admission",
             Self::Login(_) => "login after OAuth discovery failed",
         })
     }
@@ -204,7 +209,7 @@ fn resource_candidate_cause(error: &OAuthDiscoveryError) -> ResourceMetadataCaus
         OAuthDiscoveryError::RuntimeUnavailable => ResourceMetadataCause::RuntimeUnavailable,
         OAuthDiscoveryError::InvalidPolicy | OAuthDiscoveryError::IssuerMismatch
         | OAuthDiscoveryError::EndpointNotTrusted | OAuthDiscoveryError::ResourceMetadataExhausted(_)
-        | OAuthDiscoveryError::Login(_) => ResourceMetadataCause::InvalidPolicy,
+        | OAuthDiscoveryError::IssuerMetadataExhausted(_) | OAuthDiscoveryError::Login(_) => ResourceMetadataCause::InvalidPolicy,
     }
 }
 
@@ -335,6 +340,8 @@ impl OAuthDiscoveryPlan {
     /// is divided equally between its one or two candidates, so a stalled first
     /// response cannot consume the root attempt. The caller's tighter budget
     /// wins. Browser login uses its separate existing authorization deadline.
+    /// Issuer candidates likewise reserve independent time shares and leave
+    /// half their entry-time budget for work following successful discovery.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, OAuthDiscoveryError> {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(OAuthDiscoveryError::InvalidPolicy);
@@ -352,19 +359,23 @@ impl OAuthDiscoveryPlan {
     /// Discovers usable public-client code-flow endpoints. Constructed PRM
     /// locations are tried path-first then root after any unusable bounded
     /// candidate, with full identity/trust admission before selecting a winner.
-    /// This does not retry a metadata URL, follow redirects, or accept a rejected
-    /// explicit challenge hint. Once selected, an issuer is not replaced by a
-    /// root PRM or a lower-priority issuer after its own discovery fails.
-    /// Issuer-location fallback retains its existing 404/410-only policy.
+    /// The fixed same-issuer metadata sequence then selects its first fully
+    /// admitted native code-flow configuration, not merely its first HTTP 200.
+    /// This never follows redirects, retries a URL, changes the selected issuer,
+    /// relaxes endpoint trust, or accepts a rejected explicit challenge hint.
     pub async fn discover(&self, cx: &Cx) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         if self.client_id.is_none() {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
         let deadline = discovery_deadline(cx, self.timeout)?;
-        let (issuer, body) = self.discover_issuer_document(cx, deadline).await?;
-        let configuration = self.admit_issuer(issuer, &body)?;
-        check_context(cx, deadline)?;
-        Ok(configuration)
+        let issuer = self.discover_resource_issuer(cx, deadline).await?;
+        self.discover_selected_issuer(cx, deadline, issuer).await
+    }
+
+    async fn discover_selected_issuer(
+        &self, cx: &Cx, deadline: Time, selected: &TrustedOAuthIssuer,
+    ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        issuer::discover(cx, deadline, selected, |body| self.admit_issuer(selected, body)).await
     }
 
     // Registration, machine authentication and preregistered native discovery
@@ -414,22 +425,18 @@ impl OAuthDiscoveryPlan {
         Err(OAuthDiscoveryError::ResourceMetadataExhausted(failure))
     }
 
-    // Registration and preregistered discovery share the same bounded fetch,
-    // local issuer selection and terminal-versus-fallback decisions.
+    // Registration and machine authentication share the same bounded transport,
+    // identity and endpoint-document admission. Their subsequent registration
+    // or selected authentication-method checks remain explicit and cannot switch
+    // credentials or issuers. Exact source bytes reach their profile decoders.
     async fn discover_issuer_document(
         &self,
         cx: &Cx,
         deadline: Time,
     ) -> Result<(&TrustedOAuthIssuer, Vec<u8>), OAuthDiscoveryError> {
-        let issuer = self.discover_resource_issuer(cx, deadline).await?;
-        for location in issuer_metadata_urls(&issuer.url)? {
-            check_context(cx, deadline)?;
-            if let Some(body) = fetch_metadata(cx, deadline, &location, &issuer.roots).await? {
-                check_context(cx, deadline)?;
-                return Ok((issuer, body));
-            }
-        }
-        Err(OAuthDiscoveryError::MetadataNotFound)
+        let selected = self.discover_resource_issuer(cx, deadline).await?;
+        let body = issuer::discover(cx, deadline, selected, |body| issuer::admit_document(selected, body)).await?;
+        Ok((selected, body))
     }
 
     /// Resolves metadata and then drives the existing browser/PKCE/managed
