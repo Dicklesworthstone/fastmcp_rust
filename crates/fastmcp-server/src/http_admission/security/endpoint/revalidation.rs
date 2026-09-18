@@ -179,15 +179,14 @@ impl SseAuthorizationLease {
         let started = Instant::now();
         let caller_started = cx.now();
         let next_check = fresh_until(cx, caller_started, self.config.interval)?;
+        let provider_deadline = fresh_until(cx, caller_started, self.config.check_timeout)?;
         let receipt = self.server.preauthenticate_http_request(
             cx, &self.request, &self.authorization,
         );
         // Local cancellation/deadlines and work bounds win over either a late
         // success or a provider refusal. Neither can extend the freshness window.
         check_context(cx)?;
-        if started.elapsed() >= self.config.check_timeout || cx.now() >= next_check {
-            return Err(SseAuthorizationError::TimedOut);
-        }
+        admit_verdict_time(cx.now(), provider_deadline, started.elapsed(), self.config.check_timeout)?;
         let receipt = receipt.map_err(|_| SseAuthorizationError::Rejected)?;
         if receipt.fingerprint != self.principal
             || !same_facts(self.facts.as_ref(), receipt.authenticated.as_ref())
@@ -201,6 +200,11 @@ impl SseAuthorizationLease {
             .ok_or(SseAuthorizationError::InvalidPolicy)?;
         Ok(())
     }
+}
+
+fn admit_verdict_time(now: Time, deadline: Time, elapsed: Duration, timeout: Duration) -> Result<(), SseAuthorizationError> {
+    if now >= deadline || elapsed >= timeout { return Err(SseAuthorizationError::TimedOut); }
+    Ok(())
 }
 
 fn same_facts(left: Option<&AuthContext>, right: Option<&AuthContext>) -> bool {
@@ -410,5 +414,20 @@ mod tests {
         for private in ["canary", "lease-test-token", "lease-test-principal", "read"] {
             assert!(!diagnostic.contains(private));
         }
+    }
+
+    #[test]
+    fn provider_timeout_uses_the_shorter_check_bound_on_each_clock() {
+        let cx = Cx::for_testing();
+        let started = Time::from_nanos(100);
+        let config = SseRevalidationPolicy::default();
+        let deadline = fresh_until(&cx, started, config.check_timeout()).unwrap();
+        let freshness = fresh_until(&cx, started, config.interval()).unwrap();
+        assert!(deadline < freshness);
+        let before = Time::from_nanos(deadline.as_nanos() - 1);
+        let just_before = config.check_timeout() - Duration::from_nanos(1);
+        assert_eq!(admit_verdict_time(before, deadline, just_before, config.check_timeout()), Ok(()));
+        assert_eq!(admit_verdict_time(deadline, deadline, Duration::ZERO, config.check_timeout()), Err(SseAuthorizationError::TimedOut));
+        assert_eq!(admit_verdict_time(started, deadline, config.check_timeout(), config.check_timeout()), Err(SseAuthorizationError::TimedOut));
     }
 }
