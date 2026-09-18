@@ -14,8 +14,11 @@
 
 /// Origin-bound entry point to the existing asynchronous HTTP dispatcher.
 pub mod endpoint;
+/// Explicit resource-bound OAuth discovery and Bearer challenge publication.
+pub mod resource_metadata;
 
 use std::fmt;
+use std::sync::Arc;
 
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_transport::http::{HttpResponse, HttpStatus};
@@ -48,6 +51,7 @@ pub struct HttpSecurityPolicy {
     scheme: String,
     origins: Vec<String>,
     request_headers: Vec<String>,
+    resource_metadata: Option<Arc<resource_metadata::PublishedResourceMetadata>>,
 }
 
 impl fmt::Debug for HttpSecurityPolicy {
@@ -55,6 +59,7 @@ impl fmt::Debug for HttpSecurityPolicy {
         f.debug_struct("HttpSecurityPolicy")
             .field("origin_count", &self.origins.len())
             .field("request_header_count", &self.request_headers.len())
+            .field("publishes_resource_metadata", &self.resource_metadata.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -66,6 +71,7 @@ pub enum HttpSecurityError {
     InvalidPolicy,
     EndpointMismatch,
     MethodNotAllowed,
+    MetadataMethodNotAllowed,
     HeaderLimit,
     InvalidHeader,
     DuplicateHeader,
@@ -88,7 +94,7 @@ impl fmt::Display for HttpSecurityError {
         f.write_str(match self {
             Self::InvalidPolicy => "invalid HTTP origin security policy",
             Self::EndpointMismatch => "HTTP endpoint not found",
-            Self::MethodNotAllowed => "HTTP method not allowed",
+            Self::MethodNotAllowed | Self::MetadataMethodNotAllowed => "HTTP method not allowed",
             Self::HeaderLimit => "HTTP header bound exceeded",
             Self::InvalidHeader => "invalid HTTP header",
             Self::DuplicateHeader => "duplicate security-sensitive HTTP header",
@@ -96,7 +102,7 @@ impl fmt::Display for HttpSecurityError {
             Self::OriginNotAllowed => "HTTP origin not allowed",
             Self::InvalidPreflight => "invalid HTTP preflight",
             Self::HeaderNotAllowed => "HTTP preflight header not allowed",
-            Self::BodyNotAllowed => "HTTP preflight body not allowed",
+            Self::BodyNotAllowed => "HTTP body not allowed on this route",
             Self::BodyTooLarge => "HTTP body bound exceeded",
             Self::ContentLengthMismatch => "HTTP content length does not match body",
             Self::Protocol(_) => "modern HTTP protocol admission failed",
@@ -111,7 +117,7 @@ impl HttpSecurityError {
     pub fn response(&self) -> HttpResponse {
         let status = match self {
             Self::EndpointMismatch => 404,
-            Self::MethodNotAllowed => 405,
+            Self::MethodNotAllowed | Self::MetadataMethodNotAllowed => 405,
             Self::HeaderLimit => 431,
             Self::BodyTooLarge => 413,
             Self::HostNotAllowed | Self::OriginNotAllowed | Self::HeaderNotAllowed => 403,
@@ -121,18 +127,22 @@ impl HttpSecurityError {
         let mut response = HttpResponse::new(HttpStatus(status))
             .with_header("cache-control", "no-store")
             .with_header("vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
-        if status == 405 { response = response.with_header("allow", "POST, OPTIONS"); }
+        if status == 405 {
+            let methods = if matches!(self, Self::MetadataMethodNotAllowed) { "GET, OPTIONS" } else { "POST, OPTIONS" };
+            response = response.with_header("allow", methods);
+        }
         response
     }
 }
 
 /// A head-only decision, usable before reading or parsing the request body.
-/// Preflight still requires the transport to establish an empty body before
-/// writing its response. `admit` performs that check for buffered embedders.
+/// Preflight and metadata GET still require the transport to establish an empty
+/// body before writing their response. `admit` checks buffered requests.
 #[derive(Debug)]
 pub enum HttpSecurityHead {
     Post(CorsResponseHeaders),
     Preflight(HttpResponse),
+    Metadata(HttpResponse),
 }
 
 /// Security admission followed by the existing strict protocol admission.
@@ -140,14 +150,17 @@ pub enum HttpSecurityHead {
 pub enum SecuredModernRequest {
     Post { admitted: AdmittedModernPost, cors: CorsResponseHeaders },
     Preflight(HttpResponse),
+    Metadata(HttpResponse),
 }
 
 /// Non-forgeable, request-local response grant. Absence of Origin grants no
 /// cross-origin access. Apply to successful and failed responses alike, without
 /// overwriting authentication challenges, cache policy, content type or body.
+/// Explicit resource metadata augments an unambiguous Bearer challenge only.
 #[derive(Debug, Clone)]
 pub struct CorsResponseHeaders {
     origin: Option<String>,
+    metadata_location: Option<Arc<str>>,
 }
 
 impl CorsResponseHeaders {
@@ -162,6 +175,9 @@ impl CorsResponseHeaders {
             response.headers.insert("access-control-allow-origin".to_owned(), origin.clone());
             response.headers.insert("access-control-expose-headers".to_owned(),
                 "WWW-Authenticate, MCP-Protocol-Version, Retry-After".to_owned());
+        }
+        if let Some(location) = &self.metadata_location {
+            resource_metadata::extend_challenge(response, location);
         }
     }
 }
@@ -191,6 +207,7 @@ impl HttpSecurityPolicy {
         Ok(Self {
             endpoint, public_origin: public_url, scheme: scheme.to_owned(), origins,
             request_headers: DEFAULT_REQUEST_HEADERS.iter().map(|value| (*value).to_owned()).collect(),
+            resource_metadata: None,
         })
     }
 
@@ -214,11 +231,23 @@ impl HttpSecurityPolicy {
 
     pub fn endpoint(&self) -> &HttpEndpointConfig { &self.endpoint }
 
+    fn admit_route(&self, method: &str, path: &str) -> Result<(), HttpSecurityError> {
+        if path == self.endpoint.path() {
+            if matches!(method, "POST" | "OPTIONS") { return Ok(()); }
+            return Err(HttpSecurityError::MethodNotAllowed);
+        }
+        if self.is_metadata_path(path) {
+            if matches!(method, "GET" | "OPTIONS") { return Ok(()); }
+            return Err(HttpSecurityError::MetadataMethodNotAllowed);
+        }
+        Err(HttpSecurityError::EndpointMismatch)
+    }
+
     pub fn admit_head(
         &self, method: &str, path: &str, headers: &[(String, String)],
     ) -> Result<HttpSecurityHead, HttpSecurityError> {
-        if path != self.endpoint.path() { return Err(HttpSecurityError::EndpointMismatch); }
-        if !matches!(method, "POST" | "OPTIONS") { return Err(HttpSecurityError::MethodNotAllowed); }
+        self.admit_route(method, path)?;
+        let metadata = self.resource_metadata.as_ref().filter(|_| self.is_metadata_path(path));
         let limits = self.endpoint.limits();
         if headers.len() > limits.max_header_count() { return Err(HttpSecurityError::HeaderLimit); }
         let mut bytes = 0_usize;
@@ -247,20 +276,31 @@ impl HttpSecurityPolicy {
         if let Some(origin) = origin
             && (parse_origin(origin, true).is_none() || !self.origins.iter().any(|allowed| allowed == origin))
         { return Err(HttpSecurityError::OriginNotAllowed); }
-        if method == "POST" {
+        if method != "OPTIONS" {
             if headers.iter().any(|(name, _)| name.to_ascii_lowercase().starts_with("access-control-request-")) {
                 return Err(HttpSecurityError::InvalidPreflight);
             }
-            return Ok(HttpSecurityHead::Post(CorsResponseHeaders { origin: origin.map(str::to_owned) }));
+            let cors = CorsResponseHeaders {
+                origin: origin.map(str::to_owned),
+                metadata_location: self.resource_metadata.as_ref().map(|metadata| metadata.location()),
+            };
+            return match metadata {
+                Some(metadata) => Ok(HttpSecurityHead::Metadata(metadata.response(&cors))),
+                None => Ok(HttpSecurityHead::Post(cors)),
+            };
         }
         let origin = origin.ok_or(HttpSecurityError::InvalidPreflight)?;
-        if field(headers, "access-control-request-method") != Some("POST")
+        let requested_method = if metadata.is_some() { "GET" } else { "POST" };
+        if field(headers, "access-control-request-method") != Some(requested_method)
             || headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("access-control-request-private-network"))
         { return Err(HttpSecurityError::InvalidPreflight); }
         let requested = self.requested_headers(field(headers, "access-control-request-headers"))?;
+        if metadata.is_some() && requested.iter().any(|name| name != "accept") {
+            return Err(HttpSecurityError::HeaderNotAllowed);
+        }
         let mut response = HttpResponse::new(HttpStatus(204));
-        CorsResponseHeaders { origin: Some(origin.to_owned()) }.apply_to(&mut response);
-        response.headers.insert("access-control-allow-methods".to_owned(), "POST".to_owned());
+        CorsResponseHeaders { origin: Some(origin.to_owned()), metadata_location: None }.apply_to(&mut response);
+        response.headers.insert("access-control-allow-methods".to_owned(), requested_method.to_owned());
         if !requested.is_empty() {
             response.headers.insert("access-control-allow-headers".to_owned(), requested.join(", "));
         }
@@ -271,15 +311,16 @@ impl HttpSecurityPolicy {
     }
 
     /// Combines security and strict JSON-RPC admission without authenticating or
-    /// dispatching a preflight. A security refusal takes precedence over body
-    /// errors. The original request parameter source sidecar stays intact.
+    /// dispatching preflight or configured metadata GET. A security refusal takes
+    /// precedence over body errors. The original request sidecar stays intact.
     pub fn admit(
         &self, method: &str, path: &str, headers: &[(String, String)], body: &[u8],
     ) -> Result<SecuredModernRequest, HttpSecurityError> {
         let head = self.admit_head(method, path, headers)?;
-        self.validate_body(matches!(&head, HttpSecurityHead::Preflight(_)), headers, body)?;
+        self.validate_body(!matches!(&head, HttpSecurityHead::Post(_)), headers, body)?;
         match head {
             HttpSecurityHead::Preflight(response) => Ok(SecuredModernRequest::Preflight(response)),
+            HttpSecurityHead::Metadata(response) => Ok(SecuredModernRequest::Metadata(response)),
             HttpSecurityHead::Post(cors) => {
                 let admitted = admit_modern_post(&self.endpoint, method, path, headers, body)
                     .map_err(HttpSecurityError::Protocol)?;
@@ -291,9 +332,9 @@ impl HttpSecurityPolicy {
     // Shared with the real dispatcher adapter so it need not parse JSON twice
     // or replace the existing protocol-specific HTTP/JSON-RPC error mapping.
     fn validate_body(
-        &self, preflight: bool, headers: &[(String, String)], body: &[u8],
+        &self, bodyless: bool, headers: &[(String, String)], body: &[u8],
     ) -> Result<(), HttpSecurityError> {
-        if preflight && (!body.is_empty() || field(headers, "transfer-encoding").is_some()) {
+        if bodyless && (!body.is_empty() || field(headers, "transfer-encoding").is_some()) {
             return Err(HttpSecurityError::BodyNotAllowed);
         }
         if body.len() > self.endpoint.limits().max_body_bytes() { return Err(HttpSecurityError::BodyTooLarge); }

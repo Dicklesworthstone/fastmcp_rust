@@ -52,6 +52,9 @@ impl SecuredCodec {
             || target.bytes().any(|byte| byte <= 32 || byte == 127)
         { return Err(HttpSecurityError::InvalidHeader); }
         let path = target.split_once('?').map_or(target, |(path, _)| path);
+        if self.policy.is_metadata_path(path) && target != path {
+            return Err(HttpSecurityError::EndpointMismatch);
+        }
         let limits = self.policy.endpoint().limits();
         let mut headers = Vec::new();
         let mut bytes = 0_usize;
@@ -79,10 +82,10 @@ impl SecuredCodec {
             }
             value.parse::<usize>().map_err(|_| HttpSecurityError::ContentLengthMismatch)
         }).transpose()?;
-        if matches!(&head, HttpSecurityHead::Preflight(_)) {
-            // Never wait for a claimed preflight body. With no body framing,
-            // bytes already buffered after the head are also forbidden. The
-            // response closes this connection, so later pipelining is not read.
+        if !matches!(&head, HttpSecurityHead::Post(_)) {
+            // Preflight and public metadata GET are bodyless. Never wait for a
+            // claimed body, and reject already-buffered pipelining. The response
+            // closes this connection, so later request data cannot dispatch.
             if length.is_some_and(|length| length != 0) || !encodings.is_empty() || source.len() != end + 4 {
                 return Err(HttpSecurityError::BodyNotAllowed);
             }
@@ -116,7 +119,7 @@ impl Decoder for SecuredCodec {
             if end > maximum { return Ok(self.refusal(HttpSecurityError::HeaderLimit, source)); }
             match self.head(source, end) {
                 Err(error) => return Ok(self.refusal(error, source)),
-                Ok(HttpSecurityHead::Preflight(response)) => {
+                Ok(HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response)) => {
                     source.clear();
                     self.finished = true;
                     return Ok(Some(Ingress::Immediate(response)));
@@ -237,5 +240,65 @@ mod tests {
         let mut source = BytesMut::from(&b"POST /mcp HTTP/1.1\r\nHost: service.example\r\nContent-Length: 2\r\n\r\n{}NEXT"[..]);
         assert!(matches!(codec.decode(&mut source).unwrap(), Some(Ingress::Request { .. })));
         assert!(!source.is_empty(), "connection owner must reject buffered pipelining before dispatch");
+    }
+
+    fn metadata_codec() -> SecuredCodec {
+        use crate::http_admission::security::resource_metadata::ProtectedResourceMetadata;
+        let policy = (*codec().policy).clone().with_resource_metadata(ProtectedResourceMetadata::new(
+            vec!["https://issuer.example".to_owned()],
+        ).unwrap()).unwrap();
+        SecuredCodec::new(Arc::new(policy), 64)
+    }
+    const METADATA_HEAD: &str = "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: service.example\r\n";
+
+    #[test]
+    fn native_metadata_waits_for_admitted_headers_but_never_for_authentication() {
+        let mut codec = metadata_codec();
+        let mut source = BytesMut::from(METADATA_HEAD.as_bytes());
+        let before = source.to_vec();
+        assert!(codec.decode(&mut source).unwrap().is_none());
+        assert_eq!(source.as_ref(), before.as_slice());
+        source.extend_from_slice(b"\r\n");
+        let Some(Ingress::Immediate(response)) = codec.decode(&mut source).unwrap()
+            else { panic!("metadata must complete before a request is dispatched") };
+        assert_eq!(response.status.0, 200);
+        let result: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(result["resource"], "https://service.example/mcp");
+        assert_eq!(result["authorization_servers"], serde_json::json!(["https://issuer.example"]));
+        assert!(codec.decode(&mut source).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_metadata_rejects_body_claims_pipelining_and_query_aliases() {
+        for tail in ["Content-Length: 1\r\n\r\n", "Transfer-Encoding: chunked\r\n\r\n", "\r\nx"] {
+            assert_eq!(status(&mut metadata_codec(), &format!("{METADATA_HEAD}{tail}")), 400);
+        }
+        assert_eq!(status(&mut metadata_codec(), &format!("{METADATA_HEAD}Content-Length: 0\r\n\r\n")), 200);
+        let query = METADATA_HEAD.replace("/mcp HTTP", "/mcp?resource=other HTTP");
+        assert_eq!(status(&mut metadata_codec(), &format!("{query}\r\n")), 404);
+        assert_eq!(status(&mut metadata_codec(), &format!("{}\r\n", METADATA_HEAD.replacen("GET", "get", 1))), 405);
+        assert_eq!(status(&mut codec(), &format!("{METADATA_HEAD}\r\n")), 404);
+    }
+
+    #[test]
+    fn native_metadata_keeps_origin_and_duplicate_host_rejections_before_dispatch() {
+        assert_eq!(status(&mut metadata_codec(), &format!("{METADATA_HEAD}Origin: https://attacker.example\r\n\r\n")), 403);
+        assert_eq!(status(&mut metadata_codec(), &format!("{METADATA_HEAD}hOsT: service.example\r\n\r\n")), 400);
+        let wire = METADATA_HEAD.replace("Host: service.example", "Host: attacker.example\r\nForwarded: host=service.example;proto=https");
+        assert_eq!(status(&mut metadata_codec(), &format!("{wire}\r\n")), 403);
+    }
+
+    #[test]
+    fn native_mcp_receipt_adds_metadata_to_authentication_errors_only() {
+        let mut codec = metadata_codec();
+        let mut source = BytesMut::from(&b"POST /mcp HTTP/1.1\r\nHost: service.example\r\nContent-Length: 2\r\n\r\n{}"[..]);
+        let Some(Ingress::Request { cors, .. }) = codec.decode(&mut source).unwrap()
+            else { panic!("MCP POST still requires downstream protocol/auth admission") };
+        let mut response = HttpResponse::new(fastmcp_transport::http::HttpStatus(401)).with_header("www-authenticate", "Bearer");
+        cors.apply_to(&mut response);
+        assert_eq!(response.headers["www-authenticate"], "Bearer resource_metadata=\"https://service.example/.well-known/oauth-protected-resource/mcp\"");
+        let mut success = HttpResponse::ok();
+        cors.apply_to(&mut success);
+        assert!(!success.headers.contains_key("www-authenticate"));
     }
 }

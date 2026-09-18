@@ -1,9 +1,10 @@
 //! Origin-bound embedding entry point for the shipped HTTP dispatcher.
 //!
-//! Security refusals and browser preflights complete before a server session is
-//! opened. Actual POSTs use the existing authentication, authorization, strict
-//! protocol decoder and dispatch path. No credential or request header is removed
-//! to evade a downstream policy. The server's configured policy may be stricter.
+//! Security refusals, browser preflights and explicitly configured resource
+//! metadata GETs complete before a server session is opened. Actual POSTs use
+//! the existing authentication, authorization, strict protocol decoder and
+//! dispatch path. No credential or request header is removed to evade a
+//! downstream policy. The server's configured policy may be stricter.
 //!
 //! This is explicit embedding, not automatic installation on `serve_http`.
 //! Write the returned response head, not the original head retained privately by
@@ -98,13 +99,14 @@ impl std::fmt::Display for SecuredHttpEndpointError {
 impl std::error::Error for SecuredHttpEndpointError {}
 
 impl ServerHttpEndpoint {
-    /// Handles one stateless modern POST or browser preflight through an explicit
-    /// administrator-selected origin policy. No runtime is created. The caller's
-    /// Cx deadline and cancellation span session opening and awaited dispatch.
+    /// Handles one stateless modern POST, browser preflight, or configured
+    /// resource-metadata GET through an administrator-selected origin policy.
+    /// No runtime is created. The caller's Cx deadline and cancellation span
+    /// session opening and awaited dispatch.
     ///
     /// Only head/body security checks run here; JSON-RPC error construction stays
-    /// in the existing dispatcher. Preflights do not open a session, parse JSON,
-    /// authenticate, execute middleware, or invoke an application handler.
+    /// in the existing dispatcher. Preflight and public metadata do not open a
+    /// session, parse JSON, authenticate, run middleware or invoke a handler.
     ///
     /// The supplied policy must describe the server's configured modern path.
     /// Existing server CORS/authorization policy is still enforced and can refuse
@@ -177,10 +179,12 @@ fn prepare_request(policy: &HttpSecurityPolicy, request: &HttpRequest) -> Prepar
     // representation. Differently-cased map keys remain distinct and are checked.
     // A wire adapter must already reject duplicates lost before this map exists.
     let limits = policy.endpoint().limits();
-    let rejection = if request.path != policy.endpoint().path() {
+    let rejection = if let Err(error) = policy.admit_route(request.method.as_str(), &request.path) {
+        Some(error)
+    } else if policy.is_metadata_path(&request.path) && !request.query.is_empty() {
+        // Public metadata has one configured resource. A query cannot select
+        // another tenant, disclose a credential, or change the published data.
         Some(HttpSecurityError::EndpointMismatch)
-    } else if !matches!(request.method.as_str(), "POST" | "OPTIONS") {
-        Some(HttpSecurityError::MethodNotAllowed)
     } else if request.headers.len() > limits.max_header_count()
         || request.headers.iter().fold(0_usize, |size, (name, value)|
             size.saturating_add(name.len()).saturating_add(value.len())) > limits.max_header_block_bytes()
@@ -193,13 +197,13 @@ fn prepare_request(policy: &HttpSecurityPolicy, request: &HttpRequest) -> Prepar
         Ok(head) => head,
         Err(error) => return PreparedRequest::Immediate(error.response()),
     };
-    if let Err(error) = policy.validate_body(matches!(&head, HttpSecurityHead::Preflight(_)), &headers, &request.body) {
+    if let Err(error) = policy.validate_body(!matches!(&head, HttpSecurityHead::Post(_)), &headers, &request.body) {
         let mut response = error.response();
         if let HttpSecurityHead::Post(cors) = head { cors.apply_to(&mut response); }
         return PreparedRequest::Immediate(response);
     }
     match head {
-        HttpSecurityHead::Preflight(response) => PreparedRequest::Immediate(response),
+        HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response) => PreparedRequest::Immediate(response),
         HttpSecurityHead::Post(cors) => PreparedRequest::Post(cors),
     }
 }
@@ -313,5 +317,27 @@ mod tests {
                 assert!(dropped.load(Ordering::Acquire));
                 assert!(cx.checkpoint().is_ok());
             });
+    }
+
+    #[test]
+    fn buffered_metadata_is_immediate_and_cannot_select_a_resource_by_query() {
+        use super::super::resource_metadata::ProtectedResourceMetadata;
+        let policy = policy().with_resource_metadata(ProtectedResourceMetadata::new(
+            vec!["https://issuer.example".to_owned()],
+        ).unwrap()).unwrap();
+        let request = HttpRequest::new(HttpMethod::Get, policy.resource_metadata_path().unwrap())
+            .with_header("host", "service.example");
+        let PreparedRequest::Immediate(response) = prepare_request(&policy, &request)
+            else { panic!("metadata must never dispatch") };
+        assert_eq!(response.status.0, 200);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["resource"], "https://service.example/mcp");
+        let mut with_query = request.clone();
+        with_query.query.insert("resource".to_owned(), "https://attacker.example".to_owned());
+        let PreparedRequest::Immediate(response) = prepare_request(&policy, &with_query)
+            else { panic!("query must never dispatch") };
+        assert_eq!(response.status.0, 404);
+        let PreparedRequest::Immediate(response) = prepare_request(&policy, &request.with_body(b"x".to_vec()))
+            else { panic!("body must never dispatch") };
+        assert_eq!(response.status.0, 400);
     }
 }
