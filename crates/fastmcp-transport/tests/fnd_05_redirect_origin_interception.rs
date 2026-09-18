@@ -12,6 +12,7 @@
 //! WHAT "INTERCEPTION" MEANS HERE, and it is two claims, not one:
 //!   1. a 3xx is SURFACED as typed data rather than silently succeeding, and
 //!   2. the redirect target NEVER BECOMES THE ORIGIN of the response.
+//!
 //! Claim 2 is the security-relevant half. A client that quietly adopted the
 //! redirect's host would report provenance for a peer it never validated a
 //! certificate against, which is exactly the redirect-origin confusion that
