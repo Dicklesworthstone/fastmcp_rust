@@ -2698,27 +2698,25 @@ fn fnd_04_b_positive() {
         "the evaluator-output digest must be lowercase hexadecimal, got {}",
         manifest.digest
     );
-    // A SHAPE check, not a sentinel check. `revision_and_tree` has TWO failure
-    // paths and the previous `assert_ne!(.., "<unresolved>")` named only one:
-    //   .git present, ref unreadable (packed-refs) -> "<unresolved>"  -> caught
-    //   .git ABSENT entirely                       -> HEAD reads as ""
-    //                                              -> strip_prefix fails
-    //                                              -> else branch yields ""
-    //                                              -> "" != "<unresolved>" -> PASSED
-    // The uncaught path is the one the RCH execution host actually produces:
-    // it syncs source files, including `.gitattributes`/`.gitignore`, but never
-    // the `.git` directory, so the worker resembles a working copy and has no
-    // repository. A receipt recording revision "" bound the TREE (that digest
-    // is computed from synced source and still binds) while silently binding no
-    // REVISION -- quotable as evidence for a revision it never observed.
+    // A SHAPE check rather than a sentinel check, and forty lowercase hex
+    // characters is the shape. It matches this file's idiom for the adjacent
+    // tree identity.
     //
-    // Forty lowercase hex characters admits neither sentinel nor emptiness, and
-    // matches this file's idiom for the adjacent tree identity.
+    // WHAT IT BUYS, stated accurately after two corrections. `revision_and_tree`
+    // NORMALISES at its return -- `if revision.is_empty() { "<unresolved>" }` --
+    // so an empty revision CANNOT ESCAPE THE PRODUCER, and both failure paths
+    // (absent `.git`, unreadable ref) arrive here as the sentinel. The previous
+    // `assert_ne!(.., "<unresolved>")` therefore already caught every failure
+    // the producer can currently emit.
     //
-    // ONE CONJUNCTION, deliberately. `chars().all(..)` is VACUOUSLY TRUE on an
-    // empty string -- and "" is exactly what the absent-`.git` path produces --
-    // so THE HEX OPERAND ALONE ADMITS THE FAILURE THIS CHECK EXISTS TO REJECT.
-    // It also admits a 39-character hex string. The length operand rejects both.
+    // So this is FUTURE-PROOFING, not a repair. It is strictly stronger than the
+    // sentinel check on inputs the sentinel waves through -- a 39-character hex
+    // string, an uppercase digest, arbitrary garbage -- and it keeps holding if
+    // that normalisation is ever removed. The demonstrated gap is the 39-hex
+    // row, not emptiness.
+    //
+    // ONE CONJUNCTION, deliberately: the length operand is what rejects a short
+    // hex string, and `chars().all(..)` alone would admit it.
     //
     // THE HAZARD IS REMOVAL, NOT ORDERING. As two statements a later editor may
     // drop the length assert as "redundant to the stricter-looking hex check".
@@ -2726,13 +2724,24 @@ fn fnd_04_b_positive() {
     // removed without changing it on its face. Structure over commentary -- the
     // same reason FND-02's digest validator is one conjunction.
     //
-    // An earlier revision of this comment claimed the ORDER of two sequential
-    // asserts was load-bearing. That is FALSE and was measured so: `assert!(a);
-    // assert!(b);` fails iff `!a || !b`, which is exactly when `assert!(a && b)`
-    // fails. Both asserts always run, so a vacuously-true operand cannot consume
-    // the other. Order changes only which message fires first, never the
-    // rejection set. Corrected rather than deleted so the false rule does not
-    // get re-derived from the code's shape.
+    // TWO FALSE CLAIMS WERE REMOVED FROM THIS COMMENT, recorded so neither gets
+    // re-derived from the code's shape:
+    //
+    // 1. That the ORDER of two sequential asserts was load-bearing. FALSE:
+    //    `assert!(a); assert!(b);` fails iff `!a || !b`, exactly when
+    //    `assert!(a && b)` fails. Both asserts always run, so a vacuously-true
+    //    operand cannot consume the other. Order changes only which message
+    //    fires first, never the rejection set.
+    //
+    // 2. That an absent `.git` yields an escaping `""`. FALSE, and false when
+    //    written -- the normalisation at the producer's return predates that
+    //    claim by a day. `""` is unreachable here, so the vacuity of
+    //    `chars().all(..)` on an empty string, while real Rust, is irrelevant
+    //    to this call site.
+    //
+    // Both were traced by reading the comment's own reasoning instead of the
+    // code it describes. A comment that traces a code path is a claim ABOUT
+    // code; it is checked by opening that code.
     assert!(
         manifest.revision.len() == 40
             && manifest
