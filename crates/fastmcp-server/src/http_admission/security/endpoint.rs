@@ -13,14 +13,18 @@
 
 /// Socket-to-dispatch security for the caller-owned native HTTP listener.
 pub mod listener;
+/// Explicit bounded credential revalidation for secured SSE responses.
+pub mod revalidation;
 mod scope;
 
 use std::future::{Future, poll_fn};
 use std::task::Poll;
+use std::time::Duration;
 
 use asupersync::{Cx, channel::oneshot, time::Sleep};
-use fastmcp_transport::http::{HttpRequest, HttpResponse};
+use fastmcp_transport::{http::{HttpRequest, HttpResponse}, sse::SseEvent};
 
+use revalidation::{SseAuthorizationError, SseAuthorizationLease};
 use super::{CorsResponseHeaders, HttpSecurityError, HttpSecurityHead, HttpSecurityPolicy};
 use crate::{ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerHttpSseResponse};
 
@@ -46,28 +50,63 @@ impl SecuredHttpEndpointResponse {
     fn immediate(response: HttpResponse) -> Self { Self { response, stream: None } }
 }
 
-/// A native SSE response and the session owning its dispatch. Borrowing the
-/// native stream cannot detach it from that session. Call `close` after terminal
-/// delivery or peer disconnect to join dispatch tasks on the caller's runtime.
-/// Drop cancels both owners but cannot synchronously join asynchronous work.
+/// A native SSE response and the session owning its dispatch. Call `close`
+/// after terminal delivery or peer disconnect to join dispatch tasks on the
+/// caller's runtime. Drop cancels but cannot synchronously join async work.
+/// Revalidating responses expose events only through `next_event`; no raw body
+/// reference can bypass their credential checks.
 #[must_use = "close the SSE owner asynchronously after driving its response body"]
 pub struct SecuredHttpSseResponse {
     // Declaration order deliberately drops the response before its session.
     stream: Option<Box<ServerHttpSseResponse>>,
     session: Option<ServerHttpSession>,
+    authorization: Option<SseAuthorizationLease>,
+    finished: bool,
 }
 
 impl SecuredHttpSseResponse {
-    /// Access the existing native body API without extracting its ownership.
-    /// None means explicit close has already retired the response.
+    /// Access the old native body API only for responses without revalidation.
+    /// Revalidating or already-closed responses return None; use `next_event`
+    /// instead. This prevents a host from accidentally bypassing the guard.
     pub fn stream(&mut self) -> Option<&mut ServerHttpSseResponse> {
+        if self.authorization.is_some() { return None; }
         self.stream.as_deref_mut()
     }
 
-    /// Release the body, then join its session-owned dispatch. A dropped close
-    /// future still drops the local session, invoking its cancellation fallback.
+    /// Delivers one native SSE event after checking the opening credential.
+    /// Idle waits also revalidate. A dropped, polled read owns and drops the
+    /// native response rather than leaving a partially consumed body reusable.
+    /// Only a delivered terminal response permits a later successful None.
+    /// The host must close on error; an already-written 200 head cannot become
+    /// a new authentication challenge, and no success terminal is fabricated.
+    pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<SseEvent>, SecuredHttpEndpointError> {
+        if self.finished { return Ok(None); }
+        let stream = self.stream.take().ok_or(SecuredHttpEndpointError::BodyClosed)?;
+        let mut authorization = self.authorization.take();
+        let event = guard_response(cx, &mut authorization, async {
+            loop {
+                checkpoint(cx)?;
+                match stream.pop_event() {
+                    Ok(Some(event)) => return Ok::<_, SecuredHttpEndpointError>(event),
+                    Ok(None) if !stream.is_finished() => {},
+                    Ok(None) => return Err(SecuredHttpEndpointError::BodyClosed),
+                    Err(_) => return Err(SecuredHttpEndpointError::BodyFailed),
+                }
+                if cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
+            }
+        }).await??;
+        self.finished = crate::final_subscription_terminal_response_event(&event);
+        self.stream = Some(stream);
+        self.authorization = authorization;
+        Ok(Some(event))
+    }
+
+    /// Release the body and credential custody, then join session dispatch. A
+    /// dropped close future drops the local session and invokes its fallback.
     pub async fn close(&mut self, cx: &Cx) {
         self.stream = None;
+        self.authorization = None;
         if let Some(mut session) = self.session.take() { session.close(cx).await; }
     }
 }
@@ -82,6 +121,9 @@ pub enum SecuredHttpEndpointError {
     SessionUnavailable,
     DispatchFailed,
     UnexpectedLegacyStream,
+    BodyClosed,
+    BodyFailed,
+    Revalidation(SseAuthorizationError),
 }
 
 impl std::fmt::Display for SecuredHttpEndpointError {
@@ -94,6 +136,9 @@ impl std::fmt::Display for SecuredHttpEndpointError {
             Self::SessionUnavailable => "secured HTTP session could not be opened",
             Self::DispatchFailed => "secured HTTP dispatch failed",
             Self::UnexpectedLegacyStream => "modern secured HTTP dispatch produced a legacy stream",
+            Self::BodyClosed => "secured SSE response ended without a delivered terminal",
+            Self::BodyFailed => "secured SSE response failed",
+            Self::Revalidation(error) => return std::fmt::Display::fmt(error, f),
         })
     }
 }
@@ -107,16 +152,15 @@ impl ServerHttpEndpoint {
     ///
     /// After head/body security checks, POSTs retain the native strict protocol
     /// and authentication boundaries. An installed HTTP scope policy runs on
-    /// the resulting verified facts before transport admission or SSE allocation;
-    /// its native 401/403 is not inferred from an application JSON-RPC error.
-    /// Preflight and public metadata do not open a session, parse JSON,
-    /// authenticate, run middleware or invoke a handler.
+    /// verified facts before transport admission or SSE allocation; its native
+    /// 401/403 is not inferred from an application JSON-RPC error. Optional SSE
+    /// revalidation retains that exact request, provider and opening credential.
+    /// Preflight and public metadata never open a session or authenticate.
     ///
     /// The supplied policy must describe the server's configured modern path.
     /// Existing server CORS/authorization policy is still enforced and can refuse
     /// a POST even after preflight. Configure both from the same deployment policy.
-    /// The returned SSE owner retains the native session and request lifetime;
-    /// this opening future installs no stream runtime or reconnect policy.
+    /// The returned SSE owner retains its native session and request lifetime.
     pub async fn handle_secured_async(
         &self,
         cx: &Cx,
@@ -133,13 +177,12 @@ impl ServerHttpEndpoint {
             PreparedRequest::Immediate(response) => return Ok(SecuredHttpEndpointResponse::immediate(response)),
             PreparedRequest::Post(cors) => cors,
         };
-        // Transfer the session together with its response. Dropping it inside
-        // this future would cancel a successfully opened modern SSE dispatch.
-        let (response, mut session) = await_dispatch(cx, async {
+        let ((response, authorization), mut session) = await_dispatch(cx, async {
             let mut session = self.open_session(cx).map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
             let dispatched = match &policy.scope_authorization {
-                Some(scopes) => scope::dispatch(&mut session, cx, scopes, request).await,
+                Some(scopes) => scope::dispatch(&mut session, cx, scopes, request, policy.sse_revalidation).await,
                 None => session.handle_async(cx, request).await
+                    .map(|response| (response, None))
                     .map_err(|_| SecuredHttpEndpointError::DispatchFailed),
             };
             match dispatched {
@@ -152,6 +195,7 @@ impl ServerHttpEndpoint {
         }).await?;
         let response = match response {
             ServerHttpEndpointResponse::Immediate(mut response) => {
+                drop(authorization);
                 await_dispatch(cx, async { session.close(cx).await; Ok(()) }).await?;
                 cors.apply_to(&mut response);
                 SecuredHttpEndpointResponse::immediate(response)
@@ -162,13 +206,14 @@ impl ServerHttpEndpoint {
                 SecuredHttpEndpointResponse {
                     response,
                     stream: Some(SecuredHttpSseResponse {
-                        stream: Some(Box::new(stream)), session: Some(session),
+                        stream: Some(Box::new(stream)), session: Some(session), authorization, finished: false,
                     }),
                 }
             }
             #[allow(unreachable_patterns)]
             other => {
                 drop(other);
+                drop(authorization);
                 await_dispatch(cx, async { session.close(cx).await; Ok(()) }).await?;
                 return Err(SecuredHttpEndpointError::UnexpectedLegacyStream);
             }
@@ -178,21 +223,45 @@ impl ServerHttpEndpoint {
     }
 }
 
+// Poll one owned operation without restarting it. The finite timer wakes an
+// idle response, a pending representation election, or a blocked socket write.
+// Every resume checks before and after polling so a ready event cannot bypass
+// a due refusal. The surrounding response owner performs cancellation/cleanup.
+async fn guard_response<T>(
+    cx: &Cx,
+    authorization: &mut Option<SseAuthorizationLease>,
+    future: impl Future<Output = T>,
+) -> Result<T, SecuredHttpEndpointError> {
+    let Some(lease) = authorization.as_mut() else { return Ok(future.await); };
+    if cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
+    let mut wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
+    let mut future = std::pin::pin!(future);
+    poll_fn(|task| {
+        let _current = Cx::set_current(Some(cx.clone()));
+        lease.check(cx).map_err(SecuredHttpEndpointError::Revalidation)?;
+        let result = future.as_mut().poll(task);
+        lease.check(cx).map_err(SecuredHttpEndpointError::Revalidation)?;
+        if let Poll::Ready(value) = result { return Poll::Ready(Ok(value)); }
+        if wake.as_mut().poll(task).is_ready() {
+            wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
+            let _ = wake.as_mut().poll(task);
+        }
+        Poll::Pending
+    }).await
+}
+
 enum PreparedRequest {
     Immediate(HttpResponse),
     Post(CorsResponseHeaders),
 }
 
 fn prepare_request(policy: &HttpSecurityPolicy, request: &HttpRequest) -> PreparedRequest {
-    // Bound before cloning the public map into the duplicate-preserving admission
-    // representation. Differently-cased map keys remain distinct and are checked.
-    // A wire adapter must already reject duplicates lost before this map exists.
+    // Preserve differently-cased map entries; wire adapters must have rejected
+    // duplicates that would otherwise be lost before constructing this map.
     let limits = policy.endpoint().limits();
     let rejection = if let Err(error) = policy.admit_route(request.method.as_str(), &request.path) {
         Some(error)
     } else if policy.is_metadata_path(&request.path) && !request.query.is_empty() {
-        // Public metadata has one configured resource. A query cannot select
-        // another tenant, disclose a credential, or change the published data.
         Some(HttpSecurityError::EndpointMismatch)
     } else if request.headers.len() > limits.max_header_count()
         || request.headers.iter().fold(0_usize, |size, (name, value)|

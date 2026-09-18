@@ -12,7 +12,8 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_transport::{TransportError, http::{HttpRequest, HttpResponse, HttpStatus}};
 
 use super::{SecuredHttpIoLimits, ingress::{Ingress, SecuredCodec}};
-use super::super::scope;
+use super::super::{scope, guard_response};
+use super::super::revalidation::SseAuthorizationLease;
 use super::super::super::{CorsResponseHeaders, HttpSecurityPolicy};
 use super::super::super::scope_policy::request::ScopeRequestPolicy;
 use crate::{
@@ -116,22 +117,23 @@ pub(super) async fn serve(
         }
     };
     let opening = match &policy.scope_authorization {
-        Some(scopes) => scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone()).await,
-        None => session.begin_modern_sse(cx, request.clone(), authorization.clone()).await,
+        Some(scopes) => scope::begin_sse(&mut session, cx, scopes, request.clone(), authorization.clone(), policy.sse_revalidation).await,
+        None => session.begin_modern_sse(cx, request.clone(), authorization.clone()).await
+            .map(|opening| opening.map(|(request, response, raw, receipt)| (request, response, raw, receipt, None))),
     };
     let opened = match opening {
-        Ok(Ok((request, response, raw_params, receipt))) => Ok(Ok((
+        Ok(Ok((request, response, raw_params, receipt, lease))) => Ok(Ok((
             InboundRequestContext::with_modern_connection_and_transport_authorization(
                 cx.clone(), request_id_to_u64(request.id.as_ref()), InboundRequestTransport::Http,
                 &session.modern_connection, authorization,
-            ), request, raw_params, receipt, response,
+            ), request, raw_params, receipt, response, lease,
         ))),
         Ok(Err(response)) => Ok(Err(response)),
         Err(error) => Err(ServerHttpEndpointError::from_internal(error)),
     };
     let live = Arc::new(LiveModernHttpSession::new(session));
     match opened {
-        Ok(Ok((inbound, request, raw_params, receipt, response))) => {
+        Ok(Ok((inbound, request, raw_params, receipt, response, lease))) => {
             let generation = next_live_modern_http_response_body_generation();
             if let Err(live) = sessions.register_response_body(generation, Arc::clone(&live)) {
                 close_detached_modern_http_session(&sessions, live);
@@ -140,7 +142,7 @@ pub(super) async fn serve(
             }
             let _ = sse(cx, &shutdown, framed.into_inner(), Arc::clone(&endpoint.server), &live,
                 &sessions, next_modern_http_stream_generation(), inbound, request, raw_params,
-                Some(receipt), response, &cors, io).await;
+                Some(receipt), response, &cors, lease, io).await;
             if let Some(live) = sessions.take_response_body(generation) {
                 close_detached_modern_http_session(&sessions, live);
             }
@@ -213,18 +215,19 @@ async fn json(
     buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
 }
 
-// Keep the native representation election, dispatch custody and terminal
-// receipts. The intentional differences from the ordinary native writer are
-// request-local CORS decoration and finite head/frame writes. In particular,
-// an error elected before SSE admission must still be an HTTP JSON error.
+// Keep native representation election, dispatch custody and terminal receipts.
+// A credential failure never drains a successful terminal. The existing error
+// path cancels the request and retains children for ordinary session settlement.
 #[allow(clippy::too_many_arguments)]
 async fn sse(
     cx: &Cx, shutdown: &HttpListenerShutdown, stream: AsyncTcpStream,
     server: Arc<Server>, live: &LiveModernHttpSession, sessions: &LiveModernHttpSessionRegistry,
     generation: u64, inbound: InboundRequestContext, request: JsonRpcRequest,
     raw_params: Option<Arc<str>>, receipt: Option<AuthDispatchCustody>,
-    response: DualEraHttpSseResponse, cors: &CorsResponseHeaders, io: SecuredHttpIoLimits,
+    response: DualEraHttpSseResponse, cors: &CorsResponseHeaders,
+    mut lease: Option<SseAuthorizationLease>, io: SecuredHttpIoLimits,
 ) -> Result<(), ()> {
+    if let Some(lease) = lease.as_mut() { lease.check(cx).map_err(|_| ())?; }
     let sender = response.sender();
     let cancellation = sender.request_cancellation();
     let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
@@ -242,26 +245,28 @@ async fn sse(
         sessions.retain_retired_dispatches(vec![dispatch.task]);
         return Err(());
     }
-    // Keep the read half live throughout representation election and response
-    // delivery, including periods with no queued SSE events. A reset or late
-    // pipelined request must retire this request, not wait for another event or
-    // a write timeout. EOF is only a request write-half close and remains legal.
     let mut peer_byte = [0_u8; 1];
     let result = monitor_response_peer(&cancellation, reader.read(&mut peer_byte), async {
-        match await_modern_sse_dispatch_election(cx, &cancellation, &mut election).await? {
+        let elected = guard_response(cx, &mut lease,
+            await_modern_sse_dispatch_election(cx, &cancellation, &mut election))
+            .await.map_err(|_| ())??;
+        match elected {
             ModernSseDispatchElection::Stream => {},
             ModernSseDispatchElection::Immediate(mut response) => {
                 cors.apply_to(&mut response);
-                return asupersync::time::timeout(cx.now(), io.write_timeout,
-                    send_h1_bad_request_response(cx, shutdown, &mut writer, &response)).await.map_err(|_| ())?;
+                return guard_response(cx, &mut lease, asupersync::time::timeout(cx.now(), io.write_timeout,
+                    send_h1_bad_request_response(cx, shutdown, &mut writer, &response)))
+                    .await.map_err(|_| ())?.map_err(|_| ())?;
             }
             ModernSseDispatchElection::Failed => return Err(()),
         }
         let mut head = response.response().clone();
         cors.apply_to(&mut head);
         let head = sse_response_head(&head)?;
-        write_parts(cx, &mut writer, &[&head], io).await?;
+        guard_response(cx, &mut lease, write_parts(cx, &mut writer, &[&head], io))
+            .await.map_err(|_| ())??;
         loop {
+            if let Some(lease) = lease.as_mut() { lease.check(cx).map_err(|_| ())?; }
             if terminal.is_settled() { return Err(()); }
             match response.pop_event() {
                 Ok(Some(event)) => {
@@ -269,7 +274,8 @@ async fn sse(
                     let complete = final_subscription_terminal_response_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
-                    write_parts(cx, &mut writer, &[prefix.as_bytes(), &bytes, b"\r\n"], io).await?;
+                    guard_response(cx, &mut lease, write_parts(cx, &mut writer,
+                        &[prefix.as_bytes(), &bytes, b"\r\n"], io)).await.map_err(|_| ())??;
                     if control { terminal.mark_drained(); }
                     if complete { terminal.mark_completion_drained(); }
                     if terminal.is_settled() { break; }
@@ -288,7 +294,8 @@ async fn sse(
                 Err(_) => return Err(()),
             }
         }
-        write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io).await
+        guard_response(cx, &mut lease, write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io))
+            .await.map_err(|_| ())?
     }).await;
     if result.is_err() {
         terminal.mark_failed();
@@ -516,8 +523,6 @@ mod tests {
     fn secured_sse_peer_monitor_does_not_short_circuit_graceful_terminal_drain() {
         let cancellation = McpRequestCancellation::new();
         cancellation.cancel();
-        // Request cancellation alone does not establish whether a committed
-        // terminal must drain. The existing native writer makes that election.
         let mut work = Box::pin(monitor_response_peer(
             &cancellation, pending::<io::Result<usize>>(), ready(Ok::<_, ()>(7)),
         ));

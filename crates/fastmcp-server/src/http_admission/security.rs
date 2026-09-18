@@ -55,6 +55,7 @@ pub struct HttpSecurityPolicy {
     request_headers: Vec<String>,
     resource_metadata: Option<Arc<resource_metadata::PublishedResourceMetadata>>,
     scope_authorization: Option<scope_policy::request::ScopeRequestPolicy>,
+    sse_revalidation: Option<endpoint::revalidation::SseRevalidationPolicy>,
 }
 
 impl fmt::Debug for HttpSecurityPolicy {
@@ -64,6 +65,7 @@ impl fmt::Debug for HttpSecurityPolicy {
             .field("request_header_count", &self.request_headers.len())
             .field("publishes_resource_metadata", &self.resource_metadata.is_some())
             .field("enforces_method_scopes", &self.scope_authorization.is_some())
+            .field("revalidates_sse", &self.sse_revalidation.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -213,6 +215,7 @@ impl HttpSecurityPolicy {
             request_headers: DEFAULT_REQUEST_HEADERS.iter().map(|value| (*value).to_owned()).collect(),
             resource_metadata: None,
             scope_authorization: None,
+            sse_revalidation: None,
         })
     }
 

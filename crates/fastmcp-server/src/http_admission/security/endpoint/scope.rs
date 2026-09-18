@@ -16,7 +16,8 @@ use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
 use fastmcp_transport::TransportError;
 use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus};
 
-use super::{SecuredHttpEndpointError, checkpoint};
+use super::{SecuredHttpEndpointError, checkpoint, guard_response};
+use super::revalidation::{SseAuthorizationLease, SseRevalidationPolicy};
 use super::super::{HttpSecurityError, HttpSecurityPolicy};
 use super::super::scope_policy::request::{ScopeRequestPolicy, ScopeRequestRejection};
 use crate::{
@@ -42,9 +43,9 @@ impl HttpSecurityPolicy {
     /// or scope checks. Plain HTTP entry points that are not supplied this
     /// security policy, stdio, WebSocket and the exact-2024 adapter are unchanged.
     /// This method does not replace `Server::with_scope_authorization` for those
-    /// ordinary dispatch paths, authorize individual tool/resource names, or
-    /// revalidate an already-open subscription. Additional server middleware
-    /// restrictions still apply, but their errors are not reclassified as OAuth.
+    /// ordinary dispatch paths or authorize individual tool/resource names.
+    /// Additional server middleware restrictions still apply, but their errors
+    /// are not reclassified as OAuth. Revalidation is a separate explicit choice.
     ///
     /// Configuration is immutable after installation. A second installation
     /// fails rather than replacing or widening the previous scope policy.
@@ -58,15 +59,36 @@ impl HttpSecurityPolicy {
         self.scope_authorization = Some(policy);
         Ok(self)
     }
+
+    /// Revalidates the original credential throughout secured SSE delivery.
+    /// Install method scopes first and supply a real authentication provider.
+    /// A changed principal, scope set or claim closes the stream rather than
+    /// updating a handler that began with different facts. Revocation is observed
+    /// within the configured cached-verdict interval plus caller scheduling and
+    /// bounded provider work, not instantaneously. No token renewal is attempted.
+    ///
+    /// The socket writer checks while idle, selecting a response and writing.
+    /// Embedders must drive `SecuredHttpSseResponse::next_event`; raw body access
+    /// is unavailable on guarded responses. Synchronous providers must enforce
+    /// their own I/O/work timeouts. This does not hot-reload policy, provide
+    /// named-resource visibility, or revalidate Tasks detached from this response.
+    pub fn with_sse_revalidation(mut self, policy: SseRevalidationPolicy) -> Result<Self, HttpSecurityError> {
+        if self.scope_authorization.is_none() || self.sse_revalidation.is_some() {
+            return Err(HttpSecurityError::InvalidPolicy);
+        }
+        self.sse_revalidation = Some(policy);
+        Ok(self)
+    }
 }
 
-// A private, request-owned handoff, never a credential cache or a public permit.
-// All three consumers use this single preparation path. Neither the socket
-// JSON branch nor the SSE opener re-runs authentication after scope admission.
+// Private request-owned handoff. Every consumer uses the same preparation and
+// opening receipt. The optional lease retains its own original credential
+// custody and is never a shared cache or a transferable public permit.
 struct PreparedScopedPost {
     request: HttpRequest,
     raw_params: Option<Arc<str>>,
     receipt: AuthDispatchCustody,
+    lease: Option<SseAuthorizationLease>,
 }
 
 fn check_admission(
@@ -81,6 +103,7 @@ fn check_admission(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     session: &mut ServerHttpSession,
     cx: &Cx,
@@ -88,6 +111,7 @@ fn prepare(
     request: HttpRequest,
     authorization: &TransportAuthorization,
     cancellation: Option<&McpRequestCancellation>,
+    revalidation: Option<SseRevalidationPolicy>,
 ) -> Result<PreparedScopedPost, HttpResponse> {
     check_admission(cx, cancellation)?;
     if session.closed { return Err(refusal(503)); }
@@ -107,7 +131,11 @@ fn prepare(
     let rejection = scope_rejection(policy, &admitted.method, receipt.authenticated.as_ref());
     check_admission(cx, cancellation)?;
     if let Some(response) = rejection { return Err(response); }
-    Ok(PreparedScopedPost { request, raw_params, receipt: AuthDispatchCustody::Http(receipt) })
+    let lease = revalidation.filter(|_| crate::http_request_accepts_sse(&request)).map(|config| {
+        SseAuthorizationLease::new(cx, Arc::clone(&session.server), &admitted,
+            authorization, &receipt, policy.clone(), config)
+    }).transpose().map_err(|_| refusal(503))?;
+    Ok(PreparedScopedPost { request, raw_params, receipt: AuthDispatchCustody::Http(receipt), lease })
 }
 
 /// Embedding keeps its existing outer deadline guard and SSE/session owner.
@@ -116,13 +144,14 @@ pub(super) async fn dispatch(
     cx: &Cx,
     policy: &ScopeRequestPolicy,
     request: HttpRequest,
-) -> Result<ServerHttpEndpointResponse, SecuredHttpEndpointError> {
+    revalidation: Option<SseRevalidationPolicy>,
+) -> Result<(ServerHttpEndpointResponse, Option<SseAuthorizationLease>), SecuredHttpEndpointError> {
     checkpoint(cx)?;
     let authorization = match crate::transport_authorization_from_http_request(&request) {
         Ok(authorization) => authorization,
-        Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+        Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
-    dispatch_with_authorization(session, cx, policy, request, authorization, None)
+    dispatch_with_authorization(session, cx, policy, request, authorization, None, revalidation)
         .await.map_err(|_| SecuredHttpEndpointError::DispatchFailed)
 }
 
@@ -133,27 +162,34 @@ async fn dispatch_with_authorization(
     request: HttpRequest,
     authorization: TransportAuthorization,
     cancellation: Option<McpRequestCancellation>,
-) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-    let prepared = match prepare(session, cx, policy, request, &authorization, cancellation.as_ref()) {
+    revalidation: Option<SseRevalidationPolicy>,
+) -> Result<(ServerHttpEndpointResponse, Option<SseAuthorizationLease>), DualEraHttpEndpointError> {
+    let prepared = match prepare(session, cx, policy, request, &authorization, cancellation.as_ref(), revalidation) {
         Ok(prepared) => prepared,
-        Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+        Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
-    // Only a fully admitted request can pin an era or enter transport state.
     session.selected_era.get_or_insert(ProtocolEra::Modern2026);
     let endpoint_response = {
         let mut endpoint = session.endpoint_session.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         endpoint.handle(cx, prepared.request)?
     };
-    session.handle_modern(
+    let mut lease = prepared.lease;
+    let response = guard_response(cx, &mut lease, session.handle_modern(
         cx, endpoint_response, authorization, prepared.raw_params,
         Some(prepared.receipt), cancellation,
-    ).await
+    )).await;
+    match response {
+        Ok(response) => Ok((response?, lease)),
+        // No response head has been published by this path. Retire the failed
+        // native future and let the outer session owner join remaining work.
+        Err(_) => Ok((ServerHttpEndpointResponse::Immediate(refusal(503)), None)),
+    }
 }
 
-/// The socket's joined JSON dispatch child supplies its existing cancellation
-/// token. Keep native error projection and fresh-session ownership; no second
-/// middleware pipeline or asynchronous worker is introduced here.
+/// The socket's joined JSON child keeps its original cancellation token. JSON
+/// does not retain a lease after its single response; native error projection
+/// and fresh-session ownership remain unchanged.
 pub(super) async fn dispatch_socket_json(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
@@ -169,31 +205,31 @@ pub(super) async fn dispatch_socket_json(
         Ok(session) => session,
         Err(_) => return HttpResponse::internal_error(),
     };
-    dispatch_with_authorization(&mut session, cx, policy, request, authorization, Some(cancellation))
+    dispatch_with_authorization(&mut session, cx, policy, request, authorization, Some(cancellation), None)
         .await
         .map_err(ServerHttpEndpointError::from_internal)
-        .map(|response| http_endpoint_response_to_static(cx, response))
+        .map(|(response, _)| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| http_endpoint_error_response(
             &error_request, error, endpoint.server.http_config.handler_config.max_body_size,
         ))
 }
 
 type ScopedSseOpening = Result<
-    (JsonRpcRequest, DualEraHttpSseResponse, Option<Arc<str>>, AuthDispatchCustody),
+    (JsonRpcRequest, DualEraHttpSseResponse, Option<Arc<str>>, AuthDispatchCustody, Option<SseAuthorizationLease>),
     ServerHttpEndpointResponse,
 >;
 
-/// Scope-aware native SSE opening. The socket retains its existing peer
-/// monitor, response-body registry, representation election and terminal drain.
-/// Refusals return before an SSE body exists, so a 403 never follows a 200 head.
+/// The socket retains its peer monitor, registry, outcome election and terminal
+/// drain. The lease follows the exact native SSE body, not the connection pool.
 pub(super) async fn begin_sse(
     session: &mut ServerHttpSession,
     cx: &Cx,
     policy: &ScopeRequestPolicy,
     request: HttpRequest,
     authorization: TransportAuthorization,
+    revalidation: Option<SseRevalidationPolicy>,
 ) -> Result<ScopedSseOpening, DualEraHttpEndpointError> {
-    let prepared = match prepare(session, cx, policy, request, &authorization, None) {
+    let prepared = match prepare(session, cx, policy, request, &authorization, None, revalidation) {
         Ok(prepared) => prepared,
         Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
     };
@@ -211,26 +247,29 @@ pub(super) async fn begin_sse(
         }
     };
     let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
-        return session.handle_modern(
+        let mut lease = prepared.lease;
+        return match guard_response(cx, &mut lease, session.handle_modern(
             cx, endpoint_response, authorization, prepared.raw_params,
             Some(prepared.receipt), None,
-        ).await.map(Err);
+        )).await {
+            Ok(response) => response.map(Err),
+            Err(_) => Ok(Err(ServerHttpEndpointResponse::Immediate(refusal(503)))),
+        };
     };
     let request = session.endpoint_session.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner).recv_modern_request(cx)?;
     if request.method == "notifications/cancelled" {
         return Ok(Err(ServerHttpEndpointResponse::Immediate(HttpResponse::bad_request())));
     }
-    Ok(Ok((request, sse, prepared.raw_params, prepared.receipt)))
+    Ok(Ok((request, sse, prepared.raw_params, prepared.receipt, prepared.lease)))
 }
 
 fn refusal(status: u16) -> HttpResponse {
     HttpResponse::new(HttpStatus(status)).with_header("cache-control", "no-store")
 }
 
-/// Only a server-owned policy decision and admitted facts can enter this
-/// formatter. RequiredScopes has already bounded and validated every token:
-/// no quote, backslash, whitespace or HTTP control can enter its scope value.
+/// Only server policy and admitted facts enter this formatter. RequiredScopes
+/// has already bounded and validated every token before HTTP serialization.
 fn scope_rejection(
     policy: &ScopeRequestPolicy,
     method: &str,
@@ -240,24 +279,18 @@ fn scope_rejection(
         Ok(()) => return None,
         Err(rejected) => rejected,
     };
-    if rejected == ScopeRequestRejection::InvalidFacts {
-        return Some(refusal(500));
-    }
+    if rejected == ScopeRequestRejection::InvalidFacts { return Some(refusal(500)); }
     let authenticated = facts.is_some_and(|facts| {
         facts.subject.as_ref().is_some_and(|subject| !subject.is_empty())
             || facts.session_owner().is_some()
     });
-    if !authenticated {
-        return Some(refusal(401).with_header("www-authenticate", "Bearer"));
-    }
+    if !authenticated { return Some(refusal(401).with_header("www-authenticate", "Bearer")); }
     match rejected {
         ScopeRequestRejection::InsufficientScope => Some(match policy.required_scopes(method) {
             Some(required) => refusal(403).with_header(
                 "www-authenticate",
                 format!("Bearer error=\"insufficient_scope\", scope=\"{}\"", required.challenge_scope()),
             ),
-            // Defensive consistency failure: never manufacture a public or
-            // empty scope rule if a policy invariant has been violated.
             None => refusal(500),
         }),
         ScopeRequestRejection::UnconfiguredMethod => Some(refusal(403)),
@@ -356,5 +389,18 @@ mod tests {
         assert!(!response.headers.contains_key("www-authenticate"));
         assert!(response.body.is_empty());
         assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn revalidation_is_explicit_requires_scope_policy_and_cannot_be_replaced() {
+        let security = HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
+            "https://service.example", vec![],
+        ).unwrap();
+        assert!(security.clone().with_sse_revalidation(SseRevalidationPolicy::default()).is_err());
+        let security = security.with_scope_authorization(policy()).unwrap()
+            .with_sse_revalidation(SseRevalidationPolicy::default()).unwrap();
+        assert!(security.clone().with_sse_revalidation(SseRevalidationPolicy::default()).is_err());
+        assert_eq!(security.sse_revalidation.unwrap().interval(), std::time::Duration::from_secs(5));
     }
 }
