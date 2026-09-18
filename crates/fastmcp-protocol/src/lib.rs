@@ -41,6 +41,7 @@
 
 pub mod common_types;
 pub mod extensions;
+pub mod http_headers;
 #[cfg(feature = "jose")]
 pub mod jose;
 mod jsonrpc;
