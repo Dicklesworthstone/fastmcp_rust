@@ -10,6 +10,61 @@
 //! - Prompt listing and retrieval
 //! - Error handling (unknown tool, invalid params, method not found)
 //! - JSON-RPC 2.0 compliance
+//!
+//! # THIS TARGET MUST BE RUN ALONE, AND IT IS NOT REACHABLE WITHOUT `testing-lab`
+//!
+//! Two independent facts about running this file, both measured, both of which have
+//! already cost a wave each. They live here rather than only in `bd-j8mkv` because a
+//! requirement recorded only in a tracker or a mail thread gets rediscovered the hard way.
+//!
+//! ## 1. Reachability: a no-flags run executes NOTHING and says so quietly
+//!
+//! `crates/fastmcp/Cargo.toml` declares
+//! `required-features = ["testing-lab", "legacy-2024-11-05", "tasks"]` for this target,
+//! and the package default is `["legacy-2024-11-05", "tasks"]` — **`testing-lab` is not a
+//! default**. An unmet `required-features` makes Cargo **skip the target entirely**: no
+//! `Running` line, no result line, no error, `exit=0`. Naming the target with
+//! `--test e2e_protocol` does **not** satisfy the gate either.
+//!
+//! So the only sound check is: **count the `Running` lines against the targets you named.**
+//! A receipt citing this file without `--features testing-lab` recorded silence as success.
+//! Batching `e2e_modern_http` alongside additionally needs `proxy`, also not a default.
+//!
+//! ## 2. Load sensitivity: batching this target MANUFACTURES failures
+//!
+//! Measured on one tree, one command, `0 filtered out` on both runs:
+//!
+//! ```text
+//! BUSY  (--test e2e_protocol + --test e2e_modern_http, one invocation)
+//!       144 passed / 19 failed / 0 filtered out    37.57s   exit=101
+//! QUIET (--test e2e_protocol alone)
+//!       163 passed /  0 failed / 0 filtered out     2.87s   exit=0
+//! ```
+//!
+//! `144 + 19 = 163`. **Identical denominator, opposite split** — flakiness by definition,
+//! and a 13x runtime difference for the same work. All 19 failed at CONNECT, on an idle
+//! deadline, none in the behaviour under test. A flaky green is as inadmissible as a flaky
+//! red, so **a receipt citing this target is only admissible if it ran ALONE.**
+//!
+//! Note the two run types want opposite conditions: a *receipt* needs this target alone on
+//! a quiet fleet; a *load diagnosis* needs it deliberately crowded. Asking for "a run"
+//! without saying which gets the wrong experiment.
+//!
+//! ## What was changed, and what deliberately was not
+//!
+//! The connect helpers' injected policy was split into
+//! `STDIO_CONNECT_LIVENESS_IDLE_BOUND` / `_ABSOLUTE_BOUND` so the connect path is bounded
+//! by a liveness watchdog rather than by a budget that encoded a performance expectation
+//! nobody holds. Constants were **split, never raised to make a red go away** — that
+//! converts a visible flake into an invisible one.
+//!
+//! Seven `assert!(started.elapsed() <= ..)` sites remain, in three test functions. Each is
+//! an upper bound on real wall time placed AFTER the call it claims to bound, so it cannot
+//! detect the hang its message advertises while still being able to fail because the
+//! machine was slow. They are classified on `bd-j8mkv` and are deliberately **retained for
+//! now**: raising the connect bounds made them reachable under load for the first time, and
+//! removing them before one deliberately-busy run would destroy the only cheap test of that
+//! prediction.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
