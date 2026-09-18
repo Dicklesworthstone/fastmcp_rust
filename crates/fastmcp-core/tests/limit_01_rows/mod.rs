@@ -1,13 +1,30 @@
 //! LIMIT-01 A/B ordered acceptance rows and canonical digest receipts.
 //!
-//! Ported verbatim from the crate-internal `#[cfg(test)] mod limit_01_rows`
-//! for bd-600a3. The in-crate copy is deliberately left in place; this one
-//! exists so the frozen LIMIT-01 IDs can run as EXTERNAL consumers, which
-//! `cfg(test)` placement made impossible (PL-3).
+//! Ported from the crate-internal `#[cfg(test)] mod limit_01_rows` for
+//! bd-600a3. The in-crate copy is deliberately left in place; this one exists
+//! so the frozen LIMIT-01 IDs can run as EXTERNAL consumers, which `cfg(test)`
+//! placement made impossible (PL-3).
 //!
-//! Nothing here needed to change but the crate path: every symbol it uses
-//! is already public at `fastmcp_core`'s root, so no API was widened to
-//! make this compile.
+//! THREE THINGS DIFFER FROM THE `src/` COPY, and only the first is forced:
+//!   1. `crate::` -> `fastmcp_core::`, because this is a separate crate.
+//!   2. `pub(crate)` -> `pub` on every item. NOT required — a `mod` inside an
+//!      integration target is part of that test binary's own crate, so
+//!      `pub(crate)` was already visible to the parent. Incidental, from
+//!      scripting the port, and harmless.
+//!   3. `.err().expect(..)` -> `.expect_err(..)` at two sites, because
+//!      `clippy::err_expect` fires on this target and not on the `cfg(test)`
+//!      one. Behaviourally identical; the `src/` copy was resynced to match at
+//!      c620d567.
+//!
+//! An earlier version of this header said "ported verbatim" and "nothing here
+//! needed to change but the crate path". Both were false — 70 items changed
+//! visibility — and the accurate account lived only in the commit message,
+//! where nobody opening this file would find it. Corrected in place rather than
+//! deleted, so the claim cannot be re-derived from the file's shape.
+//!
+//! No API was widened to make this compile: every symbol used here was already
+//! public at `fastmcp_core`'s root, and the commit that added this file touches
+//! zero `src/` files.
 //!
 //! Each integration target compiles its own copy of this module, so items
 //! used by only one of the two targets are dead code in the other.
