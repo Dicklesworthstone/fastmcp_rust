@@ -50511,6 +50511,45 @@ activate = 1\n";
         if pointer_get(document, "/decision/release_pin_change_authorized", SUBJECT)?.as_bool() != Some(true) {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release_pin_change_authorized"));
         }
+        // SUPERSESSION AUTHORITY, ENFORCED AS INTERNAL CONSISTENCY.
+        // `supersession_authority` is prose naming WHICH prior baseline this
+        // supersession replaced. Nothing parsed it, so it was free to disagree with
+        // the `[prior_baseline_record]` section it claims to describe -- recorded,
+        // never read, therefore free to drift or to be false. Audited 2026-09-17 and
+        // currently TRUE, which is why this lands as enforcement rather than a repair.
+        //
+        // HALF OF THE CLAIM IS ENFORCEABLE HERE AND HALF IS NOT. The prose also cites
+        // an authorizing COMMIT, and resolving that needs repository history the RCH
+        // execution host does not have (it syncs sources, never `.git`). Binding the
+        // two sections to each other needs none, so that half is enforced now and the
+        // commit half stays open on bd-fnd-01-supersession-authority-unenforced-3wea2.
+        //
+        // DELIBERATELY NOT A WELL-FORMEDNESS CHECK. A non-empty string, or one merely
+        // shaped like a commit reference, proves nothing: it is satisfied by prose
+        // naming a baseline that was never recorded. This compares the two sections
+        // against each other, so it fails closed when either moves without the other.
+        //
+        // THE EMPTINESS OPERANDS ARE LOAD-BEARING, NOT DEFENSIVE PADDING. `contains`
+        // is VACUOUSLY TRUE for an empty needle, so an emptied
+        // `superseded_rust_toolchain` would satisfy the agreement test on its own and
+        // silently retire this check. They are part of one predicate for that reason;
+        // removing either reopens the hole on its face.
+        let supersession_authority = pointer_get(document, "/decision/supersession_authority", SUBJECT)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("supersession_authority"))?;
+        let superseded_toolchain = pointer_get(document, "/prior_baseline_record/superseded_rust_toolchain", SUBJECT)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("superseded_rust_toolchain"))?;
+        let superseded_pin = pointer_get(document, "/prior_baseline_record/superseded_asupersync_release_pin", SUBJECT)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("superseded_asupersync_release_pin"))?;
+        if superseded_toolchain.is_empty()
+            || superseded_pin.is_empty()
+            || !supersession_authority.contains(superseded_toolchain)
+            || !supersession_authority.contains(superseded_pin)
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("supersession_authority prior-baseline agreement"));
+        }
         if pointer_get(document, "/decision/rust_toolchain", SUBJECT)?.as_str() != Some(TOOLCHAIN_CHANNEL)
             || pointer_get(document, "/toolchain/channel", SUBJECT)?.as_str() != Some(TOOLCHAIN_CHANNEL)
             || pointer_get(document, "/toolchain/manifest_sha256", SUBJECT)?.as_str() != Some(DIST_MANIFEST_SHA)
