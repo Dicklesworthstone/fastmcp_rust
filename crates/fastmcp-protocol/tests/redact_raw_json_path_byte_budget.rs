@@ -9,6 +9,27 @@
 //! They drive the redactor through the shipped public surface
 //! (`admit_raw_json_document` -> `RawJsonAdmissionFailure::path`) rather than a
 //! `#[cfg(test)]` item, so they prove the rendering a real consumer sees.
+//!
+//! # Measured sensitivity
+//!
+//! A green test proves nothing until it has been shown to go red. Planting
+//! `rendered.push('\u{2026}')` in place of `rendered.push('*')` in
+//! `redact_raw_json_path` produced, on the exact three tests below:
+//!
+//! ```text
+//! a_multibyte_member_redacts_to_one_ascii_byte_per_character ... FAILED
+//! an_over_budget_multibyte_member_stays_within_the_byte_ceiling ... FAILED
+//! the_allowed_character_set_survives_redaction ... ok
+//! test result: FAILED. 1 passed; 2 failed                     exit=101
+//! ```
+//!
+//! The third one PASSING is the part worth keeping. It exercises the allowed
+//! character branch, which the plant did not touch, so the trio
+//! DISCRIMINATES between the two branches rather than merely reacting to any
+//! edit at all. A suite where all three went red would be the weaker result.
+//!
+//! The mutation was reverted from a pristine copy and the file's blob hash
+//! verified identical to `HEAD` afterwards.
 
 use fastmcp_protocol::{
     MAX_RAW_JSON_PATH_SEGMENT_BYTES, RawJsonTopLevel, admit_raw_json_document,
