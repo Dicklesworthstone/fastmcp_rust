@@ -42,6 +42,25 @@ const DISCOVERY: &str = r#"{"resultType":"complete","supportedVersions":["2026-0
 const LIST: &str = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#;
 const CALL: &str = r#"{"resultType":"complete","content":[],"x-exact":1.20e+4}"#;
 const NOTICE: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+const MACHINE_ISSUER_LOCATIONS: [&str; 3] = [
+    "/.well-known/oauth-authorization-server/issuer",
+    "/.well-known/openid-configuration/issuer",
+    "/issuer/.well-known/openid-configuration",
+];
+
+fn assert_endpoint_exhaustion(error: Error) {
+    use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation};
+    let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) = error else {
+        panic!("all untrusted token locations must retain their refusal causes");
+    };
+    assert_eq!(failure.classification(), IssuerMetadataFailureClass::TrustOrIntegrity);
+    assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
+        (IssuerMetadataLocation::OAuthAuthorizationServer, IssuerMetadataCause::EndpointNotTrusted),
+        (IssuerMetadataLocation::OpenIdInserted, IssuerMetadataCause::EndpointNotTrusted),
+        (IssuerMetadataLocation::OpenIdAppended, IssuerMetadataCause::EndpointNotTrusted),
+    ]);
+}
+
 // TEST ONLY CA and localhost certificate, valid 2020-2049. Installed only into
 // each isolated child process through SSL_CERT_FILE, never a persistent store.
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
@@ -203,16 +222,19 @@ impl Peer {
             json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":["https://unknown.example/issuer"],"scopes_supported":["read"]}).to_string()).await;
             return;
         }
-        let (mut tls,start,headers,body) = self.request().await;
-        assert_eq!(start,"GET /.well-known/oauth-authorization-server/issuer HTTP/1.1");
-        assert!(!headers.contains_key("authorization") && body.is_empty());
-        self.gets.fetch_add(1,Ordering::SeqCst);
         let token = if matches!(case,Case::WrongEndpoint) { "https://untrusted.example/token".to_owned() } else { format!("{}/token",self.origin()) };
         let auth = if matches!(case,Case::UnsupportedAuth) { "private_key_jwt" } else { "client_secret_basic" };
-        // Deliberately NO authorization endpoint, response_types, PKCE or DCR.
-        json_reply(&mut tls,&json!({"issuer":self.issuer(),"token_endpoint":token,
-            "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":[auth],
-            "scopes_supported":["read"]}).to_string()).await;
+        let count = if matches!(case,Case::WrongEndpoint) { 3 } else { 1 };
+        for path in &MACHINE_ISSUER_LOCATIONS[..count] {
+            let (mut tls,start,headers,body) = self.request().await;
+            assert_eq!(start,format!("GET {path} HTTP/1.1"));
+            assert!(!headers.contains_key("authorization") && body.is_empty());
+            self.gets.fetch_add(1,Ordering::SeqCst);
+            // Deliberately NO authorization endpoint, response_types, PKCE or DCR.
+            json_reply(&mut tls,&json!({"issuer":self.issuer(),"token_endpoint":token,
+                "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":[auth],
+                "scopes_supported":["read"]}).to_string()).await;
+        }
     }
     async fn token_request(&self) -> TlsStream<TcpStream> {
         let (tls,start,headers,body) = self.request().await;
@@ -287,7 +309,11 @@ fn run(case: Case) {
                         assert_eq!(peer.gets.load(Ordering::SeqCst),2);
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
                     }
-                    Case::WrongEndpoint => assert!(matches!(error,Error::Discovery(OAuthDiscoveryError::EndpointNotTrusted))),
+                    Case::WrongEndpoint => {
+                        assert_endpoint_exhaustion(error);
+                        assert_eq!(peer.gets.load(Ordering::SeqCst),4);
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
+                    }
                     _ => assert!(matches!(error,Error::UnsupportedAuthentication)),
                 }
                 assert_eq!(peer.grants.load(Ordering::SeqCst),0);
@@ -585,10 +611,6 @@ async fn post_metadata(peer: &Peer, case: PostCase) {
     json_reply(&mut tls, &json!({"resource":peer.resource(),
         "authorization_servers":[peer.issuer()],"scopes_supported":["read"]}).to_string()).await;
     drop(tls);
-    let (mut tls, start, headers, body) = peer.request().await;
-    assert_eq!(start, "GET /.well-known/oauth-authorization-server/issuer HTTP/1.1");
-    assert!(!headers.contains_key("authorization") && body.is_empty());
-    peer.gets.fetch_add(1, Ordering::SeqCst);
     let methods = match case {
         PostCase::PostAgainstBasic => json!(["client_secret_basic"]),
         PostCase::BothAdvertised | PostCase::Denied | PostCase::Redirect | PostCase::Lost =>
@@ -598,9 +620,16 @@ async fn post_metadata(peer: &Peer, case: PostCase) {
     let token = if matches!(case, PostCase::WrongOrigin) {
         "https://untrusted.example/token".to_owned()
     } else { format!("{}/token", peer.origin()) };
-    json_reply(&mut tls, &json!({"issuer":peer.issuer(),"token_endpoint":token,
-        "grant_types_supported":["client_credentials"],
-        "token_endpoint_auth_methods_supported":methods,"scopes_supported":["read"]}).to_string()).await;
+    let count = if matches!(case, PostCase::WrongOrigin) { 3 } else { 1 };
+    for path in &MACHINE_ISSUER_LOCATIONS[..count] {
+        let (mut tls, start, headers, body) = peer.request().await;
+        assert_eq!(start, format!("GET {path} HTTP/1.1"));
+        assert!(!headers.contains_key("authorization") && body.is_empty());
+        peer.gets.fetch_add(1, Ordering::SeqCst);
+        json_reply(&mut tls, &json!({"issuer":peer.issuer(),"token_endpoint":token,
+            "grant_types_supported":["client_credentials"],
+            "token_endpoint_auth_methods_supported":methods,"scopes_supported":["read"]}).to_string()).await;
+    }
 }
 
 async fn post_token_request(peer: &Peer, id: &str, secret: &str) -> TlsStream<TcpStream> {
@@ -651,9 +680,12 @@ fn run_post(case: PostCase) {
             if matches!(case, PostCase::PostAgainstBasic | PostCase::BasicAgainstPost | PostCase::WrongOrigin) {
                 let error = result.err().unwrap();
                 if matches!(case, PostCase::WrongOrigin) {
-                    assert!(matches!(error, Error::Discovery(OAuthDiscoveryError::EndpointNotTrusted)));
-                } else { assert!(matches!(error, Error::UnsupportedAuthentication)); }
-                assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+                    assert_endpoint_exhaustion(error);
+                    assert_eq!(peer.gets.load(Ordering::SeqCst), 4);
+                } else {
+                    assert!(matches!(error, Error::UnsupportedAuthentication));
+                    assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+                }
                 assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
                 assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
                 peer.quiet();
