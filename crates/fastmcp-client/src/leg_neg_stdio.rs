@@ -83,12 +83,14 @@ pub const LEG_NEG_01_A_EVALUATOR_MANIFEST_V1: &str = concat!(
     "policy-case auto-ineligible-recognized-modern-error policy=Auto signal=recognized-modern-error eligible=false paired=auto-eligible-correlated-refusal\n",
     "policy-case modern-only-never-falls-back policy=ModernOnly signal=correlated-discovery-refusal eligible=false paired=auto-eligible-correlated-refusal\n",
     "policy-case legacy-only-never-probes policy=LegacyOnly signal=no-modern-probe eligible=false paired=auto-eligible-correlated-refusal\n",
+    "policy-case auto-ineligible-malformed-first-wire policy=Auto signal=malformed-first-wire eligible=false paired=auto-eligible-correlated-refusal\n",
     "first-wire auto-modern-selected \"method\":\"server/discover\"\n",
     "first-wire auto-eligible-correlated-refusal \"method\":\"server/discover\"\n",
     "first-wire auto-ineligible-uncorrelated-refusal \"method\":\"server/discover\"\n",
     "first-wire auto-ineligible-recognized-modern-error \"method\":\"server/discover\"\n",
     "first-wire modern-only-never-falls-back \"method\":\"server/discover\"\n",
     "first-wire legacy-only-never-probes \"method\":\"initialize\"\n",
+    "first-wire auto-ineligible-malformed-first-wire \"method\":\"server/discover\"\n",
     "fallback-first-wire auto-eligible-correlated-refusal \"protocolVersion\":\"2024-11-05\"\n",
     "pair auto-eligible-correlated-refusal auto-ineligible-uncorrelated-refusal variable=discovery-refusal-response-id\n",
 );
@@ -168,6 +170,10 @@ pub enum StdioFirstWireSignal {
     /// The planted unsupported `2025-11-25` era. Negative use only; it can
     /// never satisfy a `2026-07-28` or exact-`2024-11-05` positive.
     UnsupportedEraAdvertised,
+    /// The peer answers the probe with bytes that are not an admissible
+    /// JSON-RPC response. A frame that cannot be parsed cannot be classified,
+    /// so it must never be read as a downgrade signal.
+    MalformedFirstWire,
 }
 
 impl StdioFirstWireSignal {
@@ -181,12 +187,25 @@ impl StdioFirstWireSignal {
             Self::RecognizedModernError => "recognized-modern-error",
             Self::NoModernProbe => "no-modern-probe",
             Self::UnsupportedEraAdvertised => "unsupported-era-advertised",
+            Self::MalformedFirstWire => "malformed-first-wire",
         }
     }
 
     /// Whether this signal may authorize a fresh exact-2024 child.
     ///
     /// Only under `Auto`; the policy is checked separately.
+    ///
+    /// # Adding a variant
+    ///
+    /// This is a `matches!` against a single pattern, which means it is
+    /// `_ => false` by implication: **a new variant silently becomes
+    /// ineligible and nothing fails to compile.** That default is correct for
+    /// every variant added so far, because only a correlated refusal proves
+    /// the peer refused the modern method. If you ever add a variant that
+    /// SHOULD authorize a fallback, you must add it to the pattern here — no
+    /// exhaustiveness check will catch the omission, unlike [`Self::token`],
+    /// which is an exhaustive `match` and will refuse to compile until every
+    /// variant has a frozen manifest token.
     #[must_use]
     pub const fn is_fallback_eligible(self) -> bool {
         matches!(self, Self::CorrelatedDiscoveryRefusal)

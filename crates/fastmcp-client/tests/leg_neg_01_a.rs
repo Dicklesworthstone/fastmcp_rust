@@ -88,6 +88,9 @@ if [ "$era" = modern ]; then
         modern-result)
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"leg-neg-01-a-peer","version":"1"}}}}'
             exec sleep 5;;
+        malformed-first-wire)
+            printf '%s\n' 'this is not a JSON-RPC frame'
+            exec sleep 5;;
         *) exit 94;;
     esac
 fi
@@ -432,6 +435,45 @@ fn leg_neg_01_a_positive() {
         "LegacyOnly must never emit a modern discovery probe"
     );
     assert_no_legacy_child(&legacy_only);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // A malformed first wire is not a refusal. The shipped rule quoted by
+    // this evaluator's manifest is "only a correlated JSON-RPC discovery
+    // refusal or Unix-observable clean first-probe timeout authorizes a
+    // second spawn", and bytes that do not parse as a JSON-RPC response are
+    // neither. An unparseable frame proves nothing about the peer's era, so
+    // reading it as a downgrade signal would be a classification the peer
+    // never made.
+    //
+    // This is the AC-LEG-NEG-01-A-PREDICATES "malformed" condition, which
+    // had no representable signal before this case existed.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "auto-ineligible-malformed-first-wire",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::MalformedFirstWire,
+        "malformed-first-wire",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let malformed = run(&declared);
+    assert_eq!(malformed.policy, ProtocolPolicy::Auto);
+    assert_eq!(malformed.signal, StdioFirstWireSignal::MalformedFirstWire);
+    assert_first_wire(&malformed, 0, "\"method\":\"server/discover\"");
+    assert_eq!(
+        malformed.selected_era, None,
+        "an unparseable first wire selects no era"
+    );
+    assert_eq!(
+        malformed.protocol_version, None,
+        "an unparseable first wire yields no protocol version"
+    );
+    assert!(
+        !StdioFirstWireSignal::MalformedFirstWire.is_fallback_eligible(),
+        "a malformed frame is not one of the two authorizing signals"
+    );
+    assert_no_legacy_child(&malformed);
     cleanup(&trace);
 }
 
