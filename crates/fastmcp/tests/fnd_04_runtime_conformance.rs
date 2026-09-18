@@ -2714,6 +2714,13 @@ fn fnd_04_b_positive() {
     //
     // Forty lowercase hex characters admits neither sentinel nor emptiness, and
     // matches this file's idiom for the adjacent tree identity.
+    //
+    // THE ORDER OF THESE TWO ASSERTIONS IS LOAD-BEARING. `chars().all(..)` is
+    // VACUOUSLY TRUE on an empty string, so the hex predicate alone would still
+    // admit "" -- the exact value the absent-`.git` path produces. The length
+    // check is what rejects it. Do not merge, reorder, or drop the length
+    // assertion on the grounds that the hex check looks stricter: it is the
+    // weaker of the two against the failure that actually occurs here.
     assert_eq!(
         manifest.revision.len(),
         40,
