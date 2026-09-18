@@ -1,8 +1,9 @@
 //! Exact named-operation authorization before application middleware and caches.
 //!
 //! This policy intersects a mandatory method policy with host-configured rules
-//! for tool calls, resource reads, prompt retrieval/completion and legacy resource
-//! subscriptions. Missing named rules deny; there is no wildcard, URI decoding,
+//! for tool calls, resource reads, prompt retrieval/completion and resource
+//! subscriptions. Modern listens require a ResourceWatch rule for EVERY selected
+//! resource. Missing named rules deny; there is no wildcard, URI decoding,
 //! prefix matching or request-metadata override. Catalog visibility is separate:
 //! refusals never disclose whether a target exists or which scopes it needs.
 //! Install on the built server before opening any endpoint or sharing middleware.
@@ -20,7 +21,11 @@ use crate::{Middleware, MiddlewareDecision, Server};
 const MAX_OPERATIONS: usize = 1024;
 const MAX_TARGET_BYTES: usize = 2048;
 const MAX_POLICY_BYTES: usize = 64 * 1024;
-const DOMAIN: &[u8] = b"fastmcp/named-operation-scopes/v1\0";
+// Count all requested entries, including duplicates, before evaluating grants.
+const MAX_RESOURCE_WATCHES: usize = 1024;
+const MAX_RESOURCE_WATCH_BYTES: usize = 64 * 1024;
+// v2 binds the additional all-resource authorization of subscriptions/listen.
+const DOMAIN: &[u8] = b"fastmcp/named-operation-scopes/v2\0";
 
 /// Host-selected operation identity. Names and URIs are literal, case-sensitive
 /// strings; completion permissions are distinct from retrieval permissions.
@@ -34,6 +39,9 @@ pub enum ScopedOperation {
     ResourceComplete(String),
     LegacyResourceSubscribe(String),
     LegacyResourceUnsubscribe(String),
+    /// One exact resource URI in a modern listen's resourceSubscriptions filter.
+    /// Reading a resource or subscribing in the legacy era does not grant this.
+    ResourceWatch(String),
 }
 
 impl ScopedOperation {
@@ -46,6 +54,7 @@ impl ScopedOperation {
             Self::ResourceComplete(target) => (4, target),
             Self::LegacyResourceSubscribe(target) => (5, target),
             Self::LegacyResourceUnsubscribe(target) => (6, target),
+            Self::ResourceWatch(target) => (7, target),
         }
     }
 }
@@ -60,6 +69,7 @@ impl fmt::Debug for ScopedOperation {
             Self::ResourceComplete(_) => "ResourceComplete",
             Self::LegacyResourceSubscribe(_) => "LegacyResourceSubscribe",
             Self::LegacyResourceUnsubscribe(_) => "LegacyResourceUnsubscribe",
+            Self::ResourceWatch(_) => "ResourceWatch",
         };
         f.debug_struct(kind).finish_non_exhaustive()
     }
@@ -112,10 +122,13 @@ struct CompiledOperations {
 
 /// Immutable default-deny named rules intersected with a method scope policy.
 ///
-/// All seven named-operation kinds require an explicit entry, even when their
-/// method rule permits anonymous access. Other methods use the mandatory method
-/// policy, which is itself default-deny. Empty required scopes do not bypass
-/// method grants, authentication, catalog visibility or downstream authorization.
+/// Every named operation requires an explicit entry, even when its method rule
+/// permits anonymous access. A modern listen additionally requires ResourceWatch
+/// permission for every URI in resourceSubscriptions. Catalog-only and empty
+/// resource selections have no per-resource requirements; their method gate and
+/// the native filter/extension admission still apply. No implicit read-to-watch
+/// grant is inferred. Other methods use the mandatory default-deny method policy.
+/// Empty required scopes never bypass authentication or downstream authorization.
 /// Up to 1024 entries and 64 KiB of framed named configuration are retained, in
 /// addition to the separately bounded method policy. No per-request table or
 /// expanded grant set is allocated.
@@ -180,12 +193,14 @@ impl OperationScopePolicy {
     pub fn fingerprint(&self) -> Sha256Digest { self.inner.fingerprint }
     pub fn method_policy(&self) -> &ScopeRequestPolicy { &self.inner.methods }
 
-    /// Requires both the base method grants and the exact operation's grants.
-    /// Only the protocol-defined top-level selector is inspected; arguments,
-    /// metadata, nested headers and similarly named fields cannot replace it.
+    /// Requires both the base method grants and all of the request's exact named
+    /// operation grants. Only protocol-defined selectors are inspected; arguments,
+    /// metadata and nested headers cannot replace them. A modern resource filter
+    /// is evaluated as one all-or-nothing selection, without rewriting or dropping
+    /// unauthorized entries. Up to 1024 URI entries and 64 KiB of decoded target
+    /// bytes are admitted, including duplicates. Native wire bounds may be tighter.
     /// The strict raw protocol boundary still owns duplicate-member admission.
-    /// Successful scope evaluation does not assert that a target exists or is
-    /// visible, and never creates/updates credentials or a continuing lease.
+    /// Success is not catalog visibility, a new credential, or a continuing lease.
     pub fn authorize_verified(
         &self,
         request: &JsonRpcRequest,
@@ -193,10 +208,17 @@ impl OperationScopePolicy {
     ) -> Result<(), OperationScopeRejection> {
         self.inner.methods.authorize_verified(&request.method, facts)
             .map_err(OperationScopeRejection::Method)?;
+        let grants = facts.map_or(&[][..], |facts| facts.scopes.as_slice());
+        if request.method == "subscriptions/listen" {
+            return self.authorize_resource_watches(request, grants);
+        }
         let Some(key) = request_key(request)? else { return Ok(()); };
+        self.authorize_key(key, grants)
+    }
+
+    fn authorize_key(&self, key: (u8, &str), grants: &[String]) -> Result<(), OperationScopeRejection> {
         let index = self.inner.entries.binary_search_by(|entry| entry.0.key().cmp(&key))
             .map_err(|_| OperationScopeRejection::UnconfiguredOperation)?;
-        let grants = facts.map_or(&[][..], |facts| facts.scopes.as_slice());
         if self.inner.methods.inner.implications.permits(grants, &self.inner.entries[index].1)
             .map_err(|_| OperationScopeRejection::Method(ScopeRequestRejection::InvalidFacts))?
         {
@@ -204,6 +226,33 @@ impl OperationScopePolicy {
         } else {
             Err(OperationScopeRejection::InsufficientScope)
         }
+    }
+
+    fn authorize_resource_watches(
+        &self,
+        request: &JsonRpcRequest,
+        grants: &[String],
+    ) -> Result<(), OperationScopeRejection> {
+        let notifications = request.params.as_ref().and_then(|params| params.get("notifications"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or(OperationScopeRejection::UnconfiguredOperation)?;
+        let Some(resources) = notifications.get("resourceSubscriptions") else { return Ok(()); };
+        let resources = resources.as_array().filter(|resources| resources.len() <= MAX_RESOURCE_WATCHES)
+            .ok_or(OperationScopeRejection::UnconfiguredOperation)?;
+        // Validate the whole selection before scope evaluation. Never create a
+        // partially authorized subscription or silently narrow the user's filter.
+        let mut bytes = 0_usize;
+        for value in resources {
+            let target = value.as_str().filter(|target| valid_target(target))
+                .ok_or(OperationScopeRejection::UnconfiguredOperation)?;
+            bytes = bytes.checked_add(target.len()).filter(|bytes| *bytes <= MAX_RESOURCE_WATCH_BYTES)
+                .ok_or(OperationScopeRejection::UnconfiguredOperation)?;
+        }
+        for value in resources {
+            let target = value.as_str().ok_or(OperationScopeRejection::UnconfiguredOperation)?;
+            self.authorize_key((7, target), grants)?;
+        }
+        Ok(())
     }
 }
 
@@ -447,5 +496,111 @@ mod tests {
         let text = format!("{operation:?} {policy:?} {rejection:?} {rejection}");
         assert!(!text.contains("canary"));
         assert!(!text.contains("operation-owner"));
+    }
+
+    fn watch_policy(entries: Vec<(ScopedOperation, RequiredScopes)>) -> OperationScopePolicy {
+        let methods = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::new(1, vec![
+            ("admin".into(), "listen".into()), ("admin".into(), "watch-a".into()),
+            ("admin".into(), "watch-b".into()),
+        ]).unwrap(), vec![("subscriptions/listen".into(), required(&["listen"]))]).unwrap();
+        OperationScopePolicy::new(1, methods, entries).unwrap()
+    }
+    fn watch_request(resources: Value) -> JsonRpcRequest {
+        request("subscriptions/listen", json!({"notifications":{"resourceSubscriptions":resources,"toolsListChanged":true}}))
+    }
+
+    #[test]
+    fn resource_watches_require_every_grant_and_preserve_the_complete_selection() {
+        let policy = watch_policy(vec![
+            (ScopedOperation::ResourceWatch("file:///a".into()), required(&["watch-a"])),
+            (ScopedOperation::ResourceWatch("file:///b".into()), required(&["watch-b"])),
+        ]);
+        for resources in [json!(["file:///a", "file:///b"]), json!(["file:///b", "file:///a", "file:///a"])] {
+            let request = watch_request(resources);
+            let before = serde_json::to_vec(&request).unwrap();
+            for (grants, allowed) in [(&["admin"][..], true), (&["listen", "watch-a", "watch-b"][..], true),
+                (&["listen", "watch-a"][..], false), (&["watch-a", "watch-b"][..], false)]
+            {
+                let facts = facts(grants);
+                let original = serde_json::to_vec(&facts).unwrap();
+                assert_eq!(policy.authorize_verified(&request, Some(&facts)).is_ok(), allowed);
+                assert_eq!(serde_json::to_vec(&facts).unwrap(), original);
+                assert_eq!(serde_json::to_vec(&request).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn adding_one_unpermitted_resource_refuses_without_narrowing_or_poisoning_reuse() {
+        let policy = watch_policy(vec![(ScopedOperation::ResourceWatch("file:///a".into()), required(&["watch-a"]))]);
+        let facts = facts(&["admin"]);
+        let allowed = watch_request(json!(["file:///a"]));
+        assert!(policy.authorize_verified(&allowed, Some(&facts)).is_ok());
+        for target in ["file:///b", "file:///A", "file:///%61", "file:///a/child", "file:///*"] {
+            let denied = watch_request(json!(["file:///a", target]));
+            let before = serde_json::to_vec(&denied).unwrap();
+            assert_eq!(policy.authorize_verified(&denied, Some(&facts)), Err(OperationScopeRejection::UnconfiguredOperation));
+            assert_eq!(serde_json::to_vec(&denied).unwrap(), before);
+        }
+        assert!(policy.authorize_verified(&allowed, Some(&facts)).is_ok());
+    }
+
+    #[test]
+    fn modern_watch_authority_is_not_inferred_from_read_or_legacy_subscribe_rules() {
+        let request = watch_request(json!(["file:///a"]));
+        let facts = facts(&["admin"]);
+        let rules = vec![
+            (ScopedOperation::ResourceRead("file:///a".into()), required(&[])),
+            (ScopedOperation::LegacyResourceSubscribe("file:///a".into()), required(&[])),
+        ];
+        let no_watch = watch_policy(rules.clone());
+        assert_eq!(no_watch.authorize_verified(&request, Some(&facts)), Err(OperationScopeRejection::UnconfiguredOperation));
+        let mut rules = rules;
+        rules.push((ScopedOperation::ResourceWatch("file:///a".into()), required(&["watch-a"])));
+        let explicit = watch_policy(rules);
+        assert!(explicit.authorize_verified(&request, Some(&facts)).is_ok());
+        assert_ne!(explicit.fingerprint(), no_watch.fingerprint());
+        assert!(!format!("{:?}", ScopedOperation::ResourceWatch("private-canary".into())).contains("canary"));
+    }
+
+    #[test]
+    fn empty_and_catalog_only_listens_keep_their_method_gate() {
+        let policy = watch_policy(vec![]);
+        for notifications in [json!({}), json!({"resourceSubscriptions":[]}), json!({"toolsListChanged":true})] {
+            let request = request("subscriptions/listen", json!({"notifications":notifications}));
+            assert!(policy.authorize_verified(&request, Some(&facts(&["listen"]))).is_ok());
+            assert!(policy.authorize_verified(&request, Some(&facts(&["watch-a"]))).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_or_spoofed_watch_filters_do_not_acquire_resource_authority() {
+        let policy = watch_policy(vec![(ScopedOperation::ResourceWatch("file:///a".into()), required(&[]))]);
+        let facts = facts(&["listen"]);
+        for resources in [json!(null), json!("file:///a"), json!({"uri":"file:///a"}),
+            json!(["file:///a", null]), json!(["file:///a", 7]), json!([""]), json!(["bad\nuri"])]
+        {
+            assert!(policy.authorize_verified(&watch_request(resources), Some(&facts)).is_err());
+        }
+        for params in [json!({}), json!({"notifications":null}), json!({"notifications":[]}),
+            json!({"_meta":{"notifications":{"resourceSubscriptions":["file:///a"]}}}),
+            json!({"notifications":{"resourceSubscriptions":["file:///b"]},"arguments":{"resourceSubscriptions":["file:///a"]}})]
+        {
+            assert!(policy.authorize_verified(&request("subscriptions/listen", params), Some(&facts)).is_err());
+        }
+        assert!(policy.authorize_verified(&watch_request(json!(["file:///a"])), Some(&facts)).is_ok());
+    }
+
+    #[test]
+    fn requested_watch_count_and_bytes_are_bounded_even_for_repeated_uris() {
+        let facts = facts(&["listen"]);
+        let policy = watch_policy(vec![(ScopedOperation::ResourceWatch("x".into()), required(&[]))]);
+        assert!(policy.authorize_verified(&watch_request(json!(vec!["x"; MAX_RESOURCE_WATCHES])), Some(&facts)).is_ok());
+        assert!(policy.authorize_verified(&watch_request(json!(vec!["x"; MAX_RESOURCE_WATCHES + 1])), Some(&facts)).is_err());
+        let target = "x".repeat(MAX_TARGET_BYTES);
+        let policy = watch_policy(vec![(ScopedOperation::ResourceWatch(target.clone()), required(&[]))]);
+        let count = MAX_RESOURCE_WATCH_BYTES / MAX_TARGET_BYTES;
+        assert!(policy.authorize_verified(&watch_request(json!(vec![target.clone(); count])), Some(&facts)).is_ok());
+        assert!(policy.authorize_verified(&watch_request(json!(vec![target; count + 1])), Some(&facts)).is_err());
     }
 }
