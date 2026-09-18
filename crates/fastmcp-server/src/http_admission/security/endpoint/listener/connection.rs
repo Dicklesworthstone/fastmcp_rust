@@ -195,43 +195,76 @@ async fn json(
 ) {
     let (mut reader, writer) = stream.into_split();
     let cancellation = McpRequestCancellation::new();
-    let peer_cancellation = cancellation.clone();
-    let mut peer = match cx.spawn(move |peer_cx| async move {
-        let mut byte = [0_u8; 1];
-        match reader.read(&mut byte).await {
-            Ok(0) => {}, // Write-half EOF does not cancel the response.
-            Ok(_) => { peer_cancellation.cancel(); },
-            Err(_) if !peer_cx.is_cancel_requested() => { peer_cancellation.cancel(); },
-            Err(_) => {},
-        }
-    }) {
-        Ok(peer) => peer,
-        Err(_) => return,
-    };
     let dispatch_endpoint = Arc::clone(&endpoint);
+    let dispatch_sessions = Arc::clone(&sessions);
     let dispatch_cancellation = cancellation.clone();
-    let dispatch = cx.spawn(move |request_cx| async move {
-        match scopes {
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+    let task = cx.spawn(move |request_cx| async move {
+        let response = match scopes {
             Some(scopes) => scope::dispatch_socket_json(
-                &request_cx, &dispatch_endpoint, &sessions, &scopes,
+                &request_cx, &dispatch_endpoint, &dispatch_sessions, &scopes,
                 request, authorization, dispatch_cancellation,
             ).await,
             None => dispatch_modern_http_request_with_cancellation_and_transport_authorization(
-                &request_cx, &dispatch_endpoint, &sessions, request, authorization, Some(dispatch_cancellation),
+                &request_cx, &dispatch_endpoint, &dispatch_sessions, request, authorization, Some(dispatch_cancellation),
             ).await,
-        }
+        };
+        let _ = sender.send_blocking(response);
     });
-    let response = match dispatch {
-        Ok(mut dispatch) => dispatch.join(cx).await.unwrap_or_else(|_| HttpResponse::internal_error()),
+    let mut dispatch = match task {
+        Ok(task) => OwnedJsonDispatch { task: Some(task), sessions, cancellation: cancellation.clone() },
         Err(_) => {
             cancellation.cancel();
-            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+            let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
+            buffered(cx, &shutdown, &mut framed, HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE), Some(&cors), io).await;
+            return;
         }
     };
-    peer.abort();
-    let _ = peer.join(cx).await;
+    // The connection owns this read directly. No sibling peer-reader task can
+    // survive abandonment, and a reset stops the wait even for a slow handler.
+    let mut byte = [0_u8; 1];
+    let response = monitor_response_peer(&cancellation, reader.read(&mut byte), async {
+        let response = receiver.recv(cx).await;
+        if cx.checkpoint().is_err() { return Err(()); }
+        Ok(response.unwrap_or_else(|_| HttpResponse::internal_error()))
+    }).await;
+    let Ok(mut response) = response else { return; };
+    drop(reader);
+    if !dispatch.finish(cx).await {
+        if cx.checkpoint().is_err() { return; }
+        response = HttpResponse::internal_error();
+    }
+    // Transfer any failed/unsettled child before attempting a socket write.
+    drop(dispatch);
     let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
     buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
+}
+
+/// Keep a JSON request's child handle even if its result wait or join is dropped.
+/// The one-slot result channel carries data; only this owner carries settlement.
+struct OwnedJsonDispatch {
+    task: Option<asupersync::runtime::TaskHandle<()>>,
+    sessions: LiveModernHttpSessionRegistry,
+    cancellation: McpRequestCancellation,
+}
+
+impl OwnedJsonDispatch {
+    async fn finish(&mut self, cx: &Cx) -> bool {
+        let Some(task) = self.task.as_mut() else { return true; };
+        if task.join(cx).await.is_err() { return false; }
+        self.task = None;
+        true
+    }
+}
+
+impl Drop for OwnedJsonDispatch {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.cancellation.cancel();
+            task.abort();
+            self.sessions.retain_retired_dispatches(vec![task]);
+        }
+    }
 }
 
 // Keep native representation election, dispatch custody and terminal receipts.
@@ -326,8 +359,8 @@ async fn sse(
     result
 }
 
-/// Poll the one outstanding peer read before the response, without a spawned
-/// task or repeatedly cancelling/recreating a partially completed write.
+/// Poll the one outstanding peer read before a JSON or SSE response, without a
+/// spawned task or repeatedly cancelling/recreating a partially completed write.
 ///
 /// Read EOF only disables this monitor: HTTP permits a client to half-close its
 /// request and continue reading the response. That case still relies on native
@@ -522,6 +555,67 @@ mod tests {
     }
 
     #[test]
+    fn secured_json_abandoned_join_cancels_request_and_retains_child() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let registry = Arc::new(crate::LiveModernHttpSessionRegistryState::new());
+                let cancellation = McpRequestCancellation::new();
+                let sibling = McpRequestCancellation::new();
+                let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+                let task = cx.spawn(move |child_cx| async move {
+                    let _ = receiver.recv(&child_cx).await;
+                }).unwrap();
+                let mut owner = OwnedJsonDispatch {
+                    task: Some(task), sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                };
+                let join_cx = cx.clone();
+                let mut waiting = Box::pin(async move { owner.finish(&join_cx).await });
+                poll_fn(|task| {
+                    assert!(waiting.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                }).await;
+                assert!(!cancellation.is_cancel_requested());
+                assert!(registry.retired_dispatches.lock().unwrap().is_empty());
+                drop(waiting);
+                assert!(cancellation.is_cancel_requested());
+                assert!(!sibling.is_cancel_requested());
+                let mut retired = registry.take_retired_dispatches();
+                assert_eq!(retired.len(), 1);
+                let _ = retired[0].join(&cx).await;
+                drop(sender);
+                assert!(cx.checkpoint().is_ok());
+            });
+    }
+
+    #[test]
+    fn secured_json_completed_dispatch_releases_custody_without_cancelling_request() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let registry = Arc::new(crate::LiveModernHttpSessionRegistryState::new());
+                let cancellation = McpRequestCancellation::new();
+                let effects = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&effects);
+                let task = cx.spawn(move |_| async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }).unwrap();
+                let mut owner = OwnedJsonDispatch {
+                    task: Some(task), sessions: Arc::clone(&registry), cancellation: cancellation.clone(),
+                };
+                assert!(owner.finish(&cx).await);
+                assert!(owner.task.is_none());
+                drop(owner);
+                assert_eq!(effects.load(Ordering::SeqCst), 1);
+                assert!(!cancellation.is_cancel_requested());
+                assert!(registry.retired_dispatches.lock().unwrap().is_empty());
+                assert!(cx.checkpoint().is_ok());
+            });
+    }
+
+    #[test]
     fn secured_sse_ready_reset_wins_over_a_ready_response() {
         let cancellation = McpRequestCancellation::new();
         let sibling = McpRequestCancellation::new();
@@ -610,7 +704,7 @@ mod tests {
         assert!(work.as_mut().poll(&mut task).is_pending());
         assert!(!cancellation.is_cancel_requested());
         drop(work);
-        assert!(cancellation.is_cancel_requested());
+        assert!(cancelled_or_requested(&cancellation));
         assert!(!sibling.is_cancel_requested());
         assert_eq!(peer_drops.load(Ordering::SeqCst), 1);
         assert_eq!(response_drops.load(Ordering::SeqCst), 1);
