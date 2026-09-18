@@ -2715,24 +2715,26 @@ fn fnd_04_b_positive() {
     // Forty lowercase hex characters admits neither sentinel nor emptiness, and
     // matches this file's idiom for the adjacent tree identity.
     //
-    // THE ORDER OF THESE TWO ASSERTIONS IS LOAD-BEARING. `chars().all(..)` is
-    // VACUOUSLY TRUE on an empty string, so the hex predicate alone would still
-    // admit "" -- the exact value the absent-`.git` path produces. The length
-    // check is what rejects it. Do not merge, reorder, or drop the length
-    // assertion on the grounds that the hex check looks stricter: it is the
-    // weaker of the two against the failure that actually occurs here.
-    assert_eq!(
-        manifest.revision.len(),
-        40,
-        "revision must bind: a git revision is forty hex characters, got {:?}",
-        manifest.revision
-    );
+    // ONE CONJUNCTION, deliberately, and not two sequential assertions.
+    // `chars().all(..)` is VACUOUSLY TRUE on an empty string -- and "" is
+    // exactly what the absent-`.git` path produces -- so the hex predicate
+    // alone would admit the failure this check exists to reject. The length
+    // operand is what rejects it.
+    //
+    // As two `assert!` statements that fact is load-bearing on their ORDER and
+    // survives only as a comment; a later editor dropping the length check as
+    // "redundant to the stricter-looking hex check" silently reopens the hole.
+    // As a single `&&` the two operands are visibly one predicate, order is
+    // irrelevant because both must hold, and neither half can be removed
+    // without changing the predicate on its face. Structure over commentary --
+    // the same reason FND-02's digest validator is one conjunction.
     assert!(
-        manifest
-            .revision
-            .chars()
-            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
-        "revision must bind as lowercase hexadecimal, got {:?}",
+        manifest.revision.len() == 40
+            && manifest
+                .revision
+                .chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+        "revision must bind: expected forty lowercase hex characters, got {:?}",
         manifest.revision
     );
     assert_eq!(manifest.tree.len(), 64, "tree identity must bind");
