@@ -2698,7 +2698,36 @@ fn fnd_04_b_positive() {
         "the evaluator-output digest must be lowercase hexadecimal, got {}",
         manifest.digest
     );
-    assert_ne!(manifest.revision, "<unresolved>", "revision must bind");
+    // A SHAPE check, not a sentinel check. `revision_and_tree` has TWO failure
+    // paths and the previous `assert_ne!(.., "<unresolved>")` named only one:
+    //   .git present, ref unreadable (packed-refs) -> "<unresolved>"  -> caught
+    //   .git ABSENT entirely                       -> HEAD reads as ""
+    //                                              -> strip_prefix fails
+    //                                              -> else branch yields ""
+    //                                              -> "" != "<unresolved>" -> PASSED
+    // The uncaught path is the one the RCH execution host actually produces:
+    // it syncs source files, including `.gitattributes`/`.gitignore`, but never
+    // the `.git` directory, so the worker resembles a working copy and has no
+    // repository. A receipt recording revision "" bound the TREE (that digest
+    // is computed from synced source and still binds) while silently binding no
+    // REVISION -- quotable as evidence for a revision it never observed.
+    //
+    // Forty lowercase hex characters admits neither sentinel nor emptiness, and
+    // matches this file's idiom for the adjacent tree identity.
+    assert_eq!(
+        manifest.revision.len(),
+        40,
+        "revision must bind: a git revision is forty hex characters, got {:?}",
+        manifest.revision
+    );
+    assert!(
+        manifest
+            .revision
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+        "revision must bind as lowercase hexadecimal, got {:?}",
+        manifest.revision
+    );
     assert_eq!(manifest.tree.len(), 64, "tree identity must bind");
 
     // Ordering is frozen: required IDs must equal discovered IDs, in order.
