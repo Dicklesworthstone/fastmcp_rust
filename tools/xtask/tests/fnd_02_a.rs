@@ -15,8 +15,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use fastmcp_xtask::plan_tracker::{
     self, SOURCES_PATH, TRACE_TABLE_PATH,
     diagnostics::Code,
+    digest::git_blob_hex,
     manifest::Outcome,
 };
+
+/// The authoritative final changelog, whose items A-01 requires trace rows to
+/// cover. Its registry role is "final changelog items requiring trace
+/// coverage".
+const CHANGELOG_PATH: &str = "evidence/fnd-01/vendor/core/mcp-changelog-2026-07-28-5f5440bb.mdx";
 
 /// The repository root, derived from this crate's manifest directory rather
 /// than from the process working directory, which a test harness may change.
@@ -376,6 +382,52 @@ fn fnd_02_a_detects_authoritative_source_drift() {
 
 /// The binding is verified against the bytes, not merely re-read from the
 /// registry: a registry claiming a wrong hash for an untouched file fails.
+/// A changelog that RESOLVES but cannot be decoded must fail, not silently
+/// empty the required coverage set.
+///
+/// `resolve` reads bytes and verifies the blob hash; it never validates UTF-8.
+/// The required-source gate only checks that the id resolved. So an
+/// undecodable changelog reaches the coverage step with `text()` returning
+/// `None`, where `unwrap_or_default()` used to turn it into zero required
+/// changelog items. `check_coverage` refuses a zero-item set, but the
+/// conformance items keep the set non-empty, so that guard never fired and
+/// A-01's changelog half vanished from a green run.
+#[test]
+fn fnd_02_a_rejects_a_changelog_that_is_not_valid_utf8() {
+    let scratch = Scratch::new("changelog-not-utf8");
+
+    // One invalid byte appended to an otherwise intact document, so encoding
+    // is the only thing wrong with it.
+    let path = scratch.root.join(CHANGELOG_PATH);
+    let mut bytes = fs::read(&path).expect("the scratch changelog is readable");
+    bytes.push(0xff);
+    fs::write(&path, &bytes).expect("the scratch changelog is writable");
+
+    // Rebind the registry to the corrupted bytes. WITHOUT THIS the run stops
+    // at SourceBlobDrift and never reaches the decode — which is precisely why
+    // blob verification does not cover this case. It catches bytes that
+    // CHANGED, not bytes that were never decodable to begin with.
+    scratch.mutate_once(
+        SOURCES_PATH,
+        "blob_sha1 = \"dc5c9a9cf3e6895504534cf3f300514394d8c6ae\"",
+        &format!("blob_sha1 = \"{}\"", git_blob_hex(&bytes)),
+    );
+
+    let run = plan_tracker::run_all(&scratch.root).expect("scratch loads");
+
+    assert!(!run.passed(), "an undecodable changelog must not pass");
+    assert!(
+        run.report.has(Code::SourceUnreadable),
+        "the failure must be reported, not absorbed into an empty required set"
+    );
+    // Discriminator: without this the test could pass for the wrong reason,
+    // proving blob verification works rather than UTF-8 validation.
+    assert!(
+        !run.report.has(Code::SourceBlobDrift),
+        "the binding was updated to match, so this must not be a drift failure"
+    );
+}
+
 #[test]
 fn fnd_02_a_rejects_a_binding_that_does_not_match_its_file() {
     let scratch = Scratch::new("wrong-binding");

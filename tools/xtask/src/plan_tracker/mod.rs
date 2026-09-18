@@ -240,10 +240,34 @@ pub fn run_all(root: &Path) -> Result<CheckRun, Diagnostic> {
 
     // ---- FND-02-A-01 traceability-completeness -------------------------
     let mut first = trace::check_row_completeness(&table);
-    let changelog_text = resolved
-        .get(SOURCE_ID_CHANGELOG)
-        .and_then(|source| source.text())
-        .unwrap_or_default();
+    // A resolved source is not necessarily a readable one: `resolve` reads
+    // bytes and verifies the blob hash but never validates UTF-8, and the
+    // required-source gate above only checks that the id resolved at all. So a
+    // changelog that exists and matches its recorded blob, yet holds one
+    // invalid byte sequence, reaches here with `text()` returning None.
+    //
+    // This previously ended in `unwrap_or_default()`, which turned that into
+    // an EMPTY required coverage set rather than a failure. `check_coverage`
+    // refuses a zero-item set, but only when the conformance items are absent
+    // too; with those present the set stays non-empty, the guard never fires,
+    // and the whole changelog half of A-01 coverage silently disappears from a
+    // GREEN run. The conformance path fifteen lines above reports exactly this
+    // failure as `SourceUnreadable`; this path now matches it.
+    let changelog_text = match resolved.get(SOURCE_ID_CHANGELOG).map(|source| source.text()) {
+        Some(Some(text)) => text,
+        Some(None) => {
+            first.push(Diagnostic::new(
+                Code::SourceUnreadable,
+                SOURCE_ID_CHANGELOG,
+                "bytes",
+                "core changelog is not valid UTF-8",
+            ));
+            ""
+        }
+        // Unreachable: an unresolved required source is reported by the gate
+        // above, which makes the report unclean and returns before this point.
+        None => "",
+    };
     let mut required_items = corpus::changelog_items(changelog_text);
     if let Ok(inventory) = &inventory {
         required_items.extend(corpus::conformance_items(&inventory.scenario_ids()));
