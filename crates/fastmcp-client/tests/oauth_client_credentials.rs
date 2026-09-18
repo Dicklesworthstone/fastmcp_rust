@@ -42,6 +42,25 @@ const DISCOVERY: &str = r#"{"resultType":"complete","supportedVersions":["2026-0
 const LIST: &str = r#"{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","x-exact":{"z":900719925474099312345,"a":1.20e+4}}"#;
 const CALL: &str = r#"{"resultType":"complete","content":[],"x-exact":1.20e+4}"#;
 const NOTICE: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+const MACHINE_ISSUER_LOCATIONS: [&str; 3] = [
+    "/.well-known/oauth-authorization-server/issuer",
+    "/.well-known/openid-configuration/issuer",
+    "/issuer/.well-known/openid-configuration",
+];
+
+fn assert_endpoint_exhaustion(error: Error) {
+    use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass, IssuerMetadataLocation};
+    let Error::Discovery(OAuthDiscoveryError::IssuerMetadataExhausted(failure)) = error else {
+        panic!("all untrusted token locations must retain their refusal causes");
+    };
+    assert_eq!(failure.classification(), IssuerMetadataFailureClass::TrustOrIntegrity);
+    assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
+        (IssuerMetadataLocation::OAuthAuthorizationServer, IssuerMetadataCause::EndpointNotTrusted),
+        (IssuerMetadataLocation::OpenIdInserted, IssuerMetadataCause::EndpointNotTrusted),
+        (IssuerMetadataLocation::OpenIdAppended, IssuerMetadataCause::EndpointNotTrusted),
+    ]);
+}
+
 // TEST ONLY CA and localhost certificate, valid 2020-2049. Installed only into
 // each isolated child process through SSL_CERT_FILE, never a persistent store.
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
@@ -193,17 +212,29 @@ impl Peer {
         let issuer = if matches!(case,Case::WrongIssuer) { "https://unknown.example/issuer".to_owned() } else { self.issuer() };
         json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":[issuer],"scopes_supported":["read"]}).to_string()).await;
         drop(tls);
-        if matches!(case,Case::WrongIssuer) { return; }
-        let (mut tls,start,headers,body) = self.request().await;
-        assert_eq!(start,"GET /.well-known/oauth-authorization-server/issuer HTTP/1.1");
-        assert!(!headers.contains_key("authorization") && body.is_empty());
-        self.gets.fetch_add(1,Ordering::SeqCst);
+        if matches!(case,Case::WrongIssuer) {
+            // The second constructed PRM must be tried, but it must not turn
+            // the same untrusted issuer into a token endpoint or a secret sink.
+            let (mut tls,start,headers,body) = self.request().await;
+            assert_eq!(start,"GET /.well-known/oauth-protected-resource HTTP/1.1");
+            assert!(!headers.contains_key("authorization") && body.is_empty());
+            self.gets.fetch_add(1,Ordering::SeqCst);
+            json_reply(&mut tls,&json!({"resource":self.resource(),"authorization_servers":["https://unknown.example/issuer"],"scopes_supported":["read"]}).to_string()).await;
+            return;
+        }
         let token = if matches!(case,Case::WrongEndpoint) { "https://untrusted.example/token".to_owned() } else { format!("{}/token",self.origin()) };
         let auth = if matches!(case,Case::UnsupportedAuth) { "private_key_jwt" } else { "client_secret_basic" };
-        // Deliberately NO authorization endpoint, response_types, PKCE or DCR.
-        json_reply(&mut tls,&json!({"issuer":self.issuer(),"token_endpoint":token,
-            "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":[auth],
-            "scopes_supported":["read"]}).to_string()).await;
+        let count = if matches!(case,Case::WrongEndpoint) { 3 } else { 1 };
+        for path in &MACHINE_ISSUER_LOCATIONS[..count] {
+            let (mut tls,start,headers,body) = self.request().await;
+            assert_eq!(start,format!("GET {path} HTTP/1.1"));
+            assert!(!headers.contains_key("authorization") && body.is_empty());
+            self.gets.fetch_add(1,Ordering::SeqCst);
+            // Deliberately NO authorization endpoint, response_types, PKCE or DCR.
+            json_reply(&mut tls,&json!({"issuer":self.issuer(),"token_endpoint":token,
+                "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":[auth],
+                "scopes_supported":["read"]}).to_string()).await;
+        }
     }
     async fn token_request(&self) -> TlsStream<TcpStream> {
         let (tls,start,headers,body) = self.request().await;
@@ -265,8 +296,24 @@ fn run(case: Case) {
             if matches!(case,Case::WrongIssuer|Case::WrongEndpoint|Case::UnsupportedAuth) {
                 let error = discovered.err().unwrap();
                 match case {
-                    Case::WrongIssuer => assert!(matches!(error,Error::Discovery(OAuthDiscoveryError::NoTrustedIssuer))),
-                    Case::WrongEndpoint => assert!(matches!(error,Error::Discovery(OAuthDiscoveryError::EndpointNotTrusted))),
+                    Case::WrongIssuer => {
+                        use fastmcp_client::http_auth::discovery::{ResourceMetadataCause, ResourceMetadataFailureClass, ResourceMetadataLocation};
+                        let Error::Discovery(OAuthDiscoveryError::ResourceMetadataExhausted(failure)) = error else {
+                            panic!("both untrusted PRM candidates must be reported");
+                        };
+                        assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
+                        assert_eq!(failure.attempts().iter().map(|attempt| (attempt.location(), attempt.cause())).collect::<Vec<_>>(), [
+                            (ResourceMetadataLocation::PathSpecific, ResourceMetadataCause::NoTrustedIssuer),
+                            (ResourceMetadataLocation::OriginRoot, ResourceMetadataCause::NoTrustedIssuer),
+                        ]);
+                        assert_eq!(peer.gets.load(Ordering::SeqCst),2);
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
+                    }
+                    Case::WrongEndpoint => {
+                        assert_endpoint_exhaustion(error);
+                        assert_eq!(peer.gets.load(Ordering::SeqCst),4);
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
+                    }
                     _ => assert!(matches!(error,Error::UnsupportedAuthentication)),
                 }
                 assert_eq!(peer.grants.load(Ordering::SeqCst),0);
@@ -522,3 +569,272 @@ fn live_service_response_cannot_outlive_its_opening_token() { isolated("live_ser
 fn dropping_last_client_owner_revokes_previously_issued_snapshots() { isolated("dropping_last_client_owner_revokes_previously_issued_snapshots",Case::DropOwner); }
 #[test]
 fn machine_call_input_required_is_typed_without_automatic_resubmission() { isolated("machine_call_input_required_is_typed_without_automatic_resubmission",Case::InputRequired); }
+
+// New body-password cases deliberately leave the original Basic/JWT fixture
+// assertions intact. A request cannot pass by choosing whichever method arrives.
+use fastmcp_client::http_auth::discovery::client_credentials::ClientSecretAuthenticationMethod;
+
+const POST_CHILD: &str = "FASTMCP_TEST_CLIENT_SECRET_POST_CASE";
+#[derive(Clone, Copy)]
+enum PostCase {
+    Lifecycle, Encoding, PostAgainstBasic, BasicAgainstPost, BothAdvertised,
+    Denied, Redirect, Lost, Cancel, Drop, InvalidToken, WrongOrigin,
+}
+
+fn isolated_post(name: &str, case: PostCase) {
+    if let Ok(selected) = std::env::var(POST_CHILD) {
+        assert_eq!(selected, name);
+        run_post(case);
+        return;
+    }
+    let roots = RootFile::create();
+    let mut child = Child(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(POST_CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
+        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "secret-post TLS case failed");
+            return;
+        }
+        assert!(Instant::now() < end, "secret-post child exceeded its bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+async fn post_metadata(peer: &Peer, case: PostCase) {
+    let (mut tls, start, headers, body) = peer.request().await;
+    assert_eq!(start, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1");
+    assert!(!headers.contains_key("authorization") && body.is_empty());
+    peer.gets.fetch_add(1, Ordering::SeqCst);
+    json_reply(&mut tls, &json!({"resource":peer.resource(),
+        "authorization_servers":[peer.issuer()],"scopes_supported":["read"]}).to_string()).await;
+    drop(tls);
+    let methods = match case {
+        PostCase::PostAgainstBasic => json!(["client_secret_basic"]),
+        PostCase::BothAdvertised | PostCase::Denied | PostCase::Redirect | PostCase::Lost =>
+            json!(["private_key_jwt", "client_secret_basic", "client_secret_post"]),
+        _ => json!(["client_secret_post"]),
+    };
+    let token = if matches!(case, PostCase::WrongOrigin) {
+        "https://untrusted.example/token".to_owned()
+    } else { format!("{}/token", peer.origin()) };
+    let count = if matches!(case, PostCase::WrongOrigin) { 3 } else { 1 };
+    for path in &MACHINE_ISSUER_LOCATIONS[..count] {
+        let (mut tls, start, headers, body) = peer.request().await;
+        assert_eq!(start, format!("GET {path} HTTP/1.1"));
+        assert!(!headers.contains_key("authorization") && body.is_empty());
+        peer.gets.fetch_add(1, Ordering::SeqCst);
+        json_reply(&mut tls, &json!({"issuer":peer.issuer(),"token_endpoint":token,
+            "grant_types_supported":["client_credentials"],
+            "token_endpoint_auth_methods_supported":methods,"scopes_supported":["read"]}).to_string()).await;
+    }
+}
+
+async fn post_token_request(peer: &Peer, id: &str, secret: &str) -> TlsStream<TcpStream> {
+    let (tls, start, headers, body) = peer.request().await;
+    assert_eq!(start, "POST /token HTTP/1.1", "credentials must not enter a query string");
+    assert!(!headers.contains_key("authorization"), "body credentials must not be combined with Basic or bearer auth");
+    assert!(!headers.values().any(|value| value.contains(secret)));
+    assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+    let raw = std::str::from_utf8(&body).unwrap();
+    let fields = form(raw);
+    assert_eq!(fields.len(), 5);
+    assert_eq!(raw.split('&').count(), 5, "a secret must not inject or duplicate a form field");
+    assert_eq!(fields["grant_type"], "client_credentials");
+    assert_eq!(fields["resource"], peer.resource());
+    assert_eq!(fields["scope"], "read");
+    assert_eq!(fields["client_id"], id);
+    assert_eq!(fields["client_secret"], secret);
+    assert!(!fields.contains_key("client_assertion") && !fields.contains_key("refresh_token"));
+    peer.grants.fetch_add(1, Ordering::SeqCst);
+    tls
+}
+
+async fn post_grant(peer: &Peer, id: &str, secret: &str, token: &str, seconds: u64) {
+    let mut tls = post_token_request(peer, id, secret).await;
+    json_reply(&mut tls, &json!({"access_token":token,"token_type":"Bearer",
+        "expires_in":seconds,"scope":"read","refresh_token":"NEVER-USE-THIS"}).to_string()).await;
+}
+
+fn run_post(case: PostCase) {
+    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(Box::pin(async {
+        let cx = Cx::current().unwrap();
+        let scenario = Box::pin(async {
+            let peer = Peer::new().await;
+            let (id, secret) = if matches!(case, PostCase::Encoding) {
+                ("service:β +/%", "secret&scope=admin+%é")
+            } else { ("service-client", "service-secret") };
+            let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+            let issuer = TrustedOAuthIssuer::new(peer.issuer()).unwrap().with_root_certificate(root.clone()).unwrap();
+            let mut plan = ClientCredentialsPlan::new(url(&peer.resource()), issuer, id, secret, vec!["read".to_owned()]).unwrap()
+                .with_resource_root_certificate(root).unwrap().with_renewal_leeway(Duration::ZERO).unwrap()
+                .with_timeout(Duration::from_secs(15)).unwrap();
+            if !matches!(case, PostCase::BasicAgainstPost) {
+                plan = plan.with_secret_authentication(ClientSecretAuthenticationMethod::Post).unwrap();
+                assert!(format!("{plan:?}").contains("client_secret_post"));
+            }
+            assert!(!format!("{plan:?}").contains(secret));
+            let ((), result) = pair(post_metadata(&peer, case), plan.discover(&cx)).await;
+            if matches!(case, PostCase::PostAgainstBasic | PostCase::BasicAgainstPost | PostCase::WrongOrigin) {
+                let error = result.err().unwrap();
+                if matches!(case, PostCase::WrongOrigin) {
+                    assert_endpoint_exhaustion(error);
+                    assert_eq!(peer.gets.load(Ordering::SeqCst), 4);
+                } else {
+                    assert!(matches!(error, Error::UnsupportedAuthentication));
+                    assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+                }
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                peer.quiet();
+                return;
+            }
+            let client = result.unwrap();
+            match case {
+                PostCase::Lifecycle | PostCase::Encoding | PostCase::BothAdvertised => {
+                    let seconds = if matches!(case, PostCase::Lifecycle) { 1 } else { 300 };
+                    let clone = client.clone();
+                    let ((), (one, two)) = pair(post_grant(&peer, id, secret, "post-access", seconds),
+                        pair(client.credential(&cx), clone.credential(&cx))).await;
+                    let old = one.unwrap();
+                    assert_eq!(old.generation(), 1);
+                    assert_eq!(two.unwrap().generation(), 1, "concurrent consumers share the same grant");
+                    assert!(!format!("{old:?} {client:?}").contains(secret));
+                    let ((), response) = pair(peer.operation(1, "tools/list", "post-access", LIST),
+                        client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2))).await;
+                    assert!(response.unwrap().read_json_result(&cx, 4096).await.unwrap().encode().unwrap().contains("1.20e+4"));
+                    assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                    if matches!(case, PostCase::Lifecycle) {
+                        Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
+                        assert!(old.credential().authorization_for_target(client.resource()).is_none());
+                        let ((), fresh) = pair(post_grant(&peer, id, secret, "post-renewed", 300), client.credential(&cx)).await;
+                        assert_eq!(fresh.unwrap().generation(), 2);
+                        let ((), response) = pair(peer.operation(3, "tools/call", "post-renewed", CALL),
+                            client.execute_core(&cx, core("tools/call"), RequestId::Number(3), RequestId::Number(4))).await;
+                        assert!(response.unwrap().read_json_result(&cx, 4096).await.is_ok());
+                        assert_eq!(peer.grants.load(Ordering::SeqCst), 2, "renewal must use another Post grant, not refresh_token or Basic");
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst), 4);
+                    } else { assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2); }
+                }
+                PostCase::Denied | PostCase::Redirect | PostCase::Lost | PostCase::InvalidToken => {
+                    let server = async {
+                        let mut tls = post_token_request(&peer, id, secret).await;
+                        match case {
+                            PostCase::Denied => {
+                                let body = json!({"error":"invalid_client","error_description":secret}).to_string();
+                                tls.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                                tls.flush().await.unwrap();
+                            }
+                            PostCase::Redirect => {
+                                tls.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {}/alternate-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", peer.origin()).as_bytes()).await.unwrap();
+                                tls.flush().await.unwrap();
+                            }
+                            PostCase::InvalidToken => json_reply(&mut tls,
+                                r#"{"access_token":"rejected","token_type":"Bearer","scope":"admin","expires_in":300}"#).await,
+                            _ => {},
+                        }
+                    };
+                    let ((), result) = pair(server, client.credential(&cx)).await;
+                    let error = result.err().unwrap();
+                    assert!(!format!("{error:?} {error}").contains(secret));
+                    match case {
+                        PostCase::Denied | PostCase::Redirect => assert!(matches!(error, Error::TokenEndpointRejected)),
+                        PostCase::Lost => assert!(matches!(error, Error::Transport)),
+                        _ => assert!(matches!(error, Error::ExpandedScope)),
+                    }
+                    assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                    peer.quiet(); // Even when Basic was advertised, no fallback is sent.
+                    if matches!(case, PostCase::InvalidToken) {
+                        let ((), fresh) = pair(post_grant(&peer, id, secret, "corrected", 300), client.credential(&cx)).await;
+                        assert_eq!(fresh.unwrap().generation(), 1, "rejected response must not install a token");
+                        assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
+                    }
+                    assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                }
+                PostCase::Cancel | PostCase::Drop => {
+                    let cancellation = McpRequestCancellation::new();
+                    let (sent, mut received) = oneshot::channel::<()>();
+                    let server = async {
+                        let tls = post_token_request(&peer, id, secret).await;
+                        sent.send(&cx, ()).unwrap();
+                        closed(tls).await;
+                    };
+                    let application = async {
+                        let mut pending = Box::pin(client.credential_with_cancellation(&cx, &cancellation));
+                        let mut started = std::pin::pin!(received.recv(&cx));
+                        poll_fn(|task| {
+                            assert!(pending.as_mut().poll(task).is_pending());
+                            started.as_mut().poll(task)
+                        }).await.unwrap();
+                        if matches!(case, PostCase::Drop) { drop(pending); }
+                        else {
+                            cancellation.cancel();
+                            assert!(matches!(pending.await, Err(Error::Discovery(OAuthDiscoveryError::Cancelled))));
+                        }
+                    };
+                    pair(server, application).await;
+                    assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                    assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                }
+                PostCase::PostAgainstBasic | PostCase::BasicAgainstPost | PostCase::WrongOrigin => unreachable!(),
+            }
+            assert!(cx.checkpoint().is_ok());
+            assert_eq!(peer.gets.load(Ordering::SeqCst), 2);
+            peer.quiet();
+            client.close();
+        });
+        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
+            .expect("secret-post TLS scenario must settle within its bound");
+    }));
+}
+
+#[test]
+fn secret_post_login_renewal_and_protected_calls_share_the_selected_method() {
+    isolated_post("secret_post_login_renewal_and_protected_calls_share_the_selected_method", PostCase::Lifecycle);
+}
+#[test]
+fn secret_post_preserves_unicode_and_form_delimiters_without_double_encoding() {
+    isolated_post("secret_post_preserves_unicode_and_form_delimiters_without_double_encoding", PostCase::Encoding);
+}
+#[test]
+fn secret_post_selection_refuses_basic_only_metadata_before_sending_credentials() {
+    isolated_post("secret_post_selection_refuses_basic_only_metadata_before_sending_credentials", PostCase::PostAgainstBasic);
+}
+#[test]
+fn default_basic_refuses_post_only_metadata_before_sending_credentials() {
+    isolated_post("default_basic_refuses_post_only_metadata_before_sending_credentials", PostCase::BasicAgainstPost);
+}
+#[test]
+fn advertised_method_order_cannot_override_explicit_secret_post_selection() {
+    isolated_post("advertised_method_order_cannot_override_explicit_secret_post_selection", PostCase::BothAdvertised);
+}
+#[test]
+fn denied_secret_post_does_not_retry_as_basic_or_reflect_credentials() {
+    isolated_post("denied_secret_post_does_not_retry_as_basic_or_reflect_credentials", PostCase::Denied);
+}
+#[test]
+fn redirected_secret_post_is_not_forwarded_or_replayed() {
+    isolated_post("redirected_secret_post_is_not_forwarded_or_replayed", PostCase::Redirect);
+}
+#[test]
+fn lost_secret_post_reply_does_not_switch_authentication_methods() {
+    isolated_post("lost_secret_post_reply_does_not_switch_authentication_methods", PostCase::Lost);
+}
+#[test]
+fn cancelled_secret_post_releases_the_pending_exchange() {
+    isolated_post("cancelled_secret_post_releases_the_pending_exchange", PostCase::Cancel);
+}
+#[test]
+fn abandoned_secret_post_releases_the_pending_exchange() {
+    isolated_post("abandoned_secret_post_releases_the_pending_exchange", PostCase::Drop);
+}
+#[test]
+fn invalid_secret_post_token_does_not_advance_the_cached_generation() {
+    isolated_post("invalid_secret_post_token_does_not_advance_the_cached_generation", PostCase::InvalidToken);
+}
+#[test]
+fn secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin() {
+    isolated_post("secret_post_cannot_send_credentials_to_an_unapproved_endpoint_origin", PostCase::WrongOrigin);
+}

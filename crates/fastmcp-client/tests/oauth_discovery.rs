@@ -2,6 +2,11 @@
 //! POSTs, with an in-process browser-callback simulator. No external IdP/browser
 //! is exercised. All registration writes are confined to the local TLS fixture.
 
+#[path = "oauth_discovery/resource_metadata.rs"]
+mod resource_metadata;
+#[path = "oauth_discovery/issuer_metadata.rs"]
+mod issuer_metadata;
+
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -18,6 +23,7 @@ use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream};
 use fastmcp_client::http_auth::BoundBearerCredential;
 use fastmcp_client::http_auth::discovery::{OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer};
+use fastmcp_client::http_auth::discovery::issuer::{IssuerMetadataCause, IssuerMetadataFailureClass};
 use fastmcp_client::http_auth::discovery::registration::{
     NativeClientRegistration, OAuthRegistrationError, NATIVE_REGISTRATION_REDIRECT_URIS,
 };
@@ -25,6 +31,12 @@ use fastmcp_client::http_auth::managed::OAuthSessionPolicy;
 use fastmcp_client::http_auth::oauth::OAuthError;
 use fastmcp_core::CanonicalHttpUrl;
 use serde_json::{Value, json};
+
+const ISSUER_CANDIDATES: [&str; 3] = [
+    "/.well-known/oauth-authorization-server/tenant",
+    "/.well-known/openid-configuration/tenant",
+    "/tenant/.well-known/openid-configuration",
+];
 
 // Public TEST ONLY fixture material. These keys must never be deployment keys.
 const ROOT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D\nUCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw\nMDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo\nApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS\nBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI\nrmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY\nvQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW\nX/aCEJ5+hA==\n-----END CERTIFICATE-----\n";
@@ -332,7 +344,7 @@ fn public_discovery_fallbacks_feed_the_actual_managed_pkce_login() {
 }
 
 #[test]
-fn issuer_http_failures_do_not_fallback_or_launch_the_browser() {
+fn issuer_http_failures_exhaust_the_same_issuer_without_launching_the_browser() {
     for status in [302, 307, 401, 403, 500] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -341,7 +353,7 @@ fn issuer_http_failures_do_not_fallback_or_launch_the_browser() {
             let launches = AtomicUsize::new(0);
             let server = async {
                 peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-                peer.serve("/.well-known/oauth-authorization-server/tenant", status, "peer-error-canary").await;
+                for path in ISSUER_CANDIDATES { peer.serve(path, status, "peer-error-canary").await; }
             };
             let application = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
                 launches.fetch_add(1, Ordering::SeqCst);
@@ -349,10 +361,13 @@ fn issuer_http_failures_do_not_fallback_or_launch_the_browser() {
             });
             let ((), result) = pair(server, application).await;
             let error = result.err().unwrap();
-            assert!(matches!(error, OAuthDiscoveryError::HttpStatus { status: actual } if actual == status));
             assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
+            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = error else { panic!("all candidate failures must remain visible") };
+            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
+                [IssuerMetadataCause::HttpStatus(status); 3]);
+            assert_eq!(failure.classification(), IssuerMetadataFailureClass::ProtocolOrHttp);
             assert_eq!(launches.load(Ordering::SeqCst), 0);
-            assert_eq!(peer.paths.lock().unwrap().len(), 2);
+            assert_eq!(peer.paths.lock().unwrap().len(), 4);
             peer.assert_no_extra_connections();
         });
     }
@@ -383,16 +398,25 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
             let launches = AtomicUsize::new(0);
             let server = async {
                 peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
-                peer.serve("/.well-known/oauth-authorization-server/tenant", 200, &body).await;
+                for path in ISSUER_CANDIDATES { peer.serve(path, 200, &body).await; }
             };
             let application = plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
                 launches.fetch_add(1, Ordering::SeqCst);
                 async { Ok(()) }
             });
             let ((), result) = pair(server, application).await;
-            assert!(result.is_err());
+            let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.err().unwrap() else { panic!("aggregate expected") };
+            let expected = match dimension {
+                0 => IssuerMetadataCause::IssuerMismatch,
+                1 => IssuerMetadataCause::EndpointNotTrusted,
+                2 => IssuerMetadataCause::UnsupportedFlow,
+                4 => IssuerMetadataCause::UnsupportedScopes,
+                5 => IssuerMetadataCause::SignedMetadataUnsupported,
+                _ => IssuerMetadataCause::InvalidMetadata,
+            };
+            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [expected; 3]);
             assert_eq!(launches.load(Ordering::SeqCst), 0);
-            assert_eq!(peer.paths.lock().unwrap().len(), 2);
+            assert_eq!(peer.paths.lock().unwrap().len(), 4);
             peer.assert_no_extra_connections();
         });
     }
@@ -400,6 +424,7 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
 
 #[test]
 fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
+    use fastmcp_client::http_auth::discovery::{ResourceMetadataCause, ResourceMetadataFailureClass};
     for trusted in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -411,14 +436,19 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
             } else {
                 document["authorization_servers"] = json!(["https://127.0.0.1:9/forbidden"]);
             }
-            let application = plan.discover(&cx);
-            let ((), result) = pair(peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &document.to_string()), application).await;
-            if trusted {
-                assert!(matches!(result, Err(OAuthDiscoveryError::ResourceMismatch)));
-            } else {
-                assert!(matches!(result, Err(OAuthDiscoveryError::NoTrustedIssuer)));
-            }
-            assert_eq!(peer.paths.lock().unwrap().len(), 1);
+            let server = async {
+                for path in ["/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource"] {
+                    peer.serve(path, 200, &document.to_string()).await;
+                }
+            };
+            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+                panic!("both unusable resource candidates must retain their admission causes");
+            };
+            let expected = if trusted { ResourceMetadataCause::ResourceMismatch } else { ResourceMetadataCause::NoTrustedIssuer };
+            assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
+            assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [expected, expected]);
+            assert_eq!(peer.paths.lock().unwrap().len(), 2);
             peer.assert_no_extra_connections();
         });
     }
@@ -426,6 +456,7 @@ fn invalid_resource_identity_or_untrusted_issuer_stops_before_issuer_contact() {
 
 #[test]
 fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
+    use fastmcp_client::http_auth::discovery::ResourceMetadataCause;
     for trust_resource in [false, true] {
         run(async {
             let cx = Cx::current().unwrap();
@@ -435,11 +466,24 @@ fn each_discovery_leg_requires_its_own_tls_trust_before_sending_a_get() {
                 if trust_resource {
                     peer.serve("/.well-known/oauth-protected-resource/mcp", 200, &peer.resource_document().to_string()).await;
                 }
-                let (socket, _) = peer.listener.accept().await.unwrap();
-                assert!(peer.acceptor.accept(socket).await.is_err(), "untrusted certificate cannot become an HTTP stream");
+                // Neither resource candidate may send a GET without trusted TLS.
+                // Once PRM succeeds, all three issuer candidates retain that boundary.
+                for _ in 0..if trust_resource { 3 } else { 2 } {
+                    let (socket, _) = peer.listener.accept().await.unwrap();
+                    assert!(peer.acceptor.accept(socket).await.is_err(), "untrusted certificate cannot become an HTTP stream");
+                }
             };
             let ((), result) = pair(server, plan.discover(&cx)).await;
-            assert!(matches!(result, Err(OAuthDiscoveryError::TransportFailed)));
+            if trust_resource {
+                let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else { panic!("issuer TLS failures must remain visible") };
+                assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [IssuerMetadataCause::TransportFailed; 3]);
+            } else {
+                let OAuthDiscoveryError::ResourceMetadataExhausted(failure) = result.unwrap_err() else {
+                    panic!("both resource TLS failures must remain visible");
+                };
+                assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(),
+                    [ResourceMetadataCause::TransportFailed, ResourceMetadataCause::TransportFailed]);
+            }
             assert_eq!(peer.paths.lock().unwrap().len(), usize::from(trust_resource));
             peer.assert_no_extra_connections();
         });
@@ -489,7 +533,9 @@ fn metadata_location_exhaustion_is_bounded_and_precancellation_has_no_contact() 
             }
         };
         let ((), result) = pair(server, plan.discover(&cx)).await;
-        assert!(matches!(result, Err(OAuthDiscoveryError::MetadataNotFound)));
+        let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.unwrap_err() else { panic!("issuer exhaustion expected") };
+        assert_eq!(failure.attempts().iter().map(|attempt| attempt.cause()).collect::<Vec<_>>(), [IssuerMetadataCause::NotFound; 3]);
+        assert_eq!(failure.classification(), IssuerMetadataFailureClass::NotFound);
         assert_eq!(peer.paths.lock().unwrap().len(), 4);
         // Cancel the caller's real, capability-carrying context rather than a
         // detached one: `Cx::detached_cancel_context` yields an empty capability
@@ -693,9 +739,15 @@ fn registration_checks_the_complete_code_flow_before_creating_remote_state() {
                 2 => document["token_endpoint"] = json!("https://untrusted.invalid/token"),
                 _ => { document.as_object_mut().unwrap().remove("registration_endpoint"); },
             }
-            let ((), result) = pair(peer.registration_discovery(&document), peer.registration().register(&cx)).await;
+            let server = async {
+                peer.registration_discovery(&document).await;
+                if matches!(dimension, 1 | 2) {
+                    for path in &ISSUER_CANDIDATES[1..] { peer.serve(path, 200, &document.to_string()).await; }
+                }
+            };
+            let ((), result) = pair(server, peer.registration().register(&cx)).await;
             assert!(result.is_err());
-            assert_eq!(peer.paths.lock().unwrap().len(), 2);
+            assert_eq!(peer.paths.lock().unwrap().len(), if matches!(dimension, 1 | 2) { 4 } else { 2 });
             peer.assert_no_extra_connections();
         });
     }

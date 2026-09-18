@@ -33,6 +33,9 @@
 //! Bounds are caller-supplied with no ambient defaults: the frozen central
 //! ceilings must be wired explicitly by the integration layer.
 
+/// Origin-bound ingress and browser preflight before protocol admission.
+pub mod security;
+
 use core::fmt;
 use std::sync::Arc;
 

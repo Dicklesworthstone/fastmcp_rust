@@ -36,6 +36,10 @@ use super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 pub mod registration;
 /// Preregistered machine-to-machine authentication without browser or DCR fallback.
 pub mod client_credentials;
+/// Resource-bound Bearer challenges and explicitly trusted metadata relocation.
+pub mod challenge;
+/// Ordered same-issuer metadata retrieval and bounded aggregate diagnostics.
+pub mod issuer;
 
 /// Maximum retained bytes in each resource or issuer metadata document.
 pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
@@ -62,6 +66,11 @@ pub enum OAuthDiscoveryError {
     UnsupportedFlow,
     UnsupportedScopes,
     SignedMetadataUnsupported,
+    /// Neither constructed resource-metadata location was usable. Diagnostics
+    /// retain every attempted location's safe tag and cause, never peer bytes.
+    ResourceMetadataExhausted(ResourceMetadataFailure),
+    /// No permitted location of the selected issuer passed candidate admission.
+    IssuerMetadataExhausted(issuer::IssuerMetadataFailure),
     Login(OAuthSessionError),
 }
 
@@ -84,12 +93,125 @@ impl fmt::Display for OAuthDiscoveryError {
             Self::UnsupportedFlow => "issuer does not admit the native S256 code flow",
             Self::UnsupportedScopes => "OAuth metadata does not admit the requested scopes",
             Self::SignedMetadataUnsupported => "signed OAuth metadata requires a separate verifier",
+            Self::ResourceMetadataExhausted(_) => "no constructed resource-metadata location passed admission",
+            Self::IssuerMetadataExhausted(_) => "no permitted issuer-metadata location passed admission",
             Self::Login(_) => "login after OAuth discovery failed",
         })
     }
 }
 
 impl std::error::Error for OAuthDiscoveryError {}
+
+/// Safe canonical tags for the only two constructed PRM candidates. No URI,
+/// tenant path, response body or authentication challenge enters diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceMetadataLocation {
+    PathSpecific,
+    OriginRoot,
+}
+
+/// A bounded candidate outcome, with no retained transport or parser error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceMetadataCause {
+    NotFound,
+    HttpStatus(u16),
+    InvalidRepresentation,
+    InvalidMetadata,
+    ResourceMismatch,
+    NoTrustedIssuer,
+    UnsupportedFlow,
+    UnsupportedScopes,
+    SignedMetadataUnsupported,
+    TransportFailed,
+    CandidateDeadline,
+    Cancelled,
+    RuntimeUnavailable,
+    InvalidPolicy,
+}
+
+/// Deterministic aggregate precedence: caller interruption, then trust and
+/// integrity, then HTTP/protocol, then transport, then absence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceMetadataFailureClass {
+    Cancelled,
+    OverallDeadline,
+    TrustOrIntegrity,
+    ProtocolOrHttp,
+    Transport,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceMetadataAttempt {
+    location: ResourceMetadataLocation,
+    cause: ResourceMetadataCause,
+}
+
+impl ResourceMetadataAttempt {
+    pub fn location(&self) -> ResourceMetadataLocation { self.location }
+    pub fn cause(&self) -> ResourceMetadataCause { self.cause }
+}
+
+/// Ordered failure record with exactly one or two attempted constructed URLs.
+/// A root resource has only one distinct candidate. Cancellation/overall-budget
+/// exhaustion can stop before the second candidate; unattempted slots are not
+/// fabricated. Private construction keeps this vector's cardinality bounded.
+#[derive(Debug)]
+pub struct ResourceMetadataFailure {
+    attempts: Vec<ResourceMetadataAttempt>,
+    interrupted: Option<ResourceMetadataFailureClass>,
+}
+
+impl ResourceMetadataFailure {
+    pub fn attempts(&self) -> &[ResourceMetadataAttempt] { &self.attempts }
+
+    pub fn classification(&self) -> ResourceMetadataFailureClass {
+        if let Some(interrupted) = self.interrupted { return interrupted; }
+        let mut class = ResourceMetadataFailureClass::NotFound;
+        let mut priority = 0;
+        for attempt in &self.attempts {
+            let (candidate, rank) = match attempt.cause {
+                ResourceMetadataCause::Cancelled => (ResourceMetadataFailureClass::Cancelled, 5),
+                ResourceMetadataCause::ResourceMismatch
+                | ResourceMetadataCause::NoTrustedIssuer
+                | ResourceMetadataCause::UnsupportedFlow
+                | ResourceMetadataCause::UnsupportedScopes
+                | ResourceMetadataCause::SignedMetadataUnsupported
+                | ResourceMetadataCause::InvalidPolicy => (ResourceMetadataFailureClass::TrustOrIntegrity, 4),
+                ResourceMetadataCause::HttpStatus(_)
+                | ResourceMetadataCause::InvalidRepresentation
+                | ResourceMetadataCause::InvalidMetadata => (ResourceMetadataFailureClass::ProtocolOrHttp, 3),
+                ResourceMetadataCause::TransportFailed
+                | ResourceMetadataCause::CandidateDeadline
+                | ResourceMetadataCause::RuntimeUnavailable => (ResourceMetadataFailureClass::Transport, 2),
+                ResourceMetadataCause::NotFound => (ResourceMetadataFailureClass::NotFound, 1),
+            };
+            if rank > priority { class = candidate; priority = rank; }
+        }
+        class
+    }
+}
+
+fn resource_candidate_cause(error: &OAuthDiscoveryError) -> ResourceMetadataCause {
+    match error {
+        OAuthDiscoveryError::HttpStatus { status } => ResourceMetadataCause::HttpStatus(*status),
+        OAuthDiscoveryError::MetadataNotFound => ResourceMetadataCause::NotFound,
+        OAuthDiscoveryError::InvalidRepresentation => ResourceMetadataCause::InvalidRepresentation,
+        OAuthDiscoveryError::InvalidMetadata => ResourceMetadataCause::InvalidMetadata,
+        OAuthDiscoveryError::ResourceMismatch => ResourceMetadataCause::ResourceMismatch,
+        OAuthDiscoveryError::NoTrustedIssuer => ResourceMetadataCause::NoTrustedIssuer,
+        OAuthDiscoveryError::UnsupportedFlow => ResourceMetadataCause::UnsupportedFlow,
+        OAuthDiscoveryError::UnsupportedScopes => ResourceMetadataCause::UnsupportedScopes,
+        OAuthDiscoveryError::SignedMetadataUnsupported => ResourceMetadataCause::SignedMetadataUnsupported,
+        OAuthDiscoveryError::TransportFailed => ResourceMetadataCause::TransportFailed,
+        OAuthDiscoveryError::TimedOut => ResourceMetadataCause::CandidateDeadline,
+        OAuthDiscoveryError::Cancelled => ResourceMetadataCause::Cancelled,
+        OAuthDiscoveryError::RuntimeUnavailable => ResourceMetadataCause::RuntimeUnavailable,
+        OAuthDiscoveryError::InvalidPolicy | OAuthDiscoveryError::IssuerMismatch
+        | OAuthDiscoveryError::EndpointNotTrusted | OAuthDiscoveryError::ResourceMetadataExhausted(_)
+        | OAuthDiscoveryError::IssuerMetadataExhausted(_) | OAuthDiscoveryError::Login(_) => ResourceMetadataCause::InvalidPolicy,
+    }
+}
 
 /// One administrator-trusted issuer and its permitted endpoint origins.
 /// The identifier keeps its exact spelling for RFC 9207 issuer comparison.
@@ -213,8 +335,13 @@ impl OAuthDiscoveryPlan {
     }
 
     /// One absolute bound across resource discovery and all permitted issuer
-    /// locations, not a fresh timeout per fallback. The caller's tighter budget
+    /// locations, not a fresh timeout per fallback. Constructed PRM retrieval
+    /// reserves half the remaining time for issuer discovery. The other half
+    /// is divided equally between its one or two candidates, so a stalled first
+    /// response cannot consume the root attempt. The caller's tighter budget
     /// wins. Browser login uses its separate existing authorization deadline.
+    /// Issuer candidates likewise reserve independent time shares and leave
+    /// half their entry-time budget for work following successful discovery.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, OAuthDiscoveryError> {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(OAuthDiscoveryError::InvalidPolicy);
@@ -229,40 +356,87 @@ impl OAuthDiscoveryPlan {
         Ok(self)
     }
 
-    /// Discovers usable public-client code-flow endpoints. A 404/410 alone
-    /// permits the next well-known issuer location; malformed JSON, issuer
-    /// mismatch, TLS failure, redirects, 401/403, or 5xx terminate discovery.
-    /// An invalid selected issuer never causes a switch to a lower-priority one.
+    /// Discovers usable public-client code-flow endpoints. Constructed PRM
+    /// locations are tried path-first then root after any unusable bounded
+    /// candidate, with full identity/trust admission before selecting a winner.
+    /// The fixed same-issuer metadata sequence then selects its first fully
+    /// admitted native code-flow configuration, not merely its first HTTP 200.
+    /// This never follows redirects, retries a URL, changes the selected issuer,
+    /// relaxes endpoint trust, or accepts a rejected explicit challenge hint.
     pub async fn discover(&self, cx: &Cx) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         if self.client_id.is_none() {
             return Err(OAuthDiscoveryError::InvalidPolicy);
         }
         let deadline = discovery_deadline(cx, self.timeout)?;
-        let (issuer, body) = self.discover_issuer_document(cx, deadline).await?;
-        let configuration = self.admit_issuer(issuer, &body)?;
-        check_context(cx, deadline)?;
-        Ok(configuration)
+        let issuer = self.discover_resource_issuer(cx, deadline).await?;
+        self.discover_selected_issuer(cx, deadline, issuer).await
     }
 
-    // Registration and preregistered discovery share the same bounded fetch,
-    // local issuer selection and terminal-versus-fallback decisions.
+    async fn discover_selected_issuer(
+        &self, cx: &Cx, deadline: Time, selected: &TrustedOAuthIssuer,
+    ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
+        issuer::discover(cx, deadline, selected, |body| self.admit_issuer(selected, body)).await
+    }
+
+    // Registration, machine authentication and preregistered native discovery
+    // share constructed PRM admission. An explicit challenge URI intentionally
+    // bypasses this helper: its rejection never permits constructed fallback.
+    async fn discover_resource_issuer(
+        &self, cx: &Cx, deadline: Time,
+    ) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
+        check_context(cx, deadline)?;
+        let candidates = resource_metadata_urls(&self.resource)?;
+        let deadlines = resource_candidate_deadlines(cx.now(), deadline, candidates.len())?;
+        let mut failure = ResourceMetadataFailure { attempts: Vec::with_capacity(2), interrupted: None };
+        for ((tag, location), candidate_deadline) in candidates.into_iter().zip(deadlines) {
+            // Check the outer budget before opening each candidate. A candidate
+            // timeout alone is NOT an outer-budget failure and permits the root.
+            if cx.checkpoint().is_err() {
+                failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
+                break;
+            }
+            if cx.now() >= deadline {
+                failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
+                break;
+            }
+            let result = fetch_metadata(cx, candidate_deadline, &location, &self.resource_roots).await
+                .and_then(|body| body.ok_or(OAuthDiscoveryError::MetadataNotFound))
+                .and_then(|body| self.select_issuer(&body));
+            // Admission is part of the candidate's allowance, not unbounded
+            // work after its network timeout. A noncooperative synchronous
+            // decoder cannot be preempted, but no later effect follows an overrun.
+            let result = if cx.checkpoint().is_err() {
+                Err(OAuthDiscoveryError::Cancelled)
+            } else if cx.now() >= candidate_deadline {
+                Err(OAuthDiscoveryError::TimedOut)
+            } else { result };
+            match result {
+                Ok(issuer) => return Ok(issuer),
+                Err(error) => failure.attempts.push(ResourceMetadataAttempt {
+                    location: tag, cause: resource_candidate_cause(&error),
+                }),
+            }
+        }
+        if cx.checkpoint().is_err() {
+            failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
+        } else if cx.now() >= deadline {
+            failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
+        }
+        Err(OAuthDiscoveryError::ResourceMetadataExhausted(failure))
+    }
+
+    // Registration and machine authentication share the same bounded transport,
+    // identity and endpoint-document admission. Their subsequent registration
+    // or selected authentication-method checks remain explicit and cannot switch
+    // credentials or issuers. Exact source bytes reach their profile decoders.
     async fn discover_issuer_document(
         &self,
         cx: &Cx,
         deadline: Time,
     ) -> Result<(&TrustedOAuthIssuer, Vec<u8>), OAuthDiscoveryError> {
-        let resource_url = resource_metadata_url(&self.resource)?;
-        let body = fetch_metadata(cx, deadline, &resource_url, &self.resource_roots)
-            .await?.ok_or(OAuthDiscoveryError::MetadataNotFound)?;
-        let issuer = self.select_issuer(&body)?;
-        for location in issuer_metadata_urls(&issuer.url)? {
-            check_context(cx, deadline)?;
-            if let Some(body) = fetch_metadata(cx, deadline, &location, &issuer.roots).await? {
-                check_context(cx, deadline)?;
-                return Ok((issuer, body));
-            }
-        }
-        Err(OAuthDiscoveryError::MetadataNotFound)
+        let selected = self.discover_resource_issuer(cx, deadline).await?;
+        let body = issuer::discover(cx, deadline, selected, |body| issuer::admit_document(selected, body)).await?;
+        Ok((selected, body))
     }
 
     /// Resolves metadata and then drives the existing browser/PKCE/managed
@@ -411,9 +585,35 @@ fn origin_of(url: &CanonicalHttpUrl) -> String {
 }
 
 fn resource_metadata_url(resource: &CanonicalHttpUrl) -> Result<CanonicalHttpUrl, OAuthDiscoveryError> {
+    let path = if resource.path() == "/" { "" } else { resource.path() };
     CanonicalHttpUrl::parse(&format!(
-        "{}/.well-known/oauth-protected-resource{}", origin_of(resource), resource.path(),
+        "{}/.well-known/oauth-protected-resource{path}", origin_of(resource),
     )).map_err(|_| OAuthDiscoveryError::InvalidPolicy)
+}
+
+fn resource_metadata_urls(
+    resource: &CanonicalHttpUrl,
+) -> Result<Vec<(ResourceMetadataLocation, CanonicalHttpUrl)>, OAuthDiscoveryError> {
+    validate_https(resource).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    let path = resource_metadata_url(resource)?;
+    let root = CanonicalHttpUrl::parse(&format!(
+        "{}/.well-known/oauth-protected-resource", origin_of(resource),
+    )).map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
+    if path == root { return Ok(vec![(ResourceMetadataLocation::OriginRoot, root)]); }
+    Ok(vec![(ResourceMetadataLocation::PathSpecific, path), (ResourceMetadataLocation::OriginRoot, root)])
+}
+
+// Allocate the complete schedule before the first fetch. The root has its own
+// time and 64-KiB body allowance, and at least half the original remaining time
+// remains available for the issuer. There are no resets after trickled bytes.
+fn resource_candidate_deadlines(
+    now: Time, deadline: Time, count: usize,
+) -> Result<Vec<Time>, OAuthDiscoveryError> {
+    if !(1..=2).contains(&count) { return Err(OAuthDiscoveryError::InvalidPolicy); }
+    let remaining = deadline.as_nanos().checked_sub(now.as_nanos()).ok_or(OAuthDiscoveryError::TimedOut)?;
+    let share = remaining / 2 / count as u64;
+    if share == 0 { return Err(OAuthDiscoveryError::TimedOut); }
+    Ok((1..=count).map(|index| Time::from_nanos(now.as_nanos() + share * index as u64)).collect())
 }
 
 fn issuer_metadata_urls(issuer: &CanonicalHttpUrl) -> Result<Vec<CanonicalHttpUrl>, OAuthDiscoveryError> {
@@ -586,14 +786,10 @@ async fn within<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
 ) -> Result<T, OAuthDiscoveryError> {
-    // Fail closed when the caller's runtime has no timer driver. The sleep
-    // below resolves its driver from the ambient `Cx` that each poll installs,
-    // so a missing driver must surface as a typed error here rather than as a
-    // future that is never woken.
-    if cx.timer_driver().is_none() {
-        return Err(OAuthDiscoveryError::RuntimeUnavailable);
-    }
-    let mut sleep = std::pin::pin!(Sleep::new(deadline));
+    // Bind the timer directly to the supplied caller. Candidate sub-deadlines
+    // must wake even when a different/no Cx was ambient at future construction.
+    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
+    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
@@ -849,5 +1045,89 @@ mod tests {
             vec![issuer.clone(), issuer], "client", vec![]).is_err());
         assert!(plan().with_timeout(Duration::ZERO).is_err());
         assert!(plan().with_timeout(Duration::from_secs(121)).is_err());
+    }
+
+    #[test]
+    fn constructed_resource_candidates_preserve_path_and_deduplicate_root() {
+        let candidates = resource_metadata_urls(&url("https://[::1]:8443/a%2Fb/")).unwrap();
+        assert_eq!(candidates.iter().map(|(_, url)| url.as_str()).collect::<Vec<_>>(), [
+            "https://[::1]:8443/.well-known/oauth-protected-resource/a%2Fb/",
+            "https://[::1]:8443/.well-known/oauth-protected-resource",
+        ]);
+        assert_eq!(candidates[0].0, ResourceMetadataLocation::PathSpecific);
+        assert_eq!(candidates[1].0, ResourceMetadataLocation::OriginRoot);
+        let root = resource_metadata_urls(&url("https://resource.example/")).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].0, ResourceMetadataLocation::OriginRoot);
+        assert_eq!(root[0].1.as_str(), "https://resource.example/.well-known/oauth-protected-resource");
+    }
+
+    #[test]
+    fn constructed_resource_candidates_do_not_accept_unadmitted_endpoint_shapes() {
+        for endpoint in ["http://resource.example/mcp", "https://resource.example/mcp?q=1",
+            "https://resource.example/mcp#x", "https://user@resource.example/mcp"] {
+            assert!(resource_metadata_urls(&url(endpoint)).is_err());
+        }
+    }
+
+    #[test]
+    fn constructed_schedule_reserves_root_and_issuer_before_first_fetch() {
+        let now = Time::from_nanos(100);
+        let end = Time::from_nanos(500);
+        assert_eq!(resource_candidate_deadlines(now, end, 2).unwrap(), [Time::from_nanos(200), Time::from_nanos(300)]);
+        assert_eq!(resource_candidate_deadlines(now, end, 1).unwrap(), [Time::from_nanos(300)]);
+        for count in [0, 3, usize::MAX] { assert!(resource_candidate_deadlines(now, end, count).is_err()); }
+        assert!(resource_candidate_deadlines(now, now, 2).is_err());
+        assert!(resource_candidate_deadlines(now, Time::from_nanos(103), 2).is_err());
+        let near_max = resource_candidate_deadlines(Time::from_nanos(u64::MAX - 40), Time::from_nanos(u64::MAX), 2).unwrap();
+        assert_eq!(near_max, [Time::from_nanos(u64::MAX - 30), Time::from_nanos(u64::MAX - 20)]);
+    }
+
+    #[test]
+    fn aggregate_prm_failure_keeps_order_and_integrity_precedes_later_absence() {
+        let failure = ResourceMetadataFailure { attempts: vec![
+            ResourceMetadataAttempt { location: ResourceMetadataLocation::PathSpecific, cause: ResourceMetadataCause::ResourceMismatch },
+            ResourceMetadataAttempt { location: ResourceMetadataLocation::OriginRoot, cause: ResourceMetadataCause::NotFound },
+        ], interrupted: None };
+        assert_eq!(failure.classification(), ResourceMetadataFailureClass::TrustOrIntegrity);
+        assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::ResourceMismatch);
+        assert_eq!(failure.attempts()[1].location(), ResourceMetadataLocation::OriginRoot);
+        let error = OAuthDiscoveryError::ResourceMetadataExhausted(failure);
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("https://"));
+        assert!(diagnostics.contains("PathSpecific") && diagnostics.contains("OriginRoot"));
+    }
+
+    #[test]
+    fn aggregate_prm_failure_classification_is_independent_of_candidate_order() {
+        let causes = [
+            (ResourceMetadataCause::NotFound, ResourceMetadataFailureClass::NotFound),
+            (ResourceMetadataCause::CandidateDeadline, ResourceMetadataFailureClass::Transport),
+            (ResourceMetadataCause::InvalidMetadata, ResourceMetadataFailureClass::ProtocolOrHttp),
+            (ResourceMetadataCause::NoTrustedIssuer, ResourceMetadataFailureClass::TrustOrIntegrity),
+            (ResourceMetadataCause::Cancelled, ResourceMetadataFailureClass::Cancelled),
+        ];
+        for (low_index, (low, _)) in causes.iter().enumerate() {
+            for (high, expected) in &causes[low_index..] {
+                for pair in [[*low, *high], [*high, *low]] {
+                    let failure = ResourceMetadataFailure { attempts: pair.into_iter().map(|cause| ResourceMetadataAttempt {
+                        location: ResourceMetadataLocation::PathSpecific, cause,
+                    }).collect(), interrupted: None };
+                    assert_eq!(failure.classification(), *expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_prm_failure_retains_attempts_without_inventing_a_root_fetch() {
+        for reason in [ResourceMetadataFailureClass::Cancelled, ResourceMetadataFailureClass::OverallDeadline] {
+            let failure = ResourceMetadataFailure { attempts: vec![ResourceMetadataAttempt {
+                location: ResourceMetadataLocation::PathSpecific, cause: ResourceMetadataCause::ResourceMismatch,
+            }], interrupted: Some(reason) };
+            assert_eq!(failure.classification(), reason);
+            assert_eq!(failure.attempts().len(), 1);
+            assert_eq!(failure.attempts()[0].cause(), ResourceMetadataCause::ResourceMismatch);
+        }
     }
 }

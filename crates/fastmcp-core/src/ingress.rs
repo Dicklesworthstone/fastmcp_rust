@@ -63,6 +63,18 @@ pub const DEFAULT_MAXIMUM_STALENESS: Duration = Duration::from_secs(30);
 /// not about now, so the ceiling is enforced rather than advisory.
 pub const HARD_MAXIMUM_STALENESS: Duration = Duration::from_mins(5);
 
+/// Maximum UTF-8 bytes in one verified identity, audience, or claim field.
+pub const MAX_VERIFIED_IDENTITY_FIELD_BYTES: usize = 8 * 1024;
+
+/// Maximum presented claims, counted before sorting and deduplication.
+pub const MAX_VERIFIED_IDENTITY_CLAIMS: usize = 256;
+
+/// Maximum aggregate UTF-8 bytes admitted from one provider identity.
+///
+/// Identity fields, OAuth binding fields, and every presented claim name and
+/// value consume this budget before the framework clones or sorts them.
+pub const MAX_VERIFIED_IDENTITY_BYTES: usize = 64 * 1024;
+
 // ===========================================================================
 // Errors
 // ===========================================================================
@@ -84,6 +96,16 @@ pub enum IngressFactsError {
     MaximumStalenessAboveCeiling,
     /// A configured maximum staleness was zero, which no provider can satisfy.
     MaximumStalenessZero,
+    /// An identity, audience, or claim field exceeded its individual byte bound.
+    IdentityFieldTooLong,
+    /// The presented claim count exceeded its bound before deduplication.
+    TooManyVerifiedClaims,
+    /// The aggregate verified-identity byte budget was exhausted.
+    IdentityTooLarge,
+    /// A verified claim had an empty name.
+    InvalidVerifiedClaim,
+    /// OAuth audience facts were empty or contradicted their enclosing identity.
+    InvalidAudienceBinding,
 }
 
 impl fmt::Display for IngressFactsError {
@@ -112,6 +134,21 @@ impl fmt::Display for IngressFactsError {
             ),
             Self::MaximumStalenessZero => {
                 formatter.write_str("configured maximum staleness must be nonzero")
+            }
+            Self::IdentityFieldTooLong => {
+                formatter.write_str("verified identity field exceeds its byte bound")
+            }
+            Self::TooManyVerifiedClaims => {
+                formatter.write_str("verified identity exceeds its claim-count bound")
+            }
+            Self::IdentityTooLarge => {
+                formatter.write_str("verified identity exceeds its aggregate byte bound")
+            }
+            Self::InvalidVerifiedClaim => {
+                formatter.write_str("verified claim name must be nonempty")
+            }
+            Self::InvalidAudienceBinding => {
+                formatter.write_str("verified audience binding is inconsistent or incomplete")
             }
         }
     }
@@ -599,15 +636,28 @@ impl VerifiedIngressAuthentication {
     /// `verified_claims` are normalized to a deterministic order so two
     /// authenticators that verified the same claim set produce byte-identical
     /// canonical bytes regardless of the order they happened to emit them in.
+    /// Admission bounds the original claim list, including duplicates, before
+    /// cloning the identity. OAuth binding facts must name the same resource,
+    /// provider, and configuration generation as the enclosing identity.
+    /// The validated audience may differ from the resource when the provider's
+    /// accepted-audience policy explicitly permits that alias.
     ///
     /// # Errors
     ///
     /// Returns [`IngressFactsError::KeyIdEmpty`] when any required identity
     /// field is empty. An empty identity field is not a benign default: it
     /// would let two distinct principals derive one partition.
+    /// Oversized fields, claim counts, and aggregate input return their fixed
+    /// bound errors. Empty claim names return
+    /// [`IngressFactsError::InvalidVerifiedClaim`]; incomplete or contradictory
+    /// OAuth facts return [`IngressFactsError::InvalidAudienceBinding`].
     pub fn from_verified_provider_output(
         facts: VerifiedIdentityFacts<'_>,
     ) -> Result<Self, IngressFactsError> {
+        if facts.verified_claims.len() > MAX_VERIFIED_IDENTITY_CLAIMS {
+            return Err(IngressFactsError::TooManyVerifiedClaims);
+        }
+        let mut identity_bytes = 0;
         for field in [
             facts.provider,
             facts.issuer,
@@ -619,6 +669,43 @@ impl VerifiedIngressAuthentication {
             if field.is_empty() {
                 return Err(IngressFactsError::KeyIdEmpty);
             }
+            charge_identity_field(field, &mut identity_bytes)?;
+        }
+
+        if let VerifiedAudienceBinding::OAuth {
+            canonical_resource,
+            validated_audience,
+            audience_policy_id,
+            provider,
+            configuration_generation,
+            ..
+        } = &facts.verified_audience_binding
+        {
+            for field in [
+                canonical_resource,
+                validated_audience,
+                audience_policy_id,
+                provider,
+            ] {
+                if field.is_empty() {
+                    return Err(IngressFactsError::InvalidAudienceBinding);
+                }
+                charge_identity_field(field, &mut identity_bytes)?;
+            }
+            if canonical_resource.as_str() != facts.canonical_resource
+                || provider.as_str() != facts.provider
+                || *configuration_generation != facts.configuration_generation
+            {
+                return Err(IngressFactsError::InvalidAudienceBinding);
+            }
+        }
+
+        for (name, value) in facts.verified_claims {
+            if name.is_empty() {
+                return Err(IngressFactsError::InvalidVerifiedClaim);
+            }
+            charge_identity_field(name, &mut identity_bytes)?;
+            charge_identity_field(value, &mut identity_bytes)?;
         }
 
         let mut verified_claims: Vec<(String, String)> = facts
@@ -711,6 +798,19 @@ impl VerifiedIngressAuthentication {
     }
 }
 
+fn charge_identity_field(field: &str, total: &mut usize) -> Result<(), IngressFactsError> {
+    if field.len() > MAX_VERIFIED_IDENTITY_FIELD_BYTES {
+        return Err(IngressFactsError::IdentityFieldTooLong);
+    }
+    *total = total
+        .checked_add(field.len())
+        .ok_or(IngressFactsError::IdentityTooLarge)?;
+    if *total > MAX_VERIFIED_IDENTITY_BYTES {
+        return Err(IngressFactsError::IdentityTooLarge);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for VerifiedIngressAuthentication {
     /// Names the provider and generations; never the principal.
     ///
@@ -737,7 +837,7 @@ impl fmt::Debug for VerifiedIngressAuthentication {
 /// positional call is one transposition away from swapping tenant and subject,
 /// and that transposition would be a cross-tenant identity bug that still
 /// compiles.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VerifiedIdentityFacts<'a> {
     /// The verifying provider.
     pub provider: &'a str,
@@ -761,6 +861,20 @@ pub struct VerifiedIdentityFacts<'a> {
     pub auth_policy_revision: u64,
     /// Trust generation.
     pub trust_generation: u64,
+}
+
+impl fmt::Debug for VerifiedIdentityFacts<'_> {
+    /// Provider inputs are not yet admitted: redact all strings, including
+    /// the provider and audience-policy identifiers, not only the subject.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedIdentityFacts")
+            .field("configuration_generation", &self.configuration_generation)
+            .field("auth_policy_revision", &self.auth_policy_revision)
+            .field("trust_generation", &self.trust_generation)
+            .field("verified_claim_count", &self.verified_claims.len())
+            .finish_non_exhaustive()
+    }
 }
 
 // ===========================================================================
@@ -1048,10 +1162,15 @@ impl AuthorizationRotationFacts {
     /// Fails closed on [`RevalidationDispatch::Unknown`]: an attempt that may
     /// or may not have reached the provider has not established freshness, and
     /// treating it as if it had is how a revoked authorization keeps working.
+    /// Token expiry is an independent, exclusive deadline: a fresh provider
+    /// verdict must never extend a shorter token lifetime, and a zero-lifetime
+    /// authorization is already expired even at `elapsed == Duration::ZERO`.
     #[must_use]
     pub fn is_fresh_after(&self, elapsed: Duration) -> bool {
         match self.dispatch {
-            RevalidationDispatch::Dispatched => elapsed <= self.maximum_staleness.bound(),
+            RevalidationDispatch::Dispatched => {
+                elapsed < self.expiry && elapsed <= self.maximum_staleness.bound()
+            }
             RevalidationDispatch::NotDispatched | RevalidationDispatch::Unknown => false,
         }
     }
@@ -1067,5 +1186,291 @@ impl fmt::Debug for AuthorizationRotationFacts {
             .field("maximum_staleness", &self.maximum_staleness)
             .field("dispatch", &self.dispatch)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::HMAC_SHA256_KEY_BYTES;
+
+    fn identity<'a>(claims: &'a [(&'a str, &'a str)]) -> VerifiedIdentityFacts<'a> {
+        VerifiedIdentityFacts {
+            provider: "provider",
+            configuration_generation: 7,
+            issuer: "https://issuer.example",
+            canonical_resource: "https://resource.example/mcp",
+            verified_audience_binding: VerifiedAudienceBinding::OAuth {
+                canonical_resource: "https://resource.example/mcp".to_owned(),
+                validated_audience: "urn:approved-resource-alias".to_owned(),
+                audience_policy_id: "accepted-audiences".to_owned(),
+                audience_policy_revision: 3,
+                provider: "provider".to_owned(),
+                configuration_generation: 7,
+            },
+            tenant: "tenant",
+            subject_or_principal: "subject",
+            authorized_party_or_client: "client",
+            verified_claims: claims,
+            auth_policy_revision: 11,
+            trust_generation: 13,
+        }
+    }
+
+    #[test]
+    fn admitted_claim_normalization_preserves_partition_identity() {
+        let first = VerifiedIngressAuthentication::from_verified_provider_output(identity(&[
+            ("scope", "write"),
+            ("scope", "read"),
+            ("scope", "write"),
+        ]))
+        .unwrap();
+        let second = VerifiedIngressAuthentication::from_verified_provider_output(identity(&[
+            ("scope", "read"),
+            ("scope", "write"),
+        ]))
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.verified_claims().len(), 2);
+        assert_eq!(
+            SecurityPartitionDescriptor::from_verified_ingress(&first).identity(),
+            SecurityPartitionDescriptor::from_verified_ingress(&second).identity()
+        );
+    }
+
+    #[test]
+    fn identity_fields_admit_exact_byte_bounds_and_reject_one_byte_more() {
+        let boundary = "x".repeat(MAX_VERIFIED_IDENTITY_FIELD_BYTES);
+        let oversized = format!("{boundary}x");
+        for index in 0..6 {
+            for (value, accepted) in [(boundary.as_str(), true), (oversized.as_str(), false)] {
+                let mut facts = identity(&[]);
+                facts.verified_audience_binding = VerifiedAudienceBinding::StaticCredential;
+                match index {
+                    0 => facts.provider = value,
+                    1 => facts.issuer = value,
+                    2 => facts.canonical_resource = value,
+                    3 => facts.tenant = value,
+                    4 => facts.subject_or_principal = value,
+                    _ => facts.authorized_party_or_client = value,
+                }
+                let result = VerifiedIngressAuthentication::from_verified_provider_output(facts);
+                if accepted {
+                    assert!(result.is_ok(), "field {index}");
+                } else {
+                    assert_eq!(result, Err(IngressFactsError::IdentityFieldTooLong));
+                }
+            }
+        }
+        let unicode = "é".repeat(MAX_VERIFIED_IDENTITY_FIELD_BYTES / 2 + 1);
+        let mut facts = identity(&[]);
+        facts.subject_or_principal = &unicode;
+        assert_eq!(
+            VerifiedIngressAuthentication::from_verified_provider_output(facts),
+            Err(IngressFactsError::IdentityFieldTooLong)
+        );
+    }
+
+    #[test]
+    fn claim_limits_apply_before_deduplication_and_include_names_and_values() {
+        let claims = vec![("scope", "read"); MAX_VERIFIED_IDENTITY_CLAIMS];
+        let admitted =
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&claims)).unwrap();
+        assert_eq!(admitted.verified_claims().len(), 1);
+        let mut too_many = claims;
+        too_many.push(("scope", "read"));
+        assert_eq!(
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&too_many)),
+            Err(IngressFactsError::TooManyVerifiedClaims)
+        );
+
+        let boundary = "x".repeat(MAX_VERIFIED_IDENTITY_FIELD_BYTES);
+        let oversized = format!("{boundary}x");
+        for pair in [(boundary.as_str(), ""), ("scope", boundary.as_str())] {
+            assert!(
+                VerifiedIngressAuthentication::from_verified_provider_output(identity(&[pair]))
+                    .is_ok()
+            );
+        }
+        for pair in [(oversized.as_str(), ""), ("scope", oversized.as_str())] {
+            assert_eq!(
+                VerifiedIngressAuthentication::from_verified_provider_output(identity(&[pair])),
+                Err(IngressFactsError::IdentityFieldTooLong)
+            );
+        }
+        assert_eq!(
+            VerifiedIngressAuthentication::from_verified_provider_output(identity(&[("", "value")])),
+            Err(IngressFactsError::InvalidVerifiedClaim)
+        );
+    }
+
+    #[test]
+    fn aggregate_identity_budget_counts_duplicate_claims_before_allocation() {
+        let mut values = vec!["v".repeat(MAX_VERIFIED_IDENTITY_FIELD_BYTES); 7];
+        // Six one-byte identity fields plus eight one-byte claim names.
+        let last = MAX_VERIFIED_IDENTITY_BYTES - 14 - 7 * MAX_VERIFIED_IDENTITY_FIELD_BYTES;
+        values.push("v".repeat(last));
+        for accepted in [true, false] {
+            let claims: Vec<(&str, &str)> =
+                values.iter().map(|value| ("k", value.as_str())).collect();
+            let mut facts = identity(&claims);
+            facts.provider = "p";
+            facts.issuer = "i";
+            facts.canonical_resource = "r";
+            facts.tenant = "t";
+            facts.subject_or_principal = "s";
+            facts.authorized_party_or_client = "c";
+            facts.verified_audience_binding = VerifiedAudienceBinding::StaticCredential;
+            let result = VerifiedIngressAuthentication::from_verified_provider_output(facts);
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result, Err(IngressFactsError::IdentityTooLarge));
+            }
+            values[7].push('v');
+        }
+    }
+
+    #[test]
+    fn oauth_binding_rejects_each_contradiction_without_rejecting_approved_aliases() {
+        assert!(VerifiedIngressAuthentication::from_verified_provider_output(identity(&[])).is_ok());
+        for mutation in 0..5 {
+            let mut facts = identity(&[]);
+            let VerifiedAudienceBinding::OAuth {
+                canonical_resource,
+                validated_audience,
+                audience_policy_id,
+                provider,
+                configuration_generation,
+                ..
+            } = &mut facts.verified_audience_binding
+            else {
+                panic!("OAuth fixture");
+            };
+            match mutation {
+                0 => canonical_resource.push_str("/other"),
+                1 => provider.push_str("-other"),
+                2 => *configuration_generation += 1,
+                3 => validated_audience.clear(),
+                _ => audience_policy_id.clear(),
+            }
+            assert_eq!(
+                VerifiedIngressAuthentication::from_verified_provider_output(facts),
+                Err(IngressFactsError::InvalidAudienceBinding)
+            );
+        }
+        for binding in [
+            VerifiedAudienceBinding::MutualTlsPeer,
+            VerifiedAudienceBinding::StaticCredential,
+        ] {
+            let mut facts = identity(&[]);
+            facts.verified_audience_binding = binding;
+            assert!(VerifiedIngressAuthentication::from_verified_provider_output(facts).is_ok());
+        }
+    }
+
+    #[test]
+    fn oauth_audience_and_policy_strings_are_bounded() {
+        for policy in [false, true] {
+            let mut facts = identity(&[]);
+            let VerifiedAudienceBinding::OAuth {
+                validated_audience,
+                audience_policy_id,
+                ..
+            } = &mut facts.verified_audience_binding
+            else {
+                panic!("OAuth fixture");
+            };
+            let field = if policy {
+                audience_policy_id
+            } else {
+                validated_audience
+            };
+            *field = "x".repeat(MAX_VERIFIED_IDENTITY_FIELD_BYTES);
+            assert!(
+                VerifiedIngressAuthentication::from_verified_provider_output(facts.clone()).is_ok()
+            );
+            let VerifiedAudienceBinding::OAuth {
+                validated_audience,
+                audience_policy_id,
+                ..
+            } = &mut facts.verified_audience_binding
+            else {
+                panic!("OAuth fixture");
+            };
+            let field = if policy {
+                audience_policy_id
+            } else {
+                validated_audience
+            };
+            field.push('x');
+            assert_eq!(
+                VerifiedIngressAuthentication::from_verified_provider_output(facts),
+                Err(IngressFactsError::IdentityFieldTooLong)
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_identity_debug_redacts_even_unadmitted_provider_input() {
+        let canary = "IDENTITY-SECRET-CANARY";
+        let claims = [(canary, canary)];
+        let mut facts = identity(&claims);
+        facts.provider = canary;
+        facts.issuer = canary;
+        facts.canonical_resource = canary;
+        facts.tenant = canary;
+        facts.subject_or_principal = canary;
+        facts.authorized_party_or_client = canary;
+        facts.verified_audience_binding = VerifiedAudienceBinding::OAuth {
+            canonical_resource: canary.to_owned(),
+            validated_audience: canary.to_owned(),
+            audience_policy_id: canary.to_owned(),
+            audience_policy_revision: 1,
+            provider: canary.to_owned(),
+            configuration_generation: 7,
+        };
+        let diagnostic = format!("{facts:?}");
+        assert!(!diagnostic.contains(canary));
+        assert!(diagnostic.contains("verified_claim_count: 1"));
+    }
+
+    fn rotation(expiry: Duration, dispatch: RevalidationDispatch) -> AuthorizationRotationFacts {
+        let key = HmacSha256Key::from_bytes([42; HMAC_SHA256_KEY_BYTES]);
+        let provider = SealedProviderReference::seal("test-key", 1, &key, b"provider").unwrap();
+        let token = SealedProviderReference::seal("test-key", 1, &key, b"token").unwrap();
+        AuthorizationRotationFacts::new(
+            provider,
+            token,
+            &["mcp.read"],
+            1,
+            expiry,
+            MaximumStaleness::default(),
+            dispatch,
+        )
+    }
+
+    #[test]
+    fn authorization_expiry_is_independent_of_revalidation_staleness() {
+        let expiry = Duration::from_secs(5);
+        let facts = rotation(expiry, RevalidationDispatch::Dispatched);
+        assert!(facts.is_fresh_after(expiry - Duration::from_nanos(1)));
+        assert!(!facts.is_fresh_after(expiry));
+        assert!(!facts.is_fresh_after(expiry + Duration::from_nanos(1)));
+        assert!(
+            !rotation(Duration::ZERO, RevalidationDispatch::Dispatched)
+                .is_fresh_after(Duration::ZERO)
+        );
+
+        let long_lived = rotation(Duration::from_secs(600), RevalidationDispatch::Dispatched);
+        assert!(long_lived.is_fresh_after(DEFAULT_MAXIMUM_STALENESS));
+        assert!(!long_lived.is_fresh_after(DEFAULT_MAXIMUM_STALENESS + Duration::from_nanos(1)));
+        assert!(!long_lived.is_fresh_after(Duration::MAX));
+        for dispatch in [
+            RevalidationDispatch::Unknown,
+            RevalidationDispatch::NotDispatched,
+        ] {
+            assert!(!rotation(Duration::from_secs(600), dispatch).is_fresh_after(Duration::ZERO));
+        }
     }
 }

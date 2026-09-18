@@ -260,7 +260,7 @@ impl ClientCredentialsCoreSubscription {
         // Compiling Tasks does not opt this core-only owner into Task events.
         // Retire the body rather than exposing an extension event to the caller.
         #[cfg(feature = "tasks")]
-        if matches!(&event, ModernHttpSubscriptionListenEvent::TaskNotification { .. }) {
+        if matches!(&event, ModernHttpSubscriptionListenEvent::TaskNotification(_)) {
             return Err(ClientCredentialsCoreSubscriptionError::InvalidResponse);
         }
         if let ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } = &event {
@@ -536,9 +536,16 @@ mod tests {
                           "notifications":{"resourceSubscriptions":["file:///tmp/watched"]}}})
         )
     }
+
+    const ACK: &str = concat!(
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",",
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",
+        "\"notifications\":{\"resourceSubscriptions\":[\"file:///tmp/watched\"]}}}\n\n"
+    );
     const UPDATE: &str = concat!(
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",",
-        "\"params\":{\"requestId\":7,\"uri\":\"file:///tmp/watched\"}}\n\n"
+        "\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7},",
+        "\"uri\":\"file:///tmp/watched\"}}\n\n"
     );
     /// The listen terminal must satisfy TWO independent requirements, and they are
     /// checked in this order -- derived from source, not measured:
@@ -556,7 +563,6 @@ mod tests {
     /// substring does not occur inside the _meta member, whose key ends `...Id`
     /// with no quote before it, so the perturbation stays surgical.
     const TERMINAL: &str = concat!(
-        "id: cursor-final\n",
         "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",",
         "\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":7}}}\n\n"
     );
@@ -669,13 +675,10 @@ mod tests {
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })));
             let accepted = subscription.accepted_filter().unwrap();
-            assert_eq!(
-                accepted.resource_subscriptions,
-                Some(vec!["file:///tmp/watched".to_owned()])
-            );
+            assert_eq!(accepted.resource_subscriptions, Some(vec!["file:///tmp/watched".to_owned()]));
             assert_eq!(accepted.tools_list_changed, None);
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
-                Some(ModernHttpSubscriptionListenEvent::Notification { .. })));
+                Some(ModernHttpSubscriptionListenEvent::Notification(_))));
             assert!(matches!(subscription.next_event(&cx).await.unwrap(),
                 Some(ModernHttpSubscriptionListenEvent::Terminal { .. })));
             assert_eq!(subscription.records_delivered(), 3);
@@ -722,6 +725,7 @@ mod tests {
             for (body, has_ack) in [
                 (TERMINAL.to_owned(), false),
                 ([ack(SUBSCRIPTION_ID).as_str(), &TERMINAL.replace("\"id\":7", "\"id\":8")].concat(), true),
+                ([ack(SUBSCRIPTION_ID).as_str(), &TERMINAL.replace("subscriptionId\":7", "subscriptionId\":8")].concat(), true),
             ] {
                 let (mut subscription, peer) = native_subscription(
                     &cx, body, false, ClientCredentialsCoreSubscriptionLimits::default(),
