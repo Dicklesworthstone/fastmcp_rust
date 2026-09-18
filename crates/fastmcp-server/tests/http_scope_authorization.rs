@@ -1,7 +1,7 @@
 //! Public HTTP request admission, not a scope-projection-only fixture.
-//! These tests use the installed server gate, native token verifier, ordinary
-//! middleware and real registered tool. They do not prove live socket/TLS or
-//! HTTP OAuth challenge integration; policy errors retain native RPC mapping.
+//! These tests use installed server and secured-endpoint gates, native token
+//! verification, ordinary middleware and real registered tools. They cover
+//! embedding, not live socket/TLS or external OAuth interoperability.
 
 use std::future::Future;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
@@ -296,4 +296,178 @@ fn http_scope_admission_does_not_cache_a_prior_credential_grant_after_revocation
         assert_eq!(probe.counts.middleware.load(Ordering::SeqCst),1);
         assert_eq!(probe.counts.handler.load(Ordering::SeqCst),1);
     });
+}
+
+mod named_operation_tests {
+    use super::*;
+    use std::time::Duration;
+    use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
+    use fastmcp_server::http_admission::security::HttpSecurityPolicy;
+    use fastmcp_server::http_admission::security::endpoint::{SecuredHttpEndpointError, revalidation::{SseAuthorizationError, SseRevalidationPolicy}};
+    use fastmcp_server::http_admission::security::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+
+    const PRIVATE_TOOL: &str = "private_write_probe";
+    struct OtherTool(Probe);
+    impl ToolHandler for OtherTool {
+        fn definition(&self) -> Tool {
+            let mut definition = self.0.definition();
+            definition.name = PRIVATE_TOOL.to_owned();
+            definition
+        }
+        fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+            self.0.call(ctx, arguments)
+        }
+    }
+    fn named_server(probe: &Probe, cached: bool) -> Server {
+        Server::new("named-operation-test", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .auth_provider(probe.clone())
+            .middleware(ApplicationMiddleware { probe: probe.clone(), cached })
+            .tool(probe.clone()).tool(OtherTool(probe.clone())).build()
+    }
+    fn named_rules() -> OperationScopePolicy {
+        OperationScopePolicy::new(10, policy(&[], &["invoke"]), vec![
+            (ScopedOperation::ToolCall(TOOL.into()), required(&["read"])),
+            (ScopedOperation::ToolCall(PRIVATE_TOOL.into()), required(&["write"])),
+        ]).unwrap()
+    }
+    fn named_call(probe: &Probe, id: i64, name: &str, sse: bool) -> HttpRequest {
+        request(probe, id, "tools/call", json!({"name":name,"arguments":{}}))
+            .with_header("mcp-name", name)
+            .with_header("accept", if sse { "text/event-stream" } else { "application/json" })
+    }
+    fn native_policy(revalidate: bool) -> HttpSecurityPolicy {
+        let policy = HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
+            "https://scope.example", vec![],
+        ).unwrap().with_scope_authorization(ScopeRequestPolicy::for_operations(named_rules()).unwrap()).unwrap();
+        if revalidate {
+            policy.with_sse_revalidation(SseRevalidationPolicy::new(
+                Duration::from_millis(25), Duration::from_millis(25), 64,
+            ).unwrap()).unwrap()
+        } else { policy }
+    }
+    async fn native_immediate(cx: &Cx, endpoint: &ServerHttpEndpoint, policy: &HttpSecurityPolicy, request: HttpRequest) -> HttpResponse {
+        let response = Box::pin(endpoint.handle_secured_async(cx, policy, request)).await.unwrap();
+        let (response, mut stream) = response.into_parts();
+        let streaming = stream.is_some();
+        if let Some(stream) = &mut stream { stream.close(cx).await; }
+        assert!(!streaming, "JSON or refused operation must not allocate an SSE response");
+        response
+    }
+
+    #[test]
+    fn named_permissions_precede_real_handlers_and_short_circuit_caches() {
+        run(|cx| async move {
+            for cached in [false, true] {
+                for adapted in [false, true] {
+                    let probe = Probe::new(&["invoke", "read"]);
+                    let server = named_server(&probe, cached);
+                    let server = if adapted {
+                        server.with_scope_authorization(ScopeRequestPolicy::for_operations(named_rules()).unwrap()).unwrap()
+                    } else { server.with_operation_scope_authorization(named_rules()).unwrap() };
+                    let endpoint = endpoint(server);
+                    let first = success(&dispatch(&cx, &endpoint, named_call(&probe, 1, TOOL, false)).await);
+                    if cached { assert_eq!(first["content"][0]["text"], "cache-hit"); }
+                    else {
+                        let facts: Value = serde_json::from_str(first["content"][0]["text"].as_str().unwrap()).unwrap();
+                        assert_eq!(facts, json!({"scopes":["invoke","read"],"claims":{"scope":"invoke read"}}));
+                    }
+                    let effects = usize::from(!cached);
+                    assert_eq!(probe.snapshot(), (1, 1, 0, effects));
+                    let forbidden = denied(&dispatch(&cx, &endpoint, named_call(&probe, 2, PRIVATE_TOOL, false)).await, 2, &probe);
+                    let unknown = denied(&dispatch(&cx, &endpoint, named_call(&probe, 3, "unregistered_tool", false)).await, 3, &probe);
+                    assert_eq!(unknown, forbidden, "existing and absent forbidden targets have the same error");
+                    assert_eq!(probe.snapshot(), (3, 1, 0, effects));
+                    let mut spoofed = named_call(&probe, 4, PRIVATE_TOOL, false);
+                    let mut document: Value = serde_json::from_slice(&spoofed.body).unwrap();
+                    document["params"]["arguments"] = json!({"name":TOOL,"scopes":["write"]});
+                    document["params"]["_meta"]["com.example/operation"] = json!({"name":TOOL,"requiredScopes":[]});
+                    spoofed.body = serde_json::to_vec(&document).unwrap();
+                    assert_eq!(denied(&dispatch(&cx, &endpoint, spoofed).await, 4, &probe), forbidden);
+                    assert_eq!(probe.snapshot(), (4, 1, 0, effects));
+                    assert_eq!(success(&dispatch(&cx, &endpoint, named_call(&probe, 5, TOOL, false)).await), first);
+                    assert_eq!(probe.snapshot(), (5, 2, 0, 2 * effects));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_named_json_and_sse_denials_precede_dispatch_and_preserve_valid_reuse() {
+        run(|cx| async move {
+            let probe = Probe::new(&["invoke", "read"]);
+            let endpoint = endpoint(named_server(&probe, false));
+            let policy = native_policy(false);
+            let baseline = success(&native_immediate(&cx, &endpoint, &policy, named_call(&probe, 1, TOOL, false)).await);
+            assert_eq!(probe.snapshot(), (1, 1, 0, 1));
+            let mut id = 2;
+            for sse in [false, true] {
+                let forbidden = native_immediate(&cx, &endpoint, &policy, named_call(&probe, id, PRIVATE_TOOL, sse)).await;
+                id += 1;
+                let unknown = native_immediate(&cx, &endpoint, &policy, named_call(&probe, id, "unregistered_tool", sse)).await;
+                id += 1;
+                assert_eq!(forbidden.status.0, 403);
+                assert_eq!(unknown.status.0, 403);
+                assert_eq!(unknown.headers, forbidden.headers);
+                assert_eq!(unknown.body, forbidden.body);
+                assert!(forbidden.body.is_empty());
+                assert_eq!(forbidden.headers["www-authenticate"], "Bearer error=\"insufficient_scope\"");
+                assert_eq!(forbidden.headers["cache-control"], "no-store");
+                assert!(!forbidden.headers.contains_key("transfer-encoding"));
+                assert!(!format!("{:?}", forbidden.headers).contains(PRIVATE_TOOL));
+            }
+            assert_eq!(probe.snapshot(), (5, 1, 0, 1));
+            assert_eq!(success(&native_immediate(&cx, &endpoint, &policy, named_call(&probe, 6, TOOL, false)).await), baseline);
+            assert_eq!(probe.snapshot(), (6, 2, 0, 2));
+            assert!(probe.verifier.revoke_token(&probe.token).unwrap());
+            let revoked = native_immediate(&cx, &endpoint, &policy, named_call(&probe, 7, TOOL, false)).await;
+            assert_eq!(revoked.status.0, 401);
+            assert_eq!(probe.snapshot(), (7, 2, 0, 2));
+        });
+    }
+
+    #[test]
+    fn operation_scoped_sse_delivers_valid_results_but_withholds_revoked_credentials() {
+        run(|cx| async move {
+            for revoked in [false, true] {
+                let probe = Probe::new(&["invoke", "read"]);
+                let endpoint = endpoint(named_server(&probe, false));
+                let policy = native_policy(true);
+                let response = Box::pin(endpoint.handle_secured_async(&cx, &policy, named_call(&probe, 1, TOOL, true))).await.unwrap();
+                assert_eq!(response.response().status.0, 200);
+                let (_, stream) = response.into_parts();
+                let mut stream = stream.expect("authorized operation produces a guarded SSE response");
+                assert!(stream.stream().is_none(), "raw body access cannot bypass authorization");
+                asupersync::time::timeout(cx.now(), Duration::from_secs(3), async {
+                    while probe.counts.handler.load(Ordering::SeqCst) == 0 {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                }).await.expect("registered tool must execute within the fixture bound");
+                if revoked { assert!(probe.verifier.revoke_token(&probe.token).unwrap()); }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(40)).await;
+                let event = asupersync::time::timeout(cx.now(), Duration::from_secs(3), stream.next_event(&cx))
+                    .await.expect("bounded SSE authorization wait");
+                if revoked {
+                    assert!(matches!(event, Err(SecuredHttpEndpointError::Revalidation(SseAuthorizationError::Rejected))));
+                } else {
+                    let bytes = event.unwrap().unwrap().to_bytes().unwrap();
+                    let wire = String::from_utf8(bytes).unwrap();
+                    let data = wire.lines().filter_map(|line| line.strip_prefix("data:"))
+                        .map(str::trim_start).collect::<Vec<_>>().join("\n");
+                    let message: Value = serde_json::from_str(&data).unwrap();
+                    assert_eq!(message["id"], 1);
+                    assert!(message.get("error").is_none());
+                    let facts: Value = serde_json::from_str(message["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+                    assert_eq!(facts["scopes"], json!(["invoke", "read"]));
+                    assert!(asupersync::time::timeout(cx.now(), Duration::from_secs(3), stream.next_event(&cx))
+                        .await.unwrap().unwrap().is_none());
+                }
+                assert!(probe.counts.auth.load(Ordering::SeqCst) >= 2, "fresh provider verdict is required after interval expiry");
+                assert_eq!(probe.counts.handler.load(Ordering::SeqCst), 1);
+                stream.close(&cx).await;
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
+    }
 }
