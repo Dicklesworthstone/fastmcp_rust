@@ -329,3 +329,190 @@ fn idle_native_socket_revocation_closes_only_the_original_stream_without_a_succe
         assert!(cx.checkpoint().is_ok());
     });
 }
+
+mod resource_watch_tests {
+    use super::*;
+    use fastmcp_protocol::{JsonRpcRequest, Resource, ResourceContent};
+    use fastmcp_server::{Middleware, MiddlewareDecision, ResourceHandler};
+    use fastmcp_server::http_admission::security::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+    use fastmcp_transport::http::HttpResponse;
+
+    const A: &str = "watch://resource/a";
+    const B: &str = "watch://resource/b";
+    const EMIT: &str = "emit_resource_update";
+
+    #[derive(Default)]
+    struct Effects { middleware: AtomicUsize, emissions: AtomicUsize }
+    struct Observe(Arc<Effects>);
+    impl Middleware for Observe {
+        fn on_request(&self, _: &McpContext, _: &JsonRpcRequest) -> McpResult<MiddlewareDecision> {
+            self.0.middleware.fetch_add(1, Ordering::SeqCst);
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+    struct Emitter(Arc<Effects>);
+    impl ToolHandler for Emitter {
+        fn definition(&self) -> Tool {
+            Tool { name: EMIT.into(), description: None, input_schema: json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"]}),
+                output_schema: None, icon: None, version: None, tags: vec![], annotations: None }
+        }
+        fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+            let uri = arguments.get("uri").and_then(Value::as_str)
+                .ok_or_else(|| fastmcp_core::McpError::invalid_params("URI required"))?;
+            self.0.emissions.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text(if ctx.notify_resource_updated(uri) { "notified" } else { "silent" })])
+        }
+    }
+    struct WatchedResource(&'static str);
+    impl ResourceHandler for WatchedResource {
+        fn definition(&self) -> Resource {
+            Resource { uri: self.0.into(), name: self.0.into(), description: None,
+                mime_type: Some("text/plain".into()), icon: None, version: None, tags: vec![] }
+        }
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            ctx.checkpoint()?;
+            Ok(vec![ResourceContent { uri: self.0.into(), mime_type: Some("text/plain".into()), text: Some("resource".into()), blob: None }])
+        }
+    }
+    fn watch_endpoint(probe: &Probe, effects: &Arc<Effects>) -> ServerHttpEndpoint {
+        let server = Server::new("resource-watch", "1").protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .auth_provider(probe.clone()).middleware(Observe(Arc::clone(effects)))
+            .tool(Emitter(Arc::clone(effects))).resource(WatchedResource(A)).resource(WatchedResource(B)).build();
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let endpoint = server.into_http_endpoint();
+        #[cfg(feature = "legacy-2024-11-05")]
+        let endpoint = server.into_http_endpoint("https://lease.example");
+        endpoint.unwrap()
+    }
+    fn watch_policy() -> HttpSecurityPolicy {
+        let required = |name: &str| RequiredScopes::new(vec![name.to_owned()]).unwrap();
+        let base = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::exact(1).unwrap(), vec![
+            ("subscriptions/listen".into(), required("read")), ("tools/call".into(), required("read")),
+        ]).unwrap();
+        let operations = OperationScopePolicy::new(1, base, vec![
+            (ScopedOperation::ResourceWatch(A.into()), required("read")),
+            (ScopedOperation::ResourceWatch(B.into()), required("write")),
+            (ScopedOperation::ToolCall(EMIT.into()), required("read")),
+        ]).unwrap();
+        HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32,8192,65536).unwrap()).unwrap(),
+            "https://lease.example", vec![],
+        ).unwrap().with_scope_authorization(ScopeRequestPolicy::for_operations(operations).unwrap()).unwrap()
+            .with_sse_revalidation(SseRevalidationPolicy::new(INTERVAL,INTERVAL,64).unwrap()).unwrap()
+    }
+    fn watch_request(probe: &Probe, token: usize, resources: &[&str]) -> HttpRequest {
+        let mut request = super::request(probe, token, true);
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["params"]["notifications"] = json!({"resourceSubscriptions":resources});
+        request.body = serde_json::to_vec(&body).unwrap();
+        request
+    }
+    fn emit_request(probe: &Probe, uri: &str) -> HttpRequest {
+        let mut request = super::request(probe, 1, false)
+            .with_header("accept", "application/json").with_header("mcp-method", "tools/call")
+            .with_header("mcp-name", EMIT);
+        let mut body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["id"] = json!(8);
+        body["method"] = json!("tools/call");
+        body["params"]["name"] = json!(EMIT);
+        body["params"]["arguments"] = json!({"uri":uri});
+        request.body = serde_json::to_vec(&body).unwrap();
+        request
+    }
+    async fn immediate(cx: &Cx, endpoint: &ServerHttpEndpoint, policy: &HttpSecurityPolicy, request: HttpRequest) -> HttpResponse {
+        let response = asupersync::time::timeout(cx.now(), Duration::from_secs(3),
+            Box::pin(endpoint.handle_secured_async(cx, policy, request))).await.unwrap().unwrap();
+        let (response, mut stream) = response.into_parts();
+        let streaming = stream.is_some();
+        if let Some(stream) = &mut stream { stream.close(cx).await; }
+        assert!(!streaming, "refused selection must not become a partial SSE subscription");
+        response
+    }
+    async fn emit(cx: &Cx, endpoint: &ServerHttpEndpoint, policy: &HttpSecurityPolicy, probe: &Probe, uri: &str) -> String {
+        let response = immediate(cx, endpoint, policy, emit_request(probe, uri)).await;
+        assert_eq!(response.status.0, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body.get("error").is_none());
+        body["result"]["content"][0]["text"].as_str().unwrap().to_owned()
+    }
+    fn document(event: fastmcp_transport::sse::SseEvent) -> Value {
+        let wire = encoded(event);
+        let data = wire.lines().filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start).collect::<Vec<_>>().join("\n");
+        serde_json::from_str(&data).unwrap()
+    }
+    async fn acknowledged(cx: &Cx, stream: &mut SecuredHttpSseResponse) {
+        let ack = document(next(cx, stream).await.unwrap().unwrap());
+        assert_eq!(ack["method"], "notifications/subscriptions/acknowledged");
+        assert_eq!(ack["params"]["notifications"]["resourceSubscriptions"], json!([A]));
+        assert_eq!(ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 7);
+    }
+
+    #[test]
+    fn mixed_resource_watch_denial_has_no_partial_subscription_and_valid_reuse_delivers() {
+        run(|cx| async move {
+            let probe = Probe::new();
+            let effects = Arc::new(Effects::default());
+            let endpoint = watch_endpoint(&probe, &effects);
+            let policy = watch_policy();
+            let denied = immediate(&cx, &endpoint, &policy, watch_request(&probe, 0, &[A,B])).await;
+            assert_eq!(denied.status.0, 403);
+            assert!(denied.body.is_empty());
+            assert_eq!(denied.headers["www-authenticate"], "Bearer error=\"insufficient_scope\"");
+            assert_eq!(denied.headers["cache-control"], "no-store");
+            assert_eq!(probe.calls(), 1);
+            assert_eq!(effects.middleware.load(Ordering::SeqCst), 0);
+            assert_eq!(effects.emissions.load(Ordering::SeqCst), 0);
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "silent",
+                "denial must not install even the allowed prefix of the selection");
+            let mut live = open(&cx, &endpoint, &policy, watch_request(&probe, 0, &[A])).await;
+            acknowledged(&cx, &mut live).await;
+            let before = effects.middleware.load(Ordering::SeqCst);
+            let unknown = immediate(&cx, &endpoint, &policy, watch_request(&probe, 0, &[A,"watch://resource/unknown"])).await;
+            assert_eq!(unknown.status.0, denied.status.0);
+            assert_eq!(unknown.headers, denied.headers);
+            assert_eq!(unknown.body, denied.body);
+            assert_eq!(effects.middleware.load(Ordering::SeqCst), before);
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, B).await, "silent");
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "notified");
+            let event = document(next(&cx, &mut live).await.unwrap().unwrap());
+            assert_eq!(event["method"], "notifications/resources/updated");
+            assert_eq!(event["params"]["uri"], A);
+            assert_eq!(event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 7);
+            live.close(&cx).await;
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "silent");
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn revoked_resource_watch_withholds_queued_updates_without_cancelling_a_sibling() {
+        run(|cx| async move {
+            let probe = Probe::new();
+            let effects = Arc::new(Effects::default());
+            let endpoint = watch_endpoint(&probe, &effects);
+            let policy = watch_policy();
+            let mut first = open(&cx, &endpoint, &policy, watch_request(&probe, 0, &[A])).await;
+            acknowledged(&cx, &mut first).await;
+            let mut sibling = open(&cx, &endpoint, &policy, watch_request(&probe, 1, &[A])).await;
+            acknowledged(&cx, &mut sibling).await;
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "notified");
+            assert!(probe.verifier.revoke_token(&probe.tokens[0]).unwrap());
+            let before = probe.calls();
+            asupersync::time::sleep(cx.now(), WAIT).await;
+            assert!(matches!(next(&cx, &mut first).await,
+                Err(SecuredHttpEndpointError::Revalidation(SseAuthorizationError::Rejected))));
+            assert!(probe.calls() > before);
+            first.close(&cx).await;
+            let event = document(next(&cx, &mut sibling).await.unwrap().unwrap());
+            assert_eq!(event["method"], "notifications/resources/updated");
+            assert_eq!(event["params"]["uri"], A);
+            assert_eq!(event["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 7);
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "notified");
+            assert_eq!(document(next(&cx, &mut sibling).await.unwrap().unwrap())["params"]["uri"], A);
+            sibling.close(&cx).await;
+            assert_eq!(emit(&cx, &endpoint, &policy, &probe, A).await, "silent");
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+}
