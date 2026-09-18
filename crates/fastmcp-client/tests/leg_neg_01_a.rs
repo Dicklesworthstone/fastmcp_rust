@@ -179,6 +179,50 @@ fn assert_trace_conclusive(record: &StdioClassificationRecord) {
     );
 }
 
+/// Asserts no credential reached the stdio wire, reading the OBSERVED first-wire bytes.
+///
+/// WHY THIS REPLACED AN ASSERTION ON `credential_boundary`. That field has exactly one
+/// construction site in the whole evaluator --
+/// `leg_neg_stdio.rs:428  credential_boundary: CredentialBoundary::default()` -- and nothing
+/// anywhere increments `mutations` or `attached`. So `assert_eq!(..mutations, 0)` compared a
+/// default-constructed literal against zero and **could not fail whatever the product did**.
+/// Seven such assertions stood in for AC-LEG-NEG-01-A-PREDICATES clause 2's required proof of
+/// "zero credential/cache mutation". The module comment claimed the boundary was "recorded
+/// rather than assumed so negatives can assert on it"; recording `default()` IS assuming.
+///
+/// THE ZERO IS STRUCTURAL, and that is a fact about the type surface rather than a choice:
+///   * the ONLY credential state on `ClientBuilder` is
+///     `http_bearer_credential: Option<BoundBearerCredential>` (builder.rs:221);
+///   * its ONLY two readers are inside `fn http_negotiation`, at builder.rs:829 and :918,
+///     both feeding `HttpConnectionSettings { bearer, .. }`;
+///   * `prepare_stdio_command` touches `args` and nothing else;
+///   * `BoundBearerCredential` occurs nowhere outside `http_auth` / `http_executor`.
+/// There is no path by which a credential reaches a disposable stdio child.
+///
+/// A structural zero still deserves a proof that CAN be wrong, so this asserts the
+/// observable instead of the constant: the first-wire bytes actually recorded by the fixture
+/// children carry no credential-shaped content. If a credential ever reaches a stdio frame
+/// this fires, because it reads the real trace rather than a field nothing writes.
+fn assert_no_credential_on_the_wire(record: &StdioClassificationRecord) {
+    for (index, line) in record.first_wire.iter().enumerate() {
+        let lowered = line.to_ascii_lowercase();
+        for marker in [
+            "authorization",
+            "bearer ",
+            "\"token\"",
+            "x-api-key",
+            "proxy-authorization",
+        ] {
+            assert!(
+                !lowered.contains(marker),
+                "{}: first-wire line {index} carries credential-shaped content {marker:?}; \
+                 stdio must never attach or mutate a credential. Observed: {line}",
+                record.case_id
+            );
+        }
+    }
+}
+
 /// Asserts no child beyond the disposable probe was ever started.
 fn assert_no_legacy_child(record: &StdioClassificationRecord) {
     assert_trace_conclusive(record);
@@ -200,16 +244,9 @@ fn assert_no_legacy_child(record: &StdioClassificationRecord) {
         "{}: no fresh child means no probe-reap transition",
         record.case_id
     );
-    assert_eq!(
-        record.credential_boundary.mutations, 0,
-        "{}: stdio must never mutate a credential",
-        record.case_id
-    );
-    assert_eq!(
-        record.credential_boundary.attached, 0,
-        "{}: stdio must never attach a credential",
-        record.case_id
-    );
+    // The credential requirement is still named here; the proof now reads the observed wire
+    // instead of a `default()`-constructed field that no code path writes.
+    assert_no_credential_on_the_wire(record);
 }
 
 /// Asserts that NO child was started at all -- not even the disposable probe.
@@ -260,16 +297,9 @@ fn assert_no_child_at_all(record: &StdioClassificationRecord) {
         "{}: zero legacy children",
         record.case_id
     );
-    assert_eq!(
-        record.credential_boundary.mutations, 0,
-        "{}: stdio must never mutate a credential",
-        record.case_id
-    );
-    assert_eq!(
-        record.credential_boundary.attached, 0,
-        "{}: stdio must never attach a credential",
-        record.case_id
-    );
+    // The credential requirement is still named here; the proof now reads the observed wire
+    // instead of a `default()`-constructed field that no code path writes.
+    assert_no_credential_on_the_wire(record);
 }
 
 /// Asserts the first wire line carries the frozen marker.
@@ -406,7 +436,7 @@ fn leg_neg_01_a_positive() {
         !eligible.first_wire[1].contains(MODERN_ERA),
         "the fresh child's first request must not carry modern metadata"
     );
-    assert_eq!(eligible.credential_boundary.mutations, 0);
+    assert_no_credential_on_the_wire(&eligible);
 
     // -----------------------------------------------------------------
     // The one-variable pair: the SAME refusal with a different response id
@@ -684,9 +714,13 @@ fn leg_neg_01_a_planted_negative() {
         );
     }
 
-    // Zero credential and zero cache movement on the denied path.
-    assert_eq!(planted.credential_boundary.mutations, 0);
-    assert_eq!(planted.credential_boundary.attached, 0);
+    // Zero credential movement on the denied path, proved against the observed wire.
+    // NOTE: the "zero CACHE mutation" half of clause 2 is NOT asserted here and cannot be --
+    // `StdioClassificationRecord` models no cache boundary at all (`grep -i cache` over
+    // leg_neg_stdio.rs returns nothing). That gap is tracked separately; it is inexpressible
+    // in this evaluator rather than merely untested, and a comment claiming otherwise is
+    // what stood here before.
+    assert_no_credential_on_the_wire(&planted);
     assert_eq!(planted.policy, baseline.policy);
     assert_eq!(planted.transport, baseline.transport);
     assert_eq!(planted.signal, baseline.signal);
