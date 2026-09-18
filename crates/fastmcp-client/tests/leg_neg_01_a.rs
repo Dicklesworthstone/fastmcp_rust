@@ -132,6 +132,21 @@ fn run(declared: &StdioClassificationCase) -> StdioClassificationRecord {
     evaluate_stdio_case(&cx, declared)
 }
 
+/// Runs one case whose caller-owned context is already cancelled.
+///
+/// The ONLY difference from [`run`]. Everything the case declares -- policy,
+/// signal, fixture behaviour, refusal id, legacy era -- is held fixed, so the
+/// pair below differs in exactly one variable, which is the shape
+/// AC-LEG-NEG-01-A-PREDICATES requires of every rejected case.
+fn run_cancelled(declared: &StdioClassificationCase) -> StdioClassificationRecord {
+    let cx = Cx::for_request();
+    cx.cancel_with(
+        asupersync::CancelKind::User,
+        Some("leg-neg-01-a cancelled caller"),
+    );
+    evaluate_stdio_case(&cx, declared)
+}
+
 /// Asserts the trace was actually read.
 ///
 /// Three-way on purpose: a read trace continues, an unbound trace fails as a
@@ -183,6 +198,66 @@ fn assert_no_legacy_child(record: &StdioClassificationRecord) {
     assert!(
         !record.probe_reaped(),
         "{}: no fresh child means no probe-reap transition",
+        record.case_id
+    );
+    assert_eq!(
+        record.credential_boundary.mutations, 0,
+        "{}: stdio must never mutate a credential",
+        record.case_id
+    );
+    assert_eq!(
+        record.credential_boundary.attached, 0,
+        "{}: stdio must never attach a credential",
+        record.case_id
+    );
+}
+
+/// Asserts that NO child was started at all -- not even the disposable probe.
+///
+/// Deliberately not [`assert_no_legacy_child`], which requires at least the
+/// probe to exist and would reject this record as a declaration error.
+///
+/// THE ZERO HERE IS OBSERVED, NOT ASSUMED. `reserve_trace` creates the trace
+/// file with `File::create_new` BEFORE the case runs, so the file is readable
+/// whether or not a child ever appends to it. `TraceOutcome::Read` with no
+/// `spawn:` records is therefore a genuine observed absence, not the
+/// `Unreadable` inconclusiveness that [`assert_trace_conclusive`] exists to
+/// reject. Without that pre-creation this assertion would be unsound.
+fn assert_no_child_at_all(record: &StdioClassificationRecord) {
+    match &record.trace_outcome {
+        TraceOutcome::Read => {}
+        TraceOutcome::NotBound => panic!(
+            "{}: the case declared no observation trace, so child identity is unobservable",
+            record.case_id
+        ),
+        TraceOutcome::Unreadable { reason } => panic!(
+            "{}: the observation trace is INCONCLUSIVE, not empty: {reason}. \
+             An unreadable trace must never be read as 'no children spawned'.",
+            record.case_id
+        ),
+    }
+    assert!(
+        record.unrecognized_trace_records.is_empty(),
+        "{}: the observation trace carried unrecognized records {:?}",
+        record.case_id,
+        record.unrecognized_trace_records
+    );
+    assert!(
+        record.child_pids.is_empty(),
+        "{}: a cancelled caller must not start ANY child, observed pids {:?}",
+        record.case_id,
+        record.child_pids
+    );
+    assert_eq!(
+        record.child_generation_count(),
+        0,
+        "{}: zero generations",
+        record.case_id
+    );
+    assert_eq!(
+        record.legacy_child_count(),
+        0,
+        "{}: zero legacy children",
         record.case_id
     );
     assert_eq!(
@@ -475,6 +550,67 @@ fn leg_neg_01_a_positive() {
     );
     assert_no_legacy_child(&malformed);
     cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // Auto + correlated refusal + a CANCELLED caller: the one signal that
+    // DOES authorize a legacy child starts nothing at all.
+    //
+    // This is the AC-LEG-NEG-01-A-PREDICATES "cancellation" condition, and
+    // it needs NO `StdioFirstWireSignal` variant. That absence is the
+    // evidence, not an omission: cancellation is not something the first
+    // wire SAID. It is a property of the caller's `Cx`, enforced by
+    // `admit_auto_legacy_fallback` at both legacy-spawn sites and by a
+    // checkpoint at the head of `try_connect_with_protocol_plan`.
+    //
+    // ONE VARIABLE. Identical to `auto-eligible-correlated-refusal` above --
+    // same policy, same signal, same fixture behaviour, same refusal id,
+    // same legacy era -- differing only in that the caller's context is
+    // cancelled. That case reaches two generations and one legacy child;
+    // this one reaches zero of each, which is what makes the zero
+    // attributable to cancellation rather than to a fixture that never works.
+    // -----------------------------------------------------------------
+    let (cancelled_case, cancelled_trace) = case(
+        "auto-cancelled-caller",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let cancelled = run_cancelled(&cancelled_case);
+    assert_eq!(cancelled.policy, ProtocolPolicy::Auto);
+    assert_eq!(
+        cancelled.signal,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "the declared signal is held fixed; only the caller's context differs"
+    );
+    assert!(
+        !cancelled.connected,
+        "a cancelled caller must not reach a client"
+    );
+    assert_eq!(
+        cancelled.selected_era, None,
+        "a cancelled caller selects no era"
+    );
+    assert_eq!(
+        cancelled.protocol_version, None,
+        "a cancelled caller negotiates no protocol version"
+    );
+    assert!(
+        cancelled.failure.is_some(),
+        "a cancelled caller must record a typed refusal rather than failing silently"
+    );
+    assert!(
+        cancelled.first_wire.is_empty(),
+        "no child ran, so no first wire can have been observed; got {:?}",
+        cancelled.first_wire
+    );
+    assert!(
+        !cancelled.probe_reaped(),
+        "no probe existed, so no probe-reap transition can have occurred"
+    );
+    assert_no_child_at_all(&cancelled);
+    cleanup(&cancelled_trace);
 }
 
 #[test]
