@@ -13,6 +13,7 @@
 
 /// Socket-to-dispatch security for the caller-owned native HTTP listener.
 pub mod listener;
+mod scope;
 
 use std::future::{Future, poll_fn};
 use std::task::Poll;
@@ -104,9 +105,12 @@ impl ServerHttpEndpoint {
     /// No runtime is created. The caller's Cx deadline and cancellation span
     /// session opening and awaited dispatch.
     ///
-    /// Only head/body security checks run here; JSON-RPC error construction stays
-    /// in the existing dispatcher. Preflight and public metadata do not open a
-    /// session, parse JSON, authenticate, run middleware or invoke a handler.
+    /// After head/body security checks, POSTs retain the native strict protocol
+    /// and authentication boundaries. An installed HTTP scope policy runs on
+    /// the resulting verified facts before transport admission or SSE allocation;
+    /// its native 401/403 is not inferred from an application JSON-RPC error.
+    /// Preflight and public metadata do not open a session, parse JSON,
+    /// authenticate, run middleware or invoke a handler.
     ///
     /// The supplied policy must describe the server's configured modern path.
     /// Existing server CORS/authorization policy is still enforced and can refuse
@@ -133,11 +137,16 @@ impl ServerHttpEndpoint {
         // this future would cancel a successfully opened modern SSE dispatch.
         let (response, mut session) = await_dispatch(cx, async {
             let mut session = self.open_session(cx).map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
-            match session.handle_async(cx, request).await {
+            let dispatched = match &policy.scope_authorization {
+                Some(scopes) => scope::dispatch(&mut session, cx, scopes, request).await,
+                None => session.handle_async(cx, request).await
+                    .map_err(|_| SecuredHttpEndpointError::DispatchFailed),
+            };
+            match dispatched {
                 Ok(response) => Ok((response, session)),
-                Err(_) => {
+                Err(error) => {
                     session.close(cx).await;
-                    Err(SecuredHttpEndpointError::DispatchFailed)
+                    Err(error)
                 }
             }
         }).await?;
