@@ -106,8 +106,16 @@ impl AManifest {
                 .all(|binding| is_lowercase_hex(&binding.blob_sha1, 40))
     }
 
+    /// Binds the COUNT, not merely non-emptiness.
+    ///
+    /// `!is_empty()` accepts a manifest carrying one passing subcase out of
+    /// four, which reports a green A run over a fraction of the evaluation.
+    /// `BManifest` and the integration manifest both compare against their
+    /// subcase table's length; A did not, and was the weakest of the three.
+    /// `A_SUBCASES` is `[_; 4]`, so this binds the "four ordered subcase
+    /// outcomes" the acceptance item names.
     pub fn all_subcases_passed(&self) -> bool {
-        !self.subcases.is_empty()
+        self.subcases.len() == super::A_SUBCASES.len()
             && self
                 .subcases
                 .iter()
@@ -147,12 +155,19 @@ mod tests {
             trace_row_count: 1,
             observed_fields_per_row: 13,
             required_item_count: 1,
-            subcases: vec![SubcaseOutcome {
-                id: "FND-02-A-01".to_owned(),
-                name: "traceability-completeness".to_owned(),
-                outcome: Outcome::Pass,
-                diagnostic_count: 0,
-            }],
+            // Built from the subcase table rather than hand-listed, so the
+            // fixture cannot drift from it. A one-element fixture would make
+            // `a_failing_subcase_is_not_a_pass` pass on the COUNT instead of
+            // the outcome it means to test.
+            subcases: super::super::A_SUBCASES
+                .iter()
+                .map(|(id, name)| SubcaseOutcome {
+                    id: (*id).to_owned(),
+                    name: (*name).to_owned(),
+                    outcome: Outcome::Pass,
+                    diagnostic_count: 0,
+                })
+                .collect(),
             consumer_id: "bd-mcp-fnd-02-integration-8s4k".to_owned(),
             write_counters: [0; 6],
         }
@@ -170,6 +185,25 @@ mod tests {
             .find("\"canonical_plan_sha256\"")
             .expect("plan digest present");
         assert!(schema_at < plan_at);
+    }
+
+    #[test]
+    fn a_short_subcase_list_is_not_a_pass_even_when_every_entry_passed() {
+        let full = manifest();
+        assert_eq!(full.subcases.len(), super::super::A_SUBCASES.len());
+        assert!(full.all_subcases_passed());
+
+        // Drop one subcase and leave every survivor passing. Under the old
+        // `!is_empty()` guard this still reported a green A run over three
+        // quarters of the evaluation.
+        let mut short = manifest();
+        short.subcases.pop().expect("the fixture carries subcases");
+        assert!(
+            short.subcases.iter().all(|s| s.outcome == Outcome::Pass),
+            "the mutation must remove a subcase, not fail one — otherwise \
+             this proves the outcome check, not the count check"
+        );
+        assert!(!short.all_subcases_passed());
     }
 
     #[test]
