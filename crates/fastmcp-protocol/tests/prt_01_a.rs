@@ -11,7 +11,8 @@
 use fastmcp_protocol::{
     ClientIngressFailureScope, CorrelationKey, JsonRpcAdmissionError, JsonRpcEndpointRole,
     JsonRpcMessage, JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse,
-    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, RawJsonAdmissionError, RawJsonRpcDisposition,
+    MAX_JSONRPC_STRING_ID_ENCODED_BYTES, MAX_RAW_JSON_PATH_SEGMENT_BYTES,
+    RawJsonAdmissionError, RawJsonRpcDisposition,
     RawJsonTopLevel, RequestId, UncorrelatedJsonRpcErrorResponse, admit_raw_json_document,
     admit_raw_jsonrpc_document, decode_strict_jsonrpc_message, dispose_raw_jsonrpc_failure,
 };
@@ -627,4 +628,81 @@ fn prt_01_a_planted_negative() {
     let too_large = admit_raw_jsonrpc_document(baseline, baseline.len() - 1);
     assert_eq!(too_large, Err(RawJsonAdmissionError::DocumentTooLarge));
     assert!(admit_raw_jsonrpc_document(baseline, DOCUMENT_LIMIT).is_ok());
+}
+
+/// Binds the character-counter / byte-budget equivalence in the path redactor.
+/// Supplementary coverage, deliberately NOT a frozen acceptance ID.
+///
+/// # Why prose was not enough
+///
+/// `redact_raw_json_path` counts CHARACTERS and compares them against
+/// `MAX_RAW_JSON_PATH_SEGMENT_BYTES`, a BYTE budget. That is correct only
+/// because every retained character contributes exactly one byte: the
+/// retention set is ASCII alphanumerics plus `_ . -`, and every other
+/// character collapses to a single `*`. A comment at the loop records that
+/// reasoning, and **a comment cannot fail**.
+///
+/// Two readers reached that conclusion independently and agreed — but by the
+/// same method, tracing the same branches, so the agreement was one reading
+/// with extra confidence rather than two confirmations. This test is the
+/// independent instrument: it pushes the defect through the function instead
+/// of reasoning about it.
+///
+/// # The worthless implementation this refuses
+///
+/// Every other path assertion in this file feeds the redactor an ASCII member
+/// name, so a redactor that passed names through unchanged would satisfy all
+/// of them. Widen the retention set to admit a multi-byte character — or reach
+/// for a Unicode ellipsis as the truncation marker — and the counter keeps
+/// counting characters while the output grows to two, three or four bytes
+/// each. The bound silently stops holding. This case fails when that happens;
+/// nothing else here would.
+#[test]
+fn prt_01_a_redacted_path_bounds_bytes_not_characters() {
+    // A name whose CHARACTER count and BYTE count differ by a factor of two
+    // before redaction. If this fixture ever became ASCII the test would pass
+    // while proving nothing, so it is asserted rather than assumed.
+    let name: String = "é".repeat(100);
+    assert_eq!(name.chars().count(), 100);
+    assert_eq!(
+        name.len(),
+        200,
+        "the fixture must be multi-byte or this case proves nothing"
+    );
+
+    let document = format!("{{\"{name}\":1,\"{name}\":2}}");
+    let failure =
+        admit_raw_json_document(document.as_bytes(), DOCUMENT_LIMIT, RawJsonTopLevel::AnyValue)
+            .expect_err("a duplicate member is refused whatever its name encodes to");
+    assert_eq!(
+        failure.error(),
+        RawJsonAdmissionError::DuplicateObjectMember
+    );
+
+    let path = failure.path();
+
+    // THE BINDING ASSERTION. Pure ASCII is exactly the property that makes a
+    // character count equal a byte count, so this is the invariant itself
+    // rather than a restatement of it.
+    assert!(
+        path.is_ascii(),
+        "the redacted path must be pure ASCII or the character counter stops bounding bytes: {path:?}"
+    );
+
+    // The budget, measured in BYTES, against the declared design limit rather
+    // than a frozen measurement of today's output.
+    for segment in path.split('/').skip(1) {
+        assert!(
+            segment.len() <= MAX_RAW_JSON_PATH_SEGMENT_BYTES + 1,
+            "segment {segment:?} is {} bytes, past the {MAX_RAW_JSON_PATH_SEGMENT_BYTES}-byte \
+             budget plus its one-byte truncation marker",
+            segment.len()
+        );
+    }
+
+    // Every non-retained character collapses to exactly one `*`, and the
+    // segment is truncated with `~`. Computed from the public limit so that
+    // raising the limit moves the expectation instead of rotting it.
+    let expected = format!("/{}~", "*".repeat(MAX_RAW_JSON_PATH_SEGMENT_BYTES));
+    assert_eq!(path, expected);
 }
