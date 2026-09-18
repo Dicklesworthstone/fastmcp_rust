@@ -92,7 +92,22 @@ impl fmt::Display for ClientCredentialsTasksError {
 }
 impl std::error::Error for ClientCredentialsTasksError {}
 impl From<ClientCredentialsError> for ClientCredentialsTasksError {
-    fn from(error: ClientCredentialsError) -> Self { Self::Authentication(error) }
+    fn from(error: ClientCredentialsError) -> Self {
+        match error {
+            // A refused redirect is a PROTOCOL outcome, not an authentication
+            // one, and carries the same status `require_success` would have
+            // produced had the executor returned a response instead of an error.
+            ClientCredentialsError::Redirect { status } => {
+                Self::Protocol(ManagedTasksError::HttpStatus { status })
+            }
+            // Correct TODAY because every remaining variant genuinely is an
+            // authentication-domain failure. A future PROTOCOL-outcome variant
+            // added to ClientCredentialsError would be misclassified here
+            // silently, with no compile error to catch it -- this arm accepts
+            // anything. Add it above this line, not below.
+            other => Self::Authentication(other),
+        }
+    }
 }
 impl From<ManagedTasksError> for ClientCredentialsTasksError {
     fn from(error: ManagedTasksError) -> Self { Self::Protocol(error) }

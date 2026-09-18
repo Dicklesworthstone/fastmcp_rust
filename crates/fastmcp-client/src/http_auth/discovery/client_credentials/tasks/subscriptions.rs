@@ -30,7 +30,7 @@ use super::super::{
     authorize, discovery_deadline,
 };
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener,
 };
@@ -127,7 +127,17 @@ impl ClientCredentialsTasksClient {
                 let discovery_wire = authorize(&snapshot, prepared.discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
                     executor.execute_with_cancellation(cx, cancellation, &discovery_wire).await
-                        .map_err(|_| ClientCredentialsError::Transport)
+                        .map_err(|error| match error {
+                            // Only a 3xx is preserved: it is the one executor
+                            // failure whose identity a caller acts on, and the
+                            // status IS the failure. Everything else stays
+                            // Transport because ClientCredentialsError has no
+                            // carrier for it -- narrowed deliberately, not swept.
+                            ModernHttpExecutorError::Redirect { status } => {
+                                ClientCredentialsError::Redirect { status }
+                            }
+                            _ => ClientCredentialsError::Transport,
+                        })
                 }).await?;
                 require_success(&response)?;
                 if response.metadata().kind() != ModernHttpResponseKind::Json {
@@ -145,7 +155,17 @@ impl ClientCredentialsTasksClient {
                 let wire = authorize(&snapshot, prepared.listen_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {
                     executor.execute_with_cancellation(cx, cancellation, &wire).await
-                        .map_err(|_| ClientCredentialsError::Transport)
+                        .map_err(|error| match error {
+                            // Only a 3xx is preserved: it is the one executor
+                            // failure whose identity a caller acts on, and the
+                            // status IS the failure. Everything else stays
+                            // Transport because ClientCredentialsError has no
+                            // carrier for it -- narrowed deliberately, not swept.
+                            ModernHttpExecutorError::Redirect { status } => {
+                                ClientCredentialsError::Redirect { status }
+                            }
+                            _ => ClientCredentialsError::Transport,
+                        })
                 }).await?;
                 require_success(&response)?;
                 if response.metadata().kind() != ModernHttpResponseKind::Sse {

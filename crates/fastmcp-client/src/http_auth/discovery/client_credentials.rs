@@ -84,6 +84,14 @@ pub enum ClientCredentialsError {
     RequestTooLarge,
     Negotiation,
     UnexpectedResponse,
+    /// A redirect status the executor refused to follow, carried so the caller
+    /// can classify it. MCP never follows redirects, so this is terminal; it
+    /// exists because the status is the whole content of the failure and
+    /// `Transport` erases it.
+    Redirect {
+        /// The 3xx status the resource answered with.
+        status: u16,
+    },
     Discovery(OAuthDiscoveryError),
 }
 impl fmt::Display for ClientCredentialsError {
@@ -106,6 +114,7 @@ impl fmt::Display for ClientCredentialsError {
             Self::RequestTooLarge => "client-credentials MCP request exceeds its byte bound",
             Self::Negotiation => "resource did not admit the client-credentials extension",
             Self::UnexpectedResponse => "client-credentials response rejected",
+            Self::Redirect { .. } => "resource answered the client-credentials request with a redirect, which MCP does not follow",
             Self::Discovery(_) => "client-credentials discovery or operation lifetime failed",
         })
     }
