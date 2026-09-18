@@ -16,6 +16,9 @@
 //! It does not convert a JSON-RPC policy refusal into an HTTP OAuth challenge.
 //! No token, HTTP authentication field or OAuth profile is added to stdio.
 
+/// Exact named-operation rules intersected with the method policy.
+pub mod operation;
+
 use std::fmt;
 use std::sync::Arc;
 
