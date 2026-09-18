@@ -56184,7 +56184,30 @@ original = "value"
             let member = member
                 .as_str()
                 .filter(|member| {
-                    member.starts_with("crates/")
+                    // WORKSPACE ROOTS IN SCOPE. This prefix test predates
+                    // `tools/xtask` by 45 days -- it was written at 5d211ea4
+                    // (2026-08-03) when every member did live under `crates/`,
+                    // and a7109f65 (2026-09-17 08:06, the FND-02 traceability
+                    // checker) added a member that does not. Every member must
+                    // pass this filter, so one unlisted prefix fails the whole
+                    // inventory with E_STATE_PARTITION_RNG_INVENTORY at
+                    // Cargo.toml:workspace.members. That is bd-xfwiy.
+                    //
+                    // ACCEPTING `tools/` STRENGTHENS THIS CHECK, it does not relax
+                    // it. `member_roots` drives the inventory WALK, so a member
+                    // that fails this filter is not merely unlisted -- its Rust
+                    // sources are never collected and its RNG usage is never
+                    // partitioned. Excluding `tools/` would leave a real
+                    // workspace member permanently uninventoried, which is the
+                    // relaxation; admitting it is the repair.
+                    //
+                    // The three operands below are the actual safety properties
+                    // and are untouched: no glob, relative, and Normal components
+                    // only. The prefix set stays CLOSED on purpose -- a third
+                    // top-level root must fail here and force a deliberate
+                    // decision rather than being silently swept in. This check
+                    // failing closed is what surfaced the defect.
+                    (member.starts_with("crates/") || member.starts_with("tools/"))
                         && !member.contains('*')
                         && !Path::new(member).is_absolute()
                         && Path::new(member).components().all(|component| matches!(component, std::path::Component::Normal(_)))
