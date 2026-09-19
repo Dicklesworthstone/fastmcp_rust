@@ -288,3 +288,37 @@ fn lock_contention_and_close_are_fail_closed_not_waiting_or_replay_permission() 
     assert!(mw.journal.lock().unwrap().entries.is_empty());
     assert!(!format!("{mw:?}").contains("opaque"));
 }
+
+#[test]
+fn resources_and_prompts_replay_through_their_own_method_result_codecs() {
+    let mw = middleware(ContinuationReplayLimits::default(), &McpRequestCancellation::new());
+    let cases = [
+        ("resources/read", json!({"uri":"file:///one"}), json!({
+            "resultType":"complete", "contents":[{"uri":"file:///one","text":"resource-value"}],
+            "ttlMs":0,"cacheScope":"private"
+        })),
+        ("prompts/get", json!({"name":"greeting"}), json!({
+            "resultType":"complete", "messages":[{"role":"user","content":{"type":"text","text":"prompt-value"}}],
+            "ttlMs":0,"cacheScope":"private"
+        })),
+    ];
+    for (method, mut params, expected) in cases {
+        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        params["requestState"] = json!("shared-wire-state");
+        params["inputResponses"] = json!({});
+        let req = JsonRpcRequest::new(method, Some(params), 1i64);
+        finish(&mw, &req, expected.clone());
+        assert_eq!(replay(&mw, &req), expected);
+    }
+    assert_eq!(mw.journal.lock().unwrap().entries.len(), 2, "the same wire state cannot alias across methods");
+}
+
+#[test]
+fn completed_tool_errors_replay_as_errors_not_successful_empty_results() {
+    let mw = middleware(ContinuationReplayLimits::default(), &McpRequestCancellation::new());
+    let req = request("error-state");
+    let expected = json!({"resultType":"complete","isError":true,
+        "content":[{"type":"text","text":"the operation was declined"}]});
+    finish(&mw, &req, expected.clone());
+    assert_eq!(replay(&mw, &req), expected);
+}
