@@ -15308,10 +15308,10 @@ impl Server {
             websocket_connection_generation,
         );
         let recv_close = recv_half
-            .close(cx)
+            .close(pump_cx)
             .map_err(|error| transport_run_error("receive_close", &error));
         let send_close = send_half
-            .close(cx)
+            .close(pump_cx)
             .map_err(|error| transport_run_error("send_close", &error));
         combine_split_transport_results(run_result, recv_close, send_close)
     }
