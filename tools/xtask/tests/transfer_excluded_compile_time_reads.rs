@@ -246,8 +246,7 @@ fn resolve(read: &CompileTimeRead, file: &Path, crate_root: &Path, ws: &Path) ->
         .iter()
         .filter(|s| *s != "CARGO_MANIFEST_DIR")
         .cloned()
-        .collect::<Vec<_>>()
-        .join("");
+        .collect();
     if joined.is_empty() {
         return None;
     }
