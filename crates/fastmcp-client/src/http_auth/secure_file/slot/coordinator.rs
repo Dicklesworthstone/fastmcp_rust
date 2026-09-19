@@ -254,7 +254,7 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
             }
         };
         // No payload has been handed out, so cancellation after a recovery
-        // settlement can safely fail open; a new open observes the settled state.
+        // settlement can safely refuse opening; a new open observes the settled state.
         check(cx)?;
         Ok((Self { slot, anchor, binding, snapshot, quarantined: false }, recovery))
     }
@@ -301,6 +301,40 @@ impl<A: CredentialCommitAnchor> CoordinatedCredentialSlot<A> {
         self.admit(cx, authorization)?;
         let mutation = self.slot.prepare_take(cx, authorization, expected)?;
         self.commit(cx, authorization, mutation)
+    }
+
+    /// Invalidates stored credential material without releasing its payload.
+    /// Even an initially absent slot acquires a durable tombstone: a later
+    /// caller cannot mistake logout for an uninitialized generation-zero store.
+    /// Repeating invalidation of that same tombstone is a read-only no-op.
+    ///
+    /// This is local persistent-custody invalidation, not issuer-side OAuth
+    /// revocation. It cannot recall credentials already handed to application
+    /// code. The host must separately revoke its live session and, when needed,
+    /// contact the issuer. A replacement grant must name the returned revision.
+    pub fn invalidate(
+        &mut self,
+        cx: &Cx,
+        authorization: &PartitionAuthorization,
+    ) -> Result<SlotRevision, CoordinatedSlotError> {
+        self.admit(cx, authorization)?;
+        let current = match self.slot.read_current(cx) {
+            Ok(current) => current,
+            Err(error) => {
+                self.quarantined = true;
+                return Err(error.into());
+            }
+        };
+        if let Some(record) = current {
+            if record.payload.is_none() {
+                return Ok(record.revision);
+            }
+            // Do not retain the old payload in the prepared mutation or the
+            // result; invalidation has no consume/delivery phase.
+            drop(record);
+        }
+        let mutation = self.slot.prepare(None, None)?;
+        Ok(self.commit(cx, authorization, mutation)?.revision())
     }
 
     fn admit(&mut self, cx: &Cx, authorization: &PartitionAuthorization) -> Result<(), CoordinatedSlotError> {

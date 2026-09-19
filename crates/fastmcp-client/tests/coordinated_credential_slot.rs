@@ -485,3 +485,109 @@ fn namespace_binding_is_injective_and_invalid_names_fail_before_provider_access(
     assert!(CredentialAnchorBinding::for_store(&"x".repeat(128), &fixture.key, &fixture.authorization).is_ok());
     assert_eq!(fixture.control.lock().unwrap().reads, 0);
 }
+
+#[test]
+fn invalidating_an_absent_slot_creates_a_durable_tombstone_not_a_fresh_store() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, 0);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    let tombstone = slot.invalidate(&cx, &fixture.authorization).unwrap();
+    assert_eq!(tombstone.generation(), 1);
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), None);
+    assert!(fixture.data.0.join("credential").exists());
+    assert_eq!(slot.replace(&cx, &fixture.authorization, None, b"stale-login").err(), Some(CoordinatedSlotError::Slot(CredentialSlotError::RevisionMismatch)));
+    drop(slot);
+    let (mut slot, recovery) = fixture.open(&cx).unwrap();
+    assert!(recovery.is_none());
+    assert_eq!(slot.revision(), Some(tombstone));
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), None);
+    let next = slot.replace(&cx, &fixture.authorization, Some(tombstone), b"new-grant").unwrap();
+    assert_eq!(next.generation(), 2);
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), Some(b"new-grant".to_vec()));
+}
+
+#[test]
+fn invalidation_removes_payload_and_repeating_it_does_not_advance_the_anchor() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, 0);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    let first = slot.replace(&cx, &fixture.authorization, None, b"discard-do-not-deliver").unwrap();
+    let tombstone = slot.invalidate(&cx, &fixture.authorization).unwrap();
+    assert_eq!(tombstone.generation(), first.generation() + 1);
+    assert_eq!(slot.take(&cx, &fixture.authorization, tombstone).err(), Some(CoordinatedSlotError::Slot(CredentialSlotError::Empty)));
+    let data = fixture.data_bytes();
+    assert!(!data.windows(b"discard-do-not-deliver".len()).any(|part| part == b"discard-do-not-deliver"));
+    let anchor = fs::read(fixture.anchor.0.join("anchor")).unwrap();
+    let transitions = fixture.control.lock().unwrap().transitions.len();
+    assert_eq!(slot.invalidate(&cx, &fixture.authorization).unwrap(), tombstone);
+    assert_eq!(slot.invalidate(&cx, &fixture.authorization).unwrap(), tombstone);
+    assert_eq!(fixture.data_bytes(), data);
+    assert_eq!(fs::read(fixture.anchor.0.join("anchor")).unwrap(), anchor);
+    assert_eq!(fixture.control.lock().unwrap().transitions.len(), transitions);
+}
+
+#[test]
+fn ambiguous_invalidation_settlement_recovers_without_resurrecting_the_payload() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, 0);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    slot.replace(&cx, &fixture.authorization, None, b"revoked").unwrap();
+    fixture.fault(Fault::BeforeSettle);
+    assert!(slot.invalidate(&cx, &fixture.authorization).is_err());
+    assert!(slot.requires_recovery());
+    assert_eq!(slot.invalidate(&cx, &fixture.authorization).err(), Some(CoordinatedSlotError::RecoveryRequired));
+    drop(slot);
+    let (mut slot, recovery) = fixture.open(&cx).unwrap();
+    assert!(recovery.is_some());
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), None);
+    let tombstone = slot.revision().unwrap();
+    assert_eq!(slot.invalidate(&cx, &fixture.authorization).unwrap(), tombstone);
+}
+
+#[test]
+fn failed_invalidation_prepare_retains_the_previous_payload() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, 0);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    let first = slot.replace(&cx, &fixture.authorization, None, b"retained").unwrap();
+    let before = fixture.data_bytes();
+    fixture.fault(Fault::BeforePrepare);
+    assert!(slot.invalidate(&cx, &fixture.authorization).is_err());
+    assert_eq!(fixture.data_bytes(), before);
+    drop(slot);
+    let (mut slot, recovery) = fixture.open(&cx).unwrap();
+    assert!(recovery.is_none());
+    assert_eq!(slot.revision(), Some(first));
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), Some(b"retained".to_vec()));
+}
+
+#[test]
+fn unauthorized_invalidation_does_not_query_or_change_the_owners_store() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, 0);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    let (_, bob) = identity("bob");
+    let before = fixture.control.lock().unwrap().reads;
+    assert_eq!(slot.invalidate(&cx, &bob).err(), Some(CoordinatedSlotError::Slot(CredentialSlotError::BindingMismatch)));
+    assert_eq!(fixture.control.lock().unwrap().reads, before);
+    assert!(!fixture.data.0.join("credential").exists());
+    assert!(fixture.control.lock().unwrap().transitions.is_empty());
+}
+
+#[test]
+fn repeated_invalidation_of_a_tombstone_needs_no_remaining_anchor_sequence() {
+    let fixture = Fixture::new();
+    let cx = Cx::for_testing();
+    fixture.provision(&cx, u64::MAX - 2);
+    let (mut slot, _) = fixture.open(&cx).unwrap();
+    let tombstone = slot.invalidate(&cx, &fixture.authorization).unwrap();
+    assert_eq!(slot.invalidate(&cx, &fixture.authorization).unwrap(), tombstone);
+    assert_eq!(fixture.control.lock().unwrap().transitions.len(), 2);
+    assert_eq!(slot.replace(&cx, &fixture.authorization, Some(tombstone), b"new").err(), Some(CoordinatedSlotError::SequenceExhausted));
+    assert_eq!(slot.load(&cx, &fixture.authorization).unwrap(), None);
+}
