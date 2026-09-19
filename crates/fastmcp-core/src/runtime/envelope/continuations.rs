@@ -37,7 +37,10 @@ impl ContinuationHandle {
             }
         }
         let mut bytes = [0; HANDLE_BYTES];
-        for (output, pair) in bytes.iter_mut().zip(wire.as_bytes().chunks_exact(2)) {
+        // `as_chunks` yields `[u8; 2]` rather than a slice, so the pair indexing
+        // below is checked at compile time. The length test above makes the
+        // remainder provably empty, so nothing is discarded that was not before.
+        for (output, pair) in bytes.iter_mut().zip(wire.as_bytes().as_chunks::<2>().0) {
             *output = digit(pair[0])? * 16 + digit(pair[1])?;
         }
         Ok(Self(bytes))
@@ -160,8 +163,8 @@ impl EphemeralContinuationStore {
         self.protector.check(cx)?;
         if owner.is_cancel_requested() { return Err(ContinuationStoreError::Unavailable); }
         let binding = EnvelopeBinding::continuation(key, authorization, &self.namespace)?;
-        if plaintext.len() > self.protector.policy.maximum_plaintext { return Err(EnvelopeError::TooLarge.into()); }
-        if lifetime.is_zero() || lifetime > self.protector.policy.maximum_lifetime {
+        if plaintext.len() > self.protector.policy.plaintext_limit { return Err(EnvelopeError::TooLarge.into()); }
+        if lifetime.is_zero() || lifetime > self.protector.policy.lifetime_bound {
             return Err(EnvelopeError::InvalidLifetime.into());
         }
         let charge = HEADER_BYTES + TAG_BYTES + plaintext.len() + ENTRY_IDENTITY_BYTES;

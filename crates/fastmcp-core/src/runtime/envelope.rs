@@ -90,19 +90,19 @@ impl fmt::Debug for EnvelopeBinding {
 /// Retained generations are bounded independently; rotation cannot evict a key
 /// that still protects live state merely to make room for a new key.
 #[derive(Clone, Copy, Debug)]
-pub struct EnvelopePolicy { maximum_plaintext: usize, maximum_lifetime: Duration, maximum_keys: usize }
+pub struct EnvelopePolicy { plaintext_limit: usize, lifetime_bound: Duration, retained_keys: usize }
 impl Default for EnvelopePolicy {
     fn default() -> Self {
-        Self { maximum_plaintext: 64 * 1024, maximum_lifetime: Duration::from_secs(900), maximum_keys: 4 }
+        Self { plaintext_limit: 64 * 1024, lifetime_bound: Duration::from_mins(15), retained_keys: 4 }
     }
 }
 impl EnvelopePolicy {
-    pub fn new(maximum_plaintext: usize, maximum_lifetime: Duration, maximum_keys: usize) -> Result<Self, EnvelopeError> {
-        if maximum_plaintext == 0 || maximum_plaintext > MAX_PLAINTEXT
-            || maximum_lifetime.is_zero() || maximum_lifetime > MAX_LIFETIME
-            || !(1..=8).contains(&maximum_keys)
+    pub fn new(plaintext_limit: usize, lifetime_bound: Duration, retained_keys: usize) -> Result<Self, EnvelopeError> {
+        if plaintext_limit == 0 || plaintext_limit > MAX_PLAINTEXT
+            || lifetime_bound.is_zero() || lifetime_bound > MAX_LIFETIME
+            || !(1..=8).contains(&retained_keys)
         { return Err(EnvelopeError::InvalidPolicy); }
-        Ok(Self { maximum_plaintext, maximum_lifetime, maximum_keys })
+        Ok(Self { plaintext_limit, lifetime_bound, retained_keys })
     }
 }
 
@@ -197,8 +197,8 @@ impl EphemeralEnvelopeProtector {
             keys: vec![first], generation: 1, closed: false })
     }
 
-    pub fn maximum_plaintext_bytes(&self) -> usize { self.policy.maximum_plaintext }
-    pub fn maximum_envelope_bytes(&self) -> usize { HEADER_BYTES + self.policy.maximum_plaintext + TAG_BYTES }
+    pub fn maximum_plaintext_bytes(&self) -> usize { self.policy.plaintext_limit }
+    pub fn maximum_envelope_bytes(&self) -> usize { HEADER_BYTES + self.policy.plaintext_limit + TAG_BYTES }
     pub fn generation(&self) -> u64 { self.generation }
 
     /// Irreversible local revocation. All retained keys are zeroized on drop;
@@ -210,7 +210,7 @@ impl EphemeralEnvelopeProtector {
     pub fn rotate(&mut self, cx: &Cx) -> Result<u64, EnvelopeError> {
         self.check(cx)?;
         let now = self.elapsed()?;
-        if self.keys.iter().filter(|key| key.latest_expiry > now).count() >= self.policy.maximum_keys {
+        if self.keys.iter().filter(|key| key.latest_expiry > now).count() >= self.policy.retained_keys {
             return Err(EnvelopeError::KeyCapacity);
         }
         let next = self.generation.checked_add(1).ok_or(EnvelopeError::GenerationExhausted)?;
@@ -229,8 +229,8 @@ impl EphemeralEnvelopeProtector {
     {
         self.check(cx)?;
         if binding.purpose != self.purpose { return Err(EnvelopeError::InvalidBinding); }
-        if plaintext.len() > self.policy.maximum_plaintext { return Err(EnvelopeError::TooLarge); }
-        if lifetime.is_zero() || lifetime > self.policy.maximum_lifetime { return Err(EnvelopeError::InvalidLifetime); }
+        if plaintext.len() > self.policy.plaintext_limit { return Err(EnvelopeError::TooLarge); }
+        if lifetime.is_zero() || lifetime > self.policy.lifetime_bound { return Err(EnvelopeError::InvalidLifetime); }
         let expiry = self.elapsed()?.checked_add(u64::try_from(lifetime.as_nanos()).map_err(|_| EnvelopeError::InvalidLifetime)?)
             .ok_or(EnvelopeError::InvalidLifetime)?;
         let key = self.keys.last_mut().ok_or(EnvelopeError::Closed)?;
@@ -281,7 +281,7 @@ impl EphemeralEnvelopeProtector {
         let counter = number(50)?;
         let expiry = number(58)?;
         let length = u32::from_be_bytes(header[66..70].try_into().map_err(|_| EnvelopeError::InvalidEnvelope)?) as usize;
-        if length > self.policy.maximum_plaintext || envelope.len() != HEADER_BYTES + length + TAG_BYTES {
+        if length > self.policy.plaintext_limit || envelope.len() != HEADER_BYTES + length + TAG_BYTES {
             return Err(EnvelopeError::InvalidEnvelope);
         }
         let key = self.keys.iter().find(|key| key.id == generation).ok_or(EnvelopeError::InvalidEnvelope)?;
