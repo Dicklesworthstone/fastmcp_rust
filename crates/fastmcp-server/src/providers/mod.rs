@@ -10,6 +10,8 @@
 //!   use the caller-owned asupersync blocking pool when one is installed.
 //! - With the `apps` feature, `McpAppsUiResource`: one immutable final-only
 //!   `ui://` HTML document for a negotiated MCP Apps View.
+//! - [`RegisteredSchemaTool`]: a tool using explicitly provisioned schema
+//!   resources through the router's normal input/output validation path.
 //!
 //! # Example
 //!
@@ -30,7 +32,10 @@
 mod filesystem;
 #[cfg(feature = "apps")]
 mod mcp_apps;
+mod schema_tool;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
 #[cfg(feature = "apps")]
 pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};
+pub use schema_tool::{RegisteredSchemaTool, RegisteredSchemaToolError};
+pub use fastmcp_protocol::{SchemaRegistryError, SchemaRegistryLimits, SchemaResourceRegistry};
