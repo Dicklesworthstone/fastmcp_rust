@@ -10,6 +10,9 @@
 //! replace requestState, or decide that a previous attempt may safely be retried.
 //! ManagedInteraction::resume owns those checks and the exact opaque state.
 
+/// Host-authorized mixed roots, elicitation and sampling input resolution.
+pub mod mixed;
+
 use std::fmt;
 
 use asupersync::Cx;
