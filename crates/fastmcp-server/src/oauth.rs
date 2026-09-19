@@ -327,6 +327,7 @@ pub struct OAuthHttpRoutes {
     authorization_path: String,
     token_path: String,
     revocation_path: String,
+    registration_path: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
     oidc: Option<OidcHttpRoutes>,
 }
@@ -367,7 +368,8 @@ impl std::fmt::Debug for OAuthHttpRoutes {
             .field("public_endpoint_base", &self.public_endpoint_base)
             .field("authorization_path", &self.authorization_path)
             .field("token_path", &self.token_path)
-            .field("revocation_path", &self.revocation_path);
+            .field("revocation_path", &self.revocation_path)
+            .field("registration_path", &self.registration_path);
         #[cfg(feature = "builtin-auth-server")]
         debug
             .field(
@@ -444,12 +446,17 @@ impl OAuthHttpRoutes {
                 format!("{base_path}/{suffix}")
             }
         };
+        let registration_path = server
+            .config()
+            .allow_public_clients
+            .then(|| route_path("register"));
         Ok(Self {
             server,
             public_endpoint_base,
             authorization_path: route_path("authorize"),
             token_path: route_path("token"),
             revocation_path: route_path("revoke"),
+            registration_path,
             #[cfg(feature = "builtin-auth-server")]
             oidc: None,
         })
@@ -490,17 +497,19 @@ impl OAuthHttpRoutes {
             jwks_uri,
         };
         if [
-            self.authorization_path(),
-            self.token_path(),
-            self.revocation_path(),
+            Some(self.authorization_path()),
+            Some(self.token_path()),
+            Some(self.revocation_path()),
+            self.registration_path(),
         ]
-        .contains(&candidate.discovery_path.as_str())
+        .contains(&Some(candidate.discovery_path.as_str()))
             || [
-                self.authorization_path(),
-                self.token_path(),
-                self.revocation_path(),
+                Some(self.authorization_path()),
+                Some(self.token_path()),
+                Some(self.revocation_path()),
+                self.registration_path(),
             ]
-            .contains(&candidate.jwks_path.as_str())
+            .contains(&Some(candidate.jwks_path.as_str()))
             || candidate.discovery_path == candidate.jwks_path
         {
             return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
@@ -533,6 +542,12 @@ impl OAuthHttpRoutes {
         &self.revocation_path
     }
 
+    /// Returns the native public-client registration route when enabled.
+    #[must_use]
+    pub fn registration_path(&self) -> Option<&str> {
+        self.registration_path.as_deref()
+    }
+
     pub(crate) fn server(&self) -> &Arc<OAuthServer> {
         &self.server
     }
@@ -541,6 +556,7 @@ impl OAuthHttpRoutes {
         path == self.authorization_path
             || path == self.token_path
             || path == self.revocation_path
+            || self.registration_path.as_deref() == Some(path)
             || {
                 #[cfg(feature = "builtin-auth-server")]
                 {
@@ -566,11 +582,12 @@ impl OAuthHttpRoutes {
     ) -> Result<(), OAuthHttpRouteConfigurationError> {
         if occupied_paths.into_iter().any(|occupied| {
             [
-                self.authorization_path(),
-                self.token_path(),
-                self.revocation_path(),
+                Some(self.authorization_path()),
+                Some(self.token_path()),
+                Some(self.revocation_path()),
+                self.registration_path(),
             ]
-            .contains(&occupied)
+            .contains(&Some(occupied))
                 || {
                     #[cfg(feature = "builtin-auth-server")]
                     {
@@ -1779,6 +1796,38 @@ impl OAuthClientBuilder {
         client.validate_for_retention()?;
         Ok(client)
     }
+}
+
+/// Strict RFC 7591 subset accepted by the built-in registration route.
+///
+/// The route intentionally creates native public clients only. Confidential
+/// registration, software statements, registration management credentials and
+/// arbitrary extension metadata require a separately reviewed profile.
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativePublicClientRegistrationRequest {
+    pub client_name: String,
+    pub application_type: String,
+    pub redirect_uris: Vec<String>,
+    pub token_endpoint_auth_method: String,
+    pub grant_types: Vec<String>,
+    pub response_types: Vec<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// Exact public response consumed by FastMCP's native DCR client.
+#[derive(serde::Serialize)]
+pub(crate) struct NativePublicClientRegistrationResponse {
+    pub client_id: String,
+    pub client_name: String,
+    pub application_type: &'static str,
+    pub redirect_uris: Vec<String>,
+    pub token_endpoint_auth_method: &'static str,
+    pub grant_types: Vec<String>,
+    pub response_types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 // =============================================================================
@@ -3044,6 +3093,83 @@ impl OAuthServer {
             .unwrap_or_default();
         clients.sort_unstable_by(|left, right| left.client_id.cmp(&right.client_id));
         clients
+    }
+
+    /// Registers one bounded RFC 8252 native public client from the HTTP DCR
+    /// profile. Client IDs are framework-generated CSPRNG values and no secret
+    /// or registration-management credential is created.
+    pub(crate) fn register_native_public_client(
+        &self,
+        request: NativePublicClientRegistrationRequest,
+    ) -> Result<NativePublicClientRegistrationResponse, OAuthError> {
+        self.config.validate()?;
+        if !self.config.allow_public_clients {
+            return Err(OAuthError::InvalidClient(
+                "public client registration is disabled".to_string(),
+            ));
+        }
+        if request.application_type != "native"
+            || request.token_endpoint_auth_method != "none"
+            || request.response_types.len() != 1
+            || request.response_types[0] != "code"
+            || request.grant_types.is_empty()
+            || request.grant_types.len() > 2
+            || !request.grant_types.iter().any(|grant| grant == "authorization_code")
+            || request.grant_types.iter().any(|grant| {
+                grant != "authorization_code" && grant != "refresh_token"
+            })
+            || request.grant_types.iter().enumerate().any(|(index, grant)| {
+                request.grant_types[..index].contains(grant)
+            })
+            || request.redirect_uris.iter().enumerate().any(|(index, uri)| {
+                request.redirect_uris[..index].contains(uri)
+            })
+        {
+            return Err(OAuthError::InvalidRequest(
+                "dynamic registration is outside the native public-client profile".to_string(),
+            ));
+        }
+
+        let scopes = match request.scope.as_deref() {
+            None => Vec::new(),
+            Some(scope) if scope.is_empty() => {
+                return Err(OAuthError::InvalidRequest(
+                    "dynamic registration scope is empty".to_string(),
+                ));
+            }
+            Some(scope) => {
+                let values: Vec<String> = scope.split(' ').map(str::to_owned).collect();
+                if values.iter().any(String::is_empty)
+                    || values.iter().enumerate().any(|(index, value)| {
+                        values[..index].contains(value)
+                    })
+                {
+                    return Err(OAuthError::InvalidRequest(
+                        "dynamic registration scope is not canonical".to_string(),
+                    ));
+                }
+                values
+            }
+        };
+
+        let client_id = generate_token()?;
+        let client = OAuthClient::builder(client_id.clone())
+            .redirect_uris(request.redirect_uris.clone())
+            .scopes(scopes.clone())
+            .name(request.client_name.clone())
+            .build()?;
+        self.register_client(client)?;
+
+        Ok(NativePublicClientRegistrationResponse {
+            client_id,
+            client_name: request.client_name,
+            application_type: "native",
+            redirect_uris: request.redirect_uris,
+            token_endpoint_auth_method: "none",
+            grant_types: request.grant_types,
+            response_types: request.response_types,
+            scope: (!scopes.is_empty()).then(|| scopes.join(" ")),
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -12012,4 +12138,89 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn dynamic_native_registration_retains_public_client_and_exact_profile() {
+        let server = OAuthServer::with_defaults();
+        let request = NativePublicClientRegistrationRequest {
+            client_name: "Native app".to_string(),
+            application_type: "native".to_string(),
+            redirect_uris: vec![
+                "http://127.0.0.1/oauth/callback".to_string(),
+                "http://[::1]/oauth/callback".to_string(),
+            ],
+            token_endpoint_auth_method: "none".to_string(),
+            grant_types: vec!["authorization_code".to_string(), "refresh_token".to_string()],
+            response_types: vec!["code".to_string()],
+            scope: Some("tools:read tools:write".to_string()),
+        };
+        let response = server.register_native_public_client(request).unwrap();
+        assert_eq!(response.application_type, "native");
+        assert_eq!(response.token_endpoint_auth_method, "none");
+        assert_eq!(response.grant_types, ["authorization_code", "refresh_token"]);
+        assert_eq!(response.response_types, ["code"]);
+        assert_eq!(response.scope.as_deref(), Some("tools:read tools:write"));
+        assert_eq!(response.redirect_uris.len(), 2);
+        let retained = server.get_client(&response.client_id).expect("registered client");
+        assert_eq!(retained.client_type, ClientType::Public);
+        assert_eq!(retained.redirect_uris, response.redirect_uris);
+        assert_eq!(retained.allowed_scopes.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_registration_refuses_nonpublic_profiles_without_state_change() {
+        let server = OAuthServer::with_defaults();
+        let baseline = server.list_clients().len();
+        for request in [
+            NativePublicClientRegistrationRequest {
+                client_name: "Native app".to_string(),
+                application_type: "web".to_string(),
+                redirect_uris: vec!["http://127.0.0.1/oauth/callback".to_string()],
+                token_endpoint_auth_method: "none".to_string(),
+                grant_types: vec!["authorization_code".to_string()],
+                response_types: vec!["code".to_string()],
+                scope: None,
+            },
+            NativePublicClientRegistrationRequest {
+                client_name: "Native app".to_string(),
+                application_type: "native".to_string(),
+                redirect_uris: vec![
+                    "http://127.0.0.1/oauth/callback".to_string(),
+                    "http://127.0.0.1/oauth/callback".to_string(),
+                ],
+                token_endpoint_auth_method: "none".to_string(),
+                grant_types: vec!["authorization_code".to_string()],
+                response_types: vec!["code".to_string()],
+                scope: None,
+            },
+            NativePublicClientRegistrationRequest {
+                client_name: "Native app".to_string(),
+                application_type: "native".to_string(),
+                redirect_uris: vec!["http://127.0.0.1/oauth/callback".to_string()],
+                token_endpoint_auth_method: "client_secret_basic".to_string(),
+                grant_types: vec!["authorization_code".to_string()],
+                response_types: vec!["code".to_string()],
+                scope: None,
+            },
+        ] {
+            assert!(server.register_native_public_client(request).is_err());
+            assert_eq!(server.list_clients().len(), baseline);
+        }
+
+        let disabled = OAuthServer::try_new(OAuthServerConfig {
+            allow_public_clients: false,
+            ..OAuthServerConfig::default()
+        }).unwrap();
+        assert!(disabled.register_native_public_client(NativePublicClientRegistrationRequest {
+            client_name: "Native app".to_string(),
+            application_type: "native".to_string(),
+            redirect_uris: vec!["http://127.0.0.1/oauth/callback".to_string()],
+            token_endpoint_auth_method: "none".to_string(),
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            scope: None,
+        }).is_err());
+        assert!(disabled.list_clients().is_empty());
+    }
+
+
 }

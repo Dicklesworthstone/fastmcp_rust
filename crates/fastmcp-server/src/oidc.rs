@@ -1902,8 +1902,11 @@ impl OidcProvider {
     #[must_use]
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
-        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url);
+        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
         doc.scopes_supported = self.config.supported_scopes.clone();
+        if self.oauth.config().allow_public_clients {
+            doc.registration_endpoint = Some(format!("{base_url}/register"));
+        }
         doc.claims_supported = Some(self.config.supported_claims.clone());
         // Discovery must describe this exact OAuthServer configuration, not
         // merely the broad capabilities of DiscoveryDocument::new. Public
@@ -2553,6 +2556,10 @@ mod non_signing_tests {
             assert!(doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
             assert!(doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
             assert!(doc.authorization_response_iss_parameter_supported);
+            assert_eq!(doc.registration_endpoint.is_some(), expects_none);
+            if let Some(endpoint) = &doc.registration_endpoint {
+                assert_eq!(endpoint, "https://issuer.example/register");
+            }
         }
     }
 

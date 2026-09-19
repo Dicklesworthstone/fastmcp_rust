@@ -131,8 +131,12 @@ pub use handler::{
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 use oauth::{
-    AuthorizationRequest, CodeChallengeMethod, OAuthError, OAuthHttpRoutes,
-    OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName, TokenRequest,
+    AuthorizationRequest, CodeChallengeMethod, NativePublicClientRegistrationRequest, OAuthError,
+    OAuthHttpRoutes, OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName,
+    TokenRequest,
+};
+use fastmcp_protocol::{
+    MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{
@@ -9745,6 +9749,19 @@ fn h1_oauth_singleton_header<'a>(
     Ok(singleton)
 }
 
+fn oauth_json_content_type(request: &asupersync::http::h1::Request) -> Result<(), HttpResponse> {
+    let Some(content_type) = h1_oauth_singleton_header(request, "content-type")? else {
+        return Err(HttpResponse::new(HttpStatus(415)));
+    };
+    if !content_type
+        .trim_matches([' ', '\t'])
+        .eq_ignore_ascii_case("application/json")
+    {
+        return Err(HttpResponse::new(HttpStatus(415)));
+    }
+    Ok(())
+}
+
 fn oauth_form_content_type(request: &asupersync::http::h1::Request) -> Result<(), HttpResponse> {
     let Some(content_type) = h1_oauth_singleton_header(request, "content-type")? else {
         return Err(HttpResponse::new(HttpStatus(415)));
@@ -9920,6 +9937,32 @@ fn dispatch_oauth_h1_request(
         };
     }
 
+    if routes.registration_path() == Some(raw_path) {
+        if authorization_header.is_some() || !raw_query.is_empty() {
+            return oauth_http_invalid_request();
+        }
+        if !matches!(request.method, Http1Method::Post) {
+            return oauth_http_method_not_allowed("POST");
+        }
+        if let Err(response) = oauth_json_content_type(request) {
+            return oauth_http_no_store(response);
+        }
+        if admit_security_document(SecurityDocumentKind::ClientRegistration, &request.body).is_err() {
+            return oauth_http_invalid_request();
+        }
+        let registration =
+            match serde_json::from_slice::<NativePublicClientRegistrationRequest>(&request.body) {
+                Ok(registration) => registration,
+                Err(_) => return oauth_http_invalid_request(),
+            };
+        return match routes.server().register_native_public_client(registration) {
+            Ok(response) => oauth_http_no_store(
+                HttpResponse::new(HttpStatus(201)).with_json(&response),
+            ),
+            Err(error) => oauth_http_error(error),
+        };
+    }
+
     if !raw_query.is_empty() {
         return oauth_http_invalid_request();
     }
@@ -9993,6 +10036,7 @@ struct OAuthNativeH1RouteLimits {
     authorization: String,
     token: String,
     revocation: String,
+    registration: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
     oidc_discovery: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
@@ -10005,6 +10049,7 @@ impl OAuthNativeH1RouteLimits {
             authorization: routes.authorization_path().to_owned(),
             token: routes.token_path().to_owned(),
             revocation: routes.revocation_path().to_owned(),
+            registration: routes.registration_path().map(str::to_owned),
             #[cfg(feature = "builtin-auth-server")]
             oidc_discovery: routes
                 .oidc_routes()
@@ -10029,6 +10074,8 @@ impl OAuthNativeH1RouteLimits {
             Some(0)
         } else if path == self.token || path == self.revocation {
             Some(oauth::MAX_OAUTH_FORM_BODY_BYTES)
+        } else if self.registration.as_deref() == Some(path) {
+            Some(MAX_CLIENT_REGISTRATION_BYTES)
         } else {
             None
         }
