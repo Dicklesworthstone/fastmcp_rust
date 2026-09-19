@@ -276,10 +276,20 @@ mod tests {
         let mut credential = credentials(config());
         let client = OAuthClient::new(config());
         let cx = Cx::for_testing();
-        let mut future = std::pin::pin!(client.revoke_credentials(&cx, &mut credential));
-        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        let std::task::Poll::Ready(result) = std::future::Future::poll(future.as_mut(), &mut task)
-        else { panic!("endpoint-unavailable preflight became asynchronous"); };
+        // `pin!` binds the future to the enclosing scope, so the `&mut credential`
+        // it captures stays live until that scope ends. Confining it to this block
+        // releases the borrow before the post-conditions, which read `credential`
+        // immutably and are the content of this test.
+        let result = {
+            let mut future = std::pin::pin!(client.revoke_credentials(&cx, &mut credential));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(result) =
+                std::future::Future::poll(future.as_mut(), &mut task)
+            else {
+                panic!("endpoint-unavailable preflight became asynchronous");
+            };
+            result
+        };
         assert_eq!(result.unwrap_err(), OAuthRevocationError::EndpointUnavailable);
         assert!(credential.has_refresh_token());
         assert!(!credential.bearer_credential().is_revoked());
