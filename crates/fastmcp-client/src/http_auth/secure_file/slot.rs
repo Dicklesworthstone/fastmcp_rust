@@ -26,6 +26,9 @@ use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
 use super::{AtomicFileError, AtomicFileSnapshot, AtomicFileVersion, SecureAtomicFile, checkpoint, version};
 
+/// Enforced independent-anchor transaction ordering and restart reconciliation.
+pub mod coordinator;
+
 const MAGIC: &[u8; 8] = b"FCPSLOT\0";
 const HEADER_BYTES: usize = 8 + 2 + 32 + 32 + 8 + 1 + 4;
 const FORMAT_VERSION: u16 = 1;
