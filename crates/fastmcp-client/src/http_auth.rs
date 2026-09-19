@@ -34,6 +34,9 @@ pub mod managed;
 pub mod oauth;
 /// Typed core MCP calls over managed OAuth, with incremental notifications.
 pub mod rpc;
+/// Descriptor-relative atomic storage for caller-protected credential blobs.
+#[cfg(target_os = "linux")]
+pub mod secure_file;
 
 pub use fastmcp_core::CanonicalHttpUrl;
 
