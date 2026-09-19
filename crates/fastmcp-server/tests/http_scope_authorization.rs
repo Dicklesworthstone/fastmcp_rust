@@ -3,6 +3,17 @@
 //! verification, ordinary middleware and real registered tools. They cover
 //! embedding, not live socket/TLS or external OAuth interoperability.
 
+// bd-pf5n7: the default 128 is exceeded resolving this crate's async blocks through
+// `handle_secured_async` <-> `await_dispatch`, which recurse against each other in
+// fastmcp-server PRODUCTION source (endpoint.rs:164, :297). The cycle is two frames
+// inside that crate, which is why boxing on the test side changes nothing — measured,
+// not assumed. This is the compiler's own suggestion for this crate and the czvvt
+// precedent. COST: it removes the early warning that composition depth is growing. It
+// does NOT change codegen — `recursion_limit` bounds compile-time trait resolution
+// only — so no runtime exposure is created or removed. The mechanism-level repair,
+// boxing the recursion inside endpoint.rs, is a production change and is filed apart.
+#![recursion_limit = "256"]
+
 use std::future::Future;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::{SystemTime, UNIX_EPOCH};
