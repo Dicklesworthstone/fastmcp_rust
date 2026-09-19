@@ -5,6 +5,9 @@
 //! This module neither sends a continuation nor treats a failed effect as a
 //! retry signal. The original interaction still owns requestState and ID history.
 
+/// Whole-interaction host budgets and cancellation-correct multi-round custody.
+pub mod session;
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
