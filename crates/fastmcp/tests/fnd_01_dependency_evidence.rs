@@ -65189,6 +65189,30 @@ fn fallible(value: Option<u8>) {
         {
             qualified_linux_live_reprobe("B-R3");
             assert_eq!(OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(), "reprobe");
+
+            // bd-n1dp1 Proposal 2. The refusal below is compiled on this host and
+            // unreachable, because `ordinary_platform_is_qualified()` folds to
+            // `true` here. Supplying the verdict reaches it, so the same code,
+            // site, route and observed string the not(linux) branch asserts are
+            // exercised on the fleet instead of nowhere. ADDITIVE: the two
+            // assertions above are untouched.
+            //
+            // BOUNDARY: this proves the refusal WIRING, not platform DETECTION.
+            // Nothing here tests that the predicate returns false on a genuine
+            // non-linux host; its inputs are compile-time constants and no seam
+            // changes that.
+            assert!(ordinary_platform_is_qualified(), "this branch compiles only on a qualified host");
+            assert!(!ordinary_platform_is_qualified_for("windows", "x86_64"), "a non-linux OS is unqualified");
+            assert!(!ordinary_platform_is_qualified_for("linux", "aarch64"), "a non-x86_64 arch is unqualified");
+
+            let run_id = format!("{:032x}", std::process::id());
+            let closed_path = format!("{}:/usr/bin:/bin", std::env::temp_dir().join("fnd01-unqualified-toolchain").display(),);
+            let error = ordinary_reprobe_tool_set_shared_on(&repository_root(), BootstrapMode::Produce, &run_id, &closed_path, false).expect_err("an unqualified platform must refuse");
+            assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
+            assert_eq!(error.site, OrdinaryFailureSite::ProbeToolPlatform);
+            assert_eq!(error.route(), OrdinaryFailureRoute::ToolPlatform);
+            assert_eq!(error.observed, "ordinary native-tool probes require Linux x86_64");
+            assert_eq!(error.route().stage().as_str(), "reprobe");
         }
 
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -65801,14 +65825,35 @@ fn fallible(value: Option<u8>) {
 
     #[cfg(test)]
     fn ordinary_reprobe_tool_set_shared(repository_root: &Path, mode: BootstrapMode, run_id: &str, closed_path: &str) -> Result<OrdinaryToolReprobe, OrdinaryEntryFailure> {
-        if !ordinary_platform_is_qualified() {
+        ordinary_reprobe_tool_set_shared_on(repository_root, mode, run_id, closed_path, ordinary_platform_is_qualified())
+    }
+
+    /// bd-n1dp1 Proposal 2: `ordinary_reprobe_tool_set_shared` with the platform
+    /// verdict supplied rather than sensed. Behaviour is unchanged for the real
+    /// caller, which passes `ordinary_platform_is_qualified()`; passing `false`
+    /// reaches the refusal that is otherwise dead code on a qualified host.
+    #[cfg(test)]
+    fn ordinary_reprobe_tool_set_shared_on(repository_root: &Path, mode: BootstrapMode, run_id: &str, closed_path: &str, qualified: bool) -> Result<OrdinaryToolReprobe, OrdinaryEntryFailure> {
+        if !qualified {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(OrdinaryFailureSite::ProbeToolPlatform, "ordinary native-tool probes require Linux x86_64"));
         }
         ordinary_reprobe_tool_set_qualified(repository_root, mode, run_id, closed_path, OrdinaryQualifiedPlatform)
     }
 
     fn ordinary_platform_is_qualified() -> bool {
-        cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        ordinary_platform_is_qualified_for(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// bd-n1dp1 Proposal 2: the qualification rule, callable with a platform
+    /// other than the host's.
+    ///
+    /// `cfg!(..)` folds to a literal, so on a qualified host the refusal branch
+    /// in `ordinary_reprobe_tool_set_shared` is compiled but unreachable. Taking
+    /// the platform as arguments is what makes that branch reachable from the
+    /// fleet. `std::env::consts::{OS, ARCH}` are the same compile-time facts
+    /// `cfg!` tested, so the shipped decision is unchanged.
+    fn ordinary_platform_is_qualified_for(os: &str, arch: &str) -> bool {
+        os == "linux" && arch == "x86_64"
     }
 
     const ORDINARY_CONTROLLER_BUILD_AUTHORITY_DETAIL: &str = "controller mode requires a separately authorized pinned local build or an independently audited prebuilt macOS artifact whose exact path/bytes are substituted for ordinary_controller_argv[0]";
