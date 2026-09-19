@@ -16,6 +16,9 @@
 //! If any `on_request` or `on_response` returns an error, `on_error` is invoked
 //! for the entered middleware stack to allow error rewriting.
 
+/// Encrypted terminal-result recovery for exact modern continuation retries.
+pub mod continuation_replay;
+
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::JsonRpcRequest;
 
