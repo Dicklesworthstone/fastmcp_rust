@@ -37,6 +37,7 @@ struct Probe {
     transforms: Arc<AtomicUsize>,
     revision: Arc<AtomicUsize>,
     lifetime: McpRequestCancellation,
+    require_roots: bool,
 }
 impl Probe {
     fn new() -> Self {
@@ -51,7 +52,7 @@ impl Probe {
         Self { provider: Arc::new(TokenAuthProvider::new(verifier)), alice, bob,
             authentications: Arc::new(AtomicUsize::new(0)), starts: Arc::new(AtomicUsize::new(0)),
             effects: Arc::new(AtomicUsize::new(0)), transforms: Arc::new(AtomicUsize::new(0)),
-            revision: Arc::new(AtomicUsize::new(1)), lifetime: McpRequestCancellation::new() }
+            revision: Arc::new(AtomicUsize::new(1)), lifetime: McpRequestCancellation::new(), require_roots: false }
     }
     fn authority(&self, ctx: &McpContext) -> McpResult<ContinuationReplayAuthority> {
         let auth = ctx.auth().ok_or_else(|| McpError::invalid_params("No authenticated owner"))?;
@@ -75,7 +76,7 @@ impl Probe {
         let descriptor = SecurityPartitionDescriptor::from_verified_ingress(&ingress).to_partition_descriptor().unwrap();
         let revision = format!("checkout-v{}", self.revision.load(Ordering::SeqCst));
         let key = ContinuationPartitionKey::derive(&descriptor, &["tools:call"], &revision,
-            "empty-capabilities", "test-policy", "test-deployment").unwrap();
+            if self.require_roots { "roots-capabilities" } else { "empty-capabilities" }, "test-policy", "test-deployment").unwrap();
         let owner = DurableOwnerKey::derive(&descriptor, 1).unwrap();
         Ok(ContinuationReplayAuthority::new(key, PartitionAuthorization::current(&descriptor, &owner), self.lifetime.clone()))
     }
@@ -87,10 +88,13 @@ impl AuthProvider for Probe {
         self.provider.authenticate(ctx, request)
     }
 }
-fn needs_input() -> InputRequiredResult {
+fn needs_input(require_roots: bool) -> InputRequiredResult {
+    let mut wire = json!({"resultType":"input_required","requestState":"fixture-handler-state"});
+    if require_roots {
+        wire["inputRequests"] = json!({"left":{"method":"roots/list"}, "right":{"method":"roots/list"}});
+    }
     let (decoded, diagnostic) = decode_peer_result(
-        r#"{"resultType":"input_required","requestState":"fixture-handler-state"}"#,
-        ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy,
+        &wire.to_string(), ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy,
     ).unwrap();
     assert!(diagnostic.is_none());
     let DecodedResult::InputRequired(result) = decoded else { panic!("input-required branch must decode"); };
@@ -114,16 +118,24 @@ impl ToolHandler for Probe {
             request_cx.checkpoint().expect("the request-owned Cx must remain live");
             ctx.ensure_live().unwrap();
             if let Some(inputs) = resume_inputs {
-                assert!(inputs.is_empty(), "state-only continuation has no invented input");
+                let accepted = if self.require_roots {
+                    assert_eq!(inputs.responses().len(), 2, "both partial answers reach the handler once");
+                    json!({"left":inputs.roots("left").unwrap().unwrap(),
+                        "right":inputs.roots("right").unwrap().unwrap(),
+                        "order":inputs.responses().iter().map(|(key, _)| key).collect::<Vec<_>>()})
+                } else {
+                    assert!(inputs.responses().is_empty(), "state-only continuation has no invented input");
+                    Value::Null
+                };
                 let effect = self.effects.fetch_add(1, Ordering::SeqCst) + 1;
                 let body: FinalCallToolResult = serde_json::from_value(json!({
                     "content":[{"type":"text","text":format!("committed-{effect}")}],
-                    "structuredContent":{"quantity":arguments["quantity"],"effect":effect}, "isError":false,
+                    "structuredContent":{"quantity":arguments["quantity"],"effect":effect,"accepted":accepted}, "isError":false,
                 })).unwrap();
                 Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(body, ResultMeta::empty())))
             } else {
                 self.starts.fetch_add(1, Ordering::SeqCst);
-                Outcome::Ok(FinalToolOutcome::InputRequired(needs_input()))
+                Outcome::Ok(FinalToolOutcome::InputRequired(needs_input(self.require_roots)))
             }
         })
     }
@@ -140,10 +152,19 @@ impl Middleware for Stamp {
 struct Fixture { endpoint: ServerHttpEndpoint, probe: Probe, journal: Arc<ContinuationReplayMiddleware>, policy: HttpSecurityPolicy }
 impl Fixture {
     fn new(cx: &Cx, enabled: bool, limits: ContinuationReplayLimits) -> Self {
-        let probe = Probe::new();
+        Self::with_probe(cx, enabled, limits, Probe::new(), false)
+    }
+    fn with_probe(cx: &Cx, enabled: bool, limits: ContinuationReplayLimits, probe: Probe, recover_successors: bool) -> Self {
         let authorizer = probe.clone();
-        let journal = Arc::new(ContinuationReplayMiddleware::new(cx, ProcessGenerationGuard::install().unwrap(),
-            SnapshotCloneStance::NoLiveMemoryCloning, limits, move |ctx, _| authorizer.authority(ctx)).unwrap());
+        let authorize = move |ctx: &McpContext, _: &fastmcp_protocol::JsonRpcRequest| authorizer.authority(ctx);
+        let guard = ProcessGenerationGuard::install().unwrap();
+        let journal = Arc::new(if recover_successors {
+            ContinuationReplayMiddleware::new_with_successor_recovery(cx, guard,
+                SnapshotCloneStance::NoLiveMemoryCloning, limits, authorize)
+        } else {
+            ContinuationReplayMiddleware::new(cx, guard,
+                SnapshotCloneStance::NoLiveMemoryCloning, limits, authorize)
+        }.unwrap());
         let mut builder = Server::new("continuation-replay", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().auth_provider(probe.clone()).tool(probe.clone());
         if enabled { builder = builder.middleware(journal.clone()); }
@@ -172,8 +193,11 @@ impl Fixture {
         (status, body)
     }
     async fn begin(&self, cx: &Cx, id: i64) -> Value {
-        let params = json!({"name":"checkout","arguments":{"quantity":1},"_meta":{
+        let mut params = json!({"name":"checkout","arguments":{"quantity":1},"_meta":{
             "io.modelcontextprotocol/protocolVersion":FINAL_PROTOCOL_VERSION,"io.modelcontextprotocol/clientCapabilities":{}}});
+        if self.probe.require_roots {
+            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["roots"] = json!({});
+        }
         let (status, body) = self.post(cx, id, &self.probe.alice, params.clone()).await;
         assert_eq!(status, 200);
         assert!(body.get("error").is_none(), "{body}");
@@ -183,7 +207,8 @@ impl Fixture {
         assert_ne!(state, "fixture-handler-state", "the router must mint the continuation");
         let mut retry = params;
         retry["requestState"] = json!(state);
-        retry["inputResponses"] = json!({});
+        // State-only retries omit inputResponses. A present empty map is a
+        // different protocol case and must not stand in for that omission.
         retry
     }
     async fn finish(&self, cx: &Cx, params: &Value, id: i64) -> Value {
@@ -282,8 +307,8 @@ fn public_mrtr_revocation_and_handler_revision_prevent_old_result_disclosure() {
         assert_eq!(f.finish(&cx, &params, 4).await, expected);
         f.probe.lifetime.cancel();
         assert!(rejected(&f.post(&cx, 5, &f.probe.alice, params).await));
-        assert_eq!(f.journal.prune(&cx).unwrap(), 1);
         assert_eq!(f.probe.effects(), 1);
+        assert_eq!(f.journal.prune(&cx).unwrap(), 1);
     });
 }
 
@@ -329,3 +354,6 @@ fn public_mrtr_rotation_preserves_replies_and_close_does_not_reexecute() {
         assert_eq!(f.probe.effects(), 1);
     });
 }
+
+#[path = "http_continuation_replay/successors.rs"]
+mod successors;
