@@ -386,8 +386,12 @@ async fn active<T>(
     future: impl Future<Output = Result<T, OAuthChallengeError>>,
 ) -> Result<T, OAuthChallengeError> {
     let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
-    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
-    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    if cx.timer_driver().is_none() {
+        return Err(OAuthDiscoveryError::RuntimeUnavailable.into());
+    }
+    // Public Sleep uses the caller guard installed on every poll below, not
+    // the ambient runtime at construction. No private timer API is required.
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut ambient = std::pin::pin!(receiver.recv(cx));

@@ -457,7 +457,6 @@ impl OAuthDiscoveryPlan {
         ManagedOAuthSession::authorize(cx, OAuthClient::new(configuration), policy, launch_browser)
             .await.map_err(OAuthDiscoveryError::Login)
     }
-
     fn select_issuer(&self, body: &[u8]) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
         let metadata: ResourceMetadata = decode_metadata(body)?;
         if metadata.signed_metadata.is_some() {
@@ -786,10 +785,13 @@ async fn within<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
 ) -> Result<T, OAuthDiscoveryError> {
-    // Bind the timer directly to the supplied caller. Candidate sub-deadlines
-    // must wake even when a different/no Cx was ambient at future construction.
-    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
-    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    // Public Sleep resolves the driver when polled. The caller guard below
+    // binds every registration and time read to this exact discovery owner,
+    // even when a different/no Cx was ambient at future construction.
+    if cx.timer_driver().is_none() {
+        return Err(OAuthDiscoveryError::RuntimeUnavailable);
+    }
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
