@@ -226,7 +226,7 @@ fn run_resource(case: ResourceCase) {
                     assert_eq!(client.cache_stats().unwrap().fills, 0);
                     let corrected = r#"{"resultType":"complete","contents":[],"ttlMs":60000,"cacheScope":"private"}"#;
                     let ((), result) = pair(Box::pin(serve_read(&peer, 42, &request, corrected)),
-                        Box::pin(client.read(&cx, request, || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
                     assert!(result.unwrap().is_complete());
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
@@ -301,7 +301,7 @@ fn run_resource(case: ResourceCase) {
                     assert!(matches!(result, Err(ReadError::Invalidated)));
                     assert_eq!(client.cache_stats().unwrap().fills, 0);
                     let ((), fresh) = pair(Box::pin(serve_read(&peer, 42, &request, &read_result(60000))),
-                        Box::pin(client.read(&cx, request, || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
                     assert!(fresh.unwrap().is_complete());
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
