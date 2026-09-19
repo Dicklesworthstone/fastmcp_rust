@@ -481,7 +481,9 @@ impl<T> QuorumResult<T> {
 ///
 /// Futures are polled concurrently — each poll cycle round-robins
 /// through all incomplete futures. Once quorum is reached or becomes
-/// impossible, remaining futures are dropped.
+/// impossible, remaining futures are dropped without polling later slots.
+/// A ready loser may have side effects, so it must not be polled merely to
+/// collect additional results after the decision has already been made.
 ///
 /// # Arguments
 ///
@@ -561,52 +563,31 @@ struct QuorumState<'a, T> {
 
 impl<T> QuorumState<'_, T> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
+        let max_allowed_failures = self.total - self.required;
         for i in 0..self.futures.len() {
             if let Some(result) = poll_slot(&mut self.futures[i], cx) {
                 match result {
                     Ok(val) => self.successes.push(val),
                     Err(_) => self.failures += 1,
                 }
+                // Decide at the completing slot, before a later future can
+                // start another side effect or panic after the answer is known.
+                if self.successes.len() >= self.required || self.failures > max_allowed_failures {
+                    return Poll::Ready(Ok(self.finish()));
+                }
             }
         }
 
-        let max_allowed_failures = self.total - self.required;
-
-        // Quorum met: early exit, drop remaining futures.
-        if self.successes.len() >= self.required {
-            self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met: true,
-                failure_count: self.failures,
-            }));
-        }
-
-        // Quorum impossible: too many failures.
-        if self.failures > max_allowed_failures {
-            self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met: false,
-                failure_count: self.failures,
-            }));
-        }
-
-        // All futures done but quorum not met.
-        let still_pending = self.futures.iter().any(Option::is_some);
-        if !still_pending {
-            let successes = std::mem::take(&mut self.successes);
-            let quorum_met = successes.len() >= self.required;
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met,
-                failure_count: self.failures,
-            }));
-        }
-
         Poll::Pending
+    }
+
+    fn finish(&mut self) -> QuorumResult<T> {
+        self.futures.clear();
+        QuorumResult {
+            quorum_met: self.successes.len() >= self.required,
+            successes: std::mem::take(&mut self.successes),
+            failure_count: self.failures,
+        }
     }
 }
 
@@ -654,11 +635,13 @@ pub async fn quorum_timeout<T: Send + 'static>(
     }
 
     let mut state = QuorumTimeoutState {
-        futures: futures.into_iter().map(Some).collect(),
-        successes: Vec::with_capacity(required),
-        failures: 0,
-        required,
-        total,
+        quorum: QuorumState {
+            futures: futures.into_iter().map(Some).collect(),
+            successes: Vec::with_capacity(required),
+            failures: 0,
+            required,
+            total,
+        },
         timeout: timeout_sleep(cx, timeout),
         request_cx: cx,
     };
@@ -667,11 +650,7 @@ pub async fn quorum_timeout<T: Send + 'static>(
 
 /// Internal state for quorum with timeout enforcement.
 struct QuorumTimeoutState<'future, 'cx, T> {
-    futures: Vec<Option<BoxFuture<'future, McpResult<T>>>>,
-    successes: Vec<T>,
-    failures: usize,
-    required: usize,
-    total: usize,
+    quorum: QuorumState<'future, T>,
     timeout: Sleep,
     request_cx: &'cx Cx,
 }
@@ -679,59 +658,16 @@ struct QuorumTimeoutState<'future, 'cx, T> {
 impl<T> QuorumTimeoutState<'_, '_, T> {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
         if self.request_cx.checkpoint().is_err() {
-            self.futures.clear();
+            self.quorum.futures.clear();
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
 
-        for i in 0..self.futures.len() {
-            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
-                match result {
-                    Ok(val) => self.successes.push(val),
-                    Err(_) => self.failures += 1,
-                }
-            }
-        }
-
-        let max_allowed_failures = self.total - self.required;
-
-        if self.successes.len() >= self.required {
-            self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met: true,
-                failure_count: self.failures,
-            }));
-        }
-
-        if self.failures > max_allowed_failures {
-            self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            return Poll::Ready(Ok(QuorumResult {
-                successes,
-                quorum_met: false,
-                failure_count: self.failures,
-            }));
-        }
-
-        let still_pending = self.futures.iter().any(Option::is_some);
-        if !still_pending {
-            let successes = std::mem::take(&mut self.successes);
-            return Poll::Ready(Ok(QuorumResult {
-                quorum_met: successes.len() >= self.required,
-                successes,
-                failure_count: self.failures,
-            }));
+        if let Poll::Ready(result) = self.quorum.poll(cx) {
+            return Poll::Ready(result);
         }
 
         if Pin::new(&mut self.timeout).poll(cx).is_ready() {
-            self.futures.clear();
-            let successes = std::mem::take(&mut self.successes);
-            Poll::Ready(Ok(QuorumResult {
-                quorum_met: successes.len() >= self.required,
-                successes,
-                failure_count: self.failures,
-            }))
+            Poll::Ready(Ok(self.quorum.finish()))
         } else {
             Poll::Pending
         }
@@ -825,7 +761,7 @@ mod tests {
     use super::*;
     use crate::block_on;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
 
     #[derive(Default)]
@@ -845,6 +781,156 @@ mod tests {
 
     fn make_cx() -> Cx {
         Cx::for_testing()
+    }
+
+    struct QuorumProbe {
+        result: Option<McpResult<i32>>,
+        ready: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for QuorumProbe {
+        type Output = McpResult<i32>;
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.ready.load(Ordering::Acquire) {
+                Poll::Ready(self.result.take().expect("probe polled after completion"))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for QuorumProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn quorum_case<'a>(
+        cx: &'a Cx,
+        required: usize,
+        futures: Vec<BoxFuture<'a, McpResult<i32>>>,
+        timed: bool,
+    ) -> BoxFuture<'a, McpResult<QuorumResult<i32>>> {
+        if timed {
+            Box::pin(quorum_timeout(cx, required, Duration::MAX, futures))
+        } else {
+            Box::pin(quorum(cx, required, futures))
+        }
+    }
+
+    #[test]
+    fn quorum_stops_at_the_deciding_slot_and_drops_all_losers() {
+        for timed in [false, true] {
+            // Positive and negative decisions, including an earlier failure
+            // that still leaves quorum attainable until the third slot.
+            for (required, outcomes, expected, failures, polled) in [
+                (1, [true, true, true, true], vec![0], 0, 1),
+                (4, [false, true, true, true], vec![], 1, 1),
+                (2, [true, false, true, true], vec![0, 2], 1, 3),
+            ] {
+                let cx = make_cx();
+                let polls: Vec<_> = (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+                let drops = Arc::new(AtomicUsize::new(0));
+                let futures: Vec<BoxFuture<'_, McpResult<i32>>> = outcomes
+                    .into_iter()
+                    .zip(&polls)
+                    .zip(0_i32..)
+                    .map(|((success, count), value)| {
+                        Box::pin(QuorumProbe {
+                            result: Some(if success {
+                                Ok(value)
+                            } else {
+                                Err(McpError::internal_error("replica rejected write"))
+                            }),
+                            ready: Arc::new(AtomicBool::new(true)),
+                            polls: Arc::clone(count),
+                            drops: Arc::clone(&drops),
+                        }) as BoxFuture<'_, McpResult<i32>>
+                    })
+                    .collect();
+
+                let result = block_on(quorum_case(&cx, required, futures, timed)).unwrap();
+                assert_eq!(result.quorum_met, expected.len() >= required);
+                assert_eq!(result.successes, expected);
+                assert_eq!(result.failure_count, failures);
+                for (index, count) in polls.iter().enumerate() {
+                    assert_eq!(count.load(Ordering::Relaxed), usize::from(index < polled));
+                }
+                assert_eq!(drops.load(Ordering::Relaxed), 4);
+            }
+        }
+    }
+
+    #[test]
+    fn quorum_stops_before_repolling_a_loser_after_later_progress() {
+        for timed in [false, true] {
+            let cx = make_cx();
+            let ready = Arc::new(AtomicBool::new(false));
+            let polls: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![
+                Box::pin(QuorumProbe {
+                    result: Some(Ok(1)),
+                    ready: Arc::clone(&ready),
+                    polls: Arc::clone(&polls[0]),
+                    drops: Arc::clone(&drops),
+                }),
+                Box::pin(QuorumProbe {
+                    result: Some(Ok(2)),
+                    ready: Arc::new(AtomicBool::new(true)),
+                    polls: Arc::clone(&polls[1]),
+                    drops: Arc::clone(&drops),
+                }),
+                Box::pin(QuorumProbe {
+                    result: Some(Ok(3)),
+                    ready: Arc::new(AtomicBool::new(false)),
+                    polls: Arc::clone(&polls[2]),
+                    drops: Arc::clone(&drops),
+                }),
+            ];
+            let mut future = quorum_case(&cx, 2, futures, timed);
+            let mut task_cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+            ready.store(true, Ordering::Release);
+            let Poll::Ready(result) = future.as_mut().poll(&mut task_cx) else {
+                panic!("quorum did not observe the second success");
+            };
+            let result = result.unwrap();
+            assert!(result.quorum_met);
+            assert_eq!(result.successes, vec![2, 1]);
+            assert_eq!(result.failure_count, 0);
+            assert_eq!(polls[0].load(Ordering::Relaxed), 2);
+            assert_eq!(polls[1].load(Ordering::Relaxed), 1);
+            assert_eq!(polls[2].load(Ordering::Relaxed), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+        }
+    }
+
+    #[test]
+    fn quorum_does_not_poll_a_panicking_loser_after_success_or_failure() {
+        for timed in [false, true] {
+            for required in [1, 2] {
+                let cx = make_cx();
+                let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![
+                    Box::pin(async move {
+                        if required == 1 {
+                            Ok(7)
+                        } else {
+                            Err(McpError::internal_error("quorum impossible"))
+                        }
+                    }),
+                    Box::pin(async { panic!("terminal quorum polled a losing operation") }),
+                ];
+                let result = block_on(quorum_case(&cx, required, futures, timed)).unwrap();
+                assert_eq!(result.quorum_met, required == 1);
+            }
+        }
     }
 
     #[test]
