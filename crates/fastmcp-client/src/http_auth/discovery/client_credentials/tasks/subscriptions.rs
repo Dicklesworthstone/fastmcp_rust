@@ -6,6 +6,9 @@
 //! correlation. This layer adds machine-credential lifetime and finite budgets;
 //! it never reconnects, replays missed events or cancels a remote task.
 
+/// Notification-driven snapshots for an explicitly acknowledged Task selection.
+pub mod watch;
+
 use std::time::Duration;
 
 use asupersync::Cx;
