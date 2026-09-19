@@ -6,6 +6,9 @@
 //! if another caller renews the machine client's token. Expiry ends observation.
 //! There is no polling, reconnect, task creation or remote cancellation here.
 
+/// Host-authorized input resolution driven by Task notifications.
+pub mod drive;
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
