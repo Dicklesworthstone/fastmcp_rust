@@ -402,8 +402,15 @@ impl ManagedSubscription {
 
 fn select_record(
     record: ModernHttpSubscriptionListenEvent,
-    _profile: SubscriptionProfile,
+    profile: SubscriptionProfile,
 ) -> Result<ManagedSubscriptionEvent, ManagedSubscriptionError> {
+    // `profile` is read only by the `tasks`-gated arm below. Discarding it in
+    // the other configuration keeps the name unprefixed -- an `_profile` that
+    // IS read trips used_underscore_binding under --all-features, while a bare
+    // `profile` that is not read trips unused_variables without `tasks`. Both
+    // are fatal under the gate's -D warnings, so neither name works alone.
+    #[cfg(not(feature = "tasks"))]
+    let _ = profile;
     match record {
         ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter } => {
             Ok(ManagedSubscriptionEvent::Acknowledged { accepted_filter })
@@ -416,7 +423,7 @@ fn select_record(
         }
         #[cfg(feature = "tasks")]
         ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
-            if !matches!(_profile, SubscriptionProfile::Tasks) {
+            if !matches!(profile, SubscriptionProfile::Tasks) {
                 return Err(ManagedSubscriptionError::UnsupportedExtension);
             }
             Ok(ManagedSubscriptionEvent::TaskNotification(Box::new(notification)))

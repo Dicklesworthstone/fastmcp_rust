@@ -348,7 +348,7 @@ async fn yield_once() {
     poll_fn(|task| {
         if yielded { Poll::Ready(()) }
         else { yielded = true; task.waker().wake_by_ref(); Poll::Pending }
-    }).await
+    }).await;
 }
 struct InvalidateOnExit<'a> { client: &'a ManagedResourceClient, set: FinalCacheResultSet }
 impl Drop for InvalidateOnExit<'_> {

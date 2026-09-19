@@ -13,6 +13,7 @@
 mod tests;
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -248,7 +249,7 @@ impl PrivateKeyJwtAuthentication {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
         let expires_at = issued_at.checked_add(lifetime)
-            .filter(|expiry| *expiry <= i64::MAX as u64)
+            .filter(|expiry| i64::try_from(*expiry).is_ok())
             .ok_or(ClientCredentialsError::AssertionSigning)?;
         let wall_expiry = UNIX_EPOCH.checked_add(Duration::from_secs(expires_at))
             .ok_or(ClientCredentialsError::AssertionSigning)?;
@@ -261,7 +262,10 @@ impl PrivateKeyJwtAuthentication {
         let allowance = ExternalRs256SigningDeadline::new(allowance)
             .map_err(|_| ClientCredentialsError::AssertionSigning)?;
         let nonce = draw_security_identifier().map_err(|_| ClientCredentialsError::AssertionSigning)?;
-        let jti = nonce.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let jti = nonce.as_bytes().iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
         let claims = BoundedJwsClaims::from_value(&json!({
             "iss": client_id, "sub": client_id, "aud": self.registration.audience(),
             "iat": issued_at, "exp": expires_at, "jti": jti,
