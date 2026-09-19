@@ -5,6 +5,9 @@
 //! This owner keeps the original request, deadline and counters across rounds.
 //! It never posts a continuation or interprets a lost reply as retry authority.
 
+/// Complete authenticated core calls using this shared host-input budget.
+pub mod execution;
+
 use std::fmt;
 
 use asupersync::{Cx, Time};
