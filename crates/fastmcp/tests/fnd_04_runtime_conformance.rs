@@ -3054,3 +3054,83 @@ fn fnd_04_b_planted_negative() {
         "neither planted dimension may leave a trace; observed {final_delta:?}"
     );
 }
+
+/// Creates a fresh empty directory for a `packed-refs` fixture.
+///
+/// No `.git` is involved: `packed_ref` takes a directory and reads
+/// `<dir>/packed-refs`, so a plain temp directory is a complete substrate. That
+/// is the whole point of these two tests — they run identically on a worker with
+/// no repository, which is where the FND-04 conformance target actually executes.
+fn fnd_04_packed_ref_fixture_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "fnd04-packed-ref-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("packed-refs fixture directory is creatable");
+    dir
+}
+
+/// bd-gizte: `packed_ref` resolves a packed reference past the two line kinds it
+/// is documented to skip.
+///
+/// THE WORTHLESS VERSION, NAMED FIRST. A table holding one clean
+/// `<sha> <refname>` line and an assertion that it is found. That passes with
+/// BOTH guards deleted, because a well-formed comment or peel line fails
+/// `split_once(' ')` or the name comparison anyway. It proves the happy path and
+/// nothing about the parser's actual hazards.
+///
+/// So the table below crafts a comment line and a peel line that WOULD match the
+/// wanted refname if their guards were removed, plus a near-miss name. Because
+/// `find_map` returns the FIRST match, deleting either guard changes the result
+/// rather than merely widening it.
+#[test]
+fn fnd_04_packed_ref_skips_comment_and_peel_lines_that_mimic_a_mapping() {
+    let dir = fnd_04_packed_ref_fixture_dir("positive");
+    std::fs::write(
+        dir.join("packed-refs"),
+        concat!(
+            "# refs/heads/main\n",
+            "^1111111111111111111111111111111111111111 refs/heads/main\n",
+            "2222222222222222222222222222222222222222 refs/heads/mai\n",
+            "3333333333333333333333333333333333333333 refs/heads/main\n",
+        ),
+    )
+    .expect("packed-refs fixture is writable");
+
+    assert_eq!(
+        packed_ref(&dir, "refs/heads/main").as_deref(),
+        Some("3333333333333333333333333333333333333333"),
+        "the direct mapping must win: a `#` line yields sha `#`, a `^` peel line yields the peeled \
+         sha, and `refs/heads/mai` is a different ref -- each precedes the wanted row, so any of \
+         the three being accepted returns a WRONG value rather than none"
+    );
+}
+
+/// bd-gizte: `packed_ref` yields `None` rather than a wrong value or a panic.
+///
+/// The absent-table case is the one that matters operationally: the FND-04 target
+/// runs on workers with no `.git` at all, and this function must degrade to `None`
+/// there rather than failing. That is the branch `revision_and_tree` relies on to
+/// fall through to its `"<unresolved>"` sentinel.
+#[test]
+fn fnd_04_packed_ref_returns_none_for_an_absent_reference_or_table() {
+    let dir = fnd_04_packed_ref_fixture_dir("negative");
+    std::fs::write(
+        dir.join("packed-refs"),
+        "4444444444444444444444444444444444444444 refs/heads/other\n",
+    )
+    .expect("packed-refs fixture is writable");
+
+    assert_eq!(
+        packed_ref(&dir, "refs/heads/main"),
+        None,
+        "a reference absent from the table must not resolve to another ref's sha"
+    );
+    assert_eq!(
+        packed_ref(&dir.join("no-such-directory"), "refs/heads/main"),
+        None,
+        "a missing packed-refs table must yield None, not panic -- this is the no-`.git` worker \
+         case that `revision_and_tree` falls through on"
+    );
+}
