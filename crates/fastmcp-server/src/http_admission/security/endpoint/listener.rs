@@ -1,17 +1,20 @@
-//! Caller-owned, origin-guarded native HTTP listener.
+//! Caller-owned, origin-guarded native HTTP and HTTPS listeners.
 //!
 //! Unlike the embedding adapter, this path owns socket admission, bounded H1
 //! decoding and response writes. Select it with `Server::bind_secured_http` or
-//! `Server::serve_secured_http`. It is modern MCP only, even in a legacy build.
+//! `Server::bind_secured_https`. It is modern MCP only, even in a legacy build.
 //! Hosted OAuth authorization/token routes must use a separate listener; bind
 //! refuses that combination rather than silently dropping or weakening routes.
 //!
 //! The supplied origin policy is the single CORS authority for this listener.
 //! Its exact allowlist also configures the existing downstream request handler.
 //! Authentication, authorization and protocol admission are never bypassed.
+//! HTTPS performs TLS inside each capacity-admitted connection child; plaintext
+//! HTTP remains a separate, explicitly selected listener, never a TLS fallback.
 
 mod connection;
 mod ingress;
+mod tls;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -19,6 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asupersync::Cx;
+use asupersync::io::AsyncWriteExt;
+use asupersync::tls::TlsAcceptor;
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
@@ -31,19 +36,25 @@ use crate::{
     take_unsettled_retired_modern_http_dispatches,
 };
 
-/// Finite request-read and individual response-write bounds. Request time is
+/// Finite TLS-handshake, request-read and individual response-write bounds.
+/// A handshake is attempted once within its original deadline. Request time is
 /// shared by the head and body, not renewed for each trickled byte. Each SSE
 /// frame has a finite write allowance; a subscription's execution lifetime is
 /// still owned by the server's existing request and response-body policies.
 #[derive(Clone, Copy, Debug)]
 pub struct SecuredHttpIoLimits {
+    handshake_timeout: Duration,
     request_timeout: Duration,
     write_timeout: Duration,
 }
 
 impl Default for SecuredHttpIoLimits {
     fn default() -> Self {
-        Self { request_timeout: Duration::from_secs(60), write_timeout: Duration::from_secs(15) }
+        Self {
+            handshake_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(15),
+        }
     }
 }
 
@@ -55,14 +66,25 @@ impl SecuredHttpIoLimits {
         {
             return Err(McpError::invalid_request("invalid secured HTTP I/O limits"));
         }
-        Ok(Self { request_timeout, write_timeout })
+        Ok(Self { handshake_timeout: Duration::from_secs(10), request_timeout, write_timeout })
     }
 
+    /// Sets the total TLS handshake allowance, not a timeout per read or retry.
+    /// The caller's tighter deadline still wins. Plain HTTP does not use it.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> McpResult<Self> {
+        if timeout.is_zero() || timeout > Duration::from_secs(120) {
+            return Err(McpError::invalid_request("invalid secured HTTPS handshake timeout"));
+        }
+        self.handshake_timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn handshake_timeout(self) -> Duration { self.handshake_timeout }
     pub fn request_timeout(self) -> Duration { self.request_timeout }
     pub fn write_timeout(self) -> Duration { self.write_timeout }
 }
 
-/// Native bound socket and immutable security policy. Accepted connection
+/// Native bound socket and immutable security/TLS policy. Accepted connection
 /// children use the ordinary listener's limiter, response-body registry,
 /// termination receipts and caller-owned nonquiescent shutdown outcome.
 #[must_use = "serve the bound listener on its caller-owned context"]
@@ -70,6 +92,7 @@ pub struct BoundSecuredHttpServer {
     inner: BoundHttpServer,
     policy: Arc<HttpSecurityPolicy>,
     io: SecuredHttpIoLimits,
+    tls: Option<TlsAcceptor>,
 }
 
 impl Server {
@@ -80,7 +103,8 @@ impl Server {
     /// on the downstream handler, replacing its older CORS allowlist. The lower
     /// of the existing server body limit and policy body limit always wins.
     /// Host validation uses the configured public authority, never Forwarded.
-    /// TLS termination remains the deployment's responsibility, as for bind_http.
+    /// This API is plaintext, for example behind a trusted TLS terminator.
+    /// Use `bind_secured_https` for native TLS on the accepted sockets.
     ///
     /// Unsupported protocol policies, route mismatches and co-hosted OAuth routes
     /// fail before a socket is bound or any startup hook runs.
@@ -105,7 +129,43 @@ impl Server {
         self.http_config.handler_config.max_body_size = self.http_config.handler_config.max_body_size
             .min(policy.endpoint().limits().max_body_bytes());
         let inner = self.bind_http(cx, addr).await?;
-        Ok(BoundSecuredHttpServer { inner, policy: Arc::new(policy), io: SecuredHttpIoLimits::default() })
+        Ok(BoundSecuredHttpServer {
+            inner, policy: Arc::new(policy), io: SecuredHttpIoLimits::default(), tls: None,
+        })
+    }
+
+    /// Binds the same secured MCP dispatcher behind native TLS, without an
+    /// external reverse proxy or a plaintext forwarding socket.
+    ///
+    /// Supply an asupersync `TlsAcceptor` built from the deployment's server
+    /// identity with `.alpn_protocols(vec![b"http/1.1".to_vec()])`. The actual
+    /// configuration must advertise only HTTP/1.1 and disable TLS early data;
+    /// either violation fails before binding or running startup hooks. The
+    /// acceptor retains responsibility for certificate selection, TLS versions,
+    /// optional client-certificate verification and SNI policy. A TLS client
+    /// certificate does not replace MCP authentication or grant handler access.
+    ///
+    /// Handshakes run in capacity-admitted connection children, not in the
+    /// accept loop, and use one finite deadline plus the caller's budget. A
+    /// stalled client cannot serialize later handshakes. Cancellation, failure
+    /// and timeout drop the owned socket; none permits a plaintext retry.
+    /// HTTP origin/Host checks, Bearer admission, named scopes, SSE revalidation
+    /// and request ownership use the unchanged secured HTTP pipeline.
+    pub async fn bind_secured_https(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+        policy: HttpSecurityPolicy,
+        acceptor: TlsAcceptor,
+    ) -> McpResult<BoundSecuredHttpServer> {
+        if cx.checkpoint().is_err() { return Err(McpError::request_cancelled()); }
+        tls::validate_acceptor(&acceptor)?;
+        if cx.timer_driver().is_none() {
+            return Err(McpError::invalid_request("secured HTTPS requires caller-owned timers"));
+        }
+        let mut bound = self.bind_secured_http(cx, addr, policy).await?;
+        bound.tls = Some(acceptor);
+        Ok(bound)
     }
 
     /// Binds and serves the secured native listener on the caller's runtime.
@@ -117,10 +177,24 @@ impl Server {
     ) -> McpResult<HttpServerShutdown> {
         self.bind_secured_http(cx, addr, policy).await?.serve(cx).await
     }
+
+    /// Binds and serves native HTTPS on the caller's runtime and shutdown scope.
+    pub async fn serve_secured_https(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+        policy: HttpSecurityPolicy,
+        acceptor: TlsAcceptor,
+    ) -> McpResult<HttpServerShutdown> {
+        self.bind_secured_https(cx, addr, policy, acceptor).await?.serve(cx).await
+    }
 }
 
 impl BoundSecuredHttpServer {
     pub fn local_addr(&self) -> McpResult<SocketAddr> { self.inner.local_addr() }
+
+    /// Whether this bound listener requires TLS on every accepted connection.
+    pub fn is_https(&self) -> bool { self.tls.is_some() }
 
     /// Changes only this not-yet-served listener's finite I/O limits.
     pub fn with_io_limits(mut self, limits: SecuredHttpIoLimits) -> Self {
@@ -130,8 +204,9 @@ impl BoundSecuredHttpServer {
 
     /// Accepts secured HTTP requests until caller cancellation or listener error.
     /// Capacity refusal drops the socket without spawning an error-writing task.
-    /// Shutdown retains the native two-phase terminal drain and transfers any
-    /// noncooperating children to `HttpServerShutdown::Nonquiescent`.
+    /// TLS handshakes consume that same capacity and remain in the same child
+    /// inventory. Shutdown retains the native two-phase terminal drain and
+    /// transfers noncooperating children to `HttpServerShutdown::Nonquiescent`.
     ///
     /// No legacy session, runtime, detached task or process-global retention is
     /// created. The listener and all connection children stay in the caller's
@@ -193,13 +268,34 @@ impl BoundSecuredHttpServer {
                 let sessions = Arc::clone(&bound.modern_sessions);
                 let policy = Arc::clone(&self.policy);
                 let io = self.io;
+                let acceptor = self.tls.clone();
                 let stopping = shutdown.clone();
                 match cx.spawn_in(&scope, move |connection_cx| async move {
                     let _permit = permit;
+                    let stream = match acceptor {
+                        Some(acceptor) => match tls::accept(
+                            &connection_cx, &stopping, stream, &acceptor, io.handshake_timeout,
+                        ).await {
+                            Some(stream) => stream,
+                            None => return,
+                        },
+                        None => tls::ConnectionIo::Plain(stream),
+                    };
+                    let close = stream.tls_close_handle();
                     let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> = Box::pin(
                         connection::serve(&connection_cx, stream, endpoint, sessions, stopping, policy, io),
                     );
                     connection.await;
+                    if let Some(mut close) = close
+                        && connection_cx.checkpoint().is_ok()
+                    {
+                        // Application response ownership has finished. TLS
+                        // close_notify is best-effort and bounded separately;
+                        // abandoning this child still drops every socket owner.
+                        let _ = asupersync::time::timeout(
+                            connection_cx.now(), io.write_timeout, close.shutdown(),
+                        ).await;
+                    }
                 }) {
                     Ok(child) => children.tasks.push(child),
                     Err(_) => break Err(McpError::internal_error("secured HTTP connection admission failed")),
@@ -245,5 +341,9 @@ mod tests {
         assert!(SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::ZERO).is_err());
         assert!(SecuredHttpIoLimits::new(Duration::from_secs(901), Duration::from_secs(1)).is_err());
         assert!(SecuredHttpIoLimits::new(Duration::from_secs(1), Duration::from_secs(301)).is_err());
+        assert_eq!(limits.handshake_timeout(), Duration::from_secs(10));
+        assert!(limits.with_handshake_timeout(Duration::from_secs(120)).is_ok());
+        assert!(limits.with_handshake_timeout(Duration::ZERO).is_err());
+        assert!(limits.with_handshake_timeout(Duration::from_secs(121)).is_err());
     }
 }
