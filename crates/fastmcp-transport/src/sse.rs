@@ -107,6 +107,71 @@ fn sse_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     })
 }
 
+/// Commits a bounded frame without allowing an expired caller to enter another
+/// partial write or flush. This cannot interrupt a synchronous I/O call that
+/// has already entered the kernel or caller-supplied adapter.
+///
+/// Cancellation before the first accepted byte is retryable. After any byte
+/// escapes, a refusal is terminal: appending a new frame could otherwise splice
+/// it into the unfinished one. A successful flush is the commit point; no
+/// checkpoint may retroactively turn that success into a retryable failure.
+#[cfg(feature = "legacy-2024-11-05")]
+fn sse_commit_frame<W: Write>(
+    cx: &Cx,
+    writer: &mut W,
+    closed: &mut bool,
+    mut bytes: &[u8],
+) -> Result<(), TransportError> {
+    let mut wrote_any = false;
+    while !bytes.is_empty() {
+        if let Err(error) = sse_checkpoint(cx) {
+            *closed |= wrote_any;
+            return Err(error);
+        }
+        match writer.write(bytes) {
+            Ok(0) => {
+                *closed = true;
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "SSE frame write made no progress",
+                )));
+            }
+            Ok(written) => {
+                // Defend this slicing boundary even against an invalid custom
+                // Write implementation; do not panic with a half-written frame.
+                let Some(remaining) = bytes.get(written..) else {
+                    *closed = true;
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "SSE writer reported an invalid byte count",
+                    )));
+                };
+                wrote_any = true;
+                bytes = remaining;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                *closed = true;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+    loop {
+        if let Err(error) = sse_checkpoint(cx) {
+            *closed |= wrote_any;
+            return Err(error);
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                *closed = true;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+}
+
 /// Maximum wire-line size for SSE events.
 const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
 
@@ -676,33 +741,24 @@ impl<W: Write> SseWriter<W> {
         }
     }
 
-    fn commit(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        if let Err(error) = self.writer.write_all(bytes) {
-            self.closed = true;
-            return Err(TransportError::Io(error));
-        }
-        if let Err(error) = self.writer.flush() {
-            self.closed = true;
-            return Err(TransportError::Io(error));
-        }
-        Ok(())
+    fn commit(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), TransportError> {
+        sse_commit_frame(cx, &mut self.writer, &mut self.closed, bytes)
     }
 
     /// Writes an SSE event.
     ///
     /// # Cancel-Safety
     ///
-    /// Checks for cancellation before writing.
+    /// Checks the caller's budget before encoding and between partial writes.
+    /// A refusal after any bytes are written makes the writer terminal.
     pub fn write_event(&mut self, cx: &Cx, event: &SseEvent) -> Result<(), TransportError> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         let bytes = event.to_bytes()?;
-        self.commit(&bytes)
+        self.commit(cx, &bytes)
     }
 
     /// Writes the endpoint event with the POST URL.
@@ -722,9 +778,7 @@ impl<W: Write> SseWriter<W> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         let mut encoded = match message {
             JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
@@ -744,9 +798,10 @@ impl<W: Write> SseWriter<W> {
             .event_counter
             .checked_add(1)
             .ok_or_else(|| invalid_sse_field("event ID counter"))?;
-        self.event_counter = next_event_id;
         let event = SseEvent::message(json).with_id(next_event_id.to_string());
-        self.write_event(cx, &event)
+        self.write_event(cx, &event)?;
+        self.event_counter = next_event_id;
+        Ok(())
     }
 
     /// Writes a JSON-RPC response as an SSE message event.
@@ -778,9 +833,7 @@ impl<W: Write> SseWriter<W> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         if comment
             .bytes()
@@ -801,7 +854,7 @@ impl<W: Write> SseWriter<W> {
         bytes.extend_from_slice(b": ");
         bytes.extend_from_slice(comment.as_bytes());
         bytes.push(b'\n');
-        self.commit(&bytes)
+        self.commit(cx, &bytes)
     }
 
     /// Sends a keep-alive comment.
@@ -1322,9 +1375,7 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
         let endpoint = self.advertised_endpoint.clone().ok_or_else(|| {
             TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1332,6 +1383,9 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
             ))
         })?;
         let post = LegacySseMessagePost::new(endpoint, self.encode_client_message(message)?);
+        // Encoding may itself spend the remaining budget. Do not invoke the
+        // caller-owned HTTP adapter after that budget is exhausted.
+        sse_checkpoint(cx)?;
         match self.post_sink.post(cx, post) {
             Ok(()) => Ok(()),
             Err(TransportError::Cancelled) => Err(TransportError::Cancelled),
@@ -1692,16 +1746,8 @@ impl<R: Read, W: Write> SseClientTransport<R, W> {
         }
     }
 
-    fn commit_request(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        if let Err(error) = self.request_sink.write_all(bytes) {
-            self.closed = true;
-            return Err(TransportError::Io(error));
-        }
-        if let Err(error) = self.request_sink.flush() {
-            self.closed = true;
-            return Err(TransportError::Io(error));
-        }
-        Ok(())
+    fn commit_request(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), TransportError> {
+        sse_commit_frame(cx, &mut self.request_sink, &mut self.closed, bytes)
     }
 
     /// Reads the endpoint URL from the SSE stream.
@@ -1738,9 +1784,7 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         // Send via POST (write to request sink)
         let bytes = match message {
@@ -1748,7 +1792,7 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
             JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
         };
 
-        self.commit_request(&bytes)
+        self.commit_request(cx, &bytes)
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
