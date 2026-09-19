@@ -516,6 +516,13 @@ pub struct DiscoveryDocument {
     /// Revocation endpoint URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation_endpoint: Option<String>,
+    /// Client authentication methods accepted by the revocation endpoint.
+    ///
+    /// The public-client `none` method is present only when the attached
+    /// OAuth server admits public clients.
+    pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    /// Whether every authorization response carries RFC 9207 `iss`.
+    pub authorization_response_iss_parameter_supported: bool,
     /// Supported scopes.
     pub scopes_supported: Vec<String>,
     /// Supported response types.
@@ -554,6 +561,12 @@ impl DiscoveryDocument {
             jwks_uri: None,
             registration_endpoint: None,
             revocation_endpoint: Some(format!("{}/revoke", base)),
+            revocation_endpoint_auth_methods_supported: vec![
+                "none".to_string(),
+                "client_secret_post".to_string(),
+                "client_secret_basic".to_string(),
+            ],
+            authorization_response_iss_parameter_supported: true,
             scopes_supported: vec![
                 "openid".to_string(),
                 "profile".to_string(),
@@ -568,6 +581,7 @@ impl DiscoveryDocument {
             subject_types_supported: vec!["public".to_string()],
             id_token_signing_alg_values_supported: Vec::new(),
             token_endpoint_auth_methods_supported: vec![
+                "none".to_string(),
                 "client_secret_post".to_string(),
                 "client_secret_basic".to_string(),
             ],
@@ -1891,6 +1905,16 @@ impl OidcProvider {
         let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url);
         doc.scopes_supported = self.config.supported_scopes.clone();
         doc.claims_supported = Some(self.config.supported_claims.clone());
+        // Discovery must describe this exact OAuthServer configuration, not
+        // merely the broad capabilities of DiscoveryDocument::new. Public
+        // clients authenticate token and revocation requests with client_id
+        // and no secret; confidential clients retain both secret methods.
+        if !self.oauth.config().allow_public_clients {
+            doc.token_endpoint_auth_methods_supported
+                .retain(|method| method != "none");
+            doc.revocation_endpoint_auth_methods_supported
+                .retain(|method| method != "none");
+        }
         #[cfg(feature = "builtin-auth-server")]
         if let Ok(slot) = self.signing_activation.read() {
             if let (Some(_), Some(published)) = (slot.active(), slot.published()) {
@@ -2500,6 +2524,36 @@ mod non_signing_tests {
             doc.code_challenge_methods_supported,
             Some(vec!["S256".to_string()])
         );
+        assert!(doc.authorization_response_iss_parameter_supported);
+        assert!(doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "none"));
+        assert!(doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "none"));
+        let wire = serde_json::to_value(&doc).unwrap();
+        assert_eq!(wire["authorization_response_iss_parameter_supported"], true);
+        assert_eq!(wire["revocation_endpoint_auth_methods_supported"][0], "none");
+    }
+
+    #[test]
+    fn discovery_auth_methods_follow_public_client_policy() {
+        for (allow_public_clients, expects_none) in [(true, true), (false, false)] {
+            let oauth = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                issuer: "https://issuer.example".to_string(),
+                allow_public_clients,
+                ..OAuthServerConfig::default()
+            }).unwrap());
+            let provider = OidcProvider::with_defaults(oauth).unwrap();
+            let doc = provider.discovery_document("https://issuer.example");
+            assert_eq!(
+                doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "none"),
+                expects_none,
+            );
+            assert_eq!(
+                doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "none"),
+                expects_none,
+            );
+            assert!(doc.token_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
+            assert!(doc.revocation_endpoint_auth_methods_supported.iter().any(|method| method == "client_secret_basic"));
+            assert!(doc.authorization_response_iss_parameter_supported);
+        }
     }
 
     /// FND-01 surface 2, frozen case 4.
