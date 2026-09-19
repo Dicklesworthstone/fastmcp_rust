@@ -828,8 +828,7 @@ async fn negative_14_precancelled_dispatch(cx: &Cx) {
 
     let error = post(cx, &request)
         .await
-        .err()
-        .expect("a pre-cancelled dispatch must not produce a response");
+        .expect_err("a pre-cancelled dispatch must not produce a response");
     assert!(
         matches!(error, ModernHttpExecutorError::Cancelled),
         "pre-dispatch cancellation must be the typed Cancelled refusal, got {error:?}"
@@ -1004,13 +1003,11 @@ fn positive_17_authorization_redaction() {
 fn negative_17_header_hostile_token() {
     let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").expect("canonical resource");
     let error = BoundBearerCredential::bind(resource.clone(), "bad\r\nInjected: header")
-        .err()
-        .expect("a header-hostile token must not bind");
+        .expect_err("a header-hostile token must not bind");
     assert_eq!(error, BearerBindingError::InvalidTokenBytes);
 
     let empty = BoundBearerCredential::bind(resource, "")
-        .err()
-        .expect("an empty token must not bind");
+        .expect_err("an empty token must not bind");
     assert_eq!(empty, BearerBindingError::EmptyToken);
 }
 
@@ -1126,8 +1123,7 @@ async fn negative_19_redirect_with_location(cx: &Cx) {
     let client = async {
         let error = post(cx, &request)
             .await
-            .err()
-            .expect("a redirect with a Location must still be terminal");
+            .expect_err("a redirect with a Location must still be terminal");
         assert!(
             matches!(error, ModernHttpExecutorError::Redirect { status: 307 }),
             "a Location header must not turn a redirect into a follow, got {error:?}"
@@ -1203,8 +1199,7 @@ fn negative_20_unrecognized_probe_body() {
             status: 200,
             body: HttpProbeBody::Unrecognized,
         })
-        .err()
-        .expect("an unrecognized body cannot select the modern era");
+        .expect_err("an unrecognized body cannot select the modern era");
     assert!(
         matches!(
             error,
@@ -1309,8 +1304,7 @@ fn negative_21_second_probe_refused() {
 
     let error = classifier
         .observe_modern_probe(RECOGNIZED)
-        .err()
-        .expect("a second probe on one instance must be refused");
+        .expect_err("a second probe on one instance must be refused");
     assert!(
         matches!(
             error,
@@ -1638,8 +1632,7 @@ async fn negative_24_duplicate_response_header(cx: &Cx) {
     let client = async {
         let error = post(cx, &request)
             .await
-            .err()
-            .expect("a repeated fixed-cardinality header must be refused");
+            .expect_err("a repeated fixed-cardinality header must be refused");
         assert!(
             matches!(
                 error,
@@ -1818,8 +1811,7 @@ async fn positive_26_observation_table(cx: &Cx) {
             status: 500,
             body: HttpProbeBody::Unrecognized,
         })
-        .err()
-        .expect("500 is not a downgrade signal");
+        .expect_err("500 is not a downgrade signal");
     assert!(matches!(
         error,
         ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback { status: 500, .. }
@@ -1834,8 +1826,7 @@ async fn positive_26_observation_table(cx: &Cx) {
             status: 0,
             body: HttpProbeBody::TransportFailure,
         })
-        .err()
-        .expect("a transport failure cannot classify an era");
+        .expect_err("a transport failure cannot classify an era");
     assert!(matches!(
         error,
         ClientHttpNegotiationError::ModernProbeTransportFailure
@@ -1876,8 +1867,7 @@ fn negative_26_legacy_only_probe_forbidden() {
 
     let error = classifier
         .observe_modern_probe(RECOGNIZED)
-        .err()
-        .expect("a legacy-only plan must not dispatch the modern probe");
+        .expect_err("a legacy-only plan must not dispatch the modern probe");
     assert!(
         matches!(
             error,

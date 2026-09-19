@@ -220,7 +220,7 @@ fn run_subscription(case: SubCase) {
                             let first_bad = matches!(case, SubCase::WrongAck | SubCase::WidenedAck | SubCase::BeforeAck);
                             if !first_bad { receive_ack(&mut subscription, &cx, &selected()).await; }
                             let before = serde_json::to_value(subscription.accepted_filter()).unwrap();
-                            let error = subscription.next_event(&cx).await.err().expect("invalid stream must fail");
+                            let error = subscription.next_event(&cx).await.expect_err("invalid stream must fail");
                             match case {
                                 SubCase::Truncated => assert!(matches!(error, TaskError::Protocol(ManagedTasksError::MissingTerminal))),
                                 SubCase::RemoteError => {
