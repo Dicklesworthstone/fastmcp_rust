@@ -31,6 +31,9 @@ use super::{
 };
 use super::super::{SecureAtomicFile, checkpoint};
 
+/// Caller-owned asynchronous transactions with recoverable completion custody.
+pub mod asynchronous;
+
 const MAX_NAMESPACE_BYTES: usize = 128;
 const BINDING_DOMAIN: &[u8] = b"fastmcp/credential-anchor/v1\0";
 
