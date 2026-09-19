@@ -1,16 +1,24 @@
 //! Caller-owned cancellation admission for the result-returning combinators.
 
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::time::Sleep;
 
 use super::{BoxFuture, poll_slot};
 use crate::error::{McpError, McpResult};
 
 fn checkpoint(cx: &Cx) -> McpResult<()> {
+    if cx
+        .budget()
+        .deadline
+        .is_some_and(|deadline| cx.now() >= deadline)
+    {
+        return Err(McpError::request_cancelled());
+    }
     cx.checkpoint().map_err(|_| McpError::request_cancelled())
 }
 
@@ -35,10 +43,23 @@ pub(super) fn poll_active<T>(
 /// alone cannot wake a task whose children all remain pending. The unsent
 /// oneshot's receive registers with the supplied Cx and retires that exact
 /// registration on completion, cancellation, panic, or owner abandonment.
+/// A caller deadline also gets its own native timer: untimed combinators must
+/// not wait forever for a child to wake them after that deadline expires.
+/// A bounded wait without a caller timer driver refuses before polling work.
 pub(super) async fn cancellable<T>(
     cx: &Cx,
     future: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
+    checkpoint(cx)?;
+    let mut deadline_timer = match cx.budget().deadline {
+        Some(deadline) => {
+            let driver = cx.timer_driver().ok_or_else(|| {
+                McpError::internal_error("caller deadline requires an asupersync timer driver")
+            })?;
+            Some(Sleep::with_timer_driver(deadline, driver))
+        }
+        None => None,
+    };
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = pin!(receiver.recv(cx));
     let mut future = pin!(future);
@@ -51,6 +72,12 @@ pub(super) async fn cancellable<T>(
         if cancelled.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
+        if deadline_timer
+            .as_mut()
+            .is_some_and(|timer| Pin::new(timer).poll(task).is_ready())
+        {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
         let result = future.as_mut().poll(task);
         checkpoint(cx)?;
         result
@@ -60,7 +87,6 @@ pub(super) async fn cancellable<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
@@ -336,6 +362,141 @@ mod tests {
             assert_eq!(Arc::strong_count(&counter), 2);
             cx.set_cancel_requested(true);
             assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn caller_deadlines_wake_pending_waits_on_the_callers_timer_driver() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        for kind in KINDS {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            // No ambient driver may stand in for the explicit caller's driver.
+            let _ambient = Cx::set_current(Some(Cx::for_testing()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut task = Context::from_waker(&waker);
+            let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
+            assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
+            assert!(timer.pending_count() > 0);
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+
+            clock.advance(10_000_000);
+            assert!(timer.process_timers() > 0);
+            assert!(
+                counter.0.load(Ordering::Relaxed) > 0,
+                "{kind:?} missed deadline wake"
+            );
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                panic!("{kind:?} remained pending after its caller deadline");
+            };
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(polls.load(Ordering::Relaxed), 2);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            assert_eq!(timer.pending_count(), 0);
+            drop(future);
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn dropping_a_deadline_wait_retires_both_timer_and_cancel_wakeups() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        for kind in KINDS {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut future = run(kind, &cx, probes(1, false, &polls, &drops));
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert!(timer.pending_count() > 0);
+
+            drop(future);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert_eq!(timer.pending_count(), 0, "{kind:?} retained a timer");
+            assert_eq!(Arc::strong_count(&counter), 2);
+            clock.advance(10_000_000);
+            assert_eq!(timer.process_timers(), 0);
+            cx.set_cancel_requested(true);
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn deadlines_without_a_timer_driver_refuse_before_polling_children() {
+        for kind in KINDS {
+            for ready in [false, true] {
+                let cx = Cx::for_testing_with_budget(
+                    asupersync::Budget::INFINITE
+                        .with_deadline(asupersync::Time::from_nanos(u64::MAX)),
+                );
+                assert!(cx.timer_driver().is_none());
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut future = run(kind, &cx, probes(1, ready, &polls, &drops));
+                let mut task = Context::from_waker(Waker::noop());
+                let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                    panic!("{kind:?} silently waited without a deadline driver");
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert!(error.message.contains("timer driver"));
+                assert_eq!(polls.load(Ordering::Relaxed), 0);
+                assert_eq!(drops.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn already_expired_deadlines_win_over_ready_children_and_missing_drivers() {
+        for kind in KINDS {
+            let cx = Cx::for_testing_with_budget(
+                asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO),
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut future = run(kind, &cx, probes(1, true, &polls, &drops));
+            let mut task = Context::from_waker(Waker::noop());
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                panic!("expired {kind:?} stayed pending");
+            };
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(polls.load(Ordering::Relaxed), 0);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
         }
     }
 }
