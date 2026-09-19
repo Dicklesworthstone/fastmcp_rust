@@ -48,7 +48,7 @@ pub struct ManagedCatalogWatchLimits {
 impl Default for ManagedCatalogWatchLimits {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_mins(15),
             maximum_collections: 64,
             maximum_request_ids: 4096,
             maximum_state_bytes: 1024 * 1024,

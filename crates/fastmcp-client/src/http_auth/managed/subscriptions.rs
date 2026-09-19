@@ -61,7 +61,7 @@ impl Default for ManagedSubscriptionLimits {
             request_bytes: 64 * 1024,
             frame_bytes: 64 * 1024,
             records: 1024,
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_mins(15),
         }
     }
 }

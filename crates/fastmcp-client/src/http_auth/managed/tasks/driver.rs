@@ -40,7 +40,7 @@ impl Default for ManagedTaskDriverPolicy {
     fn default() -> Self {
         Self {
             minimum_poll_interval: Duration::from_secs(1),
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_mins(15),
             maximum_polls: 512,
             maximum_updates: 32,
             maximum_input_keys: 256,
@@ -67,7 +67,7 @@ impl ManagedTaskDriverPolicy {
     ) -> Result<Self, ManagedTaskDriverError> {
         if minimum_poll_interval.is_zero()
             || minimum_poll_interval > Duration::from_secs(60)
-            || timeout.is_zero() || timeout > Duration::from_secs(86_400)
+            || timeout.is_zero() || timeout > Duration::from_hours(24)
             || !(1..=4096).contains(&maximum_polls)
             || maximum_updates > 128 || maximum_input_keys > 4096
             || !(1..=4 * 1024 * 1024).contains(&maximum_state_bytes)

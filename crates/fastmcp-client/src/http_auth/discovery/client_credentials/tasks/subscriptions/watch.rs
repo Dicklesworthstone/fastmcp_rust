@@ -50,7 +50,7 @@ pub struct ClientCredentialsTaskWatchPolicy {
 }
 impl Default for ClientCredentialsTaskWatchPolicy {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(900), maximum_snapshots: 1024, maximum_records: 2048 }
+        Self { timeout: Duration::from_mins(15), maximum_snapshots: 1024, maximum_records: 2048 }
     }
 }
 impl ClientCredentialsTaskWatchPolicy {

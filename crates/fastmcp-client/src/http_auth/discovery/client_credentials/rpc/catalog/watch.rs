@@ -56,7 +56,7 @@ pub struct ClientCredentialsCatalogWatchLimits {
 impl Default for ClientCredentialsCatalogWatchLimits {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(900), maximum_collections: 64,
+            timeout: Duration::from_mins(15), maximum_collections: 64,
             maximum_request_ids: 4096, maximum_state_bytes: 1024 * 1024,
             subscription_records: 4096,
         }
