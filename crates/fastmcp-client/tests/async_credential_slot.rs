@@ -25,7 +25,8 @@ use fastmcp_client::http_auth::secure_file::slot::coordinator::{
     CredentialAnchorSnapshot, CredentialAnchorState, CredentialCommitAnchor,
 };
 use fastmcp_client::http_auth::secure_file::slot::coordinator::asynchronous::{
-    AsyncCoordinatedCredentialSlot, CredentialIoError, CredentialSlotOpen, CredentialSlotTask,
+    AsyncCoordinatedCredentialSlot, CredentialIoError, CredentialIoLane, CredentialIoLimits,
+    CredentialIoSnapshot, CredentialSlotOpen, CredentialSlotTask,
 };
 
 const NAMESPACE: &str = "async-slot-test";
@@ -172,27 +173,43 @@ impl CredentialCommitAnchor for Anchor {
         if uncertain { Err(CredentialAnchorError::Uncertain) } else { Ok(snapshot) }
     }
 }
-struct Fixture { directory: Directory, key: CredentialStoreKey, auth: PartitionAuthorization, anchor: Anchor }
+struct Fixture {
+    directory: Directory, key: CredentialStoreKey, auth: PartitionAuthorization,
+    anchor: Anchor, lane: CredentialIoLane,
+}
 impl Fixture {
     fn new() -> Self {
+        Self::on_lane(CredentialIoLane::new(ProcessGenerationGuard::install().unwrap(), CredentialIoLimits::default()).unwrap())
+    }
+    fn on_lane(lane: CredentialIoLane) -> Self {
         let (key, auth) = identity("alice");
         let anchor = Anchor::new(&key, &auth);
-        Self { directory: Directory::new(), key, auth, anchor }
+        Self { directory: Directory::new(), key, auth, anchor, lane }
     }
     fn start_open(&self, cx: &Cx) -> Result<CredentialSlotTask<CredentialSlotOpen<Anchor>>, CredentialIoError> {
-        AsyncCoordinatedCredentialSlot::open(cx, ProcessGenerationGuard::install().unwrap(),
+        AsyncCoordinatedCredentialSlot::open(cx, &self.lane,
             self.directory.handle(), "credential".to_owned(), LIMIT, self.key, self.auth,
             NAMESPACE.to_owned(), self.anchor.clone())
     }
     async fn open(&self, cx: &Cx) -> AsyncCoordinatedCredentialSlot<Anchor> {
         let (owner, recovery) = done(cx, self.start_open(cx)).await.unwrap();
         assert_eq!(recovery, None);
+        wait_jobs(cx, &self.lane).await;
         owner
     }
 }
 async fn done<T>(cx: &Cx, task: Result<CredentialSlotTask<T>, CredentialIoError>) -> T {
     let mut task = task.unwrap();
     task.wait(cx).await.unwrap()
+}
+async fn wait_jobs(cx: &Cx, lane: &CredentialIoLane) {
+    asupersync::time::timeout_at(cx.now().saturating_add_nanos(2_000_000_000), async {
+        loop {
+            let state = lane.snapshot().unwrap();
+            if state.operations == 0 && state.closes == 0 { break; }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+    }).await.expect("credential jobs released their charges");
 }
 fn run<F, Fut>(blocking: bool, scenario: F)
 where F: FnOnce(Cx) -> Fut, Fut: Future<Output = ()>,
@@ -303,6 +320,7 @@ fn async_slot_no_pool_refuses_before_file_or_anchor_effects() {
         assert_eq!(f.anchor.counts(), (0, 0));
         assert_eq!(f.directory.contents(), None);
         assert_eq!(fs::read_dir(&f.directory.0).unwrap().count(), 0);
+        assert_eq!(f.lane.snapshot().unwrap(), CredentialIoSnapshot::default());
     });
 }
 
@@ -399,5 +417,108 @@ fn async_slot_invalidation_is_durable_and_repeat_does_not_advance_tombstone() {
         let (owner, loaded) = done(&cx, owner.load(&cx, f.auth)).await.into_parts();
         assert_eq!(loaded.unwrap(), None);
         done(&cx, owner.close(&cx)).await;
+    });
+}
+
+#[test]
+fn async_slot_shared_owner_cap_refuses_before_open_and_returns_after_close() {
+    run(true, |cx| async move {
+        let lane = CredentialIoLane::new(ProcessGenerationGuard::install().unwrap(),
+            CredentialIoLimits::new(1, 2, 1024 * 1024).unwrap()).unwrap();
+        let first = Fixture::on_lane(lane.clone());
+        let second = Fixture::on_lane(lane.clone());
+        let owner = first.open(&cx).await;
+        assert_eq!(lane.snapshot().unwrap().slots, 1);
+        assert!(matches!(second.start_open(&cx), Err(CredentialIoError::CapacityExceeded)));
+        assert_eq!(second.anchor.counts(), (0, 0));
+        assert_eq!(fs::read_dir(&second.directory.0).unwrap().count(), 0);
+        done(&cx, owner.close(&cx)).await;
+        wait_jobs(&cx, &lane).await;
+        assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        let owner = second.open(&cx).await;
+        assert_eq!(second.anchor.counts(), (1, 0));
+        done(&cx, owner.close(&cx)).await;
+        wait_jobs(&cx, &lane).await;
+        assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+    });
+}
+
+#[test]
+fn async_slot_count_and_byte_saturation_leave_the_other_store_untouched() {
+    run(true, |cx| async move {
+        for byte_limited in [false, true] {
+            let lane = CredentialIoLane::new(ProcessGenerationGuard::install().unwrap(),
+                CredentialIoLimits::new(4, if byte_limited { 2 } else { 1 },
+                    if byte_limited { 16 * 1024 + 8 * LIMIT } else { 1024 * 1024 }).unwrap()).unwrap();
+            let first = Fixture::on_lane(lane.clone());
+            let second = Fixture::on_lane(lane.clone());
+            let owner = first.open(&cx).await;
+            let release = first.anchor.arm(Pause::Read);
+            let mut pending = owner.load(&cx, first.auth).unwrap();
+            release.0.wait_entered(&cx).await;
+            let before = lane.snapshot().unwrap();
+            assert_eq!(before.operations, 1);
+            assert!(matches!(second.start_open(&cx), Err(CredentialIoError::CapacityExceeded)));
+            assert_eq!(lane.snapshot().unwrap(), before, "failed admission cannot leak its reserved slot");
+            assert_eq!(second.anchor.counts(), (0, 0));
+            assert_eq!(fs::read_dir(&second.directory.0).unwrap().count(), 0);
+            release.0.release();
+            let (owner, loaded) = pending.wait(&cx).await.unwrap().into_parts();
+            assert_eq!(loaded.unwrap(), None);
+            wait_jobs(&cx, &lane).await;
+            let other = second.open(&cx).await;
+            done(&cx, other.close(&cx)).await;
+            done(&cx, owner.close(&cx)).await;
+            wait_jobs(&cx, &lane).await;
+            assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        }
+    });
+}
+
+#[test]
+fn async_slot_dropped_operation_retains_capacity_until_provider_releases() {
+    run(true, |cx| async move {
+        let lane = CredentialIoLane::new(ProcessGenerationGuard::install().unwrap(),
+            CredentialIoLimits::new(1, 1, 1024 * 1024).unwrap()).unwrap();
+        let f = Fixture::on_lane(lane.clone());
+        let owner = f.open(&cx).await;
+        let release = f.anchor.arm(Pause::Read);
+        let pending = owner.load(&cx, f.auth).unwrap();
+        release.0.wait_entered(&cx).await;
+        let before = lane.snapshot().unwrap();
+        drop(pending);
+        assert_eq!(lane.snapshot().unwrap(), before, "dropping a task does not stop a running anchor call");
+        assert!(matches!(f.start_open(&cx), Err(CredentialIoError::CapacityExceeded)));
+        release.0.release();
+        wait_jobs(&cx, &lane).await;
+        assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        let owner = f.open(&cx).await;
+        done(&cx, owner.close(&cx)).await;
+        wait_jobs(&cx, &lane).await;
+    });
+}
+
+#[test]
+fn async_slot_close_remains_available_during_data_saturation() {
+    run(true, |cx| async move {
+        let lane = CredentialIoLane::new(ProcessGenerationGuard::install().unwrap(),
+            CredentialIoLimits::new(2, 1, 1024 * 1024).unwrap()).unwrap();
+        let first = Fixture::on_lane(lane.clone());
+        let second = Fixture::on_lane(lane.clone());
+        let owner = first.open(&cx).await;
+        let other = second.open(&cx).await;
+        let release = first.anchor.arm(Pause::Read);
+        let mut pending = owner.load(&cx, first.auth).unwrap();
+        release.0.wait_entered(&cx).await;
+        assert_eq!(lane.snapshot().unwrap().operations, 1);
+        done(&cx, other.close(&cx)).await;
+        assert_eq!(lane.snapshot().unwrap().slots, 1, "close releases a file owner despite a full data queue");
+        assert_eq!(lane.snapshot().unwrap().operations, 1);
+        release.0.release();
+        let (owner, loaded) = pending.wait(&cx).await.unwrap().into_parts();
+        assert_eq!(loaded.unwrap(), None);
+        done(&cx, owner.close(&cx)).await;
+        wait_jobs(&cx, &lane).await;
+        assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
     });
 }

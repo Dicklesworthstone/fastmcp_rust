@@ -6,6 +6,11 @@
 //! cancelled wait retains its completion mailbox and can be resumed. Cancelling
 //! the job is explicit and never means that a transaction did not commit.
 //!
+//! A shared `CredentialIoLane` bounds open owners, jobs and framework buffer
+//! reservations, including unread completions. Cancellation cannot release a
+//! running worker's reservation. The caller supplies the admission domain;
+//! opening another store does not silently create another budget.
+//!
 //! This is still storage for caller-protected blobs. Encryption, an independent
 //! durable anchor, provider authentication, and restore-epoch custody remain
 //! the existing coordinator's deployment requirements. No runtime, thread pool,
@@ -20,11 +25,15 @@ use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::runtime::TaskHandle;
 use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
-use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
+use fastmcp_core::runtime::ProcessBoundToken;
 
 use super::{CoordinatedCredentialSlot, CoordinatedSlotError, CredentialCommitAnchor};
-use super::super::{CredentialSlotError, SlotCommit, SlotRecoveryOutcome, SlotRevision};
-use super::super::super::{AtomicFileError, SecureAtomicFile};
+use super::super::{CredentialSlotError, SlotCommit, SlotRecoveryOutcome, SlotRevision, HEADER_BYTES};
+use super::super::super::{AtomicFileError, SecureAtomicFile, MAX_ATOMIC_FILE_BYTES};
+
+mod admission;
+pub use admission::{CredentialIoLane, CredentialIoLimits, CredentialIoSnapshot};
+use admission::{CONTROL_BYTES, JobLease, SlotLease, operation_bytes};
 
 /// Scheduling/wait failures, distinct from the transaction's own disposition.
 /// In particular WaitCancelled/WaitTimedOut say nothing about commit status.
@@ -32,6 +41,10 @@ use super::super::super::{AtomicFileError, SecureAtomicFile};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialIoError {
     ProcessChanged,
+    InvalidLimits,
+    InvalidSlotConfiguration,
+    CapacityExceeded,
+    AdmissionUnavailable,
     CapabilityUnavailable,
     BlockingPoolUnavailable,
     SubmissionCancelled,
@@ -48,6 +61,10 @@ impl fmt::Display for CredentialIoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ProcessChanged => "credential I/O process generation changed",
+            Self::InvalidLimits => "credential I/O limits are invalid",
+            Self::InvalidSlotConfiguration => "credential I/O slot configuration exceeds its bounds",
+            Self::CapacityExceeded => "credential I/O admission capacity exhausted",
+            Self::AdmissionUnavailable => "credential I/O admission state unavailable",
             Self::CapabilityUnavailable => "credential I/O requires caller-owned spawn, I/O and time capabilities",
             Self::BlockingPoolUnavailable => "credential I/O requires an installed caller-owned blocking pool",
             Self::SubmissionCancelled => "credential I/O submission cancelled",
@@ -76,11 +93,14 @@ impl std::error::Error for CredentialIoError {}
 /// the caller's runtime region retains that worker until it settles. Drop does
 /// not claim synchronous cleanup. Reopening must acquire the real file lock
 /// and reconcile the independent anchor; Busy is not permission to steal it.
+/// Capacity remains charged until BOTH the worker and this owner release it.
 #[must_use = "retain the operation to observe its transaction disposition"]
 pub struct CredentialSlotTask<T> {
     process: Arc<ProcessBoundToken>,
     worker: Option<TaskHandle<()>>,
+    // Drop a retained result before dropping its byte reservation.
     receiver: oneshot::Receiver<Result<T, CredentialIoError>>,
+    lease: Option<Arc<JobLease>>,
     received: bool,
 }
 
@@ -88,7 +108,9 @@ impl<T> CredentialSlotTask<T> {
     /// Waits without resubmitting. A completion, including a terminal worker
     /// failure, is delivered once. Caller cancellation or deadline ends only
     /// this wait and consumes nothing. A later wait may use a fresh live Cx.
-    /// The caller's timer is required when it sets a deadline.
+    /// The caller's timer is required when it sets a deadline. A returned value
+    /// transfers to application custody and no longer consumes this lane's
+    /// buffer budget; the live slot owner continues consuming a slot admission.
     pub async fn wait(&mut self, cx: &Cx) -> Result<T, CredentialIoError> {
         self.process.verify().map_err(|_| CredentialIoError::ProcessChanged)?;
         if self.received { return Err(CredentialIoError::AlreadyReceived); }
@@ -109,17 +131,20 @@ impl<T> CredentialSlotTask<T> {
                 // mailbox. A cancelled join cannot rewrite that election.
                 self.received = true;
                 self.worker = None;
+                self.lease = None;
                 result
             }
             Err(oneshot::RecvError::Cancelled) => Err(CredentialIoError::WaitCancelled),
             Err(oneshot::RecvError::Closed) => {
                 self.received = true;
                 if let Some(worker) = self.worker.take() { worker.abort(); }
+                self.lease = None;
                 Err(CredentialIoError::WorkerStopped)
             }
             Err(oneshot::RecvError::PolledAfterCompletion) => {
                 self.received = true;
                 if let Some(worker) = self.worker.take() { worker.abort(); }
+                self.lease = None;
                 Err(CredentialIoError::AlreadyReceived)
             }
         }
@@ -178,17 +203,22 @@ pub type CredentialSlotOpen<A> = Result<
 /// transaction; reopen with the independently anchored revision to continue.
 pub struct AsyncCoordinatedCredentialSlot<A> {
     process: Arc<ProcessBoundToken>,
+    lane: CredentialIoLane,
+    maximum_file_bytes: usize,
+    // Release the provider and file lock before returning slot capacity.
     slot: CoordinatedCredentialSlot<A>,
+    slot_lease: SlotLease,
 }
 
 impl<A: CredentialCommitAnchor + 'static> AsyncCoordinatedCredentialSlot<A> {
     /// Opens and, when necessary, recovers both file and anchor in the worker.
-    /// The directory handle is supplied by the host; no ambient path is opened.
+    /// The directory handle and shared admission lane are supplied by the host;
+    /// no ambient path is opened and no per-open capacity domain is created.
     /// The returned task, not this method, owns the opening/recovery outcome.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         cx: &Cx,
-        guard: &ProcessGenerationGuard,
+        lane: &CredentialIoLane,
         directory: File,
         leaf: String,
         maximum_bytes: usize,
@@ -197,16 +227,24 @@ impl<A: CredentialCommitAnchor + 'static> AsyncCoordinatedCredentialSlot<A> {
         namespace: String,
         anchor: A,
     ) -> Result<CredentialSlotTask<CredentialSlotOpen<A>>, CredentialIoError> {
-        guard.verify_current().map_err(|_| CredentialIoError::ProcessChanged)?;
-        let process = Arc::new(guard.token());
-        let owner_process = Arc::clone(&process);
-        submit(cx, process, move |worker_cx| {
+        check_submission(cx, &lane.process())?;
+        if !(HEADER_BYTES..=MAX_ATOMIC_FILE_BYTES).contains(&maximum_bytes)
+            || leaf.is_empty() || leaf.len() > 96 || namespace.is_empty() || namespace.len() > 128
+        { return Err(CredentialIoError::InvalidSlotConfiguration); }
+        let slot_lease = lane.reserve_slot()?;
+        let process = lane.process();
+        let owner_lane = lane.clone();
+        // Do not queue unbounded spare capacity supplied in an otherwise short
+        // String. The caller's original allocations are outside lane custody.
+        let leaf = leaf.into_boxed_str();
+        let namespace = namespace.into_boxed_str();
+        submit(cx, lane, operation_bytes(maximum_bytes)?, move |worker_cx| {
             let file = SecureAtomicFile::open(worker_cx, directory, &leaf, maximum_bytes)
                 .map_err(|error| CoordinatedSlotError::Slot(CredentialSlotError::Storage(error)))?;
             let (slot, recovery) = CoordinatedCredentialSlot::open(
                 worker_cx, file, &key, &authorization, &namespace, anchor,
             )?;
-            Ok((Self { process: owner_process, slot }, recovery))
+            Ok((Self { process, lane: owner_lane, maximum_file_bytes: maximum_bytes, slot, slot_lease }, recovery))
         })
     }
 
@@ -229,12 +267,16 @@ impl<A: CredentialCommitAnchor + 'static> AsyncCoordinatedCredentialSlot<A> {
         -> Result<CredentialSlotTask<CredentialSlotCompletion<A, SlotRevision>>, CredentialIoError>
     {
         if protected_payload.len() > self.maximum_payload_bytes() {
+            drop(protected_payload);
             check_submission(cx, &self.process)?;
-            return Ok(ready(Arc::clone(&self.process), CredentialSlotCompletion {
+            let lease = self.lane.reserve_job(CONTROL_BYTES)?;
+            return Ok(ready(Arc::clone(&self.process), lease, CredentialSlotCompletion {
                 owner: self,
                 outcome: Err(CoordinatedSlotError::Slot(CredentialSlotError::Storage(AtomicFileError::TooLarge))),
             }));
         }
+        // Length, not attacker-supplied spare Vec capacity, defines queued input.
+        let protected_payload = protected_payload.into_boxed_slice();
         self.operate(cx, move |slot, cx| slot.replace(cx, &authorization, expected, &protected_payload))
     }
 
@@ -256,8 +298,11 @@ impl<A: CredentialCommitAnchor + 'static> AsyncCoordinatedCredentialSlot<A> {
 
     /// Drops the file lock and provider on the owned blocking lane. This is
     /// local closure only: it neither invalidates storage nor revokes a token.
+    /// Close has dedicated bounded capacity, even when data jobs are saturated.
     pub fn close(self, cx: &Cx) -> Result<CredentialSlotTask<()>, CredentialIoError> {
-        submit(cx, Arc::clone(&self.process), move |_| drop(self))
+        check_submission(cx, &self.process)?;
+        let lease = self.slot_lease.reserve_close()?;
+        spawn(cx, Arc::clone(&self.process), lease, move |_| drop(self))
     }
 
     fn operate<T, F>(mut self, cx: &Cx, operation: F)
@@ -266,7 +311,8 @@ impl<A: CredentialCommitAnchor + 'static> AsyncCoordinatedCredentialSlot<A> {
         T: Send + 'static,
         F: FnOnce(&mut CoordinatedCredentialSlot<A>, &Cx) -> Result<T, CoordinatedSlotError> + Send + 'static,
     {
-        submit(cx, Arc::clone(&self.process), move |worker_cx| {
+        let lane = self.lane.clone();
+        submit(cx, &lane, operation_bytes(self.maximum_file_bytes)?, move |worker_cx| {
             let outcome = operation(&mut self.slot, worker_cx);
             CredentialSlotCompletion { owner: self, outcome }
         })
@@ -296,20 +342,33 @@ fn check_submission(cx: &Cx, process: &ProcessBoundToken) -> Result<(), Credenti
     Ok(())
 }
 
-fn ready<T>(process: Arc<ProcessBoundToken>, value: T) -> CredentialSlotTask<T> {
+fn ready<T>(process: Arc<ProcessBoundToken>, lease: Arc<JobLease>, value: T) -> CredentialSlotTask<T> {
     let (sender, receiver) = oneshot::channel();
     let _ = sender.send_blocking(Ok(value));
-    CredentialSlotTask { process, worker: None, receiver, received: false }
+    CredentialSlotTask { process, worker: None, receiver, lease: Some(lease), received: false }
 }
 
-fn submit<T, F>(cx: &Cx, process: Arc<ProcessBoundToken>, work: F)
+fn submit<T, F>(cx: &Cx, lane: &CredentialIoLane, bytes: usize, work: F)
     -> Result<CredentialSlotTask<T>, CredentialIoError>
 where T: Send + 'static, F: FnOnce(&Cx) -> T + Send + 'static,
 {
+    let process = lane.process();
     check_submission(cx, &process)?;
+    let lease = lane.reserve_job(bytes)?;
+    spawn(cx, process, lease, work)
+}
+
+fn spawn<T, F>(cx: &Cx, process: Arc<ProcessBoundToken>, lease: Arc<JobLease>, work: F)
+    -> Result<CredentialSlotTask<T>, CredentialIoError>
+where T: Send + 'static, F: FnOnce(&Cx) -> T + Send + 'static,
+{
     let worker_process = Arc::clone(&process);
+    let worker_lease = Arc::clone(&lease);
     let (sender, receiver) = oneshot::channel();
     let worker = cx.spawn_blocking(move |worker_cx| {
+        // Declared first so this charge outlives work, provider unwinding and
+        // disposal of an undeliverable result. Task drop alone cannot release it.
+        let _worker_lease = worker_lease;
         let result = if worker_process.verify().is_err() {
             Err(CredentialIoError::ProcessChanged)
         } else {
@@ -322,7 +381,7 @@ where T: Send + 'static, F: FnOnce(&Cx) -> T + Send + 'static,
         // deliberately does not consult the now-possibly-cancelled worker Cx.
         let _ = sender.send_blocking(result);
     }).map_err(|_| CredentialIoError::RuntimeUnavailable)?;
-    Ok(CredentialSlotTask { process, worker: Some(worker), receiver, received: false })
+    Ok(CredentialSlotTask { process, worker: Some(worker), receiver, lease: Some(lease), received: false })
 }
 
 #[cfg(test)]
