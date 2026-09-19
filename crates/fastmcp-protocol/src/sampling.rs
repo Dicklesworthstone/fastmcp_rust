@@ -26,7 +26,7 @@ use crate::{
 pub struct SamplingToolLoopLimits {
     max_rounds: usize,
     max_tool_calls: usize,
-    max_bytes: usize,
+    byte_ceiling: usize,
 }
 
 impl SamplingToolLoopLimits {
@@ -36,21 +36,21 @@ impl SamplingToolLoopLimits {
     pub fn new(
         max_rounds: usize,
         max_tool_calls: usize,
-        max_bytes: usize,
+        byte_ceiling: usize,
     ) -> Result<Self, SamplingToolLoopError> {
         if !(1..=1_024).contains(&max_rounds)
             || max_tool_calls > 4_096
-            || !(1..=16 * 1024 * 1024).contains(&max_bytes)
+            || !(1..=16 * 1024 * 1024).contains(&byte_ceiling)
         {
             return Err(SamplingToolLoopError::InvalidLimits);
         }
-        Ok(Self { max_rounds, max_tool_calls, max_bytes })
+        Ok(Self { max_rounds, max_tool_calls, byte_ceiling })
     }
 }
 
 impl Default for SamplingToolLoopLimits {
     fn default() -> Self {
-        Self { max_rounds: 16, max_tool_calls: 128, max_bytes: 4 * 1024 * 1024 }
+        Self { max_rounds: 16, max_tool_calls: 128, byte_ceiling: 4 * 1024 * 1024 }
     }
 }
 
@@ -142,7 +142,7 @@ impl SamplingToolLoop {
         request: FinalEmbeddedCreateMessageParams,
         limits: SamplingToolLoopLimits,
     ) -> Result<Self, SamplingToolLoopError> {
-        bounded_wire(&request, limits.max_bytes)?;
+        bounded_wire(&request, limits.byte_ceiling)?;
         if request.messages.is_empty()
             || request.temperature.is_some_and(|value| !value.is_finite())
         {
@@ -224,7 +224,7 @@ impl SamplingToolLoop {
         if self.rounds >= self.limits.max_rounds {
             return Err(SamplingToolLoopError::RoundLimit);
         }
-        bounded_wire(&response, self.limits.max_bytes)?;
+        bounded_wire(&response, self.limits.byte_ceiling)?;
         if response.role != Role::Assistant || blocks(&response.content).is_empty() {
             return Err(SamplingToolLoopError::InvalidResponse);
         }
@@ -255,7 +255,7 @@ impl SamplingToolLoop {
         next.messages.push(FinalSamplingMessage {
             role: response.role, content: response.content, meta: response.meta,
         });
-        bounded_wire(&next, self.limits.max_bytes)?;
+        bounded_wire(&next, self.limits.byte_ceiling)?;
         let count = calls.len();
         self.request = Some(next);
         self.used_ids.extend(calls.iter().map(|(id, _)| id.clone()));
@@ -288,13 +288,13 @@ impl SamplingToolLoop {
             Phase::Closed => return Err(SamplingToolLoopError::Closed),
             _ => return Err(SamplingToolLoopError::WrongPhase),
         };
-        bounded_wire(&results, self.limits.max_bytes)?;
+        bounded_wire(&results, self.limits.byte_ceiling)?;
         admit_results(&results, pending, &self.schemas)?;
         let mut next = self.request.as_ref().ok_or(SamplingToolLoopError::Closed)?.clone();
         next.messages.push(FinalSamplingMessage {
             role: Role::User, content: FinalSamplingMessageContent::Blocks(results), meta: None,
         });
-        bounded_wire(&next, self.limits.max_bytes)?;
+        bounded_wire(&next, self.limits.byte_ceiling)?;
         self.request = Some(next);
         self.phase = Phase::Ready;
         Ok(())
