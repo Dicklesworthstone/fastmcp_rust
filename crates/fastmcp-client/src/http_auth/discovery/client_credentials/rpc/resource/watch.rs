@@ -394,10 +394,12 @@ impl ChangeSignal {
 fn is_invalidation_stop(error: &ClientCredentialsResourceError, local: &McpRequestCancellation) -> bool {
     matches!(error, ClientCredentialsResourceError::Resource(ManagedResourceError::Invalidated))
         || (local.is_cancel_requested() && matches!(error,
-            ClientCredentialsResourceError::Core(ClientCredentialsCoreError::Protocol(ManagedCoreError::Cancelled))
-            | ClientCredentialsResourceError::Core(ClientCredentialsCoreError::Authentication(
-                ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)
-            ))
+            ClientCredentialsResourceError::Core(
+                ClientCredentialsCoreError::Protocol(ManagedCoreError::Cancelled)
+                | ClientCredentialsCoreError::Authentication(
+                    ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)
+                )
+            )
         ))
 }
 async fn yield_once() {
