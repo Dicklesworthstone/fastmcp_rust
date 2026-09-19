@@ -262,6 +262,9 @@ impl ManagedCoreCall {
     /// Returns `None` only after delivering the single typed result. EOF before
     /// that result, a foreign ID, malformed ingress and remote errors fail the
     /// call. Already-delivered notifications remain with the caller on failure.
+    /// An SSE result is withheld until clean body EOF: duplicate terminals,
+    /// trailing notifications, read failures, cancellation and deadline expiry
+    /// cannot turn a partial response into a published or cacheable success.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedCoreEvent>, ManagedCoreError> {
         if self.finished { return Ok(None); }
         let body = self.body.take().ok_or(ManagedCoreError::Closed)?;
@@ -284,11 +287,40 @@ impl ManagedCoreCall {
         let event = self.decoder.admit(&frame, remaining.is_some())?;
         check_call(cx, &self.cancellation, self.deadline)?;
         match &event {
-            ManagedCoreEvent::Result(_) => self.finished = true,
+            ManagedCoreEvent::Result(_) => {
+                if let Some(CoreBody::Sse(mut stream)) = remaining {
+                    finish_finite_sse(cx, &self.cancellation, self.deadline, async {
+                        stream.next_event(cx).await.map_err(ManagedCoreError::from)
+                    }).await?;
+                }
+                check_call(cx, &self.cancellation, self.deadline)?;
+                self.finished = true;
+            }
             ManagedCoreEvent::Notification(_) => self.body = remaining,
         }
         Ok(Some(event))
     }
+}
+
+// A terminal JSON-RPC result does not prove that its finite HTTP body has
+// ended. Keep the stream owned by the awaiting call until EOF, refusing the
+// first trailing data event without retaining its potentially sensitive text.
+// Native SSE framing/body bounds still apply, and the original call deadline
+// also bounds comment-only tails or peers that never close the response.
+// Dropping this wait drops the read future and its caller-owned stream; it
+// never detaches work or cancels the parent/sibling request domain.
+pub(crate) async fn finish_finite_sse(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Time,
+    next: impl Future<Output = Result<Option<String>, ManagedCoreError>>,
+) -> Result<(), ManagedCoreError> {
+    bounded_wait(cx, cancellation, deadline, async {
+        match next.await? {
+            None => Ok(()),
+            Some(_) => Err(ManagedCoreError::InvalidResponse),
+        }
+    }).await
 }
 
 pub(crate) struct CoreDecoder {
@@ -710,4 +742,91 @@ mod tests {
             assert!(cx.checkpoint().is_ok());
         });
     }
+
+    #[test]
+    fn finite_sse_requires_eof_and_rejects_all_trailing_data_without_disclosure() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+            assert!(finish_finite_sse(&cx, &cancellation, deadline, async { Ok(None) }).await.is_ok());
+            for trailing in [
+                r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":8,"error":{"code":-32603,"message":"secret-canary"}}"#,
+                "malformed-secret-canary",
+                "",
+            ] {
+                let error = finish_finite_sse(&cx, &cancellation, deadline, async {
+                    Ok(Some(trailing.to_owned()))
+                }).await.unwrap_err();
+                assert!(matches!(error, ManagedCoreError::InvalidResponse));
+                assert!(!format!("{error:?} {error}").contains("secret-canary"));
+            }
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn finite_sse_retains_tail_read_errors_and_same_poll_cancellation() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+            let failed = finish_finite_sse(&cx, &cancellation, deadline, async {
+                Err(ManagedCoreError::ResponseByteLimit)
+            }).await;
+            assert!(matches!(failed, Err(ManagedCoreError::ResponseByteLimit)));
+            let cancelled = finish_finite_sse(&cx, &cancellation, deadline, async {
+                cancellation.cancel();
+                Ok(None)
+            }).await;
+            assert!(matches!(cancelled, Err(ManagedCoreError::Cancelled)));
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn finite_sse_pending_eof_uses_the_original_absolute_deadline() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_millis(20)).unwrap();
+            let result = finish_finite_sse(&cx, &cancellation, deadline, std::future::pending()).await;
+            assert!(matches!(result, Err(ManagedCoreError::TimedOut)));
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn dropping_finite_sse_eof_wait_releases_its_owned_read() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        struct OwnedRead(Arc<AtomicBool>);
+        impl Future for OwnedRead {
+            type Output = Result<Option<String>, ManagedCoreError>;
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+        }
+        impl Drop for OwnedRead {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let deadline = call_deadline(&cx, &cancellation, Duration::from_secs(1)).unwrap();
+            let mut waiting = Box::pin(finish_finite_sse(&cx, &cancellation, deadline, OwnedRead(Arc::clone(&dropped))));
+            poll_fn(|task| { assert!(waiting.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+            drop(waiting);
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
 }
