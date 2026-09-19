@@ -9,6 +9,9 @@
 //! before touching key state. Live-memory cloning is unsupported; a declaration
 //! that an external epoch exists is not an implemented epoch check here.
 
+/// Encrypted, one-use, authorization-bound continuation custody.
+pub mod continuations;
+
 use std::fmt;
 use std::time::{Duration, Instant};
 
