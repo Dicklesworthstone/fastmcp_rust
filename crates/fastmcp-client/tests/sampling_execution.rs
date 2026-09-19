@@ -77,6 +77,8 @@ struct Host {
     pending: Option<SamplingStage>,
     cancel_after: Option<SamplingStage>,
     cancel_current: bool,
+    pending_model_index: Option<usize>,
+    after_first_model: Option<(Arc<VirtualClock>, u64)>,
     polls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
 }
@@ -86,6 +88,7 @@ impl Host {
             models: models.into(), answers: answers.into(), requests: Vec::new(),
             approvals: 0, calls: Vec::new(), fail: None, pending: None,
             cancel_after: None, cancel_current: false,
+            pending_model_index: None, after_first_model: None,
             polls: Arc::new(AtomicUsize::new(0)), drops: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -114,6 +117,10 @@ impl SamplingHost for Host {
         request: &'a FinalEmbeddedCreateMessageParams,
     ) -> SamplingHostFuture<'a, FinalCreateMessageResult> {
         self.requests.push(serde_json::to_value(request).unwrap());
+        if self.requests.len() == 1 {
+            if let Some((clock, nanos)) = &self.after_first_model { clock.advance(*nanos); }
+        }
+        if self.pending_model_index == Some(self.requests.len()) { self.pending = Some(SamplingStage::Model); }
         let value = self.models.pop_front().expect("unexpected extra model invocation");
         self.operation(SamplingStage::Model, cancellation, value)
     }
@@ -447,4 +454,225 @@ fn host_polling_uses_the_caller_and_restores_an_unrelated_ambient_context() {
         Cx::current().unwrap().set_cancel_requested(true);
         assert!(ambient.is_cancel_requested());
     });
+}
+
+mod embedded_inputs {
+    use super::*;
+    use fastmcp_client::http_auth::sampling::inputs::{
+        SamplingInputError, SamplingInputLimits, resolve_sampling_inputs,
+    };
+    use fastmcp_protocol::{
+        ExactJsonValue, FinalEmbeddedInputRequest, InputRequiredResult, RequestId, parse_exact_json,
+    };
+
+    fn descriptor() -> String {
+        serde_json::to_string(&FinalEmbeddedInputRequest::Sampling(request())).unwrap()
+    }
+
+    fn challenge(raw: Option<&str>, state: Option<&str>) -> InputRequiredResult {
+        let map = raw.map(|raw| match parse_exact_json(raw).unwrap() {
+            ExactJsonValue::Object(map) => map,
+            _ => panic!("test descriptors must be an object"),
+        });
+        InputRequiredResult::new(map, state.map(str::to_owned), Default::default()).unwrap()
+    }
+
+    fn two_inputs() -> String {
+        format!(r#"{{"z/first~\n":{},"a-second":{}}}"#, descriptor(), descriptor())
+    }
+
+    fn limits(run: SamplingRunLimits, rounds: usize, tools: usize) -> SamplingInputLimits {
+        SamplingInputLimits::new(run, 8, rounds, tools, 1_048_576, 1_048_576).unwrap()
+    }
+
+    #[test]
+    fn embedded_replies_preserve_keys_order_and_exact_results_without_carrying_request_state() {
+        with_cx(|cx, _, _| {
+            let input = challenge(Some(&two_inputs()), Some("  opaque\0/%  "));
+            let retained = input.clone();
+            let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+            let reply = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                input, RequestId::Number(55), SamplingInputLimits::default(), &mut host)).unwrap();
+            assert!(reply.request_id.correlates_with(&RequestId::Number(55)));
+            let responses = reply.input_responses.unwrap();
+            responses.validate_against_input_required(&retained).unwrap();
+            assert_eq!(responses.entries().iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+                ["z/first~\n", "a-second"]);
+            let value = serde_json::to_value(&responses).unwrap();
+            for key in ["z/first~\n", "a-second"] {
+                assert_eq!(value[key], serde_json::to_value(final_response()).unwrap());
+            }
+            assert_eq!(retained.request_state(), Some("  opaque\0/%  "));
+            assert_eq!(host.requests.len(), 2);
+            assert!(host.calls.is_empty());
+        });
+    }
+
+    #[test]
+    fn state_only_and_present_empty_maps_remain_distinct_without_host_work() {
+        with_cx(|cx, _, _| {
+            for raw in [None, Some("{}")] {
+                let mut host = Host::new(vec![], vec![]);
+                let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 0, 0, 0, 2, 2).unwrap();
+                let reply = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    challenge(raw, Some("")), RequestId::Number(56), limits, &mut host)).unwrap();
+                assert_eq!(reply.input_responses.is_some(), raw.is_some());
+                if let Some(responses) = reply.input_responses { assert!(responses.is_empty()); }
+                assert!(host.requests.is_empty());
+                assert_eq!(host.approvals, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn later_unsupported_or_invalid_descriptors_refuse_before_the_first_model_call() {
+        with_cx(|cx, _, _| {
+            for (later, expected) in [
+                (r#"{"method":"roots/list"}"#.to_owned(), SamplingInputError::UnsupportedInput),
+                (r#"{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":1}}"#.to_owned(),
+                    SamplingInputError::Run(SamplingRunError::Protocol(SamplingToolLoopError::InvalidRequest))),
+            ] {
+                let raw = format!(r#"{{"first":{},"later":{later}}}"#, descriptor());
+                let mut host = Host::new(vec![], vec![]);
+                assert_eq!(complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    challenge(Some(&raw), None), RequestId::Number(57), SamplingInputLimits::default(), &mut host)).err(), Some(expected));
+                assert!(host.requests.is_empty());
+                assert!(host.calls.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn global_model_budget_stops_a_tool_batch_that_cannot_have_its_results_consumed() {
+        with_cx(|cx, _, _| {
+            let mut host = Host::new(vec![response(call("a")), final_response(), response(call("b"))],
+                vec![answer("a")]);
+            let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                challenge(Some(&two_inputs()), None), RequestId::Number(58),
+                limits(SamplingRunLimits::default(), 3, 8), &mut host)).err().unwrap();
+            assert_eq!(error, SamplingInputError::ModelRoundLimit);
+            assert_eq!(host.requests.len(), 3);
+            assert_eq!(host.approvals, 1);
+            assert_eq!(host.calls, ["a"]);
+        });
+    }
+
+    #[test]
+    fn tool_budget_is_shared_across_input_keys_and_refuses_the_whole_later_batch() {
+        with_cx(|cx, _, _| {
+            let mut host = Host::new(vec![response(call("a")), final_response(),
+                response(json!([call("b"), call("c")]))], vec![answer("a")]);
+            let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                challenge(Some(&two_inputs()), None), RequestId::Number(59),
+                limits(SamplingRunLimits::default(), 8, 2), &mut host)).err().unwrap();
+            assert_eq!(error, SamplingInputError::ToolCallLimit);
+            assert_eq!(host.approvals, 1);
+            assert_eq!(host.calls, ["a"]);
+        });
+    }
+
+    #[test]
+    fn tool_result_byte_budget_is_not_reset_by_the_next_input_key() {
+        with_cx(|cx, _, _| {
+            let size = serde_json::to_vec(&answer("a")).unwrap().len();
+            let run = SamplingRunLimits::new(SamplingToolLoopLimits::default(),
+                Duration::from_secs(1), size * 2 - 1).unwrap();
+            let mut host = Host::new(vec![response(call("a")), final_response(), response(call("b"))],
+                vec![answer("a"), answer("b")]);
+            let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                challenge(Some(&two_inputs()), None), RequestId::Number(60), limits(run, 8, 8), &mut host)).err().unwrap();
+            assert_eq!(error, SamplingInputError::ToolResultByteLimit);
+            assert_eq!(host.requests.len(), 3);
+            assert_eq!(host.calls, ["a", "b"]);
+        });
+    }
+
+    #[test]
+    fn input_count_and_encoded_input_bytes_are_checked_before_host_work() {
+        with_cx(|cx, _, _| {
+            let raw = two_inputs();
+            for (maximum, succeeds) in [(raw.len(), true), (raw.len() - 1, false)] {
+                let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 2, 2, 0,
+                    maximum, 4096).unwrap();
+                let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+                let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    challenge(Some(&raw), None), RequestId::Number(61), limits, &mut host));
+                if succeeds { assert!(result.is_ok()); assert_eq!(host.requests.len(), 2); }
+                else { assert_eq!(result.err(), Some(SamplingInputError::InputByteLimit)); assert!(host.requests.is_empty()); }
+            }
+            let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 1, 2, 0, 4096, 4096).unwrap();
+            let mut host = Host::new(vec![], vec![]);
+            assert_eq!(complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                challenge(Some(&raw), None), RequestId::Number(62), limits, &mut host)).err(), Some(SamplingInputError::InputLimit));
+            assert!(host.requests.is_empty());
+        });
+    }
+
+    #[test]
+    fn aggregate_reply_limit_counts_escaped_keys_and_map_framing_exactly() {
+        with_cx(|cx, _, _| {
+            let expected = format!(r#"{{"z/first~\n":{},"a-second":{}}}"#,
+                serde_json::to_string(&final_response()).unwrap(), serde_json::to_string(&final_response()).unwrap());
+            for (maximum, succeeds) in [(expected.len(), true), (expected.len() - 1, false)] {
+                let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 2, 2, 0, 4096, maximum).unwrap();
+                let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+                let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    challenge(Some(&two_inputs()), None), RequestId::Number(63), limits, &mut host));
+                if succeeds { assert_eq!(serde_json::to_string(&result.unwrap().input_responses.unwrap()).unwrap(), expected); }
+                else { assert_eq!(result.err(), Some(SamplingInputError::ReplyByteLimit)); }
+                assert_eq!(host.requests.len(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn second_input_cannot_reset_the_whole_challenge_deadline() {
+        with_cx(|cx, clock, timer| {
+            let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+            host.after_first_model = Some((clock.clone(), 3_000_000));
+            host.pending_model_index = Some(2);
+            let cancellation = McpRequestCancellation::new();
+            let run = SamplingRunLimits::new(SamplingToolLoopLimits::default(), Duration::from_millis(5), 4096).unwrap();
+            let counter = Arc::new(WakeCount::default());
+            let waker = Waker::from(counter.clone());
+            let mut task = Context::from_waker(&waker);
+            let mut future = Box::pin(resolve_sampling_inputs(&cx, &cancellation,
+                challenge(Some(&two_inputs()), None), RequestId::Number(64), limits(run, 8, 8), &mut host));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert_eq!(cx.now().as_nanos(), 3_000_000);
+            clock.advance(2_000_000);
+            assert!(timer.process_timers() > 0);
+            assert!(counter.0.load(Ordering::SeqCst) > 0);
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("batch deadline reset") };
+            assert_eq!(result.err(), Some(SamplingInputError::Run(SamplingRunError::TimedOut)));
+            drop(future);
+            assert_eq!(host.requests.len(), 2);
+            assert_eq!(host.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+        });
+    }
+
+    #[test]
+    fn cancellation_on_a_later_sibling_discards_the_complete_partial_reply() {
+        with_cx(|cx, _, timer| {
+            let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+            host.pending_model_index = Some(2);
+            let cancellation = McpRequestCancellation::new();
+            let counter = Arc::new(WakeCount::default());
+            let waker = Waker::from(counter.clone());
+            let mut task = Context::from_waker(&waker);
+            let mut future = Box::pin(resolve_sampling_inputs(&cx, &cancellation,
+                challenge(Some(&two_inputs()), None), RequestId::Number(65), SamplingInputLimits::default(), &mut host));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            cancellation.cancel();
+            assert!(counter.0.load(Ordering::SeqCst) > 0);
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("batch cancellation stuck") };
+            assert_eq!(result.err(), Some(SamplingInputError::Run(SamplingRunError::Cancelled)));
+            drop(future);
+            assert_eq!(host.requests.len(), 2);
+            assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+        });
+    }
 }

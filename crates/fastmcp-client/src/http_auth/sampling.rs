@@ -30,6 +30,9 @@ use fastmcp_protocol::sampling::{
 };
 use fastmcp_protocol::{AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, admit_final_schema};
 
+/// Bounded sampling-only resolution of final input-required response maps.
+pub mod inputs;
+
 /// A host-owned operation borrowing its model/tool implementation and caller.
 /// There is no 'static requirement and no task is spawned by this driver.
 pub type SamplingHostFuture<'a, T> =
@@ -245,7 +248,7 @@ fn validate_output(
 }
 
 // Measure without allocating an extra unbounded serialization buffer.
-fn encoded_size(value: &SamplingContentBlock, maximum: usize) -> Result<usize, SamplingRunError> {
+fn encoded_size(value: &impl serde::Serialize, maximum: usize) -> Result<usize, SamplingRunError> {
     struct Counter { bytes: usize, maximum: usize, exceeded: bool }
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
