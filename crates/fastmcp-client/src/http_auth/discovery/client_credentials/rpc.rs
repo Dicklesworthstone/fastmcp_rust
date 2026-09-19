@@ -14,6 +14,8 @@
 pub mod catalog;
 /// Explicit, bounded host-driven input-required continuations.
 pub mod interaction;
+/// Bounded resource reads with opt-in, credential-local result caching.
+pub mod resource;
 
 use std::fmt;
 
