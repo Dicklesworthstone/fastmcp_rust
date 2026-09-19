@@ -11,10 +11,15 @@
 // from the cold census is an artefact of the feature set, not a property of the
 // target, so excluding it would leave a known emitter untouched by construction.
 // Cause and cost as in the six: the default 128 is exceeded resolving async blocks
-// through `handle_secured_async` <-> `await_dispatch`, which recurse against each
-// other in fastmcp-server PRODUCTION source (endpoint.rs:164, :297). Raising removes
-// the early warning that depth is growing; it does NOT change codegen, so no runtime
-// exposure is created or removed. The production-side repair is filed apart.
+// through `handle_secured_async` -> `await_dispatch` in fastmcp-server PRODUCTION
+// source (endpoint.rs:164, :297). The chain is DEEP BUT BOUNDED — `await_dispatch`
+// has no call site inside its own body, and never calls back into
+// `handle_secured_async` — so a finite budget COMPLETES the proof rather than
+// suppressing it. Raising removes the early warning that depth is growing; it does
+// NOT change codegen, so no runtime exposure is created or removed. The production-
+// side repair is filed apart.
+// NOT VERIFIED HERE: the a8574340 cold check covered the DEFAULT feature set, in
+// which this target does not emit. Its configuration remains unverified.
 #![recursion_limit = "256"]
 
 use std::future::Future;
