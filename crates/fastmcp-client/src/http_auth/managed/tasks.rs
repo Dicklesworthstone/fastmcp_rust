@@ -283,6 +283,9 @@ impl ManagedTaskCall {
 
     /// Results are delivered once. EOF without a result is an error. Session
     /// renewal never lengthens the credential lifetime of this response.
+    /// SSE terminals remain provisional until clean body EOF. Trailing records
+    /// or a failed final read withhold the result rather than starting a Task
+    /// polling/continuation workflow from an incompletely validated response.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedTaskEvent>, ManagedTasksError> {
         if self.finished { return Ok(None); }
         let body = self.body.take().ok_or(ManagedTasksError::Closed)?;
@@ -309,10 +312,42 @@ impl ManagedTaskCall {
         self.session.check(cx, &self.cancellation)?;
         if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
         if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        let event = if matches!(&event, ManagedTaskEvent::Notification(_)) {
+            self.body = remaining;
+            event
+        } else {
+            let event = match remaining {
+                Some(TaskBody::Sse(mut stream)) => {
+                    self.finish_terminal(cx, event, async { stream.next_event(cx).await }).await?
+                }
+                _ => event,
+            };
+            self.finished = true;
+            event
+        };
         self.records += 1;
-        if matches!(event, ManagedTaskEvent::Notification(_)) { self.body = remaining; }
-        else { self.finished = true; }
         Ok(Some(event))
+    }
+
+    // A task ID or input-required state is not publishable until the finite
+    // response body ends cleanly. Keep both the result and the read owned by
+    // this future, including while a peer withholds EOF. The original login
+    // expiry, operation deadline, session closure and cancellation all remain
+    // active; renewal must never extend this response's authority.
+    async fn finish_terminal(
+        &mut self,
+        cx: &Cx,
+        event: ManagedTaskEvent,
+        next: impl std::future::Future<Output = Result<Option<String>, OAuthSessionError>>,
+    ) -> Result<ManagedTaskEvent, ManagedTasksError> {
+        let trailing = self.session.await_active(
+            cx, &self.cancellation, self.deadline, Some(self.expires_at), next,
+        ).await?;
+        if trailing.is_some() { return Err(ManagedTasksError::InvalidResponse); }
+        self.session.check(cx, &self.cancellation)?;
+        if Instant::now() >= self.expires_at { return Err(OAuthSessionError::LoginRequired.into()); }
+        if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
+        Ok(event)
     }
 }
 
@@ -608,5 +643,167 @@ mod tests {
                 assert!(cx.checkpoint().is_ok());
                 assert!(!client.session.inner.closed.is_cancel_requested());
             });
+    }
+
+    fn finite_task_call() -> ManagedTaskCall {
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use asupersync::sync::Mutex;
+        use crate::http_auth::CanonicalHttpUrl;
+        use crate::http_auth::managed::{OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+
+        let url = |value| CanonicalHttpUrl::parse(value).unwrap();
+        let resource = url("https://mcp.example/mcp");
+        let config = OAuthClientConfiguration::from_trusted_endpoints(
+            "https://issuer.example", url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
+        ).unwrap();
+        let session = ManagedOAuthSession {
+            inner: Arc::new(SessionInner {
+                client: OAuthClient::new(config), resource,
+                policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
+                closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
+            }),
+        };
+        let prepared = prepare(
+            session.resource().as_str(), &meta(), &RequestId::Number(2),
+            ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: None },
+            ManagedTasksLimits::default(),
+        ).unwrap();
+        ManagedTaskCall {
+            body: None, decoder: prepared.decoder, session,
+            cancellation: McpRequestCancellation::new(), request_id: RequestId::Number(2),
+            progress: None, last_progress: None, deadline: Time::from_nanos(u64::MAX),
+            expires_at: Instant::now() + Duration::from_secs(60), generation: 1,
+            limits: ManagedTasksLimits::default(), records: 0, finished: false,
+        }
+    }
+
+    fn complete_task_event(call: &ManagedTaskCall) -> ManagedTaskEvent {
+        decode_result(&call.decoder, &envelope(r#"{"resultType":"complete","content":[]}"#), &call.request_id, 4096).unwrap()
+    }
+
+    #[test]
+    fn finite_task_terminal_withholds_every_result_family_until_eof() {
+        use std::future::{Future, poll_fn};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            for result in [
+                r#"{"resultType":"complete","content":[]}"#,
+                r#"{"resultType":"task","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#,
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#,
+            ] {
+                let mut call = finite_task_call();
+                let event = decode_result(&call.decoder, &envelope(result), &call.request_id, 4096).unwrap();
+                let eof = AtomicBool::new(false);
+                let mut finishing = Box::pin(call.finish_terminal(&cx, event, poll_fn(|_| {
+                    if eof.load(Ordering::Acquire) { Poll::Ready(Ok(None)) } else { Poll::Pending }
+                })));
+                poll_fn(|task| {
+                    assert!(finishing.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                }).await;
+                eof.store(true, Ordering::Release);
+                assert!(matches!(finishing.await, Ok(ManagedTaskEvent::ToolResult(_))));
+                assert!(!call.cancellation.is_cancel_requested());
+                assert!(!call.session.inner.closed.is_cancel_requested());
+            }
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn finite_task_terminal_rejects_trailing_records_and_preserves_read_errors() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut call = finite_task_call();
+            for trailing in [
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[]}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"secret-canary"}}"#,
+                "malformed-secret-canary",
+                "",
+            ] {
+                let error = call.finish_terminal(&cx, complete_task_event(&call), async {
+                    Ok(Some(trailing.to_owned()))
+                }).await.err().unwrap();
+                assert!(matches!(error, ManagedTasksError::InvalidResponse));
+                assert!(!format!("{error:?} {error}").contains("secret-canary"));
+            }
+            let failed = call.finish_terminal(&cx, complete_task_event(&call), async {
+                Err(OAuthSessionError::StateUnavailable)
+            }).await;
+            assert!(matches!(failed, Err(ManagedTasksError::Session(OAuthSessionError::StateUnavailable))));
+            assert!(call.finish_terminal(&cx, complete_task_event(&call), async { Ok(None) }).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn finite_task_terminal_keeps_expiry_deadline_and_owner_checks_live() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut expired = finite_task_call();
+            expired.expires_at = Instant::now();
+            assert!(matches!(expired.finish_terminal(&cx, complete_task_event(&expired), async { Ok(None) }).await,
+                Err(ManagedTasksError::Session(OAuthSessionError::LoginRequired))));
+
+            let mut timed = finite_task_call();
+            timed.deadline = deadline_after(&cx, Duration::from_millis(20)).unwrap();
+            assert!(matches!(timed.finish_terminal(&cx, complete_task_event(&timed), std::future::pending()).await,
+                Err(ManagedTasksError::Session(OAuthSessionError::TimedOut))));
+
+            let mut cancelled = finite_task_call();
+            let request_cancel = cancelled.cancellation.clone();
+            assert!(matches!(cancelled.finish_terminal(&cx, complete_task_event(&cancelled), async {
+                request_cancel.cancel();
+                Ok(None)
+            }).await, Err(ManagedTasksError::Session(OAuthSessionError::Cancelled))));
+            assert!(!cancelled.session.inner.closed.is_cancel_requested());
+
+            let mut closed = finite_task_call();
+            let session_close = closed.session.inner.closed.clone();
+            assert!(matches!(closed.finish_terminal(&cx, complete_task_event(&closed), async {
+                session_close.cancel();
+                Ok(None)
+            }).await, Err(ManagedTasksError::Session(OAuthSessionError::Closed))));
+            assert!(!closed.cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn dropping_finite_task_terminal_drops_the_owned_read_without_cancelling_siblings() {
+        use std::future::{Future, poll_fn};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::task::Poll;
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        struct OwnedRead(Arc<AtomicBool>);
+        impl Future for OwnedRead {
+            type Output = Result<Option<String>, OAuthSessionError>;
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> { Poll::Pending }
+        }
+        impl Drop for OwnedRead {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut call = finite_task_call();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut finishing = Box::pin(call.finish_terminal(
+                &cx, complete_task_event(&call), OwnedRead(Arc::clone(&dropped)),
+            ));
+            poll_fn(|task| { assert!(finishing.as_mut().poll(task).is_pending()); Poll::Ready(()) }).await;
+            drop(finishing);
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(!call.cancellation.is_cancel_requested());
+            assert!(!call.session.inner.closed.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
     }
 }
