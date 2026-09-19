@@ -36,6 +36,9 @@
 //! can discover the I/O driver via `Cx::current()` without us having to
 //! build a context out of band.
 
+/// Process-bound authenticated encryption for ephemeral protected state.
+pub mod envelope;
+
 use std::cell::OnceCell;
 use std::fmt;
 use std::future::Future;

@@ -467,6 +467,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -479,6 +480,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -1013,6 +1015,7 @@ name = "fastmcp-core"
 version = "0.10.0"
 dependencies = [
  "asupersync",
+ "chacha20poly1305",
  "getrandom 0.4.3",
  "hmac",
  "log",

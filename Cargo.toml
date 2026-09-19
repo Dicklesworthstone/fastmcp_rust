@@ -82,6 +82,9 @@ getrandom = { version = "=0.4.3", default-features = false }
 sha2 = { version = "=0.11.0", default-features = false }
 hmac = { version = "=0.13.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+# FND-08 ephemeral protection, using the frozen FND-01 envelope candidate.
+# Entropy stays in fastmcp-core; no cipher RNG or reduced-round features.
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 # FND-01 ROOT-RING-EVIDENCE / JOSE RS256 (alloc only on the direct edge)
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 # FND-01 ROOT-PROC-MACRO2-EVIDENCE (facade evidence harness)
