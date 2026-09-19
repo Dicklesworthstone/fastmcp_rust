@@ -51,9 +51,12 @@
 //!
 //! # Cancellation checks
 //!
-//! Readers and writers check `cx.is_cancel_requested()` around their I/O
-//! paths. The caller-provided synchronous `Read` and `Write` implementations
-//! are not made interruptible by those checks.
+//! Readers and writers checkpoint the caller's cancellation, deadline and
+//! execution budget before I/O and between partial operations. A budget refusal
+//! before progress is retryable; abandoning a partially consumed or written
+//! frame makes that stream terminal to prevent frame splicing. Caller-provided
+//! synchronous `Read`, `Write`, flush, iterator and POST implementations are
+//! not made interruptible once a call has entered them.
 //!
 //! # Integration Note
 //!
@@ -82,12 +85,9 @@ use crate::{CodecError, TransportError};
 /// deadline exhaustion, cancellation, and poll/cost quota exhaustion, and
 /// distinguishes `Timeout` from `Cancelled` for the caller.
 ///
-/// The ten remaining `is_cancel_requested` sites in this module still carry the
-/// weaker guard; converting them is separate work and is not done here.
-// Gated to match its only caller: `SseWriter` and its impl are behind
-// `legacy-2024-11-05`, and so is this file's `Cx` import. An ungated helper
-// naming `Cx` fails to resolve in the default feature set - that is exactly how
-// this broke the transport lib, and the lib break reached every downstream crate.
+/// All legacy SSE I/O entry points share this classification. It does not make
+/// a synchronous adapter interruptible while that adapter is executing.
+// Keep the helper and its Cx import behind the same legacy feature boundary.
 #[cfg(feature = "legacy-2024-11-05")]
 fn sse_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
@@ -961,25 +961,38 @@ impl<R: Read> SseReader<R> {
     ///
     /// # Note
     ///
-    /// On error, the reader state may be inconsistent (partial data consumed).
-    /// Callers should treat errors as terminal and not attempt further reads.
-    fn read_line_bounded(&mut self) -> Result<usize, std::io::Error> {
+    /// `consumed_input` belongs to the whole event, not just this line. It lets
+    /// the caller distinguish a retryable no-progress budget refusal from a
+    /// partially consumed event whose local parser state cannot be resumed.
+    fn read_line_bounded(
+        &mut self,
+        cx: &Cx,
+        consumed_input: &mut bool,
+    ) -> Result<usize, TransportError> {
         use std::io::BufRead;
-
-        if self.discard_lf_after_cr {
-            let has_lf = self.reader.fill_buf()?.first() == Some(&b'\n');
-            if has_lf {
-                self.reader.consume(1);
-            }
-            self.discard_lf_after_cr = false;
-        }
 
         let mut total_read = 0;
         loop {
-            let available = self.reader.fill_buf()?;
+            // A long line must not bypass the budget merely because no line
+            // delimiter has arrived yet. Interrupted reads also return here.
+            sse_checkpoint(cx)?;
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(TransportError::Io(error)),
+            };
             if available.is_empty() {
                 // EOF
                 return Ok(total_read);
+            }
+
+            if self.discard_lf_after_cr {
+                self.discard_lf_after_cr = false;
+                if available[0] == b'\n' {
+                    self.reader.consume(1);
+                    *consumed_input = true;
+                    continue;
+                }
             }
 
             // Event streams recognize CR, LF, and CRLF. A CR ends this line;
@@ -994,13 +1007,13 @@ impl<R: Read> SseReader<R> {
             // Check if this would exceed our limit
             if self.line_buffer.len().saturating_add(bytes_to_consume) > self.max_line_size {
                 self.line_buffer.clear();
-                return Err(std::io::Error::new(
+                return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "SSE line exceeds maximum size of {} bytes",
                         self.max_line_size
                     ),
-                ));
+                )));
             }
 
             // Preserve raw bytes until the complete line is available. A
@@ -1012,6 +1025,7 @@ impl<R: Read> SseReader<R> {
             let ended_with_cr = delimiter.is_some_and(|position| available[position] == b'\r');
 
             self.reader.consume(bytes_to_consume);
+            *consumed_input = true;
 
             if delimiter.is_some() {
                 self.discard_lf_after_cr = ended_with_cr;
@@ -1030,26 +1044,32 @@ impl<R: Read> SseReader<R> {
     ///
     /// # Cancel-Safety
     ///
-    /// Checks for cancellation between reads.
+    /// Checks the caller's full budget between reads, even within one line.
+    /// A no-progress budget refusal leaves the reader reusable. Refusal after
+    /// input is consumed makes the reader terminal rather than losing part of
+    /// an event and interpreting its suffix as a new event.
     pub fn read_event(&mut self, cx: &Cx) -> Result<Option<SseEvent>, TransportError> {
         if self.terminal {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         let mut event_type: Option<SseEventType> = None;
         let mut unknown_event = false;
         let mut data_lines: Vec<String> = Vec::new();
         let mut total_data_size: usize = 0;
+        let mut consumed_input = false;
         loop {
             self.line_buffer.clear();
-            let bytes_read = match self.read_line_bounded() {
+            let bytes_read = match self.read_line_bounded(cx, &mut consumed_input) {
                 Ok(bytes_read) => bytes_read,
                 Err(error) => {
-                    self.terminal = true;
-                    return Err(TransportError::Io(error));
+                    if consumed_input
+                        || !matches!(&error, TransportError::Cancelled | TransportError::Timeout)
+                    {
+                        self.terminal = true;
+                    }
+                    return Err(error);
                 }
             };
 
@@ -1059,13 +1079,13 @@ impl<R: Read> SseReader<R> {
                 return Ok(None);
             }
 
-            // Check cancellation between lines
-            if cx.is_cancel_requested() {
+            // Check the budget again before exposing or processing a line.
+            if let Err(error) = sse_checkpoint(cx) {
                 // At least one line of the current event was consumed. The
                 // parser state is local to this call, so resuming would splice
                 // the remainder into a different event.
                 self.terminal = true;
-                return Err(TransportError::Cancelled);
+                return Err(error);
             }
 
             let line = std::str::from_utf8(&self.line_buffer).map_err(|error| {
@@ -1328,6 +1348,10 @@ impl<R: Read, P: LegacySsePostSink> LegacySseClientTransport<R, P> {
                 self.closed = true;
                 return Err(TransportError::Closed);
             }
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
+                self.closed = self.reader.terminal;
+                return Err(error);
+            }
             Err(error) => {
                 self.closed = true;
                 return Err(error);
@@ -1407,7 +1431,7 @@ impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P>
                 Err(TransportError::Closed)
             }
             Err(error @ TransportError::Codec(_)) => Err(error),
-            Err(error @ TransportError::Cancelled) => {
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
                 if self.reader.terminal {
                     self.closed = true;
                 }
@@ -1593,9 +1617,7 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
             self.closed = true;
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         // Get next request from the request source (POST handler)
         match self.request_source.next() {
@@ -1613,10 +1635,11 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        self.closed = true;
         // SSE connections don't have a close frame; flush once and let the
         // connection drop. SseWriter makes this idempotent and terminal.
-        self.writer.close(cx)
+        let result = self.writer.close(cx);
+        self.closed |= self.writer.closed;
+        result
     }
 }
 
@@ -1634,9 +1657,7 @@ impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf
         if self.closed {
             return Err(TransportError::Closed);
         }
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
+        sse_checkpoint(cx)?;
 
         match self.request_source.next() {
             Some(request) => {
@@ -1688,8 +1709,9 @@ impl<W: Write + Send> TransportSendHalf for SseServerSendHalf<W> {
     }
 
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        self.closed = true;
-        self.writer.close(cx)
+        let result = self.writer.close(cx);
+        self.closed |= self.writer.closed;
+        result
     }
 }
 
@@ -1764,11 +1786,11 @@ impl<R: Read, W: Write> SseClientTransport<R, W> {
                 }
                 Ok(endpoint)
             }
-            Err(TransportError::Cancelled) => {
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
                 if self.reader.terminal {
                     self.closed = true;
                 }
-                Err(TransportError::Cancelled)
+                Err(error)
             }
             Err(error) => {
                 self.closed = true;
@@ -1808,7 +1830,7 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
             // A complete message event with invalid JSON-RPC has already
             // consumed a safe event boundary and does not corrupt the stream.
             Err(error @ TransportError::Codec(_)) => Err(error),
-            Err(error @ TransportError::Cancelled) => {
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
                 if self.reader.terminal {
                     self.closed = true;
                 }
