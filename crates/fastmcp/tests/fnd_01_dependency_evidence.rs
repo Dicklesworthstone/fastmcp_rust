@@ -39664,6 +39664,102 @@ activate = 1\n";
             .collect()
     }
 
+    /// One command identity expanded from the declared template authority.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ExpandedCommand {
+        ordinal: usize,
+        id: String,
+        template_id: String,
+        network_mode: String,
+    }
+
+    /// The ordered members of one coordinate axis, with the variable it binds.
+    ///
+    /// Three declared forms appear in the policy:
+    ///
+    /// * `singleton` — handled by the caller; no axis to resolve.
+    /// * `<var> in [a,b,c]` — an inline ordered list.
+    /// * `<var> in <table>.<field>` — a policy-declared ordered array, optionally
+    ///   followed by a space-separated `order` token.
+    ///
+    /// The trailing token is separated by a space, so stripping it cannot truncate a
+    /// field whose own name ends in `order`: `command_matrix_contract.target_order` is
+    /// a field name, while `…ring_free_projection_ids order` is a field plus the token.
+    fn coordinate_axis(policy: &Policy, axis: &str) -> VResult<(String, Vec<String>)> {
+        let axis = axis.trim();
+        let (variable, source) = axis.split_once(" in ").ok_or_else(|| Diagnostic::error("E_COMMAND_EXPANSION", "coordinate axis").at(axis.to_owned()))?;
+        let variable = variable.trim().to_owned();
+        let source = source.trim();
+        let source = source.strip_suffix(" order").unwrap_or(source).trim();
+        if let Some(inner) = source.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            let members = inner.split(',').map(|member| member.trim().to_owned()).collect::<Vec<_>>();
+            if members.is_empty() || members.iter().any(String::is_empty) {
+                return Err(Diagnostic::error("E_COMMAND_EXPANSION", "inline coordinate member").at(axis.to_owned()));
+            }
+            return Ok((variable, members));
+        }
+        let (table, field) = source.split_once('.').ok_or_else(|| Diagnostic::error("E_COMMAND_EXPANSION", "coordinate source").at(source.to_owned()))?;
+        // `output_namespace` is a modelled table, so its arrays are absent from the
+        // unmodelled map that `policy_string_array` reads.
+        let members = if table == "output_namespace" && field == "projections" {
+            policy.output_namespace.projections.clone()
+        } else {
+            policy_string_array(policy, table, field)?
+        };
+        if members.is_empty() {
+            return Err(Diagnostic::error("E_COMMAND_EXPANSION", "empty coordinate array").at(source.to_owned()));
+        }
+        Ok((variable, members))
+    }
+
+    /// Expand the declared command templates into the exact ordered command set.
+    ///
+    /// Step 1 requires the command population to come from the declared authority
+    /// rather than from a count, so every identity is built by substituting resolved
+    /// coordinates into that template's own `id_formula`. A template whose coordinate
+    /// product disagrees with its own declared `expansion_count` fails at that
+    /// template — a wrong axis is reported where it happened instead of being absorbed
+    /// into a correct-looking total.
+    fn expand_command_templates(policy: &Policy) -> VResult<Vec<ExpandedCommand>> {
+        let mut expanded: Vec<ExpandedCommand> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for template in &policy.command_template {
+            let mut rows: Vec<Vec<(String, String)>> = vec![Vec::new()];
+            if template.coordinate_domain.trim() != "singleton" {
+                for axis in template.coordinate_domain.split(" crossed with ") {
+                    let (variable, members) = coordinate_axis(policy, axis)?;
+                    let mut crossed = Vec::with_capacity(rows.len().saturating_mul(members.len()));
+                    for prefix in &rows {
+                        for member in &members {
+                            let mut next = prefix.clone();
+                            next.push((variable.clone(), member.clone()));
+                            crossed.push(next);
+                        }
+                    }
+                    rows = crossed;
+                }
+            }
+            if rows.len() != template.expansion_count {
+                return Err(Diagnostic::error("E_COMMAND_EXPANSION", &template.template_id)
+                    .at(format!("coordinate product {} does not equal declared expansion_count {}", rows.len(), template.expansion_count)));
+            }
+            for row in rows {
+                let mut id = template.id_formula.clone();
+                for (variable, member) in &row {
+                    id = id.replace(&format!("<{variable}>"), member);
+                }
+                if id.contains('<') || id.contains('>') {
+                    return Err(Diagnostic::error("E_COMMAND_EXPANSION", &template.template_id).at(format!("unsubstituted coordinate in {id}")));
+                }
+                if !seen.insert(id.clone()) {
+                    return Err(Diagnostic::error("E_COMMAND_EXPANSION", "duplicate command id").at(id));
+                }
+                expanded.push(ExpandedCommand { ordinal: expanded.len(), id, template_id: template.template_id.clone(), network_mode: template.network_mode.clone() });
+            }
+        }
+        Ok(expanded)
+    }
+
     fn policy_string_matrix(policy: &Policy, table_name: &str, field: &str) -> VResult<Vec<Vec<String>>> {
         record_array(policy_unmodeled_table(policy, table_name)?, field, table_name)?
             .iter()
@@ -59531,6 +59627,71 @@ fn fallible(value: Option<u8>) {
 
         let error = parse_symbol_stream_record(b"/tmp/libsynthetic.rlib[object.o]: symbol\tT 0a 10", 8, &artifacts, "synthetic-symbol").expect_err("tab is not an ASCII-space field separator");
         assert_eq!(error.code, "E_SYMBOL_STREAM_LINE");
+    }
+
+    /// The declared command population is reproducible from the template authority.
+    ///
+    /// The worthless version of this test is `assert_eq!(expanded.len(), 206)`. That is
+    /// precisely the "a set of 206 commands assembled to hit the number" that step 1's
+    /// gate names: it passes for any expansion whose errors cancel, and it keeps passing
+    /// if every identity is wrong. Nothing below asserts a bare total.
+    ///
+    /// What is asserted instead:
+    ///
+    /// * the ordered identity set of a crossed template equals an independently built
+    ///   cartesian product of the two policy arrays it names;
+    /// * the total agrees with a SECOND, differently shaped declaration — twelve
+    ///   `[[command_family]]` rows carrying their own `command_count`, against seventeen
+    ///   `[[command_template]]` rows carrying `expansion_count`;
+    /// * the commands that touch the network are exactly the ones the attester is
+    ///   excused from, by identity rather than by count.
+    #[test]
+    fn fnd_01_command_expansion_reproduces_the_declared_population() {
+        let root = repository_root();
+        let policy_bytes = fs::read(root.join("evidence/fnd-01/dependency-verification.toml")).expect("read dependency-verification policy");
+        let raw: toml::Value = parse_toml_strict(&policy_bytes, "command expansion policy").expect("strict raw policy");
+        let policy = raw.try_into::<Policy>().expect("typed policy");
+
+        let expanded = expand_command_templates(&policy).expect("command templates expand from the declared authority");
+
+        // Identity, not arity: rebuild one crossed template's ids from the two arrays
+        // its coordinate_domain names and require the exact ordered set.
+        let targets = policy_string_array(&policy, "command_matrix_contract", "target_order").expect("declared target order");
+        let mut expected_graph = Vec::new();
+        for projection in &policy.output_namespace.projections {
+            for target in &targets {
+                expected_graph.push(format!("projection.graph.r3.{projection}.{target}"));
+            }
+        }
+        let actual_graph = expanded.iter().filter(|command| command.template_id == "projection.graph.r3").map(|command| command.id.clone()).collect::<Vec<_>>();
+        assert_eq!(actual_graph, expected_graph, "projection.graph.r3 must be the ordered cross product of output_namespace.projections and command_matrix_contract.target_order");
+
+        // Cross-authority: the family decomposition is independent of the template one.
+        let families = policy_unmodeled_array(&policy, "command_family").expect("declared command families");
+        let family_total = families
+            .iter()
+            .map(|family| {
+                family
+                    .as_table()
+                    .and_then(|table| table.get("command_count"))
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .expect("typed family command_count")
+            })
+            .sum::<usize>();
+        assert_eq!(expanded.len(), family_total, "template expansion and command_family decomposition must describe the same population");
+
+        // Every identity is distinct, and no coordinate was left unsubstituted.
+        let distinct = expanded.iter().map(|command| command.id.as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(distinct.len(), expanded.len(), "command identities must be unique");
+        assert!(!expanded.iter().any(|command| command.id.contains('<')), "every coordinate placeholder must be substituted");
+
+        // The network boundary IS the producer/attester split. Asserted by identity so
+        // that adding a networked command fails here rather than silently enlarging the
+        // set the attester cannot reproduce offline.
+        let online = expanded.iter().filter(|command| command.network_mode == "online-acquisition").map(|command| command.id.clone()).collect::<Vec<_>>();
+        let excluded = policy_string_array(&policy, "command_matrix_contract", "attester_excluded_command_ids").expect("declared attester exclusions");
+        assert_eq!(online, excluded, "the online-acquisition commands must be exactly the attester's excluded set");
     }
 
     #[test]
