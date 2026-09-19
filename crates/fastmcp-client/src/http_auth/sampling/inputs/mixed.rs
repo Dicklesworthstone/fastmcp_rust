@@ -28,7 +28,7 @@ use super::super::{
 use crate::http_auth::rpc::ManagedCoreLimits;
 use crate::http_auth::rpc::interaction::{
     ManagedInputReply, ManagedInteractionError, ManagedInteractionLimits,
-    admit_challenge, validate_initial,
+    admit_challenge, validate_initial, validate_partial_responses,
 };
 
 /// No host error carries user input, model output, URLs or provider diagnostics.
@@ -52,7 +52,7 @@ impl CoreInputRequest {
 }
 
 /// The host supplies all disclosure, UI, model and tool authority. Approval is
-/// for the complete admitted batch and happens before its first input effect.
+/// for the complete selected batch and happens before its first input effect.
 /// Each effect must still recheck revocable host authority at its own boundary.
 ///
 /// Form decline/cancel and URL accept/decline/cancel are ordinary typed replies,
@@ -117,6 +117,8 @@ pub enum CoreInputError {
     InvalidLimits,
     InvalidRequest,
     InvalidInput,
+    InvalidSelection,
+    PartialStateRequired,
     CapabilityNotAdvertised,
     InputLimit,
     InputByteLimit,
@@ -162,9 +164,60 @@ pub async fn resolve_core_inputs<H: CoreInputHost + ?Sized>(
     limits: CoreInputLimits,
     host: &mut H,
 ) -> Result<ManagedInputReply, CoreInputError> {
+    resolve_selection(cx, cancellation, original, input, request_id, limits, None, host).await
+}
+
+/// Resolve only an explicitly selected nonempty set of input keys. Every
+/// descriptor is still admitted before approval, but approval and callbacks
+/// receive only the selection, in SERVER map order rather than caller order.
+/// Omitted inputs perform no host work and consume no model/tool budget.
+///
+/// A proper subset requires a nonempty server requestState. Resume the SAME
+/// interaction with `resume_partial`; do not assemble or alter continuation
+/// state yourself. An all-key selection is also accepted without requestState.
+/// Empty, duplicated, or unknown selections fail before host callbacks.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_selected_core_inputs<H: CoreInputHost + ?Sized>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    original: &CoreRequest,
+    input: InputRequiredResult,
+    request_id: RequestId,
+    limits: CoreInputLimits,
+    keys: &[&str],
+    host: &mut H,
+) -> Result<ManagedInputReply, CoreInputError> {
+    resolve_selection(cx, cancellation, original, input, request_id, limits, Some(keys), host).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_selection<H: CoreInputHost + ?Sized>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    original: &CoreRequest,
+    input: InputRequiredResult,
+    request_id: RequestId,
+    limits: CoreInputLimits,
+    keys: Option<&[&str]>,
+    host: &mut H,
+) -> Result<ManagedInputReply, CoreInputError> {
     request_id.validate().map_err(|_| CoreInputError::InvalidRequest)?;
     validate_initial(original).map_err(|_| CoreInputError::InvalidRequest)?;
     let end = deadline(cx, cancellation, limits.sampling.run.timeout)?;
+    if let Some(keys) = keys {
+        let map = input.input_requests().ok_or(CoreInputError::InvalidSelection)?;
+        if keys.is_empty() || keys.len() > limits.sampling.inputs || keys.len() > map.members().len() {
+            return Err(CoreInputError::InvalidSelection);
+        }
+        for (index, key) in keys.iter().enumerate() {
+            if keys[..index].contains(key) || map.get(key).is_none() {
+                return Err(CoreInputError::InvalidSelection);
+            }
+        }
+        if keys.len() < map.members().len() && input.request_state().is_none_or(str::is_empty) {
+            return Err(CoreInputError::PartialStateRequired);
+        }
+    }
     let admission = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, limits.sampling.inputs)
         .map_err(|_| CoreInputError::InvalidLimits)?;
     admit_challenge(original, &input, admission, 0, 0).map_err(|error| match error {
@@ -180,24 +233,27 @@ pub async fn resolve_core_inputs<H: CoreInputHost + ?Sized>(
     let mut input_bytes = 2;
     let mut minimum_reply_bytes = 2;
     let mut sampling_count = 0;
-    for member in map.members() {
+    for (index, member) in map.members().iter().enumerate() {
         check(cx, cancellation, end)?;
         let value = exact_json_to_serde(&member.value).map_err(|_| CoreInputError::InvalidInput)?;
         let key_bytes = encoded_size(&member.name, limits.sampling.input_bytes)
             .map_err(|_| CoreInputError::InputByteLimit)?;
         let value_bytes = encoded_size(&value, limits.sampling.input_bytes)
             .map_err(|_| CoreInputError::InputByteLimit)?;
-        input_bytes = member_bytes(input_bytes, key_bytes, value_bytes, !requests.is_empty(), limits.sampling.input_bytes)
+        input_bytes = member_bytes(input_bytes, key_bytes, value_bytes, index != 0, limits.sampling.input_bytes)
             .ok_or(CoreInputError::InputByteLimit)?;
+        let selected = keys.is_none_or(|keys| keys.contains(&member.name.as_str()));
         // Every response needs at least an object. Refuse an impossible map
         // before asking a host to perform effects whose answers cannot fit.
-        minimum_reply_bytes = member_bytes(minimum_reply_bytes, key_bytes, 2, !requests.is_empty(), limits.sampling.reply_bytes)
-            .ok_or(CoreInputError::ReplyByteLimit)?;
+        if selected {
+            minimum_reply_bytes = member_bytes(minimum_reply_bytes, key_bytes, 2, !requests.is_empty(), limits.sampling.reply_bytes)
+                .ok_or(CoreInputError::ReplyByteLimit)?;
+        }
         let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
             .map_err(|_| CoreInputError::InvalidInput)?;
         let form_schema = match &descriptor {
             FinalEmbeddedInputRequest::Sampling(request) => {
-                sampling_count += 1;
+                sampling_count += usize::from(selected);
                 SamplingToolLoop::new(request.clone(), limits.sampling.run.conversation)
                     .map_err(SamplingRunError::from)?;
                 None
@@ -208,7 +264,9 @@ pub async fn resolve_core_inputs<H: CoreInputHost + ?Sized>(
             }
             _ => None,
         };
-        requests.push(CoreInputRequest { key: member.name.clone(), descriptor, form_schema });
+        if selected {
+            requests.push(CoreInputRequest { key: member.name.clone(), descriptor, form_schema });
+        }
     }
     if sampling_count > limits.sampling.model_rounds {
         return Err(CoreInputError::Sampling(SamplingInputError::ModelRoundLimit));
@@ -277,7 +335,11 @@ pub async fn resolve_core_inputs<H: CoreInputHost + ?Sized>(
         }.await)
     }).await??;
     let responses = FinalInputResponses::try_from_entries(entries).map_err(|_| CoreInputError::InvalidResponse)?;
-    responses.validate_against_input_required(&input).map_err(|_| CoreInputError::InvalidResponse)?;
+    if keys.is_some() {
+        validate_partial_responses(&input, &responses).map_err(|_| CoreInputError::InvalidResponse)?;
+    } else {
+        responses.validate_against_input_required(&input).map_err(|_| CoreInputError::InvalidResponse)?;
+    }
     check(cx, cancellation, end)?;
     Ok(ManagedInputReply { request_id, input_responses: Some(responses) })
 }

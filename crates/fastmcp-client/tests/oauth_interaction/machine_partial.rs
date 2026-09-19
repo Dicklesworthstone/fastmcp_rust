@@ -8,6 +8,9 @@ use fastmcp_client::http_auth::discovery::client_credentials::rpc::interaction::
     ClientCredentialsInteraction, ClientCredentialsInteractionError, ClientCredentialsInputReply,
 };
 
+#[path = "mixed_inputs.rs"]
+mod mixed_inputs;
+
 const DISCOVERY: &str = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"prompts":{},"extensions":{"io.modelcontextprotocol/oauth-client-credentials":{}}},"ttlMs":0,"cacheScope":"private"}"#;
 const TWO: &str = r#"{"resultType":"input_required","inputRequests":{"one":{"method":"roots/list"},"two":{"method":"roots/list"}},"requestState":"machine-first"}"#;
 const REST: &str = r#"{"resultType":"input_required","inputRequests":{"two":{"method":"roots/list"}},"requestState":"machine-next"}"#;

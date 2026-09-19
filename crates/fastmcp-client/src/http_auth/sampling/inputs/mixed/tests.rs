@@ -327,3 +327,77 @@ fn model_budget_counts_sampling_siblings_before_approval() {
         assert!(host.calls.is_empty());
     });
 }
+
+#[test]
+fn selected_inputs_preserve_server_order_without_invoking_omitted_hosts() {
+    run(async |cx| {
+        let mut host = Host::default();
+        let reply = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&all(),input(MIXED),
+            RequestId::Number(42),CoreInputLimits::default(),&["q/url","z/root~\n"],&mut host).await.unwrap();
+        assert_eq!(host.calls,["approve","roots","url"]);
+        assert_eq!(host.approved,["z/root~\n","q/url"]);
+        let responses = reply.input_responses.unwrap();
+        assert_eq!(responses.entries().iter().map(|(key,_)|key.as_str()).collect::<Vec<_>>(),["z/root~\n","q/url"]);
+        validate_partial_responses(&input(MIXED),&responses).unwrap();
+        assert!(responses.validate_against_input_required(&input(MIXED)).is_err(),"full-map validation stays exhaustive");
+    });
+}
+
+#[test]
+fn selected_inputs_refuse_empty_unknown_and_duplicate_keys_before_approval() {
+    run(async |cx| {
+        for selection in [vec![],vec!["unknown"],vec!["a/form","a/form"],vec!["z/root~\n","unknown"]] {
+            let mut host = Host::default();
+            let result = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&all(),input(MIXED),
+                RequestId::Number(42),CoreInputLimits::default(),&selection,&mut host).await;
+            assert_eq!(result.err(),Some(CoreInputError::InvalidSelection));
+            assert!(host.calls.is_empty());
+        }
+    });
+}
+
+#[test]
+fn omitted_sampling_requires_no_model_budget_or_model_callback() {
+    run(async |cx| {
+        let sampling = SamplingInputLimits::new(SamplingRunLimits::default(),8,0,0,4096,4096).unwrap();
+        let limits = CoreInputLimits::new(sampling,256,256).unwrap();
+        let mut host = Host::default();
+        let reply = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&all(),input(MIXED),
+            RequestId::Number(42),limits,&["a/form"],&mut host).await.unwrap();
+        assert_eq!(reply.input_responses.unwrap().len(),1);
+        assert_eq!(host.calls,["approve","form"]);
+        let mut control = Host::default();
+        assert_eq!(resolve(&cx,&all(),MIXED,limits,&mut control).await.err(),
+            Some(CoreInputError::Sampling(SamplingInputError::ModelRoundLimit)));
+        assert!(control.calls.is_empty());
+    });
+}
+
+#[test]
+fn selected_subset_requires_state_but_full_selection_does_not() {
+    run(async |cx| {
+        for replacement in ["", "\"requestState\":\"\","] {
+            let source = MIXED.replace("\"requestState\":\"opaque+/%\",",replacement);
+            let mut host = Host::default();
+            let result = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&all(),input(&source),
+                RequestId::Number(42),CoreInputLimits::default(),&["a/form"],&mut host).await;
+            assert_eq!(result.err(),Some(CoreInputError::PartialStateRequired));
+            assert!(host.calls.is_empty());
+            let reply = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&all(),input(&source),
+                RequestId::Number(43),CoreInputLimits::default(),&["a/form","q/url","b/sample","z/root~\n"],&mut host).await.unwrap();
+            assert_eq!(reply.input_responses.unwrap().len(),4);
+        }
+    });
+}
+
+#[test]
+fn omitted_inputs_still_require_advertised_capabilities() {
+    run(async |cx| {
+        let mut host = Host::default();
+        let request = original(json!({"roots":{}}));
+        let result = resolve_selected_core_inputs(&cx,&McpRequestCancellation::new(),&request,input(MIXED),
+            RequestId::Number(42),CoreInputLimits::default(),&["z/root~\n"],&mut host).await;
+        assert_eq!(result.err(),Some(CoreInputError::CapabilityNotAdvertised));
+        assert!(host.calls.is_empty());
+    });
+}
