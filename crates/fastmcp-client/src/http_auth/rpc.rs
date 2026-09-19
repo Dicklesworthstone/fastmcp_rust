@@ -88,7 +88,7 @@ impl ManagedCoreLimits {
             || !(frame_bytes..=128 * 1024 * 1024).contains(&total_bytes)
             || notifications > 1024
             || timeout.is_zero()
-            || timeout > Duration::from_secs(900)
+            || timeout > Duration::from_mins(15)
         {
             return Err(ManagedCoreError::InvalidLimits);
         }

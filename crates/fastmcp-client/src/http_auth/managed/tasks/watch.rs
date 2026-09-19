@@ -44,7 +44,7 @@ pub struct ManagedTaskWatchPolicy {
 impl Default for ManagedTaskWatchPolicy {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_mins(15),
             maximum_snapshots: 1024,
             maximum_records: 2048,
         }

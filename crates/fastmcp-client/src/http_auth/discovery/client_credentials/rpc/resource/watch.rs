@@ -52,7 +52,7 @@ pub struct ClientCredentialsResourceWatchLimits {
 }
 impl Default for ClientCredentialsResourceWatchLimits {
     fn default() -> Self {
-        Self { timeout: Duration::from_secs(900), reads: 64, id_bytes: 1024 * 1024, subscription_records: 1024 }
+        Self { timeout: Duration::from_mins(15), reads: 64, id_bytes: 1024 * 1024, subscription_records: 1024 }
     }
 }
 impl ClientCredentialsResourceWatchLimits {

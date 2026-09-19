@@ -69,7 +69,7 @@ impl ClientCredentialsTasksLimits {
         if !(1..=1024 * 1024).contains(&request_bytes)
             || !(1..=1024 * 1024).contains(&frame_bytes)
             || !(1..=1024).contains(&records)
-            || timeout.is_zero() || timeout > Duration::from_secs(900)
+            || timeout.is_zero() || timeout > Duration::from_mins(15)
         { return Err(ManagedTasksError::InvalidLimits.into()); }
         Ok(Self { request_bytes, frame_bytes, records, timeout })
     }

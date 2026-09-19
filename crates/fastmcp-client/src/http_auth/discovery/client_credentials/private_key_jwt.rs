@@ -38,7 +38,7 @@ pub const JWT_BEARER_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const ASSERTION_LIFETIME: Duration = Duration::from_secs(60);
 const SIGNING_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_REGISTRATION_LIFETIME: Duration = Duration::from_secs(86_400);
+const MAX_REGISTRATION_LIFETIME: Duration = Duration::from_hours(24);
 
 /// Explicit audience policy, selected once when importing the registration.
 /// Both variants use the exact imported spelling, never URL normalization.

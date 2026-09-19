@@ -79,7 +79,7 @@ impl OAuthSessionPolicy {
             || acquisition_timeout.is_zero()
             || acquisition_timeout > Duration::from_secs(120)
             || response_head_timeout.is_zero()
-            || response_head_timeout > Duration::from_secs(900)
+            || response_head_timeout > Duration::from_mins(15)
             || !(1..=256).contains(&max_pending_acquisitions)
         {
             return Err(OAuthSessionError::InvalidPolicy);

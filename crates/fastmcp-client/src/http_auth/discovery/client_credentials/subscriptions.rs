@@ -88,7 +88,7 @@ impl Default for ClientCredentialsCoreSubscriptionLimits {
             request_bytes: 64 * 1024,
             frame_bytes: 64 * 1024,
             records: 1024,
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_mins(15),
         }
     }
 }
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(limits.request_bytes(), 64 * 1024);
         assert_eq!(limits.frame_bytes(), 64 * 1024);
         assert_eq!(limits.records(), 1024);
-        assert_eq!(limits.timeout(), Duration::from_secs(900));
+        assert_eq!(limits.timeout(), Duration::from_mins(15));
     }
 
     #[test]

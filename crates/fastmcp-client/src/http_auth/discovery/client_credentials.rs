@@ -295,7 +295,7 @@ impl ClientCredentialsPlan {
 
     /// Local reuse ceiling, also applied when expires_in is absent.
     pub fn with_maximum_token_lifetime(mut self, lifetime: Duration) -> Result<Self, ClientCredentialsError> {
-        if lifetime.is_zero() || lifetime > Duration::from_secs(86_400) {
+        if lifetime.is_zero() || lifetime > Duration::from_hours(24) {
             return Err(ClientCredentialsError::InvalidPolicy);
         }
         self.maximum_lifetime = lifetime;

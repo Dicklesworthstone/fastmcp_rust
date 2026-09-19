@@ -182,7 +182,7 @@ impl OAuthClientConfiguration {
     /// redemption. Callback traffic cannot reset it. The caller's budget may
     /// further shorten it.
     pub fn with_authorization_timeout(mut self, timeout: Duration) -> Result<Self, OAuthError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(900) {
+        if timeout.is_zero() || timeout > Duration::from_mins(15) {
             return Err(OAuthError::InvalidConfiguration);
         }
         self.authorization_timeout = timeout;
@@ -193,7 +193,7 @@ impl OAuthClientConfiguration {
     /// omitting `expires_in`. This is a client safety limit, not an assertion
     /// about the issuer's actual expiration policy.
     pub fn with_max_access_token_lifetime(mut self, lifetime: Duration) -> Result<Self, OAuthError> {
-        if lifetime.is_zero() || lifetime > Duration::from_secs(86_400) {
+        if lifetime.is_zero() || lifetime > Duration::from_hours(24) {
             return Err(OAuthError::InvalidConfiguration);
         }
         self.max_access_token_lifetime = lifetime;
