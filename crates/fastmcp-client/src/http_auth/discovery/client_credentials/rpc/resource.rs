@@ -9,6 +9,9 @@
 //! notifications to `invalidate_notification`, and clear after a subscription
 //! gap or local policy change. Public cache hints never broaden authorization.
 
+/// Subscription-driven reconciliation with explicit input-required handoff.
+pub mod watch;
+
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;

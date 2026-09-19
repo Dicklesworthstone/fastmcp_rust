@@ -17,14 +17,14 @@ fn request(mut params: Value) -> CoreRequest {
     params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
     CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap()
 }
-fn ordinary() -> CoreRequest { request(json!({"uri":"file:///one"})) }
-fn complete(request: &CoreRequest, ttl: u64, scope: &str) -> CoreResult {
+pub(super) fn ordinary() -> CoreRequest { request(json!({"uri":"file:///one"})) }
+pub(super) fn complete(request: &CoreRequest, ttl: u64, scope: &str) -> CoreResult {
     request.decode_result(&format!(r#"{{"resultType":"complete","contents":[{{"uri":"file:///one","text":"first"}},{{"uri":"file:///two","blob":"AAEC"}}],"ttlMs":{ttl},"cacheScope":"{scope}","x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#)).unwrap()
 }
 fn notification(method: &str, params: Option<Value>) -> ServerNotification {
     ServerNotification::decode(&JsonRpcRequest::notification(method, params)).unwrap()
 }
-fn runtime() -> asupersync::runtime::Runtime {
+pub(super) fn runtime() -> asupersync::runtime::Runtime {
     asupersync::runtime::RuntimeBuilder::current_thread()
         .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
         .blocking_threads(0, 2).build().unwrap()
@@ -33,7 +33,7 @@ fn runtime() -> asupersync::runtime::Runtime {
 // A pre-acquired, owner-bound credential isolates the public cache-consumer
 // path. These tests do not claim issuer discovery or authenticated HTTPS proof.
 // Cache misses deliberately stop in next_ids before any network dispatch.
-fn consumer(limits: ClientCredentialsResourceLimits) -> ClientCredentialsResourceClient {
+pub(super) fn consumer(limits: ClientCredentialsResourceLimits) -> ClientCredentialsResourceClient {
     let resource = CanonicalHttpUrl::parse("https://machine.example/mcp").unwrap();
     let closed = McpRequestCancellation::new();
     let expires_at = Instant::now() + Duration::from_secs(600);
@@ -52,7 +52,7 @@ fn consumer(limits: ClientCredentialsResourceLimits) -> ClientCredentialsResourc
     }) };
     ClientCredentialsResourceClient::new(client, limits).with_cache_limits(8, 64 * 1024).unwrap()
 }
-fn prime(client: &ClientCredentialsResourceClient, request: &CoreRequest, result: CoreResult) {
+pub(super) fn prime(client: &ClientCredentialsResourceClient, request: &CoreRequest, result: CoreResult) {
     let (_, stamped) = prepare(client.client.resource(), request, &RequestId::Number(1)).unwrap();
     let key = cache_key(client.client.resource().as_str(), &stamped, 1).unwrap();
     let mut cache = client.cache().unwrap();
