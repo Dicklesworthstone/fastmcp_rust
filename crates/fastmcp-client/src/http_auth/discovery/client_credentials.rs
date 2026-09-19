@@ -964,7 +964,7 @@ mod tests {
         assert_eq!(post.deadline, deadline);
         assert_eq!(std::str::from_utf8(&post.body).unwrap(),
             "grant_type=client_credentials&resource=https%3A%2F%2Fresource.example%2Fmcp&scope=read+write&client_id=a%3Ab+%2B&client_secret=c%2Fd%3D%25%C3%A9%26scope%3Dadmin");
-        assert_eq!(post.body.iter().filter(|byte| **byte == b'&').count(), 4);
+        assert_eq!(post.body.iter().fold(0, |n, &byte| n + usize::from(byte == b'&')), 4);
         let basic = prepare_secret_grant(ClientSecretAuthenticationMethod::Basic,
             "a:b +", "c/d=%é&scope=admin", &resource, &scopes, deadline).unwrap();
         assert_eq!(basic.authorization, Some(super::basic("a:b +", "c/d=%é&scope=admin").unwrap()));
