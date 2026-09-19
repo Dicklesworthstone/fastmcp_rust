@@ -34,6 +34,8 @@ pub mod managed;
 pub mod oauth;
 /// Typed core MCP calls over managed OAuth, with incremental notifications.
 pub mod rpc;
+/// Caller-owned model and tool execution for embedded sampling conversations.
+pub mod sampling;
 /// Descriptor-relative atomic storage for caller-protected credential blobs.
 #[cfg(target_os = "linux")]
 pub mod secure_file;

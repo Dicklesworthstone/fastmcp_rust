@@ -1,0 +1,450 @@
+//! Public execution tests. The model/tool host is deterministic test code, not
+//! a claim about a third-party provider or live MCP interoperability.
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
+
+use asupersync::{Budget, Cx, Time};
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::time::{TimerDriverHandle, VirtualClock};
+use fastmcp_client::http_auth::sampling::{
+    SamplingHost, SamplingHostError, SamplingHostFuture, SamplingRunError,
+    SamplingRunLimits, SamplingStage, run_sampling_tool_loop,
+};
+use fastmcp_core::McpRequestCancellation;
+use fastmcp_protocol::common_types::SamplingContentBlock;
+use fastmcp_protocol::sampling::{SamplingToolLoopError, SamplingToolLoopLimits};
+use fastmcp_protocol::{FinalCreateMessageResult, FinalEmbeddedCreateMessageParams};
+use serde_json::{Value, json};
+
+fn request() -> FinalEmbeddedCreateMessageParams {
+    serde_json::from_value(json!({
+        "messages":[{"role":"user","content":{"type":"text","text":"weather"}}],
+        "maxTokens":100,"metadata":{"private":"retained"},
+        "tools":[{"name":"weather","inputSchema":{"type":"object",
+            "properties":{"city":{"type":"string"}},"required":["city"]}}]
+    })).unwrap()
+}
+fn call(id: &str) -> Value {
+    json!({"type":"tool_use","id":id,"name":"weather","input":{"city":"Paris"}})
+}
+fn response(content: Value) -> FinalCreateMessageResult {
+    serde_json::from_value(json!({"role":"assistant","model":"test-model","content":content})).unwrap()
+}
+fn final_response() -> FinalCreateMessageResult {
+    serde_json::from_value(json!({"role":"assistant","model":"final-model",
+        "content":[{"type":"text","text":"done","_meta":{"marker":"untouched"}}],
+        "stopReason":"future-provider-reason","_meta":{"trace":"retained"}})).unwrap()
+}
+fn answer(id: &str) -> SamplingContentBlock {
+    serde_json::from_value(json!({"type":"tool_result","toolUseId":id,
+        "content":[{"type":"text","text":"sunny"}],"structuredContent":null})).unwrap()
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+}
+struct Pending<T> {
+    polls: Arc<AtomicUsize>, drops: Arc<AtomicUsize>, output: PhantomData<fn() -> T>,
+}
+impl<T> Future for Pending<T> {
+    type Output = Result<T, SamplingHostError>;
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) { self.drops.fetch_add(1, Ordering::SeqCst); }
+}
+
+struct Host {
+    models: VecDeque<FinalCreateMessageResult>,
+    answers: VecDeque<SamplingContentBlock>,
+    requests: Vec<Value>,
+    approvals: usize,
+    calls: Vec<String>,
+    fail: Option<(SamplingStage, SamplingHostError)>,
+    pending: Option<SamplingStage>,
+    cancel_after: Option<SamplingStage>,
+    cancel_current: bool,
+    polls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+impl Host {
+    fn new(models: Vec<FinalCreateMessageResult>, answers: Vec<SamplingContentBlock>) -> Self {
+        Self {
+            models: models.into(), answers: answers.into(), requests: Vec::new(),
+            approvals: 0, calls: Vec::new(), fail: None, pending: None,
+            cancel_after: None, cancel_current: false,
+            polls: Arc::new(AtomicUsize::new(0)), drops: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    fn operation<T: Send + 'static>(
+        &self, stage: SamplingStage, cancellation: &McpRequestCancellation,
+        value: T,
+    ) -> SamplingHostFuture<'static, T> {
+        assert!(Cx::current().unwrap().timer_driver().is_some(), "caller driver must be installed");
+        if self.pending == Some(stage) {
+            return Box::pin(Pending {
+                polls: self.polls.clone(), drops: self.drops.clone(), output: PhantomData,
+            });
+        }
+        if self.cancel_after == Some(stage) { cancellation.cancel(); }
+        if self.cancel_current { Cx::current().unwrap().set_cancel_requested(true); }
+        let result = match self.fail {
+            Some((failed_stage, reason)) if failed_stage == stage => Err(reason),
+            _ => Ok(value),
+        };
+        Box::pin(std::future::ready(result))
+    }
+}
+impl SamplingHost for Host {
+    fn sample<'a>(
+        &'a mut self, _: &'a Cx, cancellation: &'a McpRequestCancellation,
+        request: &'a FinalEmbeddedCreateMessageParams,
+    ) -> SamplingHostFuture<'a, FinalCreateMessageResult> {
+        self.requests.push(serde_json::to_value(request).unwrap());
+        let value = self.models.pop_front().expect("unexpected extra model invocation");
+        self.operation(SamplingStage::Model, cancellation, value)
+    }
+    fn approve_tools<'a>(
+        &'a mut self, _: &'a Cx, cancellation: &'a McpRequestCancellation,
+        calls: &'a [SamplingContentBlock],
+    ) -> SamplingHostFuture<'a, ()> {
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|call| matches!(call, SamplingContentBlock::ToolUse { .. })));
+        self.approvals += 1;
+        self.operation(SamplingStage::Approval, cancellation, ())
+    }
+    fn execute_tool<'a>(
+        &'a mut self, _: &'a Cx, cancellation: &'a McpRequestCancellation,
+        call: &'a SamplingContentBlock,
+    ) -> SamplingHostFuture<'a, SamplingContentBlock> {
+        let SamplingContentBlock::ToolUse { id, .. } = call else { panic!("not an admitted call") };
+        self.calls.push(id.clone());
+        let value = self.answers.pop_front().expect("unexpected extra tool invocation");
+        self.operation(SamplingStage::Tool, cancellation, value)
+    }
+}
+
+fn with_cx(test: impl FnOnce(Cx, Arc<VirtualClock>, TimerDriverHandle)) {
+    with_budget(Budget::INFINITE, test);
+}
+fn with_budget(budget: Budget, test: impl FnOnce(Cx, Arc<VirtualClock>, TimerDriverHandle)) {
+    let clock = Arc::new(VirtualClock::new());
+    let timer = TimerDriverHandle::with_virtual_clock(clock.clone());
+    let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
+        .with_timer_driver(timer.clone()).build().unwrap();
+    test(runtime.request_cx_with_budget(budget), clock, timer);
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+}
+fn complete<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut task = Context::from_waker(Waker::noop());
+    for _ in 0..64 {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut task) { return value; }
+    }
+    panic!("deterministic ready host did not finish within its poll bound");
+}
+fn two_calls() -> Host {
+    Host::new(vec![response(json!([call("a"), call("b")])), final_response()],
+        vec![answer("a"), answer("b")])
+}
+
+#[test]
+fn complete_conversation_preserves_exact_transcript_and_runs_tools_in_model_order() {
+    with_cx(|cx, _, timer| {
+        let mut host = two_calls();
+        let result = complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), SamplingRunLimits::default(), &mut host)).unwrap();
+        assert_eq!(result.response, final_response());
+        assert_eq!(result.model_rounds, 2);
+        assert_eq!(result.executed_tools, 2);
+        assert_eq!(host.calls, ["a", "b"]);
+        assert_eq!(host.approvals, 1);
+        assert_eq!(host.requests.len(), 2);
+        let next = &host.requests[1];
+        assert_eq!(next["metadata"], json!({"private":"retained"}));
+        assert_eq!(next["messages"][1]["content"], json!([call("a"),call("b")]));
+        assert_eq!(next["messages"][2]["role"], "user");
+        for (index, id) in ["a", "b"].iter().enumerate() {
+            assert_eq!(next["messages"][2]["content"][index]["toolUseId"], *id);
+            assert_eq!(next["messages"][2]["content"][index].get("structuredContent"), Some(&Value::Null));
+        }
+        assert_eq!(timer.pending_count(), 0);
+    });
+}
+
+#[test]
+fn whole_batch_denial_runs_no_tool_and_does_not_retry_the_model() {
+    with_cx(|cx, _, _| {
+        let mut host = two_calls();
+        host.fail = Some((SamplingStage::Approval, SamplingHostError::Denied));
+        let error = complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), SamplingRunLimits::default(), &mut host)).err().unwrap();
+        assert_eq!(error, SamplingRunError::Host { stage: SamplingStage::Approval, reason: SamplingHostError::Denied });
+        assert_eq!(host.approvals, 1);
+        assert!(host.calls.is_empty());
+        assert_eq!(host.requests.len(), 1);
+    });
+}
+
+#[test]
+fn malformed_later_call_prevents_even_the_valid_first_tool_from_being_approved() {
+    with_cx(|cx, _, _| {
+        let mut bad = call("b");
+        bad["input"]["city"] = json!(7);
+        let mut host = Host::new(vec![response(json!([call("a"), bad]))], vec![]);
+        let error = complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), SamplingRunLimits::default(), &mut host)).err().unwrap();
+        assert_eq!(error, SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolInput));
+        assert_eq!(host.approvals, 0);
+        assert!(host.calls.is_empty());
+    });
+}
+
+#[test]
+fn invalid_history_and_missing_timer_never_invoke_the_host() {
+    with_cx(|cx, _, _| {
+        let mut input = request();
+        input.messages.clear();
+        let mut host = Host::new(vec![], vec![]);
+        assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            input, SamplingRunLimits::default(), &mut host)).err(),
+            Some(SamplingRunError::Protocol(SamplingToolLoopError::InvalidRequest)));
+        assert!(host.requests.is_empty());
+    });
+    let mut host = Host::new(vec![], vec![]);
+    assert_eq!(complete(run_sampling_tool_loop(&Cx::for_testing(), &McpRequestCancellation::new(),
+        request(), SamplingRunLimits::default(), &mut host)).err(), Some(SamplingRunError::RuntimeUnavailable));
+    assert!(host.requests.is_empty());
+}
+
+#[test]
+fn foreign_result_id_stops_before_the_next_tool_and_cannot_be_used_for_its_sibling() {
+    with_cx(|cx, _, _| {
+        let mut host = two_calls();
+        host.answers[0] = answer("b");
+        assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), SamplingRunLimits::default(), &mut host)).err(),
+            Some(SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolResults)));
+        assert_eq!(host.calls, ["a"]);
+        assert_eq!(host.requests.len(), 1);
+    });
+}
+
+#[test]
+fn invalid_structured_output_stops_before_a_second_tool_side_effect() {
+    with_cx(|cx, _, _| {
+        let mut input = request();
+        input.tools.as_mut().unwrap()[0].output_schema = Some(json!({"type":"integer"}));
+        let mut host = two_calls();
+        assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            input, SamplingRunLimits::default(), &mut host)).err(),
+            Some(SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolOutput)));
+        assert_eq!(host.calls, ["a"]);
+        assert_eq!(host.requests.len(), 1);
+    });
+}
+
+#[test]
+fn explicit_application_error_is_a_correlated_result_not_a_host_transport_retry() {
+    with_cx(|cx, _, _| {
+        let mut input = request();
+        input.tools.as_mut().unwrap()[0].output_schema = Some(json!({"type":"integer"}));
+        let error: SamplingContentBlock = serde_json::from_value(json!({
+            "type":"tool_result","toolUseId":"a","content":[],"isError":true
+        })).unwrap();
+        let mut host = Host::new(vec![response(call("a")), final_response()], vec![error]);
+        assert!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            input, SamplingRunLimits::default(), &mut host)).is_ok());
+        assert_eq!(host.requests[1]["messages"][2]["content"][0]["isError"], true);
+        assert_eq!(host.calls, ["a"]);
+    });
+}
+
+#[test]
+fn round_limit_refuses_before_tool_approval_and_execution() {
+    with_cx(|cx, _, _| {
+        let mut host = two_calls();
+        let limits = SamplingRunLimits::new(SamplingToolLoopLimits::new(1, 8, 4096).unwrap(),
+            Duration::from_secs(1), 4096).unwrap();
+        assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), limits, &mut host)).err(), Some(SamplingRunError::Protocol(SamplingToolLoopError::RoundLimit)));
+        assert_eq!(host.approvals, 0);
+        assert!(host.calls.is_empty());
+    });
+}
+
+#[test]
+fn tool_result_bytes_are_shared_across_model_rounds() {
+    with_cx(|cx, _, _| {
+        let size = serde_json::to_vec(&answer("a")).unwrap().len();
+        for (maximum, succeeds) in [(size * 2, true), (size * 2 - 1, false)] {
+            let mut host = Host::new(vec![response(call("a")), response(call("b")), final_response()],
+                vec![answer("a"), answer("b")]);
+            let limits = SamplingRunLimits::new(SamplingToolLoopLimits::default(), Duration::from_secs(1), maximum).unwrap();
+            let result = complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(), request(), limits, &mut host));
+            if succeeds { assert_eq!(result.unwrap().executed_tools, 2); }
+            else { assert_eq!(result.err(), Some(SamplingRunError::ToolResultByteLimit)); }
+            assert_eq!(host.requests.len(), if succeeds { 3 } else { 2 });
+        }
+    });
+}
+
+#[test]
+fn host_failures_never_retry_any_model_or_tool_invocation() {
+    with_cx(|cx, _, _| {
+        for stage in [SamplingStage::Model, SamplingStage::Approval, SamplingStage::Tool] {
+            let mut host = two_calls();
+            host.fail = Some((stage, SamplingHostError::Failed));
+            assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+                request(), SamplingRunLimits::default(), &mut host)).err(),
+                Some(SamplingRunError::Host { stage, reason: SamplingHostError::Failed }));
+            assert_eq!(host.requests.len(), 1);
+            assert_eq!(host.calls.len(), usize::from(stage == SamplingStage::Tool));
+        }
+    });
+}
+
+#[test]
+fn cancellation_wakes_each_pending_host_stage_and_drops_the_owned_future() {
+    with_cx(|cx, _, timer| {
+        for stage in [SamplingStage::Model, SamplingStage::Approval, SamplingStage::Tool] {
+            let cancellation = McpRequestCancellation::new();
+            let mut host = two_calls();
+            host.pending = Some(stage);
+            let polls = host.polls.clone();
+            let drops = host.drops.clone();
+            let counter = Arc::new(WakeCount::default());
+            let waker = Waker::from(counter.clone());
+            let mut task = Context::from_waker(&waker);
+            let mut future = Box::pin(run_sampling_tool_loop(&cx, &cancellation, request(), SamplingRunLimits::default(), &mut host));
+            for _ in 0..4 {
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                if polls.load(Ordering::SeqCst) > 0 { break; }
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            let before = counter.0.load(Ordering::SeqCst);
+            cancellation.cancel();
+            assert!(counter.0.load(Ordering::SeqCst) > before, "cancellation needs a real wakeup");
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("cancel did not settle") };
+            assert_eq!(result.err(), Some(SamplingRunError::Cancelled));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(future);
+            assert_eq!(host.requests.len(), 1);
+            assert_eq!(timer.pending_count(), 0);
+        }
+    });
+}
+
+#[test]
+fn parent_cancellation_wakes_without_a_host_wakeup() {
+    with_cx(|cx, _, timer| {
+        let mut host = two_calls();
+        host.pending = Some(SamplingStage::Model);
+        let cancellation = McpRequestCancellation::new();
+        let counter = Arc::new(WakeCount::default());
+        let waker = Waker::from(counter.clone());
+        let mut task = Context::from_waker(&waker);
+        let mut future = Box::pin(run_sampling_tool_loop(&cx, &cancellation, request(), SamplingRunLimits::default(), &mut host));
+        assert!(future.as_mut().poll(&mut task).is_pending());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        cx.set_cancel_requested(true);
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("parent cancellation stuck") };
+        assert_eq!(result.err(), Some(SamplingRunError::Cancelled));
+        drop(future);
+        assert_eq!(timer.pending_count(), 0);
+    });
+}
+
+#[test]
+fn absolute_and_shorter_parent_deadlines_wake_pending_model_without_repolling_it() {
+    for parent in [None, Some(Time::from_nanos(3_000_000))] {
+        let budget = parent.map_or(Budget::INFINITE, |end| Budget::INFINITE.with_deadline(end));
+        with_budget(budget, |cx, clock, timer| {
+            let mut host = two_calls();
+            host.pending = Some(SamplingStage::Model);
+            let cancellation = McpRequestCancellation::new();
+            let counter = Arc::new(WakeCount::default());
+            let waker = Waker::from(counter.clone());
+            let mut task = Context::from_waker(&waker);
+            let limits = SamplingRunLimits::new(SamplingToolLoopLimits::default(), Duration::from_millis(5), 4096).unwrap();
+            let mut future = Box::pin(run_sampling_tool_loop(&cx, &cancellation, request(), limits, &mut host));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert!(timer.pending_count() > 0);
+            clock.advance(parent.map_or(5_000_000, |end| end.as_nanos()));
+            assert!(timer.process_timers() > 0);
+            assert!(counter.0.load(Ordering::SeqCst) > 0);
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else { panic!("deadline stuck") };
+            assert_eq!(result.err(), Some(SamplingRunError::TimedOut));
+            drop(future);
+            assert_eq!(host.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+        });
+    }
+}
+
+#[test]
+fn a_host_cancelling_during_ready_completion_cannot_publish_or_start_a_sibling() {
+    with_cx(|cx, _, _| {
+        for stage in [SamplingStage::Model, SamplingStage::Approval, SamplingStage::Tool] {
+            let cancellation = McpRequestCancellation::new();
+            let mut host = two_calls();
+            host.cancel_after = Some(stage);
+            assert_eq!(complete(run_sampling_tool_loop(&cx, &cancellation, request(), SamplingRunLimits::default(), &mut host)).err(),
+                Some(SamplingRunError::Cancelled));
+            assert_eq!(host.requests.len(), 1);
+            assert_eq!(host.calls.len(), usize::from(stage == SamplingStage::Tool));
+        }
+    });
+}
+
+#[test]
+fn dropping_the_run_releases_host_timer_and_cancel_registrations() {
+    with_cx(|cx, _, timer| {
+        let cancellation = McpRequestCancellation::new();
+        let mut host = two_calls();
+        host.pending = Some(SamplingStage::Model);
+        let counter = Arc::new(WakeCount::default());
+        let waker = Waker::from(counter.clone());
+        let mut future = Box::pin(run_sampling_tool_loop(&cx, &cancellation, request(), SamplingRunLimits::default(), &mut host));
+        assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        drop(future);
+        assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(timer.pending_count(), 0);
+        let before = counter.0.load(Ordering::SeqCst);
+        cancellation.cancel();
+        cx.set_cancel_requested(true);
+        assert_eq!(counter.0.load(Ordering::SeqCst), before);
+    });
+}
+
+#[test]
+fn host_polling_uses_the_caller_and_restores_an_unrelated_ambient_context() {
+    with_cx(|cx, _, _| {
+        let ambient = Cx::for_testing();
+        let _guard = Cx::set_current(Some(ambient.clone()));
+        let mut host = Host::new(vec![final_response()], vec![]);
+        host.cancel_current = true;
+        assert_eq!(complete(run_sampling_tool_loop(&cx, &McpRequestCancellation::new(),
+            request(), SamplingRunLimits::default(), &mut host)).err(), Some(SamplingRunError::Cancelled));
+        assert!(cx.is_cancel_requested());
+        assert!(!ambient.is_cancel_requested());
+        Cx::current().unwrap().set_cancel_requested(true);
+        assert!(ambient.is_cancel_requested());
+    });
+}
