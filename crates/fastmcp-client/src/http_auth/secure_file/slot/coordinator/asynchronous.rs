@@ -32,7 +32,7 @@ use super::super::{CredentialSlotError, SlotCommit, SlotRecoveryOutcome, SlotRev
 use super::super::super::{AtomicFileError, SecureAtomicFile, MAX_ATOMIC_FILE_BYTES};
 
 mod admission;
-pub use admission::{CredentialIoLane, CredentialIoLimits, CredentialIoSnapshot};
+pub use admission::{CredentialDrainError, CredentialIoLane, CredentialIoLimits, CredentialIoSnapshot};
 use admission::{CONTROL_BYTES, JobLease, SlotLease, operation_bytes};
 
 /// Scheduling/wait failures, distinct from the transaction's own disposition.
@@ -44,6 +44,7 @@ pub enum CredentialIoError {
     InvalidLimits,
     InvalidSlotConfiguration,
     CapacityExceeded,
+    LaneClosed,
     AdmissionUnavailable,
     CapabilityUnavailable,
     BlockingPoolUnavailable,
@@ -64,6 +65,7 @@ impl fmt::Display for CredentialIoError {
             Self::InvalidLimits => "credential I/O limits are invalid",
             Self::InvalidSlotConfiguration => "credential I/O slot configuration exceeds its bounds",
             Self::CapacityExceeded => "credential I/O admission capacity exhausted",
+            Self::LaneClosed => "credential I/O lane is shutting down",
             Self::AdmissionUnavailable => "credential I/O admission state unavailable",
             Self::CapabilityUnavailable => "credential I/O requires caller-owned spawn, I/O and time capabilities",
             Self::BlockingPoolUnavailable => "credential I/O requires an installed caller-owned blocking pool",

@@ -25,7 +25,7 @@ use fastmcp_client::http_auth::secure_file::slot::coordinator::{
     CredentialAnchorSnapshot, CredentialAnchorState, CredentialCommitAnchor,
 };
 use fastmcp_client::http_auth::secure_file::slot::coordinator::asynchronous::{
-    AsyncCoordinatedCredentialSlot, CredentialIoError, CredentialIoLane, CredentialIoLimits,
+    AsyncCoordinatedCredentialSlot, CredentialDrainError, CredentialIoError, CredentialIoLane, CredentialIoLimits,
     CredentialIoSnapshot, CredentialSlotOpen, CredentialSlotTask,
 };
 
@@ -520,5 +520,86 @@ fn async_slot_close_remains_available_during_data_saturation() {
         done(&cx, owner.close(&cx)).await;
         wait_jobs(&cx, &lane).await;
         assert_eq!(lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+    });
+}
+
+#[test]
+fn async_slot_shutdown_preserves_storage_and_drains_only_after_owner_close() {
+    run(true, |cx| async move {
+        let f = Fixture::new();
+        let owner = f.open(&cx).await;
+        let (owner, outcome) = done(&cx, owner.replace(&cx, f.auth, None, PAYLOAD.to_vec())).await.into_parts();
+        outcome.unwrap();
+        wait_jobs(&cx, &f.lane).await;
+        let bytes = f.directory.contents();
+        let snapshot = f.anchor.snapshot();
+        let counts = f.anchor.counts();
+        let clone = f.lane.clone();
+        assert_eq!(clone.begin_shutdown().unwrap().slots, 1);
+        assert!(f.lane.is_shutting_down().unwrap());
+        assert!(matches!(f.start_open(&cx), Err(CredentialIoError::LaneClosed)));
+        assert_eq!(f.anchor.counts(), counts);
+        assert_eq!(f.lane.wait_drained(&cx, Duration::from_millis(5)).await, Err(CredentialDrainError::TimedOut));
+        assert_eq!(f.lane.snapshot().unwrap().slots, 1, "timeout cannot release application ownership");
+        done(&cx, owner.close(&cx)).await;
+        clone.wait_drained(&cx, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(f.lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        assert_eq!(f.directory.contents(), bytes, "shutdown is not credential invalidation");
+        assert_eq!(f.anchor.snapshot(), snapshot);
+        assert_eq!(f.anchor.counts(), counts);
+        assert!(matches!(f.start_open(&cx), Err(CredentialIoError::LaneClosed)));
+    });
+}
+
+#[test]
+fn async_slot_shutdown_keeps_previously_admitted_result_and_owner_accounted() {
+    run(true, |cx| async move {
+        let f = Fixture::new();
+        let owner = f.open(&cx).await;
+        let release = f.anchor.arm(Pause::Read);
+        let mut pending = owner.load(&cx, f.auth).unwrap();
+        release.0.wait_entered(&cx).await;
+        let before = f.lane.begin_shutdown().unwrap();
+        assert_eq!(before.operations, 1);
+        assert_eq!(before.slots, 1);
+        let mut drain = Box::pin(f.lane.wait_drained(&cx, Duration::from_secs(2)));
+        poll_fn(|context| { assert!(drain.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        release.0.release();
+        // Shutdown does not cancel the already-admitted operation or discard
+        // its completion; the application still owns the handoff decision.
+        let (owner, result) = pending.wait(&cx).await.unwrap().into_parts();
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(f.lane.snapshot().unwrap().slots, 1);
+        poll_fn(|context| { assert!(drain.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        done(&cx, owner.close(&cx)).await;
+        drain.await.unwrap();
+        assert_eq!(f.lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        assert_eq!(f.anchor.counts().1, 0);
+    });
+}
+
+#[test]
+fn async_slot_shutdown_drain_waits_for_abandoned_nonpreemptible_provider() {
+    run(true, |cx| async move {
+        let f = Fixture::new();
+        let owner = f.open(&cx).await;
+        let release = f.anchor.arm(Pause::Read);
+        let pending = owner.load(&cx, f.auth).unwrap();
+        release.0.wait_entered(&cx).await;
+        let before = f.lane.begin_shutdown().unwrap();
+        drop(pending);
+        assert_eq!(f.lane.snapshot().unwrap(), before);
+        let mut drain = Box::pin(f.lane.wait_drained(&cx, Duration::from_secs(2)));
+        poll_fn(|context| { assert!(drain.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        // Cancelling only the observer must not detach ownership of the blocked
+        // provider or reopen admission. A fresh observer resumes the same drain.
+        drop(drain);
+        assert!(f.lane.is_shutting_down().unwrap());
+        assert_eq!(f.lane.snapshot().unwrap(), before);
+        release.0.release();
+        f.lane.wait_drained(&cx, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(f.lane.snapshot().unwrap(), CredentialIoSnapshot::default());
+        assert_eq!(f.anchor.counts().1, 0);
+        assert_eq!(f.directory.contents(), None);
     });
 }
