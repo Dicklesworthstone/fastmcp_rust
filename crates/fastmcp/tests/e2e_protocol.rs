@@ -58,13 +58,18 @@
 //! nobody holds. Constants were **split, never raised to make a red go away** — that
 //! converts a visible flake into an invisible one.
 //!
-//! Seven `assert!(started.elapsed() <= ..)` sites remain, in three test functions. Each is
-//! an upper bound on real wall time placed AFTER the call it claims to bound, so it cannot
-//! detect the hang its message advertises while still being able to fail because the
-//! machine was slow. They are classified on `bd-j8mkv` and are deliberately **retained for
-//! now**: raising the connect bounds made them reachable under load for the first time, and
-//! removing them before one deliberately-busy run would destroy the only cheap test of that
-//! prediction.
+//! Seven `assert!(started.elapsed() <= ..)` sites are **GONE** as of `bd-j8mkv`. Each was an
+//! upper bound on real wall time placed AFTER the call it claimed to bound, so it could not
+//! detect the hang its message advertised while still being able to fail because the machine
+//! was slow. They were previously retained pending one deliberately-busy run; that run was
+//! declined on the ground that the experiment could not answer the question, and the
+//! prediction was settled by reading instead — which falsified it. The reason for keeping
+//! them expired with the run that justified them.
+//!
+//! **This removed ONE of two independent load-sensitivity sources and did not touch the
+//! other.** The 19 failures above are idle-deadline refusals at CONNECT on the real-socket
+//! path, a different mechanism entirely. A later green on this target is NOT evidence that
+//! the connect problem is solved, and the must-run-alone rule above still stands.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -1403,16 +1408,17 @@ const STDIO_CONNECT_LIVENESS_IDLE_BOUND: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const STDIO_CONNECT_LIVENESS_ABSOLUTE_BOUND: Duration = Duration::from_secs(30);
 // Deliberately NOT renamed or resized. One constant was serving three unrelated roles:
-// the connect helpers' injected policy (split out above), the two `elapsed() <=`
-// assertions in the completion and MRTR positives, and the four `Instant::now() + ..`
-// polling deadlines for input-required, cancellation and notifications. Splitting the
-// liveness role out leaves those six uses exactly as they were. Deliberately described
-// by role rather than by line, because a line number is invalidated by the next edit
-// above it -- this comment block already moved them all by 24.
+// the connect helpers' injected policy (split out above), two `elapsed() <=` assertions
+// in the completion and MRTR positives, and the four `Instant::now() + ..` polling
+// deadlines for input-required, cancellation and notifications. The assertion role is
+// GONE as of bd-j8mkv -- an upper bound on elapsed wall time placed after the call it
+// bounded could not observe that call hanging, only a slow machine -- so what remains
+// here is the DEADLINE-BASE role alone, which is sound: it constructs a real deadline
+// rather than grading the host. `STDIO_COMPLETION_CLEANUP_BOUND` went with the
+// assertions; every reader it had was one of them. Deliberately described by role
+// rather than by line, because a line number is invalidated by the next edit above it.
 #[cfg(unix)]
 const STDIO_COMPLETION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(4);
-#[cfg(unix)]
-const STDIO_COMPLETION_CLEANUP_BOUND: Duration = Duration::from_secs(4);
 
 #[cfg(unix)]
 const ECHO_SERVER_INSTRUCTIONS: &str =
@@ -2920,7 +2926,6 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
         }),
     };
 
-    let completion_started = Instant::now();
     client
         .complete(params.clone())
         .expect("a completion/complete without a progress token still completes");
@@ -2932,10 +2937,7 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
     let result = client
         .complete_with_progress_marker(params.clone(), marker.clone())
         .expect("the typed ModernOnly client reaches the shipped completion provider");
-    assert!(
-        completion_started.elapsed() <= STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
-        "the positive completion finishes within its explicit public-client absolute bound"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
     assert_eq!(
         result.completion.values,
         vec!["stdio-completion-2".to_owned()],
@@ -2984,14 +2986,10 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
         "the provider count advances only for the three accepted completions"
     );
     assert_eq!(resumed.completion.has_more, Some(false));
-    let cleanup_started = Instant::now();
     client
         .close()
         .expect("modern completion stdio client cleanup and child reap");
-    assert!(
-        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
-        "the public close confirms bounded stdio child cleanup and reap"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 }
 
 #[cfg(unix)]
@@ -3619,7 +3617,6 @@ fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
     let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
 
-    let operation_started = Instant::now();
     let resource = client
         .read_resource_with_mrtr_retry("info://mrtr-resource", |_| {
             Ok(std::collections::BTreeMap::from([(
@@ -3683,10 +3680,7 @@ fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
             additional,
         } if text == "typed prompt roots=0" && additional.is_empty()
     ));
-    assert!(
-        operation_started.elapsed() <= STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
-        "both typed public MRTR completions finish within the explicit absolute bound"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 
     // RH-5: keep the method, URI, issued state, and typed roots response;
     // changing only requestState must reject without consuming the registry
@@ -3750,13 +3744,9 @@ fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
     assert_eq!(completed["ttlMs"], 7);
     assert_eq!(completed["cacheScope"], "private");
     assert_eq!(completed["contents"][0]["text"], "typed resource roots=0");
-    let raw_cleanup_started = Instant::now();
     raw.close()
         .expect("the selected-modern raw MRTR public facade cleans up");
-    assert!(
-        raw_cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
-        "the selected-modern raw MRTR facade also bounds child cleanup"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 
     let cancellation = client
         .get_prompt_with_mrtr_retry(
@@ -3809,14 +3799,10 @@ fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
         "cancellation and local bounds leave the public modern connection usable"
     );
 
-    let cleanup_started = Instant::now();
     client
         .close()
         .expect("modern MRTR stdio client cleanup reaps the shipped server");
-    assert!(
-        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
-        "the public client bounds the shipped server lifecycle by closing stdio"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 }
 
 #[cfg(unix)]
@@ -3902,14 +3888,10 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    let cleanup_started = Instant::now();
     client
         .close()
         .expect("modern Tasks stdio client cleanup reaps the live subprocess");
-    assert!(
-        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
-        "the caller-owned stdio Task service settles when the client closes"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 
     let mut legacy = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
         .expect("the exact-2024 facade retains its separate shipped stdio lifecycle");
@@ -3920,14 +3902,10 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
         legacy_result.content.first(),
         Some(LegacyContent::Text { text, .. }) if text == "exact-2024 Tasks are unavailable"
     ));
-    let legacy_cleanup_started = Instant::now();
     legacy
         .close()
         .expect("exact-2024 stdio client cleanup reaps its separate subprocess");
-    assert!(
-        legacy_cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
-        "the exact-2024 subprocess also performs bounded cleanup without a Task service"
-    );
+    // bd-j8mkv: elapsed() upper bound removed — it sat after the call it bounded, so it could only fail on a slow machine.
 }
 
 #[cfg(unix)]
