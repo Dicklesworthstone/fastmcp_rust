@@ -1315,8 +1315,7 @@ async fn duplicate_content_encoding_outcome(cx: &Cx) -> ModernHttpExecutorError 
         async {
             post(cx, &request)
                 .await
-                .err()
-                .expect("a repeated Content-Encoding must be refused")
+                .expect_err("a repeated Content-Encoding must be refused")
         },
     )
     .await;
@@ -1543,8 +1542,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
         async {
             post(cx, &request)
                 .await
-                .err()
-                .expect("a compressed response must be refused")
+                .expect_err("a compressed response must be refused")
         },
     )
     .await;
@@ -1635,8 +1633,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
     );
     let refusal = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), truncated)
         .await
-        .err()
-        .expect("a body shorter than its declared length must not be delivered");
+        .expect_err("a body shorter than its declared length must not be delivered");
     assert!(
         matches!(
             refusal,
@@ -2454,8 +2451,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
         async {
             post(cx, &request)
                 .await
-                .err()
-                .expect("a conflicting charset parameter must be refused")
+                .expect_err("a conflicting charset parameter must be refused")
         },
     )
     .await;
@@ -2531,8 +2527,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
     // -----------------------------------------------------------------------
     let absent = success_content_type_outcome(cx, 200, &[], b"{}")
         .await
-        .err()
-        .expect("a 200 with no Content-Type must be refused");
+        .expect_err("a 200 with no Content-Type must be refused");
     assert!(
         matches!(
             absent,
@@ -2548,8 +2543,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
     let duplicate =
         success_content_type_outcome(cx, 200, &["application/json", "application/json"], b"{}")
             .await
-            .err()
-            .expect("duplicate Content-Type field lines must be refused");
+            .expect_err("duplicate Content-Type field lines must be refused");
     assert!(
         matches!(
             duplicate,
@@ -3007,8 +3001,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
             listener
                 .next_event(cx)
                 .await
-                .err()
-                .expect("replacement outside the JSON string must not be repaired")
+                .expect_err("replacement outside the JSON string must not be repaired")
         },
     )
     .await;
@@ -3071,8 +3064,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
         sse_event_carrying(&terminal_with_raw_text(&[b'o', 0x00])),
     )
     .await
-    .err()
-    .expect("a raw NUL inside a JSON string must not be admitted");
+    .expect_err("a raw NUL inside a JSON string must not be admitted");
     assert!(
         matches!(
             refusal,
@@ -3108,8 +3100,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
         bom_prefixed(2, &sse_event_carrying(&terminal_with_raw_text(b"ok"))),
     )
     .await
-    .err()
-    .expect("a second BOM must not be stripped into an admissible terminal");
+    .expect_err("a second BOM must not be stripped into an admissible terminal");
     match refusal {
         ModernHttpFinalCoreListenError::EndOfStream { framing } => {
             let framing = framing.expect("end-of-stream framing must be reported");
@@ -3577,8 +3568,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
             listener
                 .next_event(cx)
                 .await
-                .err()
-                .expect("an unterminated pending event must never be dispatched")
+                .expect_err("an unterminated pending event must never be dispatched")
         },
     )
     .await;
@@ -3626,8 +3616,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
     let peer = Peer::bind().await;
     let refusal = drain_sse(cx, &peer, comment_run(KEEPALIVE_CEILING + 1), flood_limits)
         .await
-        .err()
-        .expect("one comment line over the ceiling must fail closed");
+        .expect_err("one comment line over the ceiling must fail closed");
     assert!(
         matches!(
             refusal,
@@ -3668,8 +3657,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
     // -----------------------------------------------------------------------
     let refusal = listen_to_sse_body(cx, blank_line_then_terminal(true))
         .await
-        .err()
-        .expect("an empty dispatched payload must fail JSON admission");
+        .expect_err("an empty dispatched payload must fail JSON admission");
     assert!(
         matches!(
             refusal,
@@ -3701,8 +3689,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
     // -----------------------------------------------------------------------
     let refusal = listen_to_sse_body(cx, event_typed_as_base64(EVENT_DECODER_BASE64))
         .await
-        .err()
-        .expect("a base64 payload must not be decoded because an event field named it");
+        .expect_err("a base64 payload must not be decoded because an event field named it");
     assert!(
         matches!(
             refusal,
@@ -4208,8 +4195,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         SseLimits::new(line_ceiling, 65_536, 64).expect("line-ceiling limits"),
     )
     .await
-    .err()
-    .expect("a line one octet over the ceiling must be refused");
+    .expect_err("a line one octet over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -4231,8 +4217,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         SseLimits::new(line_ceiling, event_ceiling, 64).expect("event-ceiling limits"),
     )
     .await
-    .err()
-    .expect("an event one octet over the ceiling must be refused");
+    .expect_err("an event one octet over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -4248,8 +4233,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     // are all unchanged.
     let refusal = collect_with_progress(cx, DECLARED_PROGRESS_QUEUE_CEILING + 1, true)
         .await
-        .err()
-        .expect("a progress queue one notification over the ceiling must be refused");
+        .expect_err("a progress queue one notification over the ceiling must be refused");
     assert!(
         matches!(refusal, ModernHttpFinalCoreListenError::ProgressQueueFull),
         "expected a typed progress-queue refusal, saw {refusal:?}"
@@ -4276,8 +4260,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         SseLimits::new(line_ceiling, 65_536, 64).expect("decoded-line limits"),
     )
     .await
-    .err()
-    .expect("a decoded line one byte over the ceiling must be refused");
+    .expect_err("a decoded line one byte over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -4301,8 +4284,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         SseLimits::new(line_ceiling, EXPANDING_EVENT_CEILING, 64).expect("decoded-event limits"),
     )
     .await
-    .err()
-    .expect("a decoded event one byte over the ceiling must be refused");
+    .expect_err("a decoded event one byte over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -4405,8 +4387,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
         data_line_limits(LIMIT_01_SSE_DATA_LINES_GUARDED),
     )
     .await
-    .err()
-    .expect("one data line over the ceiling must be refused");
+    .expect_err("one data line over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -4442,7 +4423,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     .await;
     assert!(
         matches!(
-            first.err().expect("the first read must refuse"),
+            first.expect_err("the first read must refuse"),
             ModernHttpExecutorError::SseParse(SseParseError::TooManyDataLines { .. })
         ),
         "the first read carries the typed data-line refusal"
@@ -4450,8 +4431,7 @@ async fn negative_11_one_byte_over_bounds(cx: &Cx) {
     assert!(
         matches!(
             second
-                .err()
-                .expect("the second read must not deliver a clean end"),
+                .expect_err("the second read must not deliver a clean end"),
             ModernHttpExecutorError::SseStreamClosed
         ),
         "a refused stream reports itself closed on every later read"
@@ -4664,8 +4644,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
             let refusal = owner
                 .next_event(cx)
                 .await
-                .err()
-                .expect("an independent server request must be refused");
+                .expect_err("an independent server request must be refused");
             assert!(
                 matches!(
                     refusal,
@@ -4709,8 +4688,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
     );
     let refusal = admit_dispatched_payload(cx, &concatenated)
         .await
-        .err()
-        .expect("concatenated JSON must not be admitted as one message");
+        .expect_err("concatenated JSON must not be admitted as one message");
     assert!(
         matches!(
             refusal,
@@ -5069,8 +5047,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     )
     .await;
     let refusal = first
-        .err()
-        .expect("a line one octet over the ceiling must be refused");
+        .expect_err("a line one octet over the ceiling must be refused");
     assert!(
         matches!(
             refusal,
@@ -5080,8 +5057,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
         "expected a typed line-bound refusal, saw {refusal:?}"
     );
     let closed = second
-        .err()
-        .expect("a refused stream must not answer a second read with an event or a clean end");
+        .expect_err("a refused stream must not answer a second read with an event or a clean end");
     assert!(
         matches!(closed, ModernHttpExecutorError::SseStreamClosed),
         "a refused stream must report itself closed, saw {closed:?}"
@@ -5122,8 +5098,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     // -----------------------------------------------------------------------
     let refusal = collect_with_progress(cx, 3, false)
         .await
-        .err()
-        .expect("a stream that never sends its final result must not complete");
+        .expect_err("a stream that never sends its final result must not complete");
     match refusal {
         ModernHttpFinalCoreListenError::EndOfStream { framing } => {
             let framing = framing.expect("end-of-stream framing must be reported");
@@ -5165,8 +5140,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     // control is the budget's cancellation bit.
     let (cancelled, _) = stream_reads_under_budget(cx, &cancelled_budget_context(), true).await;
     let cancelled = cancelled
-        .err()
-        .expect("a cancelled budget must end the wait on an endless response");
+        .expect_err("a cancelled budget must end the wait on an endless response");
     assert!(
         matches!(cancelled, ModernHttpExecutorError::Cancelled),
         "cancellation maps to Cancelled, saw {cancelled:?}"
@@ -5180,8 +5154,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     let (expired, expired_again) =
         stream_reads_under_budget(cx, &expired_budget_context(), true).await;
     let expired = expired
-        .err()
-        .expect("an expired budget must end the wait on an endless response");
+        .expect_err("an expired budget must end the wait on an endless response");
     assert!(
         matches!(expired, ModernHttpExecutorError::Transport(_)),
         "an expired deadline is a transport-level deadline outcome, saw {expired:?}"
@@ -5195,8 +5168,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     // again must keep saying so - never an event, and never the Ok(None) that
     // the live control produces, which a caller reads as "the server finished".
     let closed = expired_again
-        .err()
-        .expect("a budget-refused stream must not answer a second read with a clean end");
+        .expect_err("a budget-refused stream must not answer a second read with a clean end");
     assert!(
         matches!(closed, ModernHttpExecutorError::SseStreamClosed),
         "a refused stream must report itself closed on every later read, saw {closed:?}"
