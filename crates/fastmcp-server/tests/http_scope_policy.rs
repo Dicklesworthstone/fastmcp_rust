@@ -5,14 +5,20 @@
 //! substitute for framework catalog visibility or a sealed operation resolver.
 
 // bd-pf5n7: the default 128 is exceeded resolving this crate's async blocks through
-// `handle_secured_async` <-> `await_dispatch`, which recurse against each other in
-// fastmcp-server PRODUCTION source (endpoint.rs:164, :297). The cycle is two frames
-// inside that crate, which is why boxing on the test side changes nothing — measured,
-// not assumed. This is the compiler's own suggestion for this crate and the czvvt
-// precedent. COST: it removes the early warning that composition depth is growing. It
-// does NOT change codegen — `recursion_limit` bounds compile-time trait resolution
-// only — so no runtime exposure is created or removed. The mechanism-level repair,
-// boxing the recursion inside endpoint.rs, is a production change and is filed apart.
+// `handle_secured_async` -> `await_dispatch` in fastmcp-server PRODUCTION source
+// (endpoint.rs:164, :297). The chain is DEEP BUT BOUNDED — `await_dispatch` has no
+// call site inside its own body, and never calls back into `handle_secured_async`, so
+// neither self- nor mutual recursion is present — and a finite budget therefore
+// COMPLETES the proof rather than suppressing it. The depth accumulates two frames
+// inside that crate, which is why boxing on the test side changes nothing: measured,
+// not assumed. This is the compiler's own suggestion here, and the czvvt precedent.
+// VERIFIED SUFFICIENT at 256 — cold check at a8574340, 455/455 units rebuilt, 0
+// cached, 0 diagnostics of any code. Default feature set only.
+// COST: it removes the early warning that composition depth is growing. It does NOT
+// change codegen — `recursion_limit` bounds compile-time trait resolution only — so
+// no runtime exposure is created or removed. The mechanism-level repair, boxing the
+// three unboxed call sites in endpoint.rs (:180, :199, :217 — the idiom already
+// exists at :392), is a production change and is filed apart.
 #![recursion_limit = "256"]
 
 use std::future::Future;
