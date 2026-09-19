@@ -10,16 +10,24 @@
 // census — it emitted under run:legneg-verify, which ran with features. Its absence
 // from the cold census is an artefact of the feature set, not a property of the
 // target, so excluding it would leave a known emitter untouched by construction.
-// Cause and cost as in the six: the default 128 is exceeded resolving async blocks
-// through `handle_secured_async` -> `await_dispatch` in fastmcp-server PRODUCTION
-// source (endpoint.rs:164, :297). The chain is DEEP BUT BOUNDED — `await_dispatch`
-// has no call site inside its own body, and never calls back into
-// `handle_secured_async` — so a finite budget COMPLETES the proof rather than
-// suppressing it. Raising removes the early warning that depth is growing; it does
-// NOT change codegen, so no runtime exposure is created or removed. The production-
-// side repair is filed apart.
-// NOT VERIFIED HERE: the a8574340 cold check covered the DEFAULT feature set, in
-// which this target does not emit. Its configuration remains unverified.
+// Cause as in the six: the default 128 is exceeded resolving async blocks through
+// `handle_secured_async` -> `await_dispatch` in fastmcp-server PRODUCTION source
+// (endpoint.rs:164, :297).
+// THIS TARGET IS THE WEAKEST CASE OF THE SEVEN AND IS LABELLED AS SUCH. It did NOT
+// emit in the a8574340 cold check, because that check covered the DEFAULT feature
+// set; it emitted under run:legneg-verify, which ran WITH features. So the "256 is
+// sufficient" evidence that supports the other six DOES NOT COVER THIS FILE — its
+// emitting configuration has never been re-checked after the raise. The attribute
+// is applied here because excluding a known emitter on the strength of a run that
+// could not observe it would be excluding it by construction, not by evidence.
+// The direct call-graph reading (`await_dispatch` has no self-call and no direct
+// call back into `handle_secured_async`) applies here as it does there, with the
+// same blind spot: DIRECT CALLS ONLY, and this module holds two type-erasure points
+// (scope_policy.rs:251, endpoint/listener.rs:285), so it does not establish that the
+// call graph is acyclic.
+// COST: raising removes the early warning that depth is growing; it does NOT change
+// codegen, so no runtime exposure is created or removed. The production-side repair
+// is filed apart.
 #![recursion_limit = "256"]
 
 use std::future::Future;
