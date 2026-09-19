@@ -53,10 +53,16 @@ pub(super) async fn cancellable<T>(
     checkpoint(cx)?;
     let mut deadline_timer = match cx.budget().deadline {
         Some(deadline) => {
-            let driver = cx.timer_driver().ok_or_else(|| {
-                McpError::internal_error("caller deadline requires an asupersync timer driver")
-            })?;
-            Some(Sleep::with_timer_driver(deadline, driver))
+            if cx.timer_driver().is_none() {
+                return Err(McpError::internal_error(
+                    "caller deadline requires an asupersync timer driver",
+                ));
+            }
+            // The explicit-driver constructor is crate-private in asupersync
+            // 0.5. Public Sleep resolves its driver when polled; every poll
+            // below runs inside the supplied caller's Cx guard, including the
+            // first registration and all subsequent deadline checks.
+            Some(Sleep::new(deadline))
         }
         None => None,
     };
@@ -497,6 +503,73 @@ mod tests {
             assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
             assert_eq!(polls.load(Ordering::Relaxed), 0);
             assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn deadline_registration_never_borrows_another_runtimes_ambient_clock() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        for kind in KINDS {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+
+            // A real but unrelated ambient driver is already past the caller's
+            // deadline. Merely checking for the existence of a timer is not
+            // enough: using this clock would finish early or register elsewhere.
+            let foreign_clock = Arc::new(VirtualClock::new());
+            foreign_clock.advance(1_000_000_000);
+            let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
+            let foreign_runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(foreign_timer.clone())
+                .build()
+                .unwrap();
+            let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(foreign_cx.clone()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut task = Context::from_waker(&waker);
+            let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
+
+            assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
+            assert!(timer.pending_count() > 0);
+            assert_eq!(foreign_timer.pending_count(), 0, "{kind:?}");
+            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+
+            clock.advance(10_000_000);
+            assert!(timer.process_timers() > 0);
+            assert!(counter.0.load(Ordering::Relaxed) > 0);
+            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                panic!("{kind:?} ignored its own runtime's deadline");
+            };
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(polls.load(Ordering::Relaxed), 2);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+            assert!(!foreign_cx.is_cancel_requested());
+
+            drop(future);
+            drop(ambient);
+            drop(foreign_cx);
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }
 }
