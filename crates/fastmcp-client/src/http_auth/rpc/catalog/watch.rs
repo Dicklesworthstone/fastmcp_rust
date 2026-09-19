@@ -439,8 +439,10 @@ impl ChangeSignal {
 fn is_invalidation_stop(error: &ManagedCatalogError, local_cancel: &McpRequestCancellation) -> bool {
     matches!(error, ManagedCatalogError::Invalidated)
         || (local_cancel.is_cancel_requested() && matches!(error,
-            ManagedCatalogError::Core(ManagedCoreError::Cancelled)
-            | ManagedCatalogError::Core(ManagedCoreError::Session(OAuthSessionError::Cancelled))
+            ManagedCatalogError::Core(
+                ManagedCoreError::Cancelled
+                | ManagedCoreError::Session(OAuthSessionError::Cancelled)
+            )
         ))
 }
 
