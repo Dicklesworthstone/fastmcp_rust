@@ -6,6 +6,16 @@
 //! Server::bind_secured_https and the ordinary authentication/dispatch path.
 
 #![forbid(unsafe_code)]
+// bd-pf5n7: applied here although this target did NOT emit in the default-feature
+// census — it emitted under run:legneg-verify, which ran with features. Its absence
+// from the cold census is an artefact of the feature set, not a property of the
+// target, so excluding it would leave a known emitter untouched by construction.
+// Cause and cost as in the six: the default 128 is exceeded resolving async blocks
+// through `handle_secured_async` <-> `await_dispatch`, which recurse against each
+// other in fastmcp-server PRODUCTION source (endpoint.rs:164, :297). Raising removes
+// the early warning that depth is growing; it does NOT change codegen, so no runtime
+// exposure is created or removed. The production-side repair is filed apart.
+#![recursion_limit = "256"]
 
 use std::future::Future;
 use std::net::SocketAddr;
