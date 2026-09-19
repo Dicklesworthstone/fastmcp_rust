@@ -29,6 +29,9 @@ use zeroize::Zeroizing;
 
 use super::{Middleware, MiddlewareDecision};
 
+mod successors;
+use successors::SuccessorEntry;
+
 const VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
 const IDENTITY_BYTES: usize = 64;
 const MAX_DEPTH: usize = 64;
@@ -86,6 +89,8 @@ struct Identity {
     binding: EnvelopeBinding,
     lifetime: McpRequestCancellation,
     decoder: CoreRequest,
+    authority: ContinuationReplayAuthority,
+    operation: Option<[u8; 32]>,
 }
 struct Entry {
     fingerprint: [u8; 32],
@@ -94,11 +99,13 @@ struct Entry {
     // None fences an in-flight or uncertain attempt. Never discard this fence
     // on on_error: a duplicate's error must not release the original dispatch.
     result: Option<Vec<u8>>,
+    transition: Option<SuccessorEntry>,
     charge: usize,
 }
 struct Journal {
     protector: EphemeralEnvelopeProtector,
     entries: BTreeMap<[u8; 32], Entry>,
+    successors: BTreeMap<[u8; 32], [u8; 32]>,
     retained_bytes: usize,
     closed: bool,
 }
@@ -118,6 +125,7 @@ struct Journal {
 pub struct ContinuationReplayMiddleware {
     process: ProcessBoundToken,
     limits: ContinuationReplayLimits,
+    recover_successors: bool,
     authorize: Arc<Authorize>,
     journal: Mutex<Journal>,
 }
@@ -129,8 +137,9 @@ impl ContinuationReplayMiddleware {
         let policy = EnvelopePolicy::new(limits.result_bytes, limits.lifetime, 4).map_err(|_| unavailable())?;
         let protector = EphemeralEnvelopeProtector::new(cx, guard, stance, EnvelopePurpose::Continuation, policy)
             .map_err(|_| unavailable())?;
-        Ok(Self { process: guard.token(), limits, authorize: Arc::new(authorize),
-            journal: Mutex::new(Journal { protector, entries: BTreeMap::new(), retained_bytes: 0, closed: false }) })
+        Ok(Self { process: guard.token(), limits, recover_successors: false, authorize: Arc::new(authorize),
+            journal: Mutex::new(Journal { protector, entries: BTreeMap::new(), successors: BTreeMap::new(),
+                retained_bytes: 0, closed: false }) })
     }
 
     fn lock(&self) -> McpResult<MutexGuard<'_, Journal>> {
@@ -164,16 +173,15 @@ impl ContinuationReplayMiddleware {
         let authority = (self.authorize)(ctx, request)?;
         check_context(ctx)?;
         if authority.lifetime.is_cancel_requested() { return Err(unavailable()); }
-        let mut selector = LimitedWriter::new(self.limits.request_bytes + 256);
-        selector.write_all(b"fastmcp/mrtr-terminal-slot/v1\0").map_err(|_| unavailable())?;
-        selector.write_all(authority.key.as_bytes()).map_err(|_| unavailable())?;
-        selector.write_all(authority.authorization.as_bytes()).map_err(|_| unavailable())?;
-        serde_json::to_writer(&mut selector, &(&request.method, state)).map_err(|_| unavailable())?;
-        let slot = sha256_bounded(&selector.bytes, self.limits.request_bytes + 256).map_err(|_| unavailable())?.into_bytes();
+        let slot = self.slot(&authority, &request.method, state)?;
+        let operation = if self.recover_successors {
+            Some(successors::operation_fingerprint(&request.method, params, self.limits.request_bytes)?)
+        } else { None };
         let namespace = format!("mrtr-terminal:{}", hex(&slot));
         let binding = EnvelopeBinding::continuation(&authority.key, &authority.authorization, &namespace)
             .map_err(|_| unavailable())?;
-        Ok(Some(Identity { slot, fingerprint, binding, lifetime: authority.lifetime, decoder }))
+        Ok(Some(Identity { slot, fingerprint, binding, lifetime: authority.lifetime.clone(),
+            decoder, authority, operation }))
     }
 
     /// Reclaims only finished, expired/revoked replies. Uncertain dispatches
@@ -181,16 +189,7 @@ impl ContinuationReplayMiddleware {
     pub fn prune(&self, cx: &Cx) -> McpResult<usize> {
         cx.checkpoint().map_err(|_| unavailable())?;
         let mut state = self.lock()?;
-        let now = Instant::now();
-        let before = state.entries.len();
-        let mut released = 0;
-        state.entries.retain(|_, entry| {
-            let remove = entry.result.is_some() && (now >= entry.expires_at || entry.lifetime.is_cancel_requested());
-            if remove { released += entry.charge; }
-            !remove
-        });
-        state.retained_bytes -= released;
-        Ok(before - state.entries.len())
+        Ok(state.prune_finished(Instant::now()))
     }
 
     /// Rotates keys without invalidating unexpired retained replies.
@@ -205,6 +204,7 @@ impl ContinuationReplayMiddleware {
         state.closed = true;
         state.protector.close();
         state.entries.clear();
+        state.successors.clear();
         state.retained_bytes = 0;
         Ok(())
     }
@@ -223,14 +223,28 @@ impl Middleware for ContinuationReplayMiddleware {
             check_entry(ctx, entry, &identity)?;
             return Ok(MiddlewareDecision::Respond(result));
         }
-        let charge = state.protector.maximum_envelope_bytes() + IDENTITY_BYTES;
-        let retained = state.retained_bytes.checked_add(charge).filter(|bytes| *bytes <= self.limits.maximum_bytes)
-            .ok_or_else(unavailable)?;
+        // Validate the predecessor without changing it. A rejected operation,
+        // capacity failure or cancellation must leave its recoverable reply intact.
+        let predecessor = state.predecessor(ctx, &identity)?;
+        let charge = state.protector.maximum_envelope_bytes() + self.identity_bytes();
+        let released = predecessor.map_or(0, |(_, released)| released);
+        let retained = state.retained_bytes.checked_sub(released)
+            .and_then(|bytes| bytes.checked_add(charge))
+            .filter(|bytes| *bytes <= self.limits.maximum_bytes).ok_or_else(unavailable)?;
         if state.entries.len() >= self.limits.maximum_entries { return Err(unavailable()); }
         let expires_at = Instant::now().checked_add(self.limits.lifetime).ok_or_else(unavailable)?;
         if identity.lifetime.is_cancel_requested() { return Err(unavailable()); }
+        check_context(ctx)?;
+        // Recheck the original authorization lifetime after budget preparation.
+        let predecessor = state.predecessor(ctx, &identity)?;
         state.entries.insert(identity.slot, Entry { fingerprint: identity.fingerprint,
-            lifetime: identity.lifetime, expires_at, result: None, charge });
+            lifetime: identity.lifetime, expires_at, result: None,
+            transition: identity.operation.map(SuccessorEntry::new), charge });
+        if let Some((parent, _)) = predecessor {
+            // The check and transition are under the same lock. No request can
+            // replay the predecessor between admission and this retirement.
+            state.retire_predecessor(parent, identity.slot);
+        }
         state.retained_bytes = retained;
         Ok(MiddlewareDecision::Continue)
     }
@@ -243,23 +257,37 @@ impl Middleware for ContinuationReplayMiddleware {
         // The ordinary middleware stack runs this hook for short-circuited
         // replies too. Never reset lifetime, reseal, or grow state on a hit.
         if entry.result.is_some() { return Ok(response); }
-        if response.get("resultType").and_then(Value::as_str) != Some("complete") {
-            return Ok(response); // keep the uncertain fence, not a reusable successor
+        let discriminator = response.get("resultType").and_then(Value::as_str);
+        if discriminator != Some("complete")
+            && !(self.recover_successors && discriminator == Some("input_required"))
+        {
+            return Ok(response); // retain terminal-only mode and uncertain fences
         }
         check_shape(&response)?;
         let mut encoded = LimitedWriter::new(self.limits.result_bytes);
         serde_json::to_writer(&mut encoded, &response).map_err(|_| unavailable())?;
         let text = std::str::from_utf8(&encoded.bytes).map_err(|_| unavailable())?;
         identity.decoder.decode_result(text).map_err(|_| unavailable())?;
+        let successor = if discriminator == Some("input_required") {
+            // A response without an explicit nonempty successor remains valid
+            // protocol output, but cannot safely participate in this journal.
+            let Some(next) = response.get("requestState").and_then(Value::as_str)
+                .filter(|next| !next.is_empty()) else { return Ok(response); };
+            let next_slot = self.slot(&identity.authority, &request.method, next)?;
+            state.admit_successor(identity.slot, next_slot)?;
+            Some(next_slot)
+        } else { None };
         let lifetime = entry.expires_at.saturating_duration_since(Instant::now());
         let envelope = state.protector.seal(ctx.cx(), &identity.binding, &encoded.bytes, lifetime)
             .map_err(|_| unavailable())?;
         let entry = state.entries.get_mut(&identity.slot).ok_or_else(unavailable)?;
         check_entry(ctx, entry, &identity)?;
-        let charge = envelope.len() + IDENTITY_BYTES;
+        let charge = envelope.len() + self.identity_bytes();
         let released = entry.charge.checked_sub(charge).ok_or_else(unavailable)?;
         entry.charge = charge;
         entry.result = Some(envelope);
+        if let Some(transition) = &mut entry.transition { transition.successor = successor; }
+        if let Some(next) = successor { state.successors.insert(next, identity.slot); }
         state.retained_bytes -= released;
         Ok(response)
     }
@@ -282,6 +310,7 @@ fn check_entry(ctx: &McpContext, entry: &Entry, identity: &Identity) -> McpResul
     check_context(ctx)?;
     if entry.fingerprint != identity.fingerprint || Instant::now() >= entry.expires_at
         || entry.lifetime.is_cancel_requested() || identity.lifetime.is_cancel_requested()
+        || entry.transition.as_ref().is_some_and(|transition| transition.superseded)
     { return Err(unavailable()); }
     Ok(())
 }
