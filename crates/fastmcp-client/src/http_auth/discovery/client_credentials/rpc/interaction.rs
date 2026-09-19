@@ -19,7 +19,7 @@ use super::super::{ClientCredentialsClient, ClientCredentialsError, active, chec
 use crate::http_auth::rpc::ManagedCoreError;
 use crate::http_auth::rpc::interaction::{
     ManagedInteractionError, admit_challenge, admit_fresh_id, continuation_request,
-    input_required, validate_initial,
+    input_required, validate_initial, InputSelection, continuation_request_selected,
 };
 
 pub use crate::http_auth::rpc::interaction::{ManagedInteractionEvent, ManagedInteractionLimits};
@@ -241,6 +241,34 @@ impl ClientCredentialsInteraction {
         request_id: RequestId,
         responses: Option<FinalInputResponses>,
     ) -> Result<(), ClientCredentialsInteractionError> {
+        self.resume_selected(cx, discovery_id, request_id, responses, InputSelection::Complete).await
+    }
+
+    /// Submits only the nonempty set of answers explicitly selected by the
+    /// host. A proper subset requires nonempty server-issued requestState.
+    /// The next server result, not a local merge, defines the next challenge.
+    /// All original metadata, arguments, capability and cumulative work bounds
+    /// remain in force. Both IDs must be fresh across discovery and operation
+    /// requests from every prior round. Local refusal preserves this challenge;
+    /// once discovery starts, failure or abandonment cannot authorize a retry.
+    pub async fn resume_partial(
+        &mut self,
+        cx: &Cx,
+        discovery_id: RequestId,
+        request_id: RequestId,
+        responses: FinalInputResponses,
+    ) -> Result<(), ClientCredentialsInteractionError> {
+        self.resume_selected(cx, discovery_id, request_id, Some(responses), InputSelection::Partial).await
+    }
+
+    async fn resume_selected(
+        &mut self,
+        cx: &Cx,
+        discovery_id: RequestId,
+        request_id: RequestId,
+        responses: Option<FinalInputResponses>,
+        selection: InputSelection,
+    ) -> Result<(), ClientCredentialsInteractionError> {
         self.check(cx)?;
         let Some(Step::Awaiting(input)) = &self.step else {
             return Err(if self.step.is_none() {
@@ -251,7 +279,10 @@ impl ClientCredentialsInteraction {
         };
         admit_pair(&self.used_ids, &discovery_id, &request_id)?;
         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
-        let next = continuation_request(&self.original, input, responses)?;
+        let next = match selection {
+            InputSelection::Complete => continuation_request(&self.original, input, responses)?,
+            InputSelection::Partial => continuation_request_selected(&self.original, input, responses, selection)?,
+        };
         preflight(self.client.resource(), &next, &discovery_id, &request_id, self.limits.core())?;
         self.check(cx)?;
         // Commit ownership before suspension. A failed discovery also consumes
@@ -281,10 +312,44 @@ impl ClientCredentialsInteraction {
     /// failed or abandoned driver cannot repeat a callback or continuation.
     /// notify is synchronous and must not block the caller's async runtime.
     pub async fn drive<R, F, N>(
+        self,
+        cx: &Cx,
+        resolve: R,
+        notify: N,
+    ) -> Result<Box<CoreResult>, ClientCredentialsInteractionError>
+    where
+        R: FnMut(Box<InputRequiredResult>) -> F,
+        F: Future<Output = Result<ClientCredentialsInputReply, ClientCredentialsInteractionError>>,
+        N: FnMut(Box<ServerNotification>) -> Result<(), ClientCredentialsInteractionError>,
+    {
+        self.drive_selected(cx, resolve, notify, InputSelection::Complete).await
+    }
+
+    /// Like `drive`, but a nonempty host reply may answer a subset of the
+    /// current inputs. Omitted inputs are never executed or given fabricated
+    /// replies. Absent/present-empty input maps retain the exhaustive contract;
+    /// a proper subset requires server-owned continuation state. This does not
+    /// replay callbacks or extend the original deadline and response budgets.
+    pub async fn drive_partial<R, F, N>(
+        self,
+        cx: &Cx,
+        resolve: R,
+        notify: N,
+    ) -> Result<Box<CoreResult>, ClientCredentialsInteractionError>
+    where
+        R: FnMut(Box<InputRequiredResult>) -> F,
+        F: Future<Output = Result<ClientCredentialsInputReply, ClientCredentialsInteractionError>>,
+        N: FnMut(Box<ServerNotification>) -> Result<(), ClientCredentialsInteractionError>,
+    {
+        self.drive_selected(cx, resolve, notify, InputSelection::Partial).await
+    }
+
+    async fn drive_selected<R, F, N>(
         mut self,
         cx: &Cx,
         mut resolve: R,
         mut notify: N,
+        selection: InputSelection,
     ) -> Result<Box<CoreResult>, ClientCredentialsInteractionError>
     where
         R: FnMut(Box<InputRequiredResult>) -> F,
@@ -298,7 +363,10 @@ impl ClientCredentialsInteraction {
                     cx, self.deadline, &self.client.inner.closed, &self.cancellation, None,
                     async { Ok(resolve(Box::new(input)).await) },
                 ).await??;
-                self.resume(cx, reply.discovery_id, reply.request_id, reply.input_responses).await?;
+                let selected = if reply.input_responses.as_ref().is_some_and(|answers| !answers.is_empty()) {
+                    selection
+                } else { InputSelection::Complete };
+                self.resume_selected(cx, reply.discovery_id, reply.request_id, reply.input_responses, selected).await?;
                 continue;
             }
             match self.next_event(cx).await? {
@@ -570,5 +638,133 @@ mod tests {
         assert!(matches!(full.resume_usage(2048, 0), Err(ManagedCoreError::ResponseByteLimit)));
         assert!(matches!(full.resume_usage(0, 2), Err(ManagedCoreError::NotificationLimit)));
         assert_eq!(full.usage(), (0, 0));
+    }
+
+    fn awaiting_partial(cx: &Cx, state: Option<&str>) -> ClientCredentialsInteraction {
+        let mut operation = awaiting(cx);
+        operation.original = original("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
+        let mut result = json!({"resultType":"input_required","inputRequests":{
+            "one":{"method":"roots/list"},"two":{"method":"roots/list"}
+        }});
+        if let Some(state) = state { result["requestState"] = json!(state); }
+        operation.step = Some(Step::Awaiting(Box::new(challenge(&operation.original, &result.to_string()))));
+        operation
+    }
+
+    fn answer(key: &str) -> FinalInputResponses {
+        serde_json::from_value(json!({key:{"roots":[]}})).unwrap()
+    }
+
+    #[test]
+    fn machine_partial_refusals_preserve_challenge_ids_and_all_work_counters() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut operation = awaiting_partial(&cx, Some("state"));
+            let original = operation.original.encode_params().unwrap();
+            for invalid in [FinalInputResponses::default(), answer("foreign"),
+                serde_json::from_value(json!({"one":{"action":"decline"}})).unwrap()]
+            {
+                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), invalid).await,
+                    Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
+            }
+            assert!(matches!(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), Some(answer("one"))).await,
+                Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
+            assert_eq!(operation.pending_input().unwrap().input_requests().unwrap().members().len(), 2);
+            assert_eq!(operation.pending_input().unwrap().request_state(), Some("state"));
+            assert_eq!(operation.original.encode_params().unwrap(), original);
+            assert_eq!(operation.used_ids, [RequestId::Number(1), RequestId::Number(2)]);
+            assert_eq!((operation.continuations, operation.input_responses, operation.response_bytes, operation.notifications), (0,0,0,0));
+        });
+    }
+
+    #[test]
+    fn machine_partial_admission_uses_both_id_namespaces_before_credential_work() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut operation = awaiting_partial(&cx, Some("state"));
+            for (discovery, request) in [(1,4), (2,4), (3,1), (3,2), (3,3)] {
+                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(discovery), RequestId::Number(request), answer("one")).await,
+                    Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::RepeatedRequestId))));
+            }
+            assert_eq!(operation.continuation_count(), 0);
+            assert_eq!(operation.used_ids.len(), 2);
+            assert!(operation.pending_input().is_some());
+        });
+    }
+
+    #[test]
+    fn machine_partial_dispatch_failure_consumes_only_the_selected_answers_once() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut operation = awaiting_partial(&cx, Some("state"));
+            // The existing fixture's revoked token refuses acquisition. The
+            // partial response must reach this boundary, not full-map validation.
+            assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one")).await,
+                Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Expired)))));
+            assert!(operation.pending_input().is_none());
+            assert_eq!((operation.continuations, operation.input_responses, operation.used_ids.len()), (1,1,4));
+            assert!(matches!(operation.resume_partial(&cx, RequestId::Number(5), RequestId::Number(6), answer("one")).await,
+                Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::Closed))));
+            assert_eq!((operation.continuations, operation.input_responses, operation.used_ids.len()), (1,1,4));
+        });
+    }
+
+    #[test]
+    fn machine_partial_state_refusal_does_not_consume_the_full_answer_control() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for state in [None, Some("")] {
+                let mut operation = awaiting_partial(&cx, state);
+                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one")).await,
+                    Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::PartialStateRequired))));
+                assert_eq!(operation.continuation_count(), 0);
+                let all = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
+                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), all).await,
+                    Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Expired)))));
+                assert_eq!((operation.continuations, operation.input_responses), (1,2));
+            }
+        });
+    }
+
+    #[test]
+    fn machine_partial_owner_close_prevents_callbacks_and_attempts() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let operation = awaiting_partial(&cx, Some("state"));
+            operation.client.close();
+            let calls = std::cell::Cell::new(0);
+            let outcome = operation.drive_partial(&cx, |_| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(ClientCredentialsInputReply {
+                    discovery_id: RequestId::Number(3), request_id: RequestId::Number(4),
+                    input_responses: Some(answer("one")),
+                }))
+            }, |_| Ok(())).await;
+            assert!(matches!(outcome,
+                Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Closed)))));
+            assert_eq!(calls.get(), 0);
+        });
+    }
+
+    #[test]
+    fn machine_partial_driver_cancellation_discards_ready_host_answers() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let operation = awaiting_partial(&cx, Some("state"));
+            let cancel = operation.cancellation.clone();
+            let calls = std::cell::Cell::new(0);
+            let outcome = operation.drive_partial(&cx, |_| {
+                calls.set(calls.get() + 1);
+                cancel.cancel();
+                std::future::ready(Ok(ClientCredentialsInputReply {
+                    discovery_id: RequestId::Number(3), request_id: RequestId::Number(4),
+                    input_responses: Some(answer("one")),
+                }))
+            }, |_| Ok(())).await;
+            assert!(matches!(outcome, Err(ClientCredentialsInteractionError::Core(
+                ClientCredentialsCoreError::Authentication(ClientCredentialsError::Discovery(
+                    super::super::super::super::OAuthDiscoveryError::Cancelled))))));
+            assert_eq!(calls.get(), 1);
+        });
     }
 }

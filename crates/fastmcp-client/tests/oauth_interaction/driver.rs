@@ -27,6 +27,9 @@ mod resources;
 #[path = "partial.rs"]
 mod partial;
 
+#[path = "machine_partial.rs"]
+mod machine_partial;
+
 #[derive(Clone, Copy)]
 enum DriverCase { Complete, Cancel, Timeout, Refuse, Drop }
 
