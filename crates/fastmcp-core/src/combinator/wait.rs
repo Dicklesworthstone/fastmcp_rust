@@ -53,10 +53,19 @@ pub(super) async fn cancellable<T>(
     checkpoint(cx)?;
     let mut deadline_timer = match cx.budget().deadline {
         Some(deadline) => {
-            let driver = cx.timer_driver().ok_or_else(|| {
+            // The refusal is load-bearing and stays: without a caller timer
+            // driver this must fail before polling work rather than silently
+            // degrade to asupersync's process-global fallback timer.
+            // `Sleep::with_timer_driver` is `pub(crate)` in asupersync 0.5.0, so
+            // the driver is supplied by the `Cx::set_current` guard below: a
+            // `Sleep` with no bound driver resolves one from the ambient `Cx` at
+            // poll time, and that guard is installed before every poll of this
+            // timer. Moving or removing it would silently change the timer
+            // source, so the two must stay together.
+            let _driver = cx.timer_driver().ok_or_else(|| {
                 McpError::internal_error("caller deadline requires an asupersync timer driver")
             })?;
-            Some(Sleep::with_timer_driver(deadline, driver))
+            Some(Sleep::new(deadline))
         }
         None => None,
     };

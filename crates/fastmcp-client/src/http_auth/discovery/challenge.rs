@@ -386,8 +386,13 @@ async fn active<T>(
     future: impl Future<Output = Result<T, OAuthChallengeError>>,
 ) -> Result<T, OAuthChallengeError> {
     let deadline = cx.budget().deadline.map_or(deadline, |parent| parent.min(deadline));
-    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
-    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    // See discovery.rs: `Sleep::with_timer_driver` is `pub(crate)` in asupersync
+    // 0.5.0, so the caller's driver is supplied by the `Cx::set_current` guard in
+    // the poll closure below rather than bound at construction. The refusal stays
+    // load-bearing — without it a missing driver silently degrades to the
+    // process-global fallback timer.
+    let _timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut ambient = std::pin::pin!(receiver.recv(cx));

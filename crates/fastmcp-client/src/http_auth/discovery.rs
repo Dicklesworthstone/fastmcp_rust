@@ -786,10 +786,16 @@ async fn within<T>(
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthDiscoveryError>>,
 ) -> Result<T, OAuthDiscoveryError> {
-    // Bind the timer directly to the supplied caller. Candidate sub-deadlines
-    // must wake even when a different/no Cx was ambient at future construction.
-    let timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
-    let mut sleep = std::pin::pin!(Sleep::with_timer_driver(deadline, timer));
+    // Candidate sub-deadlines must resolve the supplied caller's timer driver,
+    // not an unrelated ambient one. `Sleep::with_timer_driver` is `pub(crate)`
+    // in asupersync 0.5.0, so the binding is no longer made at construction: the
+    // `Cx::set_current` guard inside the poll closure below is installed before
+    // every poll of this sleep, and a `Sleep` with no bound driver resolves one
+    // from the ambient `Cx` at poll time. The refusal below stays load-bearing —
+    // without it a missing driver degrades to the process-global fallback timer
+    // instead of failing.
+    let _timer = cx.timer_driver().ok_or(OAuthDiscoveryError::RuntimeUnavailable)?;
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
