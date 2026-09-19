@@ -65170,25 +65170,39 @@ fn fallible(value: Option<u8>) {
         assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// bd-n1dp1: ONE test item with the platform branches INSIDE it, mirroring
+    /// `ordinary_b_r3_unqualified_platform_fails_before_ledger_open` above.
+    ///
+    /// This frozen ID was previously TWO `#[test]` items under complementary
+    /// `#[cfg]`, so `--exact ordinary_b_r3_live_matrix` resolved to a different
+    /// item per platform and the declared-vs-discovered arithmetic carried a
+    /// paired-duplicate exception. Both bodies are preserved VERBATIM.
+    ///
+    /// STRUCTURAL REPAIR ONLY, NOT A COVERAGE ONE. The not(linux) branch still
+    /// does not execute on a linux-x86_64 host; the refusal path it asserts is
+    /// compiled but dead there because `ordinary_platform_is_qualified()` is
+    /// `cfg!(..)`, a compile-time literal with no seam. Closing that is
+    /// bd-n1dp1 Proposal 2 and is not done here.
     #[test]
     fn ordinary_b_r3_live_matrix() {
-        qualified_linux_live_reprobe("B-R3");
-        assert_eq!(OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(), "reprobe");
-    }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            qualified_linux_live_reprobe("B-R3");
+            assert_eq!(OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(), "reprobe");
+        }
 
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    #[test]
-    fn ordinary_b_r3_live_matrix() {
-        ordinary_reprobe_dual_path_pure_authority().expect("B-R3 live pure authority must precede the platform gate");
-        let run_id = format!("{:032x}", std::process::id());
-        let closed_path = format!("{}:/usr/bin:/bin", std::env::temp_dir().join("fnd01-unqualified-toolchain").display(),);
-        let error = ordinary_reprobe_tool_set_shared(&repository_root(), BootstrapMode::Produce, &run_id, &closed_path).expect_err("unqualified");
-        assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
-        assert_eq!(error.site, OrdinaryFailureSite::ProbeToolPlatform);
-        assert_eq!(error.route(), OrdinaryFailureRoute::ToolPlatform);
-        assert_eq!(error.observed, "ordinary native-tool probes require Linux x86_64");
-        assert_eq!(error.route().stage().as_str(), "reprobe");
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            ordinary_reprobe_dual_path_pure_authority().expect("B-R3 live pure authority must precede the platform gate");
+            let run_id = format!("{:032x}", std::process::id());
+            let closed_path = format!("{}:/usr/bin:/bin", std::env::temp_dir().join("fnd01-unqualified-toolchain").display(),);
+            let error = ordinary_reprobe_tool_set_shared(&repository_root(), BootstrapMode::Produce, &run_id, &closed_path).expect_err("unqualified");
+            assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
+            assert_eq!(error.site, OrdinaryFailureSite::ProbeToolPlatform);
+            assert_eq!(error.route(), OrdinaryFailureRoute::ToolPlatform);
+            assert_eq!(error.observed, "ordinary native-tool probes require Linux x86_64");
+            assert_eq!(error.route().stage().as_str(), "reprobe");
+        }
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
