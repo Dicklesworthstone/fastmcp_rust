@@ -20,6 +20,10 @@
 //! Losing futures are either retained until the documented completion
 //! condition or dropped in the same combinator future. Callers remain
 //! responsible for the cancellation behavior of work spawned elsewhere.
+//! The result-returning race, quorum, and first-success combinators observe
+//! the supplied `Cx` and register a cancellation wakeup even when every child
+//! remains pending. `join_all` and `join_all_results` retain their wait-for-all
+//! contract; dropping their owner still drops the supplied futures.
 //!
 //! # Example
 //!
@@ -49,6 +53,8 @@ use asupersync::types::CancelReason;
 use asupersync::{Cx, Outcome};
 
 use crate::error::{McpError, McpErrorCode, McpOutcome, McpResult};
+
+mod wait;
 
 // ============================================================================
 // Type Aliases
@@ -186,6 +192,7 @@ fn poll_slot<T>(slot: &mut Option<BoxFuture<'_, T>>, cx: &mut Context<'_>) -> Op
 /// Creates a native asupersync timer bounded by both the requested timeout and
 /// the caller's remaining deadline budget.
 fn timeout_sleep(cx: &Cx, requested: Duration) -> Sleep {
+    let _caller = Cx::set_current(Some(cx.clone()));
     let now = cx.now();
     let remaining = BudgetTimeExt::remaining_duration(&cx.budget(), now);
     let effective = if let Some(remaining) = remaining {
@@ -330,22 +337,17 @@ pub async fn join_all_results<T: Send + 'static>(
 /// ];
 /// let result = race(ctx.cx(), futures).await?;
 /// ```
-pub async fn race<T: Send + 'static>(_cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -> McpResult<T> {
+pub async fn race<T: Send + 'static>(cx: &Cx, futures: Vec<BoxFuture<'_, T>>) -> McpResult<T> {
     if futures.is_empty() {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
             "race requires at least one future",
         ));
     }
-    // Single future: no concurrency overhead needed.
-    if futures.len() == 1 {
-        let mut futs = futures;
-        return Ok(futs.remove(0).await);
-    }
     let mut state = RaceAllState {
         futures: futures.into_iter().map(Some).collect(),
     };
-    Ok(std::future::poll_fn(move |cx| state.poll(cx)).await)
+    wait::cancellable(cx, std::future::poll_fn(move |task| state.poll(cx, task))).await
 }
 
 /// Internal state for race_all concurrent polling.
@@ -354,12 +356,12 @@ struct RaceAllState<'a, T> {
 }
 
 impl<T> RaceAllState<'_, T> {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(&mut self, request_cx: &Cx, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
         for i in 0..self.futures.len() {
-            if let Some(val) = poll_slot(&mut self.futures[i], cx) {
+            if let Some(val) = wait::poll_active(request_cx, &mut self.futures[i], cx)? {
                 // Drop all remaining futures (cancellation).
                 self.futures.clear();
-                return Poll::Ready(val);
+                return Poll::Ready(Ok(val));
             }
         }
         Poll::Pending
@@ -401,7 +403,7 @@ pub async fn race_timeout<T: Send + 'static>(
         timeout: timeout_sleep(cx, timeout),
         request_cx: cx,
     };
-    std::future::poll_fn(move |task_cx| state.poll(task_cx)).await
+    wait::cancellable(cx, std::future::poll_fn(move |task| state.poll(task))).await
 }
 
 /// Internal state for race with timeout enforcement.
@@ -421,7 +423,7 @@ impl<T> RaceTimeoutState<'_, '_, T> {
         }
 
         for i in 0..self.futures.len() {
-            if let Some(val) = poll_slot(&mut self.futures[i], cx) {
+            if let Some(val) = wait::poll_active(self.request_cx, &mut self.futures[i], cx)? {
                 self.futures.clear();
                 return Poll::Ready(Ok(val));
             }
@@ -519,7 +521,7 @@ impl<T> QuorumResult<T> {
 /// }
 /// ```
 pub async fn quorum<T: Send + 'static>(
-    _cx: &Cx,
+    cx: &Cx,
     required: usize,
     futures: Vec<BoxFuture<'_, McpResult<T>>>,
 ) -> McpResult<QuorumResult<T>> {
@@ -549,7 +551,7 @@ pub async fn quorum<T: Send + 'static>(
         required,
         total,
     };
-    std::future::poll_fn(move |cx| state.poll(cx)).await
+    wait::cancellable(cx, std::future::poll_fn(move |task| state.poll(cx, task))).await
 }
 
 /// Internal state for quorum concurrent polling.
@@ -562,10 +564,10 @@ struct QuorumState<'a, T> {
 }
 
 impl<T> QuorumState<'_, T> {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
+    fn poll(&mut self, request_cx: &Cx, cx: &mut Context<'_>) -> Poll<McpResult<QuorumResult<T>>> {
         let max_allowed_failures = self.total - self.required;
         for i in 0..self.futures.len() {
-            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
+            if let Some(result) = wait::poll_active(request_cx, &mut self.futures[i], cx)? {
                 match result {
                     Ok(val) => self.successes.push(val),
                     Err(_) => self.failures += 1,
@@ -645,7 +647,7 @@ pub async fn quorum_timeout<T: Send + 'static>(
         timeout: timeout_sleep(cx, timeout),
         request_cx: cx,
     };
-    std::future::poll_fn(move |task_cx| state.poll(task_cx)).await
+    wait::cancellable(cx, std::future::poll_fn(move |task| state.poll(task))).await
 }
 
 /// Internal state for quorum with timeout enforcement.
@@ -662,7 +664,7 @@ impl<T> QuorumTimeoutState<'_, '_, T> {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
 
-        if let Poll::Ready(result) = self.quorum.poll(cx) {
+        if let Poll::Ready(result) = self.quorum.poll(self.request_cx, cx) {
             return Poll::Ready(result);
         }
 
@@ -700,7 +702,7 @@ impl<T> QuorumTimeoutState<'_, '_, T> {
 /// let result = first_ok(ctx.cx(), futures).await?;
 /// ```
 pub async fn first_ok<T: Send + 'static>(
-    _cx: &Cx,
+    cx: &Cx,
     futures: Vec<BoxFuture<'_, McpResult<T>>>,
 ) -> McpResult<T> {
     if futures.is_empty() {
@@ -714,7 +716,7 @@ pub async fn first_ok<T: Send + 'static>(
         futures: futures.into_iter().map(Some).collect(),
         last_error: None,
     };
-    std::future::poll_fn(move |cx| state.poll(cx)).await
+    wait::cancellable(cx, std::future::poll_fn(move |task| state.poll(cx, task))).await
 }
 
 /// Internal state for first-success concurrent polling.
@@ -724,9 +726,9 @@ struct FirstOkState<'a, T> {
 }
 
 impl<T> FirstOkState<'_, T> {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
+    fn poll(&mut self, request_cx: &Cx, cx: &mut Context<'_>) -> Poll<McpResult<T>> {
         for i in 0..self.futures.len() {
-            if let Some(result) = poll_slot(&mut self.futures[i], cx) {
+            if let Some(result) = wait::poll_active(request_cx, &mut self.futures[i], cx)? {
                 match result {
                     Ok(val) => {
                         // Found a success — drop all remaining futures.

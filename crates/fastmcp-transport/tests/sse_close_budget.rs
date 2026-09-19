@@ -97,6 +97,351 @@ fn expired_context() -> Cx {
     Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(asupersync::Time::ZERO))
 }
 
+mod ingress_budget {
+    use super::{CountingWriter, cancelled_context, expired_context};
+    use asupersync::Cx;
+    use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+    use fastmcp_transport::sse::{
+        LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink,
+        SseClientTransport, SseEvent, SseReader, SseServerTransport,
+    };
+    use fastmcp_transport::{Transport, TransportError, TransportRecvHalf, TransportSendHalf};
+    use std::io::{Cursor, Error, ErrorKind, Read};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct ReadEffects {
+        calls: usize,
+        bytes: usize,
+    }
+
+    #[derive(Default)]
+    struct ReadControl {
+        cancel_after_progress: Option<Cx>,
+        cancel_before_progress: Option<Cx>,
+        interrupt_once: bool,
+    }
+
+    struct ProbeReader {
+        input: Cursor<Vec<u8>>,
+        chunk: usize,
+        effects: Arc<Mutex<ReadEffects>>,
+        control: Arc<Mutex<ReadControl>>,
+    }
+
+    impl ProbeReader {
+        fn new(input: Vec<u8>, chunk: usize) -> Self {
+            assert!(chunk > 0);
+            Self {
+                input: Cursor::new(input),
+                chunk,
+                effects: Arc::new(Mutex::new(ReadEffects::default())),
+                control: Arc::new(Mutex::new(ReadControl::default())),
+            }
+        }
+    }
+
+    impl Read for ProbeReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.effects.lock().expect("read effects").calls += 1;
+            let mut control = self.control.lock().expect("read control");
+            if let Some(cx) = control.cancel_before_progress.take() {
+                cx.set_cancel_requested(true);
+                return Err(Error::from(ErrorKind::Interrupted));
+            }
+            if std::mem::take(&mut control.interrupt_once) {
+                return Err(Error::from(ErrorKind::Interrupted));
+            }
+            let limit = bytes.len().min(self.chunk);
+            let read = self.input.read(&mut bytes[..limit])?;
+            self.effects.lock().expect("read effects").bytes += read;
+            if let Some(cx) = control.cancel_after_progress.take() {
+                cx.set_cancel_requested(true);
+            }
+            Ok(read)
+        }
+    }
+
+    fn snapshot(effects: &Arc<Mutex<ReadEffects>>) -> ReadEffects {
+        effects.lock().expect("read effects").clone()
+    }
+
+    fn message_wire() -> Vec<u8> {
+        SseEvent::message(r#"{"jsonrpc":"2.0","id":41,"result":{"ok":true}}"#)
+            .to_bytes()
+            .expect("response event")
+    }
+
+    fn assert_response(message: JsonRpcMessage) {
+        let JsonRpcMessage::Response(response) = message else {
+            panic!("expected the original response");
+        };
+        let json = serde_json::to_value(response).expect("response JSON");
+        assert_eq!(json["id"], 41);
+        assert_eq!(json["result"]["ok"], true);
+    }
+
+    #[test]
+    fn reader_budget_refusal_consumes_nothing_and_preserves_the_first_event() {
+        for expired in [false, true] {
+            let probe = ProbeReader::new(b"data: retained\n\n".to_vec(), 2);
+            let effects = Arc::clone(&probe.effects);
+            let mut reader = SseReader::new(probe);
+            let cx = if expired {
+                expired_context()
+            } else {
+                cancelled_context()
+            };
+            let error = reader.read_event(&cx).expect_err("refuse exhausted budget");
+            assert!(matches!(
+                (&error, expired),
+                (TransportError::Timeout, true) | (TransportError::Cancelled, false)
+            ));
+            assert_eq!(snapshot(&effects), ReadEffects::default());
+            let event = reader
+                .read_event(&Cx::for_testing())
+                .expect("retry the same stream")
+                .expect("retained event");
+            assert_eq!(event.data, "retained");
+        }
+    }
+
+    #[test]
+    fn interrupted_read_retries_without_losing_the_event() {
+        let probe = ProbeReader::new(b"data: retained\n\n".to_vec(), usize::MAX);
+        probe.control.lock().expect("read control").interrupt_once = true;
+        let effects = Arc::clone(&probe.effects);
+        let mut reader = SseReader::new(probe);
+        let event = reader
+            .read_event(&Cx::for_testing())
+            .expect("Interrupted is not EOF or corrupt framing")
+            .expect("event");
+        assert_eq!(event.data, "retained");
+        assert_eq!(snapshot(&effects).calls, 2);
+    }
+
+    #[test]
+    fn interrupted_read_then_cancellation_without_progress_is_retryable() {
+        let cx = Cx::for_testing();
+        let probe = ProbeReader::new(b"data: retained\n\n".to_vec(), usize::MAX);
+        probe.control.lock().expect("read control").cancel_before_progress = Some(cx.clone());
+        let effects = Arc::clone(&probe.effects);
+        let mut reader = SseReader::new(probe);
+        assert!(matches!(reader.read_event(&cx), Err(TransportError::Cancelled)));
+        assert_eq!(snapshot(&effects), ReadEffects { calls: 1, bytes: 0 });
+        let event = reader
+            .read_event(&Cx::for_testing())
+            .expect("no consumed bytes means no abandoned parser state")
+            .expect("event");
+        assert_eq!(event.data, "retained");
+    }
+
+    #[test]
+    fn cancellation_inside_an_unterminated_line_stops_before_the_next_read() {
+        for cancel in [false, true] {
+            let cx = Cx::for_testing();
+            let probe = ProbeReader::new(b"data: first\n\ndata: second\n\n".to_vec(), 3);
+            probe.control.lock().expect("read control").cancel_after_progress =
+                cancel.then(|| cx.clone());
+            let effects = Arc::clone(&probe.effects);
+            let mut reader = SseReader::new(probe);
+            let result = reader.read_event(&cx);
+            if !cancel {
+                assert_eq!(result.expect("same reader without cancellation").expect("first").data, "first");
+                let second = reader.read_event(&cx).expect("read").expect("second");
+                assert_eq!(second.data, "second");
+                continue;
+            }
+            assert!(matches!(result, Err(TransportError::Cancelled)));
+            let stopped = snapshot(&effects);
+            assert_eq!(stopped, ReadEffects { calls: 1, bytes: 3 });
+            assert!(matches!(
+                reader.read_event(&Cx::for_testing()),
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(snapshot(&effects), stopped, "must not parse the abandoned suffix");
+        }
+    }
+
+    #[test]
+    fn cr_lf_and_crlf_boundaries_remain_chunk_invariant() {
+        let wire = b"id: 9\r\ndata: one\r\ndata: two\r\n\r\ndata: after\r\r";
+        for chunk in [1, 2, 3, wire.len()] {
+            let mut reader = SseReader::new(ProbeReader::new(wire.to_vec(), chunk));
+            let first = reader.read_event(&Cx::for_testing()).expect("read").expect("first");
+            assert_eq!(first.data, "one\ntwo", "chunk={chunk}");
+            assert_eq!(first.id.as_deref(), Some("9"));
+            let second = reader.read_event(&Cx::for_testing()).expect("read").expect("second");
+            assert_eq!(second.data, "after", "chunk={chunk}");
+            assert_eq!(second.id.as_deref(), Some("9"));
+            assert!(reader.read_event(&Cx::for_testing()).expect("EOF").is_none());
+        }
+    }
+
+    #[test]
+    fn generic_client_receive_keeps_an_unconsumed_timeout_retryable() {
+        let probe = ProbeReader::new(message_wire(), 3);
+        let effects = Arc::clone(&probe.effects);
+        let mut client = SseClientTransport::new(probe, Vec::<u8>::new());
+        assert!(matches!(client.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(snapshot(&effects), ReadEffects::default());
+        assert_response(client.recv(&Cx::for_testing()).expect("same response after timeout"));
+    }
+
+    #[test]
+    fn generic_client_endpoint_timeout_keeps_the_original_endpoint() {
+        let endpoint = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        let probe = ProbeReader::new(endpoint, 3);
+        let effects = Arc::clone(&probe.effects);
+        let mut client = SseClientTransport::new(probe, Vec::<u8>::new());
+        assert!(matches!(client.read_endpoint(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(snapshot(&effects), ReadEffects::default());
+        assert_eq!(
+            client.read_endpoint(&Cx::for_testing()).expect("retry").as_deref(),
+            Some("/original")
+        );
+    }
+
+    // This receive-only scenario must never attempt an outbound HTTP request.
+    struct NoPost;
+
+    impl LegacySsePostSink for NoPost {
+        fn post(&mut self, _cx: &Cx, _post: LegacySseMessagePost) -> Result<(), TransportError> {
+            panic!("receive and establish must not POST");
+        }
+    }
+
+    #[test]
+    fn exact_legacy_establish_and_receive_remain_retryable_before_progress() {
+        let mut wire = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        wire.extend(message_wire());
+        let probe = ProbeReader::new(wire, 3);
+        let effects = Arc::clone(&probe.effects);
+        let mut client = LegacySseClientTransport::new(probe, NoPost);
+        assert!(matches!(client.establish(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(snapshot(&effects), ReadEffects::default());
+        assert_eq!(client.advertised_endpoint(), None);
+        assert_eq!(client.establish(&Cx::for_testing()).expect("retry"), "/original");
+        let before_receive = snapshot(&effects);
+        assert!(matches!(client.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(snapshot(&effects), before_receive);
+        assert_response(client.recv(&Cx::for_testing()).expect("preserved response"));
+        assert_eq!(client.advertised_endpoint(), Some("/original"));
+    }
+
+    #[test]
+    fn exact_legacy_client_cannot_resume_an_abandoned_message() {
+        let mut wire = SseEvent::endpoint("/original").to_bytes().expect("endpoint");
+        wire.extend(message_wire());
+        let probe = ProbeReader::new(wire, 1);
+        let effects = Arc::clone(&probe.effects);
+        let control = Arc::clone(&probe.control);
+        let mut client = LegacySseClientTransport::new(probe, NoPost);
+        client.establish(&Cx::for_testing()).expect("establish");
+        let before = snapshot(&effects);
+        let cx = Cx::for_testing();
+        control.lock().expect("read control").cancel_after_progress = Some(cx.clone());
+        assert!(matches!(client.recv(&cx), Err(TransportError::Cancelled)));
+        let stopped = snapshot(&effects);
+        assert_eq!(stopped.calls, before.calls + 1);
+        assert_eq!(stopped.bytes, before.bytes + 1);
+        assert!(matches!(client.recv(&Cx::for_testing()), Err(TransportError::Closed)));
+        assert_eq!(snapshot(&effects), stopped);
+    }
+
+    struct CountedRequests {
+        requests: std::vec::IntoIter<JsonRpcRequest>,
+        advances: Arc<AtomicUsize>,
+    }
+
+    impl Iterator for CountedRequests {
+        type Item = JsonRpcRequest;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.advances.fetch_add(1, Ordering::SeqCst);
+            self.requests.next()
+        }
+    }
+
+    fn requests(advances: &Arc<AtomicUsize>) -> CountedRequests {
+        CountedRequests {
+            requests: vec![JsonRpcRequest::new("tools/list", None, 73_i64)].into_iter(),
+            advances: Arc::clone(advances),
+        }
+    }
+
+    fn assert_request(message: JsonRpcMessage) {
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected original request");
+        };
+        let json = serde_json::to_value(request).expect("request JSON");
+        assert_eq!(json["id"], 73);
+        assert_eq!(json["method"], "tools/list");
+    }
+
+    #[test]
+    fn server_ingress_timeout_does_not_advance_or_discard_a_request() {
+        let advances = Arc::new(AtomicUsize::new(0));
+        let mut server = SseServerTransport::new(Vec::<u8>::new(), requests(&advances), "/mcp");
+        assert!(matches!(server.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(advances.load(Ordering::SeqCst), 0);
+        assert_request(server.recv(&Cx::for_testing()).expect("retained request"));
+        assert_eq!(advances.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn split_server_ingress_timeout_does_not_advance_or_discard_a_request() {
+        let advances = Arc::new(AtomicUsize::new(0));
+        let (mut recv, _send) =
+            SseServerTransport::new(Vec::<u8>::new(), requests(&advances), "/mcp").into_split();
+        assert!(matches!(recv.recv(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(advances.load(Ordering::SeqCst), 0);
+        assert_request(recv.recv(&Cx::for_testing()).expect("retained request"));
+        assert_eq!(advances.load(Ordering::SeqCst), 1);
+    }
+
+    fn response() -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse::success(
+            73.into(),
+            serde_json::json!({"tools": []}),
+        ))
+    }
+
+    #[test]
+    fn refused_server_close_does_not_disable_ingress_or_egress() {
+        let advances = Arc::new(AtomicUsize::new(0));
+        let sink = CountingWriter::default();
+        let mut server = SseServerTransport::new(sink.clone(), requests(&advances), "/mcp");
+        assert!(matches!(server.close(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(sink.flushes(), 0);
+        assert!(sink.wrote_nothing());
+        assert_request(server.recv(&Cx::for_testing()).expect("close refusal preserved ingress"));
+        server.send(&Cx::for_testing(), &response()).expect("close refusal preserved egress");
+        assert_eq!(sink.flushes(), 2, "endpoint and response each committed once");
+        server.close(&Cx::for_testing()).expect("live close");
+        assert_eq!(sink.flushes(), 3);
+        server.close(&expired_context()).expect("terminal close stays idempotent");
+        assert_eq!(sink.flushes(), 3);
+    }
+
+    #[test]
+    fn refused_split_send_close_does_not_disable_egress() {
+        let advances = Arc::new(AtomicUsize::new(0));
+        let sink = CountingWriter::default();
+        let (_recv, mut send) =
+            SseServerTransport::new(sink.clone(), requests(&advances), "/mcp").into_split();
+        assert!(matches!(send.close(&expired_context()), Err(TransportError::Timeout)));
+        assert_eq!(sink.flushes(), 0);
+        assert!(sink.wrote_nothing());
+        send.send(&Cx::for_testing(), &response()).expect("close refusal preserved egress");
+        assert_eq!(sink.flushes(), 2);
+        send.close(&Cx::for_testing()).expect("live close");
+        send.close(&expired_context()).expect("idempotent close");
+        assert_eq!(sink.flushes(), 3);
+    }
+}
+
 /// The control: a live context commits and flushes exactly once.
 #[test]
 fn sse_close_under_a_live_context_commits_and_flushes() {
