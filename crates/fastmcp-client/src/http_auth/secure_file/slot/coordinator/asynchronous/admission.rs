@@ -34,28 +34,28 @@ pub(super) const CONTROL_BYTES: usize = 16 * 1024;
 pub struct CredentialIoLimits {
     maximum_slots: usize,
     maximum_operations: usize,
-    maximum_reserved_bytes: usize,
+    reserved_bytes: usize,
 }
 
 impl Default for CredentialIoLimits {
     fn default() -> Self {
-        Self { maximum_slots: 128, maximum_operations: 32, maximum_reserved_bytes: 16 * 1024 * 1024 }
+        Self { maximum_slots: 128, maximum_operations: 32, reserved_bytes: 16 * 1024 * 1024 }
     }
 }
 
 impl CredentialIoLimits {
     pub fn new(slots: usize, operations: usize, bytes: usize) -> Result<Self, CredentialIoError> {
         if slots == 0 || slots > MAX_SLOTS || operations == 0 || operations > MAX_OPERATIONS
-            || bytes < CONTROL_BYTES || bytes > MAX_RESERVED_BYTES
+            || !(CONTROL_BYTES..=MAX_RESERVED_BYTES).contains(&bytes)
         {
             return Err(CredentialIoError::InvalidLimits);
         }
-        Ok(Self { maximum_slots: slots, maximum_operations: operations, maximum_reserved_bytes: bytes })
+        Ok(Self { maximum_slots: slots, maximum_operations: operations, reserved_bytes: bytes })
     }
 
     pub fn maximum_slots(self) -> usize { self.maximum_slots }
     pub fn maximum_operations(self) -> usize { self.maximum_operations }
-    pub fn maximum_reserved_bytes(self) -> usize { self.maximum_reserved_bytes }
+    pub fn maximum_reserved_bytes(self) -> usize { self.reserved_bytes }
 }
 
 /// One coherent, non-secret view of the lane. Slot owners include those held
