@@ -80,6 +80,8 @@ pub enum ManagedInteractionError {
     NotAwaitingInput,
     InputPending,
     InvalidInputResponses,
+    /// A proper subset needs server-owned state to retain the accepted answers.
+    PartialStateRequired,
     CapabilityNotAdvertised,
     ContinuationLimit,
     InputLimit,
@@ -98,6 +100,7 @@ impl fmt::Display for ManagedInteractionError {
             Self::NotAwaitingInput => "interaction is not awaiting input",
             Self::InputPending => "interaction requires explicit host input before another response read",
             Self::InvalidInputResponses => "answers do not match the current input-required result",
+            Self::PartialStateRequired => "partial answers require a nonempty server continuation state",
             Self::CapabilityNotAdvertised => "input-required result requests an unadvertised client capability",
             Self::ContinuationLimit => "interaction continuation limit exceeded",
             Self::InputLimit => "interaction input-response limit exceeded",
@@ -258,10 +261,45 @@ impl ManagedInteraction {
     /// A manually observed pending challenge can be handed to `drive`; a
     /// previously delivered final result is never delivered a second time.
     pub async fn drive<R, F, N>(
+        self,
+        cx: &Cx,
+        resolve: R,
+        notify: N,
+    ) -> Result<Box<CoreResult>, ManagedInteractionError>
+    where
+        R: FnMut(Box<InputRequiredResult>) -> F,
+        F: Future<Output = Result<ManagedInputReply, ManagedInteractionError>>,
+        N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
+    {
+        self.drive_selected(cx, resolve, notify, InputSelection::Complete).await
+    }
+
+    /// Drives an operation whose host may answer only some inputs per round.
+    /// Each callback authorizes only the returned answers; omitted inputs are
+    /// neither resolved nor given synthetic cancellation/error responses.
+    /// State-only and present-empty challenges retain the `drive` contract.
+    /// Nonempty proper subsets require server-issued continuation state.
+    /// All callback, continuation, byte and lifetime bounds span the full run.
+    pub async fn drive_partial<R, F, N>(
+        self,
+        cx: &Cx,
+        resolve: R,
+        notify: N,
+    ) -> Result<Box<CoreResult>, ManagedInteractionError>
+    where
+        R: FnMut(Box<InputRequiredResult>) -> F,
+        F: Future<Output = Result<ManagedInputReply, ManagedInteractionError>>,
+        N: FnMut(Box<ServerNotification>) -> Result<(), ManagedInteractionError>,
+    {
+        self.drive_selected(cx, resolve, notify, InputSelection::Partial).await
+    }
+
+    async fn drive_selected<R, F, N>(
         mut self,
         cx: &Cx,
         mut resolve: R,
         mut notify: N,
+        selection: InputSelection,
     ) -> Result<Box<CoreResult>, ManagedInteractionError>
     where
         R: FnMut(Box<InputRequiredResult>) -> F,
@@ -287,7 +325,12 @@ impl ManagedInteraction {
                         Ok(resolve(input).await)
                     }).await??;
                     self.check(cx)?;
-                    self.resume(cx, reply.request_id, reply.input_responses).await?;
+                    // Absence/empty presence keep their strict meaning. Only
+                    // a nonempty response map can opt into partial progress.
+                    let selected = if reply.input_responses.as_ref().is_some_and(|answers| !answers.is_empty()) {
+                        selection
+                    } else { InputSelection::Complete };
+                    self.resume_selected(cx, reply.request_id, reply.input_responses, selected).await?;
                 }
                 ManagedInteractionEvent::Complete(result) => return Ok(result),
             }
@@ -362,6 +405,35 @@ impl ManagedInteraction {
         request_id: RequestId,
         responses: Option<FinalInputResponses>,
     ) -> Result<(), ManagedInteractionError> {
+        self.resume_selected(cx, request_id, responses, InputSelection::Complete).await
+    }
+
+    /// Submits a nonempty subset of the current challenge's answers. Unselected
+    /// inputs are not fabricated, executed, or retained as local answers. The
+    /// next response determines the remaining challenge and its successor state.
+    /// A proper subset requires a nonempty server-issued requestState; without
+    /// it the server has supplied no continuation custody for omitted answers.
+    /// Supplying all answers remains valid, including for a stateless challenge.
+    ///
+    /// This uses the same bounded, one-attempt dispatch as `resume`. Local
+    /// validation failures preserve the original challenge. A lost response or
+    /// an abandoned send never authorizes another attempt with the old state.
+    pub async fn resume_partial(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+        responses: FinalInputResponses,
+    ) -> Result<(), ManagedInteractionError> {
+        self.resume_selected(cx, request_id, Some(responses), InputSelection::Partial).await
+    }
+
+    async fn resume_selected(
+        &mut self,
+        cx: &Cx,
+        request_id: RequestId,
+        responses: Option<FinalInputResponses>,
+        selection: InputSelection,
+    ) -> Result<(), ManagedInteractionError> {
         self.check(cx)?;
         let Some(Step::Awaiting(input)) = &self.step else {
             return Err(if self.step.is_none() {
@@ -373,7 +445,7 @@ impl ManagedInteraction {
         admit_fresh_id(&self.used_ids, &request_id)?;
         // All fallible local validation happens before consuming the challenge.
         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
-        let next = continuation_request(&self.original, input, responses)?;
+        let next = continuation_request_selected(&self.original, input, responses, selection)?;
         let (wire, mut decoder) = prepare(
             self.session.resource().as_str(), next, request_id.clone(), self.limits.core,
         )?;
@@ -491,11 +563,57 @@ pub(crate) fn continuation_request(
     input: &InputRequiredResult,
     responses: Option<FinalInputResponses>,
 ) -> Result<CoreRequest, ManagedInteractionError> {
-    match (input.input_requests(), responses.as_ref()) {
-        (None, None) => {},
-        (Some(_), Some(responses)) => responses.validate_against_input_required(input)
-            .map_err(|_| ManagedInteractionError::InvalidInputResponses)?,
-        _ => return Err(ManagedInteractionError::InvalidInputResponses),
+    continuation_request_selected(original, input, responses, InputSelection::Complete)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum InputSelection { Complete, Partial }
+
+/// Validate only correlation/shape, never invoke a resolver or manufacture
+/// answers for omitted inputs. The interaction already admitted capabilities
+/// and the entire challenge before making it available to the host.
+pub(crate) fn validate_partial_responses(
+    input: &InputRequiredResult,
+    responses: &FinalInputResponses,
+) -> Result<(), ManagedInteractionError> {
+    let requests = input.input_requests().ok_or(ManagedInteractionError::InvalidInputResponses)?;
+    if responses.is_empty() || responses.len() > requests.members().len()
+        || requests.members().len() > MAX_INPUTS_PER_ROUND
+    {
+        return Err(ManagedInteractionError::InvalidInputResponses);
+    }
+    for (key, response) in responses.entries() {
+        let request = requests.get(key).ok_or(ManagedInteractionError::InvalidInputResponses)?;
+        let request = exact_json_to_serde(request).map_err(|_| ManagedInteractionError::InvalidInputResponses)?;
+        let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(request)
+            .map_err(|_| ManagedInteractionError::InvalidInputResponses)?;
+        if !response.matches_kind(descriptor.response_kind()) {
+            return Err(ManagedInteractionError::InvalidInputResponses);
+        }
+    }
+    if responses.len() < requests.members().len()
+        && input.request_state().is_none_or(str::is_empty)
+    {
+        return Err(ManagedInteractionError::PartialStateRequired);
+    }
+    Ok(())
+}
+
+pub(crate) fn continuation_request_selected(
+    original: &CoreRequest,
+    input: &InputRequiredResult,
+    responses: Option<FinalInputResponses>,
+    selection: InputSelection,
+) -> Result<CoreRequest, ManagedInteractionError> {
+    if matches!(selection, InputSelection::Partial) {
+        validate_partial_responses(input, responses.as_ref().ok_or(ManagedInteractionError::InvalidInputResponses)?)?;
+    } else {
+        match (input.input_requests(), responses.as_ref()) {
+            (None, None) => {},
+            (Some(_), Some(responses)) => responses.validate_against_input_required(input)
+                .map_err(|_| ManagedInteractionError::InvalidInputResponses)?,
+            _ => return Err(ManagedInteractionError::InvalidInputResponses),
+        }
     }
     let mut next = original.clone();
     let state = input.request_state().map(str::to_owned);
@@ -634,5 +752,107 @@ mod tests {
         assert!(matches!(validate_initial(&request("tools/list", json!({}), json!({}))), Err(ManagedInteractionError::InvalidInitialRequest)));
         assert!(ManagedInteractionLimits::new(ManagedCoreLimits::default(), 65, 1).is_err());
         assert!(ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 1025).is_err());
+    }
+
+    fn two_inputs(original: &CoreRequest, state: Option<&str>) -> InputRequiredResult {
+        let mut value = json!({"resultType":"input_required", "inputRequests":{
+            "one":{"method":"roots/list"}, "two":{"method":"roots/list"}
+        }});
+        if let Some(state) = state { value["requestState"] = json!(state); }
+        input(original, &value.to_string())
+    }
+
+    #[test]
+    fn partial_answers_advance_all_three_methods_without_rewriting_original_fields() {
+        for (method, params) in [
+            ("tools/call", json!({"name":"echo","arguments":{"x":1}})),
+            ("resources/read", json!({"uri":"file:///unchanged/%2F"})),
+            ("prompts/get", json!({"name":"prompt","arguments":{"subject":"same"}})),
+        ] {
+            let original = request(method, params, json!({"roots":{}}));
+            let before = original.encode_params().unwrap().unwrap();
+            let challenge = two_inputs(&original, Some("  opaque\0  "));
+            let supplied = answers(json!({"two":{"roots":[]}}));
+            assert!(continuation_request(&original, &challenge, Some(supplied.clone())).is_err(),
+                "the existing exhaustive API must not silently become partial");
+            let next = continuation_request_selected(&original, &challenge, Some(supplied), InputSelection::Partial).unwrap();
+            let mut encoded = next.encode_params().unwrap().unwrap();
+            assert_eq!(encoded["inputResponses"], json!({"two":{"roots":[]}}));
+            assert_eq!(encoded["requestState"], "  opaque\0  ");
+            encoded.as_object_mut().unwrap().remove("inputResponses");
+            encoded.as_object_mut().unwrap().remove("requestState");
+            assert_eq!(encoded, before);
+            assert_eq!(original.encode_params().unwrap().unwrap(), before);
+            assert_eq!(challenge.input_requests().unwrap().members().len(), 2);
+        }
+    }
+
+    #[test]
+    fn proper_subsets_require_state_but_complete_answers_do_not() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
+        for state in [None, Some("")] {
+            let challenge = two_inputs(&original, state);
+            assert!(matches!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))),
+                Err(ManagedInteractionError::PartialStateRequired)));
+            assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]},"two":{"roots":[]}}))).is_ok());
+        }
+        // Opaque whitespace is not a missing handle and must not be trimmed.
+        assert!(validate_partial_responses(&two_inputs(&original, Some(" ")), &answers(json!({"one":{"roots":[]}}))).is_ok());
+    }
+
+    #[test]
+    fn partial_admission_rejects_empty_foreign_and_wrong_kind_answers() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
+        let challenge = two_inputs(&original, Some("state"));
+        for wire in [json!({}), json!({"other":{"roots":[]}}), json!({"one":{"action":"decline"}}),
+            json!({"one":{"roots":[]},"two":{"roots":[]},"other":{"roots":[]}})]
+        {
+            assert!(matches!(validate_partial_responses(&challenge, &answers(wire)),
+                Err(ManagedInteractionError::InvalidInputResponses)));
+            assert_eq!(challenge.request_state(), Some("state"));
+            assert_eq!(challenge.input_requests().unwrap().members().len(), 2);
+        }
+        assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))).is_ok());
+    }
+
+    #[test]
+    fn partial_resume_never_synthesizes_state_only_or_empty_map_responses() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({}));
+        for source in [r#"{"resultType":"input_required","requestState":"state"}"#,
+            r#"{"resultType":"input_required","inputRequests":{},"requestState":"state"}"#]
+        {
+            let challenge = input(&original, source);
+            assert!(validate_partial_responses(&challenge, &answers(json!({}))).is_err());
+            assert!(validate_partial_responses(&challenge, &answers(json!({"one":{"roots":[]}}))).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_round_uses_successor_state_and_does_not_resend_accepted_answers() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
+        let first = two_inputs(&original, Some("first-state"));
+        let _ = continuation_request_selected(&original, &first,
+            Some(answers(json!({"one":{"roots":[]}}))), InputSelection::Partial).unwrap();
+        let second = input(&original, r#"{"resultType":"input_required","inputRequests":{"two":{"method":"roots/list"}},"requestState":"second-state"}"#);
+        assert!(validate_partial_responses(&second, &answers(json!({"one":{"roots":[]}}))).is_err());
+        let next = continuation_request_selected(&original, &second,
+            Some(answers(json!({"two":{"roots":[]}}))), InputSelection::Partial).unwrap().encode_params().unwrap().unwrap();
+        assert_eq!(next["requestState"], "second-state");
+        assert_eq!(next["inputResponses"], json!({"two":{"roots":[]}}));
+        let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 2, 2).unwrap();
+        assert!(admit_challenge(&original, &second, limits, 1, 1).is_ok());
+        assert!(matches!(admit_challenge(&original, &second, limits, 2, 1), Err(ManagedInteractionError::ContinuationLimit)));
+        assert!(matches!(admit_challenge(&original, &second, limits, 1, 2), Err(ManagedInteractionError::InputLimit)));
+    }
+
+    #[test]
+    fn partial_answer_wire_order_is_preserved_and_duplicate_keys_are_refused() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{}}));
+        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"a":{"method":"roots/list"},"m":{"method":"roots/list"},"z":{"method":"roots/list"}},"requestState":"state"}"#);
+        let responses: FinalInputResponses = serde_json::from_str(r#"{"z":{"roots":[]},"a":{"roots":[]}}"#).unwrap();
+        validate_partial_responses(&challenge, &responses).unwrap();
+        assert_eq!(responses.entries().iter().map(|(name,_)| name.as_str()).collect::<Vec<_>>(), ["z","a"]);
+        assert_eq!(serde_json::to_string(&responses).unwrap(), r#"{"z":{"roots":[]},"a":{"roots":[]}}"#);
+        assert!(serde_json::from_str::<FinalInputResponses>(r#"{"z":{"roots":[]},"z":{"roots":[]}}"#).is_err());
     }
 }
