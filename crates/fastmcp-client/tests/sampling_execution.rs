@@ -462,7 +462,8 @@ mod embedded_inputs {
         SamplingInputError, SamplingInputLimits, resolve_sampling_inputs,
     };
     use fastmcp_protocol::{
-        ExactJsonValue, FinalEmbeddedInputRequest, InputRequiredResult, RequestId, parse_exact_json,
+        ExactJsonValue, FinalEmbeddedInputRequest, InputRequiredResult, RequestId, ResultMeta,
+        parse_exact_json,
     };
 
     fn descriptor() -> String {
@@ -474,7 +475,13 @@ mod embedded_inputs {
             ExactJsonValue::Object(map) => map,
             _ => panic!("test descriptors must be an object"),
         });
-        InputRequiredResult::new(map, state.map(str::to_owned), Default::default()).unwrap()
+        // bd-seclh: `ResultMeta::empty()` rather than `Default` — the same value
+        // (all three fields None), with the intent named. Its doc states the wire
+        // consequence: "preserves the absence of the optional `_meta` member".
+        // No assertion in this file reads result metadata, so empty is correct
+        // here and not merely compiling. 54 sites use the named constructors;
+        // this was the only `Default`.
+        InputRequiredResult::new(map, state.map(str::to_owned), ResultMeta::empty()).unwrap()
     }
 
     fn two_inputs() -> String {
