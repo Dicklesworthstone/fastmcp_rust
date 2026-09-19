@@ -660,7 +660,7 @@ fn auth_00_a_positive() {
         DEFAULT_MAXIMUM_STALENESS
     );
     assert_eq!(DEFAULT_MAXIMUM_STALENESS, Duration::from_secs(30));
-    assert_eq!(HARD_MAXIMUM_STALENESS, Duration::from_secs(5 * 60));
+    assert_eq!(HARD_MAXIMUM_STALENESS, Duration::from_mins(5));
     assert_eq!(rotation.dispatch(), RevalidationDispatch::Dispatched);
     assert!(
         rotation.is_fresh_after(Duration::from_secs(29)),
