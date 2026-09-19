@@ -22,6 +22,7 @@ fn session() -> ManagedOAuthSession {
             policy: OAuthSessionPolicy::default(),
             state: Arc::new(Mutex::new(None)),
             closed: McpRequestCancellation::new(),
+            logout_handoff: std::sync::atomic::AtomicBool::new(false),
             pending: AtomicUsize::new(0),
         }),
     }

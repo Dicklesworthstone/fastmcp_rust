@@ -33,6 +33,9 @@ use serde::{Deserialize, Deserializer};
 
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 
+/// RFC 7009 remote token revocation for explicitly trusted native clients.
+pub mod revocation;
+
 const CALLBACK_PATH: &str = "/oauth/callback";
 const STATE_DOMAIN: &[u8] = b"fastmcp/oauth-loopback-state/v1\0";
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
@@ -109,6 +112,7 @@ pub struct OAuthClientConfiguration {
     issuer: String,
     authorization_endpoint: CanonicalHttpUrl,
     token_endpoint: CanonicalHttpUrl,
+    revocation_endpoint: Option<CanonicalHttpUrl>,
     resource: CanonicalHttpUrl,
     client_id: String,
     scopes: Vec<String>,
@@ -164,6 +168,7 @@ impl OAuthClientConfiguration {
             issuer,
             authorization_endpoint,
             token_endpoint,
+            revocation_endpoint: None,
             resource,
             client_id,
             scopes,

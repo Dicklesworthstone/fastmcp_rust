@@ -489,8 +489,9 @@ impl OAuthDiscoveryPlan {
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         let (authorization, token) = self.admit_issuer_endpoints(issuer, body)?;
+        let revocation = self.admit_revocation_endpoint(issuer, body)?;
         self.configure_client(
-            issuer, authorization, token,
+            issuer, authorization, token, revocation,
             self.client_id.as_deref().ok_or(OAuthDiscoveryError::InvalidPolicy)?,
         )
     }
@@ -500,12 +501,17 @@ impl OAuthDiscoveryPlan {
         issuer: &TrustedOAuthIssuer,
         authorization: CanonicalHttpUrl,
         token: CanonicalHttpUrl,
+        revocation: Option<CanonicalHttpUrl>,
         client_id: &str,
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         let mut configuration = OAuthClientConfiguration::from_trusted_endpoints(
             issuer.identifier.clone(), authorization, token, self.resource.clone(),
             client_id, self.scopes.clone(),
         ).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+        if let Some(endpoint) = revocation {
+            configuration = configuration.with_trusted_revocation_endpoint(endpoint)
+                .map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
+        }
         for root in &issuer.roots {
             configuration = configuration.with_extra_root_certificate(root.clone())
                 .map_err(|_| OAuthDiscoveryError::InvalidPolicy)?;
@@ -551,6 +557,26 @@ impl OAuthDiscoveryPlan {
         }
         admit_scopes(&self.scopes, metadata.scopes_supported.as_deref())?;
         Ok((issuer.endpoint(&metadata.authorization_endpoint)?, issuer.endpoint(&metadata.token_endpoint)?))
+    }
+
+    // Revocation is optional for login. Only advertise it to the runtime when
+    // metadata explicitly says a public client may use the endpoint without a
+    // client secret. If that claim exists, the endpoint must pass the same
+    // explicit issuer-origin trust boundary as authorization/token endpoints.
+    fn admit_revocation_endpoint(
+        &self,
+        issuer: &TrustedOAuthIssuer,
+        body: &[u8],
+    ) -> Result<Option<CanonicalHttpUrl>, OAuthDiscoveryError> {
+        let metadata: IssuerMetadata = decode_metadata(body)?;
+        validate_optional_array(metadata.revocation_endpoint_auth_methods_supported.as_deref())?;
+        let Some(endpoint) = metadata.revocation_endpoint else { return Ok(None); };
+        if !metadata.revocation_endpoint_auth_methods_supported.as_ref()
+            .is_some_and(|methods| has(methods, "none"))
+        {
+            return Ok(None);
+        }
+        Ok(Some(issuer.endpoint(&endpoint)?))
     }
 }
 
@@ -698,6 +724,10 @@ struct IssuerMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    #[serde(default, deserialize_with = "present")]
+    revocation_endpoint: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    revocation_endpoint_auth_methods_supported: Option<Vec<String>>,
     response_types_supported: Vec<String>,
     #[serde(default, deserialize_with = "present")]
     grant_types_supported: Option<Vec<String>>,
@@ -949,6 +979,37 @@ mod tests {
             document.as_object_mut().unwrap().remove(member);
             assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::UnsupportedFlow)));
         }
+    }
+
+    #[test]
+    fn public_client_revocation_endpoint_requires_explicit_none_and_origin_trust() {
+        let mut plan = plan();
+        let mut document = issuer_document();
+        document["revocation_endpoint"] = json!("https://issuer.example/revoke");
+        document["revocation_endpoint_auth_methods_supported"] = json!(["none"]);
+        let configuration = admit(&plan, &document).unwrap();
+        assert_eq!(
+            configuration.revocation_endpoint().map(CanonicalHttpUrl::as_str),
+            Some("https://issuer.example/revoke"),
+        );
+
+        document["revocation_endpoint_auth_methods_supported"] = json!(["client_secret_basic"]);
+        assert!(admit(&plan, &document).unwrap().revocation_endpoint().is_none());
+        document.as_object_mut().unwrap().remove("revocation_endpoint_auth_methods_supported");
+        assert!(admit(&plan, &document).unwrap().revocation_endpoint().is_none());
+
+        document["revocation_endpoint_auth_methods_supported"] = json!(["none"]);
+        document["revocation_endpoint"] = json!("https://tokens.example/revoke");
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::EndpointNotTrusted)));
+        plan.issuers[0] = plan.issuers[0].clone()
+            .with_endpoint_origin(url("https://tokens.example/")).unwrap();
+        assert_eq!(
+            admit(&plan, &document).unwrap().revocation_endpoint().map(CanonicalHttpUrl::as_str),
+            Some("https://tokens.example/revoke"),
+        );
+
+        document["revocation_endpoint"] = serde_json::Value::Null;
+        assert!(matches!(admit(&plan, &document), Err(OAuthDiscoveryError::InvalidMetadata)));
     }
 
     #[test]

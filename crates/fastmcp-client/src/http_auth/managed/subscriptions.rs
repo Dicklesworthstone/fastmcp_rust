@@ -718,7 +718,7 @@ mod tests {
                     inner: Arc::new(SessionInner {
                         client: OAuthClient::new(config), resource: resource.clone(),
                         policy: OAuthSessionPolicy::default(), state: Arc::new(Mutex::new(None)),
-                        closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
+                        closed: McpRequestCancellation::new(), logout_handoff: std::sync::atomic::AtomicBool::new(false), pending: AtomicUsize::new(0),
                     }),
                 };
                 let expiry = Instant::now() + Duration::from_secs(60);

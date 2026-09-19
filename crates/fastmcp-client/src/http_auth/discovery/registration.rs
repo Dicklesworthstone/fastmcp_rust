@@ -179,6 +179,7 @@ impl NativeClientRegistration {
         }
         let (issuer, body) = self.discovery.discover_issuer_document(cx, deadline).await?;
         let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, &body)?;
+        let revocation = self.discovery.admit_revocation_endpoint(issuer, &body)?;
         let (endpoint, grants) = self.registration_endpoint(issuer, &body)?;
         let payload = self.request_body(&grants)?;
         let headers = self.request_headers(&endpoint)?;
@@ -207,7 +208,9 @@ impl NativeClientRegistration {
             return Err(OAuthRegistrationError::ResponseRejected);
         }
         let client_id = self.admit_response(&response.body, &grants)?;
-        let configuration = self.discovery.configure_client(issuer, authorization, token, &client_id)?;
+        let configuration = self.discovery.configure_client(
+            issuer, authorization, token, revocation, &client_id,
+        )?;
         check_context(cx, deadline)?;
         Ok(RegisteredNativeClient { client_id, configuration })
     }

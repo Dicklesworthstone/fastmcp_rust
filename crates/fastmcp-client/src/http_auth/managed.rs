@@ -13,7 +13,7 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,8 @@ use crate::http_executor::{
 };
 use crate::sse::SseLimits;
 
+/// Explicit logout with remote issuer revocation and local session closure.
+pub mod logout;
 /// Typed core subscriptions retaining managed cancellation and token lifetime.
 pub mod subscriptions;
 /// Official Tasks execution with credential-bound live discovery.
@@ -225,6 +227,9 @@ struct SessionInner {
     policy: OAuthSessionPolicy,
     state: Arc<Mutex<Option<GrantState>>>,
     closed: McpRequestCancellation,
+    // True only while logout owns the right to recover a refresh-held grant
+    // after closing snapshot admission.
+    logout_handoff: AtomicBool,
     pending: AtomicUsize,
 }
 
@@ -280,6 +285,7 @@ impl ManagedOAuthSession {
                     credentials, renew_after, generation: 1, renewal_failed: false,
                 }))),
                 closed: McpRequestCancellation::new(),
+                logout_handoff: AtomicBool::new(false),
                 pending: AtomicUsize::new(0),
             }),
         })
@@ -297,6 +303,10 @@ impl ManagedOAuthSession {
     /// be recalled. An unpolled response is released on its next poll or drop;
     /// no background task is created to drive abandoned work. Grant disposal is
     /// best effort while another caller retains its lock.
+    ///
+    /// Use [`Self::logout`] when the trusted issuer advertised an RFC 7009
+    /// revocation endpoint and remote invalidation should be attempted before
+    /// the in-memory grant is discarded.
     pub fn close(&self) {
         self.inner.closed.cancel();
         if let Ok(mut state) = self.inner.state.try_lock_owned() {
@@ -323,7 +333,11 @@ impl ManagedOAuthSession {
         self.await_active(cx, cancellation, deadline, None, async {
             let guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
                 .await.map_err(|_| OAuthSessionError::StateUnavailable)?;
-            let mut guard = SessionGuard { guard, closed: &self.inner.closed };
+            let mut guard = SessionGuard {
+                guard,
+                closed: &self.inner.closed,
+                logout_handoff: &self.inner.logout_handoff,
+            };
             self.check(cx, cancellation)?;
             let state = guard.as_mut().ok_or(OAuthSessionError::Closed)?;
             if state.renewal_failed || state.credentials.bearer_credential().is_revoked() {
@@ -630,6 +644,7 @@ impl Drop for PendingPermit<'_> {
 struct SessionGuard<'a> {
     guard: OwnedMutexGuard<Option<GrantState>>,
     closed: &'a McpRequestCancellation,
+    logout_handoff: &'a AtomicBool,
 }
 
 impl Deref for SessionGuard<'_> {
@@ -643,7 +658,9 @@ impl DerefMut for SessionGuard<'_> {
 
 impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
-        if self.closed.is_cancel_requested() {
+        if self.closed.is_cancel_requested()
+            && !self.logout_handoff.load(Ordering::Acquire)
+        {
             *self.guard = None;
         }
     }
@@ -725,7 +742,8 @@ mod tests {
                 client: OAuthClient::new(configuration), resource,
                 policy: OAuthSessionPolicy::default(),
                 state: Arc::new(Mutex::new(None)),
-                closed: McpRequestCancellation::new(), pending: AtomicUsize::new(0),
+                closed: McpRequestCancellation::new(),
+                logout_handoff: AtomicBool::new(false), pending: AtomicUsize::new(0),
             }),
         }
     }
