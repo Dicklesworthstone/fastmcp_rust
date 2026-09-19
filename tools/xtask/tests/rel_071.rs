@@ -59,6 +59,33 @@ fn rel_071_positive() {
     assert_eq!(observations.version, "0.7.1");
     assert_eq!(observations.required_file_count, 77);
 
+    // The four lawful categories are BOUND, not merely mentioned. Workflow runs
+    // and environments are permanent RULE 0.5 exclusions and are deliberately
+    // absent from this record; they are not pending work.
+    assert_eq!(
+        observations.release.tag, "v0.7.1",
+        "category: repository tag"
+    );
+    assert_eq!(
+        observations.release.required_asset_count, 16,
+        "category: GitHub release/assets"
+    );
+    assert_eq!(
+        observations.credential_presence.required_entry_count, 4,
+        "category: credential-presence metadata"
+    );
+    // The anchor is what keeps the digest columns from being the release
+    // restating its own manifest.
+    assert!(
+        observations
+            .release
+            .assets
+            .iter()
+            .any(|asset| asset.name == observations.release.anchored_asset
+                && asset.independently_verified),
+        "one asset must be independently recomputed"
+    );
+
     let disposition = rel_071::evaluate(&observations);
 
     assert!(
@@ -159,11 +186,72 @@ fn rel_071_planted_negative() {
         refused_c.render()
     );
 
-    // The accepted row is re-evaluated last and must still be admitted, so the
-    // three refusals above cannot be explained by the evaluator having become
-    // unable to admit anything.
-    assert!(
-        rel_071::evaluate(&accepted).admitted(),
-        "the accepted row must still be admitted after the planted arms"
+    // ARM D — one release asset removed. Same "removes one required
+    // observation" arm, over the release/assets category.
+    let mut arm_d = load();
+    let dropped_asset = arm_d.release.assets.remove(0);
+    let refused_d = rel_071::evaluate(&arm_d);
+    assert_eq!(
+        refused_d.codes(),
+        vec![Code::ReleaseAssetMissing],
+        "dropping asset {} must refuse for exactly that reason:\n{}",
+        dropped_asset.name,
+        refused_d.render()
+    );
+
+    // ARM E — the anchor withdrawn. Without an independently recomputed digest
+    // the release's digest columns are only the release restating itself, and
+    // the evaluator must say so rather than admitting a self-witnessing record.
+    let mut arm_e = load();
+    for asset in &mut arm_e.release.assets {
+        asset.independently_verified = false;
+    }
+    let refused_e = rel_071::evaluate(&arm_e);
+    assert_eq!(
+        refused_e.codes(),
+        vec![Code::NoAnchoredAsset],
+        "an unanchored record must be refused:\n{}",
+        refused_e.render()
+    );
+
+    // ARM F — a credential VALUE planted where only presence belongs. The
+    // record must refuse to carry it, so that a fixture which starts leaking
+    // fails loudly instead of being published.
+    let mut arm_f = load();
+    arm_f.credential_presence.entries[2].detail =
+        Some("gho_EXAMPLENOTAREALTOKENVALUE0000000000".to_owned());
+    let refused_f = rel_071::evaluate(&arm_f);
+    assert_eq!(
+        refused_f.codes(),
+        vec![Code::CredentialValueDisclosed],
+        "a credential value must be refused, not recorded:\n{}",
+        refused_f.render()
+    );
+
+    // ARM G — the commit field emptied. Equality alone would admit this: two
+    // empty strings compare equal. Only the shape gate catches it.
+    let mut arm_g = load();
+    arm_g.vcs_sha1 = String::new();
+    arm_g.tag_commit = String::new();
+    assert_eq!(
+        arm_g.vcs_sha1, arm_g.tag_commit,
+        "the two fields are still EQUAL; only their shape is wrong"
+    );
+    let refused_g = rel_071::evaluate(&arm_g);
+    assert_eq!(
+        refused_g.codes(),
+        vec![Code::MalformedCommit],
+        "equal-but-malformed commits must be refused:\n{}",
+        refused_g.render()
+    );
+
+    // The accepted row is re-evaluated last and must still be admitted, and its
+    // disposition must be BYTE-FOR-BYTE what arm 0 produced — not merely
+    // admitted. A disposition that changed while staying admitted would
+    // otherwise pass unnoticed.
+    assert_eq!(
+        rel_071::evaluate(&accepted),
+        accepted_disposition,
+        "the accepted disposition must be unchanged after the planted arms"
     );
 }
