@@ -990,3 +990,392 @@ fn fnd_01_a_workspace_snapshot_describes_this_repository() {
         present_forbidden.join("\n"),
     );
 }
+
+// ===========================================================================
+// bd-fnd01-anchoring-false-attestation-44sow
+// WORKSPACE-INPUT PROVENANCE: the REVISION anchor.
+// ===========================================================================
+
+/// The frozen verifier that DECLARES the workspace-input bindings.
+///
+/// READ, NEVER WRITTEN. That path is `ordered_paths[1]` (policy `:284`) and
+/// `authoring_write_paths[1]` under `authoring_owner = ahet.1.14` (`:2850`),
+/// so a byte change there resets the authoring quiet window and belongs to
+/// that bead alone. This file is named in the policy only in a comment
+/// (`:230`) and in none of those lists, which is why the check lives here.
+///
+/// ITS TEXT IS PARSED RATHER THAN ITS VALUES COPIED. A re-declared copy would
+/// satisfy this test while silently drifting from the table actually in force
+/// — and the module contract above forbids anchoring an assertion to a
+/// constant copied from the artifact under test (RH-5). Parsing keeps the two
+/// sides of every comparison in different artifacts: the declaration on one
+/// side, Git object storage on the other.
+const WORKSPACE_INPUT_DECLARATION_SOURCE: &str =
+    "crates/fastmcp/tests/fnd_01_dependency_evidence.rs";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceInputRow {
+    path: String,
+    byte_length: usize,
+    sha256: String,
+    revision: String,
+}
+
+/// Splits one tuple-literal row into its fields, respecting quotes.
+///
+/// Underscores are NOT stripped here: `7_224` is a numeric separator but a
+/// path may legitimately contain `_`, and a blanket strip would corrupt the
+/// join key. The caller strips them from the field it parses as a number.
+fn parse_tuple_fields(row: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for character in row.chars() {
+        match character {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => fields.push(std::mem::take(&mut current)),
+            _ if in_quotes || !character.is_whitespace() => current.push(character),
+            _ => {}
+        }
+    }
+    fields.push(current);
+    fields
+        .into_iter()
+        .map(|field| field.trim().to_owned())
+        .filter(|field| !field.is_empty())
+        .collect()
+}
+
+/// Extracts the tuple rows of a `const <name>: [...; N] = [...]` declaration.
+///
+/// Fails closed at every step. A missing declaration, an unterminated literal,
+/// or a parsed row count that disagrees with the `N` in the declared type is a
+/// hard failure rather than a short vector, because a silently partial parse
+/// would make every assertion built on it vacuous while still looking green.
+fn parse_declared_tuple_rows(source: &str, name: &str) -> Vec<Vec<String>> {
+    let marker = format!("const {name}:");
+    let start = source.find(&marker).unwrap_or_else(|| {
+        panic!("{name} is declared in {WORKSPACE_INPUT_DECLARATION_SOURCE}")
+    });
+    let tail = &source[start..];
+    let assignment = tail
+        .find("= [")
+        .unwrap_or_else(|| panic!("{name} assigns an array literal"));
+    let declared_type = &tail[..assignment];
+    let declared_count: usize = declared_type
+        .rsplit(';')
+        .next()
+        .and_then(|fragment| fragment.split(']').next())
+        .unwrap_or_else(|| panic!("{name} declares an array length"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} declares a decimal array length"));
+
+    let body_start = assignment + 3;
+    let body_end = tail[body_start..]
+        .find("];")
+        .unwrap_or_else(|| panic!("{name}'s array literal is terminated"))
+        + body_start;
+    let body = &tail[body_start..body_end];
+
+    let mut rows = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('(') {
+        let close = rest[open..]
+            .find(')')
+            .unwrap_or_else(|| panic!("{name} has an unterminated tuple row"))
+            + open;
+        rows.push(parse_tuple_fields(&rest[open + 1..close]));
+        rest = &rest[close + 1..];
+    }
+
+    assert_eq!(
+        rows.len(),
+        declared_count,
+        "{name}: parsed {} row(s) but the declared type says {declared_count}. A partial parse \
+         must fail here rather than silently shrink the population under test",
+        rows.len(),
+    );
+    rows
+}
+
+/// Joins the binding table to the provenance table by path.
+///
+/// The two tables are declared separately and the pure checker already proves
+/// their path sets are equal; this join re-derives that rather than assuming
+/// it, so a divergence shows up as a hard failure instead of a dropped row.
+fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
+    let source =
+        fs::read_to_string(workspace_root().join(WORKSPACE_INPUT_DECLARATION_SOURCE))
+            .expect("the FND-01 verifier source is readable");
+
+    let bindings = parse_declared_tuple_rows(&source, "TOOLCHAIN_WORKSPACE_INPUTS");
+    let provenance = parse_declared_tuple_rows(&source, "TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE");
+    assert!(
+        !bindings.is_empty(),
+        "a zero-row parse would let every assertion below pass while examining nothing"
+    );
+    assert_eq!(
+        bindings.len(),
+        provenance.len(),
+        "every bound workspace input must carry exactly one provenance row"
+    );
+
+    bindings
+        .iter()
+        .map(|binding| {
+            let [path, byte_length, sha256] = binding.as_slice() else {
+                panic!("a TOOLCHAIN_WORKSPACE_INPUTS row is (path, byte_length, sha256)")
+            };
+            let revision = provenance
+                .iter()
+                .find_map(|row| match row.as_slice() {
+                    [anchored_path, revision] if anchored_path == path => Some(revision.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{path} is bound but carries no provenance row"));
+            WorkspaceInputRow {
+                path: path.clone(),
+                byte_length: byte_length
+                    .replace('_', "")
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{path}: byte_length is a decimal count")),
+                sha256: sha256.clone(),
+                revision,
+            }
+        })
+        .collect()
+}
+
+/// Every commit touching `path`, newest first.
+///
+/// Fails closed for the same reason `blob_at_revision` does: a check that
+/// silently examines nothing is the defect this capability exists to remove.
+fn commits_touching(path: &str) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", "--format=%H", "--", path])
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|error| panic!("{path}: cannot run `git log -- {path}`: {error}"));
+    assert!(
+        output.status.success(),
+        "{path}: `git log -- {path}` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// PROPERTY 2: the blob at each anchor equals the recorded length AND digest.
+///
+/// Returns one line per divergence rather than asserting, so the positive and
+/// the planted negative drive the SAME predicate — a negative that
+/// re-implements the check proves the re-implementation discriminates, not
+/// this one.
+fn workspace_input_provenance_drift(rows: &[WorkspaceInputRow]) -> Vec<String> {
+    let mut drift = Vec::new();
+    for row in rows {
+        let anchored = blob_at_revision(&row.revision, &row.path);
+        let digest = live_sha256_hex(&anchored);
+        if anchored.len() != row.byte_length || digest != row.sha256 {
+            drift.push(format!(
+                "{} @{}: recorded {} bytes / {}, the anchor holds {} bytes / {}",
+                row.path,
+                row.revision,
+                row.byte_length,
+                row.sha256,
+                anchored.len(),
+                digest,
+            ));
+        }
+    }
+    drift
+}
+
+/// PROPERTY 3: the anchor is the LATEST commit touching that path.
+///
+/// An anchor absent from the path's history entirely is reported separately
+/// from a stale one: they are different defects and collapsing them would hide
+/// a fabricated revision behind the much commoner staleness message.
+fn workspace_input_unaccounted_movers(rows: &[WorkspaceInputRow]) -> Vec<String> {
+    let mut movers = Vec::new();
+    for row in rows {
+        let history = commits_touching(&row.path);
+        let Some(latest) = history.first() else {
+            movers.push(format!("{}: no commit in this history touches a bound path", row.path));
+            continue;
+        };
+        match history.iter().position(|commit| *commit == row.revision) {
+            Some(0) => {}
+            Some(later) => movers.push(format!(
+                "{}: anchored at {}, but {later} later commit(s) have touched it, most recently {latest}",
+                row.path, row.revision,
+            )),
+            None => movers.push(format!(
+                "{}: anchored at {}, which does not appear in this path's history at all; its \
+                 most recent commit is {latest}",
+                row.path, row.revision,
+            )),
+        }
+    }
+    movers
+}
+
+/// PROPERTY 2, AND THE CONTROL THAT MAKES THE NEXT TEST ATTRIBUTABLE.
+///
+/// `fnd_01_check_workspace_input_anchoring` asserts set-equality over the path
+/// columns and a 40-hex shape on each revision. It never reads the bytes, so
+/// it cannot assert that the recorded commit produced them. The TREE half of
+/// that gap is already closed elsewhere and already fires: `checked_read` is
+/// handed a `FileBinding` by `toolchain_workspace_inputs_with_bindings`, so a
+/// digest that disagrees with the working tree surfaces as `E_FILE_LENGTH`
+/// wrapped in `E_TOOLCHAIN_ASUPERSYNC`. What nothing checked is the REVISION
+/// half: that the anchor really holds those bytes.
+///
+/// EXPECTED GREEN, and that is the point. If this fails, the instrument is
+/// broken and the red below means nothing; if it passes, the anchors are
+/// honest and a property-3 failure is a real finding rather than a
+/// misconfigured harness.
+///
+/// WHAT IT STILL CANNOT DETECT, stated rather than implied: reading Git object
+/// storage establishes what THIS repository holds at a revision. It cannot
+/// establish that this repository is what any external party published, that
+/// the history was not rewritten before the read, or that the anchor was
+/// chosen honestly rather than back-fitted to bytes already written.
+#[test]
+fn fnd_01_a_workspace_inputs_bind_the_bytes_of_their_anchors() {
+    let rows = declared_workspace_input_rows();
+    assert!(!rows.is_empty(), "a zero-row parse would prove nothing");
+
+    let drift = workspace_input_provenance_drift(&rows);
+    assert!(
+        drift.is_empty(),
+        "{} recorded workspace input(s) are NOT the bytes of the commit they name. A recorded \
+         pair that disagrees with its own anchor was hand-edited or re-anchored rather than \
+         mechanically derived, and the anchor is then a false attestation carried by a green \
+         check:\n{}",
+        drift.len(),
+        drift.join("\n"),
+    );
+}
+
+/// PROPERTY 3: no unaccounted mover since the anchor.
+///
+/// THIS TEST IS EXPECTED TO FAIL, and the failure is the finding. A dependency
+/// refresh regenerates `Cargo.lock` and moves `Cargo.toml` while nothing
+/// obliges it to re-attest; the pure checker cannot notice because the path
+/// SET is unchanged, and the tree check reports only that some length differs.
+/// This names the commit responsible.
+///
+/// THE CORRECT RESPONSE TO A RED HERE IS TO ADJUDICATE THE MOVE IT NAMES —
+/// never to edit the bound file, and never to re-anchor a row to make it
+/// quiet. Re-attestation is legitimate only from the mover, with the drift
+/// enumerated; a re-attest that merely updates a number is indistinguishable
+/// from a regeneration-to-get-green (RH-3).
+#[test]
+fn fnd_01_a_workspace_input_anchors_are_the_latest_movers() {
+    let rows = declared_workspace_input_rows();
+    assert!(!rows.is_empty(), "a zero-row parse would prove nothing");
+
+    let movers = workspace_input_unaccounted_movers(&rows);
+    assert!(
+        movers.is_empty(),
+        "{} bound workspace input(s) were moved after the commit they are anchored to. The \
+         recorded bytes therefore describe an older tree while the anchor still claims to be \
+         current, and no check in the frozen verifier can see it:\n{}",
+        movers.len(),
+        movers.join("\n"),
+    );
+}
+
+/// PLANTED NEGATIVE for property 2 — exactly the mutation this bead names.
+///
+/// The failure mode is a digest moved to match new bytes while the provenance
+/// commit is left alone: the check then passes while the anchor falsely claims
+/// to have produced them. This performs that mutation and nothing else — one
+/// hex character of one digest, the revision untouched — and requires both the
+/// typed refusal AND that a second accepted row stays green, so a negative
+/// that merely proves "something fails" cannot satisfy it.
+#[test]
+fn fnd_01_a_workspace_input_digest_move_is_refused() {
+    let rows = declared_workspace_input_rows();
+    let clean = workspace_input_provenance_drift(&rows);
+    let accepted: Vec<&WorkspaceInputRow> = rows
+        .iter()
+        .filter(|row| !clean.iter().any(|line| line.starts_with(&format!("{} @", row.path))))
+        .collect();
+    assert!(
+        accepted.len() >= 2,
+        "this control needs two rows that already bind at their anchors, so the red below is \
+         caused by the plant rather than by pre-existing drift; found {}",
+        accepted.len(),
+    );
+
+    let target = accepted[0].path.clone();
+    let witness = accepted[1].path.clone();
+    let mut planted = rows.clone();
+    for row in &mut planted {
+        if row.path == target {
+            row.sha256 = flip_one_digest_character(&row.sha256);
+        }
+    }
+    assert_ne!(
+        planted, rows,
+        "the plant must actually change the table it is testing"
+    );
+
+    let drift = workspace_input_provenance_drift(&planted);
+    assert!(
+        drift.iter().any(|line| line.starts_with(&format!("{target} @"))),
+        "a digest moved away from its anchor's bytes, with the provenance commit untouched, must \
+         be refused; got {drift:?}"
+    );
+    assert!(
+        !drift.iter().any(|line| line.starts_with(&format!("{witness} @"))),
+        "the plant changed exactly one row, so {witness} must remain green; got {drift:?}"
+    );
+}
+
+/// PLANTED NEGATIVE for property 3, built from real history.
+///
+/// The stale anchor is DERIVED at run time — the second-newest commit touching
+/// a bound path — rather than written as a constant, so the plant stays valid
+/// as history grows and cannot pass by matching a number someone typed. It
+/// isolates one clause: the bytes are untouched and only the anchor moves
+/// backwards by exactly one commit.
+#[test]
+fn fnd_01_a_workspace_input_stale_anchor_is_refused() {
+    let rows = declared_workspace_input_rows();
+    let planted_row = rows
+        .iter()
+        .find(|row| commits_touching(&row.path).len() >= 2)
+        .expect("at least one bound path has two commits in its history")
+        .clone();
+    let history = commits_touching(&planted_row.path);
+    let previous = history[1].clone();
+    let latest = history[0].clone();
+
+    let mut planted = rows.clone();
+    for row in &mut planted {
+        if row.path == planted_row.path {
+            row.revision = previous.clone();
+        }
+    }
+
+    let movers = workspace_input_unaccounted_movers(&planted);
+    let reported = movers
+        .iter()
+        .find(|line| line.starts_with(&format!("{}: ", planted_row.path)))
+        .unwrap_or_else(|| {
+            panic!(
+                "an anchor one commit behind the latest mover must be refused; got {movers:?}"
+            )
+        });
+    assert!(
+        reported.contains("1 later commit(s)") && reported.contains(&latest),
+        "the refusal must name how far behind the anchor is and which commit moved it last; got \
+         {reported}"
+    );
+}
