@@ -130,6 +130,9 @@ pub use handler::{
     promote_legacy_resource_contents, promote_legacy_tool_content,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
+pub use middleware::continuation_replay::{
+    ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
+};
 use oauth::{
     AuthorizationRequest, CodeChallengeMethod, NativePublicClientRegistrationRequest, OAuthError,
     OAuthHttpRoutes, OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName,

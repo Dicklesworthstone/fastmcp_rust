@@ -18,9 +18,9 @@ use fastmcp_protocol::{CompleteResult, Content, CoreResultDiscriminatorPolicy, D
     FINAL_PROTOCOL_VERSION, decode_peer_result, protocol_policy::ProtocolPolicy};
 use fastmcp_server::{AuthProvider, AuthRequest, Server, ServerHttpEndpoint, StaticTokenVerifier, TokenAuthProvider, ToolHandler};
 use fastmcp_server::bidirectional::MrtrCompletedInputs;
-use fastmcp_server::handler::{BoxFuture, FinalToolOutcome, ToolExecutionMode};
-use fastmcp_server::middleware::Middleware;
-use fastmcp_server::middleware::continuation_replay::{ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware};
+use fastmcp_server::{BoxFuture, FinalToolOutcome, ToolExecutionMode};
+use fastmcp_server::Middleware;
+use fastmcp_server::{ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware};
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::http_admission::security::HttpSecurityPolicy;
 use fastmcp_transport::http::{HttpMethod, HttpRequest};
