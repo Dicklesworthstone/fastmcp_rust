@@ -61,7 +61,7 @@ impl Default for SecuredHttpIoLimits {
 impl SecuredHttpIoLimits {
     pub fn new(request_timeout: Duration, write_timeout: Duration) -> McpResult<Self> {
         if request_timeout.is_zero() || write_timeout.is_zero()
-            || request_timeout > Duration::from_secs(900)
+            || request_timeout > Duration::from_mins(15)
             || write_timeout > Duration::from_secs(300)
         {
             return Err(McpError::invalid_request("invalid secured HTTP I/O limits"));
