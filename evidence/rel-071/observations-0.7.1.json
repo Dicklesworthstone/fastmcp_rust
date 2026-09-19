@@ -399,5 +399,157 @@
       "archive_sha256": "25da7c6c4f7b4e7d7a1c2c349b3e4b966c7998e7be80acb2c260683a285e2f86",
       "tree_sha256": "25da7c6c4f7b4e7d7a1c2c349b3e4b966c7998e7be80acb2c260683a285e2f86"
     }
-  ]
+  ],
+  "release": {
+    "surface": "github-release",
+    "note": "PUBLICATION surface, not CI. No workflow run, rerun state or environment was observed; those are RULE 0.5 exclusions, permanent and not pending.",
+    "tag": "v0.7.1",
+    "draft": false,
+    "prerelease": false,
+    "created_at": "2026-08-24T21:23:41Z",
+    "published_at": "2026-08-24T22:22:17Z",
+    "author": "Dicklesworthstone",
+    "required_asset_count": 16,
+    "anchored_asset": "fastmcp-darwin-aarch64.tar.xz",
+    "anchor_note": "This asset was downloaded and hashed independently; its digest equals both SHA256SUMS and its .sha256 sibling. Without it the digest columns would be the release witnessing itself.",
+    "assets": [
+      {
+        "name": "SHA256SUMS",
+        "size": 640,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp",
+        "size": 13731744,
+        "sha256": "48dca06bd50733063bd2efa65ebbd96eb87376cd53e1279c217618b2c8783fc3",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-aarch64.tar.xz",
+        "size": 3425840,
+        "sha256": "a2a6d4613e312efa11c87673cd3a1fc2ad7b2c271922dc7c3bdfb47f0eadf3e5",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": true
+      },
+      {
+        "name": "fastmcp-darwin-aarch64.tar.xz.sha256",
+        "size": 96,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-amd64.tar.xz",
+        "size": 3777968,
+        "sha256": "3b8610a73679dc4cadefba2e0479aecd58d6989490aeaaf6c83cdcfd75e623fa",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-amd64.tar.xz.sha256",
+        "size": 94,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-arm64.tar.xz",
+        "size": 3425840,
+        "sha256": "a2a6d4613e312efa11c87673cd3a1fc2ad7b2c271922dc7c3bdfb47f0eadf3e5",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-arm64.tar.xz.sha256",
+        "size": 94,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-x86_64.tar.xz",
+        "size": 3777968,
+        "sha256": "3b8610a73679dc4cadefba2e0479aecd58d6989490aeaaf6c83cdcfd75e623fa",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-darwin-x86_64.tar.xz.sha256",
+        "size": 95,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-linux-amd64.tar.xz",
+        "size": 4049964,
+        "sha256": "50c744025bcca13fd118ecbeccfca38a2e60d86c12de448940e9bc933053e140",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-linux-amd64.tar.xz.sha256",
+        "size": 93,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-linux-x86_64.tar.xz",
+        "size": 4049964,
+        "sha256": "50c744025bcca13fd118ecbeccfca38a2e60d86c12de448940e9bc933053e140",
+        "digest_source": "SHA256SUMS+sibling",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp-linux-x86_64.tar.xz.sha256",
+        "size": 94,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp.sha256",
+        "size": 74,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      },
+      {
+        "name": "fastmcp_rust-v0.7.1-manifest.json",
+        "size": 6012,
+        "sha256": null,
+        "digest_source": "none",
+        "independently_verified": false
+      }
+    ]
+  },
+  "credential_presence": {
+    "scope": "this host only",
+    "observed_at_utc": "2026-09-19T08:38:00Z",
+    "note": "PRESENCE/ABSENCE ONLY. No credential value, token, or key material is recorded here or anywhere in this fixture.",
+    "required_entry_count": 4,
+    "entries": [
+      {
+        "name": "CARGO_REGISTRY_TOKEN",
+        "present": false
+      },
+      {
+        "name": "~/.cargo/credentials.toml",
+        "present": false
+      },
+      {
+        "name": "gh auth github.com",
+        "present": true,
+        "detail": "scopes include repo, workflow, delete_repo"
+      },
+      {
+        "name": "dsr signing keypair",
+        "present": true
+      }
+    ]
+  }
 }
