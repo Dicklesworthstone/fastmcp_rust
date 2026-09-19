@@ -175,7 +175,7 @@ new file mode 100644
 +
 +    pub fn resource(&self) -> &CanonicalHttpUrl { &self.resource }
 +    pub fn tool_name(&self) -> &str { &self.tool_name }
-+    pub fn schema(&self) -> &Value { &self.schema.schema() }
++    pub fn schema(&self) -> &Value { self.schema.schema() }
 +    pub fn bindings(&self) -> &[ParameterHeaderBinding] { self.schema.header_plan().bindings() }
 +
 +    fn project_request(
