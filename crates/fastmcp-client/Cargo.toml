@@ -48,7 +48,9 @@ html5ever = { version = "=0.40.1", optional = true }
 fastmcp-protocol = { workspace = true, features = ["jose"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["event", "fs", "process"] }
+# SecureAtomicFile converts owned rustix descriptors to std::fs::File. Require
+# std explicitly rather than relying on another crate's feature unification.
+rustix = { workspace = true, features = ["std", "event", "fs", "process"] }
 
 [dev-dependencies]
 # Test-only context construction; production callers supply or inherit a Cx.

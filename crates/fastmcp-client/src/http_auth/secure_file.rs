@@ -19,7 +19,7 @@
 //! arrives: reporting a retryable cancellation then would conceal a commit.
 //! Local filesystem rename/fsync/locking semantics are required; distributed
 //! filesystems, hostile same-UID processes, inherited handles after fork, and
-//! macOS ACLs, and Windows DACL/reparse behavior are outside this implementation's
+//! macOS ACLs and Windows DACL/reparse behavior are outside this implementation's
 //! boundary. The API is absent on those platforms rather than inferring private
 //! access from Unix mode bits where extended ACLs can independently grant it.
 
@@ -32,6 +32,9 @@ use asupersync::Cx;
 use fastmcp_core::crypto::{draw_security_identifier, sha256_bounded};
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, flock, openat, renameat, statat, unlinkat};
 use rustix::io::Errno;
+
+/// Generation-preserving custody and recovery of caller-protected blobs.
+pub mod slot;
 
 /// Hard allocation and on-disk payload ceiling. A store can choose a lower one.
 pub const MAX_ATOMIC_FILE_BYTES: usize = 1024 * 1024;
