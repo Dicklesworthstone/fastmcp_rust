@@ -54,6 +54,7 @@ pub mod protocol_version;
 mod result;
 pub mod sampling;
 pub mod schema;
+pub mod schema_registry;
 pub mod security_admission;
 pub mod server_discovery;
 #[cfg(feature = "tasks")]
@@ -127,6 +128,7 @@ pub use schema::{
     ValidationError, ValidationResult, admit_final_form_schema, admit_final_schema, validate,
     validate_final_core_result, validate_strict,
 };
+pub use schema_registry::{SchemaRegistryError, SchemaRegistryLimits, SchemaResourceRegistry};
 pub use security_admission::{
     ADMITTED_RSA_PUBLIC_EXPONENT, AdmittedCompactJws, AdmittedRsaPublicJwk, CompactJwsProfile,
     JwkAdmissionPolicy, JwkThumbprintSha256, JwsProtectedHeader, MAX_CLIENT_ID_METADATA_BYTES,
