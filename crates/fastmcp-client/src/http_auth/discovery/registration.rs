@@ -486,7 +486,7 @@ mod tests {
         let (_, grants) = owner.registration_endpoint(&owner.discovery.issuers[0], body).unwrap();
         assert_eq!(grants, ["authorization_code"]);
         for body in [
-            br#"{}"#.as_slice(),
+            br"{}".as_slice(),
             br#"{"registration_endpoint":null}"#.as_slice(),
             br#"{"registration_endpoint":"http://issuer.example/register"}"#.as_slice(),
             br#"{"registration_endpoint":"https://issuer.example/register?q=1"}"#.as_slice(),

@@ -89,7 +89,7 @@ fn registration_declarations_cannot_be_defaulted_or_replaced_by_server_fields() 
         changed[format!("{field}_supported")] = good[field].clone();
         assert!(registration(&changed, ClientAssertionAudience::Issuer).is_err());
     }
-    let bytes = serde_json::to_string(&good).unwrap().replacen("{", "{\"client_id\":\"other\",", 1);
+    let bytes = serde_json::to_string(&good).unwrap().replacen('{', "{\"client_id\":\"other\",", 1);
     assert!(PrivateKeyJwtRegistration::from_trusted_json(bytes.as_bytes(), 9,
         Instant::now() + Duration::from_secs(300), binding(), ClientAssertionAudience::Issuer).is_err());
     assert!(registration(&good, ClientAssertionAudience::Issuer).is_ok());

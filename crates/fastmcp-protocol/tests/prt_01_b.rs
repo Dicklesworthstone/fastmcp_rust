@@ -176,7 +176,7 @@ fn prt_01_security_admission_planted_negative() {
         let baseline = representative(kind);
         assert!(admit_security_document(kind, baseline.as_bytes()).is_ok());
 
-        let planted = format!(r#"{{"dup":1,"dup":2,"trailer":{}}}"#, baseline.len(),);
+        let planted = format!(r#"{{"dup":1,"dup":2,"trailer":{}}}"#, baseline.len());
         let failure = admit_security_document(kind, planted.as_bytes())
             .expect_err("a duplicate member is refused for every document class");
         assert_eq!(
@@ -415,7 +415,7 @@ fn prt_01_compact_jws_profiles_planted_negative() {
         ),
     ];
     for (label, token, expected) in planted {
-        assert_eq!(admit_compact_jws(profile, &token), Err(expected), "{label}",);
+        assert_eq!(admit_compact_jws(profile, &token), Err(expected), "{label}");
     }
 
     // Structural refusals reach the same boundary before any claim is read.

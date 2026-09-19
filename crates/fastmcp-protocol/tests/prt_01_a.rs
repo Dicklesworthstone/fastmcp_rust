@@ -30,8 +30,7 @@ fn admit(frame: &[u8]) -> JsonRpcMessage {
 /// Decodes through the shipped entry point, asserting refusal.
 fn refuse(frame: &[u8]) -> JsonRpcAdmissionError {
     decode_strict_jsonrpc_message(frame, DOCUMENT_LIMIT)
-        .err()
-        .expect("the shipped decoder must refuse this frame")
+        .expect_err("the shipped decoder must refuse this frame")
 }
 
 #[test]

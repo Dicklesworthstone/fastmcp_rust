@@ -749,7 +749,9 @@ fn decode_state(state: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut decoded = [0; 32];
-    for (index, pair) in state.as_bytes().chunks_exact(2).enumerate() {
+    // `as_chunks` yields `[u8; 2]`, so the pair indexing below is checked at
+    // compile time. The length test above makes the remainder provably empty.
+    for (index, pair) in state.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
     }
     Some(decoded)

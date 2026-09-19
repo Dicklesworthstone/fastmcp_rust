@@ -605,7 +605,7 @@ mod tests {
         assert!(matches!(parse(&oversized_value), Err(OAuthChallengeError::LimitExceeded)));
         assert!(matches!(parse(&format!("Bearer {}=v", "x".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
         assert!(matches!(parse(&format!("{} realm=v, Bearer", "X".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
-        let fields = (0..MAX_PARAMETERS + 1).map(|n| format!("p{n}=v")).collect::<Vec<_>>().join(",");
+        let fields = (0..=MAX_PARAMETERS).map(|n| format!("p{n}=v")).collect::<Vec<_>>().join(",");
         assert!(matches!(parse(&format!("Bearer {fields}")), Err(OAuthChallengeError::LimitExceeded)));
         let schemes = format!("{}Bearer", "Other, ".repeat(MAX_CHALLENGES));
         assert!(matches!(parse(&schemes), Err(OAuthChallengeError::LimitExceeded)));
