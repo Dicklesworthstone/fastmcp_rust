@@ -977,12 +977,12 @@ async fn positive_01_request_construction(cx: &Cx) {
     let target = peer.target();
     let authority = peer.authority();
 
-    let (probe, connection) = pair(serve_probe(&peer), async {
+    let (probe, connection) = Box::pin(pair(serve_probe(&peer), async {
         builder(&target)
             .connect_http_with_cx(cx)
             .await
             .expect("the public modern client must connect over the loopback socket")
-    })
+    }))
     .await;
 
     assert!(
@@ -1033,7 +1033,7 @@ async fn negative_01_target_header_split(cx: &Cx) {
     // The listener really was live; only the mutated construction was refused.
     // Exactly one socket is consumed here, by the control request.
     let request = accepted.expect("control request");
-    let (wire, bytes) = pair(
+    let (wire, bytes) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1049,7 +1049,7 @@ async fn negative_01_target_header_split(cx: &Cx) {
                 .await
                 .expect("the control response body must be readable")
         },
-    )
+    ))
     .await;
     assert_eq!(header_values(&wire.head, "accept").len(), 1);
     assert_eq!(bytes, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec());
@@ -1067,7 +1067,7 @@ async fn positive_02_single_post_exact_body(cx: &Cx) {
     let request = ping_request(&peer.target());
     let expected_body = ping_body();
 
-    let (wire, body) = pair(
+    let (wire, body) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1085,7 +1085,7 @@ async fn positive_02_single_post_exact_body(cx: &Cx) {
                 .await
                 .expect("the JSON response body must be readable")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -1141,7 +1141,7 @@ async fn positive_03_content_type_and_accept(cx: &Cx) {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
 
-    let (wire, ()) = pair(
+    let (wire, ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1157,7 +1157,7 @@ async fn positive_03_content_type_and_accept(cx: &Cx) {
                 .await
                 .expect("the response body must be readable");
         },
-    )
+    ))
     .await;
 
     assert_eq!(
@@ -1226,7 +1226,7 @@ async fn negative_03_name_header_split(cx: &Cx) {
 
     // The unweakened Accept still reaches the live listener unchanged.
     let request = accepted.expect("control request");
-    let (wire, ()) = pair(
+    let (wire, ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1242,7 +1242,7 @@ async fn negative_03_name_header_split(cx: &Cx) {
                 .await
                 .expect("the control body must be readable");
         },
-    )
+    ))
     .await;
     assert_eq!(exactly_one_header(&wire.head, "accept"), MODERN_MCP_ACCEPT);
     // The refused construction opened no socket of its own.
@@ -1296,7 +1296,7 @@ async fn content_encoding_outcome(
 async fn duplicate_content_encoding_outcome(cx: &Cx) -> ModernHttpExecutorError {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), error) = pair(
+    let ((), error) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1318,7 +1318,7 @@ async fn duplicate_content_encoding_outcome(cx: &Cx) -> ModernHttpExecutorError 
                 .await
                 .expect_err("a repeated Content-Encoding must be refused")
         },
-    )
+    ))
     .await;
     error
 }
@@ -1340,7 +1340,7 @@ async fn identity_labelled_body_outcome(
 ) -> Result<Vec<u8>, ModernHttpExecutorError> {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1362,7 +1362,7 @@ async fn identity_labelled_body_outcome(
                 Err(error) => Err(error),
             }
         },
-    )
+    ))
     .await;
     outcome
 }
@@ -1380,7 +1380,7 @@ async fn truncated_body_outcome(
 ) -> Result<Vec<u8>, ModernHttpExecutorError> {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1403,7 +1403,7 @@ async fn truncated_body_outcome(
                 Err(error) => Err(error),
             }
         },
-    )
+    ))
     .await;
     outcome
 }
@@ -1413,7 +1413,7 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
     let request = ping_request(&peer.target());
     let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"note":"uncoded"}}"#;
 
-    let (wire, body) = pair(
+    let (wire, body) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1438,7 +1438,7 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
                 .await
                 .expect("the identity-coded body must be readable")
         },
-    )
+    ))
     .await;
 
     let accept_encoding = exactly_one_header(&wire.head, "accept-encoding");
@@ -1500,7 +1500,7 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
     // ran a "decompress if it looks compressed" fallback, returns different
     // bytes here while passing every other case in this group.
     // -----------------------------------------------------------------------
-    let delivered = identity_labelled_body_outcome(cx, GZIP_MAGIC_BODY)
+    let delivered = Box::pin(identity_labelled_body_outcome(cx, GZIP_MAGIC_BODY))
         .await
         .expect("an identity-labelled body must be delivered without inspection");
     assert_eq!(
@@ -1512,7 +1512,7 @@ async fn positive_04_identity_accept_encoding(cx: &Cx) {
     // Delivery control on the same lane: a body that fully satisfies its
     // declared length is returned intact, so the truncation negative differs
     // from it in delivery alone.
-    let complete = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY)
+    let complete = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY))
         .await
         .expect("a fully delivered body must be readable");
     assert_eq!(complete.as_slice(), COMPLETE_RESPONSE_BODY);
@@ -1524,7 +1524,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
     let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"note":"uncoded"}}"#;
 
     // The sole changed variable is the response content coding.
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1545,7 +1545,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
                 .await
                 .expect_err("a compressed response must be refused")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -1601,7 +1601,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
     // A repeated field line is a header-cardinality violation, and is reported
     // as such rather than being folded into the coding refusal - the two are
     // different defects and a caller can tell them apart.
-    let duplicate = duplicate_content_encoding_outcome(cx).await;
+    let duplicate = Box::pin(duplicate_content_encoding_outcome(cx)).await;
     assert!(
         matches!(
             duplicate,
@@ -1632,7 +1632,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
         COMPLETE_RESPONSE_BODY.len(),
         "the planted negative under-delivers by exactly one byte"
     );
-    let refusal = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), truncated)
+    let refusal = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), truncated))
         .await
         .expect_err("a body shorter than its declared length must not be delivered");
     assert!(
@@ -1645,7 +1645,7 @@ async fn negative_04_compressed_response(cx: &Cx) {
     // Unchanged state: the same lane still delivers a complete body verbatim
     // after the truncated one failed, so the refusal closed only its own
     // response.
-    let restored = truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY)
+    let restored = Box::pin(truncated_body_outcome(cx, COMPLETE_RESPONSE_BODY.len(), COMPLETE_RESPONSE_BODY))
         .await
         .expect("a complete body must still be delivered after a truncation refusal");
     assert_eq!(restored.as_slice(), COMPLETE_RESPONSE_BODY);
@@ -1673,7 +1673,7 @@ async fn capture_request_head(
 ) -> Wire {
     let peer = Peer::bind().await;
     let mut connection = connect(cx, &peer).await;
-    let (wire, ()) = pair(
+    let (wire, ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1695,7 +1695,7 @@ async fn capture_request_head(
                 .request_json(cx, method, params, RequestId::Number(request_id), 64 * 1024)
                 .await;
         },
-    )
+    ))
     .await;
     wire
 }
@@ -1704,7 +1704,7 @@ async fn positive_05_routing_headers(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
 
-    let (wire, ()) = pair(
+    let (wire, ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let wire = read_request(&mut io).await;
@@ -1733,7 +1733,7 @@ async fn positive_05_routing_headers(cx: &Cx) {
                 .expect("a terminal event must arrive");
             assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
         },
-    )
+    ))
     .await;
 
     assert_eq!(
@@ -1754,7 +1754,7 @@ async fn positive_05_routing_headers(cx: &Cx) {
     // A client that hardcoded `name` passes the tools/call case above and fails
     // both of these.
     // -----------------------------------------------------------------------
-    let listed = capture_request_head(cx, "tools/list", serde_json::json!({}), 5).await;
+    let listed = Box::pin(capture_request_head(cx, "tools/list", serde_json::json!({}), 5)).await;
     assert_eq!(
         exactly_one_header(&listed.head, "MCP-Protocol-Version"),
         "2026-07-28"
@@ -1765,12 +1765,12 @@ async fn positive_05_routing_headers(cx: &Cx) {
         "a method with no name mirror must emit no Mcp-Name field line at all"
     );
 
-    let read = capture_request_head(
+    let read = Box::pin(capture_request_head(
         cx,
         "resources/read",
         serde_json::json!({"uri": ROUTING_RESOURCE_URI}),
         6,
-    )
+    ))
     .await;
     assert_eq!(
         exactly_one_header(&read.head, "MCP-Protocol-Version"),
@@ -1845,7 +1845,7 @@ async fn negative_05_missing_name_mirror(cx: &Cx) {
     // is what proves that. This third call goes out over the SAME connection
     // and must still succeed, so the refusals left behind no request state, no
     // endpoint rebinding and no credential state.
-    let ((), ()) = pair(
+    let ((), ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1870,7 +1870,7 @@ async fn negative_05_missing_name_mirror(cx: &Cx) {
             assert_eq!(response.id, Some(RequestId::Number(7)));
             assert!(response.error.is_none());
         },
-    )
+    ))
     .await;
 }
 
@@ -1896,7 +1896,7 @@ fn json_response_with_raw_note(raw_note: &[u8]) -> Vec<u8> {
 async fn direct_json_admission(cx: &Cx, body: Vec<u8>) -> Result<(), ClientHttpConnectionError> {
     let peer = Peer::bind().await;
     let mut connection = connect(cx, &peer).await;
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1915,7 +1915,7 @@ async fn direct_json_admission(cx: &Cx, body: Vec<u8>) -> Result<(), ClientHttpC
                 .await
                 .map(|_| ())
         },
-    )
+    ))
     .await;
     outcome
 }
@@ -1935,7 +1935,7 @@ async fn positive_06_json_strict_utf8(cx: &Cx) {
     let mut connection = connect(cx, &peer).await;
     let body = utf8_json_response();
 
-    let ((), response) = pair(
+    let ((), response) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1954,7 +1954,7 @@ async fn positive_06_json_strict_utf8(cx: &Cx) {
                 .await
                 .expect("valid UTF-8 JSON must be admitted without repair")
         },
-    )
+    ))
     .await;
 
     assert_eq!(response.id, Some(RequestId::Number(2)));
@@ -1967,7 +1967,7 @@ async fn positive_06_json_strict_utf8(cx: &Cx) {
     // lane refuses MALFORMED BYTES, not the replacement character itself - and
     // the distinction matters, because the negative half proves the same
     // logical character arrives legitimately over SSE.
-    direct_json_admission(cx, json_response_with_raw_note("\u{FFFD}".as_bytes()))
+    Box::pin(direct_json_admission(cx, json_response_with_raw_note("\u{FFFD}".as_bytes())))
         .await
         .expect("a well-formed U+FFFD is ordinary UTF-8 and must be admitted");
 }
@@ -1986,7 +1986,7 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
     );
     body.extend_from_slice(&utf8_json_response());
 
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2005,7 +2005,7 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
                 .await
                 .expect_err("a BOM must be rejected, never stripped or repaired")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -2027,7 +2027,7 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
     midstream_note.extend_from_slice(b"before");
     midstream_note.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     midstream_note.extend_from_slice(b"after");
-    let midstream = direct_json_admission(cx, json_response_with_raw_note(&midstream_note))
+    let midstream = Box::pin(direct_json_admission(cx, json_response_with_raw_note(&midstream_note)))
         .await
         .expect_err("a midstream BOM must be refused, not just a leading one");
     assert!(
@@ -2053,7 +2053,7 @@ async fn negative_06_json_byte_order_mark(cx: &Cx) {
     // ---------------------------------------------------------------------
     const LONE_CONTINUATION: &[u8] = &[0xFF];
 
-    let malformed = direct_json_admission(cx, json_response_with_raw_note(LONE_CONTINUATION))
+    let malformed = Box::pin(direct_json_admission(cx, json_response_with_raw_note(LONE_CONTINUATION)))
         .await
         .expect_err("malformed UTF-8 must be refused on the direct lane, never repaired");
     assert!(
@@ -2183,7 +2183,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
     ] {
         let peer = Peer::bind().await;
         let request = ping_request(&peer.target());
-        let ((), kind) = pair(
+        let ((), kind) = Box::pin(pair(
             async {
                 let mut io = peer.accept().await;
                 let _ = read_request(&mut io).await;
@@ -2199,7 +2199,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
                     .metadata()
                     .kind()
             },
-        )
+        ))
         .await;
         assert_eq!(
             kind, expected,
@@ -2260,7 +2260,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
         let headers: Vec<(&str, &str)> = content_type
             .map(|value| vec![("Content-Type", value)])
             .unwrap_or_default();
-        let ((), metadata) = pair(
+        let ((), metadata) = Box::pin(pair(
             async {
                 let mut io = peer.accept().await;
                 let _ = read_request(&mut io).await;
@@ -2282,7 +2282,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
                     .metadata()
                     .clone()
             },
-        )
+        ))
         .await;
 
         assert_eq!(metadata.status(), status);
@@ -2302,7 +2302,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
     // admission rather than an opaque one.
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), admission) = pair(
+    let ((), admission) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2316,7 +2316,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
                 .metadata()
                 .error_body_admission()
         },
-    )
+    ))
     .await;
     assert_eq!(
         admission, None,
@@ -2412,7 +2412,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
     // Side 4, still usable afterwards: an ordinary request still completes.
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), ()) = pair(
+    let ((), ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2427,7 +2427,7 @@ async fn positive_07_response_content_type(cx: &Cx) {
                 .await
                 .expect("its body must still be readable");
         },
-    )
+    ))
     .await;
 }
 
@@ -2436,7 +2436,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
     let request = ping_request(&peer.target());
 
     // The sole changed variable is the charset parameter value.
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2454,7 +2454,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
                 .await
                 .expect_err("a conflicting charset parameter must be refused")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -2484,7 +2484,7 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
     ) -> Option<ModernHttpErrorBodyAdmission> {
         let peer = Peer::bind().await;
         let request = ping_request(&peer.target());
-        let ((), admission) = pair(
+        let ((), admission) = Box::pin(pair(
             async {
                 let mut io = peer.accept().await;
                 let _ = read_request(&mut io).await;
@@ -2498,25 +2498,25 @@ async fn negative_07_wrong_charset_parameter(cx: &Cx) {
                     .metadata()
                     .error_body_admission()
             },
-        )
+        ))
         .await;
         admission
     }
 
     assert_eq!(
-        error_body_admission(cx, "application/json").await,
+        Box::pin(error_body_admission(cx, "application/json")).await,
         Some(ModernHttpErrorBodyAdmission::JsonRpcError),
         "the accepted error body declares exactly JSON"
     );
     assert_eq!(
-        error_body_admission(cx, "text/plain").await,
+        Box::pin(error_body_admission(cx, "text/plain")).await,
         Some(ModernHttpErrorBodyAdmission::Opaque),
         "the same bytes under a non-JSON declared type must stay opaque"
     );
     // Restored: the refusal came from the declared type, not from a poisoned
     // admission path.
     assert_eq!(
-        error_body_admission(cx, "application/json").await,
+        Box::pin(error_body_admission(cx, "application/json")).await,
         Some(ModernHttpErrorBodyAdmission::JsonRpcError),
         "the unmutated declared type is admitted again"
     );
@@ -2855,7 +2855,7 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
     let connection = connect(cx, &peer).await;
     let body = replacement_stream(true);
 
-    let ((), ()) = pair(
+    let ((), ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2887,7 +2887,7 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
                 "replacement inside a JSON string must survive as U+FFFD"
             );
         },
-    )
+    ))
     .await;
     // -----------------------------------------------------------------------
     // Every-split-point golden.
@@ -2913,7 +2913,7 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
         "the whole-body decode must be the declared golden"
     );
 
-    let byte_by_byte = drain_sse_in_chunks(cx, &sweep_peer, corpus.clone(), limits(), 1)
+    let byte_by_byte = Box::pin(drain_sse_in_chunks(cx, &sweep_peer, corpus.clone(), limits(), 1))
         .await
         .expect("the golden corpus must assemble one byte at a time");
     assert_eq!(
@@ -2922,7 +2922,7 @@ async fn positive_08_replacement_decoder_and_bom(cx: &Cx) {
     );
 
     for split in 1..corpus.len() {
-        let observed = drain_sse_split_at(cx, &sweep_peer, &corpus, limits(), split)
+        let observed = Box::pin(drain_sse_split_at(cx, &sweep_peer, &corpus, limits(), split))
             .await
             .unwrap_or_else(|error| {
                 panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
@@ -2980,7 +2980,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
     // from inside the JSON string to a structural position outside it.
     let body = replacement_stream(false);
 
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3004,7 +3004,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
                 .await
                 .expect_err("replacement outside the JSON string must not be repaired")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -3040,7 +3040,7 @@ async fn negative_08_replacement_outside_json(cx: &Cx) {
     );
 
     for split in 1..body.len() {
-        let observed = drain_sse_split_at(cx, &sweep_peer, &body, limits(), split)
+        let observed = Box::pin(drain_sse_split_at(cx, &sweep_peer, &body, limits(), split))
             .await
             .unwrap_or_else(|error| {
                 panic!("a chunk boundary at byte {split} must not fail the stream: {error:?}")
@@ -3144,7 +3144,7 @@ async fn drain_sse_in_chunks(
 ) -> Result<Vec<String>, ModernHttpExecutorError> {
     assert!(chunk_bytes > 0, "a chunk must carry at least one byte");
     let request = ping_request(&peer.target());
-    let ((), payloads) = pair(
+    let ((), payloads) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3171,7 +3171,7 @@ async fn drain_sse_in_chunks(
                 }
             }
         },
-    )
+    ))
     .await;
     payloads
 }
@@ -3210,7 +3210,7 @@ async fn drain_sse_split_at(
     let head = body[..split].to_vec();
     let tail = body[split..].to_vec();
     let request = ping_request(&peer.target());
-    let ((), payloads) = pair(
+    let ((), payloads) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3236,7 +3236,7 @@ async fn drain_sse_split_at(
                 }
             }
         },
-    )
+    ))
     .await;
     payloads
 }
@@ -3260,7 +3260,7 @@ async fn positive_09_line_endings_and_data_fields(cx: &Cx) {
     for chunk_bytes in [1_usize, 7, body.len()] {
         let peer = Peer::bind().await;
         by_chunking.push(
-            drain_sse_in_chunks(cx, &peer, body.clone(), limits(), chunk_bytes)
+            Box::pin(drain_sse_in_chunks(cx, &peer, body.clone(), limits(), chunk_bytes))
                 .await
                 .expect("a well-formed event stream must assemble without refusal"),
         );
@@ -3388,7 +3388,7 @@ async fn positive_10_comments_and_inert_fields(cx: &Cx) {
     first.extend_from_slice(&terminal_tool_result(2, "inert-ok"));
     first.extend_from_slice(b"\n\n");
 
-    let (second_wire, ()) = pair(
+    let (second_wire, ()) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3444,7 +3444,7 @@ async fn positive_10_comments_and_inert_fields(cx: &Cx) {
                 .expect("the second terminal must arrive");
             assert!(matches!(event, ModernHttpFinalCoreEvent::Terminal(_)));
         },
-    )
+    ))
     .await;
 
     // `id: 42` created no resumption state: the next request carries neither
@@ -3549,7 +3549,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
     body.extend_from_slice(&terminal_tool_result(2, "never-dispatched"));
     body.extend_from_slice(b"\n");
 
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3573,7 +3573,7 @@ async fn negative_10_eof_without_blank_line(cx: &Cx) {
                 .await
                 .expect_err("an unterminated pending event must never be dispatched")
         },
-    )
+    ))
     .await;
 
     match refusal {
@@ -4482,7 +4482,7 @@ async fn admit_dispatched_payload(
 ) -> Result<(), ModernHttpFinalCoreListenError> {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -4505,7 +4505,7 @@ async fn admit_dispatched_payload(
                 .expect("the admission request must reach the peer");
             listener.next_event(cx).await.map(|_| ())
         },
-    )
+    ))
     .await;
     // Admitted or refused, the client answers nothing on the wire: a response
     // back to the server would require opening another socket.
@@ -4517,7 +4517,7 @@ async fn positive_12_response_isolation(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
 
-    let ((), ()) = pair(
+    let ((), ()) = Box::pin(pair(
         async {
             let mut first = peer.accept().await;
             let _ = read_request(&mut first).await;
@@ -4575,13 +4575,13 @@ async fn positive_12_response_isolation(cx: &Cx) {
                 .expect("the owning terminal must arrive");
             assert!(matches!(owner_event, ModernHttpFinalCoreEvent::Terminal(_)));
         },
-    )
+    ))
     .await;
     // Exactly one JSON-RPC object in a dispatched payload is admitted. These
     // bytes are the control for the concatenation negative, which reuses them
     // verbatim so that the only thing changing there is that they appear twice.
     let single = terminal_tool_result(2, "single-object");
-    admit_dispatched_payload(cx, &single)
+    Box::pin(admit_dispatched_payload(cx, &single))
         .await
         .expect("one complete JSON-RPC object must be admitted");
 }
@@ -4590,7 +4590,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
 
-    let ((), ()) = pair(
+    let ((), ()) = Box::pin(pair(
         async {
             let mut first = peer.accept().await;
             let _ = read_request(&mut first).await;
@@ -4666,7 +4666,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
                     .is_none()
             );
         },
-    )
+    ))
     .await;
 
     // No JSON-RPC parse/invalid-request response was posted back to the
@@ -4689,7 +4689,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
         single.len() * 2,
         "the negative differs from the control by exactly one appended copy"
     );
-    let refusal = admit_dispatched_payload(cx, &concatenated)
+    let refusal = Box::pin(admit_dispatched_payload(cx, &concatenated))
         .await
         .expect_err("concatenated JSON must not be admitted as one message");
     assert!(
@@ -4703,7 +4703,7 @@ async fn negative_12_invalid_direction(cx: &Cx) {
     // Unchanged state: the single object is admitted again on a fresh stream,
     // so the concatenation refusal poisoned neither the admission path nor the
     // fixture that drives it.
-    admit_dispatched_payload(cx, &single)
+    Box::pin(admit_dispatched_payload(cx, &single))
         .await
         .expect("one complete object must still be admitted after the refusal");
 }
@@ -4790,7 +4790,7 @@ async fn stream_reads_under_budget(
 ) {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let (held, outcomes) = pair(
+    let (held, outcomes) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -4825,7 +4825,7 @@ async fn stream_reads_under_budget(
             let again = stream.next_event(budget).await;
             (under_budget, again)
         },
-    )
+    ))
     .await;
     drop(held);
     outcomes
@@ -4837,7 +4837,7 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
     let marker = ProgressMarker::from("http-03-a-progress");
     let server_marker = marker.clone();
 
-    let (wire, ()) = pair(
+    let (wire, ()) = Box::pin(pair(
         async {
             // SSE lane: request-scoped progress then exactly one terminal.
             let mut sse = peer.accept().await;
@@ -4912,7 +4912,7 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
             assert_eq!(response.id, Some(RequestId::Number(3)));
             assert!(response.error.is_none());
         },
-    )
+    ))
     .await;
 
     assert_eq!(exactly_one_header(&wire.head, "Mcp-Method"), "tools/call");
@@ -4967,7 +4967,7 @@ async fn positive_13_terminal_outcome_and_progress(cx: &Cx) {
     // against, and it is also the contrast for idempotency: a healthy ended
     // stream repeats Ok(None), where a refused one must repeat a closure.
     // -----------------------------------------------------------------------
-    let (ended, ended_again) = stream_reads_under_budget(cx, &Cx::for_testing(), false).await;
+    let (ended, ended_again) = Box::pin(stream_reads_under_budget(cx, &Cx::for_testing(), false)).await;
     assert!(
         matches!(ended, Ok(None)),
         "a live budget on a terminated stream reports a clean end, saw {ended:?}"
@@ -4992,7 +4992,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     let mut connection = connect(cx, &peer).await;
 
     // The sole changed variable is the terminal response ID.
-    let ((), refusal) = pair(
+    let ((), refusal) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -5015,7 +5015,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
                 .await
                 .expect_err("an uncorrelated terminal must not be delivered")
         },
-    )
+    ))
     .await;
 
     assert!(
@@ -5141,7 +5141,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
 
     // Side 2: the cancellation limb. The sole changed variable against the
     // control is the budget's cancellation bit.
-    let (cancelled, _) = stream_reads_under_budget(cx, &cancelled_budget_context(), true).await;
+    let (cancelled, _) = Box::pin(stream_reads_under_budget(cx, &cancelled_budget_context(), true)).await;
     let cancelled = cancelled
         .expect_err("a cancelled budget must end the wait on an endless response");
     assert!(
@@ -5155,7 +5155,7 @@ async fn negative_13_terminal_id_mismatch(cx: &Cx) {
     // and a caller could not tell "someone cancelled me" from "I ran out of
     // time".
     let (expired, expired_again) =
-        stream_reads_under_budget(cx, &expired_budget_context(), true).await;
+        Box::pin(stream_reads_under_budget(cx, &expired_budget_context(), true)).await;
     let expired = expired
         .expect_err("an expired budget must end the wait on an endless response");
     assert!(
