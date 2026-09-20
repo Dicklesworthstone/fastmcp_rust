@@ -116,9 +116,9 @@ fn run_resource(case: ResourceCase) {
                     assert!(original.contains("1.20e+4") && original.contains("900719925474099312345"));
                     assert!(original.contains("exact first") && original.contains("AAEC") && original.contains("file:///two"));
                     if matches!(case, ResourceCase::Cached) {
-                        let hit = client.clone().read(&cx, request.clone(),
+                        let hit = Box::pin(client.clone().read(&cx, request.clone(),
                             || panic!("cached read must not allocate an ID"), |_| panic!("cached read must not replay notifications"),
-                        ).await.unwrap();
+                        )).await.unwrap();
                         assert!(hit.is_cache_hit());
                         assert_eq!(hit.result().encode().unwrap(), original);
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
@@ -168,7 +168,7 @@ fn run_resource(case: ResourceCase) {
                             assert!(result.unwrap().is_complete());
                         }
                     }
-                    let base = client.read(&cx, request, || panic!("continuations cannot replace the ordinary cache"), |_| Ok(())).await.unwrap();
+                    let base = Box::pin(client.read(&cx, request, || panic!("continuations cannot replace the ordinary cache"), |_| Ok(()))).await.unwrap();
                     assert!(base.is_cache_hit());
                     assert_eq!(client.cache_stats().unwrap().fills, 1);
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 5);
@@ -261,11 +261,11 @@ fn run_resource(case: ResourceCase) {
                 }
                 ResourceCase::RevokeBeforePost | ResourceCase::ClearBeforePost => {
                     let credential = session.credential(&cx).await.unwrap();
-                    let result = client.read(&cx, request, || {
+                    let result = Box::pin(client.read(&cx, request, || {
                         if matches!(case, ResourceCase::RevokeBeforePost) { credential.credential().revoke(); }
                         else { client.clear().unwrap(); }
                         next_id(&ids)
-                    }, |_| Ok(())).await;
+                    }, |_| Ok(()))).await;
                     match case {
                         ResourceCase::RevokeBeforePost => assert!(matches!(result, Err(ReadError::CredentialUnavailable))),
                         _ => assert!(matches!(result, Err(ReadError::Invalidated))),
@@ -278,7 +278,7 @@ fn run_resource(case: ResourceCase) {
                         Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
                     assert!(first.unwrap().is_complete());
                     session.credential(&cx).await.unwrap().credential().revoke();
-                    assert!(client.read(&cx, request, || panic!("revoked read cannot dispatch"), |_| Ok(())).await.is_err());
+                    assert!(Box::pin(client.read(&cx, request, || panic!("revoked read cannot dispatch"), |_| Ok(()))).await.is_err());
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
                     assert_eq!(client.cache_stats().unwrap().hits, 0);
                 }
@@ -307,15 +307,15 @@ fn run_resource(case: ResourceCase) {
                 }
                 ResourceCase::Preflight => {
                     let wrong = core("tools/call", false);
-                    assert!(matches!(client.read(&cx, wrong, || panic!("wrong method cannot allocate ID"), |_| Ok(())).await,
+                    assert!(matches!(Box::pin(client.read(&cx, wrong, || panic!("wrong method cannot allocate ID"), |_| Ok(()))).await,
                         Err(ReadError::NotResourceRead)));
                     let mut params = request.encode_params().unwrap().unwrap();
                     params["_meta"]["com.example/oversized"] = json!("x".repeat(8192));
                     let oversized = CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params)).unwrap();
-                    assert!(matches!(client.read(&cx, oversized, || panic!("oversize cannot allocate ID"), |_| Ok(())).await,
+                    assert!(matches!(Box::pin(client.read(&cx, oversized, || panic!("oversize cannot allocate ID"), |_| Ok(()))).await,
                         Err(ReadError::Core(ManagedCoreError::RequestTooLarge))));
                     cancellation.cancel();
-                    assert!(matches!(client.read_with_cancellation(&cx, &cancellation, request, || next_id(&ids), |_| Ok(())).await,
+                    assert!(matches!(Box::pin(client.read_with_cancellation(&cx, &cancellation, request, || next_id(&ids), |_| Ok(()))).await,
                         Err(ReadError::Core(ManagedCoreError::Cancelled))));
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
                     assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
