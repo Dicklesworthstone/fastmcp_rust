@@ -103,7 +103,7 @@ async fn healthy_listen(peer: &Peer, tasks: &ClientCredentialsTasksClient, cx: &
         receive_ack(&mut subscription, cx, &selected()).await;
         receive_terminal(&mut subscription, cx, id + 1).await;
     };
-    pair(server, application).await;
+    Box::pin(pair(server, application)).await;
 }
 
 fn run_subscription(case: SubCase) {
@@ -173,16 +173,16 @@ fn run_subscription(case: SubCase) {
                             }
                             receive_terminal(&mut subscription, &cx, 2).await;
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2, "events cause no polling or mutation");
                     }
                     SubCase::MissingTasks | SubCase::MissingAuth => {
                         let mut document = discovery();
                         let key = if matches!(case, SubCase::MissingTasks) { TASKS_EXTENSION } else { CLIENT_CREDENTIALS_EXTENSION };
                         document["capabilities"]["extensions"].as_object_mut().unwrap().remove(key);
-                        let ((), rejected) = pair(discover(&peer, 1, "access-one", &document),
+                        let ((), rejected) = Box::pin(pair(discover(&peer, 1, "access-one", &document),
                             tasks.subscribe(&cx, RequestId::Number(1), RequestId::Number(2), selected(),
-                                ClientCredentialsSubscriptionLimits::default())).await;
+                                ClientCredentialsSubscriptionLimits::default()))).await;
                         match case {
                             SubCase::MissingTasks => assert!(matches!(rejected, Err(TaskError::Protocol(ManagedTasksError::Negotiation)))),
                             _ => assert!(matches!(rejected, Err(TaskError::Authentication(Error::Negotiation)))),
@@ -232,7 +232,7 @@ fn run_subscription(case: SubCase) {
                             assert_eq!(serde_json::to_value(subscription.accepted_filter()).unwrap(), before);
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::Closed))));
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2);
                         healthy_listen(&peer, &tasks, &cx, 3, "access-one", 1).await;
                     }
@@ -265,7 +265,7 @@ fn run_subscription(case: SubCase) {
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::Closed))));
                             assert!(cx.checkpoint().is_ok());
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2, "local interruption sends no tasks/cancel");
                         if matches!(case, SubCase::Cancel | SubCase::Abandon | SubCase::Deadline) {
                             healthy_listen(&peer, &tasks, &cx, 3, "access-one", 1).await;
@@ -286,7 +286,7 @@ fn run_subscription(case: SubCase) {
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::RecordLimit))));
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::Closed))));
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2);
                     }
                     SubCase::Renewal => {
@@ -305,7 +305,7 @@ fn run_subscription(case: SubCase) {
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Authentication(Error::Expired))));
                             assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::Closed))));
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                         healthy_listen(&peer, &tasks, &cx, 3, "access-two", 2).await;
                         assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 4);
@@ -322,8 +322,8 @@ fn run_subscription(case: SubCase) {
                             tls.write_all(head.as_bytes()).await.unwrap();
                             tls.flush().await.unwrap();
                         };
-                        let (_, response) = pair(server, tasks.subscribe(&cx, RequestId::Number(1),
-                            RequestId::Number(2), selected(), ClientCredentialsSubscriptionLimits::default())).await;
+                        let (_, response) = Box::pin(pair(server, tasks.subscribe(&cx, RequestId::Number(1),
+                            RequestId::Number(2), selected(), ClientCredentialsSubscriptionLimits::default()))).await;
                         let error = response.err().unwrap();
                         match case {
                             SubCase::Denied => assert!(matches!(error, TaskError::Protocol(ManagedTasksError::HttpStatus { status:401 }))),
@@ -349,7 +349,7 @@ fn run_subscription(case: SubCase) {
                             assert_eq!(task_subscription_ids(subscription.accepted_filter().unwrap()).unwrap().unwrap(), vec![task_id()]);
                             receive_terminal(&mut subscription, &cx, 2).await;
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                     }
                     SubCase::Preflight => unreachable!(),
                 }
