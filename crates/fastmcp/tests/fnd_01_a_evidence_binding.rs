@@ -391,10 +391,19 @@ fn blob_at_revision(revision: &str, path: &str) -> Vec<u8> {
         .unwrap_or_else(|error| {
             panic!("{path}: cannot run `git cat-file blob {revision}:{path}`: {error}")
         });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not a git repository"),
+        "VOID, NOT A FINDING - {path}: no git repository on this host. RCH syncs source files \
+         and never `.git` (.rchignore), so this check cannot evaluate on a worker and its \
+         failure says nothing about the property under test. Run it where the repository is \
+         authoritative. Raw stderr: {}",
+        stderr.trim()
+    );
     assert!(
         output.status.success(),
         "{path}: `git cat-file blob {revision}:{path}` failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        stderr.trim()
     );
     output.stdout
 }
@@ -1250,10 +1259,19 @@ fn commits_touching(path: &str) -> Vec<String> {
         .current_dir(workspace_root())
         .output()
         .unwrap_or_else(|error| panic!("{path}: cannot run `git log -- {path}`: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not a git repository"),
+        "VOID, NOT A FINDING - {path}: no git repository on this host. RCH syncs source files \
+         and never `.git` (.rchignore), so this check cannot evaluate on a worker and its \
+         failure says nothing about the property under test. Run it where the repository is \
+         authoritative. Raw stderr: {}",
+        stderr.trim()
+    );
     assert!(
         output.status.success(),
-        "{path}: `git log -- {path}` failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "{path}: `git log --full-history -- {path}` failed: {}",
+        stderr.trim()
     );
     String::from_utf8_lossy(&output.stdout)
         .lines()
