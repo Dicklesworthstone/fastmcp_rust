@@ -37,6 +37,9 @@
 //! }
 //! ```
 
+/// Authenticated, reversibly routed resource templates.
+pub mod dynamic;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
