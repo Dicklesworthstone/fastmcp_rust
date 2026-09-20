@@ -177,7 +177,7 @@ impl ServerHttpEndpoint {
             PreparedRequest::Immediate(response) => return Ok(SecuredHttpEndpointResponse::immediate(response)),
             PreparedRequest::Post(cors) => cors,
         };
-        let ((response, authorization), mut session) = await_dispatch(cx, async {
+        let ((response, authorization), mut session) = Box::pin(await_dispatch(cx, async {
             let mut session = self.open_session(cx).map_err(|_| SecuredHttpEndpointError::SessionUnavailable)?;
             let dispatched = match &policy.scope_authorization {
                 Some(scopes) => scope::dispatch(&mut session, cx, scopes, request, policy.sse_revalidation).await,
@@ -192,7 +192,7 @@ impl ServerHttpEndpoint {
                     Err(error)
                 }
             }
-        }).await?;
+        })).await?;
         let response = match response {
             ServerHttpEndpointResponse::Immediate(mut response) => {
                 drop(authorization);
