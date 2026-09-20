@@ -5,12 +5,15 @@
 //! exact matched URI is sent to the MCP endpoint; captured parameters never
 //! become HTTP headers or a different fetch target.
 
+mod completion;
+pub use completion::ManagedOAuthCompletion;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult};
-use fastmcp_protocol::common_types::{Annotations, OpenMetadata, RawIcon};
+use fastmcp_protocol::common_types::{AbsoluteUri, Annotations, OpenMetadata, RawIcon};
 use fastmcp_protocol::{
     CompleteResult, CoreResult, FinalCoreResult, FinalReadResourceResult,
     FinalResourceTemplate, Resource, ResourceContent, ResourceTemplate,
@@ -20,7 +23,7 @@ use serde_json::json;
 
 use super::{Forwarder, MODERN_ASYNC_ONLY, ManagedOAuthProvider, UNEXPECTED_RESULT, outcome};
 use crate::handler::{
-    BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalResourceUriUse,
     ResourceHandler, ResourceUriUsePolicy, UriParams,
 };
 
@@ -67,6 +70,13 @@ impl ManagedOAuthResourceTemplate {
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         ctx.checkpoint()?;
         super::check_cx(cx)?;
+        // A variable in the scheme position can expand to HTTPS even though
+        // the catalog template does not literally begin with it. Apply the
+        // server's URI-use policy to the actual target before authenticated I/O.
+        let target = AbsoluteUri::parse(uri).map_err(|_| route_error())?;
+        if !ResourceUriUsePolicy::server_mediated().admits(&target, FinalResourceUriUse::ResourceReadTarget) {
+            return Err(route_error());
+        }
         if self.matcher.match_uri(uri).map_err(|_| route_error())?.is_none() {
             return Err(route_error());
         }
@@ -279,6 +289,25 @@ mod tests {
             assert_eq!(backend.responses.lock().unwrap().len(), 1);
             assert_eq!(template.forwarder.next_id.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[test]
+    fn variable_scheme_cannot_turn_a_mediated_route_into_client_direct_https() {
+        let (template, backend) = fixture(vec![result(), result()], false);
+        let template = build_templates(template.forwarder, vec![definition("{scheme}://monthly/{name}")])
+            .unwrap().pop().unwrap();
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(block_on(template.read_final_async_with_uri(&ctx, "report://monthly/alpha", &UriParams::new())).is_ok());
+        let next_id = template.forwarder.next_id.load(Ordering::Relaxed);
+        for uri in ["https://monthly/alpha", "HTTPS://monthly/alpha"] {
+            // The matcher alone admits this. Only the runtime URI-use policy
+            // can refuse it; the negative differs from the positive by scheme.
+            assert!(template.matcher.match_uri(uri).unwrap().is_some());
+            assert!(block_on(template.read_final_async_with_uri(&ctx, uri, &UriParams::new())).is_err());
+        }
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert_eq!(backend.responses.lock().unwrap().len(), 1);
+        assert_eq!(template.forwarder.next_id.load(Ordering::Relaxed), next_id);
     }
 
     #[test]
