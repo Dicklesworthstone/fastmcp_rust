@@ -163,7 +163,7 @@ impl ClientCredentialsResourceClient {
         let owner = &self.client.inner.closed;
         let _gap = InvalidateOnExit { cache: Arc::clone(&self.cache), set: set.clone() };
         self.cache()?.invalidate_result_set(&set);
-        active(cx, deadline, owner, cancellation, None, async {
+        Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let (discovery_id, listen_id) = issue_pair(&ids)?;
                 check_binding(cx, cancellation, deadline, owner, None)?;
@@ -265,7 +265,7 @@ impl ClientCredentialsResourceClient {
                     }.await)
                 }).await?
             }.await)
-        }).await?
+        })).await?
     }
 }
 

@@ -177,7 +177,7 @@ impl ClientCredentialsCatalogClient {
         let owner = &self.client.inner.closed;
         let _gap = InvalidateOnExit { invalidation: Arc::clone(&self.invalidation), kind };
         self.fences()?.invalidate_result_set(&kind.result_set());
-        active(cx, deadline, owner, cancellation, None, async {
+        Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let (discovery_id, listen_id) = issue_pair(&ids)?;
                 check_binding(cx, cancellation, deadline, owner, None)?;
@@ -283,7 +283,7 @@ impl ClientCredentialsCatalogClient {
                     }.await)
                 }).await?
             }.await)
-        }).await?
+        })).await?
     }
 }
 
