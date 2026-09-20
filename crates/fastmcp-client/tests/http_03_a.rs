@@ -957,12 +957,13 @@ fn tool_call_params(name: &str) -> serde_json::Value {
 /// Connects the public modern client, answering its probe on the fixture.
 async fn connect(cx: &Cx, peer: &Peer) -> ClientHttpConnection {
     let target = peer.target();
-    let (_, connection) = pair(serve_probe(peer), async {
+    // Boxed inside the helper, not at its 18 call sites.
+    let (_, connection) = Box::pin(pair(serve_probe(peer), async {
         builder(&target)
             .connect_http_with_cx(cx)
             .await
             .expect("the public modern client must connect over the loopback socket")
-    })
+    }))
     .await;
     connection
 }
@@ -1272,7 +1273,7 @@ async fn content_encoding_outcome(
     if let Some(encoding) = encoding {
         headers.push(("Content-Encoding", encoding));
     }
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -1285,7 +1286,7 @@ async fn content_encoding_outcome(
                 Err(error) => Err(error),
             }
         },
-    )
+    ))
     .await;
     outcome
 }
@@ -2112,7 +2113,7 @@ async fn success_content_type_outcome(
         .iter()
         .map(|value| ("Content-Type", *value))
         .collect();
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2124,7 +2125,7 @@ async fn success_content_type_outcome(
                 .await
                 .map(|response| response.metadata().kind())
         },
-    )
+    ))
     .await;
     peer.assert_no_further_connection();
     outcome
