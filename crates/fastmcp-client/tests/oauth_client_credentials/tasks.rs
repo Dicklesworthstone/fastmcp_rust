@@ -142,7 +142,7 @@ fn run_tasks(case: TaskCase) {
                         let ManagedTaskEvent::Snapshot(snapshot)=result(&tasks,&cx,11,ManagedTaskRequest::Get(task_id())).await else { panic!("terminal snapshot required") };
                         assert!(matches!(snapshot.task,Task::Cancelled(_)));
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),12);
                 }
@@ -151,8 +151,8 @@ fn run_tasks(case: TaskCase) {
                     let mut missing=discovery();
                     let key=if matches!(case,TaskCase::MissingTasks) { TASKS_EXTENSION } else { CLIENT_CREDENTIALS_EXTENSION };
                     missing["capabilities"]["extensions"].as_object_mut().unwrap().remove(key);
-                    let ((), rejected)=pair(discover(&peer,1,"access-one",&missing),
-                        tasks.request(&cx,RequestId::Number(1),RequestId::Number(2),ManagedTaskRequest::Cancel(task_id()))).await;
+                    let ((), rejected)=Box::pin(pair(discover(&peer,1,"access-one",&missing),
+                        tasks.request(&cx,RequestId::Number(1),RequestId::Number(2),ManagedTaskRequest::Cancel(task_id())))).await;
                     match case {
                         TaskCase::MissingTasks => assert!(matches!(rejected,Err(TaskError::Protocol(ManagedTasksError::Negotiation)))),
                         _ => assert!(matches!(rejected,Err(TaskError::Authentication(Error::Negotiation)))),
@@ -160,8 +160,8 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),1,"no mutation on partial negotiation");
                     peer.quiet();
                     let good=task("working","complete");
-                    let (_, snapshot)=pair(operation(&peer,3,"tasks/get","access-one",&good),
-                        result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id()))).await;
+                    let (_, snapshot)=Box::pin(pair(operation(&peer,3,"tasks/get","access-one",&good),
+                        result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id())))).await;
                     assert!(matches!(snapshot,ManagedTaskEvent::Snapshot(_)));
                     assert_eq!(client.credential(&cx).await.unwrap().generation(),1);
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
@@ -184,10 +184,10 @@ fn run_tasks(case: TaskCase) {
                         }
                         assert!(matches!(call.next_event(&cx).await,Err(TaskError::Protocol(ManagedTasksError::Closed))));
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2);
                     let good=task("working","complete");
-                    let (_, snapshot)=pair(operation(&peer,3,"tasks/get","access-one",&good),result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id()))).await;
+                    let (_, snapshot)=Box::pin(pair(operation(&peer,3,"tasks/get","access-one",&good),result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id())))).await;
                     assert!(matches!(snapshot,ManagedTaskEvent::Snapshot(_)));
                 }
                 TaskCase::InvalidProgress | TaskCase::Truncated | TaskCase::Cancel | TaskCase::Close
@@ -227,7 +227,7 @@ fn run_tasks(case: TaskCase) {
                         }
                         assert!(matches!(call.next_event(&cx).await,Err(TaskError::Protocol(ManagedTasksError::Closed))));
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1,"a live response never renews its credential");
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2,"interruption never sends tasks/cancel or replays the tool");
                 }
@@ -244,7 +244,7 @@ fn run_tasks(case: TaskCase) {
                         };
                         tls.write_all(response.as_bytes()).await.unwrap(); tls.flush().await.unwrap();
                     };
-                    let ((), outcome)=pair(server,tasks.request(&cx,RequestId::Number(1),RequestId::Number(2),ManagedTaskRequest::Cancel(task_id()))).await;
+                    let ((), outcome)=Box::pin(pair(server,tasks.request(&cx,RequestId::Number(1),RequestId::Number(2),ManagedTaskRequest::Cancel(task_id())))).await;
                     assert!(outcome.is_err());
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2,"uncertain mutation is never automatically replayed");
@@ -264,13 +264,13 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),0);
                     peer.quiet();
                     let server=async { peer.grant("access-one",300).await; operation(&peer,3,"tasks/get","access-one",&task("working","complete")).await; };
-                    let ((),snapshot)=pair(server,result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id()))).await;
+                    let ((),snapshot)=Box::pin(pair(server,result(&tasks,&cx,3,ManagedTaskRequest::Get(task_id())))).await;
                     assert!(matches!(snapshot,ManagedTaskEvent::Snapshot(_)));
                 }
                 TaskCase::Renewal => {
                     acquire(&peer,&cx,&client,"access-one",1).await;
                     let working=task("working","complete");
-                    pair(operation(&peer,1,"tasks/get","access-one",&working),result(&tasks,&cx,1,ManagedTaskRequest::Get(task_id()))).await;
+                    Box::pin(pair(operation(&peer,1,"tasks/get","access-one",&working),result(&tasks,&cx,1,ManagedTaskRequest::Get(task_id())))).await;
                     Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
                     let server=async { peer.grant("access-two",300).await; operation(&peer,3,"tasks/get","access-two",&working).await; };
                     let application=async {
@@ -278,7 +278,7 @@ fn run_tasks(case: TaskCase) {
                         assert_eq!(call.credential_generation(),2);
                         assert!(matches!(call.next_event(&cx).await.unwrap(),Some(ManagedTaskEvent::Snapshot(_))));
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst),2);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),4,"renewed credentials require fresh composed discovery");
                 }
