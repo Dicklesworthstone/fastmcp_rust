@@ -277,8 +277,8 @@ fn run_private(case: PrivateCase) {
                         pair(grant(&peer, &signer, audience, 300), application).await;
                         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
                         assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
-                        let (_, response) = pair(peer.operation(1, "tools/list", "access-one", LIST),
-                            client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2))).await;
+                        let (_, response) = Box::pin(pair(peer.operation(1, "tools/list", "access-one", LIST),
+                            client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2)))).await;
                         let result = response.unwrap().read_json_result(&cx, 4096).await.unwrap();
                         assert!(result.encode().unwrap().contains("1.20e+4"));
                         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
@@ -377,7 +377,7 @@ fn run_private(case: PrivateCase) {
                         assert_ne!(previous.as_ref(), Some(&fresh)); assert_eq!(generation, 1);
                     }
                     #[cfg(feature = "tasks")]
-                    PrivateCase::Tasks => tasks_with_private_key(&peer, &signer, &client, &cx, audience).await,
+                    PrivateCase::Tasks => Box::pin(tasks_with_private_key(&peer, &signer, &client, &cx, audience)).await,
                 }
                 assert!(cx.checkpoint().is_ok());
                 assert_eq!(backend.in_flight.load(Ordering::SeqCst), 0);
@@ -445,7 +445,7 @@ async fn tasks_with_private_key(peer: &Peer, signer: &ExternalRs256Signer,
         assert!(matches!(subscription.next_event(cx).await.unwrap(), Some(ModernHttpSubscriptionListenEvent::Terminal { .. })));
         assert!(subscription.next_event(cx).await.unwrap().is_none());
     };
-    pair(server, application).await;
+    Box::pin(pair(server, application)).await;
     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
     assert_eq!(peer.rpcs.load(Ordering::SeqCst), 4);
 }
