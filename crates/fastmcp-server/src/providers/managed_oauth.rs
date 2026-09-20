@@ -29,6 +29,9 @@
 //! for tool in provider.tools(cx).await? {
 //!     builder = builder.tool(tool);
 //! }
+//! for resource in provider.resources(cx).await? {
+//!     builder = builder.resource(resource);
+//! }
 //! ```
 
 use std::collections::HashSet;
@@ -46,15 +49,17 @@ use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CompleteResult, Content, CoreRequest, CoreResult, FinalCallToolResult,
-    FinalCoreResult, FinalTool, RequestId, ServerNotification, Tool,
+    FinalCoreResult, FinalReadResourceResult, FinalResource, FinalTool,
+    RequestId, Resource, ResourceContent, ServerNotification, Tool,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
     FINAL_PROTOCOL_VERSION_META_KEY,
 };
 use serde_json::{Value, json};
 
 use crate::handler::{
-    BoxFuture, FinalToolOutcome, FinalToolSchemaAuthority, ToolExecutionMode,
-    ToolHandler, UpstreamFinalToolSchemaRegistration,
+    BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    FinalToolOutcome, FinalToolSchemaAuthority, ResourceHandler, ToolExecutionMode,
+    ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
 const UPSTREAM_FAILURE: &str = "Authenticated upstream request failed";
@@ -119,12 +124,28 @@ impl ManagedOAuthProvider {
         let pages = self.catalog(cx, "tools/list").await?;
         let mut entries = Vec::new();
         for page in pages {
-            let CoreResult::Final(FinalCoreResult::ToolsList(page)) = page else {
+            let CoreResult::Final(FinalCoreResult::ToolsList { result: page, .. }) = page else {
                 return Err(McpError::invalid_request(UNEXPECTED_RESULT));
             };
             entries.extend(page.payload.tools);
         }
         build_tools(Arc::clone(&self.forwarder), entries, self.namespace.as_deref())
+    }
+
+    /// Collects the complete concrete-resource catalog before returning handlers.
+    /// URIs are retained verbatim: a tool namespace never changes resource routing.
+    /// Duplicate URIs fail the entire acquisition rather than shadowing a route.
+    /// Templates and resource subscriptions are not installed by this method.
+    pub async fn resources(&self, cx: &Cx) -> McpResult<Vec<ManagedOAuthResource>> {
+        let pages = self.catalog(cx, "resources/list").await?;
+        let mut entries = Vec::new();
+        for page in pages {
+            let CoreResult::Final(FinalCoreResult::ResourcesList { result: page, .. }) = page else {
+                return Err(McpError::invalid_request(UNEXPECTED_RESULT));
+            };
+            entries.extend(page.payload.resources);
+        }
+        build_resources(Arc::clone(&self.forwarder), entries)
     }
 
     async fn catalog(&self, cx: &Cx, method: &str) -> McpResult<Vec<CoreResult>> {
@@ -142,6 +163,108 @@ impl ManagedOAuthProvider {
         check_cx(cx)?;
         Ok(collected.into_pages())
     }
+}
+
+/// One concrete resource from a fully collected authenticated upstream catalog.
+/// Its URI is an immutable route identity, not an arbitrary authenticated fetch
+/// target. Reads use the managed MCP endpoint, never a direct fetch of that URI.
+pub struct ManagedOAuthResource {
+    forwarder: Arc<Forwarder>,
+    definition: FinalResource,
+}
+
+impl ManagedOAuthResource {
+    /// The exact final catalog entry, including size, annotations and metadata.
+    pub fn catalog_definition(&self) -> &FinalResource { &self.definition }
+
+    async fn invoke(&self, ctx: &McpContext, cx: &Cx, uri: &str)
+        -> McpResult<CompleteResult<FinalReadResourceResult>>
+    {
+        // Direct callers must not widen a registered handler's authority by
+        // supplying another URI. Refuse before allocating an ID or doing I/O.
+        if uri != self.definition.uri.as_str() {
+            return Err(McpError::invalid_params("Managed OAuth resource URI does not match its route"));
+        }
+        match self.forwarder.execute(ctx, cx, "resources/read", json!({"uri": uri})).await? {
+            FinalCoreResult::ResourcesRead { result, .. } => Ok(result),
+            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+        }
+    }
+}
+
+impl ResourceHandler for ManagedOAuthResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.definition.uri.as_str().to_owned(),
+            name: self.definition.name.clone(),
+            description: self.definition.description.clone(),
+            mime_type: self.definition.mime_type.clone(),
+            icon: None, version: None, tags: Vec::new(),
+        }
+    }
+    fn final_definition(&self) -> Option<FinalResource> { Some(self.definition.clone()) }
+    fn final_title(&self) -> Option<&str> { self.definition.title.as_deref() }
+    fn final_icons(&self) -> Option<&[RawIcon]> { self.definition.icons.as_deref() }
+    fn final_metadata(&self) -> Option<&OpenMetadata> { self.definition.meta.as_ref() }
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        // Otherwise the router replaces the upstream TTL/scope with its defaults.
+        FinalResourceReadCacheHintProvenance::Explicit
+    }
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Err(McpError::invalid_request(MODERN_ASYNC_ONLY))
+    }
+    fn on_subscribe(&self, _ctx: &McpContext, _uri: &str) -> McpResult<()> {
+        Err(McpError::invalid_request("Managed OAuth resource subscriptions are not installed"))
+    }
+    fn on_unsubscribe(&self, _ctx: &McpContext, _uri: &str) -> McpResult<()> {
+        Err(McpError::invalid_request("Managed OAuth resource subscriptions are not installed"))
+    }
+    fn read_final_async<'a>(&'a self, ctx: &'a McpContext)
+        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), self.definition.uri.as_str()).await) })
+    }
+    fn read_final_async_with_uri<'a>(&'a self, ctx: &'a McpContext, uri: &'a str, _params: &'a UriParams)
+        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), uri).await) })
+    }
+    fn read_final_outcome_async<'a>(&'a self, ctx: &'a McpContext)
+        -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>>
+    {
+        Box::pin(async move {
+            outcome(self.invoke(ctx, ctx.cx(), self.definition.uri.as_str()).await.map(FinalMethodOutcome::Complete))
+        })
+    }
+    fn read_final_outcome_async_with_uri<'a>(&'a self, ctx: &'a McpContext, uri: &'a str, _params: &'a UriParams)
+        -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), uri).await.map(FinalMethodOutcome::Complete)) })
+    }
+    fn read_final_async_with_uri_in_request<'a>(
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, uri: &'a str, _params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalReadResourceResult>>> {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, uri).await) })
+    }
+    fn read_final_outcome_async_with_uri_in_request<'a>(
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, uri: &'a str, _params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, uri).await.map(FinalMethodOutcome::Complete)) })
+    }
+}
+
+fn build_resources(forwarder: Arc<Forwarder>, entries: Vec<FinalResource>)
+    -> McpResult<Vec<ManagedOAuthResource>>
+{
+    let mut uris = HashSet::new();
+    let mut resources = Vec::with_capacity(entries.len());
+    for definition in entries {
+        if !uris.insert(definition.uri.as_str().to_owned()) {
+            return Err(McpError::invalid_request("Authenticated upstream catalog contains duplicate resource URIs"));
+        }
+        resources.push(ManagedOAuthResource { forwarder: Arc::clone(&forwarder), definition });
+    }
+    Ok(resources)
 }
 
 /// A tool admitted from a fully collected authenticated upstream catalog.
@@ -333,7 +456,7 @@ fn upstream_error(error: ManagedCoreError) -> McpError {
 }
 fn tool_result(result: FinalCoreResult) -> McpResult<CompleteResult<FinalCallToolResult>> {
     match result {
-        FinalCoreResult::ToolsCall(result) => Ok(result),
+        FinalCoreResult::ToolsCall { result, .. } => Ok(result),
         _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
     }
 }
@@ -378,9 +501,9 @@ mod tests {
         })).unwrap()
     }
     fn response(error: bool) -> FinalCoreResult {
-        FinalCoreResult::ToolsCall(CompleteResult::new(FinalCallToolResult {
+        FinalCoreResult::ToolsCall { result: CompleteResult::new(FinalCallToolResult {
             content: Vec::new(), is_error: error, structured_content: Some(json!({"answer":42})),
-        }, ResultMeta::empty()))
+        }, ResultMeta::empty()), diagnostic: None }
     }
     fn fixture(responses: Vec<FinalCoreResult>, cancel: bool) -> (ManagedOAuthTool, Arc<Backend>) {
         let backend = Arc::new(Backend { calls: Mutex::new(Vec::new()), responses: Mutex::new(responses.into()), cancel_on_return: cancel });
@@ -504,5 +627,142 @@ mod tests {
         let message = upstream_error(ManagedCoreError::InvalidResponse).to_string();
         assert!(message.contains(UPSTREAM_FAILURE));
         assert!(!message.contains("token"));
+    }
+
+    fn resource_definition(uri: &str) -> FinalResource {
+        serde_json::from_value(json!({
+            "uri": uri, "name": "Report", "title": "Quarterly report",
+            "description": "Remote document", "mimeType": "text/plain", "size": 42,
+            "icons": [{"src":"https://example.com/report.png","mimeType":"image/png"}],
+            "annotations": {"audience":["assistant"],"priority":0.5},
+            "_meta": {"com.example/source":{"revision":9}}
+        })).unwrap()
+    }
+
+    fn resource_response() -> FinalCoreResult {
+        let request = core_request("resources/read", json!({"uri":"file:///report"}), None).unwrap();
+        let CoreResult::Final(result) = request.decode_result(r#"{
+            "resultType":"complete",
+            "contents":[{"uri":"file:///report","text":"first"},{"uri":"file:///attachment","blob":"AAEC"}],
+            "ttlMs":1234,"cacheScope":"private","_meta":{"com.example/revision":9},
+            "x-exact":{"z":900719925474099312345,"a":1.20e+4}
+        }"#).unwrap() else { panic!("expected final resource result") };
+        result
+    }
+
+    fn resource_fixture(responses: Vec<FinalCoreResult>, cancel: bool)
+        -> (ManagedOAuthResource, Arc<Backend>)
+    {
+        let (tool, backend) = fixture(responses, cancel);
+        let resource = build_resources(tool.forwarder, vec![resource_definition("file:///report")])
+            .unwrap().pop().unwrap();
+        (resource, backend)
+    }
+
+    #[test]
+    fn authenticated_resource_preserves_catalog_and_explicit_cache_authority() {
+        let (resource, _) = resource_fixture(vec![], false);
+        assert_eq!(
+            serde_json::to_value(resource.final_definition().unwrap()).unwrap(),
+            serde_json::to_value(resource_definition("file:///report")).unwrap(),
+        );
+        assert_eq!(resource.definition().uri, "file:///report");
+        assert_eq!(resource.final_resource_read_cache_hint_provenance(), FinalResourceReadCacheHintProvenance::Explicit);
+        assert!(!resource.declares_final_mrtr());
+        assert!(resource.template().is_none());
+    }
+
+    #[test]
+    fn owned_resource_read_preserves_contents_cache_hints_metadata_and_exact_extras() {
+        let expected = CoreResult::Final(resource_response()).encode().unwrap();
+        let (resource, backend) = resource_fixture(vec![resource_response()], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let result = block_on(resource.read_final_async_with_uri_in_request(
+            &ctx, &cx, "file:///report", &UriParams::new(),
+        )).unwrap();
+        let actual = CoreResult::Final(FinalCoreResult::ResourcesRead { result, diagnostic: None }).encode().unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.contains("900719925474099312345") && actual.contains("1.20e+4"));
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["uri"], "file:///report");
+        assert_eq!(calls[0].1["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
+    }
+
+    #[test]
+    fn resource_uri_substitution_refuses_before_id_allocation_or_io() {
+        let (resource, backend) = resource_fixture(vec![resource_response()], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        assert!(block_on(resource.read_final_async_with_uri_in_request(
+            &ctx, &cx, "file:///another-principal", &UriParams::new(),
+        )).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+        assert_eq!(backend.responses.lock().unwrap().len(), 1);
+        assert_eq!(resource.forwarder.next_id.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resource_catalog_collision_uses_uri_not_display_name() {
+        let (resource, _) = resource_fixture(vec![], false);
+        let first = resource_definition("file:///report");
+        let different_uri = resource_definition("file:///other");
+        assert_eq!(build_resources(Arc::clone(&resource.forwarder), vec![first.clone(), different_uri]).unwrap().len(), 2);
+        let mut same_uri = first.clone();
+        same_uri.name = "Another name".to_owned();
+        assert!(build_resources(resource.forwarder, vec![first, same_uri]).is_err());
+    }
+
+    #[test]
+    fn resource_async_entry_points_all_preserve_the_final_result() {
+        let (resource, backend) = resource_fixture(vec![resource_response(); 5], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let params = UriParams::from([("unused".to_owned(), "value".to_owned())]);
+        assert!(block_on(resource.read_final_async(&ctx)).is_ok());
+        assert!(block_on(resource.read_final_async_with_uri(&ctx, "file:///report", &params)).is_ok());
+        assert!(matches!(block_on(resource.read_final_outcome_async(&ctx)).unwrap(), FinalMethodOutcome::Complete(_)));
+        assert!(matches!(block_on(resource.read_final_outcome_async_with_uri(&ctx, "file:///report", &params)).unwrap(), FinalMethodOutcome::Complete(_)));
+        assert!(matches!(block_on(resource.read_final_outcome_async_with_uri_in_request(&ctx, &cx, "file:///report", &params)).unwrap(), FinalMethodOutcome::Complete(_)));
+        assert_eq!(backend.calls.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn resource_input_required_is_not_flattened_or_retried() {
+        let request = core_request("resources/read", json!({"uri":"file:///report"}), None).unwrap();
+        let CoreResult::Final(input) = request.decode_result(r#"{"resultType":"input_required","requestState":"opaque"}"#).unwrap()
+            else { panic!("expected final input-required result") };
+        for response in [input, response(false)] {
+            let (resource, backend) = resource_fixture(vec![response, resource_response()], false);
+            let cx = Cx::for_testing();
+            let ctx = McpContext::new(cx.clone(), 1);
+            assert!(block_on(resource.read_final_outcome_async_with_uri_in_request(
+                &ctx, &cx, "file:///report", &UriParams::new(),
+            )).is_err());
+            assert_eq!(backend.calls.lock().unwrap().len(), 1);
+            assert_eq!(backend.responses.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn resource_pre_cancel_and_late_cancel_prevent_result_delivery() {
+        for cancel_on_return in [false, true] {
+            let (resource, backend) = resource_fixture(vec![resource_response()], cancel_on_return);
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            if !cancel_on_return { ctx.request_cancellation().cancel(); }
+            assert!(block_on(resource.read_final_async(&ctx)).is_err());
+            assert_eq!(backend.calls.lock().unwrap().len(), usize::from(cancel_on_return));
+        }
+    }
+
+    #[test]
+    fn resource_legacy_and_subscription_calls_never_start_network_work() {
+        let (resource, backend) = resource_fixture(vec![resource_response()], false);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(resource.read(&ctx).is_err());
+        assert!(resource.on_subscribe(&ctx, "file:///report").is_err());
+        assert!(resource.on_unsubscribe(&ctx, "file:///report").is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
     }
 }
