@@ -47,9 +47,9 @@ fn run_partial(case: PartialCase) {
         let cx = Cx::current().unwrap();
         let scenario = async {
             let peer = Peer::new().await;
-            let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(
+            let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(
                 &cx, peer.client(), OAuthSessionPolicy::default(), browser,
-            )).await;
+            ))).await;
             let session = session.unwrap();
             let cancellation = McpRequestCancellation::new();
             let method = match case { PartialCase::Manual(method) => method, _ => "tools/call" };
@@ -62,9 +62,9 @@ fn run_partial(case: PartialCase) {
             let mut first: Value = serde_json::from_str(TWO).unwrap();
             if matches!(case, PartialCase::MissingState) { first.as_object_mut().unwrap().remove("requestState"); }
             let first = first.to_string();
-            let (_, operation) = pair(peer.response(51, &first), session.start_core_interaction_with_cancellation(
+            let (_, operation) = Box::pin(pair(peer.response(51, &first), session.start_core_interaction_with_cancellation(
                 &cx, &cancellation, request, RequestId::Number(51), limits,
-            )).await;
+            ))).await;
             let mut operation = operation.unwrap();
             pending(&mut operation, &cx).await;
             let expected_posts = match case {
@@ -84,15 +84,15 @@ fn run_partial(case: PartialCase) {
                     }
                     assert!(matches!(operation.resume_partial(&cx, RequestId::Number(51), answers("one")).await,
                         Err(ManagedInteractionError::RepeatedRequestId)));
-                    let (wire, resumed) = pair(peer.response(52, REMAINING),
-                        operation.resume_partial(&cx, RequestId::Number(52), answers("one"))).await;
+                    let (wire, resumed) = Box::pin(pair(peer.response(52, REMAINING),
+                        operation.resume_partial(&cx, RequestId::Number(52), answers("one")))).await;
                     resumed.unwrap();
                     assert_continuation(&wire, &original, "  first+/%\0  ", "one");
                     pending(&mut operation, &cx).await;
                     assert!(matches!(operation.resume_partial(&cx, RequestId::Number(53), answers("one")).await,
                         Err(ManagedInteractionError::InvalidInputResponses)));
-                    let (wire, resumed) = pair(peer.response(53, complete(method)),
-                        operation.resume_partial(&cx, RequestId::Number(53), answers("two"))).await;
+                    let (wire, resumed) = Box::pin(pair(peer.response(53, complete(method)),
+                        operation.resume_partial(&cx, RequestId::Number(53), answers("two")))).await;
                     resumed.unwrap();
                     assert_continuation(&wire, &original, "next-state", "two");
                     finished(&mut operation, &cx).await;
@@ -116,7 +116,7 @@ fn run_partial(case: PartialCase) {
                             input_responses: Some(answers(if round == 0 { "one" } else { "two" })),
                         }))
                     }, |_| Ok(()));
-                    let ((), result) = pair(server, driver).await;
+                    let ((), result) = Box::pin(pair(server, driver)).await;
                     assert!(result.unwrap().encode().unwrap().contains("1.20e+4"));
                     assert_eq!(calls.get(), 2);
                     3
@@ -128,8 +128,8 @@ fn run_partial(case: PartialCase) {
                         assert_continuation(&wire, &original, "  first+/%\0  ", "one");
                         drop(tls); // request accepted, no response at all
                     };
-                    let ((), outcome) = pair(server,
-                        operation.resume_partial(&cx, RequestId::Number(52), answers("one"))).await;
+                    let ((), outcome) = Box::pin(pair(server,
+                        operation.resume_partial(&cx, RequestId::Number(52), answers("one")))).await;
                     if outcome.is_ok() { assert!(operation.next_event(&cx).await.is_err()); }
                     assert!(operation.pending_input().is_none());
                     assert!(matches!(operation.resume_partial(&cx, RequestId::Number(53), answers("one")).await,
@@ -151,8 +151,8 @@ fn run_partial(case: PartialCase) {
                     1
                 }
                 PartialCase::RoundLimit => {
-                    let (_, resumed) = pair(peer.response(52, REMAINING),
-                        operation.resume_partial(&cx, RequestId::Number(52), answers("one"))).await;
+                    let (_, resumed) = Box::pin(pair(peer.response(52, REMAINING),
+                        operation.resume_partial(&cx, RequestId::Number(52), answers("one")))).await;
                     resumed.unwrap();
                     assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::ContinuationLimit)));
                     assert!(operation.pending_input().is_none());
@@ -166,8 +166,8 @@ fn run_partial(case: PartialCase) {
                     assert_eq!(operation.continuation_count(), 0);
                     // The same ID and challenge remain usable with all answers.
                     let all = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
-                    let (wire, resumed) = pair(peer.response(52, complete(method)),
-                        operation.resume_partial(&cx, RequestId::Number(52), all)).await;
+                    let (wire, resumed) = Box::pin(pair(peer.response(52, complete(method)),
+                        operation.resume_partial(&cx, RequestId::Number(52), all))).await;
                     resumed.unwrap();
                     assert!(wire["params"].get("requestState").is_none());
                     assert_eq!(wire["params"]["inputResponses"].as_object().unwrap().len(), 2);
@@ -180,7 +180,7 @@ fn run_partial(case: PartialCase) {
             peer.quiet();
             session.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await.unwrap();
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await.unwrap();
     });
 }
 
