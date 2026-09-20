@@ -149,7 +149,10 @@ fn request(id: i64, extra_meta: Option<Value>) -> HttpRequest {
 }
 
 async fn dispatch(cx: &Cx, endpoint: &ServerHttpEndpoint, request: HttpRequest) -> HttpResponse {
-    let response = endpoint.handle_secured_async(cx, &ingress_policy(), request).await.unwrap();
+    // Boxed inside the helper rather than at its twelve call sites: shrinking
+    // `dispatch`'s own future below the threshold clears the callers too, so this
+    // is one edit instead of thirteen and one allocation per call either way.
+    let response = Box::pin(endpoint.handle_secured_async(cx, &ingress_policy(), request)).await.unwrap();
     let (response, stream) = response.into_parts();
     assert!(stream.is_none(), "the probe requests one immediate JSON response");
     assert!(!String::from_utf8_lossy(&response.body).contains(TOKEN));
