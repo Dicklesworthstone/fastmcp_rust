@@ -214,7 +214,7 @@ impl ClientCredentialsResourceClient {
                                 let Some(local) = signal.begin(revision)? else { continue };
                                 let generation = self.cache()?.begin_fetch(&set);
                                 attempts += 1;
-                                let read = self.read_with_cancellation(cx, &local, request.clone(), || {
+                                let read = Box::pin(self.read_with_cancellation(cx, &local, request.clone(), || {
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                     let pair = issue_pair(&ids)?;
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
@@ -226,7 +226,7 @@ impl ClientCredentialsResourceClient {
                                     let continuing = observer.emit(ClientCredentialsResourceWatchEvent::Notification(notification))?;
                                     check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                     if continuing { Ok(()) } else { Err(ManagedResourceError::AbortedByHost.into()) }
-                                }).await;
+                                })).await;
                                 signal.finish()?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                 // Local cancellation may replace the callback's
@@ -261,7 +261,7 @@ impl ClientCredentialsResourceClient {
                                 published = Some(revision);
                             }
                         };
-                        monitor_first(monitor, reads).await
+                        Box::pin(monitor_first(monitor, reads)).await
                     }.await)
                 }).await?
             }.await)
