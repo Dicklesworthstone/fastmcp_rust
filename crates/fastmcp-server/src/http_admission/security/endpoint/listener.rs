@@ -14,6 +14,7 @@
 
 mod connection;
 mod ingress;
+mod liveness;
 mod tls;
 
 use std::future::Future;
@@ -285,16 +286,21 @@ impl BoundSecuredHttpServer {
                     let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> = Box::pin(
                         connection::serve(&connection_cx, stream, endpoint, sessions, stopping, policy, io),
                     );
-                    connection.await;
+                    // Per-I/O limits cannot bound a silent response wait or
+                    // a handler that ignores its deadline. Keep the caller's
+                    // cancellation and absolute deadline armed for the whole
+                    // owned connection, not just individual writes.
+                    let served = liveness::drive(&connection_cx, connection).await;
                     if let Some(mut close) = close
+                        && served.is_ok()
                         && connection_cx.checkpoint().is_ok()
                     {
                         // Application response ownership has finished. TLS
-                        // close_notify is best-effort and bounded separately;
-                        // abandoning this child still drops every socket owner.
-                        let _ = asupersync::time::timeout(
+                        // close_notify is best-effort: its local timeout must
+                        // not extend the caller's remaining connection budget.
+                        let _ = liveness::drive(&connection_cx, asupersync::time::timeout(
                             connection_cx.now(), io.write_timeout, close.shutdown(),
-                        ).await;
+                        )).await;
                     }
                 }) {
                     Ok(child) => children.tasks.push(child),
