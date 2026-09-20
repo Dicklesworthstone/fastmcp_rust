@@ -10743,9 +10743,9 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
             .await
             .map_err(|error| format!("live HTTP ProxyClient Tasks listen connect failed: {error}"))?;
 
-        let mut creator = modern::ClientBuilder::new()
+        let mut creator = Box::pin(modern::ClientBuilder::new()
             .client_info("e2e-http-proxy-tasks-listen-creator", "1.0.0")
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx)
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx))
             .await
             .map_err(|error| format!("public HTTP creator connect failed: {error}"))?;
         let created = creator
