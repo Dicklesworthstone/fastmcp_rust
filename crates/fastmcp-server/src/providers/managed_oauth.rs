@@ -32,9 +32,12 @@
 //! for resource in provider.resources(cx).await? {
 //!     builder = builder.resource(resource);
 //! }
+//! for prompt in provider.prompts(cx).await? {
+//!     builder = builder.prompt(prompt);
+//! }
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,8 +52,9 @@ use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CompleteResult, Content, CoreRequest, CoreResult, FinalCallToolResult,
-    FinalCoreResult, FinalReadResourceResult, FinalResource, FinalTool,
-    RequestId, Resource, ResourceContent, ServerNotification, Tool,
+    FinalCoreResult, FinalGetPromptResult, FinalPrompt, FinalReadResourceResult,
+    FinalResource, FinalTool, Prompt, PromptMessage, RequestId, Resource,
+    ResourceContent, ServerNotification, Tool,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
     FINAL_PROTOCOL_VERSION_META_KEY,
 };
@@ -58,8 +62,8 @@ use serde_json::{Value, json};
 
 use crate::handler::{
     BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalToolOutcome, FinalToolSchemaAuthority, ResourceHandler, ToolExecutionMode,
-    ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
+    FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ResourceHandler,
+    ToolExecutionMode, ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
 const UPSTREAM_FAILURE: &str = "Authenticated upstream request failed";
@@ -104,7 +108,7 @@ impl ManagedOAuthProvider {
         self
     }
 
-    /// Prefixes local tool names, never upstream names or resource URIs.
+    /// Prefixes local tool and prompt names, never upstream names or resource URIs.
     /// Namespace admission happens before catalog or credential acquisition.
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> McpResult<Self> {
         let namespace = namespace.into();
@@ -148,6 +152,22 @@ impl ManagedOAuthProvider {
         build_resources(Arc::clone(&self.forwarder), entries)
     }
 
+    /// Collects all prompts before exposing any registrable handlers.
+    /// Final argument titles and absent-versus-false `required` values remain
+    /// intact. A namespace changes only the published name, not the upstream
+    /// request name or caller-supplied argument values.
+    pub async fn prompts(&self, cx: &Cx) -> McpResult<Vec<ManagedOAuthPrompt>> {
+        let pages = self.catalog(cx, "prompts/list").await?;
+        let mut entries = Vec::new();
+        for page in pages {
+            let CoreResult::Final(FinalCoreResult::PromptsList { result: page, .. }) = page else {
+                return Err(McpError::invalid_request(UNEXPECTED_RESULT));
+            };
+            entries.extend(page.payload.prompts);
+        }
+        build_prompts(Arc::clone(&self.forwarder), entries, self.namespace.as_deref())
+    }
+
     async fn catalog(&self, cx: &Cx, method: &str) -> McpResult<Vec<CoreResult>> {
         check_cx(cx)?;
         let request = core_request(method, json!({}), None)?;
@@ -163,6 +183,92 @@ impl ManagedOAuthProvider {
         check_cx(cx)?;
         Ok(collected.into_pages())
     }
+}
+
+/// One prompt from a fully collected authenticated upstream catalog.
+/// Published names may be namespaced; execution always retains the original
+/// upstream identity and returns the final prompt result without projection.
+pub struct ManagedOAuthPrompt {
+    forwarder: Arc<Forwarder>,
+    upstream_name: String,
+    definition: FinalPrompt,
+}
+
+impl ManagedOAuthPrompt {
+    /// The immutable final catalog definition, including exact argument metadata.
+    pub fn catalog_definition(&self) -> &FinalPrompt { &self.definition }
+
+    async fn invoke(&self, ctx: &McpContext, cx: &Cx, arguments: HashMap<String, String>)
+        -> McpResult<CompleteResult<FinalGetPromptResult>>
+    {
+        match self.forwarder.execute(
+            ctx, cx, "prompts/get", json!({"name": self.upstream_name, "arguments": arguments}),
+        ).await? {
+            FinalCoreResult::PromptsGet { result, .. } => Ok(result),
+            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+        }
+    }
+}
+
+impl PromptHandler for ManagedOAuthPrompt {
+    // Legacy shape is registration-only. Modern catalogs use final_definition.
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: self.definition.name.clone(),
+            description: self.definition.description.clone(),
+            arguments: self.definition.arguments.as_ref().map(|arguments| {
+                arguments.iter().map(|argument| fastmcp_protocol::PromptArgument {
+                    name: argument.name.clone(),
+                    description: argument.description.clone(),
+                    required: argument.required.unwrap_or(false),
+                }).collect()
+            }).unwrap_or_default(),
+            icon: None, version: None, tags: Vec::new(),
+        }
+    }
+    fn final_definition(&self) -> Option<FinalPrompt> { Some(self.definition.clone()) }
+    fn final_title(&self) -> Option<&str> { self.definition.title.as_deref() }
+    fn final_icons(&self) -> Option<&[RawIcon]> { self.definition.icons.as_deref() }
+    fn final_metadata(&self) -> Option<&OpenMetadata> { self.definition.meta.as_ref() }
+    fn get(&self, _ctx: &McpContext, _arguments: HashMap<String, String>) -> McpResult<Vec<PromptMessage>> {
+        Err(McpError::invalid_request(MODERN_ASYNC_ONLY))
+    }
+    fn get_final_async<'a>(&'a self, ctx: &'a McpContext, arguments: HashMap<String, String>)
+        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), arguments).await) })
+    }
+    fn get_final_async_in_request<'a>(
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, arguments).await) })
+    }
+    fn get_final_outcome_async<'a>(&'a self, ctx: &'a McpContext, arguments: HashMap<String, String>)
+        -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), arguments).await.map(FinalMethodOutcome::Complete)) })
+    }
+    fn get_final_outcome_async_in_request<'a>(
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, arguments).await.map(FinalMethodOutcome::Complete)) })
+    }
+}
+
+fn build_prompts(forwarder: Arc<Forwarder>, entries: Vec<FinalPrompt>, namespace: Option<&str>)
+    -> McpResult<Vec<ManagedOAuthPrompt>>
+{
+    let mut names = HashSet::new();
+    let mut prompts = Vec::with_capacity(entries.len());
+    for mut definition in entries {
+        if !names.insert(definition.name.clone()) {
+            return Err(McpError::invalid_request("Authenticated upstream catalog contains duplicate prompt names"));
+        }
+        let upstream_name = definition.name.clone();
+        definition.name = published_name(namespace, &upstream_name)?;
+        prompts.push(ManagedOAuthPrompt { forwarder: Arc::clone(&forwarder), upstream_name, definition });
+    }
+    Ok(prompts)
 }
 
 /// One concrete resource from a fully collected authenticated upstream catalog.
@@ -354,7 +460,7 @@ fn build_tools(forwarder: Arc<Forwarder>, entries: Vec<FinalTool>, namespace: Op
 
 fn published_name(namespace: Option<&str>, original: &str) -> McpResult<String> {
     let name = namespace.map_or_else(|| original.to_owned(), |prefix| format!("{prefix}/{original}"));
-    if name.is_empty() || name.len() > 128 {
+    if original.is_empty() || name.len() > 128 {
         return Err(McpError::invalid_request("Managed OAuth provider name exceeds its bound"));
     }
     Ok(name)
@@ -764,5 +870,164 @@ mod tests {
         assert!(resource.on_subscribe(&ctx, "file:///report").is_err());
         assert!(resource.on_unsubscribe(&ctx, "file:///report").is_err());
         assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    fn prompt_definition() -> FinalPrompt {
+        serde_json::from_value(json!({
+            "name":"summarize", "title":"Summarize a report", "description":"Remote prompt",
+            "arguments":[
+                {"name":"report","title":"Report text","required":true},
+                {"name":"style","title":"Writing style"},
+                {"name":"language","title":"Output language","required":false}
+            ],
+            "icons":[{"src":"https://example.com/prompt.png","mimeType":"image/png"}],
+            "_meta":{"com.example/prompt":{"revision":3}}
+        })).unwrap()
+    }
+
+    fn prompt_response() -> FinalCoreResult {
+        let request = core_request("prompts/get", json!({"name":"summarize","arguments":{"report":"text"}}), None).unwrap();
+        let CoreResult::Final(result) = request.decode_result(r#"{
+            "resultType":"complete","description":"An exact upstream prompt",
+            "messages":[
+                {"role":"user","content":{"type":"text","text":"Summarize this","_meta":{"com.example/block":true}}},
+                {"role":"assistant","content":{"type":"text","text":"Ready"}}
+            ],
+            "_meta":{"com.example/revision":3},
+            "x-exact":{"z":900719925474099312345,"a":1.20e+4}
+        }"#).unwrap() else { panic!("expected final prompt result") };
+        result
+    }
+
+    fn prompt_fixture(responses: Vec<FinalCoreResult>, cancel: bool)
+        -> (ManagedOAuthPrompt, Arc<Backend>)
+    {
+        let (tool, backend) = fixture(responses, cancel);
+        let prompt = build_prompts(tool.forwarder, vec![prompt_definition()], Some("remote"))
+            .unwrap().pop().unwrap();
+        (prompt, backend)
+    }
+
+    #[test]
+    fn authenticated_prompt_catalog_retains_argument_titles_and_required_presence() {
+        let (prompt, _) = prompt_fixture(vec![], false);
+        let mut expected = prompt_definition();
+        expected.name = "remote/summarize".to_owned();
+        let actual = serde_json::to_value(prompt.final_definition().unwrap()).unwrap();
+        assert_eq!(actual, serde_json::to_value(expected).unwrap());
+        assert_eq!(actual["arguments"][0]["title"], "Report text");
+        assert!(actual["arguments"][1].get("required").is_none());
+        assert_eq!(actual["arguments"][2]["required"], false);
+        assert_eq!(prompt.definition().name, "remote/summarize");
+        assert!(!prompt.declares_final_mrtr());
+    }
+
+    #[test]
+    fn owned_prompt_get_rewrites_only_name_and_preserves_full_final_result() {
+        let expected = CoreResult::Final(prompt_response()).encode().unwrap();
+        let (prompt, backend) = prompt_fixture(vec![prompt_response()], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let arguments = HashMap::from([
+            ("report".to_owned(), "Unicode: 日本語\n{not metadata}".to_owned()),
+            ("_meta".to_owned(), "ordinary prompt data".to_owned()),
+        ]);
+        let result = block_on(prompt.get_final_async_in_request(&ctx, &cx, arguments.clone())).unwrap();
+        let actual = CoreResult::Final(FinalCoreResult::PromptsGet { result, diagnostic: None }).encode().unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.contains("900719925474099312345") && actual.contains("1.20e+4"));
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["name"], "summarize");
+        assert_eq!(calls[0].1["arguments"], serde_json::to_value(arguments).unwrap());
+        assert_eq!(calls[0].1["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
+    }
+
+    #[test]
+    fn prompt_async_entry_points_return_complete_outcomes_without_legacy_projection() {
+        let (prompt, backend) = prompt_fixture(vec![prompt_response(); 3], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let arguments = HashMap::from([("report".to_owned(), "text".to_owned())]);
+        assert!(block_on(prompt.get_final_async(&ctx, arguments.clone())).is_ok());
+        assert!(matches!(block_on(prompt.get_final_outcome_async(&ctx, arguments.clone())).unwrap(), FinalMethodOutcome::Complete(_)));
+        assert!(matches!(block_on(prompt.get_final_outcome_async_in_request(&ctx, &cx, arguments)).unwrap(), FinalMethodOutcome::Complete(_)));
+        assert_eq!(backend.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn prompt_catalog_duplicate_and_oversized_names_fail_without_partial_handlers() {
+        let (prompt, backend) = prompt_fixture(vec![], false);
+        assert!(build_prompts(Arc::clone(&prompt.forwarder), vec![prompt_definition(), prompt_definition()], None).is_err());
+        let mut oversized = prompt_definition();
+        oversized.name = "x".repeat(128);
+        assert!(build_prompts(prompt.forwarder, vec![prompt_definition(), oversized], Some("remote")).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_namespace_cannot_hide_an_empty_upstream_tool_or_prompt_name() {
+        let (tool, _) = fixture(vec![], false);
+        let mut bad_tool = definition();
+        bad_tool.name.clear();
+        let mut bad_prompt = prompt_definition();
+        bad_prompt.name.clear();
+        assert!(build_tools(Arc::clone(&tool.forwarder), vec![bad_tool], Some("remote")).is_err());
+        assert!(build_prompts(tool.forwarder, vec![bad_prompt], Some("remote")).is_err());
+    }
+
+    #[test]
+    fn prompt_input_required_and_wrong_method_results_never_trigger_retry() {
+        let request = core_request("prompts/get", json!({"name":"summarize"}), None).unwrap();
+        let CoreResult::Final(input) = request.decode_result(r#"{"resultType":"input_required","requestState":"opaque"}"#).unwrap()
+            else { panic!("expected final input-required result") };
+        for response in [input, resource_response()] {
+            let (prompt, backend) = prompt_fixture(vec![response, prompt_response()], false);
+            let cx = Cx::for_testing();
+            let ctx = McpContext::new(cx.clone(), 1);
+            let arguments = HashMap::from([("report".to_owned(), "text".to_owned())]);
+            assert!(block_on(prompt.get_final_outcome_async_in_request(&ctx, &cx, arguments)).is_err());
+            assert_eq!(backend.calls.lock().unwrap().len(), 1);
+            assert_eq!(backend.responses.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn prompt_pre_cancel_and_late_cancel_prevent_result_delivery() {
+        for cancel_on_return in [false, true] {
+            let (prompt, backend) = prompt_fixture(vec![prompt_response()], cancel_on_return);
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            if !cancel_on_return { ctx.request_cancellation().cancel(); }
+            let arguments = HashMap::from([("report".to_owned(), "text".to_owned())]);
+            assert!(block_on(prompt.get_final_async(&ctx, arguments)).is_err());
+            assert_eq!(backend.calls.lock().unwrap().len(), usize::from(cancel_on_return));
+        }
+    }
+
+    #[test]
+    fn prompt_legacy_sync_and_async_calls_do_not_start_network_work() {
+        let (prompt, backend) = prompt_fixture(vec![prompt_response()], false);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(prompt.get(&ctx, HashMap::new()).is_err());
+        assert!(block_on(prompt.get_async(&ctx, HashMap::new())).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_resource_and_prompt_handlers_share_one_correlation_id_allocator() {
+        let (tool, backend) = fixture(vec![response(false), resource_response(), prompt_response()], false);
+        let resource = build_resources(Arc::clone(&tool.forwarder), vec![resource_definition("file:///report")])
+            .unwrap().pop().unwrap();
+        let prompt = build_prompts(Arc::clone(&tool.forwarder), vec![prompt_definition()], None)
+            .unwrap().pop().unwrap();
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(block_on(tool.call_final_async(&ctx, json!({}))).is_ok());
+        assert!(block_on(resource.read_final_async(&ctx)).is_ok());
+        assert!(block_on(prompt.get_final_async(&ctx, HashMap::from([("report".to_owned(), "text".to_owned())]))).is_ok());
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for (index, (id, _)) in calls.iter().enumerate() {
+            assert!(calls[..index].iter().all(|(previous, _)| !id.correlates_with(previous)));
+        }
     }
 }
