@@ -156,9 +156,9 @@ fn machine_resource_public_cache_hit_uses_current_custody_without_callbacks() {
         let result = complete(&request, 60000, "public");
         let encoded = result.encode().unwrap();
         prime(&client, &request, result);
-        let read = client.clone().read(&cx, request,
+        let read = Box::pin(client.clone().read(&cx, request,
             || panic!("a cache hit must not allocate request IDs"),
-            |_| panic!("a cache hit must not replay notifications")).await.unwrap();
+            |_| panic!("a cache hit must not replay notifications"))).await.unwrap();
         assert!(read.is_cache_hit() && read.is_complete());
         assert_eq!(read.credential_generation(), 1);
         assert_eq!(read.result().encode().unwrap(), encoded);
@@ -184,8 +184,8 @@ fn machine_resource_cached_data_cannot_escape_cancel_close_revoke_or_expiry() {
                     else { token.expires_at = Instant::now(); }
                 }
             }
-            let result = client.read_with_cancellation(&cx, &cancellation, request,
-                || panic!("unusable credentials must not reach request IDs"), |_| Ok(())).await;
+            let result = Box::pin(client.read_with_cancellation(&cx, &cancellation, request,
+                || panic!("unusable credentials must not reach request IDs"), |_| Ok(()))).await;
             assert!(result.is_err());
         }
     });
@@ -200,10 +200,10 @@ fn machine_resource_public_cache_cannot_cross_generation_or_consumer_instances()
         prime(&client, &request, complete(&request, 60000, "public"));
         let separate = ClientCredentialsResourceClient::new(client.client.clone(), client.limits)
             .with_cache_limits(8, 64 * 1024).unwrap();
-        assert!(matches!(separate.read(&cx, request.clone(), abort_ids, |_| Ok(())).await,
+        assert!(matches!(Box::pin(separate.read(&cx, request.clone(), abort_ids, |_| Ok(()))).await,
             Err(ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost))));
         client.client.inner.state.try_lock_owned().unwrap().generation = 2;
-        assert!(matches!(client.read(&cx, request, abort_ids, |_| Ok(())).await,
+        assert!(matches!(Box::pin(client.read(&cx, request, abort_ids, |_| Ok(()))).await,
             Err(ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost))));
     });
 }
@@ -221,7 +221,7 @@ fn machine_resource_notifications_and_clone_clear_retire_cached_reads() {
                 1 => client.invalidate_notification(&notification("notifications/resources/updated", Some(json!({"uri":"file:///one"})))).unwrap(),
                 _ => client.invalidate_notification(&notification("notifications/resources/list_changed", None)).unwrap(),
             }
-            assert!(matches!(client.read(&cx, request, abort_ids, |_| Ok(())).await,
+            assert!(matches!(Box::pin(client.read(&cx, request, abort_ids, |_| Ok(()))).await,
                 Err(ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost))));
         }
     });
@@ -236,7 +236,7 @@ fn machine_resource_continuations_bypass_ordinary_cached_answers() {
         prime(&client, &original, complete(&original, 60000, "public"));
         for params in [json!({"uri":"file:///one","requestState":""}), json!({"uri":"file:///one","inputResponses":{}})] {
             let calls = Cell::new(0);
-            let result = client.read(&cx, request(params), || { calls.set(calls.get() + 1); abort_ids() }, |_| Ok(())).await;
+            let result = Box::pin(client.read(&cx, request(params), || { calls.set(calls.get() + 1); abort_ids() }, |_| Ok(()))).await;
             assert!(matches!(result, Err(ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost))));
             assert_eq!(calls.get(), 1);
         }
@@ -251,7 +251,7 @@ fn machine_resource_callback_invalidation_and_cancellation_prevent_dispatch() {
             let client = consumer(ClientCredentialsResourceLimits::default());
             let cancellation = McpRequestCancellation::new();
             let calls = Cell::new(0);
-            let result = client.read_with_cancellation(&cx, &cancellation, ordinary(), || {
+            let result = Box::pin(client.read_with_cancellation(&cx, &cancellation, ordinary(), || {
                 calls.set(calls.get() + 1);
                 match case {
                     0 => client.clear().unwrap(),
@@ -259,7 +259,7 @@ fn machine_resource_callback_invalidation_and_cancellation_prevent_dispatch() {
                     _ => client.client.close(),
                 }
                 Ok((RequestId::Number(10), RequestId::Number(11)))
-            }, |_| Ok(())).await;
+            }, |_| Ok(()))).await;
             if case == 0 {
                 assert!(matches!(result, Err(ClientCredentialsResourceError::Resource(ManagedResourceError::Invalidated))));
             } else { assert!(result.is_err()); }
@@ -275,7 +275,7 @@ fn machine_resource_cache_hits_still_enforce_content_and_byte_limits() {
         let client = consumer(ClientCredentialsResourceLimits::new(ManagedCoreLimits::default(), 1).unwrap());
         let request = ordinary();
         prime(&client, &request, complete(&request, 60000, "private"));
-        assert!(matches!(client.read(&cx, request.clone(), || panic!("expected a hit"), |_| Ok(())).await,
+        assert!(matches!(Box::pin(client.read(&cx, request.clone(), || panic!("expected a hit"), |_| Ok(()))).await,
             Err(ClientCredentialsResourceError::Resource(ManagedResourceError::ContentsLimit))));
         let core = ManagedCoreLimits::new(4096, 1024, 2048, 1, Duration::from_secs(1)).unwrap();
         let client = consumer(ClientCredentialsResourceLimits::new(core, 2).unwrap());
@@ -284,7 +284,7 @@ fn machine_resource_cache_hits_still_enforce_content_and_byte_limits() {
             "ttlMs":60000, "cacheScope":"private",
         }).to_string()).unwrap();
         prime(&client, &request, large);
-        assert!(matches!(client.read(&cx, request, || panic!("expected a hit"), |_| Ok(())).await,
+        assert!(matches!(Box::pin(client.read(&cx, request, || panic!("expected a hit"), |_| Ok(()))).await,
             Err(ClientCredentialsResourceError::Core(ClientCredentialsCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))));
     });
 }
