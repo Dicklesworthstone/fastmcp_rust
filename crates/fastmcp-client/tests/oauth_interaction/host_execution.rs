@@ -44,7 +44,7 @@ impl SamplingHost for Host {
     fn sample<'a>(&'a mut self, _: &'a Cx, _: &'a McpRequestCancellation,
         request: &'a FinalEmbeddedCreateMessageParams) -> SamplingHostFuture<'a, FinalCreateMessageResult>
     {
-        let first = self.models % 2 == 0;
+        let first = self.models.is_multiple_of(2);
         self.models += 1;
         assert_eq!(request.messages.len(), if first {0} else {2});
         let content = if first { json!({"type":"tool_use","id":"fixture-use","name":"fixture","input":{}}) }

@@ -384,7 +384,7 @@ fn run(case: Case) {
                             event(&mut tls, CHANGED, false).await;
                             event(&mut tls, &terminal(42, SECOND), true).await;
                         };
-                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
+                        let ((), result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await.unwrap(), Some(ManagedInteractionEvent::Notification(_))));
                         pending(&mut operation, &cx).await;
@@ -393,7 +393,7 @@ fn run(case: Case) {
                             sse_head(&mut tls).await;
                             event(&mut tls, CHANGED, true).await;
                         };
-                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(43), Some(answers("second"))))).await;
+                        let ((), result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(43), Some(answers("second"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::Core(ManagedCoreError::NotificationLimit))));
                     }
@@ -417,7 +417,7 @@ fn run(case: Case) {
                     }
                     Case::LostReply => {
                         let server = async { let (tls, _) = peer.request(false).await; drop(tls); };
-                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
+                        let ((), result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         assert!(result.is_err());
                         assert!(matches!(operation.resume(&cx, RequestId::Number(43), Some(answers("first"))).await, Err(ManagedInteractionError::Closed)));
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::Closed)));

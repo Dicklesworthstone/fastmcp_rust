@@ -56,7 +56,7 @@ impl SamplingHost for Host {
         _: &'a FinalEmbeddedCreateMessageParams) -> SamplingHostFuture<'a, FinalCreateMessageResult>
     {
         self.calls.push("model");
-        let use_tool = self.looping && self.models % 2 == 0;
+        let use_tool = self.looping && self.models.is_multiple_of(2);
         self.models += 1;
         let content = if use_tool { json!({"type":"tool_use","id":"owned-use","name":"fixture","input":{}}) }
             else { json!({"type":"text","text":"done"}) };

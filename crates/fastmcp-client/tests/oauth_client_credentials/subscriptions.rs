@@ -322,7 +322,7 @@ fn run_subscription(case: SubCase) {
                             tls.write_all(head.as_bytes()).await.unwrap();
                             tls.flush().await.unwrap();
                         };
-                        let (_, response) = Box::pin(pair(server, tasks.subscribe(&cx, RequestId::Number(1),
+                        let ((), response) = Box::pin(pair(server, tasks.subscribe(&cx, RequestId::Number(1),
                             RequestId::Number(2), selected(), ClientCredentialsSubscriptionLimits::default()))).await;
                         let error = response.err().unwrap();
                         match case {

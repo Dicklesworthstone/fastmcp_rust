@@ -282,7 +282,7 @@ fn run_watch(case: WatchCase) {
                                 tls.flush().await.unwrap();
                             }
                         });
-                        let (_, result) = pair(server, Box::pin(session.subscribe_tasks(&cx, requested(), RequestId::Number(1), RequestId::Number(2), limits))).await;
+                        let ((), result) = pair(server, Box::pin(session.subscribe_tasks(&cx, requested(), RequestId::Number(1), RequestId::Number(2), limits))).await;
                         assert!(result.is_err());
                         peer.quiet();
                     }

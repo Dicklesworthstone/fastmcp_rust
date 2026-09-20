@@ -277,7 +277,7 @@ fn run_private(case: PrivateCase) {
                         pair(grant(&peer, &signer, audience, 300), application).await;
                         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
                         assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
-                        let (_, response) = Box::pin(pair(peer.operation(1, "tools/list", "access-one", LIST),
+                        let ((), response) = Box::pin(pair(peer.operation(1, "tools/list", "access-one", LIST),
                             client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2)))).await;
                         let result = response.unwrap().read_json_result(&cx, 4096).await.unwrap();
                         assert!(result.encode().unwrap().contains("1.20e+4"));
