@@ -30,12 +30,16 @@ use super::{
     ManagedOAuthSession, bounded_wait, call_deadline, check_call, prepare,
 };
 
+/// Explicit reply recovery for independently configured continuation journals.
+pub mod recovery;
+
 const MAX_INPUTS_PER_ROUND: usize = 128;
 
 /// Limits for the whole interaction, not a fresh budget for each retry.
 /// `core.total_bytes`, `core.notifications` and `core.timeout` are shared by
 /// every round. `core.request_bytes` and `core.frame_bytes` apply per request
-/// and frame. At most `max_continuations + 1` POSTs can ever be attempted.
+/// and frame. Ordinary resumption attempts at most `max_continuations + 1`
+/// POSTs; explicit journal recovery additionally has its own bounded attempts.
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedInteractionLimits {
     core: ManagedCoreLimits,
