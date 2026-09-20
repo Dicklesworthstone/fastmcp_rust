@@ -65400,7 +65400,7 @@ fn fallible(value: Option<u8>) {
             assert!(!ordinary_platform_is_qualified_for("linux", "aarch64"), "a non-x86_64 arch is unqualified");
 
             let run_id = format!("{:032x}", std::process::id());
-            let closed_path = format!("{}:/usr/bin:/bin", std::env::temp_dir().join("fnd01-unqualified-toolchain").display(),);
+            let closed_path = format!("{}:/usr/bin:/bin", std::env::temp_dir().join("fnd01-unqualified-toolchain").display());
             let error = ordinary_reprobe_tool_set_shared_on(&repository_root(), BootstrapMode::Produce, &run_id, &closed_path, false).expect_err("an unqualified platform must refuse");
             assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
             assert_eq!(error.site, OrdinaryFailureSite::ProbeToolPlatform);

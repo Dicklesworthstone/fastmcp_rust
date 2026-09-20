@@ -405,11 +405,10 @@ fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
     while index < bytes.len() {
         if bytes[index] == b'"' {
             let closing = index + 1;
-            if bytes[closing..closing + hashes.min(bytes.len() - closing)]
-                .iter()
-                .filter(|byte| **byte == b'#')
-                .count()
-                >= hashes
+            let run = &bytes[closing..closing + hashes.min(bytes.len() - closing)];
+            // The slice is capped at `hashes`, so "all hashes" is exactly the old
+            // `count() >= hashes`: it can only hold when the run is full length.
+            if run.len() == hashes && run.iter().all(|byte| *byte == b'#')
             {
                 return closing + hashes;
             }
@@ -2005,7 +2004,7 @@ fn subcase_13_cross_platform_stdio() -> SubcaseOutcome {
     let rows: Vec<StdioTargetRow> = TARGET_MATRIX
         .iter()
         .map(|target| StdioTargetRow {
-            target: *target,
+            target,
             own_process_cancel_aware: own_stdio,
             child_process_cancel_aware: child_stdio,
             transport_avoids_blocking_own_stdio: !uses_blocking_std_stdio,

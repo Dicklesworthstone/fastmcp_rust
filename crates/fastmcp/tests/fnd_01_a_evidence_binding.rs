@@ -935,7 +935,7 @@ fn fnd_01_a_workspace_snapshot_describes_this_repository() {
         let prefix = format!("{scan_root}/");
         let bound_here: Vec<&String> = bound.iter().filter(|p| p.starts_with(&prefix)).collect();
         for path in &found {
-            if !bound_here.iter().any(|bound_path| *bound_path == path) {
+            if !bound_here.contains(&path) {
                 unbound.push(path.clone());
             }
         }

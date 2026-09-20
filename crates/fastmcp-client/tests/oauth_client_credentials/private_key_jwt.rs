@@ -66,7 +66,7 @@ impl KeyDirectory {
                     return directory;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
-                Err(_) => panic!("could not create owned signing fixture directory"),
+                Err(error) => panic!("could not create owned signing fixture directory: {error}"),
             }
         }
         panic!("signing fixture directory budget exhausted");

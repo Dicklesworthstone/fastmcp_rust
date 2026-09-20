@@ -1356,9 +1356,14 @@ fn limit_01_i_positive() {
         );
     }
     // Every lifecycle row lands on the same fully-discharged terminal tuple.
-    for index in (UPSTREAM_EVIDENCE_ROWS + 14)..(UPSTREAM_EVIDENCE_ROWS + 19) {
+    for (index, row) in receipt
+        .iter()
+        .enumerate()
+        .take(UPSTREAM_EVIDENCE_ROWS + 19)
+        .skip(UPSTREAM_EVIDENCE_ROWS + 14)
+    {
         assert!(
-            receipt[index].ends_with("global=0 partition=0 committed=0 released=1"),
+            row.ends_with("global=0 partition=0 committed=0 released=1"),
             "lifecycle receipt row {index} must show exact-once release and zero retained occupancy"
         );
     }

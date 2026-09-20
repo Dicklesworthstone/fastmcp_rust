@@ -197,6 +197,7 @@ fn assert_trace_conclusive(record: &StdioClassificationRecord) {
 ///     both feeding `HttpConnectionSettings { bearer, .. }`;
 ///   * `prepare_stdio_command` touches `args` and nothing else;
 ///   * `BoundBearerCredential` occurs nowhere outside `http_auth` / `http_executor`.
+///
 /// There is no path by which a credential reaches a disposable stdio child.
 ///
 /// A structural zero still deserves a proof that CAN be wrong, so this asserts the
@@ -251,6 +252,7 @@ fn assert_no_credential_on_the_wire(record: &StdioClassificationRecord) {
 ///   * The Auto probe DOES build a transient client inside the builder, so
 ///     "no client exists" is too strong. But that transient drops there,
 ///     taking its per-client cache with it, and nothing shared survives it.
+///
 /// There is no cache that outlives a denied stdio classification.
 ///
 /// A structural zero still deserves a proof that CAN be wrong, so this

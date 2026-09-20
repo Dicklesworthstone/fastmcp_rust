@@ -337,11 +337,11 @@ fn recompute_digest(manifest: &str) -> Sha256Digest {
 }
 
 fn render_digest(digest: &Sha256Digest) -> String {
-    digest
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+    digest.as_bytes().iter().fold(String::new(), |mut rendered, byte| {
+        let _ = write!(rendered, "{byte:02x}");
+        rendered
+    })
 }
 
 // ---------------------------------------------------------------------------
