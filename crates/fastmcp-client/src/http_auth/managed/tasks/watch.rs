@@ -183,7 +183,7 @@ impl ManagedTasksClient {
             policy.timeout,
         )?;
         let deadline = deadline_after(cx, policy.timeout)?;
-        let subscription = self.session.await_active(cx, cancellation, deadline, None, async {
+        let subscription = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(async {
                 let mut subscription = self.session.subscribe_tasks_with_cancellation(
                     cx, cancellation, request, listen_ids.discovery, listen_ids.operation, limits,
@@ -196,7 +196,7 @@ impl ManagedTasksClient {
                 state.admit_acknowledgement(&accepted_filter)?;
                 Ok(subscription)
             }.await)
-        }).await??;
+        })).await??;
         self.session.check(cx, cancellation)?;
         Ok(ManagedTaskWatch {
             client: self.clone(), cancellation: cancellation.clone(),
@@ -249,7 +249,7 @@ impl ManagedTaskWatch {
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let snapshot = client.session.await_active(cx, &cancellation, deadline, None, async {
+        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
             Ok(async {
                 let (task_id, cause) = match self.state.initial.pop_front() {
                     Some(id) => (id, ManagedTaskSnapshotCause::Initial),
@@ -281,7 +281,7 @@ impl ManagedTaskWatch {
                 };
                 Ok(ManagedTaskSnapshot { task: Box::new(result.task), cause })
             }.await)
-        }).await??;
+        })).await??;
         client.session.check(cx, &cancellation)?;
         if cx.now() >= deadline {
             return Err(OAuthSessionError::TimedOut.into());
