@@ -336,7 +336,7 @@ fn public_discovery_fallbacks_feed_the_actual_managed_pkce_login() {
             assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer discovered-access".to_owned()));
             session.close();
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(peer.paths.lock().unwrap().len(), 5);
         peer.assert_no_extra_connections();
@@ -359,7 +359,7 @@ fn issuer_http_failures_exhaust_the_same_issuer_without_launching_the_browser() 
                 launches.fetch_add(1, Ordering::SeqCst);
                 async { Ok(()) }
             });
-            let ((), result) = pair(server, application).await;
+            let ((), result) = Box::pin(pair(server, application)).await;
             let error = result.err().unwrap();
             assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
             let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = error else { panic!("all candidate failures must remain visible") };
@@ -404,7 +404,7 @@ fn invalid_issuer_metadata_has_no_browser_or_token_endpoint_effects() {
                 launches.fetch_add(1, Ordering::SeqCst);
                 async { Ok(()) }
             });
-            let ((), result) = pair(server, application).await;
+            let ((), result) = Box::pin(pair(server, application)).await;
             let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = result.err().unwrap() else { panic!("aggregate expected") };
             let expected = match dimension {
                 0 => IssuerMetadataCause::IssuerMismatch,
@@ -629,7 +629,7 @@ fn native_registration_login_and_refresh_reuse_one_admitted_client_id() {
                 assert_eq!(snapshot.credential().authorization_for_target(&url(&resource)), Some("Bearer registration-access-two".to_owned()));
                 session.close();
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(*peer.paths.lock().unwrap(), vec![
                 "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server/tenant",
                 "/register", "/token", "/token",
@@ -715,7 +715,7 @@ fn changed_registration_metadata_never_reaches_the_browser() {
                 }
                 result
             };
-            let ((), result) = pair(server, application).await;
+            let ((), result) = Box::pin(pair(server, application)).await;
             let error = result.err().unwrap();
             assert!(matches!(error, OAuthRegistrationError::ResponseRejected));
             assert!(!format!("{error:?} {error}").contains("peer-secret-canary"));
