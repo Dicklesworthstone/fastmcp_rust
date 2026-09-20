@@ -617,8 +617,6 @@ fn transform_input_schema(
     let capacity = arg_transforms.len();
     let mut props_to_remove: Vec<String> = Vec::with_capacity(capacity);
     let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::with_capacity(capacity);
-    let mut required_renames: Vec<(String, String)> = Vec::with_capacity(capacity);
-    let mut required_removes: Vec<String> = Vec::with_capacity(capacity);
     let mut required_adds: Vec<String> = Vec::with_capacity(capacity);
 
     // First pass: collect property transformations
@@ -630,7 +628,6 @@ fn transform_input_schema(
         for (original_name, transform) in arg_transforms {
             if transform.hide {
                 props_to_remove.push(original_name.clone());
-                required_removes.push(original_name.clone());
                 continue;
             }
 
@@ -660,15 +657,11 @@ fn transform_input_schema(
                 // Apply required override
                 if transform.required == Some(true) {
                     required_adds.push(new_name.clone());
-                } else if transform.required == Some(false) {
-                    required_removes.push(new_name.clone());
-                    required_removes.push(original_name.clone());
                 }
 
                 if new_name != original_name {
                     props_to_remove.push(original_name.clone());
                     props_to_add.push((new_name.clone(), new_schema));
-                    required_renames.push((original_name.clone(), new_name.clone()));
                 } else {
                     // Update in place
                     props_to_add.push((original_name.clone(), new_schema));
@@ -689,18 +682,29 @@ fn transform_input_schema(
 
     // Apply required array changes
     if let Some(required) = obj.get_mut("required").and_then(|r| r.as_array_mut()) {
-        // Handle renames
-        for (old_name, new_name) in required_renames {
-            if let Some(idx) = required.iter().position(|v| v.as_str() == Some(&old_name)) {
-                required[idx] = serde_json::json!(new_name);
+        // Project each ORIGINAL requirement once. Sequential renames can
+        // rename a previously rewritten entry again, losing requirements in
+        // swaps/cycles. Likewise, removing by a published name can remove an
+        // unrelated argument whose original name happens to be that alias.
+        let original_required = std::mem::take(required);
+        for value in original_required {
+            let mapped = match value.as_str().and_then(|name| arg_transforms.get(name)) {
+                Some(transform) if transform.hide || transform.required == Some(false) => {
+                    continue;
+                }
+                Some(transform) => match &transform.name {
+                    Some(name) => serde_json::Value::String(name.clone()),
+                    None => value,
+                },
+                None => value,
+            };
+            if !required.contains(&mapped) {
+                required.push(mapped);
             }
         }
-        // Handle removes - compare &str directly to avoid allocation
-        required.retain(|v| {
-            v.as_str()
-                .is_none_or(|s| !required_removes.iter().any(|r| r == s))
-        });
-        // Handle adds
+        // Preserve existing requirement order, then add explicitly required
+        // arguments deterministically rather than in HashMap iteration order.
+        required_adds.sort_unstable();
         for name in required_adds {
             if !required.iter().any(|v| v.as_str() == Some(&name)) {
                 required.push(serde_json::json!(name));
@@ -836,6 +840,117 @@ mod tests {
                 .is_err()
         );
         assert!(tool.transform_arguments(serde_json::json!([1, 2])).is_err());
+    }
+
+    fn regression_three_argument_schema(required: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "integer"},
+                "c": {"type": "boolean"}
+            },
+            "required": required,
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn regression_schema_requirements_follow_a_swap_once() {
+        let original = regression_three_argument_schema(serde_json::json!(["a", "b"]));
+        let transforms = HashMap::from([
+            ("a".to_owned(), ArgTransform::new().name("b")),
+            ("b".to_owned(), ArgTransform::new().name("a")),
+        ]);
+        let actual = transform_input_schema(&transforms, &original);
+        assert_eq!(actual["required"], serde_json::json!(["b", "a"]));
+        assert_eq!(actual["properties"]["b"]["type"], "string");
+        assert_eq!(actual["properties"]["a"]["type"], "integer");
+        assert_eq!(actual["additionalProperties"], false);
+        assert_eq!(original["required"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn regression_schema_requirements_follow_a_three_cycle_once() {
+        let original = regression_three_argument_schema(serde_json::json!(["a", "b", "c"]));
+        let transforms = HashMap::from([
+            ("a".to_owned(), ArgTransform::new().name("b")),
+            ("b".to_owned(), ArgTransform::new().name("c")),
+            ("c".to_owned(), ArgTransform::new().name("a")),
+        ]);
+        let actual = transform_input_schema(&transforms, &original);
+        assert_eq!(actual["required"], serde_json::json!(["b", "c", "a"]));
+        assert_eq!(actual["properties"]["b"]["type"], "string");
+        assert_eq!(actual["properties"]["c"]["type"], "integer");
+        assert_eq!(actual["properties"]["a"]["type"], "boolean");
+    }
+
+    #[test]
+    fn regression_optional_override_does_not_remove_another_alias_requirement() {
+        let original = regression_three_argument_schema(serde_json::json!(["a", "b"]));
+        let transforms = HashMap::from([
+            ("a".to_owned(), ArgTransform::new().name("b").optional()),
+            ("b".to_owned(), ArgTransform::new().name("a")),
+        ]);
+        assert_eq!(
+            transform_input_schema(&transforms, &original)["required"],
+            serde_json::json!(["a"])
+        );
+    }
+
+    #[test]
+    fn regression_hidden_original_does_not_remove_a_visible_alias_requirement() {
+        let original = regression_three_argument_schema(serde_json::json!(["a", "b"]));
+        let transforms = HashMap::from([
+            ("a".to_owned(), ArgTransform::new().name("b")),
+            ("b".to_owned(), ArgTransform::drop_with_default(10)),
+        ]);
+        let actual = transform_input_schema(&transforms, &original);
+        assert_eq!(actual["required"], serde_json::json!(["b"]));
+        assert_eq!(actual["properties"]["b"]["type"], "string");
+    }
+
+    #[test]
+    fn regression_explicit_required_additions_are_stable_and_unique() {
+        let original = regression_three_argument_schema(serde_json::json!(["c"]));
+        let transforms = HashMap::from([
+            ("a".to_owned(), ArgTransform::new().name("z").required()),
+            ("b".to_owned(), ArgTransform::new().name("y").required()),
+            ("c".to_owned(), ArgTransform::new().required()),
+        ]);
+        assert_eq!(
+            transform_input_schema(&transforms, &original)["required"],
+            serde_json::json!(["c", "y", "z"])
+        );
+    }
+
+    #[test]
+    fn regression_required_without_properties_is_renamed_consistently() {
+        let original = serde_json::json!({"type": "object", "required": ["a"]});
+        let transforms = HashMap::from([("a".to_owned(), ArgTransform::new().name("b"))]);
+        assert_eq!(
+            transform_input_schema(&transforms, &original)["required"],
+            serde_json::json!(["b"])
+        );
+    }
+
+    #[test]
+    fn regression_schema_and_runtime_agree_on_overlapping_argument_names() {
+        let mut parent = SearchToolFixture::new("roundtrip");
+        parent.schema["required"] = serde_json::json!(["q", "n"]);
+        let tool = TransformedTool::from_tool(parent)
+            .rename_arg("q", "n")
+            .rename_arg("n", "q")
+            .build();
+        let published = tool.definition().input_schema;
+        assert_eq!(published["required"], serde_json::json!(["n", "q"]));
+        assert_eq!(published["properties"]["n"]["type"], "string");
+        assert_eq!(published["properties"]["q"]["type"], "integer");
+        let input = serde_json::json!({"n": "query", "q": 4});
+        assert_eq!(
+            tool.transform_arguments(input).unwrap(),
+            serde_json::json!({"q": "query", "n": 4})
+        );
     }
 
     struct SearchToolFixture {
