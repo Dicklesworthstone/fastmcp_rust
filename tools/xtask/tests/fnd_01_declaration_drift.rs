@@ -86,6 +86,7 @@ const KNOWN_DRIFTS: &[&str] = &[
     "dependency.flate2",
     "dependency.hmac",
     "dependency.sha2",
+    "workspace.package.ids",
 ];
 
 /// Collects every declaration mismatch between the policy and the tree.
@@ -186,7 +187,65 @@ fn observed_drifts() -> BTreeMap<String, (String, String)> {
             out.insert(format!("dependency.{name}"), (declared, actual));
         }
     }
+
+    // 7. workspace_package_ids: the policy's list of package NAMES, which is a
+    //    separate key from package_member_paths and drifted the same way. It was
+    //    unwatched until bd-a61ej: repairing package_member_paths alone would have
+    //    left the policy internally inconsistent with this detector green.
+    let declared_ids = policy_src
+        .split("workspace_package_ids = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .map(|body| body.matches('"').count() / 2)
+        .unwrap_or(0);
+    let actual_ids = root
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+        .map_or(0, Vec::len);
+    if declared_ids != actual_ids {
+        out.insert(
+            "workspace.package.ids".to_owned(),
+            (declared_ids.to_string(), actual_ids.to_string()),
+        );
+    }
     out
+}
+
+/// Every `workspace_package_*` key this detector knows how to check.
+///
+/// bd-a61ej: the checks above resolve policy keys by LITERAL NAME, and `scalar`
+/// returns None for an absent name, which SKIPS the comparison rather than
+/// failing it. So a re-attestation that renames or adds a key would silently
+/// narrow this file while its positive control kept passing on the other keys.
+/// Asserting the key SET makes that fail loudly and separately from a value
+/// drift. This does not change what the detector claims about any value; it
+/// claims only that it still knows about every value.
+const WATCHED_POLICY_KEYS: &[&str] = &[
+    "workspace_package_edition",
+    "workspace_package_ids",
+    "workspace_package_license",
+    "workspace_package_rust_version",
+    "workspace_package_version",
+];
+
+/// Every `workspace_package_*` key the policy actually declares.
+fn policy_package_keys() -> std::collections::BTreeSet<String> {
+    let src = read(POLICY);
+    let mut found = std::collections::BTreeSet::new();
+    for line in src.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("workspace_package_") else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+            .collect();
+        if !name.is_empty() && line[18 + name.len()..].trim_start().starts_with('=') {
+            found.insert(format!("workspace_package_{name}"));
+        }
+    }
+    found
 }
 
 /// First `key = "value"` in `src`, or None. Deliberately line-anchored: the
@@ -242,5 +301,38 @@ fn fnd_01_policy_declarations_have_not_drifted_further() {
             .map(|k| format!("  {k}"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+#[test]
+fn fnd_01_detector_still_knows_every_policy_declaration_key() {
+    let declared = policy_package_keys();
+    let watched: std::collections::BTreeSet<String> =
+        WATCHED_POLICY_KEYS.iter().map(|k| (*k).to_owned()).collect();
+
+    // POSITIVE CONTROL. The policy declares these keys today, so an empty read
+    // means this test stopped parsing the policy — not that the policy is empty.
+    assert!(
+        !declared.is_empty(),
+        "no workspace_package_* key found in {POLICY}; this test has stopped reading it"
+    );
+
+    let unwatched: Vec<_> = declared.difference(&watched).cloned().collect();
+    assert!(
+        unwatched.is_empty(),
+        "the policy declares workspace_package_* keys this detector does not check, so their \
+         values are unwatched and could drift silently — add a comparison for each, then add it \
+         to WATCHED_POLICY_KEYS:\n{}",
+        unwatched.join("\n  ")
+    );
+
+    let vanished: Vec<_> = watched.difference(&declared).cloned().collect();
+    assert!(
+        vanished.is_empty(),
+        "this detector names workspace_package_* keys the policy no longer declares. A RENAME is \
+         the likely cause, and a renamed key is skipped rather than failed by `scalar`, which is \
+         exactly how this file would go silently narrow (bd-a61ej). Re-point the comparison at \
+         the new name; do not simply delete the entry:\n{}",
+        vanished.join("\n  ")
     );
 }
