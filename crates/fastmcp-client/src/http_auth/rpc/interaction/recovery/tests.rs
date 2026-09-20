@@ -56,7 +56,7 @@ fn replay_preparation_preserves_exact_state_parameters_and_selected_answer_order
         params.as_object_mut().unwrap().remove("requestState");
         params.as_object_mut().unwrap().remove("inputResponses");
         assert_eq!(params, before);
-        assert_eq!(original.encode_params().unwrap().unwrap(), before);
+        assert_eq!(original.encode_params().unwrap(), Some(before));
     }
 }
 
@@ -87,6 +87,15 @@ fn unknown_response_reservations_are_bounded_without_integer_wrap() {
     for (used, frame, total) in [(101, 200, 300), (300, 1, 300), (usize::MAX, 1, usize::MAX)] {
         assert!(matches!(reserve_frame(used, frame, total), Err(ManagedCoreError::ResponseByteLimit)));
     }
+}
+
+#[test]
+fn answers_are_bounded_before_retaining_or_cloning_the_continuation() {
+    let responses = answers(json!({"root":{"roots":[{"uri":format!("file:///{}", "x".repeat(256))}]}}));
+    let bytes = serde_json::to_vec(&responses).unwrap().len();
+    assert!(admit_answer_bytes(Some(&responses), bytes).is_ok());
+    assert!(matches!(admit_answer_bytes(Some(&responses), bytes - 1), Err(ManagedCoreError::RequestTooLarge)));
+    assert!(admit_answer_bytes(None, 0).is_ok());
 }
 
 #[test]

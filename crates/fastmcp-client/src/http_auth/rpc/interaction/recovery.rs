@@ -64,7 +64,8 @@ impl fmt::Debug for ContinuationReplayContract {
     }
 }
 
-/// Closed diagnostics contain no answers, state, endpoint or peer error text.
+/// Local refusals and interrupted-I/O diagnostics retain no answers or state.
+/// Other failures keep the existing managed interaction's error boundary.
 #[derive(Debug)]
 pub enum ContinuationRecoveryError {
     Interrupted,
@@ -155,8 +156,12 @@ impl ManagedInteraction {
         }
         let input = self.pending_input().ok_or(ManagedInteractionError::NotAwaitingInput)?;
         admit_challenge(&self.original, input, self.limits, self.continuations, self.input_responses)?;
+        admit_answer_bytes(responses.as_ref(), self.limits.core.request_bytes)?;
         let answer_count = responses.as_ref().map_or(0, FinalInputResponses::len);
         let request = recovery_request(&self.original, input, responses)?;
+        // Check the complete retained request before handing out the owner.
+        // This ID is used only for encoding admission, never dispatch/history.
+        let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
         self.step = None;
         Ok(RecoverableManagedContinuation {
             interaction: self, request: Some(request), call: None, phase: Phase::Prepared,
@@ -321,6 +326,13 @@ fn recovery_request(original: &CoreRequest, input: &InputRequiredResult, respons
 }
 fn reserve_frame(used: usize, frame: usize, total: usize) -> Result<usize, ManagedCoreError> {
     used.checked_add(frame).filter(|reserved| *reserved <= total).ok_or(ManagedCoreError::ResponseByteLimit)
+}
+fn admit_answer_bytes(responses: Option<&FinalInputResponses>, maximum: usize) -> Result<(), ManagedCoreError> {
+    if let Some(responses) = responses {
+        let mut encoded = super::super::BoundedWriter { bytes: Vec::new(), maximum };
+        serde_json::to_writer(&mut encoded, responses).map_err(|_| ManagedCoreError::RequestTooLarge)?;
+    }
+    Ok(())
 }
 fn recoverable_transport_failure(error: &ManagedCoreError) -> bool {
     matches!(error, ManagedCoreError::MissingTerminal)

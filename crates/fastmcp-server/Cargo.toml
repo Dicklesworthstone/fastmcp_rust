@@ -38,6 +38,9 @@ enterprise-auth = ["fastmcp-protocol/jose"]
 oauth-client-credentials = ["fastmcp-protocol/jose"]
 builtin-auth-server = ["fastmcp-protocol/jose", "dep:argon2"]
 proxy = ["dep:fastmcp-client"]
+# Opt in to host-provisioned root certificates for native HTTPS egress. Do not
+# activate the optional proxy client merely to select the shared TLS root policy.
+native-tls-roots = ["asupersync/tls-native-roots", "fastmcp-client?/native-tls-roots"]
 proxy-legacy = [
     "proxy",
     "legacy-2024-11-05",
@@ -103,6 +106,11 @@ required-features = ["legacy-2024-11-05"]
 name = "leg_02_b_contract"
 path = "tests/leg_02_b_contract.rs"
 required-features = ["legacy-2024-11-05"]
+
+[[test]]
+name = "http_continuation_recovery"
+path = "tests/http_continuation_recovery.rs"
+required-features = ["proxy", "native-tls-roots"]
 
 [lints]
 workspace = true
