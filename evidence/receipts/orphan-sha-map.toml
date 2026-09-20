@@ -1,0 +1,1014 @@
+# Orphaned-commit-sha map for batch-verify receipts.
+#
+# WHY THIS FILE EXISTS. Two history rewrites left commit shas cited in bead receipts
+# unreachable from HEAD. The content survived; the names did not. Receipts are NOT edited:
+# a receipt records what was verified when it was written, and rewriting its shas would
+# make it say something the verification never said. This map is ADDITIVE and is joined
+# against by orphan sha.
+#
+# HOW TO USE IT. Given an unreachable sha in a receipt, look it up under [[twinned]] and
+# read `twin`. Verify the pairing yourself rather than trusting it:
+#     git show <orphan> | git patch-id --stable
+#     git show <twin>   | git patch-id --stable
+# Both must print the `patch_id` recorded on the row. Include a pair you expect to DIFFER
+# in any such check: an errored comparison returns empty==empty and reports every pair
+# equivalent, which is the failure mode this file is most likely to be read through.
+#
+# URGENCY. The orphans currently resolve as dangling objects and are readable today. They
+# are garbage-collectable. After a `git gc` the left-hand column becomes unresolvable and
+# this map becomes the only record that the pairing was ever established.
+
+schema             = "orphan-sha-map/v1"
+generated          = "2026-09-20"
+generated_by       = "MagentaOsprey"
+bead               = "bd-receipt-sha-orphan-map-j6ag2"
+path_ruled_by      = "WildMountain"
+head_at_generation = "28ecaeb6501671f4c5a05db7fd9dd5cce164fe73"
+
+# METHOD, so every figure is re-derivable.
+#   population : every bead in .beads/issues.jsonl (1130 records) - title, description,
+#                close_reason and all comments; tokens matching [0-9a-f]{7,40}
+#   resolution : git cat-file --batch-check  (2319 tokens -> 1090 commits)
+#   reachability: membership in `git rev-list HEAD` (3074 commits) -> 188 unreachable
+#   pairing    : git patch-id --stable over all 2997 patch-ids derivable from HEAD
+#                (77 of 3074 commits yield none: merges and empties; 0 orphans are merges)
+# CONTROLS THAT PASSED, without which the results above are not load-bearing:
+#   discrimination : a deliberately mismatched pair (a93c9777 vs bf569927) -> DIFFERS
+#   resolvability  : "deadbeefdeadbeef" -> fatal: Not a valid object name
+#   citation reality: sampled orphans appear as prose citations ("MEASURED AT 20941c47")
+# WITHDRAWN during derivation, recorded so the figures are not silently revised:
+#   "113 twinless" - an artifact of a 900-commit patch-id window; full history moved 29
+#                    of them to twinned. The twinless figure is 84.
+#   "0 genuine losses" - a false zero from a zsh `[ "$a" \> "$b" ]` that errors rather
+#                    than compares, defaulting every row to one branch.
+
+[summary]
+orphan_shas_total   = 188
+beads_citing_orphan = 84   # closed 50, in_progress 14, review 11, open 8, deferred 1
+twinned             = 104
+twinless            = 84
+
+# ---------------------------------------------------------------------------
+# TWINNED: an exact byte-identical diff exists on HEAD. patch_id proves it.
+# Both shas are full 40-hex; abbreviations can become ambiguous as history grows.
+# ---------------------------------------------------------------------------
+
+[[twinned]]
+orphan   = "00e213184554b6b527153c5a9637fc4b25f605fe"
+twin     = "9b79bb204d0b364d3f5c5c5642f17e88fbab2f00"
+patch_id = "36fa58f945a922dff95a600a1d49d919cd54a4eb"
+
+[[twinned]]
+orphan   = "0c8d5f162eacfde2423e4546b4b043f9e04b3f9a"
+twin     = "67baf5cbecd8a16897baa0514729799ab98b0e3a"
+patch_id = "39637597b630cbb512c0d5317880b4e5b4109694"
+
+[[twinned]]
+orphan   = "0d1fcf848dd8521082471940390fe25a7c74e3ce"
+twin     = "ce8cb21b862a49fb6f2a7108008203becee80691"
+patch_id = "da7608bb52f67bfa07e37cb1a59c9781ea9edd22"
+
+[[twinned]]
+orphan   = "107d30ea8f20f881c3185fcdb7811f4ecd89098a"
+twin     = "8edeb0a458f800564858b42aaa4913c35ad44476"
+patch_id = "643c7a166f203fa5bfbae9187b826592a82a1355"
+
+[[twinned]]
+orphan   = "124ac18e2dad8ed7fe211740b42a3facd4a45a79"
+twin     = "9c584c436bba479e004bf11e72c40a24327bbf50"
+patch_id = "4fe92bfaa325466a987b8051dc43e8b1b1a7adb2"
+
+[[twinned]]
+orphan   = "124ac18e2dad8ed7fe211740b42a3facd4a45a79"
+twin     = "9c584c436bba479e004bf11e72c40a24327bbf50"
+patch_id = "4fe92bfaa325466a987b8051dc43e8b1b1a7adb2"
+
+[[twinned]]
+orphan   = "14166e301f98cdb1d4aea94b6b94c1d5f47b7039"
+twin     = "e4ea1d15715fde5bb260fbf78d89f0f67645fcbe"
+patch_id = "6f0519a567806c0f119db55a823bdc0b225fa716"
+
+[[twinned]]
+orphan   = "1586df4c9bb345a0cdf3eb6b89e2baf2e3b4c9be"
+twin     = "26e9132c01d9582802c91754a99e892e8287f362"
+patch_id = "7922a9b68d253954fd63a7f742c7eca418177047"
+
+[[twinned]]
+orphan   = "15b03ae763936ef312dd49c06bf61d435827868f"
+twin     = "89bab4e046390e82ccb30d3ec102a6187a0a925e"
+patch_id = "6140f1c030faddd473b4167267934a6cf6a4757f"
+
+[[twinned]]
+orphan   = "1a18f94230f9e103501edc804cbfe8dd4fb5b9cb"
+twin     = "aa09a123ab4d218560c568610762383601c1bcff"
+patch_id = "9ff9519deef9d4c95b05e6d7d6c4d86711b17384"
+
+[[twinned]]
+orphan   = "1b19920145608d7195f2871bb3cfeeefd875b199"
+twin     = "0122b9ec89960764218e7fe7a6158e08b1d46da8"
+patch_id = "5c52039f630ee6cbb263498593a66b93b301fc86"
+
+[[twinned]]
+orphan   = "1b6c511a5d71afed7dd0b45b0e17fc13951acdf6"
+twin     = "773275bc8d10ee69db33f6d5a21a311f4f20d546"
+patch_id = "e0408f21a1ce18b6090ee49889385c4b513bf7cf"
+
+[[twinned]]
+orphan   = "1d5732fb6a0953223d094dfd42e0ef5ff960769c"
+twin     = "824919411579009d8a8d3aa2bbc7ac638f44a433"
+patch_id = "0e761b7f6630c9aa49b8b61fdfefe7ea5292a14e"
+
+[[twinned]]
+orphan   = "20941c476c20b30f12c8fbf53066b1e02a019c4c"
+twin     = "bf569927b93228617404dad4444c0ce8ddff1c0f"
+patch_id = "71659bd5889165dbb210496d20fe3389a17f6ca4"
+
+[[twinned]]
+orphan   = "20941c476c20b30f12c8fbf53066b1e02a019c4c"
+twin     = "bf569927b93228617404dad4444c0ce8ddff1c0f"
+patch_id = "71659bd5889165dbb210496d20fe3389a17f6ca4"
+
+[[twinned]]
+orphan   = "21161648d6b4bb9e503bbaa51c540b784a746345"
+twin     = "38463d1564669c5ada4ba00d823ed2564a149306"
+patch_id = "65dec65dac09e982e976c4e861219a86d7067d11"
+
+[[twinned]]
+orphan   = "22c570096ad8ad22822bdf4fbec68063ba302001"
+twin     = "80c3de1226ba5ee262286b452d6b5a387e4560c7"
+patch_id = "3f906e5239f8e9a7c0af4ffa5be9383100417d17"
+
+[[twinned]]
+orphan   = "22c570096ad8ad22822bdf4fbec68063ba302001"
+twin     = "80c3de1226ba5ee262286b452d6b5a387e4560c7"
+patch_id = "3f906e5239f8e9a7c0af4ffa5be9383100417d17"
+
+[[twinned]]
+orphan   = "272d86cc71511a8e5bed85b31813020af670ddb5"
+twin     = "3c1efb0a267df2029934d2cca466bd4dc6e4bf73"
+patch_id = "11eaced1da8d72f5ac2d66ba848952aaa03585a4"
+
+[[twinned]]
+orphan   = "2d05abde2b04fee464bdbd3b40571be948b1e703"
+twin     = "e02baf23e34436b4da6fe1b1c44c394ab7b6cb2a"
+patch_id = "75f589dd8eefdea78021ee95bc8482741b8dba7e"
+
+[[twinned]]
+orphan   = "33f3a1dc6a7a1a0d5e285fa57b5cece1a2b543df"
+twin     = "7881aa6239dd7c86acf4afea047ebce5f2dad07a"
+patch_id = "1a4c7145fb0571a591ed043547ee1a7fa2e01801"
+
+[[twinned]]
+orphan   = "34e76891c5c1bea2c992dfc6f5da7fbaf93a50fa"
+twin     = "f3f7745005d2e5113554a79ea35e7b119a013655"
+patch_id = "b3cb4e564d37bc613f44748d02f304906ce475f4"
+
+[[twinned]]
+orphan   = "37d61a53e388f493995ae06a2a475ce89c8f0820"
+twin     = "876b876f10415c80f14c0848b3f02a5b69346791"
+patch_id = "fc608991dcdf70e08a142cc6a07e3a84bb5ffa2b"
+
+[[twinned]]
+orphan   = "3a8f4ac54c644f53ac63aedb333c3c8a924545ae"
+twin     = "2f22108b8bc72b599eb17f7f14d757abfab88c49"
+patch_id = "a5d4180f2b82149544c1f27ac38e43764a317643"
+
+[[twinned]]
+orphan   = "3a8f4ac54c644f53ac63aedb333c3c8a924545ae"
+twin     = "2f22108b8bc72b599eb17f7f14d757abfab88c49"
+patch_id = "a5d4180f2b82149544c1f27ac38e43764a317643"
+
+[[twinned]]
+orphan   = "3e2e82a93f884ac23511d230ea60a46a85c6a2fb"
+twin     = "87a8b689b99013b2f5447d839e88f5ad87e07fbf"
+patch_id = "5df49b13da870e9faaaa443f90c12a3de9585964"
+
+[[twinned]]
+orphan   = "422b63f9268dc55b4caa2d98adbea6569e6c2194"
+twin     = "9f5f2668262aafea61424a233be132d3b8bec958"
+patch_id = "62551f03c95c26662186c5796d01a0e84aa10dc4"
+
+[[twinned]]
+orphan   = "43737d727c4e17303aa5259f09c9aa73a53856d4"
+twin     = "05a875def98b1fc5eb2f9fb77b8a2b7773d6dfc8"
+patch_id = "380d6afccb11437e06ef61e6edd69ea735fa2d8e"
+
+[[twinned]]
+orphan   = "43d4be8c28b063814055eef4a6ef4cd4bed06943"
+twin     = "dbd49da02afeb09b6fcc36ab514429369c988026"
+patch_id = "ae30ef384cb78fa872e30469c9858e5595fd1332"
+
+[[twinned]]
+orphan   = "45caf34ecf53742a2436950194b09d6e454c5004"
+twin     = "0aa8c15a8d4940dad3a22491573d0cc0616521c3"
+patch_id = "a4dbdee2943ea8806407322aaadca91f2d0f2647"
+
+[[twinned]]
+orphan   = "466d34d012f3bcb6eb5a3fa1156252e0368af0e2"
+twin     = "30d016eed9c98ec6072cb43433956f26a151230a"
+patch_id = "eb4c8f56c271e59aaa933019ae05d7092f3d5ac8"
+
+[[twinned]]
+orphan   = "4748487a4cc29de3ed3a57c2bf28968d320ca854"
+twin     = "bf7f62f31fc1d70771e6b3f3adfba21e0d81183d"
+patch_id = "82625089cb6e4a7d0398258fbfb2289f6e59b16b"
+
+[[twinned]]
+orphan   = "4d4da7b67fa69583f4891f5d15cd8158b2845610"
+twin     = "dafba3c969eaebc28a981a2910f272e1a0e644d3"
+patch_id = "785eb2c20ad450ad7aaf685cf2dad4b8fd77b522"
+
+[[twinned]]
+orphan   = "53ea26fa27c0156a68cf802cc9481c09d1326b89"
+twin     = "8a2ee05ffba806fd2d30117353dd0e9f409ebc18"
+patch_id = "f10a79e18fe8267368079ec932dcf688baac9382"
+
+[[twinned]]
+orphan   = "543209b581e310e2b40bed0811af4823bb734e94"
+twin     = "3745713237f9aabbad7501404e3fef94278fb4a3"
+patch_id = "d4e2181b35addf389b0bd371ee29859f2672e6a8"
+
+[[twinned]]
+orphan   = "54a7e589d7ec843f71eb74f998ce4b53a8069f7c"
+twin     = "e3f0d7d4785993bc3fb590b423afc06ad2698878"
+patch_id = "61e518c8851815703c11b4f072d6e2d8b785037a"
+
+[[twinned]]
+orphan   = "5557718f9a7a862d850dd02ba9b10db65ce46aa1"
+twin     = "bb2273ee3edbb5c6e9596c927a7c84baded86c33"
+patch_id = "b18e64ed1f8e4b00231e3c044ee4c2214c43c9be"
+
+[[twinned]]
+orphan   = "559855d287b9f084971ae60b40215a68cd2b6592"
+twin     = "b077c02b4f78566aa9847aa5129bb72e5b63274a"
+patch_id = "1a68b03fb99547ac195b5abcd1fa1afb7212097e"
+
+[[twinned]]
+orphan   = "56434ca126a5cb7781dd8abc6ce02f7e574b25b2"
+twin     = "5570055bbf332630d50a0bfaaa5a045deb7e6baa"
+patch_id = "07ea9fe0e97df2b694fe17fb1eef970e0f0763ae"
+
+[[twinned]]
+orphan   = "5b520469359845c5c40509d14b711bcf5ca147a6"
+twin     = "6a6a8eef940a32c3008c13b6ad1ba112c368cdae"
+patch_id = "d0524a4e8b572bda22f7fa0adcb9c18104ef8c3f"
+
+[[twinned]]
+orphan   = "5c224bb1d97a69d50435b5d45a37a788c516dcd7"
+twin     = "c45f1e762aa2b993e5ab61951c528c72c9bae6f3"
+patch_id = "e9378ec701019e500daf329226f9f3637fb37dcd"
+
+[[twinned]]
+orphan   = "60cea1f2bf2409d56e106ca5ee7ca9251ede748f"
+twin     = "3b672af9e5ef6eb344164b32e3ee7f96ee31306e"
+patch_id = "463d055614e9c8438cf94ac66bbb043d1f3e8f3d"
+
+[[twinned]]
+orphan   = "62003110abfe3362189bd3febd172b32becd4271"
+twin     = "b5e05faeb5681579262c6c2b3bf2eb880f57c758"
+patch_id = "b3e837403872ea168e1e7c6fd95dfb70bd4cb639"
+
+[[twinned]]
+orphan   = "64e37504d70e16743730f4efa04cea04b068141a"
+twin     = "7cfb31eec7cd5c9d79b25bd8f72b771ddd39480c"
+patch_id = "280dec77cfbdd60728360700253f11e8bee6f75c"
+
+[[twinned]]
+orphan   = "65c3aa864cd5585d791b1b3a256611946864a21f"
+twin     = "ca8d23c88095f221826d633ea9eea45dddd57005"
+patch_id = "018a39bd63fd0a8d1fab756df2aee1630470385e"
+
+[[twinned]]
+orphan   = "670b60dbf706aaf0b43814e314289efb6005fba4"
+twin     = "3b83aac1cb86236a6763950f5428e5d12751d13d"
+patch_id = "769cdbf36c718f66615e0a9e3eba4addb41954ca"
+
+[[twinned]]
+orphan   = "7199e20ce1ebe05b26b33f8e12700b2ebce52551"
+twin     = "604a57e0c583a7ac05ba6c39d0562d001dc89880"
+patch_id = "d99ca8a85c234cbd8107c0a46e060fafdbe7cd67"
+
+[[twinned]]
+orphan   = "7242ab60f62b677c3acf74255c629990166c5e06"
+twin     = "6abd19387f6f6fd0fe2f107960c0cc1115a6d6f8"
+patch_id = "701f76dbe5526da5ce84359f2904ac47e71d8aba"
+
+[[twinned]]
+orphan   = "734064e32010396a3ba3dda5c621146ebb3b429f"
+twin     = "ca9a376cbd45ab7048a73b6ee5a11d1a4e31bb57"
+patch_id = "14cf581399ef2066c90bd4f76e62c36b5167de81"
+
+[[twinned]]
+orphan   = "760e332424bad46e84bfe53b7cc5681194c3e11f"
+twin     = "305515555b3105ce0ca5fcdb39ff1cdcb3656686"
+patch_id = "4191768d99ae06232d2ac81bbed5400b41928f65"
+
+[[twinned]]
+orphan   = "7667864fb5ad4d13d88a8a313ac699f19fbf8096"
+twin     = "b2ab32e92435bcf515d2f18513684525be070b08"
+patch_id = "a6fd6e2c0fb45c58dd2ccc125b5e890ac7768aa5"
+
+[[twinned]]
+orphan   = "76e9e092ae5edb702a8da5354ff0e9d571374869"
+twin     = "3ac4e4b3b09f6ca0f32a41d5e3831aa4e2d40e7b"
+patch_id = "0dc9292bb153edeaff41d3166e3b344adba129a4"
+
+[[twinned]]
+orphan   = "77164b50f171794825d7884a93caca9406ec79a5"
+twin     = "423c2bfb4429f3d3a642cf6417935439bce1b3ac"
+patch_id = "238e84eb826bdd3b41e572d91c01f9e1889e6f07"
+
+[[twinned]]
+orphan   = "7ad4401d311106ba6bec492cd265b0941a8950d7"
+twin     = "f714ef7ca3a53524afea29021188681d0d919de6"
+patch_id = "fd86465960a4482fd687ecd68cebbdddf7e824d3"
+
+[[twinned]]
+orphan   = "7c71457d36bc5733db7b0ec2a5ecd49eb1c3797c"
+twin     = "6769e236bcb9ad26316f63b8b85630fa74e58377"
+patch_id = "75ab21b1d1ed4f78d406ed8a3aa6d512153f4c78"
+
+[[twinned]]
+orphan   = "80edfc41996259bc2eb7ae956def561d89902e2f"
+twin     = "0ab2c783ed301346f91eaf4577d4a6d929ca89cb"
+patch_id = "ff330c715171fc731983012b7de65f52321d48b1"
+
+[[twinned]]
+orphan   = "8326037155a4f1399cf74396d69f66f71ab048dc"
+twin     = "cec86e4cf915070719e339a307986e815c912476"
+patch_id = "9d025247f90bafaf794a10aab389c5d980f8202e"
+
+[[twinned]]
+orphan   = "8439709a29e02ea1671de7934a43f8bd0672b899"
+twin     = "c34faadbeace7fd9e64a26bc5fad913793f992ed"
+patch_id = "d185248b69beefd4f25d8ab5851351015799ddcd"
+
+[[twinned]]
+orphan   = "84f6168b824dd0ee3c59bf9aea8d1be865018e16"
+twin     = "ff028549be637d841c9c202421793b33dc6cf80a"
+patch_id = "f8fecbfdea8995684b327fd34f7e3deb74e221d0"
+
+[[twinned]]
+orphan   = "8535837c4289ae1a85fe453a7a2edfc57b45cae9"
+twin     = "c3b9eef7edf1258a02acc90a02d6bc17145567de"
+patch_id = "9e6cf788268d073e234b913b4fd6989ac1b95eab"
+
+[[twinned]]
+orphan   = "8551966484b81af833ed2deee18e47df116df26c"
+twin     = "ef1e310a22c6f1444ef131ea35af850033b2e335"
+patch_id = "cfe6f32075aec4094e8f78e6c47896ad3689578e"
+
+[[twinned]]
+orphan   = "8a1998fdb84f011680cbbac9b30a94754ddf3b8d"
+twin     = "3f3a6194e62722b152089021e50ba8b5e56ddfc2"
+patch_id = "920ed102a03c6ce66d2099bc93ae477f08db7db4"
+
+[[twinned]]
+orphan   = "8af27b6c013bbe080c9fd77755362d8d05986399"
+twin     = "23b2f43209862eff56ae295d0eab88381c5d1407"
+patch_id = "f1919aa2e571551144a6f3d79bd72bd5bf357e5d"
+
+[[twinned]]
+orphan   = "8f4d0869caef0c497d5233b173976007d1b1c131"
+twin     = "acade8a85df2962c04caf6747c9a9c2e3ce3a5b6"
+patch_id = "b16e1e9d127ec49dfa911077793230f8a5dedb23"
+
+[[twinned]]
+orphan   = "93379bbb8efae06273a7341f2866e59971b7ed0b"
+twin     = "94cf89f7bc6bb360f0fc06140125c421882a3d59"
+patch_id = "0afb74b559058d6deb2134664c72978d2649fa71"
+
+[[twinned]]
+orphan   = "94bc87853ee8e4acb6dbd58770cd1b1a5e928ebf"
+twin     = "b62082e87ee2be7707f6d34d173d603439f47e5e"
+patch_id = "c588653a2c414cd917a8ca15420176bdd3c15b27"
+
+[[twinned]]
+orphan   = "982b5119d10e21a6c737057760549b76647813f1"
+twin     = "375fbf93bb308d202a2d3aff33f53894cf9b0b2f"
+patch_id = "4fcae80d57db5777ad7434ce96a43b8286a806fa"
+
+[[twinned]]
+orphan   = "982b5119d10e21a6c737057760549b76647813f1"
+twin     = "375fbf93bb308d202a2d3aff33f53894cf9b0b2f"
+patch_id = "4fcae80d57db5777ad7434ce96a43b8286a806fa"
+
+[[twinned]]
+orphan   = "9e253e467718a61eb3d19a896629d68a25c8104e"
+twin     = "719d07621ab588a1d87a4ad62030fd56ebf04a3f"
+patch_id = "d3663fe19b02fb04344105a88dac3f3e95863cb0"
+
+[[twinned]]
+orphan   = "a140ed147a52af7903bacaeeeda997e2ef19b899"
+twin     = "4df8726becad9742b167ba626fb8ebb2aecf1393"
+patch_id = "da00b2c1ae914c58947417ec38cfd43409f20a00"
+
+[[twinned]]
+orphan   = "a5503c461ee857e5f8b0b88a41bd0f64e7e5cf58"
+twin     = "ad073ccb12d575c7c3f3471772002486f5e2e88c"
+patch_id = "146efbaf52b45e588de30d84452e4de80b972cbf"
+
+[[twinned]]
+orphan   = "a7b753f3a8d8fe71d51bb8a99ee7ddc64de2b3f7"
+twin     = "c5d3e805b142412d10044f8f3c33417863bf171a"
+patch_id = "955ead2f68fdea6f4dfcc834b1773a8b35f2cea4"
+
+[[twinned]]
+orphan   = "a8574340aa221470de2715be24709f15147363e1"
+twin     = "6f1f114c8ba43c3e3f8a42b2e05ec64a7f4b033b"
+patch_id = "51beb4ba4a0f4a51b6130d7f62eee853c4fe7acd"
+
+[[twinned]]
+orphan   = "a93c97774f6970e2b5b40be2ae202838d179d0e0"
+twin     = "9cd6a38e689fc9c541704758a8f888dcc9df84d4"
+patch_id = "b650e8c6fb41d6a8b7735ebf4029ea3e156760d8"
+
+[[twinned]]
+orphan   = "ac629bec21eb81a88ef273bb0892ea3ecb11ae48"
+twin     = "599435729f4eff556e09464e3bda747d426e7f23"
+patch_id = "3cee9feea305640d29185f4d93f1d5d9983ed730"
+
+[[twinned]]
+orphan   = "af2f01ba00184c8eeb3cdc2fc0a37aa4e2bd04c9"
+twin     = "02bdc2947737bf3f1e72d4cb936404bec6231cca"
+patch_id = "91088d089f418b205de107c8e6987f8964288445"
+
+[[twinned]]
+orphan   = "b271be0d02d8b7a636f02efa77f922dcdcee6cfd"
+twin     = "049eca19b0a4a62ee54bd435c543430b8eaa0b90"
+patch_id = "0a6aa93fe1faa9639b063d854f2c6246bc59ebed"
+
+[[twinned]]
+orphan   = "b34cba3ff7b12479473c9221bf5bc53955d56062"
+twin     = "696451425f28d469f427b1e2540b1aedd9026991"
+patch_id = "f299aea2bc418b5d2e86a16d2f4217deb001efe0"
+
+[[twinned]]
+orphan   = "b7d1c7c53d12df933ade27fe668426a6d0c6f848"
+twin     = "db34940c35dbf222e38317648753fe210ccdc1ba"
+patch_id = "52050194524e799009433a9bc74ff5d8296f9f03"
+
+[[twinned]]
+orphan   = "bf89f6326b01dcb66044637a4d8794d835d3a086"
+twin     = "5b15b1374eda308e988c58b987badef123106534"
+patch_id = "249e5dc369b6bf1987252935475aea6b1ff2c235"
+
+[[twinned]]
+orphan   = "c87208f7daf7f70a70703097ee72ba37f8c1cb5f"
+twin     = "335cff458056ce74b12253b23f437ceb07f11b69"
+patch_id = "bba642702353f4f153a8f8d9cf19cd84ee086258"
+
+[[twinned]]
+orphan   = "ca61f87fb9d3766475791c340cd5c9104a685158"
+twin     = "fbdf4ddee21d66c227a7adcdcbb750ce9ce674a0"
+patch_id = "0bdb7aafea6ad071b6befbe5e2da4391c7c13c43"
+
+[[twinned]]
+orphan   = "d0891f590d656b9a320d2e8062632a9b22800f17"
+twin     = "ac07aee1be388f5e04082d873c7b43ed381b08ab"
+patch_id = "0fa97c29180cc1cc3ca40bef857c77feddd2a820"
+
+[[twinned]]
+orphan   = "d505230b6aab4c39c9f70bde76c1fa64ad819ccc"
+twin     = "dd4845b1eea4cffd5534df3e95e0a8d808d80696"
+patch_id = "1dadd19da4634972058467c3628c5e88fd839e39"
+
+[[twinned]]
+orphan   = "d8a38826b376bb775a626ad54f1d8f50a98dbc94"
+twin     = "f0ad9835e9bd4f57711c377fba46f5648bc9c29a"
+patch_id = "32c3689eeb7aa51f7f14cc70ba63ca434fbffd03"
+
+[[twinned]]
+orphan   = "d9de5563179f9ebdf396623aee37a2ce22fe12dc"
+twin     = "a2daecc36f2f81c254fa840f933022a9471cf504"
+patch_id = "f14f4dbfc65e93c64c44d9e8db58af74d9b3353e"
+
+[[twinned]]
+orphan   = "dbd48d096cd715960651718ff2e55b48d5a3beb7"
+twin     = "ceeb1a3ac5f694d5337acba6f155889c57078829"
+patch_id = "f748f50468b85f7e4ade7142815cba8082a21e73"
+
+[[twinned]]
+orphan   = "de77d9b60d2d4e9ddff8643d05a9911d33f8cb93"
+twin     = "3fb3d5f50b91b705187f587c5997f408679f82cd"
+patch_id = "0b1f92fbd059da52d04234547b2ed12068bb9721"
+
+[[twinned]]
+orphan   = "debf9d8140d90d4f39949d2f6906d961a1ef1117"
+twin     = "06645dde6b716a5c36d4d71af3be91b542cb3a8b"
+patch_id = "dcc24f76dc0cf82774a03e9303911eb6f7ca784b"
+
+[[twinned]]
+orphan   = "e276c0d4daa87b6455415ea00d39d228cff61ea2"
+twin     = "e8de937f4d2e7cf13db38853031c78afb3194b2a"
+patch_id = "3bb8ad9cdcbcb9c10a2edab143c484de57293ec8"
+
+[[twinned]]
+orphan   = "e386bc46a7dd60ab4d086a65e7664b93e0bbf3ac"
+twin     = "b40104328ed828962eae78e6077bf1e9c34f5d31"
+patch_id = "aff2301c055c69597887baef38eb0f1a86a4fb35"
+
+[[twinned]]
+orphan   = "e5f569a4ed11c26531a414e0b8e87e8bc0bf6a2c"
+twin     = "4b22d762b85b0585db32a6e851b389b49663b2f2"
+patch_id = "859af8ede40dc645bad059f77d05dfdf0dc329c7"
+
+[[twinned]]
+orphan   = "e97e4dcea0cab48344f0aa460fba93d4dbda1066"
+twin     = "a80cb1d88435ecb0b2d6f7822bcf15756ed528af"
+patch_id = "8ed405b3acff63a597cd19f66a8ba2a4bd0669a1"
+
+[[twinned]]
+orphan   = "ea51944608e364460337f78224acf90ffd01c00b"
+twin     = "d364e8adc8b3e24896ecf40f046a4390d094416f"
+patch_id = "55025bff9f1e66eabcb977152191ca59d398e9ec"
+
+[[twinned]]
+orphan   = "ea51944608e364460337f78224acf90ffd01c00b"
+twin     = "d364e8adc8b3e24896ecf40f046a4390d094416f"
+patch_id = "55025bff9f1e66eabcb977152191ca59d398e9ec"
+
+[[twinned]]
+orphan   = "eb3cfe00698be0e1c8b4511f37caa0b2d298f050"
+twin     = "92e7f74eb6689ab14add0cfd21dd81ae4b7ccc06"
+patch_id = "c7435b9bcfecc5a354b8363643f9cb1143a3eb23"
+
+[[twinned]]
+orphan   = "eb3cfe00698be0e1c8b4511f37caa0b2d298f050"
+twin     = "92e7f74eb6689ab14add0cfd21dd81ae4b7ccc06"
+patch_id = "c7435b9bcfecc5a354b8363643f9cb1143a3eb23"
+
+[[twinned]]
+orphan   = "eb747a98c84700dfb7f1013ef34e004166ee4d3d"
+twin     = "30d129585174fecd37fac6deeb8f6d38b4424106"
+patch_id = "8d92c314cdbe213f26020c2000ad394b8df81bf3"
+
+[[twinned]]
+orphan   = "f8a47e3c180e2de31058fc89be0f35cea17800d3"
+twin     = "dcaa0bee7f115d15539877e2652debaf3ee049e3"
+patch_id = "3fd231a4a4f9cc04343f624cb903eb07ca005cea"
+
+[[twinned]]
+orphan   = "f8a47e3c180e2de31058fc89be0f35cea17800d3"
+twin     = "dcaa0bee7f115d15539877e2652debaf3ee049e3"
+patch_id = "3fd231a4a4f9cc04343f624cb903eb07ca005cea"
+
+[[twinned]]
+orphan   = "fac112de6e0a4bfdbb93b2ced19d8ed94f0f0107"
+twin     = "14e65f224c3bbddce81072c56cfd075aa04280a2"
+patch_id = "aadcc239ca6e21dcd6829454d73def108b4d008e"
+
+[[twinned]]
+orphan   = "fba0a5e61ae170d38b67d7b34ff481aacd9c8b5f"
+twin     = "1a4fa405ab76a69f91467486deae788a45ee9de6"
+patch_id = "afce913a90a137a07cfe248480a064c9a46d969d"
+
+[[twinned]]
+orphan   = "fd5273bc158e0be1f1fa09aae7ec074b0fa0a67c"
+twin     = "b6d5c778ffe4b80e752c34bdd4daa36f4d741c41"
+patch_id = "a3a5f67ee674f1cc5b1b95be9bbb4015d3d4153b"
+
+[[twinned]]
+orphan   = "fe748b0c1cd13053e1bdb5ba5ff707f45eba0d1a"
+twin     = "e02e18fa203a7ad842f753b669924df890624f6a"
+patch_id = "83b96c4c36ff3def0cacb8bb75fcc6c57320584e"
+
+# ---------------------------------------------------------------------------
+# TWINLESS: NO exact byte-identical diff was found on HEAD.
+#
+# THIS IS A WEAKER AND DIFFERENT CLAIM THAN THE SECTION ABOVE. It does NOT mean the
+# work was lost. It means no commit reachable from HEAD has a byte-identical patch.
+# The change may be present in evolved form, having been modified by later work, or
+# superseded by a different implementation of the same fix.
+#
+# WORKED EXAMPLE, which is why the distinction is drawn rather than asserted:
+#   4c0a9216 "resolve the caller timer driver at poll, not construction" has no twin
+#   because it was a local re-invention of work already upstream - 77efb897 and
+#   b544946d, both REACHABLE from HEAD, both touching the same concern, upstream being
+#   strictly better (+77/-4 with a regression test vs +11/-2 without). The content was
+#   not lost; it was superseded by different bytes. Some fraction of the rows below
+#   will be this shape. Each needs its own determination; none is made here.
+#
+# 66 of these date to 2026-08 and 18 to 2026-09, so they predate the rewrite audited
+# on the owning bead - they were stranded by an EARLIER one.
+# ---------------------------------------------------------------------------
+
+[[twinless]]
+orphan    = "03e3d0e99d2e83c98a1afbbdbff88399f4ce7078"
+patch_id  = "4cfb571c4c45d86d14ce30be8273aa67a53a94d3"
+committed = "2026-08-24T22:38:42-04:00"
+
+[[twinless]]
+orphan    = "0691b8336596f8b5874e9db8fbd229bd9ba65ca8"
+patch_id  = "6a90c56c4433f9feb07a0cbee4a92c4b793bfb50"
+committed = "2026-08-30T03:47:58-04:00"
+
+[[twinless]]
+orphan    = "089414392ec40ab99ccfa374e082415ed68265ac"
+patch_id  = "934b8662fcb25de6787f4dbd404c66781170a592"
+committed = "2026-08-24T20:46:08-04:00"
+
+[[twinless]]
+orphan    = "09da2dcdc451699b4a6697359deadc2f21151d56"
+patch_id  = "03519e9754b2029548bb16a73ece138c3ece14c2"
+committed = "2026-08-25T00:31:57-04:00"
+
+[[twinless]]
+orphan    = "13ba6e0b4eb40eab1a3ba4d9ef055ff47b13272a"
+patch_id  = "868d9872cd82c743a194ae42d0542e4c2a475214"
+committed = "2026-08-31T02:13:37-04:00"
+
+[[twinless]]
+orphan    = "13ba6e0b4eb40eab1a3ba4d9ef055ff47b13272a"
+patch_id  = "868d9872cd82c743a194ae42d0542e4c2a475214"
+committed = "2026-08-31T02:13:37-04:00"
+
+[[twinless]]
+orphan    = "1ea49bdf828a0155a4d079a2b5188e364bb6ac1b"
+patch_id  = "ef998bb960dfb3de477095b02497fc886f6d5ca9"
+committed = "2026-08-30T19:34:12-04:00"
+
+[[twinless]]
+orphan    = "1ea49bdf828a0155a4d079a2b5188e364bb6ac1b"
+patch_id  = "ef998bb960dfb3de477095b02497fc886f6d5ca9"
+committed = "2026-08-30T19:34:12-04:00"
+
+[[twinless]]
+orphan    = "312af809670f2a54f5e6ace10dfc7186bcbcad29"
+patch_id  = "a7851f5c08a3130a330b646fbf201c7b088d1ad9"
+committed = "2026-09-01T11:57:23-04:00"
+
+[[twinless]]
+orphan    = "34317ad9202d41ab0b166907fc628c608e7412f0"
+patch_id  = "528829ecd43133b2040c79303732d527f41b083f"
+committed = "2026-08-24T16:24:00-04:00"
+
+[[twinless]]
+orphan    = "38ac8563e33488bdf1a015e27983071e42b61f33"
+patch_id  = "e25469b6ece951a7c3e79c58b3320a45729d2747"
+committed = "2026-09-01T11:36:26-04:00"
+
+[[twinless]]
+orphan    = "3bb280549c1f7de85136bbbffa94ef7bdc0f47a5"
+patch_id  = "471b6651d9a99c639adbff3f503d8d653c730ad1"
+committed = "2026-08-30T07:16:54-04:00"
+
+[[twinless]]
+orphan    = "3bb280549c1f7de85136bbbffa94ef7bdc0f47a5"
+patch_id  = "471b6651d9a99c639adbff3f503d8d653c730ad1"
+committed = "2026-08-30T07:16:54-04:00"
+
+[[twinless]]
+orphan    = "3cfeb63415d8fec2ae782377f54bed3948d15711"
+patch_id  = "d087fe64e26191ab19ff1f281d95e7d075ad238f"
+committed = "2026-08-25T00:29:39-04:00"
+
+[[twinless]]
+orphan    = "4b1dbf5702ddcb6ea24ed680e70a5f57b2c4a249"
+patch_id  = "96a317cf33819310243dee6be7e01a50bca24874"
+committed = "2026-08-30T08:27:46-04:00"
+
+[[twinless]]
+orphan    = "4c0a921645ff9d68ccecaa3b12876185595b9561"
+patch_id  = "fa745bed839533a29a3914ac80e7cbf5c66ad3d1"
+committed = "2026-09-19T00:44:41-04:00"
+
+[[twinless]]
+orphan    = "4dafe4fc0d8997328c74c3fe619af4c724232d44"
+patch_id  = "e0b1dfcd0436e059b8687cf05e25650f38079e6e"
+committed = "2026-09-01T12:06:49-04:00"
+
+[[twinless]]
+orphan    = "4ded7204b372884a7b7d1ce3b88c010c7efc8c48"
+patch_id  = "9ff743551829a4df3263a4d980ca4df5a7fcd3df"
+committed = "2026-09-01T08:18:13-04:00"
+
+[[twinless]]
+orphan    = "507d764acaface2694c0085de6938b4d5a1911b9"
+patch_id  = "e89816d39c78891f8ada0d9af8c9ed6f51524188"
+committed = "2026-08-30T20:37:07-04:00"
+
+[[twinless]]
+orphan    = "51997667e76363ece248ba1e89491d182009244c"
+patch_id  = "e29581de8a445223a1aa7bb823a690dcc8cf985b"
+committed = "2026-08-30T17:38:04-04:00"
+
+[[twinless]]
+orphan    = "52fb655d60e12034edb1524223952216ea52389a"
+patch_id  = "cc9198651985fe17c17a0a2484e0a6c46058b0a5"
+committed = "2026-08-30T17:46:57-04:00"
+
+[[twinless]]
+orphan    = "577b52e5b0b26f79e2c9b2e57639ba074950778c"
+patch_id  = "9f250d4a744eb55c65fdb2cb8e557e106317806f"
+committed = "2026-08-30T03:48:22-04:00"
+
+[[twinless]]
+orphan    = "585395c70c8c5ed5caee8a13e4863080244b2187"
+patch_id  = "60778b7de70f80a91054dcc37e9ce0a307e29c76"
+committed = "2026-09-01T11:40:37-04:00"
+
+[[twinless]]
+orphan    = "5a1f47d1b0472f7833bcd29899e22a9cbdc87a3a"
+patch_id  = "41c05c61c6b8ac34346a2c418f85e96b2270f191"
+committed = "2026-08-31T23:20:43-04:00"
+
+[[twinless]]
+orphan    = "5bc1ee3fdf9b0ef2d1f61f5a60b0b957ff766aee"
+patch_id  = "37daa26e24a0c9556dca9a328e5545e9cc9abf0c"
+committed = "2026-08-30T18:26:54-04:00"
+
+[[twinless]]
+orphan    = "5bc1ee3fdf9b0ef2d1f61f5a60b0b957ff766aee"
+patch_id  = "37daa26e24a0c9556dca9a328e5545e9cc9abf0c"
+committed = "2026-08-30T18:26:54-04:00"
+
+[[twinless]]
+orphan    = "5bc1ee3fdf9b0ef2d1f61f5a60b0b957ff766aee"
+patch_id  = "37daa26e24a0c9556dca9a328e5545e9cc9abf0c"
+committed = "2026-08-30T18:26:54-04:00"
+
+[[twinless]]
+orphan    = "62b33179daf363a69042c7fa8c7caef4a0423b56"
+patch_id  = "f6ed42155099195918dda86a8f2bc6dc0c37c40f"
+committed = "2026-09-01T12:11:53-04:00"
+
+[[twinless]]
+orphan    = "689273f7fcf74a33ab1ae43b3182a49ccb545ed7"
+patch_id  = "48a5578d6421c5ae7a937583f98cfa7384e51504"
+committed = "2026-08-30T14:55:28-04:00"
+
+[[twinless]]
+orphan    = "689273f7fcf74a33ab1ae43b3182a49ccb545ed7"
+patch_id  = "48a5578d6421c5ae7a937583f98cfa7384e51504"
+committed = "2026-08-30T14:55:28-04:00"
+
+[[twinless]]
+orphan    = "6a3b173d62d97964327548c2cae8550ae65f0194"
+patch_id  = "cd9cea3b5b78d6f4ca1131a5ee1a6b016e9ed9d1"
+committed = "2026-08-30T11:53:20-04:00"
+
+[[twinless]]
+orphan    = "6a3b173d62d97964327548c2cae8550ae65f0194"
+patch_id  = "cd9cea3b5b78d6f4ca1131a5ee1a6b016e9ed9d1"
+committed = "2026-08-30T11:53:20-04:00"
+
+[[twinless]]
+orphan    = "71cfc3a8f33d8793b729a59a42cdb292c211c102"
+patch_id  = "f4cf68b0746a400e0724ee7e89073cc7890f1d6f"
+committed = "2026-08-30T08:47:24-04:00"
+
+[[twinless]]
+orphan    = "7273e292c81ec88389578c3c2c03ee7065616c9c"
+patch_id  = "e69710ea780e7ac8bf6a25c57cd3df247cb57fcc"
+committed = "2026-08-30T03:56:15-04:00"
+
+[[twinless]]
+orphan    = "7273e292c81ec88389578c3c2c03ee7065616c9c"
+patch_id  = "e69710ea780e7ac8bf6a25c57cd3df247cb57fcc"
+committed = "2026-08-30T03:56:15-04:00"
+
+[[twinless]]
+orphan    = "751afd929105c27b49ecf73738fff9e01427fae5"
+patch_id  = "520bc6109bbc64d619c2ed3d87287af7c57c3b0a"
+committed = "2026-08-30T08:09:03-04:00"
+
+[[twinless]]
+orphan    = "751afd929105c27b49ecf73738fff9e01427fae5"
+patch_id  = "520bc6109bbc64d619c2ed3d87287af7c57c3b0a"
+committed = "2026-08-30T08:09:03-04:00"
+
+[[twinless]]
+orphan    = "752bd12da61b8c09c62a3bd5477a5851eb6ebb47"
+patch_id  = "d97fada7a28ad722f8ac4a118f23e12d61d08a19"
+committed = "2026-08-30T16:58:48-04:00"
+
+[[twinless]]
+orphan    = "752bd12da61b8c09c62a3bd5477a5851eb6ebb47"
+patch_id  = "d97fada7a28ad722f8ac4a118f23e12d61d08a19"
+committed = "2026-08-30T16:58:48-04:00"
+
+[[twinless]]
+orphan    = "75ebfb6c8380cb8c41d0737c0cbd41264ccebf3e"
+patch_id  = "80f5693fe3834562b038b878b33ee1fddbe02bcb"
+committed = "2026-09-01T17:08:45-04:00"
+
+[[twinless]]
+orphan    = "76c0a162c04c2a20f0a9e544741bbdf8f29bd115"
+patch_id  = "d97fada7a28ad722f8ac4a118f23e12d61d08a19"
+committed = "2026-08-31T15:47:24-04:00"
+
+[[twinless]]
+orphan    = "8ae0e18b021c4bf1c84105022684a914dfd981ad"
+patch_id  = "266f08d94e8e3ede77b012a21de0d6727b47f82b"
+committed = "2026-09-01T05:18:32-04:00"
+
+[[twinless]]
+orphan    = "95c38a305bfb7803aa055ff32faa4d08c8cb6d21"
+patch_id  = "844aea594e487eb03af71b3c4a82db9a172527c8"
+committed = "2026-09-01T11:47:03-04:00"
+
+[[twinless]]
+orphan    = "960e293b3a16f7c804384593f633ff5298ef084d"
+patch_id  = "df3cc1a255b5850d9cf26092f8ac22a98ebe0b24"
+committed = "2026-08-30T14:48:05-04:00"
+
+[[twinless]]
+orphan    = "960e293b3a16f7c804384593f633ff5298ef084d"
+patch_id  = "df3cc1a255b5850d9cf26092f8ac22a98ebe0b24"
+committed = "2026-08-30T14:48:05-04:00"
+
+[[twinless]]
+orphan    = "a18144c6989d2d0387ecba7a303d35ccdbfdd75d"
+patch_id  = "4b168965485d1e728b50a317c346b493b976140a"
+committed = "2026-08-30T21:41:54-04:00"
+
+[[twinless]]
+orphan    = "a78e4bda72a41c9460ba2e281cb9560363e62152"
+patch_id  = "ed3822cda06ccadebbc5a9a8ee085a0ef426e86d"
+committed = "2026-08-30T18:05:54-04:00"
+
+[[twinless]]
+orphan    = "a78e4bda72a41c9460ba2e281cb9560363e62152"
+patch_id  = "ed3822cda06ccadebbc5a9a8ee085a0ef426e86d"
+committed = "2026-08-30T18:05:54-04:00"
+
+[[twinless]]
+orphan    = "a78e4bda72a41c9460ba2e281cb9560363e62152"
+patch_id  = "ed3822cda06ccadebbc5a9a8ee085a0ef426e86d"
+committed = "2026-08-30T18:05:54-04:00"
+
+[[twinless]]
+orphan    = "a8486f5be39ff4854f27794eeb08bb55d3f65317"
+patch_id  = "837bb9c135723f950266852c79feeac615297427"
+committed = "2026-08-30T03:50:49-04:00"
+
+[[twinless]]
+orphan    = "a8486f5be39ff4854f27794eeb08bb55d3f65317"
+patch_id  = "837bb9c135723f950266852c79feeac615297427"
+committed = "2026-08-30T03:50:49-04:00"
+
+[[twinless]]
+orphan    = "a87e919002357fcfca5e7bacbffef4d61e3a6694"
+patch_id  = "3764b9435e268ad5245a885998298d8fd9f0c2a5"
+committed = "2026-09-01T11:26:47-04:00"
+
+[[twinless]]
+orphan    = "a9639f42a79a22593fda9bc4442a3f2c6857ab18"
+patch_id  = "3a47c2b29c2ead4d690849968ee36c1d0c22f790"
+committed = "2026-08-31T18:29:51-04:00"
+
+[[twinless]]
+orphan    = "a9d1148c07681e741d4b8d4b1be85e97c501de8c"
+patch_id  = "63b08c2299ddade0aaa3caa6d84dbe5e90fb81fd"
+committed = "2026-08-30T06:51:07-04:00"
+
+[[twinless]]
+orphan    = "a9d1148c07681e741d4b8d4b1be85e97c501de8c"
+patch_id  = "63b08c2299ddade0aaa3caa6d84dbe5e90fb81fd"
+committed = "2026-08-30T06:51:07-04:00"
+
+[[twinless]]
+orphan    = "af008174531f3e4058fc0b8ed77234875d31e03d"
+patch_id  = "745810dbe6021a4c91a84ffb7595b8b7a561b90a"
+committed = "2026-08-30T16:57:04-04:00"
+
+[[twinless]]
+orphan    = "af008174531f3e4058fc0b8ed77234875d31e03d"
+patch_id  = "745810dbe6021a4c91a84ffb7595b8b7a561b90a"
+committed = "2026-08-30T16:57:04-04:00"
+
+[[twinless]]
+orphan    = "b20825b976f6f9e7b88b6472985f601d7efaf8db"
+patch_id  = "44edbf1a9e376b7752f55544446a61392feb3f39"
+committed = "2026-09-01T08:11:01-04:00"
+
+[[twinless]]
+orphan    = "b2fb61692796221229da86f2ffe36c26d9be64b6"
+patch_id  = "7057878bb76d258895b2d442938cbe208a2ee1cd"
+committed = "2026-08-30T15:50:45-04:00"
+
+[[twinless]]
+orphan    = "b2fb61692796221229da86f2ffe36c26d9be64b6"
+patch_id  = "7057878bb76d258895b2d442938cbe208a2ee1cd"
+committed = "2026-08-30T15:50:45-04:00"
+
+[[twinless]]
+orphan    = "bc632442c643b722d6975599a2d42dd3a9d8e3a7"
+patch_id  = "d19e4296fe562c27b135bd09bb6c7ec32725cc48"
+committed = "2026-08-30T03:54:44-04:00"
+
+[[twinless]]
+orphan    = "cbf6a1a461fa1147777ca365c5f792a98b1852a9"
+patch_id  = "b4b0c1a69cad79552bdb089ef94a32e7c65b1c0a"
+committed = "2026-08-31T00:39:35-04:00"
+
+[[twinless]]
+orphan    = "cbf6a1a461fa1147777ca365c5f792a98b1852a9"
+patch_id  = "b4b0c1a69cad79552bdb089ef94a32e7c65b1c0a"
+committed = "2026-08-31T00:39:35-04:00"
+
+[[twinless]]
+orphan    = "cccb6003f37f3d55e6e8539976d33cdd3790c42f"
+patch_id  = "7785fbac0825c3d778b2cb28735e4be130a0eca3"
+committed = "2026-09-01T11:19:52-04:00"
+
+[[twinless]]
+orphan    = "d1d1db6acc8714bbe3f07c7e6b14898fd82be1a1"
+patch_id  = "d65b2e04ab7b8f42f32adbf3262c5055dfc646d4"
+committed = "2026-08-30T06:11:56-04:00"
+
+[[twinless]]
+orphan    = "db69a72014753ca725bf5fff7d54e0c11113fe04"
+patch_id  = "cbde0e7fea5b024a8341398c7255fad0fe3566cc"
+committed = "2026-08-31T15:47:28-04:00"
+
+[[twinless]]
+orphan    = "dda10b9a0147e1a3e1af6af50cbb26f36391e0f9"
+patch_id  = "76f3889600cfd4d0a967b03284f43c3729fd8f9e"
+committed = "2026-08-30T18:21:26-04:00"
+
+[[twinless]]
+orphan    = "dda10b9a0147e1a3e1af6af50cbb26f36391e0f9"
+patch_id  = "76f3889600cfd4d0a967b03284f43c3729fd8f9e"
+committed = "2026-08-30T18:21:26-04:00"
+
+[[twinless]]
+orphan    = "e23982b81ff049189abc2349398c6b7a5afcfca4"
+patch_id  = "d410d1094045762f7f62c9dcdae0d96b06d9669b"
+committed = "2026-08-24T14:22:55-04:00"
+
+[[twinless]]
+orphan    = "eb545ee2f19750a1e81e7708e21686c421e2607d"
+patch_id  = "11ab567683313903e85fc8a4a3bb34a0f6e0cd2d"
+committed = "2026-08-30T18:41:33-04:00"
+
+[[twinless]]
+orphan    = "eb545ee2f19750a1e81e7708e21686c421e2607d"
+patch_id  = "11ab567683313903e85fc8a4a3bb34a0f6e0cd2d"
+committed = "2026-08-30T18:41:33-04:00"
+
+[[twinless]]
+orphan    = "eb545ee2f19750a1e81e7708e21686c421e2607d"
+patch_id  = "11ab567683313903e85fc8a4a3bb34a0f6e0cd2d"
+committed = "2026-08-30T18:41:33-04:00"
+
+[[twinless]]
+orphan    = "ed0605800dcb161115047cbb218ae058f8a6973b"
+patch_id  = "4ab0915137256f225ccdcb0743f1aefe9f4506c7"
+committed = "2026-09-01T17:06:56-04:00"
+
+[[twinless]]
+orphan    = "ef2cc1c0835492ad9e9654608363fc500de99281"
+patch_id  = "49628c8c5998e67d7ac148e5dc11756550f7d3e7"
+committed = "2026-08-30T08:15:23-04:00"
+
+[[twinless]]
+orphan    = "efc3cc196a855c59e2d470979a510e6069b429cb"
+patch_id  = "91852ad4e2863a4e2aba75deaf9d51c45ca7fd60"
+committed = "2026-09-01T11:51:26-04:00"
+
+[[twinless]]
+orphan    = "f02742abb42e9df8120b77e0a1e7f047e9bef247"
+patch_id  = "dce2551d418fdc83302219cbf0e493471745fc43"
+committed = "2026-09-01T15:01:17-04:00"
+
+[[twinless]]
+orphan    = "f303ac8b44cadb2352e2761c8c70779e5554d1d2"
+patch_id  = "5ab01152a3a7dfe888abbec05d0db37a285c5685"
+committed = "2026-08-30T23:28:51-04:00"
+
+[[twinless]]
+orphan    = "f303ac8b44cadb2352e2761c8c70779e5554d1d2"
+patch_id  = "5ab01152a3a7dfe888abbec05d0db37a285c5685"
+committed = "2026-08-30T23:28:51-04:00"
+
+[[twinless]]
+orphan    = "f334ea2c9002c00fdbaea7940379a0969f3ab192"
+patch_id  = "ecb4ccada8357047a388904de7fe13cf8a86682b"
+committed = "2026-09-01T11:02:46-04:00"
+
+[[twinless]]
+orphan    = "f62b8730ed7e72ed8da7fb20f8c72e50ebeee95b"
+patch_id  = "4c1aea95907bb048ae413c9e1931fee36abf50d2"
+committed = "2026-08-24T23:31:03-04:00"
+
+[[twinless]]
+orphan    = "f91ed0c8dab09cb98040aa3ac5a1d9dd622e2e51"
+patch_id  = "524a390f364cc3c98dc4b1330cd37b7ec5829a06"
+committed = "2026-08-30T15:43:41-04:00"
+
+[[twinless]]
+orphan    = "ff4ecfc5308be17aae88a1099adf79828520f1ce"
+patch_id  = "d40aab8ee36f9d43c99e8967cecb2f0dc1bfe4a5"
+committed = "2026-09-01T19:59:14-04:00"
+
+[[twinless]]
+orphan    = "ff8926bb3b19d0caf83d795f90e9af87be713d34"
+patch_id  = "86ac86d7c5bfa1869e7ad17bb7bc81de967d3fc7"
+committed = "2026-08-30T18:13:20-04:00"
+
+[[twinless]]
+orphan    = "ff8926bb3b19d0caf83d795f90e9af87be713d34"
+patch_id  = "86ac86d7c5bfa1869e7ad17bb7bc81de967d3fc7"
+committed = "2026-08-30T18:13:20-04:00"
