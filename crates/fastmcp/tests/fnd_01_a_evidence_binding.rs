@@ -1099,6 +1099,51 @@ fn parse_declared_tuple_rows(source: &str, name: &str) -> Vec<Vec<String>> {
     rows
 }
 
+/// Refuses to validate a table the verifier no longer uses.
+///
+/// THE FALSE-PASS INPUT THIS CLOSES. Everything below reads the two constants
+/// out of the frozen verifier's TEXT. That binds the check to a DECLARATION,
+/// and a declaration can outlive its use: rewire the verifier to a different
+/// table, leave these constants in place, and the parse still succeeds, the
+/// git comparisons still pass, and every test here reports GREEN while the
+/// table actually in force goes unchecked. Measured by simulating exactly that
+/// rewire on the real source — the declarations survive and the count of live
+/// call sites drops from 2 to 0.
+///
+/// So liveness is asserted rather than assumed: at least one call to the pure
+/// checker must consume BOTH constants. This cannot prove the verifier is
+/// correct, only that the table under test is the table being used.
+fn assert_workspace_input_tables_are_live(source: &str) {
+    const CALL: &str = "fnd_01_check_workspace_input_anchoring(";
+    const WINDOW: usize = 260;
+
+    let mut live = 0usize;
+    let mut cursor = 0usize;
+    while let Some(found) = source[cursor..].find(CALL) {
+        let at = cursor + found;
+        let mut end = (at + WINDOW).min(source.len());
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        let window = &source[at..end];
+        if window.contains("TOOLCHAIN_WORKSPACE_INPUTS")
+            && window.contains("TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE")
+        {
+            live += 1;
+        }
+        cursor = at + CALL.len();
+    }
+
+    assert!(
+        live > 0,
+        "no call to fnd_01_check_workspace_input_anchoring consumes both \
+         TOOLCHAIN_WORKSPACE_INPUTS and TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE. The constants \
+         are still DECLARED, so every check in this file would parse them and pass — while \
+         the table the verifier actually uses goes unexamined. A declaration that outlives \
+         its use is exactly the false premise this bead exists to refuse."
+    );
+}
+
 /// Joins the binding table to the provenance table by path.
 ///
 /// The two tables are declared separately and the pure checker already proves
@@ -1108,6 +1153,8 @@ fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
     let source =
         fs::read_to_string(workspace_root().join(WORKSPACE_INPUT_DECLARATION_SOURCE))
             .expect("the FND-01 verifier source is readable");
+
+    assert_workspace_input_tables_are_live(&source);
 
     let bindings = parse_declared_tuple_rows(&source, "TOOLCHAIN_WORKSPACE_INPUTS");
     let provenance = parse_declared_tuple_rows(&source, "TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE");
