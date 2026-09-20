@@ -233,7 +233,7 @@ impl ClientCredentialsCatalogClient {
                                 let Some(local_cancel) = signal.begin(revision)? else { continue };
                                 let generation = self.fences()?.begin_fetch(&kind.result_set());
                                 attempts += 1;
-                                let result = self.collect_with_cancellation(
+                                let result = Box::pin(self.collect_with_cancellation(
                                     cx, &local_cancel, request.clone(),
                                     || {
                                         check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
@@ -249,7 +249,7 @@ impl ClientCredentialsCatalogClient {
                                         check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                         if continuing { Ok(()) } else { Err(ManagedCatalogError::AbortedByHost.into()) }
                                     },
-                                ).await;
+                                )).await;
                                 signal.finish()?;
                                 check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                 if observer.stopped.load(Ordering::Acquire) { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
@@ -279,7 +279,7 @@ impl ClientCredentialsCatalogClient {
                                 if !continuing { return Ok(ClientCredentialsCatalogWatchOutcome::StoppedByHost); }
                             }
                         };
-                        monitor_first(monitor, reconcile).await
+                        Box::pin(monitor_first(monitor, reconcile)).await
                     }.await)
                 }).await?
             }.await)
