@@ -179,9 +179,9 @@ fn run_catalog(case: CatalogCase) {
                     let original = result.unwrap();
                     assert_complete(&original, method);
                     if matches!(case, CatalogCase::CacheHit) {
-                        let cached = client.clone().collect(&cx, catalog_request(method),
+                        let cached = Box::pin(client.clone().collect(&cx, catalog_request(method),
                             || panic!("cache hits must not allocate RPC IDs"), |_| panic!("cached results must not invent notifications"),
-                        ).await.unwrap();
+                        )).await.unwrap();
                         for (first, next) in original.pages().iter().zip(cached.pages()) { assert_eq!(first.encode().unwrap(), next.encode().unwrap()); }
                         assert_complete(&cached, method);
                         assert_eq!(client.cache_stats().unwrap().hits, 2);
@@ -319,9 +319,9 @@ fn run_catalog(case: CatalogCase) {
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
                 CatalogCase::Preflight => {
-                    assert!(matches!(client.collect(&cx, core("tools/call", false), || panic!("no ID before method admission"), |_| Ok(())).await, Err(ManagedCatalogError::NotCatalog)));
+                    assert!(matches!(Box::pin(client.collect(&cx, core("tools/call", false), || panic!("no ID before method admission"), |_| Ok(()))).await, Err(ManagedCatalogError::NotCatalog)));
                     cancellation.cancel();
-                    assert!(matches!(client.collect_with_cancellation(&cx, &cancellation, catalog_request(method), || panic!("no ID after cancellation"), |_| Ok(())).await, Err(ManagedCatalogError::Core(ManagedCoreError::Cancelled))));
+                    assert!(matches!(Box::pin(client.collect_with_cancellation(&cx, &cancellation, catalog_request(method), || panic!("no ID after cancellation"), |_| Ok(()))).await, Err(ManagedCatalogError::Core(ManagedCoreError::Cancelled))));
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
                 }
                 CatalogCase::Renewal => {
@@ -332,13 +332,13 @@ fn run_catalog(case: CatalogCase) {
                         pages(&peer, method, 51, 60000, "private").await;
                     });
                     let application = Box::pin(async {
-                        let result = client.collect(&cx, catalog_request(method), || {
+                        let result = Box::pin(client.collect(&cx, catalog_request(method), || {
                             if first.get() == 42 { std::thread::sleep(Duration::from_millis(2100)); }
                             next_id(&first)
-                        }, |_| Ok(())).await;
+                        }, |_| Ok(()))).await;
                         assert!(matches!(result, Err(ManagedCatalogError::CredentialChanged)));
                         first.set(51);
-                        let fresh = client.collect(&cx, catalog_request(method), || next_id(&first), |_| Ok(())).await.unwrap();
+                        let fresh = Box::pin(client.collect(&cx, catalog_request(method), || next_id(&first), |_| Ok(()))).await.unwrap();
                         assert_complete(&fresh, method);
                         assert_eq!(fresh.credential_generation(), 2);
                         assert_eq!(client.cache_stats().unwrap().fills, 3);
@@ -352,13 +352,13 @@ fn run_catalog(case: CatalogCase) {
                         &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
                     ))).await;
                     assert_complete(&result.unwrap(), method);
-                    let cached = client.collect(&cx, catalog_request(method), || panic!("warm pages need no POST"), |_| Ok(())).await.unwrap();
+                    let cached = Box::pin(client.collect(&cx, catalog_request(method), || panic!("warm pages need no POST"), |_| Ok(()))).await.unwrap();
                     assert_complete(&cached, method);
                     let before = client.cache_stats().unwrap();
                     assert_eq!(before.hits, 2);
                     let credential = session.credential(&cx).await.unwrap();
                     credential.credential().revoke();
-                    let result = client.collect(&cx, catalog_request(method), || panic!("revoked cache access must not attempt a POST"), |_| Ok(())).await;
+                    let result = Box::pin(client.collect(&cx, catalog_request(method), || panic!("revoked cache access must not attempt a POST"), |_| Ok(()))).await;
                     // Acquisition refuses an already-revoked login before the
                     // collector receives a snapshot or touches its cache.
                     assert!(matches!(result, Err(ManagedCatalogError::Core(
@@ -370,12 +370,12 @@ fn run_catalog(case: CatalogCase) {
                 CatalogCase::RevokeBeforePost | CatalogCase::ClearBeforePost => {
                     let credential = session.credential(&cx).await.unwrap();
                     let ids = Cell::new(0);
-                    let result = client.collect(&cx, catalog_request(method), || {
+                    let result = Box::pin(client.collect(&cx, catalog_request(method), || {
                         ids.set(ids.get() + 1);
                         if matches!(case, CatalogCase::RevokeBeforePost) { credential.credential().revoke(); }
                         else { client.clone().clear().unwrap(); }
                         Ok(RequestId::Number(41))
-                    }, |_| panic!("no peer event before dispatch")).await;
+                    }, |_| panic!("no peer event before dispatch"))).await;
                     if matches!(case, CatalogCase::RevokeBeforePost) {
                         assert!(matches!(result, Err(ManagedCatalogError::CredentialRevoked)));
                     } else {
