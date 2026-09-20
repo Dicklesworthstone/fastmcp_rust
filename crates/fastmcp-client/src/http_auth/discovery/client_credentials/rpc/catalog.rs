@@ -187,7 +187,7 @@ impl ClientCredentialsCatalogClient {
         let mut state = Traversal::new(list_params(&request)?.cursor.as_deref(), self.limits)?;
         let generation = self.fences()?.begin_fetch(&kind.result_set());
         let owner = &self.client.inner.closed;
-        active(cx, deadline, owner, cancellation, None, async {
+        Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let mut pinned: Option<ClientCredentialsSnapshot> = None;
                 let mut pages = Vec::new();
@@ -254,7 +254,7 @@ impl ClientCredentialsCatalogClient {
                     kind, pages, item_count: state.items, credential_generation: pinned.generation(),
                 })
             }.await)
-        }).await?
+        })).await?
     }
 
     fn fences(&self) -> Result<MutexGuard<'_, FinalResultCache>, ClientCredentialsCatalogError> {
