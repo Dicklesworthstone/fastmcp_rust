@@ -105,11 +105,11 @@ fn watched_task_public_precancellation_never_enters_host_callbacks() {
         let client=consumer();
         let cancellation=McpRequestCancellation::new();
         cancellation.cancel();
-        let result=client.drive_task_watching_with_cancellation(&cx,&cancellation,TaskId::parse("one").unwrap(),
+        let result=Box::pin(client.drive_task_watching_with_cancellation(&cx,&cancellation,TaskId::parse("one").unwrap(),
             "drive".to_owned(),ClientCredentialsTaskWatchDrivePolicy::default(),
             |_| { panic!("cancelled run must not resolve input"); #[allow(unreachable_code)]
                 std::future::ready(Ok(ManagedTaskInputAction::ReturnToCaller)) },
-            |_| panic!("cancelled run must not observe snapshots")).await;
+            |_| panic!("cancelled run must not observe snapshots"))).await;
         assert!(matches!(result,Err(ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Task(
             ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(_)))))));
         assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
