@@ -65339,11 +65339,36 @@ fn fallible(value: Option<u8>) {
     /// item per platform and the declared-vs-discovered arithmetic carried a
     /// paired-duplicate exception. Both bodies are preserved VERBATIM.
     ///
-    /// STRUCTURAL REPAIR ONLY, NOT A COVERAGE ONE. The not(linux) branch still
-    /// does not execute on a linux-x86_64 host; the refusal path it asserts is
-    /// compiled but dead there because `ordinary_platform_is_qualified()` is
-    /// `cfg!(..)`, a compile-time literal with no seam. Closing that is
-    /// bd-n1dp1 Proposal 2 and is not done here.
+    /// PROPOSAL 2 IS DONE. The seam exists and both branches use it:
+    /// `ordinary_reprobe_tool_set_shared_on` takes `qualified: bool` and
+    /// refuses when it is false; `ordinary_reprobe_tool_set_shared` is the
+    /// real entrypoint and supplies
+    /// `ordinary_platform_is_qualified()`. The linux branch below calls the
+    /// `_on` form with an INJECTED verdict, so the refusal WIRING is exercised
+    /// on the fleet instead of nowhere; the not(linux) branch calls the REAL
+    /// entrypoint, so it senses the platform for real.
+    ///
+    /// `ordinary_platform_is_qualified()` is NOT `cfg!(..)` -- it is
+    /// `ordinary_platform_is_qualified_for(std::env::consts::OS, ARCH)`.
+    /// Those are `&'static str` consts for the target, so it folds to `true`
+    /// on a qualified host exactly as a `cfg!` would, but the seam is real:
+    /// `_for(os, arch)` accepts any platform and `_on(.., qualified)` accepts
+    /// any verdict.
+    ///
+    /// Symbols above are named, NOT cited by line number, deliberately: a line
+    /// reference in a doc comment goes stale on the next edit above it, which
+    /// is the same rot this comment was rewritten to remove.
+    ///
+    /// RESIDUAL, AND IT IS ABOUT COVERAGE, NOT WIRING. On a linux-x86_64 host
+    /// the predicate's false path is never reached with REAL inputs -- only by
+    /// injection (`_on`) and by literal arguments (`_for("windows", ..)`).
+    /// Detection-plus-wiring together was measured once, off-lane, by executing
+    /// this test on Darwin arm64 (MagentaSummit, bd-n1dp1 comment 3490:
+    /// compiles, runs, 1 passed). NOTHING IN THE FLEET REPEATS THAT -- every
+    /// campaign worker is linux-x86_64 -- so a regression in the not(linux)
+    /// branch would be caught only by someone repeating that run by hand.
+    /// Continuous coverage needs a non-linux runner, which is a scheduling
+    /// decision above this test.
     #[test]
     fn ordinary_b_r3_live_matrix() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
