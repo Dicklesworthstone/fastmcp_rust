@@ -234,15 +234,15 @@ fn machine_resource_watch_aborted_opening_fences_preexisting_cache() {
         let request = ordinary();
         prime(&client, &request, complete(&request, 60000, "public"));
         let calls = Cell::new(0);
-        let result = client.watch(&cx, request.clone(), ClientCredentialsResourceWatchLimits::default(), || {
+        let result = Box::pin(client.watch(&cx, request.clone(), ClientCredentialsResourceWatchLimits::default(), || {
             calls.set(calls.get() + 1);
             Err(ManagedResourceError::AbortedByHost.into())
-        }, |_| panic!("failed opening cannot emit watch events")).await;
+        }, |_| panic!("failed opening cannot emit watch events"))).await;
         assert!(matches!(result, Err(ClientCredentialsResourceWatchError::Resource(
             ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost)))));
         assert_eq!(calls.get(), 1);
         assert!(!client.client.inner.closed.is_cancel_requested());
-        let result = client.read(&cx, request, || Err(ManagedResourceError::AbortedByHost.into()), |_| Ok(())).await;
+        let result = Box::pin(client.read(&cx, request, || Err(ManagedResourceError::AbortedByHost.into()), |_| Ok(()))).await;
         assert!(matches!(result, Err(ClientCredentialsResourceError::Resource(ManagedResourceError::AbortedByHost))));
     });
 }
@@ -253,11 +253,11 @@ fn machine_resource_watch_id_callback_cancellation_prevents_listen_dispatch() {
         let cx = Cx::current().unwrap();
         let client = consumer(ClientCredentialsResourceLimits::default());
         let cancellation = McpRequestCancellation::new();
-        let result = client.watch_with_cancellation(&cx, &cancellation, ordinary(),
+        let result = Box::pin(client.watch_with_cancellation(&cx, &cancellation, ordinary(),
             ClientCredentialsResourceWatchLimits::default(), || {
                 cancellation.cancel();
                 Ok((RequestId::Number(1), RequestId::Number(2)))
-            }, |_| panic!("cancelled opening cannot emit watch events")).await;
+            }, |_| panic!("cancelled opening cannot emit watch events"))).await;
         assert!(result.is_err());
         assert!(!client.client.inner.closed.is_cancel_requested());
     });
