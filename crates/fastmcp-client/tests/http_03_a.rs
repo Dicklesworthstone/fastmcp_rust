@@ -3183,7 +3183,9 @@ async fn drain_sse(
     sse_limits: SseLimits,
 ) -> Result<Vec<String>, ModernHttpExecutorError> {
     let chunk_bytes = body.len().max(1);
-    drain_sse_in_chunks(cx, peer, body, sse_limits, chunk_bytes).await
+    // Boxed inside the helper, not at its 26 call sites: shrinking drain_sse's own
+    // future below the threshold clears the callers with it.
+    Box::pin(drain_sse_in_chunks(cx, peer, body, sse_limits, chunk_bytes)).await
 }
 
 /// Delivers one SSE body as exactly two chunks with the boundary at `split`.
