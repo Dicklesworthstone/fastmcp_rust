@@ -146,8 +146,8 @@ fn run_machine(case: MachineCase) {
             let limits = ManagedInteractionLimits::new(
                 ManagedCoreLimits::new(4096, 4096, 16384, 4, Duration::from_secs(15)).unwrap(), 2, 2).unwrap();
             let server = async { grant(&peer).await; round(&peer, 60, TWO).await };
-            let (wire, operation) = pair(server, client.start_core_interaction(&cx, request,
-                RequestId::Number(60), RequestId::Number(61), limits)).await;
+            let (wire, operation) = Box::pin(pair(server, client.start_core_interaction(&cx, request,
+                RequestId::Number(60), RequestId::Number(61), limits))).await;
             assert_eq!(wire["params"], original);
             let mut operation = operation.unwrap();
             challenge(&mut operation, &cx).await;
@@ -155,22 +155,22 @@ fn run_machine(case: MachineCase) {
                 MachineCase::Manual(_) => {
                     // Reused discovery ID, wrong key, and strict-subset refusal
                     // cannot perform even a fresh discovery POST.
-                    assert!(matches!(operation.resume_partial(&cx, RequestId::Number(60), RequestId::Number(63), answers("one")).await,
+                    assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(60), RequestId::Number(63), answers("one"))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::RepeatedRequestId))));
-                    assert!(matches!(operation.resume_partial(&cx, RequestId::Number(62), RequestId::Number(63), answers("foreign")).await,
+                    assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(62), RequestId::Number(63), answers("foreign"))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
-                    assert!(matches!(operation.resume(&cx, RequestId::Number(62), RequestId::Number(63), Some(answers("one"))).await,
+                    assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(62), RequestId::Number(63), Some(answers("one")))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
                     peer.quiet();
-                    let (wire, result) = pair(round(&peer, 62, REST), operation.resume_partial(
-                        &cx, RequestId::Number(62), RequestId::Number(63), answers("one"))).await;
+                    let (wire, result) = Box::pin(pair(round(&peer, 62, REST), operation.resume_partial(
+                        &cx, RequestId::Number(62), RequestId::Number(63), answers("one")))).await;
                     result.unwrap();
                     assert_wire(&wire, &original, "one", "machine-first");
                     challenge(&mut operation, &cx).await;
-                    assert!(matches!(operation.resume_partial(&cx, RequestId::Number(64), RequestId::Number(65), answers("one")).await,
+                    assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(64), RequestId::Number(65), answers("one"))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
-                    let (wire, result) = pair(round(&peer, 64, complete(method)), operation.resume_partial(
-                        &cx, RequestId::Number(64), RequestId::Number(65), answers("two"))).await;
+                    let (wire, result) = Box::pin(pair(round(&peer, 64, complete(method)), operation.resume_partial(
+                        &cx, RequestId::Number(64), RequestId::Number(65), answers("two")))).await;
                     result.unwrap();
                     assert_wire(&wire, &original, "two", "machine-next");
                     complete_machine(&mut operation, &cx).await;
@@ -192,31 +192,31 @@ fn run_machine(case: MachineCase) {
                             input_responses:Some(answers(if round == 0 {"one"} else {"two"})),
                         }))
                     }, |_| Ok(()));
-                    let ((), result) = pair(server, driver).await;
+                    let ((), result) = Box::pin(pair(server, driver)).await;
                     assert!(result.unwrap().encode().unwrap().contains("1.20e+4"));
                     assert_eq!(calls.get(), 2);
                     6
                 }
                 MachineCase::OwnerClose => {
                     let calls = Cell::new(0);
-                    let result = operation.drive_partial(&cx, |_| {
+                    let result = Box::pin(operation.drive_partial(&cx, |_| {
                         calls.set(calls.get()+1); client.close();
                         std::future::ready(Ok(ClientCredentialsInputReply {
                             discovery_id:RequestId::Number(62), request_id:RequestId::Number(63),
                             input_responses:Some(answers("one")),
                         }))
-                    }, |_| Ok(())).await;
+                    }, |_| Ok(()))).await;
                     assert!(result.is_err()); assert_eq!(calls.get(),1);
                     2
                 }
                 MachineCase::DiscoveryRefusal => {
                     let denied = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}"#;
-                    let (wire, result) = pair(peer.response(62, denied), operation.resume_partial(
-                        &cx, RequestId::Number(62), RequestId::Number(63), answers("one"))).await;
+                    let (wire, result) = Box::pin(pair(peer.response(62, denied), operation.resume_partial(
+                        &cx, RequestId::Number(62), RequestId::Number(63), answers("one")))).await;
                     assert_eq!(wire["method"], "server/discover");
                     assert!(result.is_err()); assert!(operation.pending_input().is_none());
                     assert_eq!(operation.continuation_count(),1);
-                    assert!(matches!(operation.resume_partial(&cx, RequestId::Number(64), RequestId::Number(65), answers("one")).await,
+                    assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(64), RequestId::Number(65), answers("one"))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::Closed))));
                     3
                 }
@@ -226,7 +226,7 @@ fn run_machine(case: MachineCase) {
             peer.quiet();
             client.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await.unwrap();
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await.unwrap();
     });
 }
 
