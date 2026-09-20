@@ -56343,6 +56343,17 @@ original = "value"
             // two, and an allowlist entry wider than its use is a permission
             // nobody is checking.
             | "crates/fastmcp-client/src/http_auth/discovery/client_credentials/private_key_jwt.rs"
+            // The Linux capability-relative credential blob store draws its atomic
+            // temp-file discriminator THROUGH the sealed API and contains ZERO
+            // `getrandom` references -- structurally identical to the private_key_jwt
+            // admission directly above, on the same stated test. Added by fa5539f8
+            // (2026-09-18), which regressed a check that had passed at cb2c30eb.
+            // Narrow single-API form for the same reason given above: it needs one
+            // draw, and an entry wider than its use is a permission nobody checks.
+            // NOTE the file is `#[cfg(target_os = "linux")]` (http_auth.rs:40), so
+            // this violation is invisible to every non-Linux analysis -- it can only
+            // ever be caught by a Linux run, which is why it survived from 09-18.
+            | "crates/fastmcp-client/src/http_auth/secure_file.rs"
             | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
             "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
             _ => false,
