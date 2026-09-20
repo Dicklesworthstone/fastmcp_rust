@@ -273,7 +273,7 @@ fn run_case(case: Case) {
             let ids: Vec<TaskId> = serde_json::from_value(selected.clone()).unwrap();
             if matches!(case, Case::Precancel) {
                 cancellation.cancel();
-                assert!(matches!(client.watch_tasks_with_cancellation(&cx, &cancellation, ids, "watch".to_owned(), policy).await,
+                assert!(matches!(Box::pin(client.watch_tasks_with_cancellation(&cx, &cancellation, ids, "watch".to_owned(), policy)).await,
                     Err(ManagedTaskWatchError::Session(OAuthSessionError::Cancelled))));
                 peer.no_extra_request();
                 assert_eq!(peer.discoveries.load(Ordering::SeqCst), 0);
@@ -310,20 +310,20 @@ fn run_case(case: Case) {
                 assert_closed(&mut stream).await;
             });
             let application = Box::pin(async {
-                let result = client.watch_tasks_with_cancellation(&cx, &cancellation, ids, "watch".to_owned(), policy).await;
+                let result = Box::pin(client.watch_tasks_with_cancellation(&cx, &cancellation, ids, "watch".to_owned(), policy)).await;
                 if matches!(case, Case::PartialAck) {
                     assert!(matches!(result, Err(ManagedTaskWatchError::IncompleteAcknowledgement)));
                     return;
                 }
                 let mut watch = result.unwrap();
-                let first = watch.next_snapshot(&cx).await;
+                let first = Box::pin(watch.next_snapshot(&cx)).await;
                 if matches!(case, Case::WrongResponse | Case::WrongTask) {
                     match case {
                         Case::WrongResponse => assert!(matches!(first, Err(ManagedTaskWatchError::Task(ManagedTasksError::ResponseIdMismatch)))),
                         _ => assert!(matches!(first, Err(ManagedTaskWatchError::Task(ManagedTasksError::TaskIdMismatch)))),
                     }
                     assert_eq!(watch.remaining_tasks(), 1);
-                    assert!(matches!(watch.next_snapshot(&cx).await, Err(ManagedTaskWatchError::Closed)));
+                    assert!(matches!(Box::pin(watch.next_snapshot(&cx)).await, Err(ManagedTaskWatchError::Closed)));
                     return;
                 }
                 let first = first.unwrap().unwrap();
@@ -332,12 +332,12 @@ fn run_case(case: Case) {
                 if matches!(case, Case::CompletionRace) {
                     assert!(matches!(*first.task, Task::Cancelled(_)));
                     assert_eq!(watch.remaining_tasks(), 0);
-                    assert!(watch.next_snapshot(&cx).await.unwrap().is_none());
+                    assert!(Box::pin(watch.next_snapshot(&cx)).await.unwrap().is_none());
                     return;
                 }
                 assert!(matches!(*first.task, Task::Working(_)));
                 if matches!(case, Case::Multi) {
-                    let second = watch.next_snapshot(&cx).await.unwrap().unwrap();
+                    let second = Box::pin(watch.next_snapshot(&cx)).await.unwrap().unwrap();
                     assert_eq!(second.cause, ManagedTaskSnapshotCause::Initial);
                     assert_eq!(second.task.base().task_id, TaskId::parse("two").unwrap());
                     assert!(matches!(*second.task, Task::Cancelled(_)));
@@ -364,7 +364,7 @@ fn run_case(case: Case) {
                             assert_eq!(last.task.base().task_id, TaskId::parse("one").unwrap());
                             assert!(matches!(*last.task, Task::Cancelled(_)));
                             assert_eq!(watch.remaining_tasks(), 0);
-                            assert!(watch.next_snapshot(&cx).await.unwrap().is_none());
+                            assert!(Box::pin(watch.next_snapshot(&cx)).await.unwrap().is_none());
                         }
                         Case::SnapshotLimit => assert!(matches!(result, Err(ManagedTaskWatchError::SnapshotLimit))),
                         Case::Interrupted => assert!(matches!(result, Err(ManagedTaskWatchError::Interrupted))),
@@ -375,7 +375,7 @@ fn run_case(case: Case) {
                 }
                 if !matches!(case, Case::Multi) {
                     assert_eq!(watch.remaining_tasks(), 1);
-                    assert!(matches!(watch.next_snapshot(&cx).await, Err(ManagedTaskWatchError::Closed)));
+                    assert!(matches!(Box::pin(watch.next_snapshot(&cx)).await, Err(ManagedTaskWatchError::Closed)));
                 }
                 assert!(cx.checkpoint().is_ok(), "the watch cannot cancel its caller's context");
                 if !matches!(case, Case::SessionClose) {
