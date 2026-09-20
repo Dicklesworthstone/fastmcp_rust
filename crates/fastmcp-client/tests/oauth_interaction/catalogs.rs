@@ -78,10 +78,10 @@ async fn pages(peer: &Peer, method: &str, first: i64, ttl: u64, scope: &str) {
     serve_page(peer, method, first + 1, Some(""), &page(method, "two", None, ttl, scope)).await;
 }
 
-fn next_id(counter: &Cell<i64>) -> Result<RequestId, ManagedCatalogError> {
+fn next_id(counter: &Cell<i64>) -> RequestId {
     let next = counter.get();
     counter.set(next + 1);
-    Ok(RequestId::Number(next))
+    RequestId::Number(next)
 }
 
 fn assert_complete(result: &CollectedCatalog, method: &str) {
@@ -165,7 +165,7 @@ fn run_catalog(case: CatalogCase) {
                     for (index, method) in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"].into_iter().enumerate() {
                         let id = 41 + index as i64 * 2;
                         let ((), result) = pair(Box::pin(pages(&peer, method, id, 60000, "private")), Box::pin(client.collect(
-                            &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                            &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                         ))).await;
                         assert_complete(&result.unwrap(), method);
                     }
@@ -174,7 +174,7 @@ fn run_catalog(case: CatalogCase) {
                 CatalogCase::CacheHit | CatalogCase::Clear | CatalogCase::ExternalInvalidation | CatalogCase::Metadata | CatalogCase::ZeroTtl => {
                     let ttl = if matches!(case, CatalogCase::ZeroTtl) { 0 } else { 60000 };
                     let ((), result) = pair(Box::pin(pages(&peer, method, 41, ttl, "public")), Box::pin(client.collect(
-                        &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                     ))).await;
                     let original = result.unwrap();
                     assert_complete(&original, method);
@@ -190,13 +190,13 @@ fn run_catalog(case: CatalogCase) {
                         // constructed client using the same login/resource.
                         let isolated = ManagedCatalogClient::new(session.clone(), limits).with_cache_limits(16, 1048576).unwrap();
                         let ((), fresh) = pair(Box::pin(pages(&peer, method, 43, 60000, "public")), Box::pin(isolated.collect(
-                            &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                            &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                         ))).await;
                         assert_complete(&fresh.unwrap(), method);
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
                     } else if matches!(case, CatalogCase::ZeroTtl) {
                         let ((), repeated) = pair(Box::pin(serve_page(&peer, method, 43, Some(""), &page(method, "two", None, 0, "public"))), Box::pin(client.collect(
-                            &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                            &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                         ))).await;
                         assert_complete(&repeated.unwrap(), method);
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 3);
@@ -211,7 +211,7 @@ fn run_catalog(case: CatalogCase) {
                             request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap();
                         }
                         let ((), repeated) = pair(Box::pin(pages(&peer, method, 43, 60000, "public")), Box::pin(client.collect(
-                            &cx, request, || next_id(&first), |_| Ok(()),
+                            &cx, request, || Ok(next_id(&first)), |_| Ok(()),
                         ))).await;
                         assert_complete(&repeated.unwrap(), method);
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
@@ -236,7 +236,7 @@ fn run_catalog(case: CatalogCase) {
                             assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
                         }
                     });
-                    let ((), result) = pair(server, Box::pin(client.collect(&cx, catalog_request(method), || next_id(&first), |_| {
+                    let ((), result) = pair(server, Box::pin(client.collect(&cx, catalog_request(method), || Ok(next_id(&first)), |_| {
                         notices.set(notices.get() + 1);
                         // Acquiring this same mutex proves observers are not
                         // invoked under the internal cache lock.
@@ -271,7 +271,7 @@ fn run_catalog(case: CatalogCase) {
                             if matches!(case, CatalogCase::RepeatedId) { return Ok(serde_json::from_str("41e0").unwrap()); }
                             if matches!(case, CatalogCase::LateId) { std::thread::sleep(Duration::from_millis(1100)); }
                         }
-                        next_id(&first)
+                        Ok(next_id(&first))
                     }, |_| Ok(())))).await;
                     let error = result.err().unwrap();
                     match case {
@@ -295,7 +295,7 @@ fn run_catalog(case: CatalogCase) {
                         assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
                     });
                     let application = Box::pin(async {
-                        let mut collecting = Box::pin(client.collect_with_cancellation(&cx, &cancellation, catalog_request(method), || next_id(&first), |_| Ok(())));
+                        let mut collecting = Box::pin(client.collect_with_cancellation(&cx, &cancellation, catalog_request(method), || Ok(next_id(&first)), |_| Ok(())));
                         let mut started = std::pin::pin!(rx.recv(&cx));
                         poll_fn(|task| {
                             assert!(collecting.as_mut().poll(task).is_pending());
@@ -334,11 +334,11 @@ fn run_catalog(case: CatalogCase) {
                     let application = Box::pin(async {
                         let result = Box::pin(client.collect(&cx, catalog_request(method), || {
                             if first.get() == 42 { std::thread::sleep(Duration::from_millis(2100)); }
-                            next_id(&first)
+                            Ok(next_id(&first))
                         }, |_| Ok(()))).await;
                         assert!(matches!(result, Err(ManagedCatalogError::CredentialChanged)));
                         first.set(51);
-                        let fresh = Box::pin(client.collect(&cx, catalog_request(method), || next_id(&first), |_| Ok(()))).await.unwrap();
+                        let fresh = Box::pin(client.collect(&cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()))).await.unwrap();
                         assert_complete(&fresh, method);
                         assert_eq!(fresh.credential_generation(), 2);
                         assert_eq!(client.cache_stats().unwrap().fills, 3);
@@ -349,7 +349,7 @@ fn run_catalog(case: CatalogCase) {
                 }
                 CatalogCase::RevokedCache => {
                     let ((), result) = pair(Box::pin(pages(&peer, method, 41, 60000, "public")), Box::pin(client.collect(
-                        &cx, catalog_request(method), || next_id(&first), |_| Ok(()),
+                        &cx, catalog_request(method), || Ok(next_id(&first)), |_| Ok(()),
                     ))).await;
                     assert_complete(&result.unwrap(), method);
                     let cached = Box::pin(client.collect(&cx, catalog_request(method), || panic!("warm pages need no POST"), |_| Ok(()))).await.unwrap();
@@ -395,7 +395,7 @@ fn run_catalog(case: CatalogCase) {
                         let mut byte = [0];
                         assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "revoked response is retired without awaiting its terminal");
                     });
-                    let ((), result) = pair(server, Box::pin(client.collect(&cx, catalog_request(method), || next_id(&first), |_| {
+                    let ((), result) = pair(server, Box::pin(client.collect(&cx, catalog_request(method), || Ok(next_id(&first)), |_| {
                         notices.set(notices.get() + 1);
                         credential.credential().revoke();
                         Ok(())

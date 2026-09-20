@@ -30,12 +30,12 @@ impl SecuredCodec {
         Self { inner: NativeHttp1Codec::new(body_limit, None), policy, body_limit, cors: None, finished: false }
     }
 
-    fn refusal(&mut self, error: HttpSecurityError, source: &mut BytesMut) -> Option<Ingress> {
+    fn refusal(&mut self, error: HttpSecurityError, source: &mut BytesMut) -> Ingress {
         let mut response = error.response();
         if let Some(cors) = &self.cors { cors.apply_to(&mut response); }
         self.finished = true;
         source.clear();
-        Some(Ingress::Immediate(response))
+        Ingress::Immediate(response)
     }
 
     fn head(&self, source: &[u8], end: usize) -> Result<HttpSecurityHead, HttpSecurityError> {
@@ -110,15 +110,15 @@ impl Decoder for SecuredCodec {
             let end = source.windows(4).position(|window| window == b"\r\n\r\n");
             let Some(end) = end else {
                 if source.len() > maximum {
-                    return Ok(self.refusal(HttpSecurityError::HeaderLimit, source));
+                    return Ok(Some(self.refusal(HttpSecurityError::HeaderLimit, source)));
                 }
                 // Do not delegate until the complete head has been admitted:
                 // the inner decoder is allowed to consume bytes incrementally.
                 return Ok(None);
             };
-            if end > maximum { return Ok(self.refusal(HttpSecurityError::HeaderLimit, source)); }
+            if end > maximum { return Ok(Some(self.refusal(HttpSecurityError::HeaderLimit, source))); }
             match self.head(source, end) {
-                Err(error) => return Ok(self.refusal(error, source)),
+                Err(error) => return Ok(Some(self.refusal(error, source))),
                 Ok(HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response)) => {
                     source.clear();
                     self.finished = true;
@@ -134,7 +134,7 @@ impl Decoder for SecuredCodec {
                 Ok(Some(Ingress::Request { request, cors }))
             }
             Ok(None) => Ok(None),
-            Err(_) => Ok(self.refusal(HttpSecurityError::InvalidHeader, source)),
+            Err(_) => Ok(Some(self.refusal(HttpSecurityError::InvalidHeader, source))),
         }
     }
 }

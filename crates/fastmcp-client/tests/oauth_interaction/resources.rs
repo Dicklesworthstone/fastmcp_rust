@@ -59,10 +59,10 @@ fn changed_request(request: &CoreRequest, key: &str, value: Value) -> CoreReques
 fn read_result(ttl: u64) -> String {
     format!(r#"{{"resultType":"complete","contents":[{{"uri":"file:///one","text":"exact first"}},{{"uri":"file:///two","blob":"AAEC"}}],"ttlMs":{ttl},"cacheScope":"public","x-exact":{{"z":900719925474099312345,"a":1.20e+4}}}}"#)
 }
-fn next_id(ids: &Cell<i64>) -> Result<RequestId, ReadError> {
+fn next_id(ids: &Cell<i64>) -> RequestId {
     let id = ids.get();
     ids.set(id + 1);
-    Ok(RequestId::Number(id))
+    RequestId::Number(id)
 }
 fn notification(method: &str) -> ServerNotification {
     let params = (method == "notifications/resources/updated").then(|| json!({"uri":URI}));
@@ -107,7 +107,7 @@ fn run_resource(case: ResourceCase) {
                     let ttl = if matches!(case, ResourceCase::ZeroTtl) { 0 } else { 60000 };
                     let wire = read_result(ttl);
                     let ((), first) = pair(Box::pin(serve_read(&peer, 41, &request, &wire)),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     let first = first.unwrap();
                     assert!(first.is_complete() && !first.is_cache_hit());
                     assert_eq!(first.uri(), URI);
@@ -127,7 +127,7 @@ fn run_resource(case: ResourceCase) {
                         // consumer using exactly the same managed login.
                         let separate = ManagedResourceClient::new(session.clone(), limits).with_cache_limits(8, 65536).unwrap();
                         let ((), fresh) = pair(Box::pin(serve_read(&peer, 42, &request, &wire)),
-                            Box::pin(separate.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                            Box::pin(separate.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                         assert!(!fresh.unwrap().is_cache_hit());
                     } else {
                         let next = match case {
@@ -147,7 +147,7 @@ fn run_resource(case: ResourceCase) {
                             _ => request.clone(),
                         };
                         let ((), second) = pair(Box::pin(serve_read(&peer, 42, &next, &wire)),
-                            Box::pin(client.read(&cx, next.clone(), || next_id(&ids), |_| Ok(())))).await;
+                            Box::pin(client.read(&cx, next.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                         assert!(!second.unwrap().is_cache_hit());
                     }
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
@@ -155,7 +155,7 @@ fn run_resource(case: ResourceCase) {
                 ResourceCase::Continuation => {
                     let wire = read_result(60000);
                     let ((), base) = pair(Box::pin(serve_read(&peer, 41, &request, &wire)),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     assert!(base.unwrap().is_complete());
                     for (index, continued) in [
                         changed_request(&request, "requestState", json!("")),
@@ -164,7 +164,7 @@ fn run_resource(case: ResourceCase) {
                         for repeat in 0..2 {
                             let id = 42 + (index * 2 + repeat) as i64;
                             let ((), result) = pair(Box::pin(serve_read(&peer, id, &continued, &wire)),
-                                Box::pin(client.read(&cx, continued.clone(), || next_id(&ids), |_| Ok(())))).await;
+                                Box::pin(client.read(&cx, continued.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                             assert!(result.unwrap().is_complete());
                         }
                     }
@@ -176,7 +176,7 @@ fn run_resource(case: ResourceCase) {
                 ResourceCase::InputRequired => {
                     for id in [41, 42] {
                         let ((), result) = pair(Box::pin(serve_read(&peer, id, &request, INPUT)),
-                            Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                            Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                         let result = result.unwrap();
                         assert!(!result.is_complete() && !result.is_cache_hit());
                         assert!(result.result().encode().unwrap().contains("1.20e+4"));
@@ -198,7 +198,7 @@ fn run_resource(case: ResourceCase) {
                             event(&mut tls, &terminal(41, &read_result(60000)), true).await;
                         } else { socket_closed(tls).await; }
                     };
-                    let read = client.read(&cx, request, || next_id(&ids), |notice| {
+                    let read = client.read(&cx, request, || Ok(next_id(&ids)), |notice| {
                         notices.set(notices.get() + 1);
                         let _ = client.cache_stats().unwrap(); // callback runs outside the cache mutex
                         if matches!(case, ResourceCase::InlineUpdate) {
@@ -221,12 +221,12 @@ fn run_resource(case: ResourceCase) {
                     let malformed = r#"{"resultType":"complete","contents":[{"uri":"file:///one","text":"secret","blob":"AAEC"}],"ttlMs":60000,"cacheScope":"private"}"#;
                     let body = if matches!(case, ResourceCase::ContentsLimit) { read_result(60000) } else { malformed.to_owned() };
                     let ((), result) = pair(Box::pin(serve_read(&peer, 41, &request, &body)),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     assert!(result.is_err());
                     assert_eq!(client.cache_stats().unwrap().fills, 0);
                     let corrected = r#"{"resultType":"complete","contents":[],"ttlMs":60000,"cacheScope":"private"}"#;
                     let ((), result) = pair(Box::pin(serve_read(&peer, 42, &request, corrected)),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     assert!(result.unwrap().is_complete());
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
@@ -241,7 +241,7 @@ fn run_resource(case: ResourceCase) {
                     };
                     let application = async {
                         let mut read = Box::pin(client.read_with_cancellation(&cx, &cancellation,
-                            request, || next_id(&ids), |_| Ok(())));
+                            request, || Ok(next_id(&ids)), |_| Ok(())));
                         let mut started = std::pin::pin!(receiver.recv(&cx));
                         poll_fn(|task| { assert!(read.as_mut().poll(task).is_pending()); started.as_mut().poll(task) }).await.unwrap();
                         if matches!(case, ResourceCase::Drop) { drop(read); }
@@ -264,7 +264,7 @@ fn run_resource(case: ResourceCase) {
                     let result = Box::pin(client.read(&cx, request, || {
                         if matches!(case, ResourceCase::RevokeBeforePost) { credential.credential().revoke(); }
                         else { client.clear().unwrap(); }
-                        next_id(&ids)
+                        Ok(next_id(&ids))
                     }, |_| Ok(()))).await;
                     match case {
                         ResourceCase::RevokeBeforePost => assert!(matches!(result, Err(ReadError::CredentialUnavailable))),
@@ -275,7 +275,7 @@ fn run_resource(case: ResourceCase) {
                 ResourceCase::RevokedHit => {
                     let wire = read_result(60000);
                     let ((), first) = pair(Box::pin(serve_read(&peer, 41, &request, &wire)),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     assert!(first.unwrap().is_complete());
                     session.credential(&cx).await.unwrap().credential().revoke();
                     assert!(Box::pin(client.read(&cx, request, || panic!("revoked read cannot dispatch"), |_| Ok(()))).await.is_err());
@@ -291,7 +291,7 @@ fn run_resource(case: ResourceCase) {
                         release.recv(&cx).await.unwrap();
                         json_reply(&mut tls, &terminal(41, &read_result(60000))).await;
                     };
-                    let read = client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(()));
+                    let read = client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(()));
                     let clear = async {
                         receiver.recv(&cx).await.unwrap();
                         client.clone().clear().unwrap();
@@ -301,7 +301,7 @@ fn run_resource(case: ResourceCase) {
                     assert!(matches!(result, Err(ReadError::Invalidated)));
                     assert_eq!(client.cache_stats().unwrap().fills, 0);
                     let ((), fresh) = pair(Box::pin(serve_read(&peer, 42, &request, &read_result(60000))),
-                        Box::pin(client.read(&cx, request.clone(), || next_id(&ids), |_| Ok(())))).await;
+                        Box::pin(client.read(&cx, request.clone(), || Ok(next_id(&ids)), |_| Ok(())))).await;
                     assert!(fresh.unwrap().is_complete());
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                 }
@@ -315,7 +315,7 @@ fn run_resource(case: ResourceCase) {
                     assert!(matches!(Box::pin(client.read(&cx, oversized, || panic!("oversize cannot allocate ID"), |_| Ok(()))).await,
                         Err(ReadError::Core(ManagedCoreError::RequestTooLarge))));
                     cancellation.cancel();
-                    assert!(matches!(Box::pin(client.read_with_cancellation(&cx, &cancellation, request, || next_id(&ids), |_| Ok(()))).await,
+                    assert!(matches!(Box::pin(client.read_with_cancellation(&cx, &cancellation, request, || Ok(next_id(&ids)), |_| Ok(()))).await,
                         Err(ReadError::Core(ManagedCoreError::Cancelled))));
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 0);
                     assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);

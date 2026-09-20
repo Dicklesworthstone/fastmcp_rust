@@ -36,8 +36,8 @@ fn bound(resource: &str, token: &str) -> BoundBearerCredential {
     BoundBearerCredential::bind(url(resource), token).expect("an https binding is admissible")
 }
 
-fn expected_header(token: &str) -> Option<String> {
-    Some(format!("Bearer {token}"))
+fn expected_header(token: &str) -> String {
+    format!("Bearer {token}")
 }
 
 /// Revocation withholds the credential from the value it was called on, from
@@ -57,7 +57,7 @@ fn public_revocation_withholds_existing_and_future_clones() {
         assert!(!candidate.is_revoked(), "{label} starts unrevoked");
         assert_eq!(
             candidate.authorization_for_target(&resource),
-            expected_header(TOKEN),
+            Some(expected_header(TOKEN)),
             "{label} releases its header before revocation"
         );
     }
@@ -98,7 +98,7 @@ fn public_revocation_withholds_existing_and_future_clones() {
     );
     assert_eq!(
         independent.authorization_for_target(&resource),
-        expected_header(TOKEN),
+        Some(expected_header(TOKEN)),
         "a separately bound credential still releases its header"
     );
 }
@@ -140,7 +140,7 @@ fn public_revocation_is_independent_of_expiry_and_clone_drop() {
         .expect("an https binding with an expiry is admissible");
     assert_eq!(
         live.authorization_for_target(&resource),
-        expected_header(TOKEN),
+        Some(expected_header(TOKEN)),
         "an unexpired credential releases its header"
     );
     live.revoke();
@@ -193,7 +193,7 @@ fn public_revocation_is_visible_across_threads() {
         assert!(!worker_credential.is_revoked());
         assert_eq!(
             worker_credential.authorization_for_target(&resource),
-            expected_header(TOKEN),
+            Some(expected_header(TOKEN)),
             "the moved credential is live before revocation"
         );
         ready_tx.send(()).expect("the main thread is still waiting");
