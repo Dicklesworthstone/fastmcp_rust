@@ -115,7 +115,7 @@ async fn fresh_listen_after_gap(peer: &Peer, session: &ManagedOAuthSession, cx: 
         consume_ack(&mut listener, cx).await;
         consume_terminal(&mut listener, cx, 42).await;
     };
-    pair(server, application).await;
+    Box::pin(pair(server, application)).await;
 }
 
 fn run_subscription(case: SubscriptionCase) {
@@ -133,7 +133,7 @@ fn run_subscription(case: SubscriptionCase) {
             };
             // The expiry case tests the original stream, not an early renewal.
             let policy = OAuthSessionPolicy::new(Duration::ZERO, Duration::from_secs(30), Duration::from_secs(20), 64).unwrap();
-            let ((), session) = pair(login, ManagedOAuthSession::authorize(&cx, peer.client(), policy, browser)).await;
+            let ((), session) = Box::pin(pair(login, ManagedOAuthSession::authorize(&cx, peer.client(), policy, browser))).await;
             let session = session.unwrap();
             // Boxed so the twelve cases' locals live on the heap. Inlined, this
             // match makes one state machine large enough to abort the child with
@@ -159,7 +159,7 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(matches!(*notification, ServerNotification::ResourceUpdated(_)));
                         consume_terminal(&mut listener, &cx, 41).await;
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                 }
                 SubscriptionCase::BadAcknowledgement => {
                     let mut widened = selected_filter();
@@ -187,10 +187,10 @@ fn run_subscription(case: SubscriptionCase) {
                             assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::InvalidResponse)));
                             assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                     }
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 7);
-                    fresh_listen_after_gap(&peer, &session, &cx).await;
+                    Box::pin(fresh_listen_after_gap(&peer, &session, &cx)).await;
                 }
                 SubscriptionCase::BadEvent => {
                     for frame in [
@@ -212,9 +212,9 @@ fn run_subscription(case: SubscriptionCase) {
                             assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::InvalidResponse)));
                             assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                     }
-                    fresh_listen_after_gap(&peer, &session, &cx).await;
+                    Box::pin(fresh_listen_after_gap(&peer, &session, &cx)).await;
                 }
                 SubscriptionCase::Truncated => {
                     let server = async {
@@ -227,9 +227,9 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::MissingTerminal)));
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 1);
-                    fresh_listen_after_gap(&peer, &session, &cx).await;
+                    Box::pin(fresh_listen_after_gap(&peer, &session, &cx)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 2);
                 }
                 SubscriptionCase::Cancel | SubscriptionCase::SessionClose | SubscriptionCase::AbandonRead
@@ -272,10 +272,10 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                         assert!(cx.checkpoint().is_ok());
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 1);
                     if !matches!(case, SubscriptionCase::SessionClose | SubscriptionCase::Expiry) {
-                        pair(peer.catalog(42), complete_catalog(&session, &cx, 42)).await;
+                        Box::pin(pair(peer.catalog(42), complete_catalog(&session, &cx, 42))).await;
                     }
                 }
                 SubscriptionCase::RecordLimit => {
@@ -291,8 +291,8 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::RecordLimit)));
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                     };
-                    pair(server, application).await;
-                    fresh_listen_after_gap(&peer, &session, &cx).await;
+                    Box::pin(pair(server, application)).await;
+                    Box::pin(fresh_listen_after_gap(&peer, &session, &cx)).await;
                 }
                 SubscriptionCase::Preflight => {
                     let tiny = ManagedSubscriptionLimits::new(1, 4096, 10, Duration::from_secs(15)).unwrap();
@@ -306,7 +306,7 @@ fn run_subscription(case: SubscriptionCase) {
                     assert!(matches!(session.subscribe_core_with_cancellation(&cx, &cancelled, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()).await, Err(ManagedSubscriptionError::Session(OAuthSessionError::Cancelled))));
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 0);
                     peer.no_extra_connections();
-                    fresh_listen_after_gap(&peer, &session, &cx).await;
+                    Box::pin(fresh_listen_after_gap(&peer, &session, &cx)).await;
                 }
                 SubscriptionCase::HttpFailure => {
                     for status in [200, 401, 403, 307, 500] {
@@ -314,7 +314,7 @@ fn run_subscription(case: SubscriptionCase) {
                             let (mut tls, _) = peer.request("/mcp").await;
                             json_reply(&mut tls, status, "peer-error-canary").await;
                         };
-                        let ((), result) = pair(server, session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default())).await;
+                        let ((), result) = Box::pin(pair(server, session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()))).await;
                         let error = result.err().expect("a successful subscription requires SSE");
                         assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
                     }
@@ -331,7 +331,7 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(listener.accepted_filter().is_none());
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     // The same peer error with the actual bearer must be withheld
                     // by HTTP before it can become a subscription Remote error.
                     let server = async {
@@ -349,7 +349,7 @@ fn run_subscription(case: SubscriptionCase) {
                         assert!(listener.accepted_filter().is_none());
                         assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 7);
                 }
             } }).await;
@@ -357,7 +357,7 @@ fn run_subscription(case: SubscriptionCase) {
             peer.no_extra_connections();
             session.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), test).await
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), test)).await
             .expect("complete authenticated subscription fixture must settle within its bound");
     });
 }
