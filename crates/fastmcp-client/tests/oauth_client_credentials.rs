@@ -348,7 +348,7 @@ fn run(case: Case) {
                             assert!(result.encode().unwrap().contains("1.20e+4"));
                         }
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),4);
                 }
@@ -359,8 +359,8 @@ fn run(case: Case) {
                     assert!(old.credential().authorization_for_target(client.resource()).is_none());
                     let ((),fresh) = pair(peer.grant("access-two",300),client.credential(&cx)).await;
                     assert_eq!(fresh.unwrap().generation(),2);
-                    let ((),response) = pair(peer.operation(1,"tools/list","access-two",LIST),
-                        client.execute_core(&cx,core("tools/list"),RequestId::Number(1),RequestId::Number(2))).await;
+                    let ((),response) = Box::pin(pair(peer.operation(1,"tools/list","access-two",LIST),
+                        client.execute_core(&cx,core("tools/list"),RequestId::Number(1),RequestId::Number(2)))).await;
                     assert_eq!(response.unwrap().read_json_result(&cx,4096).await.unwrap().era(),ProtocolEra::Modern2026);
                     assert_eq!(peer.grants.load(Ordering::SeqCst),2);
                 }
@@ -398,8 +398,8 @@ fn run(case: Case) {
                     ].into_iter().enumerate() {
                         let id=1+2*index as i64;
                         let document=DISCOVERY.replace(from,to);
-                        let ((),result)=pair(peer.discovery(id,"access-one",&document),
-                            client.execute_core(&cx,core("tools/call"),RequestId::Number(id),RequestId::Number(id+1))).await;
+                        let ((),result)=Box::pin(pair(peer.discovery(id,"access-one",&document),
+                            client.execute_core(&cx,core("tools/call"),RequestId::Number(id),RequestId::Number(id+1)))).await;
                         assert!(matches!(result,Err(Error::Negotiation)));
                     }
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),3,"no business POST after rejected capability advertisement");
@@ -415,11 +415,11 @@ fn run(case: Case) {
                             tls.flush().await.unwrap();
                         }
                     };
-                    let ((),result)=pair(server,client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2))).await;
+                    let ((),result)=Box::pin(pair(server,client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2)))).await;
                     if let Ok(response)=result { assert!(response.read_json_result(&cx,4096).await.is_err()); }
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2); peer.quiet();
-                    let ((),response)=pair(peer.operation(3,"tools/list","access-one",LIST),
-                        client.execute_core(&cx,core("tools/list"),RequestId::Number(3),RequestId::Number(4))).await;
+                    let ((),response)=Box::pin(pair(peer.operation(3,"tools/list","access-one",LIST),
+                        client.execute_core(&cx,core("tools/list"),RequestId::Number(3),RequestId::Number(4)))).await;
                     assert!(response.unwrap().read_json_result(&cx,4096).await.is_ok());
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                 }
@@ -487,7 +487,7 @@ fn run(case: Case) {
                         }
                         assert!(matches!(stream.next_event(&cx).await,Err(Error::Closed)));
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1,"opening-token expiry never renews a live response");
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2);
                 }
@@ -504,8 +504,8 @@ fn run(case: Case) {
                 Case::InputRequired => {
                     acquire(&peer,&cx,&client,"access-one",300).await;
                     let challenge=r#"{"resultType":"input_required","requestState":"opaque-state","x-exact":1.20e+4}"#;
-                    let ((),response)=pair(peer.operation(1,"tools/call","access-one",challenge),
-                        client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2))).await;
+                    let ((),response)=Box::pin(pair(peer.operation(1,"tools/call","access-one",challenge),
+                        client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2)))).await;
                     let result=response.unwrap().read_json_result(&cx,4096).await.unwrap();
                     assert!(matches!(&result,CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { .. })));
                     let encoded=result.encode().unwrap();
@@ -702,8 +702,8 @@ fn run_post(case: PostCase) {
                     assert_eq!(old.generation(), 1);
                     assert_eq!(two.unwrap().generation(), 1, "concurrent consumers share the same grant");
                     assert!(!format!("{old:?} {client:?}").contains(secret));
-                    let ((), response) = pair(peer.operation(1, "tools/list", "post-access", LIST),
-                        client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2))).await;
+                    let ((), response) = Box::pin(pair(peer.operation(1, "tools/list", "post-access", LIST),
+                        client.execute_core(&cx, core("tools/list"), RequestId::Number(1), RequestId::Number(2)))).await;
                     assert!(response.unwrap().read_json_result(&cx, 4096).await.unwrap().encode().unwrap().contains("1.20e+4"));
                     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
                     if matches!(case, PostCase::Lifecycle) {
@@ -711,8 +711,8 @@ fn run_post(case: PostCase) {
                         assert!(old.credential().authorization_for_target(client.resource()).is_none());
                         let ((), fresh) = pair(post_grant(&peer, id, secret, "post-renewed", 300), client.credential(&cx)).await;
                         assert_eq!(fresh.unwrap().generation(), 2);
-                        let ((), response) = pair(peer.operation(3, "tools/call", "post-renewed", CALL),
-                            client.execute_core(&cx, core("tools/call"), RequestId::Number(3), RequestId::Number(4))).await;
+                        let ((), response) = Box::pin(pair(peer.operation(3, "tools/call", "post-renewed", CALL),
+                            client.execute_core(&cx, core("tools/call"), RequestId::Number(3), RequestId::Number(4)))).await;
                         assert!(response.unwrap().read_json_result(&cx, 4096).await.is_ok());
                         assert_eq!(peer.grants.load(Ordering::SeqCst), 2, "renewal must use another Post grant, not refresh_token or Basic");
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 4);
