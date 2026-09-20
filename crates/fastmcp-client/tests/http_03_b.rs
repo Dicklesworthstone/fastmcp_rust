@@ -794,7 +794,7 @@ async fn positive_14_cancellation_closes_response(cx: &Cx) {
         );
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert!(
         header_values(&wire.head, "last-event-id").is_empty(),
         "a cancelled exchange must not have offered resumption state"
@@ -864,7 +864,7 @@ async fn positive_15_response_deadline(cx: &Cx) {
         );
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert!(
         wire.head.starts_with("POST /mcp HTTP/1.1\r\n"),
         "the exchange must POST the configured modern route"
@@ -902,7 +902,7 @@ async fn negative_15_stalled_peer(cx: &Cx) {
         }
     };
 
-    let (_wire, ()) = pair(server, client).await;
+    let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
 }
 
@@ -930,7 +930,7 @@ async fn positive_16_no_retry_no_replay(cx: &Cx) {
             .expect("an ordinary exchange must be admitted");
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert_eq!(wire.body, ping_body(), "the body is transmitted verbatim");
     assert_eq!(
         exactly_one_header(&wire.head, "content-length"),
@@ -962,7 +962,7 @@ async fn negative_16_midexchange_close(cx: &Cx) {
         );
     };
 
-    let (_wire, ()) = pair(server, client).await;
+    let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
 }
 
@@ -1098,7 +1098,7 @@ async fn positive_19_redirect_no_follow(cx: &Cx) {
             }
         };
 
-        let (_wire, ()) = pair(server, client).await;
+        let (_wire, ()) = Box::pin(pair(server, client)).await;
         peer.assert_no_further_connection();
     }
 }
@@ -1130,7 +1130,7 @@ async fn negative_19_redirect_with_location(cx: &Cx) {
         );
     };
 
-    let (_wire, ()) = pair(server, client).await;
+    let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
     elsewhere.assert_no_further_connection();
 }
@@ -1158,7 +1158,7 @@ async fn positive_20_discover_preclassification_frame(cx: &Cx) {
         let _ = connect.connect_http_with_cx(cx).await;
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert!(
         wire.head.starts_with("POST /mcp HTTP/1.1\r\n"),
         "the probe must POST the configured modern route: {:?}",
@@ -1498,7 +1498,7 @@ async fn positive_23_activation_proof_notification(cx: &Cx) {
         );
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert_eq!(wire.body, body, "the notification body is sent verbatim");
     assert_eq!(
         exactly_one_header(&wire.head, "Mcp-Method"),
@@ -1553,7 +1553,7 @@ async fn negative_23_acknowledgement_with_content_type(cx: &Cx) {
         }
     };
 
-    let (_wire, ()) = pair(server, client).await;
+    let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
 }
 
@@ -1596,7 +1596,7 @@ async fn positive_24_independent_server_request(cx: &Cx) {
         }
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert!(
         header_values(&wire.head, "mcp-session-id").is_empty(),
         "the client must not offer session state"
@@ -1643,7 +1643,7 @@ async fn negative_24_duplicate_response_header(cx: &Cx) {
         );
     };
 
-    let (_wire, ()) = pair(server, client).await;
+    let (_wire, ()) = Box::pin(pair(server, client)).await;
     peer.assert_no_further_connection();
 }
 
@@ -1676,7 +1676,7 @@ async fn positive_25_no_resumption_state(cx: &Cx) {
         }
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     for forbidden in ["last-event-id", "mcp-session-id"] {
         assert!(
             header_values(&wire.head, forbidden).is_empty(),
@@ -1714,7 +1714,7 @@ async fn negative_25_resumption_state_offered(cx: &Cx) {
         }
     };
 
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert!(
         header_values(&wire.head, "last-event-id").is_empty(),
         "an offered event ID must not be echoed on the request"
@@ -1755,7 +1755,7 @@ async fn positive_26_observation_table(cx: &Cx) {
     let client = async {
         let _ = connect.connect_http_with_cx(cx).await;
     };
-    let (wire, ()) = pair(server, client).await;
+    let (wire, ()) = Box::pin(pair(server, client)).await;
     assert_eq!(
         exactly_one_header(&wire.head, "Mcp-Method"),
         "server/discover",
