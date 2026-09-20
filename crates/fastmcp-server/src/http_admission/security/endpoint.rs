@@ -232,7 +232,12 @@ async fn guard_response<T>(
     authorization: &mut Option<SseAuthorizationLease>,
     future: impl Future<Output = T>,
 ) -> Result<T, SecuredHttpEndpointError> {
-    let Some(lease) = authorization.as_mut() else { return Ok(future.await); };
+    let Some(lease) = authorization.as_mut() else {
+        // Credential revalidation is optional; execution liveness is not.
+        // Register cancellation/deadline wakes even when the operation itself
+        // is idle, and refuse a result that becomes ready during cancellation.
+        return await_dispatch(cx, async { Ok(future.await) }).await;
+    };
     if cx.timer_driver().is_none() { return Err(SecuredHttpEndpointError::TimerUnavailable); }
     let mut wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
     let mut future = std::pin::pin!(future);
@@ -418,4 +423,126 @@ mod tests {
             else { panic!("body must never dispatch") };
         assert_eq!(response.status.0, 400);
     }
+    #[test]
+    fn response_guard_without_revalidation_preserves_live_ready_results() {
+        let cx = Cx::for_testing();
+        assert!(cx.timer_driver().is_none());
+        let mut authorization = None;
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, async { 17 }));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Ok(17)));
+    }
+
+    #[test]
+    fn response_guard_without_revalidation_refuses_cancel_before_polling() {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let polls = std::cell::Cell::new(0);
+        let mut authorization = None;
+        let operation = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready(17)
+        });
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)));
+        assert_eq!(polls.get(), 0, "cancelled response must not consume an event or write bytes");
+    }
+
+    #[test]
+    fn response_guard_without_revalidation_refuses_an_unserviceable_deadline() {
+        let cx = Cx::for_testing_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(
+                asupersync::Time::ZERO.saturating_add_nanos(u64::MAX),
+            ),
+        );
+        assert!(cx.timer_driver().is_none());
+        let polls = std::cell::Cell::new(0);
+        let mut authorization = None;
+        let operation = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            Poll::Ready(17)
+        });
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable)));
+        assert_eq!(polls.get(), 0, "an unenforceable deadline must not start response work");
+    }
+
+    #[test]
+    fn response_guard_without_revalidation_withholds_a_ready_result_on_cancel() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct ResultOwner(Arc<AtomicBool>);
+        impl Drop for ResultOwner {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let cx = Cx::for_testing();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut authorization = None;
+        let operation = poll_fn(|_| {
+            cx.set_cancel_requested(true);
+            Poll::Ready(ResultOwner(Arc::clone(&dropped)))
+        });
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, operation));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled))));
+        assert!(dropped.load(Ordering::Acquire), "withheld result must release its owned resources");
+    }
+
+    #[test]
+    fn response_guard_without_revalidation_wakes_an_idle_operation_on_cancel() {
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        struct WakeCount(AtomicUsize);
+        impl std::task::Wake for WakeCount {
+            fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        struct Idle(Arc<AtomicBool>);
+        impl Future for Idle {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> { Poll::Pending }
+        }
+        impl Drop for Idle {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let cx = Cx::for_testing();
+        let counter = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut task = std::task::Context::from_waker(&waker);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut authorization = None;
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, Idle(Arc::clone(&dropped))));
+        assert!(guarded.as_mut().poll(&mut task).is_pending());
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        cx.set_cancel_requested(true);
+        // Check the wake before repolling: a checkpoint-only implementation
+        // would strand this operation when the socket/event source is idle.
+        assert!(counter.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(SecuredHttpEndpointError::Cancelled)));
+        drop(guarded);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn abandoning_response_guard_without_revalidation_drops_the_operation() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        struct Idle(Arc<AtomicBool>);
+        impl Future for Idle {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> { Poll::Pending }
+        }
+        impl Drop for Idle {
+            fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+        }
+        let cx = Cx::for_testing();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut authorization = None;
+        let mut guarded = Box::pin(guard_response(&cx, &mut authorization, Idle(Arc::clone(&dropped))));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(guarded.as_mut().poll(&mut task).is_pending());
+        drop(guarded);
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(cx.checkpoint().is_ok(), "dropping a response must not cancel its caller");
+    }
+
 }
