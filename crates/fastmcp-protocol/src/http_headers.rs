@@ -28,7 +28,8 @@ pub const MAX_PARAMETER_HEADER_PATH_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 bytes in one decoded header value.
 pub const MAX_MCP_HEADER_VALUE_BYTES: usize = 8 * 1024;
 /// Includes the sentinel and Base64 expansion of the maximum decoded value.
-pub const MAX_MCP_ENCODED_HEADER_VALUE_BYTES: usize = 4 * MAX_MCP_HEADER_VALUE_BYTES.div_ceil(3) + 10;
+pub const MAX_MCP_ENCODED_HEADER_VALUE_BYTES: usize = 4 * MAX_MCP_HEADER_VALUE_BYTES.div_ceil(3)
+    + SENTINEL_PREFIX.len() + SENTINEL_SUFFIX.len();
 /// Maximum complete field-name/value bytes produced by one projection.
 pub const MAX_PARAMETER_HEADER_BLOCK_BYTES: usize = 64 * 1024;
 /// Numeric mirrors use the exact JavaScript-safe integer range, not f64.
@@ -198,7 +199,13 @@ pub fn decode_mcp_header_value(value: &[u8]) -> Result<String, McpHeaderError> {
     let value = std::str::from_utf8(value).map_err(|_| McpHeaderError::InvalidHeaderValue)?;
     let value = value.trim_matches([' ', '\t']);
     if is_sentinel(value) {
-        let encoded = &value[SENTINEL_PREFIX.len()..value.len() - SENTINEL_SUFFIX.len()];
+        // Prefix and suffix may overlap in malformed input (`=?base64?=`).
+        // Remove them sequentially rather than constructing an unchecked range.
+        // Keep is_sentinel's broad recognition: the encoder must still wrap
+        // malformed sentinel-looking literals so they round-trip as data.
+        let encoded = value.strip_prefix(SENTINEL_PREFIX)
+            .and_then(|payload| payload.strip_suffix(SENTINEL_SUFFIX))
+            .ok_or(McpHeaderError::InvalidHeaderValue)?;
         let decoded = STANDARD.decode(encoded).map_err(|_| McpHeaderError::InvalidHeaderValue)?;
         if decoded.len() > MAX_MCP_HEADER_VALUE_BYTES { return Err(McpHeaderError::LimitExceeded); }
         String::from_utf8(decoded).map_err(|_| McpHeaderError::InvalidHeaderValue)
@@ -502,6 +509,66 @@ mod tests {
         assert_eq!(encode_mcp_header_value(" padded ").unwrap(), "=?base64?IHBhZGRlZCA=?=");
         assert_eq!(decode_mcp_header_value(b" \t=?base64?IHBhZGRlZCA=?=\t ").unwrap(), " padded ");
         assert_eq!(decode_mcp_header_value(b"=?BASE64?YWJj?=").unwrap(), "=?BASE64?YWJj?=");
+    }
+
+    #[test]
+    fn overlapping_sentinel_is_rejected_without_panicking_or_reinterpreting_it() {
+        for raw in [b"=?base64?=".as_slice(), b" \t=?base64?=\t "] {
+            assert_eq!(decode_mcp_header_value(raw), Err(McpHeaderError::InvalidHeaderValue));
+        }
+        // The empty encoding has two distinct question marks, not an overlap.
+        assert_eq!(decode_mcp_header_value(b"=?base64??="), Ok(String::new()));
+        for literal in ["=?base64?=", "=?base64??=", "=?base64?YQ==?="] {
+            let encoded = encode_mcp_header_value(literal).unwrap();
+            assert_ne!(encoded, literal, "sentinel-looking literals must be escaped");
+            assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), literal);
+        }
+    }
+
+    #[test]
+    fn encoded_values_round_trip_at_every_base64_padding_boundary() {
+        for length in [MAX_MCP_HEADER_VALUE_BYTES - 2, MAX_MCP_HEADER_VALUE_BYTES - 1,
+            MAX_MCP_HEADER_VALUE_BYTES] {
+            for value in ["\0".repeat(length), format!("{} ", "x".repeat(length - 1))] {
+                let encoded = encode_mcp_header_value(&value).unwrap();
+                assert_eq!(encoded.len(), SENTINEL_PREFIX.len() + 4 * length.div_ceil(3)
+                    + SENTINEL_SUFFIX.len());
+                assert!(encoded.len() <= MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
+                assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), value);
+            }
+        }
+        // The byte immediately beyond the decoded limit can occupy the same
+        // Base64 quantum as a valid maximum-length value. Check both bounds.
+        let oversized = "\0".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1);
+        assert_eq!(encode_mcp_header_value(&oversized), Err(McpHeaderError::LimitExceeded));
+        let wire = format!("{SENTINEL_PREFIX}{}{SENTINEL_SUFFIX}", STANDARD.encode(oversized));
+        assert_eq!(wire.len(), MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
+        assert_eq!(decode_mcp_header_value(wire.as_bytes()), Err(McpHeaderError::LimitExceeded));
+    }
+
+    #[test]
+    fn parameter_mirrors_reject_overlapping_sentinels_without_mutating_arguments() {
+        let plan = scalar("string");
+        let arguments = json!({"value":"=?base64?="});
+        let before = arguments.clone();
+        let projected = plan.project(Some(&arguments)).unwrap();
+        plan.validate(Some(&arguments), projected.fields()).unwrap();
+        assert_eq!(plan.validate(Some(&arguments), &[("Mcp-Param-Value".to_owned(),
+            "=?base64?=".to_owned())]), Err(McpHeaderError::InvalidHeaderValue));
+        assert_eq!(arguments, before);
+    }
+
+    #[test]
+    fn maximum_encoded_parameter_projection_is_accepted_by_its_own_validator() {
+        let plan = scalar("string");
+        let arguments = json!({"value":"\0".repeat(MAX_MCP_HEADER_VALUE_BYTES)});
+        let before = arguments.clone();
+        let projected = plan.project(Some(&arguments)).unwrap();
+        assert_eq!(projected.fields()[0].1.len(), MAX_MCP_ENCODED_HEADER_VALUE_BYTES);
+        plan.validate(Some(&arguments), projected.fields()).unwrap();
+        assert_eq!(arguments, before);
+        let oversized = json!({"value":"\0".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1)});
+        assert_eq!(plan.project(Some(&oversized)), Err(McpHeaderError::LimitExceeded));
     }
 
     #[test]
