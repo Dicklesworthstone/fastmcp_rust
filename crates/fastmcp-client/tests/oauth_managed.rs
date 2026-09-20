@@ -212,7 +212,7 @@ fn managed_oauth_concurrent_callers_share_one_live_refresh_and_generation() {
                 assert!(!format!("{snapshot:?} {session:?}").contains("access-two"));
             }
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
         peer.assert_no_extra_connection();
     });
@@ -253,7 +253,7 @@ fn cancelling_a_refresh_waiter_does_not_cancel_the_refresh_owner() {
             assert_eq!(snapshot.unwrap().generation(), 2);
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 2);
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
         peer.assert_no_extra_connection();
     });
@@ -287,7 +287,7 @@ fn bounded_refresh_admission_recovers_after_saturation() {
             assert_eq!(snapshot.unwrap().generation(), 2);
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 2);
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
         peer.assert_no_extra_connection();
     });
@@ -326,7 +326,7 @@ fn abandoned_or_closed_refresh_never_reuses_the_consumed_lineage() {
                 }
                 assert!(cx.checkpoint().is_ok());
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
             peer.assert_no_extra_connection();
         });
@@ -349,7 +349,7 @@ fn wrong_target_and_precancelled_calls_do_not_trigger_token_renewal() {
             session.close();
             assert!(matches!(session.clone().credential(&cx).await, Err(OAuthSessionError::Closed)));
         };
-        pair(peer.login(FIRST), application).await;
+        Box::pin(pair(peer.login(FIRST), application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
         peer.assert_no_extra_connection();
     });
@@ -365,7 +365,7 @@ fn a_nonrenewable_expired_grant_requires_explicit_login_without_peer_contact() {
             expire_first_grant(&cx).await;
             assert!(matches!(session.credential(&cx).await, Err(OAuthSessionError::LoginRequired)));
         };
-        pair(peer.login(NO_REFRESH), application).await;
+        Box::pin(pair(peer.login(NO_REFRESH), application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
         peer.assert_no_extra_connection();
     });
@@ -399,7 +399,7 @@ fn issued_credentials_cannot_outlive_close_or_the_last_managed_login_owner() {
                 }
                 assert!(cx.checkpoint().is_ok());
             };
-            pair(peer.login(NEXT), application).await;
+            Box::pin(pair(peer.login(NEXT), application)).await;
             assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
             peer.assert_no_extra_connection();
         });
@@ -427,7 +427,7 @@ fn revoking_an_issued_snapshot_prevents_reacquisition_and_authenticated_dispatch
             session.close();
             assert!(matches!(session.credential(&cx).await, Err(OAuthSessionError::Closed)));
         };
-        pair(peer.login(NEXT), application).await;
+        Box::pin(pair(peer.login(NEXT), application)).await;
         assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
         peer.assert_no_extra_connection();
     });
