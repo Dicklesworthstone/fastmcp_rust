@@ -3132,7 +3132,7 @@ impl OAuthServer {
 
         let scopes = match request.scope.as_deref() {
             None => Vec::new(),
-            Some(scope) if scope.is_empty() => {
+            Some("") => {
                 return Err(OAuthError::InvalidRequest(
                     "dynamic registration scope is empty".to_string(),
                 ));

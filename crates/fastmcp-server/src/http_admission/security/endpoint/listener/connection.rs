@@ -388,7 +388,7 @@ where
         if !half_closed {
             match peer.as_mut().poll(task) {
                 Poll::Ready(Ok(0)) => half_closed = true,
-                Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+                Poll::Ready(Ok(_) | Err(_)) => {
                     cancellation.cancel();
                     return Poll::Ready(Err(()));
                 }

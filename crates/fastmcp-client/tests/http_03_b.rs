@@ -894,9 +894,9 @@ async fn negative_15_stalled_peer(cx: &Cx) {
     let client = async {
         let outcome = post(cx, &request).await;
         match outcome {
-            Err(ModernHttpExecutorError::Timeout(_))
-            | Err(ModernHttpExecutorError::Transport(_))
-            | Err(ModernHttpExecutorError::ResponseBodyReadFailed) => {}
+            Err(ModernHttpExecutorError::Timeout(_)
+            | ModernHttpExecutorError::Transport(_)
+            | ModernHttpExecutorError::ResponseBodyReadFailed) => {}
             Err(other) => panic!("a stalled peer must be a typed refusal, got {other:?}"),
             Ok(_) => panic!("a stalled peer must not produce an admitted response"),
         }

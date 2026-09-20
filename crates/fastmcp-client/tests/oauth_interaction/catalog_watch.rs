@@ -317,8 +317,8 @@ fn run_watch(case: WatchCase) {
                         assert_eq!(ids.get(), 2, "an external clear cannot trigger a hidden refetch");
                     }
                     WatchCase::SessionClose => assert!(matches!(result,
-                        Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked))
-                        | Err(WatchError::Subscription(fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError::Session(OAuthSessionError::Closed)))
+                        Err(WatchError::Catalog(ManagedCatalogError::CredentialRevoked)
+                        | WatchError::Subscription(fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError::Session(OAuthSessionError::Closed)))
                     )),
                     WatchCase::Gap | WatchCase::Expired => assert!(result.is_err()),
                     WatchCase::Drop | WatchCase::Preflight => unreachable!(),

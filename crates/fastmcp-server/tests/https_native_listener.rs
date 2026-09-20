@@ -456,7 +456,7 @@ fn https_native_handshake_deadline_closes_a_stalled_socket_and_preserves_listene
         let healthy = exchange(&cx, running.address, request(false)).await;
         drop(stalled);
         running.stop(&cx).await;
-        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "server must close, not leave the read pending");
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))), "server must close, not leave the read pending");
         assert_eq!(before, (0, 0));
         success(&decode_wire(&healthy.unwrap()), false);
     });
@@ -472,7 +472,7 @@ fn https_native_shutdown_settles_handshakes_without_waiting_for_their_timeout() 
         running.stop(&cx).await;
         let mut byte = [0_u8; 1];
         let closed = asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, stalled.read(&mut byte)).await;
-        assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))));
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))));
         assert_eq!(probe.counts(), (0, 0));
         assert!(cx.checkpoint().is_ok());
     });
