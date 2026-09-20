@@ -2146,7 +2146,7 @@ async fn classified_error_body(
 ) -> Option<ModernHttpErrorBody> {
     let peer = Peer::bind().await;
     let request = ping_request(&peer.target());
-    let ((), classified) = pair(
+    let ((), classified) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2161,7 +2161,7 @@ async fn classified_error_body(
                 .await
                 .expect("the bounded body must be readable")
         },
-    )
+    ))
     .await;
     peer.assert_no_further_connection();
     classified
@@ -2799,7 +2799,7 @@ async fn listen_to_sse_body(
 ) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
     let peer = Peer::bind().await;
     let connection = connect(cx, &peer).await;
-    let ((), outcome) = pair(
+    let ((), outcome) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -2820,7 +2820,7 @@ async fn listen_to_sse_body(
                 .expect("the request must reach the peer");
             listener.next_event(cx).await
         },
-    )
+    ))
     .await;
     // Admitted or refused, the client answers nothing on the wire.
     peer.assert_no_further_connection();
@@ -3806,7 +3806,7 @@ async fn collect_with_progress(
         "the fixture must not reach the pending-event byte ceiling"
     );
 
-    let ((), collected) = pair(
+    let ((), collected) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -3834,7 +3834,7 @@ async fn collect_with_progress(
                 .collect(cx)
                 .await
         },
-    )
+    ))
     .await;
     collected
 }
@@ -4731,7 +4731,7 @@ async fn read_sse_twice(
     Result<Option<String>, ModernHttpExecutorError>,
 ) {
     let request = ping_request(&peer.target());
-    let ((), outcomes) = pair(
+    let ((), outcomes) = Box::pin(pair(
         async {
             let mut io = peer.accept().await;
             let _ = read_request(&mut io).await;
@@ -4750,7 +4750,7 @@ async fn read_sse_twice(
             let second = stream.next_event(cx).await;
             (first, second)
         },
-    )
+    ))
     .await;
     outcomes
 }
