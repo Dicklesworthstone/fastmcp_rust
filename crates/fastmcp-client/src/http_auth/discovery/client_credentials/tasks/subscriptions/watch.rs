@@ -139,7 +139,7 @@ impl ClientCredentialsTasksClient {
         )?;
         let deadline = discovery_deadline(cx, policy.timeout).map_err(ClientCredentialsError::from)?;
         let owner = &self.client.inner.closed;
-        active(cx, deadline, owner, cancellation, None, async {
+        Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(async {
                 let mut subscription = self.subscribe_with_cancellation(
                     cx, cancellation, discovery_id, request_id, filter, limits,
@@ -158,7 +158,7 @@ impl ClientCredentialsTasksClient {
                     subscription: Some(subscription), state, ids, deadline, finished: false,
                 })
             }.await)
-        }).await?
+        })).await?
     }
 }
 
