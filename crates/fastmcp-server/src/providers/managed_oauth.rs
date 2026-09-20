@@ -1,0 +1,508 @@
+//! Authenticated, request-owned forwarding of modern core capabilities.
+//!
+//! The application supplies ONE managed upstream login and explicitly registers
+//! the returned handlers. This is service-account delegation, not on-behalf-of
+//! authentication: protect the gateway with its own authorization policy and
+//! register only capabilities that downstream users may exercise with that
+//! login. Incoming credentials and request metadata never become upstream HTTP
+//! headers. The endpoint, refresh policy and credential custody stay inside
+//! `ManagedOAuthSession`.
+//!
+//! Catalogs are collected completely, with the managed client's page, byte,
+//! credential-generation and invalidation bounds, before any handlers are
+//! returned. Registration still belongs to the normal server builder/router.
+//! Each invocation performs exactly one managed core POST on the request-owned
+//! `Cx`; it never holds a route mutex, starts a runtime, or retries a failed
+//! operation. Native response admission, clean finite-SSE EOF, expiry and
+//! cancellation checks remain in the managed client.
+//!
+//! This provider intentionally advertises no reverse-input or extension
+//! capabilities. It forwards complete modern core results only: it does not
+//! claim legacy execution, MRTR or Tasks relay. An unexpected input-required or
+//! extension result is refused, not flattened or automatically replayed.
+//!
+//! ```ignore
+//! use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;
+//! // `login` is an application-provisioned ManagedOAuthSession; `cx` belongs
+//! // to the application's runtime. No token is copied into the server context.
+//! let provider = ManagedOAuthProvider::new(login).with_namespace("upstream")?;
+//! for tool in provider.tools(cx).await? {
+//!     builder = builder.tool(tool);
+//! }
+//! ```
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use asupersync::Cx;
+use fastmcp_client::http_auth::managed::ManagedOAuthSession;
+use fastmcp_client::http_auth::rpc::catalog::{
+    ManagedCatalogClient, ManagedCatalogError, ManagedCatalogLimits,
+};
+use fastmcp_client::http_auth::rpc::{ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
+use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
+use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
+use fastmcp_protocol::protocol_policy::ProtocolEra;
+use fastmcp_protocol::{
+    CompleteResult, Content, CoreRequest, CoreResult, FinalCallToolResult,
+    FinalCoreResult, FinalTool, RequestId, ServerNotification, Tool,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
+    FINAL_PROTOCOL_VERSION_META_KEY,
+};
+use serde_json::{Value, json};
+
+use crate::handler::{
+    BoxFuture, FinalToolOutcome, FinalToolSchemaAuthority, ToolExecutionMode,
+    ToolHandler, UpstreamFinalToolSchemaRegistration,
+};
+
+const UPSTREAM_FAILURE: &str = "Authenticated upstream request failed";
+const UNEXPECTED_RESULT: &str = "Authenticated upstream returned an unsupported result";
+const MODERN_ASYNC_ONLY: &str = "Managed OAuth handlers require modern asynchronous dispatch";
+
+/// An explicitly provisioned upstream and independently bounded catalog/call policies.
+/// Clones share the same login and correlation-ID allocator, not response caches.
+#[derive(Clone)]
+pub struct ManagedOAuthProvider {
+    session: ManagedOAuthSession,
+    forwarder: Arc<Forwarder>,
+    catalog_limits: ManagedCatalogLimits,
+    namespace: Option<String>,
+}
+
+impl ManagedOAuthProvider {
+    /// Construction performs no I/O. Registering the returned handlers delegates
+    /// this login's authority; it does not forward the gateway caller's identity.
+    pub fn new(session: ManagedOAuthSession) -> Self {
+        Self {
+            forwarder: Arc::new(Forwarder {
+                backend: Arc::new(NativeBackend(session.clone())),
+                next_id: Arc::new(AtomicU64::new(1)),
+                limits: ManagedCoreLimits::default(),
+            }),
+            session,
+            catalog_limits: ManagedCatalogLimits::default(),
+            namespace: None,
+        }
+    }
+
+    /// Selects bounds already validated by the managed client. Use this before
+    /// sharing provider clones; existing clones and handlers retain their policy.
+    pub fn with_limits(mut self, calls: ManagedCoreLimits, catalogs: ManagedCatalogLimits) -> Self {
+        self.forwarder = Arc::new(Forwarder {
+            backend: Arc::new(NativeBackend(self.session.clone())),
+            next_id: Arc::clone(&self.forwarder.next_id),
+            limits: calls,
+        });
+        self.catalog_limits = catalogs;
+        self
+    }
+
+    /// Prefixes local tool names, never upstream names or resource URIs.
+    /// Namespace admission happens before catalog or credential acquisition.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> McpResult<Self> {
+        let namespace = namespace.into();
+        if namespace.is_empty() || namespace.len() > 64
+            || !namespace.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(McpError::invalid_params("Invalid managed OAuth provider namespace"));
+        }
+        self.namespace = Some(namespace);
+        Ok(self)
+    }
+
+    /// Collects all tools or returns an error without a partial handler list.
+    /// Schemas and final-only catalog metadata stay exact, including outputSchema.
+    /// No remote advertisement is installed into a router by this method.
+    pub async fn tools(&self, cx: &Cx) -> McpResult<Vec<ManagedOAuthTool>> {
+        let pages = self.catalog(cx, "tools/list").await?;
+        let mut entries = Vec::new();
+        for page in pages {
+            let CoreResult::Final(FinalCoreResult::ToolsList(page)) = page else {
+                return Err(McpError::invalid_request(UNEXPECTED_RESULT));
+            };
+            entries.extend(page.payload.tools);
+        }
+        build_tools(Arc::clone(&self.forwarder), entries, self.namespace.as_deref())
+    }
+
+    async fn catalog(&self, cx: &Cx, method: &str) -> McpResult<Vec<CoreResult>> {
+        check_cx(cx)?;
+        let request = core_request(method, json!({}), None)?;
+        let collector = ManagedCatalogClient::new(self.session.clone(), self.catalog_limits);
+        let collected = collector.collect(
+            cx,
+            request,
+            || self.forwarder.allocate_id().map_err(|_| ManagedCatalogError::AbortedByHost),
+            // No logging/subscription capabilities are advertised. A catalog
+            // changed during materialization must not become a partial snapshot.
+            |_| Err(ManagedCatalogError::AbortedByHost),
+        ).await.map_err(|_| McpError::invalid_request("Authenticated upstream catalog acquisition failed"))?;
+        check_cx(cx)?;
+        Ok(collected.into_pages())
+    }
+}
+
+/// A tool admitted from a fully collected authenticated upstream catalog.
+/// Its private construction prevents an arbitrary local definition from minting
+/// the server's sealed exact-proxy schema registration.
+pub struct ManagedOAuthTool {
+    forwarder: Arc<Forwarder>,
+    upstream_name: String,
+    definition: FinalTool,
+}
+
+impl ManagedOAuthTool {
+    /// The immutable final catalog entry published by this handler.
+    pub fn catalog_definition(&self) -> &FinalTool { &self.definition }
+
+    async fn invoke(&self, ctx: &McpContext, cx: &Cx, arguments: Value)
+        -> McpResult<CompleteResult<FinalCallToolResult>>
+    {
+        let result = self.forwarder.execute(
+            ctx, cx, "tools/call", json!({"name": self.upstream_name, "arguments": arguments}),
+        ).await?;
+        tool_result(result)
+    }
+}
+
+impl ToolHandler for ManagedOAuthTool {
+    // Required legacy registration shape only; no lossy legacy execution is offered.
+    fn definition(&self) -> Tool {
+        Tool {
+            name: self.definition.name.clone(),
+            description: self.definition.description.clone(),
+            input_schema: self.definition.input_schema.clone(),
+            output_schema: self.definition.output_schema.clone(),
+            icon: None, version: None, tags: Vec::new(), annotations: None,
+        }
+    }
+    fn final_definition(&self) -> Option<FinalTool> { Some(self.definition.clone()) }
+    fn final_title(&self) -> Option<&str> { self.definition.title.as_deref() }
+    fn final_icons(&self) -> Option<&[RawIcon]> { self.definition.icons.as_deref() }
+    fn final_metadata(&self) -> Option<&OpenMetadata> { self.definition.meta.as_ref() }
+    fn output_schema(&self) -> Option<Value> { self.definition.output_schema.clone() }
+    fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority { FinalToolSchemaAuthority::Upstream }
+    fn upstream_final_tool_schema_registration(&self) -> Option<UpstreamFinalToolSchemaRegistration> {
+        Some(UpstreamFinalToolSchemaRegistration::exact_proxy())
+    }
+    fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Async }
+    fn call(&self, _ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
+        Err(McpError::invalid_request(MODERN_ASYNC_ONLY))
+    }
+    fn call_final_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
+        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), arguments).await) })
+    }
+    fn call_final_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
+        -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, arguments).await) })
+    }
+    fn call_final_outcome_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
+        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, ctx.cx(), arguments).await.map(FinalToolOutcome::Complete)) })
+    }
+    fn call_final_outcome_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
+        -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
+    {
+        Box::pin(async move { outcome(self.invoke(ctx, cx, arguments).await.map(FinalToolOutcome::Complete)) })
+    }
+}
+
+fn build_tools(forwarder: Arc<Forwarder>, entries: Vec<FinalTool>, namespace: Option<&str>)
+    -> McpResult<Vec<ManagedOAuthTool>>
+{
+    let mut names = HashSet::new();
+    let mut tools = Vec::with_capacity(entries.len());
+    for mut definition in entries {
+        if !names.insert(definition.name.clone()) {
+            return Err(McpError::invalid_request("Authenticated upstream catalog contains duplicate tool names"));
+        }
+        let upstream_name = definition.name.clone();
+        definition.name = published_name(namespace, &upstream_name)?;
+        tools.push(ManagedOAuthTool { forwarder: Arc::clone(&forwarder), upstream_name, definition });
+    }
+    Ok(tools)
+}
+
+fn published_name(namespace: Option<&str>, original: &str) -> McpResult<String> {
+    let name = namespace.map_or_else(|| original.to_owned(), |prefix| format!("{prefix}/{original}"));
+    if name.is_empty() || name.len() > 128 {
+        return Err(McpError::invalid_request("Managed OAuth provider name exceeds its bound"));
+    }
+    Ok(name)
+}
+
+fn core_request(method: &str, mut parameters: Value, progress: Option<Value>) -> McpResult<CoreRequest> {
+    let object = parameters.as_object_mut().ok_or_else(|| McpError::invalid_params("Invalid upstream parameters"))?;
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(FINAL_PROTOCOL_VERSION_META_KEY.to_owned(), json!(FINAL_PROTOCOL_VERSION));
+    metadata.insert(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(), json!({}));
+    if let Some(progress) = progress { metadata.insert("progressToken".to_owned(), progress); }
+    // Replace, never merge, caller metadata. Nested tool arguments remain data.
+    object.insert("_meta".to_owned(), Value::Object(metadata));
+    CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&parameters))
+        .map_err(|_| McpError::invalid_params("Invalid managed OAuth core request"))
+}
+
+struct Forwarder {
+    backend: Arc<dyn CoreBackend>,
+    next_id: Arc<AtomicU64>,
+    limits: ManagedCoreLimits,
+}
+
+impl Forwarder {
+    fn allocate_id(&self) -> McpResult<RequestId> {
+        let id = self.next_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| McpError::internal_error("Managed OAuth request ID space exhausted"))?;
+        Ok(RequestId::String(format!("managed-provider-{id}")))
+    }
+
+    async fn execute(&self, ctx: &McpContext, cx: &Cx, method: &str, parameters: Value)
+        -> McpResult<FinalCoreResult>
+    {
+        ctx.checkpoint()?;
+        check_cx(cx)?;
+        let progress = ctx.progress_marker().map(serde_json::to_value).transpose()
+            .map_err(|_| McpError::invalid_params("Invalid upstream progress marker"))?;
+        let request = core_request(method, parameters, progress)?;
+        let id = self.allocate_id()?;
+        let result = self.backend.execute(ctx, cx, request, id, self.limits).await;
+        // A late success cannot cross either cancellation boundary.
+        check_cx(cx)?;
+        ctx.checkpoint()?;
+        result
+    }
+}
+
+// The production constructor always installs NativeBackend. Test injection is
+// private to this module and cannot grant an application schema bypass.
+trait CoreBackend: Send + Sync {
+    fn execute<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
+        id: RequestId, limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>;
+}
+
+struct NativeBackend(ManagedOAuthSession);
+
+impl CoreBackend for NativeBackend {
+    fn execute<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
+        id: RequestId, limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>
+    {
+        Box::pin(async move {
+            let cancellation = ctx.request_cancellation();
+            let mut call = self.0.request_core_with_cancellation(cx, &cancellation, request, id, limits)
+                .await.map_err(upstream_error)?;
+            while let Some(event) = call.next_event(cx).await.map_err(upstream_error)? {
+                ctx.checkpoint()?;
+                match event {
+                    ManagedCoreEvent::Result(result) => return match *result {
+                        CoreResult::Final(result) => Ok(result),
+                        _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+                    },
+                    ManagedCoreEvent::Notification(notification) => forward_notification(ctx, *notification)?,
+                }
+            }
+            Err(McpError::invalid_request(UNEXPECTED_RESULT))
+        })
+    }
+}
+
+fn forward_notification(ctx: &McpContext, notification: ServerNotification) -> McpResult<()> {
+    let ServerNotification::Progress(progress) = notification else {
+        // No log-level or subscription metadata was advertised. Never relay an
+        // unsolicited log containing the upstream service account's private data.
+        return Err(McpError::invalid_request("Unexpected authenticated upstream notification"));
+    };
+    let exact = |value| serde_json::to_value(value).and_then(serde_json::from_value::<serde_json::Number>)
+        .map_err(|_| McpError::invalid_request("Invalid upstream progress number"));
+    let amount = exact(progress.progress)?;
+    let total = progress.total.map(exact).transpose()?;
+    ctx.report_progress_exact(amount, total, progress.message.as_deref());
+    Ok(())
+}
+
+fn upstream_error(error: ManagedCoreError) -> McpError {
+    match error {
+        ManagedCoreError::Cancelled | ManagedCoreError::TimedOut => McpError::request_cancelled(),
+        _ => McpError::invalid_request(UPSTREAM_FAILURE),
+    }
+}
+fn tool_result(result: FinalCoreResult) -> McpResult<CompleteResult<FinalCallToolResult>> {
+    match result {
+        FinalCoreResult::ToolsCall(result) => Ok(result),
+        _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+    }
+}
+fn check_cx(cx: &Cx) -> McpResult<()> {
+    cx.checkpoint().map_err(|_| McpError::request_cancelled())
+}
+fn outcome<T>(result: McpResult<T>) -> McpOutcome<T> {
+    match result { Ok(value) => Outcome::Ok(value), Err(error) => Outcome::Err(error) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use fastmcp_core::block_on;
+    use fastmcp_protocol::ResultMeta;
+
+    struct Backend {
+        calls: Mutex<Vec<(RequestId, Value)>>,
+        responses: Mutex<VecDeque<FinalCoreResult>>,
+        cancel_on_return: bool,
+    }
+    impl CoreBackend for Backend {
+        fn execute<'a>(&'a self, ctx: &'a McpContext, _cx: &'a Cx, request: CoreRequest,
+            id: RequestId, _limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>
+        {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((id, request.encode_params().unwrap().unwrap()));
+                if self.cancel_on_return { ctx.request_cancellation().cancel(); }
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| McpError::internal_error("test backend exhausted"))
+            })
+        }
+    }
+    fn definition() -> FinalTool {
+        serde_json::from_value(json!({
+            "name":"lookup", "title":"Exact title", "description":"Remote tool",
+            "inputSchema":{"type":"object","properties":{"key":{"type":"string"}}},
+            "outputSchema":{"type":"object","properties":{"answer":{"type":"integer"}}},
+            "annotations":{"title":"Annotation title","readOnlyHint":true},
+            "_meta":{"com.example/source":{"revision":7}}
+        })).unwrap()
+    }
+    fn response(error: bool) -> FinalCoreResult {
+        FinalCoreResult::ToolsCall(CompleteResult::new(FinalCallToolResult {
+            content: Vec::new(), is_error: error, structured_content: Some(json!({"answer":42})),
+        }, ResultMeta::empty()))
+    }
+    fn fixture(responses: Vec<FinalCoreResult>, cancel: bool) -> (ManagedOAuthTool, Arc<Backend>) {
+        let backend = Arc::new(Backend { calls: Mutex::new(Vec::new()), responses: Mutex::new(responses.into()), cancel_on_return: cancel });
+        let forwarder = Arc::new(Forwarder { backend: backend.clone(), next_id: Arc::new(AtomicU64::new(1)), limits: ManagedCoreLimits::default() });
+        let tool = build_tools(forwarder, vec![definition()], Some("remote")).unwrap().pop().unwrap();
+        (tool, backend)
+    }
+
+    #[test]
+    fn authenticated_tool_keeps_exact_catalog_and_upstream_schema_authority() {
+        let (tool, _) = fixture(vec![], false);
+        let mut expected = definition();
+        expected.name = "remote/lookup".to_owned();
+        assert_eq!(serde_json::to_value(tool.final_definition().unwrap()).unwrap(), serde_json::to_value(expected).unwrap());
+        assert!(tool.upstream_final_tool_schema_registration().is_some());
+        assert_eq!(tool.execution_mode(), ToolExecutionMode::Async);
+        assert!(!tool.declares_final_tasks());
+        assert!(!tool.declares_final_mrtr());
+    }
+
+    #[test]
+    fn owned_tool_call_rewrites_only_the_name_and_preserves_structured_result() {
+        let (tool, backend) = fixture(vec![response(false)], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let result = block_on(tool.call_final_async_in_request(&ctx, &cx, json!({"key":"abc","_meta":{"user_data":true}}))).unwrap();
+        assert_eq!(result.payload.structured_content, Some(json!({"answer":42})));
+        assert!(!result.payload.is_error);
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["name"], "lookup");
+        assert_eq!(calls[0].1["arguments"]["_meta"], json!({"user_data":true}));
+        assert_eq!(calls[0].1["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
+    }
+
+    #[test]
+    fn tool_error_result_is_not_converted_to_success_or_retried() {
+        let (tool, backend) = fixture(vec![response(true)], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let result = block_on(tool.call_final_async_in_request(&ctx, &cx, json!({}))).unwrap();
+        assert!(result.payload.is_error);
+        assert_eq!(result.payload.structured_content, Some(json!({"answer":42})));
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn metadata_is_rebuilt_instead_of_forwarding_credentials_or_extensions() {
+        let request = core_request("tools/call", json!({"name":"lookup","arguments":{},"_meta":{
+            "authorization":"Bearer secret", "io.modelcontextprotocol/clientCapabilities":{"extensions":{"evil":{}}}
+        }}), None).unwrap();
+        let params = request.encode_params().unwrap().unwrap();
+        assert_eq!(params["_meta"].as_object().unwrap().len(), 2);
+        assert!(!serde_json::to_string(&params).unwrap().contains("secret"));
+        assert_eq!(params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
+    }
+
+    #[test]
+    fn malformed_arguments_never_enter_the_backend() {
+        let (tool, backend) = fixture(vec![response(false)], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        assert!(block_on(tool.call_final_async_in_request(&ctx, &cx, json!([1,2]))).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_dispatch_never_enters_the_backend() {
+        let (tool, backend) = fixture(vec![response(false)], false);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        ctx.request_cancellation().cancel();
+        assert!(block_on(tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_success_is_refused_after_request_cancellation() {
+        let (tool, backend) = fixture(vec![response(false)], true);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        assert!(block_on(tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_err());
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_calls_do_not_start_modern_network_work() {
+        let (tool, backend) = fixture(vec![response(false)], false);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        assert!(tool.call(&ctx, json!({})).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_catalog_entries_are_refused_without_partial_handlers() {
+        let (tool, backend) = fixture(vec![], false);
+        assert!(build_tools(tool.forwarder, vec![definition(), definition()], None).is_err());
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_ids_are_unique_and_exhaustion_never_wraps() {
+        let (tool, _) = fixture(vec![], false);
+        let first = tool.forwarder.allocate_id().unwrap();
+        let second = tool.forwarder.allocate_id().unwrap();
+        assert!(!first.correlates_with(&second));
+        tool.forwarder.next_id.store(u64::MAX, Ordering::Relaxed);
+        assert!(tool.forwarder.allocate_id().is_err());
+        assert_eq!(tool.forwarder.next_id.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn oversized_names_are_rejected_instead_of_truncated() {
+        assert!(published_name(Some("namespace"), &"x".repeat(128)).is_err());
+        assert_eq!(published_name(Some("ns"), "tool").unwrap(), "ns/tool");
+        assert!(published_name(None, "").is_err());
+    }
+
+    #[test]
+    fn upstream_failures_are_redacted() {
+        let message = upstream_error(ManagedCoreError::InvalidResponse).to_string();
+        assert!(message.contains(UPSTREAM_FAILURE));
+        assert!(!message.contains("token"));
+    }
+}

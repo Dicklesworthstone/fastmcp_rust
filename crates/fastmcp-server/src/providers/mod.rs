@@ -12,6 +12,8 @@
 //!   `ui://` HTML document for a negotiated MCP Apps View.
 //! - [`RegisteredSchemaTool`]: a tool using explicitly provisioned schema
 //!   resources through the router's normal input/output validation path.
+//! - With the `proxy` feature, `managed_oauth::ManagedOAuthProvider`: bounded,
+//!   authenticated modern upstream catalogs and request-owned forwarding.
 //!
 //! # Example
 //!
@@ -33,6 +35,10 @@ mod filesystem;
 #[cfg(feature = "apps")]
 mod mcp_apps;
 mod schema_tool;
+
+/// Authenticated, request-owned modern core forwarding using a managed login.
+#[cfg(feature = "proxy")]
+pub mod managed_oauth;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
 #[cfg(feature = "apps")]
