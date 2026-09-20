@@ -165,8 +165,8 @@ fn machine_watch_public_precancellation_and_owner_close_never_acquire_a_grant() 
             let client=consumer();
             let cancel=McpRequestCancellation::new();
             if closed { client.client.close(); } else { cancel.cancel(); }
-            let result=client.watch_tasks_with_cancellation(&cx,&cancel,vec![id("one")],"test".to_owned(),
-                ClientCredentialsTaskWatchPolicy::default()).await;
+            let result=Box::pin(client.watch_tasks_with_cancellation(&cx,&cancel,vec![id("one")],"test".to_owned(),
+                ClientCredentialsTaskWatchPolicy::default())).await;
             if closed {
                 assert!(matches!(result,Err(ClientCredentialsTaskWatchError::Task(ClientCredentialsTasksError::Authentication(ClientCredentialsError::Closed)))));
             } else {
@@ -181,9 +181,9 @@ fn machine_watch_public_invalid_selection_is_rejected_before_network_work() {
     runtime().block_on(async {
         let cx=Cx::current().unwrap();
         let client=consumer();
-        assert!(matches!(client.watch_tasks(&cx,vec![],"test".to_owned(),ClientCredentialsTaskWatchPolicy::default()).await,
+        assert!(matches!(Box::pin(client.watch_tasks(&cx,vec![],"test".to_owned(),ClientCredentialsTaskWatchPolicy::default())).await,
             Err(ClientCredentialsTaskWatchError::InvalidSelection)));
-        assert!(matches!(client.watch_tasks(&cx,vec![id("one")],"bad:prefix".to_owned(),ClientCredentialsTaskWatchPolicy::default()).await,
+        assert!(matches!(Box::pin(client.watch_tasks(&cx,vec![id("one")],"bad:prefix".to_owned(),ClientCredentialsTaskWatchPolicy::default())).await,
             Err(ClientCredentialsTaskWatchError::InvalidIdPrefix)));
         assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
     });
