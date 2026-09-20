@@ -625,9 +625,23 @@ mod tests {
         })).unwrap()
     }
     fn response(error: bool) -> FinalCoreResult {
-        FinalCoreResult::ToolsCall { result: CompleteResult::new(FinalCallToolResult {
-            content: Vec::new(), is_error: error, structured_content: Some(json!({"answer":42})),
-        }, ResultMeta::empty()), diagnostic: None }
+        // Struct variant, third instance of the sibling-enum shape carry-over.
+        // CONSTRUCTION, not a pattern: `diagnostic` needs a VALUE here, so the
+        // `diagnostic: _` used at the two match sites does not apply. `None` is
+        // the in-tree idiom for "no peer diagnostic" (fastmcp-client/src/lib.rs
+        // :39172, :39415) and this canned test response exercises no diagnostic
+        // path -- it preserves the behaviour the tuple form had.
+        FinalCoreResult::ToolsCall {
+            result: CompleteResult::new(
+                FinalCallToolResult {
+                    content: Vec::new(),
+                    is_error: error,
+                    structured_content: Some(json!({"answer":42})),
+                },
+                ResultMeta::empty(),
+            ),
+            diagnostic: None,
+        }
     }
     fn fixture(responses: Vec<FinalCoreResult>, cancel: bool) -> (ManagedOAuthTool, Arc<Backend>) {
         let backend = Arc::new(Backend { calls: Mutex::new(Vec::new()), responses: Mutex::new(responses.into()), cancel_on_return: cancel });
