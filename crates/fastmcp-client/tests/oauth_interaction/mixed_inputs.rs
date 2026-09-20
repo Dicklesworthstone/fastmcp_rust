@@ -187,8 +187,8 @@ fn run_mixed(case: MixedCase) {
                 let client = client.unwrap();
                 expected["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"] = json!({CLIENT_CREDENTIALS_EXTENSION:{}});
                 let server = async {grant(&peer).await;round(&peer,60,MIXED).await};
-                let (wire,operation) = pair(server,client.start_core_interaction_with_cancellation(
-                    &cx,&cancellation,request.clone(),RequestId::Number(60),RequestId::Number(61),limits)).await;
+                let (wire,operation) = Box::pin(pair(server,client.start_core_interaction_with_cancellation(
+                    &cx,&cancellation,request.clone(),RequestId::Number(60),RequestId::Number(61),limits))).await;
                 assert_eq!(wire["params"],expected);
                 let mut operation = operation.unwrap();
                 challenge(&mut operation,&cx).await;
@@ -201,8 +201,8 @@ fn run_mixed(case: MixedCase) {
                         RequestId::Number(63),CoreInputLimits::default(),&mut host).await.unwrap()
                 };
                 let responses = reply.input_responses.unwrap();
-                let (wire,resumed) = pair(round(&peer,62,if partial {REMAINING} else {complete(method)}),
-                    operation.resume_partial(&cx,RequestId::Number(62),reply.request_id,responses.clone())).await;
+                let (wire,resumed) = Box::pin(pair(round(&peer,62,if partial {REMAINING} else {complete(method)}),
+                    operation.resume_partial(&cx,RequestId::Number(62),reply.request_id,responses.clone()))).await;
                 resumed.unwrap();
                 assert_reply(&wire,&expected,"first+/%",&responses);
                 if partial {
@@ -212,8 +212,8 @@ fn run_mixed(case: MixedCase) {
                         RequestId::Number(65),CoreInputLimits::default(),&mut host).await.unwrap();
                     let responses = reply.input_responses.unwrap();
                     assert!(responses.get("a/form").is_none());
-                    let (wire,resumed) = pair(round(&peer,64,complete(method)),operation.resume(
-                        &cx,RequestId::Number(64),reply.request_id,Some(responses.clone()))).await;
+                    let (wire,resumed) = Box::pin(pair(round(&peer,64,complete(method)),operation.resume(
+                        &cx,RequestId::Number(64),reply.request_id,Some(responses.clone())))).await;
                     resumed.unwrap();
                     assert_reply(&wire,&expected,"successor+/%",&responses);
                 }
@@ -222,11 +222,11 @@ fn run_mixed(case: MixedCase) {
                 assert_eq!(peer.posts.load(Ordering::SeqCst),if partial {6} else {4});
                 client.close();
             } else {
-                let ((),session) = pair(peer.login(),ManagedOAuthSession::authorize(
-                    &cx,peer.client(),OAuthSessionPolicy::default(),browser)).await;
+                let ((),session) = Box::pin(pair(peer.login(),ManagedOAuthSession::authorize(
+                    &cx,peer.client(),OAuthSessionPolicy::default(),browser))).await;
                 let session = session.unwrap();
-                let (wire,operation) = pair(peer.response(41,MIXED),session.start_core_interaction_with_cancellation(
-                    &cx,&cancellation,request.clone(),RequestId::Number(41),limits)).await;
+                let (wire,operation) = Box::pin(pair(peer.response(41,MIXED),session.start_core_interaction_with_cancellation(
+                    &cx,&cancellation,request.clone(),RequestId::Number(41),limits))).await;
                 assert_eq!(wire["params"],expected);
                 let mut operation = operation.unwrap();
                 pending(&mut operation,&cx).await;
@@ -269,15 +269,15 @@ fn run_mixed(case: MixedCase) {
                             assert_reply(&wire,&expected,"first+/%",&responses);
                             drop(socket); // The server consumed the continuation, but its reply was lost.
                         };
-                        let ((),resumed)=pair(server,operation.resume(&cx,reply.request_id,Some(responses.clone()))).await;
+                        let ((),resumed)=Box::pin(pair(server,operation.resume(&cx,reply.request_id,Some(responses.clone())))).await;
                         if resumed.is_ok() { assert!(operation.next_event(&cx).await.is_err()); }
                         assert!(operation.pending_input().is_none());
                         assert!(matches!(operation.resume(&cx,RequestId::Number(43),Some(responses)).await,Err(ManagedInteractionError::Closed)));
                         assert_effects(&host,false);
                         assert_eq!(peer.posts.load(Ordering::SeqCst),2);
                     } else {
-                        let (wire,resumed)=pair(peer.response(42,if partial {REMAINING} else {complete(method)}),
-                            operation.resume_partial(&cx,reply.request_id,responses.clone())).await;
+                        let (wire,resumed)=Box::pin(pair(peer.response(42,if partial {REMAINING} else {complete(method)}),
+                            operation.resume_partial(&cx,reply.request_id,responses.clone()))).await;
                         resumed.unwrap();
                         assert_reply(&wire,&expected,"first+/%",&responses);
                         if partial {
@@ -287,8 +287,8 @@ fn run_mixed(case: MixedCase) {
                                 RequestId::Number(43),CoreInputLimits::default(),&mut host).await.unwrap();
                             let responses=reply.input_responses.unwrap();
                             assert!(responses.get("a/form").is_none());
-                            let (wire,resumed)=pair(peer.response(43,complete(method)),
-                                operation.resume(&cx,reply.request_id,Some(responses.clone()))).await;
+                            let (wire,resumed)=Box::pin(pair(peer.response(43,complete(method)),
+                                operation.resume(&cx,reply.request_id,Some(responses.clone())))).await;
                             resumed.unwrap();
                             assert_reply(&wire,&expected,"successor+/%",&responses);
                         }
