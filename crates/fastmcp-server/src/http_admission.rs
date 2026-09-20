@@ -33,6 +33,8 @@
 //! Bounds are caller-supplied with no ambient defaults: the frozen central
 //! ceilings must be wired explicitly by the integration layer.
 
+mod accept;
+
 /// Origin-bound ingress and browser preflight before protocol admission.
 pub mod security;
 
@@ -460,87 +462,13 @@ fn is_singleton_identity_coding(value: &str) -> bool {
     semantic_codings == 1
 }
 
-/// Selects JSON when JSON is acceptable, SSE only when SSE is acceptable,
-/// and rejects when neither representation is. A request with no `Accept`
-/// field accepts every representation and selects JSON. Media ranges that
-/// cannot be parsed grant no acceptance.
+/// Select the highest-quality offered representation after applying media-range
+/// specificity. JSON wins ties and remains the default when Accept is absent.
+/// Invalid syntax never grants acceptance through a wildcard or quoted value.
 fn negotiate_representation(
     headers: &[(String, String)],
 ) -> Result<ResponseRepresentation, ModernPostRejection> {
-    let mut members = 0_usize;
-    let mut saw_accept_header = false;
-    let mut json_acceptable = false;
-    let mut sse_acceptable = false;
-    for (name, value) in headers {
-        if !name.eq_ignore_ascii_case("accept") {
-            continue;
-        }
-        saw_accept_header = true;
-        for member in value.split(',') {
-            let member = trim_http_ows(member);
-            if member.is_empty() {
-                continue;
-            }
-            members += 1;
-            if members > MAX_ACCEPT_MEMBERS {
-                return Err(ModernPostRejection::NotAcceptable);
-            }
-            let mut parameters = member.split(';');
-            let Some(essence) = parameters.next().map(trim_http_ows) else {
-                continue;
-            };
-            if media_range_weight_is_zero(parameters) {
-                continue;
-            }
-            if matches_media_range(essence, "application", "json") {
-                json_acceptable = true;
-            }
-            if matches_media_range(essence, "text", "event-stream") {
-                sse_acceptable = true;
-            }
-        }
-    }
-    if !saw_accept_header {
-        return Ok(ResponseRepresentation::Json);
-    }
-    if json_acceptable {
-        return Ok(ResponseRepresentation::Json);
-    }
-    if sse_acceptable {
-        return Ok(ResponseRepresentation::RequestScopedSse);
-    }
-    Err(ModernPostRejection::NotAcceptable)
-}
-
-/// `true` when a `q` parameter is present and denotes zero weight.
-fn media_range_weight_is_zero<'a>(parameters: impl Iterator<Item = &'a str>) -> bool {
-    for parameter in parameters {
-        let Some((name, value)) = trim_http_ows(parameter).split_once('=') else {
-            continue;
-        };
-        if !trim_http_ows(name).eq_ignore_ascii_case("q") {
-            continue;
-        }
-        let value = trim_http_ows(value);
-        let mut chars = value.chars();
-        if chars.next() != Some('0') {
-            return false;
-        }
-        let rest = chars.as_str();
-        let fraction = rest.strip_prefix('.').unwrap_or(rest);
-        return fraction.len() <= 3 && fraction.chars().all(|digit| digit == '0');
-    }
-    false
-}
-
-fn matches_media_range(essence: &str, wanted_type: &str, wanted_subtype: &str) -> bool {
-    let Some((range_type, range_subtype)) = essence.split_once('/') else {
-        return false;
-    };
-    let range_type = trim_http_ows(range_type);
-    let range_subtype = trim_http_ows(range_subtype);
-    (range_type == "*" || range_type.eq_ignore_ascii_case(wanted_type))
-        && (range_subtype == "*" || range_subtype.eq_ignore_ascii_case(wanted_subtype))
+    accept::negotiate_representation(headers)
 }
 
 fn body_protocol_version(request: &JsonRpcRequest) -> Option<&str> {
