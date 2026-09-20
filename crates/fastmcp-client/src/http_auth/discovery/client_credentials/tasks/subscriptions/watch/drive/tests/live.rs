@@ -233,7 +233,7 @@ fn run(case: Case) {
             let application = async {
                 if watching {
                     let ids = serde_json::from_value(selected.clone()).unwrap();
-                    let opened = client.watch_tasks(&cx,ids,"watch".to_owned(),watch_policy).await;
+                    let opened = Box::pin(client.watch_tasks(&cx,ids,"watch".to_owned(),watch_policy)).await;
                     if matches!(case,Case::PartialAck) {
                         assert!(matches!(opened,Err(ClientCredentialsTaskWatchError::IncompleteAcknowledgement)));
                         return;
@@ -263,7 +263,7 @@ fn run(case: Case) {
                     if matches!(case,Case::ObservationOnly) {0} else {8},8,4096).unwrap();
                 let mut resolutions = 0;
                 let mut snapshots = 0;
-                let result = client.drive_task_watching_with_cancellation(&cx,&cancel,TaskId::parse("one").unwrap(),"drive".to_owned(),policy,
+                let result = Box::pin(client.drive_task_watching_with_cancellation(&cx,&cancel,TaskId::parse("one").unwrap(),"drive".to_owned(),policy,
                     |pending| {
                         assert!(!matches!(case,Case::ObservationOnly));
                         resolutions += 1;
@@ -273,7 +273,7 @@ fn run(case: Case) {
                         if resolutions == 2 { assert!(!pending.contains_key("one")); }
                         if matches!(case,Case::CancelResolver) { cancel.cancel(); }
                         std::future::ready(Ok(ManagedTaskInputAction::Respond(answers(json!({key:{"roots":[]}})))))
-                    }, |_| { snapshots += 1; Ok(()) }).await;
+                    }, |_| { snapshots += 1; Ok(()) })).await;
                 match case {
                     Case::PartialInputs => {
                         assert!(matches!(result,Ok(ManagedTaskRunOutcome::Terminal(task)) if matches!(*task,Task::Cancelled(_))));
@@ -292,7 +292,7 @@ fn run(case: Case) {
                     _ => unreachable!(),
                 }
             };
-            pair(server,application).await;
+            Box::pin(pair(server,application)).await;
             assert_eq!(peer.updates.load(Ordering::SeqCst), match case { Case::PartialInputs=>2,Case::RejectUpdate=>1,_=>0 });
         };
         asupersync::time::timeout_at(cx.now().saturating_add_nanos(15_000_000_000),Box::pin(scenario)).await.unwrap();
