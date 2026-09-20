@@ -205,7 +205,9 @@ impl TransformedTool {
 
         let mut result = serde_json::Map::new();
 
-        // Apply transformations
+        // Consume published names before discarding original-name aliases.
+        // An original name can also be another argument's published name in
+        // swaps or chains (a -> b, b -> c). Values move without cloning.
         for (original_name, transform) in &self.arg_transforms {
             let new_name = transform.name.as_ref().unwrap_or(original_name);
 
@@ -214,8 +216,6 @@ impl TransformedTool {
                 // under the published name or the original name must not
                 // override the configured default, and cannot substitute for
                 // a missing one.
-                args.remove(new_name);
-                args.remove(original_name);
                 if let Some(default) = &transform.default {
                     result.insert(original_name.clone(), default.clone());
                     continue;
@@ -230,19 +230,13 @@ impl TransformedTool {
             } else if let Some(default) = &transform.default {
                 result.insert(original_name.clone(), default.clone());
             }
-            // A caller who still sends the original name after a rename must
-            // not overwrite the mapped value in the leftover-args pass.
-            if new_name != original_name {
-                args.remove(original_name);
-            }
         }
 
-        // Pass through any remaining arguments that weren't transformed
+        // Only unrelated arguments pass through. Original names and aliases
+        // are owned by the transformation above: neither may overwrite a
+        // mapped value or a server-owned hidden default.
         for (key, value) in args {
-            // Check if this key maps back to an original name
-            if let Some(original) = self.name_mapping.get(&key) {
-                result.insert(original.clone(), value);
-            } else {
+            if !self.arg_transforms.contains_key(&key) && !self.name_mapping.contains_key(&key) {
                 result.insert(key, value);
             }
         }
@@ -723,6 +717,126 @@ mod tests {
     use fastmcp_core::block_on;
     use fastmcp_protocol::Content;
     use fastmcp_protocol::common_types::ContentBlock;
+
+    #[test]
+    fn regression_argument_name_swap_is_simultaneous() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("swap"))
+            .rename_arg("q", "n")
+            .rename_arg("n", "q")
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({"n": "query", "q": 7}))
+                .unwrap(),
+            serde_json::json!({"q": "query", "n": 7})
+        );
+    }
+
+    #[test]
+    fn regression_argument_rename_chain_preserves_both_inputs() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("chain"))
+            .rename_arg("q", "n")
+            .rename_arg("n", "limit")
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({
+                "n": "query", "limit": 7, "q": "stale alias", "extra": false
+            }))
+            .unwrap(),
+            serde_json::json!({"q": "query", "n": 7, "extra": false})
+        );
+    }
+
+    #[test]
+    fn regression_argument_three_cycle_preserves_all_values() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("cycle"))
+            .rename_arg("a", "b")
+            .rename_arg("b", "c")
+            .rename_arg("c", "a")
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({"a": 3, "b": 1, "c": 2}))
+                .unwrap(),
+            serde_json::json!({"a": 1, "b": 2, "c": 3})
+        );
+    }
+
+    #[test]
+    fn regression_hidden_original_name_can_be_a_visible_alias() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("hidden"))
+            .rename_arg("q", "n")
+            .hide_arg("n", 10)
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({"n": "query", "q": "stale"}))
+                .unwrap(),
+            serde_json::json!({"q": "query", "n": 10})
+        );
+    }
+
+    #[test]
+    fn regression_hidden_alias_cannot_override_its_default() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("hidden"))
+            .transform_arg("n", ArgTransform::new().name("limit").default(10).hide())
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({
+                "q": "query", "n": 900, "limit": 800, "extra": 0
+            }))
+            .unwrap(),
+            serde_json::json!({"q": "query", "n": 10, "extra": 0})
+        );
+    }
+
+    #[test]
+    fn regression_swap_preserves_present_null_and_falsy_values() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("values"))
+            .transform_arg("q", ArgTransform::new().name("n").default("fallback"))
+            .transform_arg("n", ArgTransform::new().name("q").default(99))
+            .build();
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(""),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                tool.transform_arguments(serde_json::json!({"n": value.clone(), "q": 0}))
+                    .unwrap(),
+                serde_json::json!({"q": value, "n": 0})
+            );
+        }
+    }
+
+    #[test]
+    fn regression_chain_defaults_only_replace_absent_published_values() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("defaults"))
+            .transform_arg("q", ArgTransform::new().name("n").default("fallback"))
+            .transform_arg("n", ArgTransform::new().name("limit").default(10))
+            .build();
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({"n": "query"}))
+                .unwrap(),
+            serde_json::json!({"q": "query", "n": 10})
+        );
+        assert_eq!(
+            tool.transform_arguments(serde_json::Value::Null).unwrap(),
+            serde_json::json!({"q": "fallback", "n": 10})
+        );
+    }
+
+    #[test]
+    fn regression_hidden_argument_still_requires_a_server_default() {
+        let tool = TransformedTool::from_tool(SearchToolFixture::new("missing-default"))
+            .transform_arg("n", ArgTransform::new().name("limit").hide())
+            .build();
+        assert!(
+            tool.transform_arguments(serde_json::json!({"n": 1, "limit": 2}))
+                .is_err()
+        );
+        assert!(tool.transform_arguments(serde_json::json!([1, 2])).is_err());
+    }
 
     struct SearchToolFixture {
         name: String,
