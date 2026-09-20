@@ -442,10 +442,10 @@ fn run(case: Case) {
             }
             if matches!(case, Case::WrongResource | Case::UntrustedIssuer | Case::MissingHintDocument | Case::RedirectHint | Case::InvalidMetadata) {
                 let launched = AtomicUsize::new(0);
-                let ((), result) = pair(peer.metadata(case, &peer.resource(), &peer.issuer()),
+                let ((), result) = Box::pin(pair(peer.metadata(case, &peer.resource(), &peer.issuer()),
                     plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| async {
                         launched.fetch_add(1, Ordering::SeqCst); Err(OAuthError::BrowserLaunchFailed)
-                    })).await;
+                    }))).await;
                 let error = result.unwrap_err();
                 match case {
                     Case::WrongResource => assert!(matches!(error, Error::Discovery(OAuthDiscoveryError::ResourceMismatch))),
@@ -470,7 +470,7 @@ fn run(case: Case) {
                     session.close();
                     assert!(credential.credential().authorization_for_target(&peer.resource()).is_none());
                 };
-                pair(server, application).await;
+                Box::pin(pair(server, application)).await;
                 assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
                 assert_eq!(peer.probes.load(Ordering::SeqCst), 1, "explicit login never repeats the original resource POST");
             } else {
