@@ -65,17 +65,17 @@ fn run_driver(case: DriverCase) {
         let cx = Cx::current().unwrap();
         let scenario = async {
             let peer = Peer::new().await;
-            let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(
+            let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(
                 &cx, peer.client(), OAuthSessionPolicy::default(), browser,
-            )).await;
+            ))).await;
             let session = session.unwrap();
             let cancellation = McpRequestCancellation::new();
             let timeout = if matches!(case, DriverCase::Timeout) { Duration::from_secs(1) } else { Duration::from_secs(15) };
             let core_limits = ManagedCoreLimits::new(4096, 4096, 16384, 8, timeout).unwrap();
             let limits = ManagedInteractionLimits::new(core_limits, 2, 2).unwrap();
-            let (_, operation) = pair(peer.response(41, FIRST), session.start_core_interaction_with_cancellation(
+            let (_, operation) = Box::pin(pair(peer.response(41, FIRST), session.start_core_interaction_with_cancellation(
                 &cx, &cancellation, core("tools/call", true), RequestId::Number(41), limits,
-            )).await;
+            ))).await;
             let mut operation = operation.unwrap();
             // Demonstrate handing a manually observed challenge to the driver.
             pending(&mut operation, &cx).await;
@@ -114,7 +114,7 @@ fn run_driver(case: DriverCase) {
                         release.take().unwrap().send(&cx, ()).unwrap();
                         Ok(())
                     });
-                    let ((), result) = pair(server, driven).await;
+                    let ((), result) = Box::pin(pair(server, driven)).await;
                     assert!(result.unwrap().encode().unwrap().contains("1.20e+4"));
                     assert_eq!(calls.get(), 2);
                     assert_eq!(notifications.get(), 1);
@@ -182,7 +182,7 @@ fn run_driver(case: DriverCase) {
             assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
             session.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await
             .expect("resolver fixture must settle within its bound");
     });
 }
