@@ -5087,10 +5087,10 @@ pub mod modern {
             client_info: ClientInfo,
             client_capabilities: ClientCapabilities,
         ) -> Result<Self, HttpClientConnectError> {
-            ClientBuilder::new()
+            Box::pin(ClientBuilder::new()
                 .client_info(client_info.name, client_info.version)
                 .capabilities(client_capabilities)
-                .connect_http_with_cx(endpoint, cx)
+                .connect_http_with_cx(endpoint, cx))
                 .await
         }
 
