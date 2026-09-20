@@ -230,10 +230,10 @@ fn run_watch(case: WatchCase) {
                     let mut params = request(method).encode_params().unwrap().unwrap();
                     params["cursor"] = json!("");
                     let suffix = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap();
-                    assert!(matches!(client.watch(&cx, suffix, watch_limits, || panic!("no IDs before preflight"), |_| Ok(Control::Stop)).await, Err(WatchError::CursorNotAllowed)));
-                    assert!(matches!(client.watch(&cx, core("tools/call", false), watch_limits, || panic!("no IDs for non-catalog"), |_| Ok(Control::Stop)).await, Err(WatchError::Catalog(ManagedCatalogError::NotCatalog))));
+                    assert!(matches!(Box::pin(client.watch(&cx, suffix, watch_limits, || panic!("no IDs before preflight"), |_| Ok(Control::Stop))).await, Err(WatchError::CursorNotAllowed)));
+                    assert!(matches!(Box::pin(client.watch(&cx, core("tools/call", false), watch_limits, || panic!("no IDs for non-catalog"), |_| Ok(Control::Stop))).await, Err(WatchError::Catalog(ManagedCatalogError::NotCatalog))));
                     cancellation.cancel();
-                    assert!(client.watch_with_cancellation(&cx, &cancellation, request(method), watch_limits, || panic!("no IDs after cancellation"), |_| Ok(Control::Stop)).await.is_err());
+                    assert!(Box::pin(client.watch_with_cancellation(&cx, &cancellation, request(method), watch_limits, || panic!("no IDs after cancellation"), |_| Ok(Control::Stop))).await.is_err());
                     return;
                 }
                 let mut watching = Box::pin(client.watch_with_cancellation(&cx, &cancellation, request(method), watch_limits,
@@ -338,7 +338,7 @@ fn run_watch(case: WatchCase) {
             assert_eq!(peer.tokens.load(Ordering::SeqCst), 1);
             peer.quiet(); // No automatic resubscribe, refresh or arbitrary retry.
             if matches!(case, WatchCase::ScopedCache) {
-                let cached = client.collect(&cx, request("prompts/list"), || panic!("unrelated catalog was not cleared"), |_| Ok(())).await.unwrap();
+                let cached = Box::pin(client.collect(&cx, request("prompts/list"), || panic!("unrelated catalog was not cleared"), |_| Ok(()))).await.unwrap();
                 assert_eq!(cached.item_count(), 1);
             }
             if matches!(case, WatchCase::Live | WatchCase::Terminal | WatchCase::Drop) {
