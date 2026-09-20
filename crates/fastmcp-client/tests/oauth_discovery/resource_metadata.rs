@@ -221,7 +221,7 @@ fn both_failures_remain_ordered_redacted_and_cannot_invoke_login() {
             launches.fetch_add(1, Ordering::SeqCst);
             async { Err(OAuthError::BrowserLaunchFailed) }
         });
-        let ((), result) = pair(server, application).await;
+        let ((), result) = Box::pin(pair(server, application)).await;
         let error = result.err().unwrap();
         let diagnostics = format!("{error:?} {error}");
         assert!(!diagnostics.contains("secret") && !diagnostics.contains("https://"));
@@ -310,7 +310,7 @@ fn explicit_hint_failure_cannot_use_constructed_fallback_but_no_hint_can() {
                 peer.serve(if explicit { "/hint" } else { PATH }, 503, "").await;
                 if !explicit { root_and_issuer(&peer).await; }
             };
-            let ((), result) = pair(server, plan.discover(&cx)).await;
+            let ((), result) = Box::pin(pair(server, plan.discover(&cx))).await;
             if explicit {
                 assert!(matches!(result, Err(OAuthChallengeError::Discovery(OAuthDiscoveryError::HttpStatus { status: 503 }))));
                 assert_eq!(*peer.paths.lock().unwrap(), ["/hint"]);
@@ -374,7 +374,7 @@ fn machine_authentication_uses_root_metadata_without_a_browser_or_secret_on_get(
             assert_eq!(snapshot.credential().authorization_for_target(client.resource()), Some("Bearer root-service-token".to_owned()));
             client.close();
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(*peer.paths.lock().unwrap(), [PATH, ROOT_PATH, ISSUER_PATH, "/token"]);
         peer.assert_no_extra_connections();
     });
