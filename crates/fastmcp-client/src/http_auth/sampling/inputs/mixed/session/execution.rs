@@ -257,11 +257,11 @@ where H: CoreInputHost + ?Sized,
         .map_err(CoreInputSessionError::from)?;
     inputs.deadline = inputs.deadline.min(network_end);
     let end = inputs.deadline;
-    let mut interaction = guarded(cx, cancellation, end, None,
-        authentication.start(cx, cancellation, request, &mut ids, limits.interaction)).await?;
+    let mut interaction = Box::pin(guarded(cx, cancellation, end, None,
+        authentication.start(cx, cancellation, request, &mut ids, limits.interaction))).await?;
     let mut owner = None;
     loop {
-        match guarded(cx, cancellation, end, owner.as_ref(), interaction.next(cx)).await? {
+        match Box::pin(guarded(cx, cancellation, end, owner.as_ref(), interaction.next(cx))).await? {
             ManagedInteractionEvent::Notification(notification) => {
                 guarded(cx, cancellation, end, owner.as_ref(), async { notify(notification) }).await?;
             }
@@ -270,7 +270,7 @@ where H: CoreInputHost + ?Sized,
                     return Err(CoreInputSessionError::ResolutionLimit.into());
                 }
                 if owner.is_none() {
-                    owner = Some(guarded(cx, cancellation, end, None, authentication.owner(cx, cancellation)).await?);
+                    owner = Some(Box::pin(guarded(cx, cancellation, end, None, authentication.owner(cx, cancellation))).await?);
                 }
                 let (discovery, request_id) = interaction.continuation_ids(&mut ids)?;
                 let selection = guarded(cx, cancellation, end, owner.as_ref(), async { select(&input) }).await?;
@@ -289,7 +289,7 @@ where H: CoreInputHost + ?Sized,
                         }
                     })
                 }).await?;
-                guarded(cx, cancellation, end, owner.as_ref(), interaction.resume(cx, discovery, reply, partial)).await?;
+                Box::pin(guarded(cx, cancellation, end, owner.as_ref(), interaction.resume(cx, discovery, reply, partial))).await?;
             }
             ManagedInteractionEvent::Complete(result) => {
                 let (continuations, credential_generation) = interaction.counts();
