@@ -281,7 +281,7 @@ fn run(case: Case) {
         let cx = Cx::current().unwrap();
         let scenario = async {
             let peer = Peer::new().await;
-            let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser)).await;
+            let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser))).await;
             let session = session.unwrap();
             let cancellation = McpRequestCancellation::new();
             let method = match case { Case::Resource => "resources/read", Case::Prompt => "prompts/get", _ => "tools/call" };
@@ -295,7 +295,7 @@ fn run(case: Case) {
             let initial = core(method, !matches!(case, Case::Capability));
             let expected = initial.encode_params().unwrap().unwrap();
             let first_result = if matches!(case, Case::StateOnly) { r#"{"resultType":"input_required","requestState":""}"# } else { FIRST };
-            let (first_request, operation) = pair(peer.response(41, first_result), session.start_core_interaction_with_cancellation(&cx, &cancellation, initial, RequestId::Number(41), limits)).await;
+            let (first_request, operation) = Box::pin(pair(peer.response(41, first_result), session.start_core_interaction_with_cancellation(&cx, &cancellation, initial, RequestId::Number(41), limits))).await;
             let mut operation = operation.unwrap();
             assert_eq!(first_request["params"], expected);
 
@@ -319,7 +319,7 @@ fn run(case: Case) {
                                 peer.quiet();
                             }
                         }
-                        let (second, resumed) = pair(peer.response(42, SECOND), operation.resume(&cx, RequestId::Number(42), Some(answers("first")))).await;
+                        let (second, resumed) = Box::pin(pair(peer.response(42, SECOND), operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         resumed.unwrap();
                         assert_eq!(second["params"]["requestState"], "  sealed+/%\0  ");
                         assert_eq!(second["params"]["inputResponses"], json!({"first":{"roots":[]}}));
@@ -349,27 +349,27 @@ fn run(case: Case) {
                             release_tx.send(&cx, ()).unwrap();
                             finished(&mut operation, &cx).await;
                         };
-                        pair(server, client).await;
+                        Box::pin(pair(server, client)).await;
                         assert_eq!(operation.continuation_count(), 2);
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 3);
                     }
                     Case::StateOnly => {
                         let empty = serde_json::from_value(json!({})).unwrap();
                         assert!(matches!(operation.resume(&cx, RequestId::Number(42), Some(empty)).await, Err(ManagedInteractionError::InvalidInputResponses)));
-                        let (second, result) = pair(peer.response(42, r#"{"resultType":"input_required","inputRequests":{}}"#), operation.resume(&cx, RequestId::Number(42), None)).await;
+                        let (second, result) = Box::pin(pair(peer.response(42, r#"{"resultType":"input_required","inputRequests":{}}"#), operation.resume(&cx, RequestId::Number(42), None))).await;
                         result.unwrap();
                         assert_eq!(second["params"]["requestState"], "");
                         assert!(second["params"].get("inputResponses").is_none());
                         pending(&mut operation, &cx).await;
                         assert!(matches!(operation.resume(&cx, RequestId::Number(43), None).await, Err(ManagedInteractionError::InvalidInputResponses)));
-                        let (third, result) = pair(peer.response(43, complete(method)), operation.resume(&cx, RequestId::Number(43), Some(serde_json::from_value(json!({})).unwrap()))).await;
+                        let (third, result) = Box::pin(pair(peer.response(43, complete(method)), operation.resume(&cx, RequestId::Number(43), Some(serde_json::from_value(json!({})).unwrap())))).await;
                         result.unwrap();
                         assert_eq!(third["params"]["inputResponses"], json!({}));
                         assert!(third["params"].get("requestState").is_none());
                         finished(&mut operation, &cx).await;
                     }
                     Case::RoundLimit => {
-                        let (_, result) = pair(peer.response(42, SECOND), operation.resume(&cx, RequestId::Number(42), Some(answers("first")))).await;
+                        let (_, result) = Box::pin(pair(peer.response(42, SECOND), operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::ContinuationLimit)));
                         assert!(operation.pending_input().is_none());
@@ -384,7 +384,7 @@ fn run(case: Case) {
                             event(&mut tls, CHANGED, false).await;
                             event(&mut tls, &terminal(42, SECOND), true).await;
                         };
-                        let (_, result) = pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first")))).await;
+                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await.unwrap(), Some(ManagedInteractionEvent::Notification(_))));
                         pending(&mut operation, &cx).await;
@@ -393,7 +393,7 @@ fn run(case: Case) {
                             sse_head(&mut tls).await;
                             event(&mut tls, CHANGED, true).await;
                         };
-                        let (_, result) = pair(server, operation.resume(&cx, RequestId::Number(43), Some(answers("second")))).await;
+                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(43), Some(answers("second"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::Core(ManagedCoreError::NotificationLimit))));
                     }
@@ -401,7 +401,7 @@ fn run(case: Case) {
                         let large = format!(r#"{{"resultType":"complete","content":[],"padding":"{}"}}"#, "x".repeat(350));
                         assert!(terminal(42, &large).len() < 512);
                         assert!(terminal(41, FIRST).len() + terminal(42, &large).len() > 512);
-                        let (_, result) = pair(peer.response(42, &large), operation.resume(&cx, RequestId::Number(42), Some(answers("first")))).await;
+                        let (_, result) = Box::pin(pair(peer.response(42, &large), operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         result.unwrap();
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::Core(ManagedCoreError::ResponseByteLimit))));
                     }
@@ -417,7 +417,7 @@ fn run(case: Case) {
                     }
                     Case::LostReply => {
                         let server = async { let (tls, _) = peer.request(false).await; drop(tls); };
-                        let (_, result) = pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first")))).await;
+                        let (_, result) = Box::pin(pair(server, operation.resume(&cx, RequestId::Number(42), Some(answers("first"))))).await;
                         assert!(result.is_err());
                         assert!(matches!(operation.resume(&cx, RequestId::Number(43), Some(answers("first"))).await, Err(ManagedInteractionError::Closed)));
                         assert!(matches!(operation.next_event(&cx).await, Err(ManagedInteractionError::Closed)));
@@ -441,7 +441,7 @@ fn run(case: Case) {
                             drop(resume);
                             assert!(matches!(operation.resume(&cx, RequestId::Number(43), Some(answers("first"))).await, Err(ManagedInteractionError::Closed)));
                         };
-                        pair(server, client).await;
+                        Box::pin(pair(server, client)).await;
                         assert_eq!(peer.posts.load(Ordering::SeqCst), 2);
                     }
                     Case::Capability | Case::InputLimit => unreachable!(),
@@ -451,7 +451,7 @@ fn run(case: Case) {
             peer.quiet();
             session.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await
             .expect("whole interaction fixture must settle within its bound");
     });
 }

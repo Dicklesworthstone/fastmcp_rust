@@ -482,12 +482,12 @@ fn run(case: Case) {
         let cx = Cx::current().unwrap();
         let body = async {
             let peer = Peer::new().await;
-            let ((), session) = pair(peer.login(), ManagedOAuthSession::authorize(
+            let ((), session) = Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(
                 &cx, peer.client(), OAuthSessionPolicy::default(), browser,
-            )).await;
+            ))).await;
             let session = session.unwrap();
             match case {
-                Case::Json => { pair(peer.catalog(41), complete_catalog(&session, &cx, 41)).await; }
+                Case::Json => { Box::pin(pair(peer.catalog(41), complete_catalog(&session, &cx, 41))).await; }
                 Case::Sse => {
                     let (release_tx, mut release_rx) = oneshot::channel::<()>();
                     let server = async {
@@ -506,7 +506,7 @@ fn run(case: Case) {
                         assert!(result.encode().unwrap().contains("hello from TLS"));
                         assert!(call.next_event(&cx).await.unwrap().is_none());
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                 }
                 Case::InvalidResponse => {
                     for (id, invalid) in [
@@ -526,7 +526,7 @@ fn run(case: Case) {
                             assert!(matches!(call.next_event(&cx).await, Err(ManagedCoreError::Closed)));
                             complete_catalog(&session, &cx, id + 1).await;
                         };
-                        pair(server, application).await;
+                        Box::pin(pair(server, application)).await;
                     }
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 6);
                 }
@@ -541,7 +541,7 @@ fn run(case: Case) {
                         assert!(matches!(*result, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })));
                         assert!(call.next_event(&cx).await.unwrap().is_none());
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 1);
                 }
                 Case::Cancel | Case::Deadline => {
@@ -570,14 +570,14 @@ fn run(case: Case) {
                         assert!(cx.checkpoint().is_ok());
                         complete_catalog(&session, &cx, 42).await;
                     };
-                    pair(server, application).await;
+                    Box::pin(pair(server, application)).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 2);
                 }
                 Case::Preflight => {
                     let tiny = ManagedCoreLimits::new(1, 4096, 4096, 1, Duration::from_secs(2)).unwrap();
                     assert!(matches!(session.request_core(&cx, core("tools/list", json!({})), RequestId::Number(41), tiny).await, Err(ManagedCoreError::RequestTooLarge)));
                     peer.no_extra_connections();
-                    pair(peer.catalog(42), complete_catalog(&session, &cx, 42)).await;
+                    Box::pin(pair(peer.catalog(42), complete_catalog(&session, &cx, 42))).await;
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 1);
                 }
                 Case::HttpFailure => {
@@ -587,7 +587,7 @@ fn run(case: Case) {
                             json_reply(&mut tls, status, "peer-error-canary").await;
                         };
                         let application = session.request_core(&cx, core("tools/list", json!({})), RequestId::Number(41), ManagedCoreLimits::default());
-                        let ((), result) = pair(server, application).await;
+                        let ((), result) = Box::pin(pair(server, application)).await;
                         let error = result.err().unwrap();
                         assert!(!format!("{error:?} {error}").contains("peer-error-canary"));
                         peer.no_extra_connections();
@@ -600,16 +600,16 @@ fn run(case: Case) {
                         assert!(peer.acceptor.accept(socket).await.is_err(), "MCP certificate must be trusted before any bearer POST");
                     };
                     let application = session.request_core(&cx, core("tools/list", json!({})), RequestId::Number(41), ManagedCoreLimits::default());
-                    let ((), result) = pair(server, application).await;
+                    let ((), result) = Box::pin(pair(server, application)).await;
                     assert!(result.is_err());
                     assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 0);
                 }
                 Case::CatalogPages => {
                     let client = catalog_client(&session);
-                    let ((), collected) = pair(
+                    let ((), collected) = Box::pin(pair(
                         two_page_catalog_peer(&peer, CATALOG_PAGE_TWO_FINAL),
                         client.collect(&cx, core("tools/list", json!({})), fresh_ids(61), |_| Ok(())),
-                    ).await;
+                    )).await;
                     let collected = collected.expect("a complete two-page traversal must succeed");
 
                     // Complete output: BOTH pages, and both actual tools.
@@ -624,8 +624,8 @@ fn run(case: Case) {
                     // `fresh_ids` deliberately starts elsewhere -- a cache hit
                     // must not consume an id, and must not reach the peer even
                     // though the peer has nothing left to serve.
-                    let again = client
-                        .collect(&cx, core("tools/list", json!({})), fresh_ids(91), |_| Ok(()))
+                    let again = Box::pin(client
+                        .collect(&cx, core("tools/list", json!({})), fresh_ids(91), |_| Ok(())))
                         .await
                         .expect("the cached repeat must succeed without the peer");
                     assert_eq!(
@@ -642,10 +642,10 @@ fn run(case: Case) {
                     // second page: its nextCursor repeats page one's instead
                     // of being absent.
                     let client = catalog_client(&session);
-                    let ((), collected) = pair(
+                    let ((), collected) = Box::pin(pair(
                         two_page_catalog_peer(&peer, CATALOG_PAGE_TWO_REPEATS_CURSOR),
                         client.collect(&cx, core("tools/list", json!({})), fresh_ids(61), |_| Ok(())),
-                    ).await;
+                    )).await;
 
                     // Destructured rather than `expect_err`: CollectedCatalog
                     // does not implement Debug, so the Err-extracting helpers
@@ -669,7 +669,7 @@ fn run(case: Case) {
             peer.no_extra_connections();
             session.close();
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), body)
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), body))
             .await.expect("complete public OAuth/MCP case must settle within its bound");
     });
 }
