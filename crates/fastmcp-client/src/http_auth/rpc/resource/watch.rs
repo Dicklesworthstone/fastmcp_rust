@@ -148,7 +148,7 @@ impl ManagedResourceClient {
         let set = FinalCacheResultSet::Resource(uri.clone());
         let _gap = InvalidateOnExit { client: self, set: set.clone() };
         self.cache()?.invalidate_result_set(&set);
-        bounded_wait(cx, cancellation, deadline, async {
+        Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
                 let binding = self.session.credential_with_cancellation(cx, cancellation)
                     .await.map_err(ManagedCoreError::from)?;
@@ -199,7 +199,7 @@ impl ManagedResourceClient {
                         let Some(local) = signal.begin(revision)? else { continue };
                         let generation = self.cache()?.begin_fetch(&set);
                         attempts += 1;
-                        let read = self.read_with_cancellation(cx, &local, request.clone(), || {
+                        let read = Box::pin(self.read_with_cancellation(cx, &local, request.clone(), || {
                             check_binding(cx, cancellation, deadline, &binding)?;
                             let id = issue_id(&ids)?;
                             check_binding(cx, cancellation, deadline, &binding)?;
@@ -211,7 +211,7 @@ impl ManagedResourceClient {
                             let continuing = observer.emit(ManagedResourceWatchEvent::Notification(notification))?;
                             check_binding(cx, cancellation, deadline, &binding)?;
                             if continuing { Ok(()) } else { Err(ManagedResourceError::AbortedByHost) }
-                        }).await;
+                        })).await;
                         signal.finish()?;
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if observer.stopped.load(Ordering::Acquire) { return Ok(ManagedResourceWatchOutcome::StoppedByHost); }
@@ -248,7 +248,7 @@ impl ManagedResourceClient {
                     reads.as_mut().poll(task)
                 }).await
             }.await)
-        }).await?
+        })).await?
     }
 }
 

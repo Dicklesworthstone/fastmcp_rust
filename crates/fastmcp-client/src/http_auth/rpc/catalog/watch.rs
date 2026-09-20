@@ -199,7 +199,7 @@ impl ManagedCatalogClient {
         // traversal when this watch is abandoned during acknowledgment/read.
         let _gap = InvalidateOnExit { client: self, kind };
         self.cache()?.invalidate_result_set(&kind.result_set());
-        bounded_wait(cx, cancellation, deadline, async {
+        Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
                 let binding = self.session.credential_with_cancellation(cx, cancellation)
                     .await.map_err(ManagedCoreError::from)?;
@@ -254,7 +254,7 @@ impl ManagedCatalogClient {
                         // delivering a notification through this watch.
                         let cache_generation = self.cache()?.begin_fetch(&kind.result_set());
                         attempts += 1;
-                        let result = self.collect_with_cancellation(
+                        let result = Box::pin(self.collect_with_cancellation(
                             cx, &local_cancel, request.clone(),
                             || {
                                 check_binding(cx, cancellation, deadline, &binding)?;
@@ -271,7 +271,7 @@ impl ManagedCatalogClient {
                                 check_binding(cx, cancellation, deadline, &binding)?;
                                 if continuing { Ok(()) } else { Err(ManagedCatalogError::AbortedByHost) }
                             },
-                        ).await;
+                        )).await;
                         signal.finish()?;
                         check_binding(cx, cancellation, deadline, &binding)?;
                         if observer.stopped.load(Ordering::Acquire) { return Ok(ManagedCatalogWatchOutcome::StoppedByHost); }
@@ -317,7 +317,7 @@ impl ManagedCatalogClient {
                     reconcile.as_mut().poll(task)
                 }).await
             }.await)
-        }).await?
+        })).await?
     }
 }
 
