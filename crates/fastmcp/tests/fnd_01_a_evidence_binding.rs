@@ -1099,6 +1099,34 @@ fn parse_declared_tuple_rows(source: &str, name: &str) -> Vec<Vec<String>> {
     rows
 }
 
+/// Blanks `//` line comments so a commented-out call cannot read as live.
+///
+/// MEASURED NECESSITY: without this, the liveness guard below passed with EVERY
+/// call site commented out, because the substring was still present. That is the
+/// defect the guard exists to refuse, committed one level up inside the guard.
+///
+/// BLOCK COMMENTS ARE DELIBERATELY NOT STRIPPED, and the reason is measured. A
+/// first version also consumed `/* ... */`. The verifier contains `/*` inside
+/// STRING LITERALS — glob patterns such as `"/*"` and `"dist/**"` — and holds 7
+/// `/*` against only 2 `*/`, so an unmatched opener swallowed **2,102,460 of
+/// 4,001,124 characters (53%)**, both call sites included. The guard then read 0
+/// live sites on perfectly good source and would have failed for everyone,
+/// permanently. "Over-stripping fails closed" was the right direction and the
+/// wrong magnitude: a guard that is supposed to always pass fails closed INTO A
+/// PERMANENT RED, which is not a safe error.
+///
+/// Line-only stripping removes 57,273 characters (1.4%) and is correct on all
+/// three controls: real source stays at 2 live sites, a commented-out call and a
+/// rewired table both drop to 0. A `//` inside a string truncates that one line,
+/// which is bounded damage and can only make the guard fire.
+fn strip_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Refuses to validate a table the verifier no longer uses.
 ///
 /// THE FALSE-PASS INPUT THIS CLOSES. Everything below reads the two constants
@@ -1113,10 +1141,20 @@ fn parse_declared_tuple_rows(source: &str, name: &str) -> Vec<Vec<String>> {
 /// So liveness is asserted rather than assumed: at least one call to the pure
 /// checker must consume BOTH constants. This cannot prove the verifier is
 /// correct, only that the table under test is the table being used.
+///
+/// RESIDUAL LIMITS, MEASURED AND STATED RATHER THAN IMPLIED. Comments are
+/// stripped before scanning, so a commented-out call no longer counts — without
+/// that, this guard passed with EVERY call site commented out, still reporting
+/// two live sites. Two cases remain that a text scan cannot decide: a call
+/// behind a `#[cfg(..)]` that is off in the build under test, and the literal
+/// call text inside a string. Both were tried and both kept the guard green at
+/// two sites. Its strength is "the call text exists outside comments", NOT
+/// "the call executes", and it must not be cited as the latter.
 fn assert_workspace_input_tables_are_live(source: &str) {
     const CALL: &str = "fnd_01_check_workspace_input_anchoring(";
     const WINDOW: usize = 260;
 
+    let source = &strip_line_comments(source);
     let mut live = 0usize;
     let mut cursor = 0usize;
     while let Some(found) = source[cursor..].find(CALL) {
@@ -1254,7 +1292,12 @@ fn workspace_input_provenance_drift(rows: &[WorkspaceInputRow]) -> Vec<String> {
 /// TWO TRIGGERS, DELIBERATELY NOT COLLAPSED, because they are different
 /// defects with different severities and one can hide the other.
 ///
-///   CONTENT DRIFT  the bytes at HEAD differ from the bytes at the anchor.
+///   CONTENT DRIFT  the bytes at HEAD differ from the bytes at the anchor. The message
+///                  carries BOTH DIGESTS, not only lengths: a same-length edit is real and
+///                  observed — planting a stale anchor on `rust-toolchain.toml` yields
+///                  "anchor 239 bytes, HEAD 239 bytes" while the content genuinely differs,
+///                  which reads as a contradiction unless the digests are shown. A
+///                  length-only comparison would have missed that drift entirely.
 ///                  The recorded digest no longer describes the tree, so the
 ///                  binding is stale and the anchor's claim is false. This is
 ///                  what a dependency-pin refresh produces.
@@ -1290,11 +1333,14 @@ fn workspace_input_unaccounted_movers(rows: &[WorkspaceInputRow]) -> Vec<String>
                 (None, _) => "no commit in this history touches the path".to_owned(),
             };
             movers.push(format!(
-                "{}: CONTENT DRIFT since anchor {} - anchor holds {} bytes, HEAD holds {} bytes; {}",
+                "{}: CONTENT DRIFT since anchor {} - anchor holds {} bytes / {}, HEAD holds {} \
+                 bytes / {}; {}",
                 row.path,
                 row.revision,
                 anchored.len(),
+                live_sha256_hex(&anchored),
                 current.len(),
+                live_sha256_hex(&current),
                 attribution,
             ));
             continue;
