@@ -239,7 +239,7 @@ impl ManagedCatalogClient {
         // The provisional ID does not escape into the transport or ID history.
         let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
         let mut state = Traversal::new(list_params(&request)?.cursor.as_deref(), self.limits)?;
-        bounded_wait(cx, cancellation, deadline, async {
+        Box::pin(bounded_wait(cx, cancellation, deadline, async {
             Ok(async {
                 let credential = self.session.credential_with_cancellation(cx, cancellation).await
                     .map_err(ManagedCoreError::from)?;
@@ -338,7 +338,7 @@ impl ManagedCatalogClient {
                 require_unrevoked(current.credential())?;
                 Ok(CollectedCatalog { kind, pages, item_count: state.items, credential_generation: generation })
             }.await)
-        }).await?
+        })).await?
     }
 
     fn cache(&self) -> Result<MutexGuard<'_, FinalResultCache>, ManagedCatalogError> {
