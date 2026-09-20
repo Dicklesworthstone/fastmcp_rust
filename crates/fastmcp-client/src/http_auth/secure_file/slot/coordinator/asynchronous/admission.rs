@@ -254,7 +254,7 @@ impl CredentialIoLane {
         let mut state = self.inner.state.lock().map_err(|_| CredentialIoError::AdmissionUnavailable)?;
         if state.shutting_down { return Err(CredentialIoError::LaneClosed); }
         let total = state.usage.reserved_bytes.checked_add(bytes).ok_or(CredentialIoError::CapacityExceeded)?;
-        if state.usage.operations >= self.inner.limits.maximum_operations || total > self.inner.limits.maximum_reserved_bytes {
+        if state.usage.operations >= self.inner.limits.maximum_operations || total > self.inner.limits.reserved_bytes {
             return Err(CredentialIoError::CapacityExceeded);
         }
         // Both dimensions commit together. A byte refusal cannot consume a job.
