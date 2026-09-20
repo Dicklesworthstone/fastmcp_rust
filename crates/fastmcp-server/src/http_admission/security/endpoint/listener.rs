@@ -43,7 +43,7 @@ use crate::{
 /// still owned by the server's existing request and response-body policies.
 #[derive(Clone, Copy, Debug)]
 pub struct SecuredHttpIoLimits {
-    handshake_timeout: Duration,
+    handshake_bound: Duration,
     request_timeout: Duration,
     write_timeout: Duration,
 }
@@ -51,7 +51,7 @@ pub struct SecuredHttpIoLimits {
 impl Default for SecuredHttpIoLimits {
     fn default() -> Self {
         Self {
-            handshake_timeout: Duration::from_secs(10),
+            handshake_bound: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(15),
         }
@@ -66,7 +66,7 @@ impl SecuredHttpIoLimits {
         {
             return Err(McpError::invalid_request("invalid secured HTTP I/O limits"));
         }
-        Ok(Self { handshake_timeout: Duration::from_secs(10), request_timeout, write_timeout })
+        Ok(Self { handshake_bound: Duration::from_secs(10), request_timeout, write_timeout })
     }
 
     /// Sets the total TLS handshake allowance, not a timeout per read or retry.
@@ -75,11 +75,11 @@ impl SecuredHttpIoLimits {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(McpError::invalid_request("invalid secured HTTPS handshake timeout"));
         }
-        self.handshake_timeout = timeout;
+        self.handshake_bound = timeout;
         Ok(self)
     }
 
-    pub fn handshake_timeout(self) -> Duration { self.handshake_timeout }
+    pub fn handshake_timeout(self) -> Duration { self.handshake_bound }
     pub fn request_timeout(self) -> Duration { self.request_timeout }
     pub fn write_timeout(self) -> Duration { self.write_timeout }
 }
@@ -274,7 +274,7 @@ impl BoundSecuredHttpServer {
                     let _permit = permit;
                     let stream = match acceptor {
                         Some(acceptor) => match tls::accept(
-                            &connection_cx, &stopping, stream, &acceptor, io.handshake_timeout,
+                            &connection_cx, &stopping, stream, &acceptor, io.handshake_bound,
                         ).await {
                             Some(stream) => stream,
                             None => return,
