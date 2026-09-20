@@ -26794,6 +26794,7 @@ activate = 1\n";
         expected_files: &BTreeSet<String>,
         output: &mut BTreeSet<String>,
         maximum_files: usize,
+        mut extra_directories: Option<&mut BTreeSet<String>>,
     ) -> VResult<()> {
         validate_ascii_posix_path(relative, "inventory root")?;
         let directory = resolve_safe(root, relative, "inventory root")?;
@@ -26823,9 +26824,21 @@ activate = 1\n";
             if metadata.is_dir() {
                 let prefix = format!("{child}/");
                 if !expected_files.iter().any(|expected| expected.starts_with(&prefix)) {
-                    return Err(Diagnostic::error("E_SOURCE_EXTRA_DIRECTORY", &child));
+                    // A caller that supplies a sink wants the COMPLETE enumeration, so one
+                    // unexpected directory must not pre-empt the caller's own set difference
+                    // below. Still fail-closed: the caller fails when the sink is nonempty.
+                    // Deliberately does NOT descend -- an unexpected subtree is unbounded and
+                    // would trade a diagnostic for an E_INVENTORY_BOUND resource failure, so
+                    // files beneath it are reported as their containing directory.
+                    match extra_directories.as_deref_mut() {
+                        Some(sink) => {
+                            sink.insert(child.clone());
+                            continue;
+                        }
+                        None => return Err(Diagnostic::error("E_SOURCE_EXTRA_DIRECTORY", &child)),
+                    }
                 }
-                collect_tree_files(root, &child, excluded_exact_paths, excluded_exact_directory, expected_files, output, maximum_files)?;
+                collect_tree_files(root, &child, excluded_exact_paths, excluded_exact_directory, expected_files, output, maximum_files, extra_directories.as_deref_mut())?;
             } else if metadata.is_file() {
                 #[cfg(unix)]
                 if metadata.nlink() != 1 {
@@ -27428,7 +27441,7 @@ activate = 1\n";
         let excluded = policy.source_tree.excluded_exact_paths.iter().cloned().collect::<BTreeSet<_>>();
         validate_case_unique(excluded.iter().cloned(), "source tree exclusions")?;
         let mut actual = BTreeSet::new();
-        collect_tree_files(root, &policy.paths.source_root, &excluded, &policy.source_tree.excluded_exact_directory, &expected, &mut actual, policy.bounds.exact_source_input_count)?;
+        collect_tree_files(root, &policy.paths.source_root, &excluded, &policy.source_tree.excluded_exact_directory, &expected, &mut actual, policy.bounds.exact_source_input_count, None)?;
         if actual != expected {
             let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
             let extra = actual.difference(&expected).cloned().collect::<Vec<_>>();
@@ -31332,14 +31345,26 @@ activate = 1\n";
             return Err(Diagnostic::error("E_WORKSPACE_ROOT_FILE_SET", subject));
         }
         let mut actual_closed = BTreeSet::new();
+        let mut extra_directories = BTreeSet::new();
         let no_excluded_paths = BTreeSet::new();
         for closed_root in &closed_roots {
-            collect_tree_files(root, closed_root, &no_excluded_paths, ".fnd01-no-excluded-directory", &expected_closed, &mut actual_closed, bindings.len())?;
+            collect_tree_files(
+                root,
+                closed_root,
+                &no_excluded_paths,
+                ".fnd01-no-excluded-directory",
+                &expected_closed,
+                &mut actual_closed,
+                bindings.len(),
+                Some(&mut extra_directories),
+            )?;
         }
-        if actual_closed != expected_closed {
+        if !extra_directories.is_empty() || actual_closed != expected_closed {
             let missing = expected_closed.difference(&actual_closed).cloned().collect::<Vec<_>>();
             let extra = actual_closed.difference(&expected_closed).cloned().collect::<Vec<_>>();
-            return Err(Diagnostic::error("E_WORKSPACE_CLOSED_SET", subject).at(format!("missing={missing:?};extra={extra:?}")));
+            let extra_directories = extra_directories.iter().cloned().collect::<Vec<_>>();
+            return Err(Diagnostic::error("E_WORKSPACE_CLOSED_SET", subject)
+                .at(format!("missing={missing:?};extra={extra:?};extra_directories={extra_directories:?}")));
         }
         for relative in required_absent_paths {
             let path = match relative.as_str() {
