@@ -142,7 +142,7 @@ fn run_execution(case: ExecutionCase) {
             let is_partial = matches!(case, ExecutionCase::Partial | ExecutionCase::MachinePartial);
             let method = match case { ExecutionCase::Complete(method) => method, _ => "tools/call" };
             let managed = if is_machine { None } else {
-                Some(pair(peer.login(), ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser)).await.1.unwrap())
+                Some(Box::pin(pair(peer.login(), ManagedOAuthSession::authorize(&cx, peer.client(), OAuthSessionPolicy::default(), browser))).await.1.unwrap())
             };
             let machine = if is_machine {
                 Some(pair(metadata(&peer), plan(&peer).discover(&cx)).await.1.unwrap())
@@ -207,21 +207,21 @@ fn run_execution(case: ExecutionCase) {
             let application = async {
                 if let Some(client) = &machine {
                     if is_partial {
-                        client.execute_core_with_selected_input_host(&cx, &cancellation, request,
-                            "owned".to_owned(), limits, &mut host, selector, notifier).await
+                        Box::pin(client.execute_core_with_selected_input_host(&cx, &cancellation, request,
+                            "owned".to_owned(), limits, &mut host, selector, notifier)).await
                     } else {
-                        client.execute_core_with_input_host(&cx, &cancellation, request,
-                            "owned".to_owned(), limits, &mut host, notifier).await
+                        Box::pin(client.execute_core_with_input_host(&cx, &cancellation, request,
+                            "owned".to_owned(), limits, &mut host, notifier)).await
                     }
                 } else if matches!(case, ExecutionCase::Complete("tools/call")) {
-                    managed.as_ref().unwrap().execute_core_with_input_host(&cx, &cancellation,
-                        request, "owned".to_owned(), limits, &mut host, notifier).await
+                    Box::pin(managed.as_ref().unwrap().execute_core_with_input_host(&cx, &cancellation,
+                        request, "owned".to_owned(), limits, &mut host, notifier)).await
                 } else {
-                    managed.as_ref().unwrap().execute_core_with_selected_input_host(&cx, &cancellation,
-                        request, "owned".to_owned(), limits, &mut host, selector, notifier).await
+                    Box::pin(managed.as_ref().unwrap().execute_core_with_selected_input_host(&cx, &cancellation,
+                        request, "owned".to_owned(), limits, &mut host, selector, notifier)).await
                 }
             };
-            let ((), result) = pair(server, application).await;
+            let ((), result) = Box::pin(pair(server, application)).await;
             let expected_posts = match case {
                 ExecutionCase::ModelLimit => {
                     assert!(matches!(result, Err(CoreInputExecutionError::Input(CoreInputSessionError::Input(
@@ -262,7 +262,7 @@ fn run_execution(case: ExecutionCase) {
             if let Some(client) = &managed { client.close(); }
             if let Some(client) = &machine { client.close(); }
         };
-        asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario).await.unwrap();
+        Box::pin(asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), scenario)).await.unwrap();
     });
 }
 
