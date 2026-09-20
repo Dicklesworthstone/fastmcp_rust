@@ -144,7 +144,7 @@ fn secured_http_native_post_reaches_real_authentication_and_tool_once() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(), request()).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(), request())).await.unwrap();
         assert!(!response.is_streaming());
         let (response, stream) = response.into_parts();
         assert!(stream.is_none());
@@ -167,13 +167,13 @@ fn secured_http_browser_preflight_never_invokes_authentication_or_tool() {
             .with_header("origin", "https://app.example")
             .with_header("access-control-request-method", "POST")
             .with_header("access-control-request-headers", "authorization, mcp-method, mcp-name, mcp-protocol-version, content-type");
-        let response = endpoint.handle_secured_async(&cx, &policy(), preflight.clone()).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(), preflight.clone())).await.unwrap();
         assert_eq!(response.response().status.0, 204);
         assert!(response.response().body.is_empty());
         assert_eq!(response.response().headers["access-control-allow-origin"], "https://app.example");
         assert_eq!(probe.counts(), (0, 0));
         let rejected = preflight.with_header("access-control-request-method", "DELETE");
-        let response = endpoint.handle_secured_async(&cx, &policy(), rejected).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(), rejected)).await.unwrap();
         assert_eq!(response.response().status.0, 400);
         assert_eq!(probe.counts(), (0, 0));
     });
@@ -184,12 +184,12 @@ fn secured_http_forbidden_origin_cannot_spend_a_valid_bearer_credential() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(),
-            request().with_header("origin", "https://attacker.example")).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(),
+            request().with_header("origin", "https://attacker.example"))).await.unwrap();
         assert_eq!(response.response().status.0, 403);
         assert!(response.response().body.is_empty());
         assert_eq!(probe.counts(), (0, 0));
-        let control = endpoint.handle_secured_async(&cx, &policy(), request()).await.unwrap();
+        let control = Box::pin(endpoint.handle_secured_async(&cx, &policy(), request())).await.unwrap();
         assert_eq!(control.response().status.0, 200);
         assert_eq!(probe.counts(), (1, 1));
     });
@@ -200,14 +200,14 @@ fn secured_http_forwarded_authority_cannot_override_the_public_host() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(), request()
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(), request()
             .with_header("host", "attacker.example")
             .with_header("x-forwarded-host", "service.example")
-            .with_header("forwarded", "host=service.example;proto=https")).await.unwrap();
+            .with_header("forwarded", "host=service.example;proto=https"))).await.unwrap();
         assert_eq!(response.response().status.0, 403);
         assert_eq!(probe.counts(), (0, 0));
-        let control = endpoint.handle_secured_async(&cx, &policy(),
-            request().with_header("host", "SERVICE.EXAMPLE:443")).await.unwrap();
+        let control = Box::pin(endpoint.handle_secured_async(&cx, &policy(),
+            request().with_header("host", "SERVICE.EXAMPLE:443"))).await.unwrap();
         assert_eq!(control.response().status.0, 200);
         assert_eq!(probe.counts(), (1, 1));
     });
@@ -218,8 +218,8 @@ fn secured_http_keeps_native_query_credential_refusal_and_challenge() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(),
-            request().with_query("access_token", "http-security-test-token")).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(),
+            request().with_query("access_token", "http-security-test-token"))).await.unwrap();
         assert_eq!(response.response().status.0, 401);
         assert_eq!(response.response().headers["www-authenticate"], "Bearer");
         let body: serde_json::Value = serde_json::from_slice(&response.response().body).unwrap();
@@ -234,8 +234,8 @@ fn secured_http_allowed_authority_is_not_authentication() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(),
-            request().with_header("authorization", "Bearer wrong-token")).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(),
+            request().with_header("authorization", "Bearer wrong-token"))).await.unwrap();
         assert_eq!(response.response().status.0, 401);
         assert!(response.response().headers.contains_key("www-authenticate"));
         assert_eq!(probe.counts(), (1, 0));
@@ -252,7 +252,7 @@ fn secured_http_preserves_the_dispatchers_protocol_error_response() {
         let ServerHttpEndpointResponse::Immediate(expected) = session.handle_async(&cx, malformed.clone()).await.unwrap()
             else { panic!("native protocol refusal must be immediate") };
         session.close(&cx).await;
-        let actual = endpoint.handle_secured_async(&cx, &policy(), malformed).await.unwrap();
+        let actual = Box::pin(endpoint.handle_secured_async(&cx, &policy(), malformed)).await.unwrap();
         assert_eq!(actual.response().status, expected.status);
         assert_eq!(actual.response().body, expected.body);
         assert_eq!(probe.counts(), (0, 0));
@@ -268,7 +268,7 @@ fn secured_http_policy_route_mismatch_is_a_configuration_error_before_dispatch()
             HttpEndpointConfig::new("/other", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
             "https://service.example", vec![],
         ).unwrap();
-        assert!(matches!(endpoint.handle_secured_async(&cx, &wrong, request()).await,
+        assert!(matches!(Box::pin(endpoint.handle_secured_async(&cx, &wrong, request())).await,
             Err(SecuredHttpEndpointError::PolicyRouteMismatch)));
         assert_eq!(probe.counts(), (0, 0));
     });
@@ -279,8 +279,8 @@ fn secured_http_returned_sse_retains_its_session_until_explicit_close() {
     run(|cx| async move {
         let probe = Probe::new();
         let endpoint = endpoint(&probe);
-        let response = endpoint.handle_secured_async(&cx, &policy(),
-            request().with_header("accept", "text/event-stream")).await.unwrap();
+        let response = Box::pin(endpoint.handle_secured_async(&cx, &policy(),
+            request().with_header("accept", "text/event-stream"))).await.unwrap();
         assert!(response.is_streaming());
         let (head, stream) = response.into_parts();
         assert_eq!(head.status.0, 200);
