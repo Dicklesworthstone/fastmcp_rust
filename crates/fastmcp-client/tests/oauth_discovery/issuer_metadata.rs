@@ -202,9 +202,9 @@ fn exhausted_issuer_sequence_retains_all_causes_and_never_selects_another_issuer
             peer.serve(B, 503, "secret-error-canary").await;
             peer.serve(C, 404, "").await;
         };
-        let ((), result) = pair(server, plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
+        let ((), result) = Box::pin(pair(server, plan.authorize_managed(&cx, OAuthSessionPolicy::default(), |_| {
             launched.fetch_add(1, Ordering::SeqCst); async { Err(OAuthError::BrowserLaunchFailed) }
-        })).await;
+        }))).await;
         let error = result.err().unwrap();
         assert!(!format!("{error:?} {error}").contains("secret-error-canary"));
         let OAuthDiscoveryError::IssuerMetadataExhausted(failure) = error else { panic!("ordered aggregate expected") };
@@ -247,7 +247,7 @@ fn explicit_resource_hint_uses_the_same_issuer_resolver_before_real_pkce_login()
             assert_eq!(session.credential(&cx).await.unwrap().credential().authorization_for_target(&url(&resource)), Some("Bearer fallback-access".to_owned()));
             session.close();
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(*peer.paths.lock().unwrap(), ["/hint", A, B, "/token"]);
         peer.assert_no_extra_connections();
     });
@@ -299,7 +299,7 @@ fn machine_registration_recovers_same_issuer_metadata_without_browser_fields() {
             assert_eq!(client.credential(&cx).await.unwrap().credential().authorization_for_target(&url(&peer.resource())), Some("Bearer machine-fallback".to_owned()));
             client.close();
         };
-        pair(server, application).await;
+        Box::pin(pair(server, application)).await;
         assert_eq!(*peer.paths.lock().unwrap(), [PRM, A, B, "/token"]);
         peer.assert_no_extra_connections();
     });
