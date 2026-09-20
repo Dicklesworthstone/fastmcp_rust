@@ -5,11 +5,12 @@
 //! one response body. Notifications are delivered incrementally, never hidden
 //! by a terminal collector. All wire admission uses fastmcp-protocol codecs.
 //!
-//! This explicit modern-only API does not negotiate extensions, implement
-//! subscriptions, project schema-derived custom headers, cache results, or
-//! automatically retry an input-required result. Use the returned typed
+//! This explicit modern-only core-call API does not negotiate extensions,
+//! project schema-derived custom headers, cache results, or automatically
+//! retry an input-required result. Use the returned typed
 //! `input_required` branch to implement an explicit host continuation policy.
 //! It does not replace the existing Auto/legacy or extension-aware clients.
+//! For bounded authenticated subscription streams, see [`subscription`].
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -43,6 +44,8 @@ pub mod catalog;
 pub mod interaction;
 /// Bounded resource reads and explicitly enabled credential-local result caching.
 pub mod resource;
+/// Request-owned, bounded core subscription streams over managed OAuth.
+pub mod subscription;
 
 /// Independent request, frame, cumulative payload, notification and time bounds.
 /// Native HTTP/SSE bounds continue to apply and may be tighter than these limits.
