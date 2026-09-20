@@ -128,7 +128,19 @@ impl ManagedOAuthProvider {
         let pages = self.catalog(cx, "tools/list").await?;
         let mut entries = Vec::new();
         for page in pages {
-            let CoreResult::Final(FinalCoreResult::ToolsList { result: page, .. }) = page else {
+            // FinalCoreResult carries STRUCT variants { result, diagnostic }; its
+            // siblings LegacyCoreResult / FinalCoreRequest / LegacyCoreRequest /
+            // McpAppsHostRequest all use the tuple form for the same variant name,
+            // which is where the original shape came from. `diagnostic` is dropped
+            // deliberately: this fn returns Vec<ManagedOAuthTool> and has nowhere to
+            // carry a peer diagnostic. Propagating it upstream is a real question for
+            // a FORWARDING provider and needs the managed-OAuth ownership decision,
+            // not a signature change smuggled in under a compile fix.
+            let CoreResult::Final(FinalCoreResult::ToolsList {
+                result: page,
+                diagnostic: _,
+            }) = page
+            else {
                 return Err(McpError::invalid_request(UNEXPECTED_RESULT));
             };
             entries.extend(page.payload.tools);
@@ -486,7 +498,9 @@ struct Forwarder {
 
 impl Forwarder {
     fn allocate_id(&self) -> McpResult<RequestId> {
-        let id = self.next_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        let id = self
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| McpError::internal_error("Managed OAuth request ID space exhausted"))?;
         Ok(RequestId::String(format!("managed-provider-{id}")))
     }
@@ -562,7 +576,11 @@ fn upstream_error(error: ManagedCoreError) -> McpError {
 }
 fn tool_result(result: FinalCoreResult) -> McpResult<CompleteResult<FinalCallToolResult>> {
     match result {
-        FinalCoreResult::ToolsCall { result, .. } => Ok(result),
+        // Struct variant, same reasoning as the tools/list site above.
+        FinalCoreResult::ToolsCall {
+            result,
+            diagnostic: _,
+        } => Ok(result),
         _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
     }
 }
