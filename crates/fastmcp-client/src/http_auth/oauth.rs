@@ -1469,7 +1469,7 @@ mod tests {
                 assert_eq!(credentials.scopes, ["tools:read".to_owned()]);
                 Ok::<(), OAuthError>(())
             };
-            let (server, application) = pair(server, application).await;
+            let (server, application) = Box::pin(pair(server, application)).await;
             assert_eq!(server, Ok(()));
             assert_eq!(application, Ok(()));
         });
@@ -1495,7 +1495,7 @@ mod tests {
             let application = client.authorize(&cx, |authorization| async move {
                 send_callback(caller, authorization).await.map(|_| ())
             });
-            let (server, application) = pair(server, application).await;
+            let (server, application) = Box::pin(pair(server, application)).await;
             assert_eq!(server, Ok(()));
             assert_eq!(application.err(), Some(OAuthError::TransportFailed));
         });
