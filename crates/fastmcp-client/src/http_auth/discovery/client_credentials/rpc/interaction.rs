@@ -6,6 +6,9 @@
 //! answers. It cannot replace the target, method, original arguments, metadata
 //! or opaque requestState. No transport failure is an automatic retry signal.
 
+/// Explicit same-credential recovery from a configured continuation reply journal.
+pub mod recovery;
+
 use std::fmt;
 use std::future::Future;
 

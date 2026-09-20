@@ -21,7 +21,7 @@ use super::{
 use crate::http_auth::managed::OAuthSessionError;
 use crate::http_executor::{ModernHttpExecutorError, ModernHttpResponseKind};
 
-const MAX_RECOVERIES: usize = 4;
+pub(crate) const MAX_RECOVERIES: usize = 4;
 // At most 64 continuation rounds, each with its first POST and four recovery
 // POSTs, plus the initial operation. The ordinary interaction keeps this same
 // history after a successful hand-back, so IDs never become reusable.
@@ -55,6 +55,13 @@ impl ContinuationReplayContract {
             return Err(ContinuationRecoveryError::InvalidContract);
         }
         Ok(Self { resource, maximum_recoveries })
+    }
+
+    pub(crate) fn admit_endpoint(&self, resource: &CanonicalHttpUrl) -> Result<usize, ContinuationRecoveryError> {
+        if resource.as_str() != self.resource.as_str() {
+            return Err(ContinuationRecoveryError::EndpointMismatch);
+        }
+        Ok(self.maximum_recoveries)
     }
 }
 impl fmt::Debug for ContinuationReplayContract {
@@ -151,9 +158,7 @@ impl ManagedInteraction {
         mut self, cx: &Cx, responses: Option<FinalInputResponses>, contract: ContinuationReplayContract,
     ) -> Result<RecoverableManagedContinuation, ContinuationRecoveryError> {
         self.check(cx)?;
-        if self.session.resource().as_str() != contract.resource.as_str() {
-            return Err(ContinuationRecoveryError::EndpointMismatch);
-        }
+        let maximum_recoveries = contract.admit_endpoint(self.session.resource())?;
         let input = self.pending_input().ok_or(ManagedInteractionError::NotAwaitingInput)?;
         admit_challenge(&self.original, input, self.limits, self.continuations, self.input_responses)?;
         admit_answer_bytes(responses.as_ref(), self.limits.core.request_bytes)?;
@@ -165,7 +170,7 @@ impl ManagedInteraction {
         self.step = None;
         Ok(RecoverableManagedContinuation {
             interaction: self, request: Some(request), call: None, phase: Phase::Prepared,
-            maximum_recoveries: contract.maximum_recoveries, attempts: 0, answer_count,
+            maximum_recoveries, attempts: 0, answer_count,
         })
     }
 }
@@ -315,7 +320,7 @@ impl RecoverableManagedContinuation {
     }
 }
 
-fn recovery_request(original: &CoreRequest, input: &InputRequiredResult, responses: Option<FinalInputResponses>)
+pub(crate) fn recovery_request(original: &CoreRequest, input: &InputRequiredResult, responses: Option<FinalInputResponses>)
     -> Result<CoreRequest, ContinuationRecoveryError>
 {
     if input.request_state().is_none_or(str::is_empty) { return Err(ContinuationRecoveryError::StateRequired); }
@@ -324,10 +329,10 @@ fn recovery_request(original: &CoreRequest, input: &InputRequiredResult, respons
     } else { InputSelection::Complete };
     Ok(continuation_request_selected(original, input, responses, selection)?)
 }
-fn reserve_frame(used: usize, frame: usize, total: usize) -> Result<usize, ManagedCoreError> {
+pub(crate) fn reserve_frame(used: usize, frame: usize, total: usize) -> Result<usize, ManagedCoreError> {
     used.checked_add(frame).filter(|reserved| *reserved <= total).ok_or(ManagedCoreError::ResponseByteLimit)
 }
-fn admit_answer_bytes(responses: Option<&FinalInputResponses>, maximum: usize) -> Result<(), ManagedCoreError> {
+pub(crate) fn admit_answer_bytes(responses: Option<&FinalInputResponses>, maximum: usize) -> Result<(), ManagedCoreError> {
     if let Some(responses) = responses {
         let mut encoded = super::super::BoundedWriter { bytes: Vec::new(), maximum };
         serde_json::to_writer(&mut encoded, responses).map_err(|_| ManagedCoreError::RequestTooLarge)?;
@@ -336,10 +341,12 @@ fn admit_answer_bytes(responses: Option<&FinalInputResponses>, maximum: usize) -
 }
 fn recoverable_transport_failure(error: &ManagedCoreError) -> bool {
     matches!(error, ManagedCoreError::MissingTerminal)
-        || matches!(error, ManagedCoreError::Session(OAuthSessionError::Http(
-            ModernHttpExecutorError::ResponseBodyReadFailed
-            | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_)))
-        )))
+        || matches!(error, ManagedCoreError::Session(OAuthSessionError::Http(error))
+            if recovery_http_interruption(error))
+}
+pub(crate) fn recovery_http_interruption(error: &ModernHttpExecutorError) -> bool {
+    matches!(error, ModernHttpExecutorError::ResponseBodyReadFailed
+        | ModernHttpExecutorError::Transport(ClientError::Io(_) | ClientError::HttpError(HttpError::Io(_))))
 }
 
 #[cfg(test)]
