@@ -20421,11 +20421,19 @@ mod ordinary {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     use super::phase_b_std::{ToolIdentity, ToolProbeAuthority, ToolProbeInput, validate_tool_probe_batch, validate_version_stream_for_role};
 
+    // bd-rf6yo: gated to match its only use sites, which live inside
+    // `ordinary_checked_cargo_example_binding` under the same cfg. Imported
+    // unconditionally it is an unused import off-linux, and gate 4 runs
+    // `-D warnings`, so the target did not compile on a non-linux host at all.
+    // It IS used on linux -- do not delete it.
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    use super::trust_std::checked_cargo_hardlink_snapshot;
+
     use super::trust_std::{
         ACQUISITION_SPOOL_PREFIX, AcquisitionToolPaths, BootstrapEnvironment, BootstrapMode, CONTROL_LEDGER_PREFIX, CONTROL_SCRATCH_MAXIMA, CanonicalRecord, CanonicalValue, CheckedSnapshot,
         ControlLedgerExpectation, FileBinding, IntegrationSeal, MAX_ACQUISITION_SPOOL_BYTES, MAX_CONTROL_LEDGER_BYTES, MAX_GATE_EXECUTABLE_BYTES, MAX_SPARSE_CACHE_INPUT_BYTES,
         MAX_SUPPLY_BUNDLE_BYTES, MAX_VERIFIER_BYTES, OrdinaryHandoffArguments, RetainedSnapshotSet, SDF_OPT, SDF_REQ, SIF_OPT, SIF_REQ, SparseDependencyKind, SparseDependencySemantic,
-        SparsePubtimeFailure, ValidatedControlLedger, ValidatedDirectoryTreeBinding, ValidatedFileBinding, ValidatedTargetSnapshot, bootstrap_role_name, checked_cargo_hardlink_snapshot, checked_read,
+        SparsePubtimeFailure, ValidatedControlLedger, ValidatedDirectoryTreeBinding, ValidatedFileBinding, ValidatedTargetSnapshot, bootstrap_role_name, checked_read,
         checked_snapshot, emit_entry_diagnostic, emit_entry_diagnostic_parts, encode_canonical_record, encode_lower_hex, entry_diagnostic_code_is_valid, expected_ordinary_handoff_argv,
         expected_ordinary_handoff_environment, expected_ordinary_supply_relative_path, has_exact_gate_intent, join_control_build_stream, parse_canonical_record_file,
         parse_canonical_record_file_with_final_self_digest, parse_integration_seal, parse_ordinary_handoff_arguments, parse_outer_transport_record, read_ordinary_handoff_environment,
