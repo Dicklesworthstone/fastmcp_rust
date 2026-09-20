@@ -547,9 +547,9 @@ mod tests {
             assert!(matches!(operation.next_event(&cx).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InputPending))));
             let wrong = Some(serde_json::from_value(json!({})).unwrap());
-            assert!(matches!(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), wrong).await,
+            assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), wrong)).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
-            assert!(matches!(operation.resume(&cx, RequestId::Number(1), RequestId::Number(4), None).await,
+            assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(1), RequestId::Number(4), None)).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::RepeatedRequestId))));
             assert_eq!(operation.pending_input().unwrap().request_state(), Some("current-state"));
             assert_eq!(operation.continuation_count(), 0);
@@ -562,12 +562,12 @@ mod tests {
         runtime().block_on(async {
             let cx = Cx::current().unwrap();
             let mut operation = awaiting(&cx);
-            assert!(matches!(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), None).await,
+            assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), None)).await,
                 Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Expired)))));
             assert!(operation.pending_input().is_none());
             assert_eq!(operation.continuation_count(), 1);
             assert_eq!(operation.used_ids.len(), 4);
-            assert!(matches!(operation.resume(&cx, RequestId::Number(5), RequestId::Number(6), None).await,
+            assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(5), RequestId::Number(6), None)).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::Closed))));
             assert_eq!(operation.continuation_count(), 1);
         });
@@ -581,7 +581,7 @@ mod tests {
                 let mut operation = awaiting(&cx);
                 if close_owner { operation.client.close(); }
                 else { operation.cancellation.cancel(); }
-                assert!(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), None).await.is_err());
+                assert!(Box::pin(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), None)).await.is_err());
                 assert!(operation.pending_input().is_none());
                 assert_eq!(operation.continuation_count(), 0);
                 assert_eq!(operation.used_ids.len(), 2);
@@ -664,10 +664,10 @@ mod tests {
             for invalid in [FinalInputResponses::default(), answer("foreign"),
                 serde_json::from_value(json!({"one":{"action":"decline"}})).unwrap()]
             {
-                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), invalid).await,
+                assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), invalid)).await,
                     Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
             }
-            assert!(matches!(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), Some(answer("one"))).await,
+            assert!(matches!(Box::pin(operation.resume(&cx, RequestId::Number(3), RequestId::Number(4), Some(answer("one")))).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::InvalidInputResponses))));
             assert_eq!(operation.pending_input().unwrap().input_requests().unwrap().members().len(), 2);
             assert_eq!(operation.pending_input().unwrap().request_state(), Some("state"));
@@ -683,7 +683,7 @@ mod tests {
             let cx = Cx::current().unwrap();
             let mut operation = awaiting_partial(&cx, Some("state"));
             for (discovery, request) in [(1,4), (2,4), (3,1), (3,2), (3,3)] {
-                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(discovery), RequestId::Number(request), answer("one")).await,
+                assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(discovery), RequestId::Number(request), answer("one"))).await,
                     Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::RepeatedRequestId))));
             }
             assert_eq!(operation.continuation_count(), 0);
@@ -699,11 +699,11 @@ mod tests {
             let mut operation = awaiting_partial(&cx, Some("state"));
             // The existing fixture's revoked token refuses acquisition. The
             // partial response must reach this boundary, not full-map validation.
-            assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one")).await,
+            assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one"))).await,
                 Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Expired)))));
             assert!(operation.pending_input().is_none());
             assert_eq!((operation.continuations, operation.input_responses, operation.used_ids.len()), (1,1,4));
-            assert!(matches!(operation.resume_partial(&cx, RequestId::Number(5), RequestId::Number(6), answer("one")).await,
+            assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(5), RequestId::Number(6), answer("one"))).await,
                 Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::Closed))));
             assert_eq!((operation.continuations, operation.input_responses, operation.used_ids.len()), (1,1,4));
         });
@@ -715,11 +715,11 @@ mod tests {
             let cx = Cx::current().unwrap();
             for state in [None, Some("")] {
                 let mut operation = awaiting_partial(&cx, state);
-                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one")).await,
+                assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), answer("one"))).await,
                     Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::PartialStateRequired))));
                 assert_eq!(operation.continuation_count(), 0);
                 let all = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
-                assert!(matches!(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), all).await,
+                assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(3), RequestId::Number(4), all)).await,
                     Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Expired)))));
                 assert_eq!((operation.continuations, operation.input_responses), (1,2));
             }
