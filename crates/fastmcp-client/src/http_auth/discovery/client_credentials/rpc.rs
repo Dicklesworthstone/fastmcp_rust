@@ -113,14 +113,14 @@ impl ClientCredentialsClient {
         let deadline = discovery_deadline(cx, limits.timeout().min(self.inner.timeout))
             .map_err(ClientCredentialsError::from)?;
         preflight(self.resource(), &request, &discovery_id, &request_id, limits)?;
-        let response = active(
+        let response = Box::pin(active(
             cx,
             deadline,
             &self.inner.closed,
             cancellation,
             None,
             self.execute_core_with_cancellation(cx, cancellation, request, discovery_id, request_id),
-        )
+        ))
         .await?;
         ClientCredentialsCoreCall::from_response(response, limits, deadline)
     }
