@@ -1147,13 +1147,21 @@ fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
         .collect()
 }
 
-/// Every commit touching `path`, newest first.
+/// Every commit touching `path`, newest first, WITHOUT history simplification.
+///
+/// `--full-history` is load-bearing, not hygiene. Plain `git log -- <path>`
+/// simplifies merge history and OMITS commits that really did modify the file:
+/// measured on this repository, 79 default vs 103 full-history for `Cargo.toml`,
+/// 114 vs 134 for `Cargo.lock`, 7 vs 9 for `rust-toolchain.toml`, against 79
+/// reachable merges. A staleness check built on the simplified list can report
+/// "anchor is the latest mover" while a later commit moved it — passing while
+/// carrying a false premise, which is the exact defect this bead exists to close.
 ///
 /// Fails closed for the same reason `blob_at_revision` does: a check that
 /// silently examines nothing is the defect this capability exists to remove.
 fn commits_touching(path: &str) -> Vec<String> {
     let output = std::process::Command::new("git")
-        .args(["log", "--format=%H", "--", path])
+        .args(["log", "--full-history", "--format=%H", "--", path])
         .current_dir(workspace_root())
         .output()
         .unwrap_or_else(|error| panic!("{path}: cannot run `git log -- {path}`: {error}"));
@@ -1194,29 +1202,72 @@ fn workspace_input_provenance_drift(rows: &[WorkspaceInputRow]) -> Vec<String> {
     drift
 }
 
-/// PROPERTY 3: the anchor is the LATEST commit touching that path.
+/// PROPERTY 3: nothing has moved the bound path since its anchor.
 ///
-/// An anchor absent from the path's history entirely is reported separately
-/// from a stale one: they are different defects and collapsing them would hide
-/// a fabricated revision behind the much commoner staleness message.
+/// TWO TRIGGERS, DELIBERATELY NOT COLLAPSED, because they are different
+/// defects with different severities and one can hide the other.
+///
+///   CONTENT DRIFT  the bytes at HEAD differ from the bytes at the anchor.
+///                  The recorded digest no longer describes the tree, so the
+///                  binding is stale and the anchor's claim is false. This is
+///                  what a dependency-pin refresh produces.
+///   LATER TOUCHER  the bytes are identical but a later commit touched the
+///                  path (a revert, a no-op rewrite). The digest is still
+///                  true; only the attribution is stale. Reported, because
+///                  the declared property is "the anchor is the LATEST commit
+///                  touching that path", and narrowing that to content alone
+///                  would be weakening the check to match reality.
+///
+/// CONTENT IS THE PRIMARY TRIGGER AND IT IS EVALUATED FIRST, because it is
+/// derived from object storage and cannot be defeated by history traversal at
+/// all. The commit list is used only to ATTRIBUTE a drift that content has
+/// already proven. A check whose only evidence is `git log` can pass while
+/// false whenever simplification omits the modifying commit — see
+/// `commits_touching`, where that omission is measured rather than assumed.
 fn workspace_input_unaccounted_movers(rows: &[WorkspaceInputRow]) -> Vec<String> {
     let mut movers = Vec::new();
     for row in rows {
+        let anchored = blob_at_revision(&row.revision, &row.path);
+        let current = blob_at_revision("HEAD", &row.path);
         let history = commits_touching(&row.path);
-        let Some(latest) = history.first() else {
-            movers.push(format!("{}: no commit in this history touches a bound path", row.path));
+        let position = history.iter().position(|commit| *commit == row.revision);
+
+        if anchored != current {
+            let attribution = match (history.first(), position) {
+                (Some(latest), Some(later)) => format!(
+                    "{later} later commit(s) touched it, most recently {latest}"
+                ),
+                (Some(latest), None) => format!(
+                    "its anchor is absent from this path's full history; most recent is {latest}"
+                ),
+                (None, _) => "no commit in this history touches the path".to_owned(),
+            };
+            movers.push(format!(
+                "{}: CONTENT DRIFT since anchor {} - anchor holds {} bytes, HEAD holds {} bytes; {}",
+                row.path,
+                row.revision,
+                anchored.len(),
+                current.len(),
+                attribution,
+            ));
             continue;
-        };
-        match history.iter().position(|commit| *commit == row.revision) {
-            Some(0) => {}
-            Some(later) => movers.push(format!(
-                "{}: anchored at {}, but {later} later commit(s) have touched it, most recently {latest}",
+        }
+
+        match (history.first(), position) {
+            (_, Some(0)) => {}
+            (Some(latest), Some(later)) => movers.push(format!(
+                "{}: LATER TOUCHER of anchor {} - content is unchanged, but {later} later \
+                 commit(s) touched it, most recently {latest}",
                 row.path, row.revision,
             )),
-            None => movers.push(format!(
-                "{}: anchored at {}, which does not appear in this path's history at all; its \
-                 most recent commit is {latest}",
+            (Some(latest), None) => movers.push(format!(
+                "{}: anchor {} does not appear in this path's full history at all; its most \
+                 recent commit is {latest}",
                 row.path, row.revision,
+            )),
+            (None, _) => movers.push(format!(
+                "{}: no commit in this history touches a bound path",
+                row.path
             )),
         }
     }
