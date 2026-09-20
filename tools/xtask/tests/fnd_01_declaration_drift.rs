@@ -54,7 +54,18 @@ fn parse(path: &str) -> toml::Value {
 
 const POLICY: &str = "evidence/fnd-01/dependency-verification.toml";
 
-/// The ten drifts measured at commit:1a18f942 on 2026-09-19, recorded on bd-dmnn6.
+/// The ten drifts measured on 2026-09-19, recorded on bd-dmnn6, against these
+/// exact inputs:
+///
+///     Cargo.toml           blob 2cf86cc1e4178ad09c9bd8159942da97cd9e65a0
+///     rust-toolchain.toml  blob e36bd453a98fc579be6afd951f5ef5b7cc170469
+///
+/// Bound by BLOB, not by revision. The measurement sha was 1a18f942, which is
+/// already rebase-orphaned (twin aa09a123) barely an hour after it was written;
+/// three of this bead's shas died the same way and only the blobs survived. A
+/// commit sha is a changing name for fixed content, so a receipt that needs to
+/// outlive a rebase names the content. The shas above are a convenience for a
+/// reader who wants context, not the anchor.
 ///
 /// Ten drifts render as NINE keys: the license VALUE drift ("MIT" -> gone) and the
 /// license KEY drift (`license.workspace` -> `license-file.workspace`) are one
