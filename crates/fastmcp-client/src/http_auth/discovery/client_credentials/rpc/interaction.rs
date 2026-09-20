@@ -599,14 +599,14 @@ mod tests {
             let closer = operation.client.clone();
             let calls = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&calls);
-            let result = operation.drive(&cx, move |_| {
+            let result = Box::pin(operation.drive(&cx, move |_| {
                 observed.fetch_add(1, Ordering::Relaxed);
                 let closer = closer.clone();
                 async move {
                     closer.close();
                     std::future::pending::<Result<ClientCredentialsInputReply, ClientCredentialsInteractionError>>().await
                 }
-            }, |_| Ok(())).await;
+            }, |_| Ok(()))).await;
             assert!(matches!(result,
                 Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Closed)))));
             assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -733,13 +733,13 @@ mod tests {
             let operation = awaiting_partial(&cx, Some("state"));
             operation.client.close();
             let calls = std::cell::Cell::new(0);
-            let outcome = operation.drive_partial(&cx, |_| {
+            let outcome = Box::pin(operation.drive_partial(&cx, |_| {
                 calls.set(calls.get() + 1);
                 std::future::ready(Ok(ClientCredentialsInputReply {
                     discovery_id: RequestId::Number(3), request_id: RequestId::Number(4),
                     input_responses: Some(answer("one")),
                 }))
-            }, |_| Ok(())).await;
+            }, |_| Ok(()))).await;
             assert!(matches!(outcome,
                 Err(ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Authentication(ClientCredentialsError::Closed)))));
             assert_eq!(calls.get(), 0);
@@ -753,14 +753,14 @@ mod tests {
             let operation = awaiting_partial(&cx, Some("state"));
             let cancel = operation.cancellation.clone();
             let calls = std::cell::Cell::new(0);
-            let outcome = operation.drive_partial(&cx, |_| {
+            let outcome = Box::pin(operation.drive_partial(&cx, |_| {
                 calls.set(calls.get() + 1);
                 cancel.cancel();
                 std::future::ready(Ok(ClientCredentialsInputReply {
                     discovery_id: RequestId::Number(3), request_id: RequestId::Number(4),
                     input_responses: Some(answer("one")),
                 }))
-            }, |_| Ok(())).await;
+            }, |_| Ok(()))).await;
             assert!(matches!(outcome, Err(ClientCredentialsInteractionError::Core(
                 ClientCredentialsCoreError::Authentication(ClientCredentialsError::Discovery(
                     super::super::super::super::OAuthDiscoveryError::Cancelled))))));
