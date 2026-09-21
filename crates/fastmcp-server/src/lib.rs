@@ -7020,9 +7020,22 @@ impl BoundHttpServer {
                     // observed promptly while reaping keeps its coarse cadence.
                     const REAP_PARK_CHUNK: Duration = Duration::from_millis(100);
                     let mut parked = Duration::ZERO;
+                    #[cfg(test)]
+                    lib_unit_tests::record_f2ndd_reaper_stage(41);
                     loop {
+                        // DIAGNOSTIC (bd-f2ndd): the cancellation check below sits
+                        // AFTER this sleep, so the short-chunk mitigation only works
+                        // if the sleep returns. 42 before, 43 after: if 42 is the
+                        // high-water mark the sleep never returned and checkpoint was
+                        // never evaluated -- a different failure from it returning Ok.
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_stage(42);
                         asupersync::time::sleep(reaper_cx.now(), REAP_PARK_CHUNK).await;
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_stage(43);
                         if reaper_cx.checkpoint().is_err() {
+                            #[cfg(test)]
+                            lib_unit_tests::record_f2ndd_reaper_stage(44);
                             break;
                         }
                         parked += REAP_PARK_CHUNK;
@@ -23549,6 +23562,14 @@ mod lib_unit_tests {
     /// cancels, yet `serve` still does not return -- so the stall moved to the
     /// server and has no stage. This records how far serve's shutdown gets.
     pub(super) static F2NDD_SERVE_STAGE: AtomicUsize = AtomicUsize::new(0);
+
+    /// DIAGNOSTIC (bd-f2ndd). Separate from the serve counter so a reaper
+    /// stage cannot mask a serve stage under fetch_max.
+    pub(super) static F2NDD_REAPER_STAGE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_f2ndd_reaper_stage(stage: usize) {
+        F2NDD_REAPER_STAGE.fetch_max(stage, Ordering::SeqCst);
+    }
 
     pub(super) fn record_f2ndd_serve_stage(stage: usize) {
         F2NDD_SERVE_STAGE.fetch_max(stage, Ordering::SeqCst);
@@ -43329,7 +43350,7 @@ mod lib_unit_tests {
                 format!(
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
-                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}. \
+                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{} \
                      The stall is NOT fixed; do not raise this bound.",
                     F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
                     match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
@@ -43343,6 +43364,13 @@ mod lib_unit_tests {
                         35 => "parked at finish_live_modern_http_sessions",
                         36 => "parked at drain_cooperative_shutdown",
                         _ => "past every shutdown await -- the stall is after them",
+                    },
+                    match F2NDD_REAPER_STAGE.load(Ordering::SeqCst) {
+                        0 => " REAPER never started",
+                        41 => " REAPER entered but never reached its first sleep",
+                        42 => " REAPER PARKED IN sleep() AND NEVER RETURNED -- checkpoint() was NEVER EVALUATED, so the short-chunk mitigation never ran; this is a sleep that does not wake, not a cancellation that is not observed",
+                        43 => " REAPER completed a sleep but checkpoint() returned Ok despite the abort -- the mitigation ran and did not see cancellation",
+                        _ => " REAPER observed cancellation and broke; the join is parked on something other than the loop",
                     }
                 )
             })?;
