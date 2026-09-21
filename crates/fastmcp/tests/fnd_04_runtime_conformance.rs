@@ -3166,9 +3166,18 @@ fn fnd_04_packed_ref_returns_none_for_an_absent_reference_or_table() {
 /// `#[cfg(test)] mod X;` bodies (13,220 lines) and 103 inside three inline modules
 /// gated by a non-literal attribute -- `fastmcp-server/src/oidc.rs`
 /// (`signer_activation_tests`, 49), `fastmcp-transport/src/sse.rs` (`tests`, 48)
-/// and `fastmcp-server/src/extensions.rs` (`tests`, 6). The two sets are disjoint.
-/// That leaves 44 genuinely shipped sites: 84% of what B-07 denies is test code its
-/// own instrument cannot see.
+/// and `fastmcp-server/src/extensions.rs` (`tests`, 6). Direct enumeration over
+/// original-file offsets -- not 278 minus the two exclusions, which would assume
+/// they are disjoint -- leaves 45 genuinely shipped sites. The great majority of
+/// what B-07 denies is test code its own instrument cannot see, and the dimension
+/// `out-of-band-cx` collapses from 141 to 0: it currently denies nothing shipped.
+///
+/// FEATURE CAVEAT, because 45 is a count of SOURCE TEXT and B-07 scans text. A
+/// reader who compiles at some feature set and counts will not see 45 and may hunt
+/// a defect that was never built: 26 are ungated, 10 sit behind `feature = "tasks"`,
+/// 5 behind `feature = "legacy-2024-11-05"`, 3 behind an `any(..)` of it, and 1
+/// behind `not(feature = "legacy-2024-11-05")` -- visible only when that feature is
+/// OFF. No single feature selection sees all 45.
 ///
 /// Those counts are deliberately NOT asserted. They measure a moving population and
 /// would rot into a false failure the next time anyone adds a test. What is asserted
