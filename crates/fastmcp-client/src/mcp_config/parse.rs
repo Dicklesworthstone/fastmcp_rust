@@ -6,47 +6,68 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 
 use super::{ConfigError, McpConfig, ServerConfig};
 
-// `Option` distinguishes an absent registry from an explicitly empty one. A
-// present null is not an absent registry. Visit entries before collecting them
-// so a repeated server name cannot silently replace a command or disabled flag.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
+// Collect maps without discarding an earlier definition or control before
+// validation. Keys are checked after deserialization, including JSON escapes.
+fn unique_map<'de, D, T>(
+    deserializer: D,
+    duplicate_message: &'static str,
+) -> Result<HashMap<String, T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    struct RegistryVisitor<T>(std::marker::PhantomData<T>);
+    struct UniqueMapVisitor<T> {
+        duplicate_message: &'static str,
+        value: std::marker::PhantomData<T>,
+    }
 
-    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for RegistryVisitor<T> {
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for UniqueMapVisitor<T> {
         type Value = HashMap<String, T>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a server registry with unique names")
+            formatter.write_str("a configuration map with unique keys")
         }
 
         fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
         where
             A: serde::de::MapAccess<'de>,
         {
-            let mut servers = HashMap::new();
+            let mut values = HashMap::new();
             while let Some(name) = map.next_key::<String>()? {
-                match servers.entry(name) {
+                match values.entry(name) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(map.next_value::<T>()?);
                     }
                     std::collections::hash_map::Entry::Occupied(_) => {
-                        return Err(A::Error::custom(
-                            "duplicate server name in configuration registry",
-                        ));
+                        return Err(A::Error::custom(self.duplicate_message));
                     }
                 }
             }
-            Ok(servers)
+            Ok(values)
         }
     }
 
-    deserializer
-        .deserialize_map(RegistryVisitor::<T>(std::marker::PhantomData))
-        .map(Some)
+    deserializer.deserialize_map(UniqueMapVisitor::<T> {
+        duplicate_message,
+        value: std::marker::PhantomData,
+    })
+}
+
+// `Option` distinguishes an absent registry from an explicitly empty one. A
+// present null is not an absent registry: the map visitor rejects it.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    unique_map(deserializer, "duplicate server name in configuration registry").map(Some)
+}
+
+fn extra_fields<'de, D>(deserializer: D) -> Result<HashMap<String, serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    unique_map(deserializer, "duplicate top-level configuration field")
 }
 
 #[derive(Deserialize)]
@@ -56,7 +77,7 @@ struct ConfigWire {
     mcp_servers: Option<HashMap<String, ServerConfig>>,
     #[serde(default, deserialize_with = "present")]
     servers: Option<HashMap<String, VscodeStdioServer>>,
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "extra_fields")]
     extra: HashMap<String, serde_json::Value>,
 }
 
@@ -369,5 +390,44 @@ mod tests {
         assert_eq!(config.mcp_servers.len(), 2);
         assert!(config.get_server("first").unwrap().disabled);
         assert_eq!(config.get_server("second").unwrap().command, "replacement");
+    }
+
+    #[test]
+    fn duplicate_top_level_controls_cannot_hide_unsupported_values() {
+        for controls in [
+            r#""inputs":[{"id":"ask","type":"promptString"}],"inputs":[]"#,
+            r#""inputs":false,"inputs":[]"#,
+            r#""inputs":[],"in\u0070uts":[]"#,
+            r#""$schema":false,"$schema":"schema.json""#,
+            r#""$schema":"first.json","$schema":"second.json""#,
+        ] {
+            let json = format!(r#"{{"servers":{{"local":{{"command":"server"}}}},{controls}}}"#);
+            let error = serde_json::from_str::<McpConfig>(&json).unwrap_err();
+            assert!(error.to_string().contains("duplicate top-level configuration field"));
+            assert!(McpConfig::from_json(&json).is_err());
+            assert!(McpConfig::from_jsonc(&json).is_err());
+        }
+        let valid_jsonc = r#"{/*config*/"servers":{"local":{"command":"server",},},"inputs":[],}"#;
+        let invalid_jsonc = r#"{/*config*/"servers":{"local":{"command":"server",},},"inputs":[{"id":"ask"}],"inputs":[],}"#;
+        assert!(McpConfig::from_jsonc(valid_jsonc).is_ok());
+        assert!(McpConfig::from_jsonc(invalid_jsonc).is_err());
+    }
+
+    #[test]
+    fn unique_top_level_controls_keep_their_existing_validation() {
+        let valid = r#"{"servers":{"local":{"command":"server"}},"inputs":[],"$schema":"schema.json"}"#;
+        let config = McpConfig::from_json(valid).unwrap();
+        assert_eq!(config.get_server("local").unwrap().command, "server");
+        assert!(McpConfig::from_jsonc(valid).is_ok());
+        for control in [
+            r#""inputs":[{"id":"ask","type":"promptString"}]"#,
+            r#""inputs":false"#,
+            r#""$schema":false"#,
+            r#""sandbox":true"#,
+        ] {
+            let json = format!(r#"{{"servers":{{"local":{{"command":"server"}}}},{control}}}"#);
+            assert!(McpConfig::from_json(&json).is_err());
+            assert!(McpConfig::from_jsonc(&json).is_err());
+        }
     }
 }
