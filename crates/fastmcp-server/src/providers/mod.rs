@@ -14,6 +14,9 @@
 //!   resources through the router's normal input/output validation path.
 //! - With the `proxy` feature, `managed_oauth::ManagedOAuthProvider`: bounded,
 //!   authenticated modern upstream catalogs and request-owned forwarding.
+//! - With the `proxy` feature, `ClientCredentialsProvider`: the same exact
+//!   tool, resource, prompt, template and completion handlers using an explicitly
+//!   provisioned machine identity instead of an interactive OAuth login.
 //!
 //! # Example
 //!
@@ -42,6 +45,8 @@ mod schema_tool;
 /// Authenticated, request-owned modern core forwarding using a managed login.
 #[cfg(feature = "proxy")]
 pub mod managed_oauth;
+#[cfg(feature = "proxy")]
+pub use managed_oauth::dynamic::ClientCredentialsProvider;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
 pub use blocking::{BlockingCompletion, BlockingHandlerLane, BlockingPrompt, BlockingResource, BlockingTool};

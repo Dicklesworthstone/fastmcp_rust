@@ -7,6 +7,8 @@
 
 mod completion;
 pub use completion::ManagedOAuthCompletion;
+mod machine;
+pub use machine::ClientCredentialsProvider;
 
 use std::collections::HashSet;
 use std::sync::Arc;
