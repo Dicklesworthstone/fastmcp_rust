@@ -47,7 +47,8 @@ pub struct NotSet;
 /// Transformation rules for a single argument.
 ///
 /// Use the builder methods to specify which aspects of the argument to transform.
-/// Any field left as `None` will inherit from the original argument.
+/// Unspecified fields inherit from the original argument, except that a runtime
+/// default makes omission legal unless `required` is explicitly `Some(true)`.
 #[derive(Debug, Clone, Default)]
 pub struct ArgTransform {
     /// New name for the argument.
@@ -59,8 +60,8 @@ pub struct ArgTransform {
     /// Whether to hide this argument from the schema.
     /// Hidden arguments must have a default value.
     pub hide: bool,
-    /// Override the required status.
-    /// Only `Some(true)` is meaningful (to make optional → required).
+    /// Override the required status. `Some(true)` requires an explicit value
+    /// even with a default; `Some(false)` permits omission.
     pub required: Option<bool>,
     /// New type annotation for the argument (as JSON Schema).
     pub type_schema: Option<serde_json::Value>,
@@ -88,6 +89,10 @@ impl ArgTransform {
     }
 
     /// Sets the default value for this argument.
+    ///
+    /// The adapter supplies it only when the published argument is absent.
+    /// Omission is allowed by the generated schema unless [`Self::required`]
+    /// was explicitly selected. Present values, including null, are not replaced.
     #[must_use]
     pub fn default(mut self, value: impl Into<serde_json::Value>) -> Self {
         self.default = Some(value.into());
@@ -635,16 +640,17 @@ fn transform_input_schema(
                 let new_name = transform.name.as_ref().unwrap_or(original_name);
                 let mut new_schema = prop_schema;
 
+                // Select the replacement first. Explicit description/default
+                // overrides belong to that schema, not to the discarded one.
+                if let Some(type_schema) = &transform.type_schema {
+                    new_schema = type_schema.clone();
+                }
+
                 // Apply description override
                 if let (Some(desc), Some(schema_obj)) =
                     (&transform.description, new_schema.as_object_mut())
                 {
                     schema_obj.insert(String::from("description"), serde_json::json!(desc));
-                }
-
-                // Apply type override
-                if let Some(type_schema) = &transform.type_schema {
-                    new_schema = type_schema.clone();
                 }
 
                 // Apply default override
@@ -689,7 +695,13 @@ fn transform_input_schema(
         let original_required = std::mem::take(required);
         for value in original_required {
             let mapped = match value.as_str().and_then(|name| arg_transforms.get(name)) {
-                Some(transform) if transform.hide || transform.required == Some(false) => {
+                Some(transform)
+                    if transform.hide
+                        || transform.required == Some(false)
+                        || (transform.default.is_some() && transform.required != Some(true)) =>
+                {
+                    // Only actual adapter defaults permit omission. A schema's
+                    // default annotation alone does not supply a runtime value.
                     continue;
                 }
                 Some(transform) => match &transform.name {
@@ -2154,5 +2166,245 @@ mod tests {
                 .expect("final-aware parent resume log is not poisoned"),
             "TransformedTool must call the parent MRTR resume hook instead of dropping resume inputs"
         );
+    }
+
+    #[test]
+    fn runtime_defaults_make_renamed_arguments_optional_in_both_catalogs() {
+        for required in [false, true] {
+            let mut transform = ArgTransform::new().name("query").default_str("fallback");
+            if required {
+                transform = transform.required();
+            }
+            let tool = TransformedTool::from_tool(FinalAwareParent::new())
+                .transform_arg("q", transform)
+                .build();
+            for schema in [
+                tool.definition().input_schema,
+                tool.final_definition().unwrap().input_schema,
+            ] {
+                assert_eq!(schema["properties"]["query"]["default"], "fallback");
+                let admitted = fastmcp_protocol::admit_final_schema(schema).unwrap();
+                assert_eq!(admitted.validate(&serde_json::json!({})).is_err(), required);
+                assert!(admitted.validate(&serde_json::json!({"query": ""})).is_ok());
+                assert!(admitted.validate(&serde_json::json!({"query": null})).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn falsy_runtime_defaults_are_not_confused_with_absent_defaults() {
+        for default in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(""),
+        ] {
+            let mut parent = SearchToolFixture::new("defaults");
+            parent.schema = serde_json::json!({
+                "type": "object",
+                "properties": {"value": {}},
+                "required": ["value"]
+            });
+            let tool = TransformedTool::from_tool(parent)
+                .transform_arg("value", ArgTransform::new().default(default.clone()))
+                .build();
+            let schema =
+                fastmcp_protocol::admit_final_schema(tool.definition().input_schema).unwrap();
+            assert!(schema.validate(&serde_json::json!({})).is_ok());
+            assert_eq!(
+                tool.transform_arguments(serde_json::json!({})).unwrap(),
+                serde_json::json!({"value": default})
+            );
+        }
+    }
+
+    #[test]
+    fn schema_default_annotations_alone_do_not_relax_required_arguments() {
+        let mut parent = SearchToolFixture::new("annotation");
+        parent.schema["properties"]["q"]["default"] = serde_json::json!("annotation-only");
+        let tool = TransformedTool::from_tool(parent)
+            .rename_arg("q", "query")
+            .build();
+        let schema = fastmcp_protocol::admit_final_schema(tool.definition().input_schema).unwrap();
+        assert!(schema.validate(&serde_json::json!({})).is_err());
+        assert!(
+            schema
+                .validate(&serde_json::json!({"query": "explicit"}))
+                .is_ok()
+        );
+        assert_eq!(
+            tool.transform_arguments(serde_json::json!({})).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn explicit_description_and_default_override_the_replacement_schema() {
+        for explicit_description in [false, true] {
+            let mut transform = ArgTransform::new()
+                .name("query")
+                .type_schema(serde_json::json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replacement description",
+                    "default": ["replacement"]
+                }))
+                .default(serde_json::json!(["configured"]));
+            if explicit_description {
+                transform = transform.description("Explicit description");
+            }
+            let tool = TransformedTool::from_tool(FinalAwareParent::new())
+                .transform_arg("q", transform)
+                .build();
+            for schema in [
+                tool.definition().input_schema,
+                tool.final_definition().unwrap().input_schema,
+            ] {
+                let property = &schema["properties"]["query"];
+                assert_eq!(
+                    property["description"],
+                    if explicit_description {
+                        "Explicit description"
+                    } else {
+                        "Replacement description"
+                    }
+                );
+                assert_eq!(property["default"], serde_json::json!(["configured"]));
+                assert_eq!(property["type"], "array");
+                let admitted = fastmcp_protocol::admit_final_schema(schema).unwrap();
+                assert!(
+                    admitted
+                        .validate(&serde_json::json!({"query": ["item"]}))
+                        .is_ok()
+                );
+                assert!(
+                    admitted
+                        .validate(&serde_json::json!({"query": "item"}))
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    struct AsyncDefaultParent(FinalAwareParent);
+
+    impl ToolHandler for AsyncDefaultParent {
+        fn definition(&self) -> Tool {
+            self.0.definition()
+        }
+
+        fn final_definition(&self) -> Option<FinalTool> {
+            self.0.final_definition()
+        }
+
+        fn execution_mode(&self) -> crate::ToolExecutionMode {
+            crate::ToolExecutionMode::Async
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.0.call(ctx, arguments)
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            self.0.call_final_outcome_async_resuming_in_request(
+                ctx,
+                request_cx,
+                arguments,
+                resume_inputs,
+            )
+        }
+    }
+
+    #[test]
+    fn router_dispatch_applies_defaults_but_preserves_explicit_required_and_type_checks() {
+        use std::sync::Arc;
+
+        use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, JsonRpcRequest};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for required in [false, true] {
+                let parent = FinalAwareParent::new();
+                let recorded = Arc::clone(&parent.recorded);
+                let mut transform = ArgTransform::new().name("query").default_str("fallback");
+                if required {
+                    transform = transform.required();
+                }
+                let tool = TransformedTool::from_tool(AsyncDefaultParent(parent))
+                    .transform_arg("q", transform)
+                    .build();
+                let mut router = crate::Router::new();
+                router.add_tool(tool).unwrap();
+                let router = Arc::new(router);
+                for (id, arguments, rejected, expected) in [
+                    (
+                        1_i64,
+                        serde_json::json!({}),
+                        required,
+                        serde_json::json!({"q": "fallback"}),
+                    ),
+                    (
+                        2_i64,
+                        serde_json::json!({"query": ""}),
+                        false,
+                        serde_json::json!({"q": ""}),
+                    ),
+                    (
+                        3_i64,
+                        serde_json::json!({"query": null}),
+                        true,
+                        serde_json::json!(null),
+                    ),
+                ] {
+                    assert!(recorded.lock().unwrap().is_none());
+                    let request = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "search",
+                            "arguments": arguments,
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                                "io.modelcontextprotocol/clientCapabilities": {}
+                            }
+                        })),
+                        id,
+                    );
+                    let context = McpContext::with_state(
+                        cx.clone(),
+                        id as u64,
+                        fastmcp_core::SessionState::new(),
+                    );
+                    let response = Arc::clone(&router)
+                        .dispatch_stateless_owned(context, request)
+                        .await
+                        .unwrap();
+                    assert_eq!(response["resultType"], "complete");
+                    // Successful replies omit isError. Decode its typed wire
+                    // default instead of requiring an explicit false member.
+                    let payload: FinalCallToolResult =
+                        serde_json::from_value(response.clone()).unwrap();
+                    assert_eq!(payload.is_error, rejected);
+                    let observed = recorded.lock().unwrap().take();
+                    if rejected {
+                        assert!(observed.is_none(), "rejected input must not reach the parent");
+                    } else {
+                        assert_eq!(observed, Some(expected));
+                        assert_eq!(response["content"][0]["text"], "final");
+                    }
+                }
+            }
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }

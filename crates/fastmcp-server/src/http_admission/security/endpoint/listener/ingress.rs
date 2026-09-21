@@ -74,12 +74,19 @@ impl SecuredCodec {
         for line in lines {
             if headers.len() >= limits.max_header_count() { return Err(HttpSecurityError::HeaderLimit); }
             let (name, value) = line.split_once(':').ok_or(HttpSecurityError::InvalidHeader)?;
+            // Charge received values before trimming OWS. The policy below
+            // sees normalized values and cannot recover discarded padding.
+            // Colons and CRLF framing have their own allowance in decode().
+            bytes = bytes
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .ok_or(HttpSecurityError::HeaderLimit)?;
+            if bytes > limits.max_header_block_bytes() {
+                return Err(HttpSecurityError::HeaderLimit);
+            }
             // Do not trim the name: whitespace before ':' and obs-fold are not
             // equivalent to an ordinary field. Keep all duplicate fields intact.
             let value = value.trim_matches([' ', '\t']);
-            bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(value.len()))
-                .ok_or(HttpSecurityError::HeaderLimit)?;
-            if bytes > limits.max_header_block_bytes() { return Err(HttpSecurityError::HeaderLimit); }
             headers.push((name.to_owned(), value.to_owned()));
         }
         let head = self.policy.admit_head(method, path, &headers)?;
@@ -256,8 +263,12 @@ mod tests {
     use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 
     fn codec() -> SecuredCodec {
+        codec_with_header_limit(2048)
+    }
+
+    fn codec_with_header_limit(maximum: usize) -> SecuredCodec {
         let policy = HttpSecurityPolicy::new(
-            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(16, 2048, 64).unwrap()).unwrap(),
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(16, maximum, 64).unwrap()).unwrap(),
             "https://service.example", vec!["https://app.example".to_owned()],
         ).unwrap();
         SecuredCodec::new(Arc::new(policy), 64)
@@ -580,5 +591,131 @@ mod tests {
                     assert!(cx.checkpoint().is_ok());
                 }
             });
+    }
+
+    fn padded_expect_head(whitespace: &str, extra: usize) -> String {
+        // The four existing fields charge 81 bytes including their separator
+        // spaces; X-Pad adds five name bytes. Forty-two padding bytes reach
+        // exactly 128. Colons, CRLF and the request line are not field values.
+        assert_eq!(whitespace.len(), 1);
+        format!(
+            "{}X-Pad:{}\r\n\r\n",
+            EXPECT_HEAD.strip_suffix("\r\n").unwrap(),
+            whitespace.repeat(42 + extra)
+        )
+    }
+
+    #[test]
+    fn header_padding_budget_is_exact_and_independent_of_chunk_boundaries() {
+        for whitespace in [" ", "\t"] {
+            for extra in [0, 1] {
+                let head = padded_expect_head(whitespace, extra);
+                for split in 0..head.len() {
+                    let mut codec = codec_with_header_limit(128);
+                    let mut source = BytesMut::from(&head.as_bytes()[..split]);
+                    assert!(codec.decode(&mut source).unwrap().is_none());
+                    assert_eq!(source.as_ref(), &head.as_bytes()[..split]);
+                    source.extend_from_slice(&head.as_bytes()[split..]);
+                    let decision = codec.decode(&mut source).unwrap();
+                    if extra == 0 {
+                        assert!(matches!(decision, Some(Ingress::Continue)));
+                        assert_eq!(source.as_ref(), head.as_bytes());
+                        source.extend_from_slice(b"{}");
+                        let Some(Ingress::Request { request, cors }) =
+                            codec.decode(&mut source).unwrap()
+                        else {
+                            panic!("at-limit padding must preserve ordinary body decoding");
+                        };
+                        assert_eq!(request.body, b"{}");
+                        assert_eq!(cors.allowed_origin(), Some("https://app.example"));
+                    } else {
+                        let Some(Ingress::Immediate(response)) = decision else {
+                            panic!("one extra padding byte must refuse before Continue or dispatch");
+                        };
+                        assert_eq!(response.status.0, 431);
+                        assert!(response.body.is_empty());
+                        assert_eq!(response.headers["cache-control"], "no-store");
+                        assert!(source.is_empty());
+                        assert!(codec.cors.is_none());
+                        source.extend_from_slice(EXPECT_HEAD.as_bytes());
+                        source.extend_from_slice(b"{}");
+                        assert!(codec.decode(&mut source).unwrap().is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bodyless_metadata_cannot_bypass_the_header_padding_budget() {
+        for extra in [0, 1] {
+            // Host plus its untrimmed value charge 20 bytes; X-Pad charges
+            // another five. Its remaining padding reaches the 2048-byte cap.
+            let head = format!(
+                "{METADATA_HEAD}X-Pad:{}\r\n\r\n",
+                "\t".repeat(2048 - 25 + extra)
+            );
+            assert_eq!(
+                status(&mut metadata_codec(), &head),
+                if extra == 0 { 200 } else { 431 }
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_padding_never_writes_continue_or_reads_the_request_body() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for extra in [0, 1] {
+                let peer = ExpectPeer {
+                    head: std::io::Cursor::new(padded_expect_head(" ", extra).into_bytes()),
+                    body: std::io::Cursor::new(b"{}".to_vec()),
+                    written: Vec::new(),
+                    flushed: false,
+                    pending_write: false,
+                    fail_write: false,
+                    body_reads: 0,
+                };
+                let mut framed = Framed::new(peer, codec_with_header_limit(128));
+                let shutdown = HttpListenerShutdown::new(&cx);
+                let mut writing_continue = false;
+                let result = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(1),
+                    receive(
+                        &cx,
+                        &shutdown,
+                        &mut framed,
+                        Duration::from_secs(1),
+                        &mut writing_continue,
+                    ),
+                )
+                .await
+                .expect("header admission must settle without waiting for an unacknowledged body");
+                if extra == 0 {
+                    let Some(Ok(Ingress::Request { request, .. })) = result else {
+                        panic!("at-limit head must still acknowledge and receive its body");
+                    };
+                    assert_eq!(request.body, b"{}");
+                    assert_eq!(framed.get_ref().written, CONTINUE_RESPONSE);
+                    assert_eq!(framed.get_ref().body_reads, 1);
+                } else {
+                    let Some(Ok(Ingress::Immediate(response))) = result else {
+                        panic!("over-limit head must produce only a final refusal");
+                    };
+                    assert_eq!(response.status.0, 431);
+                    assert!(framed.get_ref().written.is_empty());
+                    assert!(!framed.get_ref().flushed);
+                    assert_eq!(framed.get_ref().body_reads, 0);
+                }
+                assert!(!writing_continue);
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }

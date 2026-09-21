@@ -91,6 +91,44 @@ impl Drop for LogoutHandoff<'_> {
 }
 
 impl ManagedOAuthSession {
+    /// Runs caller-owned work only while this shared login remains open.
+    ///
+    /// This extends local logout/close wakeups to work between HTTP requests,
+    /// such as a pending model, browser-consent or input-resolution future.
+    /// Closure is checked before every poll and again before publishing a ready
+    /// result. An already closed session never polls `operation`; closing any
+    /// session clone wakes the guard and drops pending work on its next poll.
+    /// No caller Cx or independently owned session is cancelled.
+    ///
+    /// This is a local lifetime guard, not an authorization lease. It neither
+    /// renews credentials nor checks token expiry, and does not add a deadline:
+    /// retain the operation's existing caller budget and cancellation guard.
+    /// Its future must not block a poll and must be safe to drop. Construct
+    /// side-effecting callbacks inside the guarded async block, not before
+    /// calling this method. Already committed effects cannot be undone, and
+    /// closure after the final check cannot recall a result already delivered.
+    /// Dropping the guard unregisters its wakeup without closing the session.
+    pub async fn run_while_open<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, OAuthSessionError> {
+        let mut closed = pin!(self.inner.closed.cancelled());
+        let mut operation = pin!(operation);
+        poll_fn(|task| {
+            if self.inner.closed.is_cancel_requested() || closed.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthSessionError::Closed));
+            }
+            let result = operation.as_mut().poll(task);
+            // A ready callback may itself close the login. Withhold and drop
+            // its result rather than allowing one last continuation to escape.
+            if self.inner.closed.is_cancel_requested() {
+                return Poll::Ready(Err(OAuthSessionError::Closed));
+            }
+            result.map(Ok)
+        })
+        .await
+    }
+
     /// Closes this shared login and attempts RFC 7009 revocation at most once
     /// for each retained token when a trusted endpoint is configured.
     ///
@@ -566,5 +604,113 @@ mod tests {
             assert!(report.local_closed());
             assert_eq!(report.remote(), remote);
         }
+    }
+
+    #[test]
+    fn closed_session_never_polls_guarded_host_work() {
+        let session = session();
+        session.close();
+        let polls = AtomicUsize::new(0);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let owner = Owner(Arc::clone(&dropped));
+        let operation = async {
+            let _owner = owner;
+            polls.fetch_add(1, Ordering::SeqCst);
+            17_u8
+        };
+        let mut guarded = Box::pin(session.run_while_open(operation));
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(OAuthSessionError::Closed))));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn close_and_logout_wake_pending_host_work_without_cancelling_siblings() {
+        for logout in [false, true] {
+            with_runtime(|cx, _, _| {
+                let session = session();
+                let closer = session.clone();
+                let sibling = self::session();
+                let polls = AtomicUsize::new(0);
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let owner = Owner(Arc::clone(&dropped));
+                let operation = async {
+                    let _owner = owner;
+                    poll_fn(|_| {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        Poll::<()>::Pending
+                    }).await
+                };
+                let counter = Arc::new(WakeCount::default());
+                let waker = Waker::from(Arc::clone(&counter));
+                let mut task = Context::from_waker(&waker);
+                let mut guarded = Box::pin(session.run_while_open(operation));
+                assert!(guarded.as_mut().poll(&mut task).is_pending());
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                let before = counter.0.load(Ordering::SeqCst);
+                if logout {
+                    let mut closing = Box::pin(closer.logout(cx));
+                    assert!(matches!(closing.as_mut().poll(&mut task), Poll::Ready(Ok(_))));
+                } else {
+                    closer.close();
+                }
+                assert!(counter.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(guarded.as_mut().poll(&mut task), Poll::Ready(Err(OAuthSessionError::Closed))));
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                assert!(!sibling.inner.closed.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn closure_during_host_poll_withholds_and_drops_its_ready_result() {
+        for close in [false, true] {
+            let session = session();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let operation = async {
+                if close { session.close(); }
+                Owner(Arc::clone(&dropped))
+            };
+            let mut guarded = Box::pin(session.run_while_open(operation));
+            let mut task = Context::from_waker(Waker::noop());
+            match (close, guarded.as_mut().poll(&mut task)) {
+                (false, Poll::Ready(Ok(owner))) => {
+                    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                    drop(owner);
+                    assert!(!session.inner.closed.is_cancel_requested());
+                }
+                (true, Poll::Ready(Err(OAuthSessionError::Closed))) => {}
+                _ => panic!("only an open login may publish host output"),
+            }
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn dropping_host_guard_unregisters_wakeup_and_keeps_login_usable() {
+        let session = session();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let owner = Owner(Arc::clone(&dropped));
+        let operation = async move {
+            let _owner = owner;
+            std::future::pending::<()>().await
+        };
+        let counter = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        let mut guarded = Box::pin(session.run_while_open(operation));
+        assert!(guarded.as_mut().poll(&mut task).is_pending());
+        drop(guarded);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(!session.inner.closed.is_cancel_requested());
+        assert_eq!(Arc::strong_count(&counter), 2);
+        let mut ready = Box::pin(session.run_while_open(std::future::ready(17_u8)));
+        assert!(matches!(ready.as_mut().poll(&mut task), Poll::Ready(Ok(17))));
+        let before = counter.0.load(Ordering::SeqCst);
+        session.close();
+        assert_eq!(counter.0.load(Ordering::SeqCst), before);
     }
 }

@@ -76,6 +76,19 @@ impl ManagedOAuthInputCapabilities {
     }
 }
 
+/// Which correlated answers a host callback may submit in one continuation.
+/// This selects local reply handling, not an additional upstream capability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManagedOAuthInputResponseMode {
+    /// Require every input in the current challenge. This is the default.
+    #[default]
+    Complete,
+    /// Permit a nonempty subset when the upstream supplied nonempty continuation
+    /// state. The server, not the gateway, retains already accepted answers and
+    /// determines the successor challenge. No omitted answer is synthesized.
+    Partial,
+}
+
 /// Limits apply across the entire forwarded operation, including host pauses.
 /// Request/frame/response/time limits come from `ManagedOAuthProvider::with_limits`;
 /// this policy never replaces them with a fresh budget for each continuation.
@@ -84,6 +97,7 @@ pub struct ManagedOAuthInputPolicy {
     capabilities: ManagedOAuthInputCapabilities,
     maximum_continuations: usize,
     maximum_input_responses: usize,
+    response_mode: ManagedOAuthInputResponseMode,
 }
 
 impl Default for ManagedOAuthInputPolicy {
@@ -92,6 +106,7 @@ impl Default for ManagedOAuthInputPolicy {
             capabilities: ManagedOAuthInputCapabilities::default(),
             maximum_continuations: 8,
             maximum_input_responses: 256,
+            response_mode: ManagedOAuthInputResponseMode::Complete,
         }
     }
 }
@@ -105,9 +120,35 @@ impl ManagedOAuthInputPolicy {
         maximum_continuations: usize,
         maximum_input_responses: usize,
     ) -> McpResult<Self> {
-        let policy = Self { capabilities, maximum_continuations, maximum_input_responses };
+        let policy = Self {
+            capabilities,
+            maximum_continuations,
+            maximum_input_responses,
+            response_mode: ManagedOAuthInputResponseMode::Complete,
+        };
         policy.limits(ManagedCoreLimits::default())?;
         Ok(policy)
+    }
+
+    /// Opt into incremental approval without changing capabilities or limits.
+    /// In Partial mode a host may still return all requested answers. A proper
+    /// subset requires nonempty server-owned requestState; absent and empty
+    /// input maps retain their exact presence rules in both modes.
+    ///
+    /// Every subset consumes one continuation. Limits cover the entire operation,
+    /// not a fresh allowance per subset. The complete challenge is admitted
+    /// against the remaining input budget before invoking the host. Previously
+    /// accepted answers are never merged into a later reply by this provider.
+    #[must_use]
+    pub const fn with_response_mode(mut self, mode: ManagedOAuthInputResponseMode) -> Self {
+        self.response_mode = mode;
+        self
+    }
+
+    /// The local reply policy retained by this provider configuration.
+    #[must_use]
+    pub const fn response_mode(self) -> ManagedOAuthInputResponseMode {
+        self.response_mode
     }
 
     fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
@@ -119,11 +160,16 @@ impl ManagedOAuthInputPolicy {
 
 /// Explicit consent/disclosure boundary for one admitted upstream challenge.
 ///
-/// Return all correlated typed answers. `None` is valid only when inputRequests
-/// was absent; a present empty map needs a present empty response map. Returning
-/// an error declines the operation without a continuation POST. The handler may
-/// inspect downstream authentication in `ctx`, but must not equate it with the
-/// upstream service account. Neither requestState nor routing can be replaced.
+/// By default return all correlated typed answers. Explicitly selecting
+/// [`ManagedOAuthInputResponseMode::Partial`] also permits a nonempty subset
+/// when the server supplied nonempty continuation state. The next callback sees
+/// only the server's successor challenge; do not repeat previously accepted
+/// answers. This is not permission to perform an omitted input's side effects.
+/// `None` is valid only when inputRequests was absent; a present empty map needs
+/// a present empty response map in either mode. Returning an error declines the
+/// operation without a continuation POST. The handler may inspect downstream
+/// authentication in `ctx`, but must not equate it with the upstream service
+/// account. Neither requestState nor routing can be replaced.
 ///
 /// The future runs on the supplied request-owned `cx`, with the interaction's
 /// original deadline and cancellation domain. It must cooperate with cancellation
@@ -194,11 +240,21 @@ impl CoreBackend for InteractiveBackend {
             let operation = self.session.start_core_interaction_with_cancellation(
                 cx, &cancellation, interactive, id, self.policy.limits(limits)?,
             ).await.map_err(interaction_error)?;
-            let result = operation.drive(
-                cx,
-                |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
-                |notification| forward_notification(ctx, *notification).map_err(host_error),
-            ).await.map_err(interaction_error)?;
+            // Both paths consume the same operation owner. In particular, a
+            // partial reply must not reopen an interaction with renewed budgets
+            // or make a lost intermediate response eligible for automatic retry.
+            let result = match self.policy.response_mode {
+                ManagedOAuthInputResponseMode::Complete => operation.drive(
+                    cx,
+                    |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
+                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                ).await,
+                ManagedOAuthInputResponseMode::Partial => operation.drive_partial(
+                    cx,
+                    |input| resolve_reply(self.handler.as_ref(), ctx, cx, &self.next_id, input),
+                    |notification| forward_notification(ctx, *notification).map_err(host_error),
+                ).await,
+            }.map_err(interaction_error)?;
             ctx.checkpoint()?;
             check_cx(cx)?;
             match *result {
@@ -345,6 +401,23 @@ mod tests {
         assert!(ManagedOAuthInputPolicy::new(roots(), 65, 1024).is_err());
         assert!(ManagedOAuthInputPolicy::new(roots(), 64, 1025).is_err());
         assert!(ManagedOAuthInputPolicy::new(roots(), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn partial_input_replies_require_explicit_local_opt_in() {
+        assert_eq!(ManagedOAuthInputResponseMode::default(), ManagedOAuthInputResponseMode::Complete);
+        assert_eq!(ManagedOAuthInputPolicy::default().response_mode(), ManagedOAuthInputResponseMode::Complete);
+        let original = ManagedOAuthInputPolicy::new(roots(), 2, 3).unwrap();
+        let partial = original.with_response_mode(ManagedOAuthInputResponseMode::Partial);
+        assert_eq!(original.response_mode(), ManagedOAuthInputResponseMode::Complete);
+        assert_eq!(partial.response_mode(), ManagedOAuthInputResponseMode::Partial);
+        assert_eq!(partial.capabilities, original.capabilities);
+        assert_eq!(partial.maximum_continuations, 2);
+        assert_eq!(partial.maximum_input_responses, 3);
+        assert_eq!(
+            partial.with_response_mode(ManagedOAuthInputResponseMode::Complete).response_mode(),
+            ManagedOAuthInputResponseMode::Complete,
+        );
     }
 
     #[derive(Clone, Copy)]

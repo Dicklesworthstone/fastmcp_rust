@@ -35,6 +35,9 @@ use crate::http_auth::rpc::interaction::{
     admit_challenge, admit_fresh_id, continuation_request_selected, validate_initial,
 };
 
+/// Owned tool submission with explicit uncertainty across send/read abandonment.
+pub mod submission;
+
 /// Whole-operation bounds, in addition to the Tasks client's per-frame and
 /// per-request limits. The Tasks client's timeout is one deadline for the entire interaction,
 /// including discovery, credential acquisition, reads and host input pauses.
@@ -203,8 +206,7 @@ impl ToolProgress {
         let _ = ManagedTaskRequestIds::new(ids.discovery.clone(), ids.operation.clone())?;
         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
         let next = continuation_request_selected(&self.original, input, responses, selection)?;
-        let parameters = next.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?
-            .ok_or(ManagedTasksError::InvalidRequest)?;
+        let parameters = next.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?.ok_or(ManagedTasksError::InvalidRequest)?;
         let name = parameters.get("name").and_then(Value::as_str)
             .ok_or(ManagedTasksError::InvalidRequest)?.to_owned();
         let progress = parameters["_meta"].get("progressToken").map(|value|
