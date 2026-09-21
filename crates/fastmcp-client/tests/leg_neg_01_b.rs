@@ -453,6 +453,9 @@ fn leg_neg_01_b_positive() {
         .err(),
         Some(HttpFallbackError::InvalidObservation)
     );
+
+    // Every case above is conditional on the caller asking. This is not.
+    assert_permit_issuance_is_sole_sourced();
 }
 
 /// A coordinator that authorized and opened its one legacy GET from the
@@ -470,6 +473,156 @@ fn authorized_and_opened() -> HttpFallbackCoordinator {
         .open_legacy_get(permit)
         .expect("the single authorization opens one GET");
     coordinator
+}
+
+/// Structural proof that a legacy `GET` authorization has exactly one issuer.
+///
+/// WHY THIS CANNOT BE AN OBSERVATIONAL TEST, WHICH IS THE WHOLE POINT.
+/// Every case above drives the coordinator through its own public methods, so
+/// each one is conditional on the caller choosing to ask. They prove that *this*
+/// coordinator refuses an ineligible row; none of them can prove that a legacy
+/// `GET` has no other door. The property that makes "downgrade-resistant" mean
+/// anything is that [`LegacyGetPermit`] is unforgeable: private fields, no
+/// public constructor, and exactly one struct-literal site, inside `observe`.
+/// That is a claim about the shipped source, and no value assertion reaches it.
+///
+/// WHAT THIS DELIBERATELY DOES NOT CLAIM. It does not show that any production
+/// path consults the coordinator - as of this commit nothing outside `lib.rs`
+/// re-exports names it at all, and wiring it is LEG-HTTP-01's work, not this
+/// leaf's. This guard fixes the boundary so that whoever wires it cannot
+/// quietly route around it.
+///
+/// MUTATION BEHAVIOUR, which is what makes this a real check rather than a
+/// restatement: adding `pub fn new` to the permit, publishing a field, adding a
+/// second construction site, deleting the only one, adding a third field, or
+/// renaming either anchor out from under the guard each produce a distinct
+/// failure. All seven were run against a mutated copy of the shipped source
+/// before this was committed; the two anchor cases exist because an earlier
+/// draft passed vacuously when it could not find its own subject.
+fn assert_permit_issuance_is_sole_sourced() {
+    let leg_neg = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/leg_neg.rs");
+    let source = std::fs::read_to_string(&leg_neg)
+        .unwrap_or_else(|error| panic!("the shipped coordinator source must be readable: {error}"));
+
+    let mut violations = Vec::new();
+
+    // (1) and (2): the permit's only struct-literal construction, and the
+    // function that encloses it.
+    let mut constructions = Vec::new();
+    let mut current = "<none>";
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() <= 4 {
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub const fn "))
+                .or_else(|| trimmed.strip_prefix("const fn "))
+            {
+                current = rest.split(['(', '<']).next().unwrap_or("<none>");
+            }
+        }
+        if trimmed.contains("LegacyGetPermit {")
+            && !trimmed.starts_with("pub struct ")
+            && !trimmed.starts_with("impl ")
+        {
+            constructions.push(current);
+        }
+    }
+    if constructions.len() != 1 {
+        violations.push(format!(
+            "LegacyGetPermit must be constructed at exactly one site; found {constructions:?}"
+        ));
+    }
+    if constructions != ["observe"] {
+        violations.push(format!(
+            "the only permit construction must sit inside `observe`; found {constructions:?}"
+        ));
+    }
+
+    // (3): the permit's inherent impl exposes accessors only - no constructor.
+    let mut methods = Vec::new();
+    let mut inside = false;
+    let mut saw_impl = false;
+    for line in source.lines() {
+        if line.starts_with("impl LegacyGetPermit {") {
+            inside = true;
+            saw_impl = true;
+            continue;
+        }
+        if inside {
+            if line == "}" {
+                break;
+            }
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub const fn "))
+                .or_else(|| trimmed.strip_prefix("const fn "))
+            {
+                methods.push(rest.split(['(', '<']).next().unwrap_or("<none>").to_owned());
+            }
+        }
+    }
+    if !saw_impl {
+        violations.push(
+            "`impl LegacyGetPermit` was not found: this guard cannot see its subject".to_owned(),
+        );
+    }
+    methods.sort();
+    if saw_impl && methods != ["attempt_id", "target"] {
+        violations.push(format!(
+            "`impl LegacyGetPermit` must expose the two accessors and no constructor; \
+             found {methods:?}"
+        ));
+    }
+
+    // (4): every field is private, so no external crate can build one literally.
+    let mut public_fields = Vec::new();
+    let mut inside = false;
+    let mut saw_struct = false;
+    let mut field_count = 0_usize;
+    for line in source.lines() {
+        if line.starts_with("pub struct LegacyGetPermit {") {
+            inside = true;
+            saw_struct = true;
+            continue;
+        }
+        if inside {
+            if line == "}" {
+                break;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.contains(':') && !trimmed.starts_with("//") {
+                field_count += 1;
+            }
+            if let Some(rest) = trimmed.strip_prefix("pub ") {
+                public_fields.push(rest.split(':').next().unwrap_or("<none>").to_owned());
+            }
+        }
+    }
+    if !saw_struct {
+        violations.push(
+            "`pub struct LegacyGetPermit` was not found: this guard cannot see its subject"
+                .to_owned(),
+        );
+    }
+    if saw_struct && field_count != 2 {
+        violations.push(format!(
+            "LegacyGetPermit must carry exactly its two bound fields; found {field_count}"
+        ));
+    }
+    if !public_fields.is_empty() {
+        violations.push(format!(
+            "every LegacyGetPermit field must stay private; found public {public_fields:?}"
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "the legacy GET authorization boundary moved: {violations:#?}"
+    );
 }
 
 #[test]
