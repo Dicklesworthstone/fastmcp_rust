@@ -4,8 +4,9 @@
 //! snapshots. Notifications are invalidations, not authoritative replacements:
 //! each one causes a freshly authorized `tasks/get`. A queued old notification
 //! therefore cannot replace a newer snapshot, and a completion between listen
-//! admission and the first get is still observed. No polling, reconnect,
-//! mutation replay, event-history recovery or background worker is installed.
+//! admission and the first get is still observed. The default watch installs no
+//! polling, reconnect, mutation replay, event-history recovery or background
+//! worker. The explicit `recovery` API adds bounded observation-only reconnect.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -30,6 +31,8 @@ use super::super::subscriptions::{
 
 /// Host-approved input resolution over a credential-pinned Task watch.
 pub mod drive;
+/// Bounded observation-only reconnection and snapshot reconciliation.
+pub mod recovery;
 
 const MAX_WATCH_TASKS: usize = 128;
 const MAX_SELECTION_BYTES: usize = 64 * 1024;
@@ -71,7 +74,9 @@ impl ManagedTaskWatchPolicy {
         {
             return Err(ManagedTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { timeout, maximum_snapshots, maximum_records })
+        Ok(Self {
+            timeout, maximum_snapshots, maximum_records,
+        })
     }
 }
 
@@ -81,6 +86,8 @@ impl ManagedTaskWatchPolicy {
 pub enum ManagedTaskSnapshotCause {
     Initial,
     ChangeNotification,
+    /// Fresh state after a new, fully acknowledged recovery subscription.
+    Reconnected,
 }
 
 /// One current Task, including input-required, completed, failed or cancelled
