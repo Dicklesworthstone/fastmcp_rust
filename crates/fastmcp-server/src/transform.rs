@@ -2208,7 +2208,8 @@ mod tests {
             let tool = TransformedTool::from_tool(parent)
                 .transform_arg("value", ArgTransform::new().default(default.clone()))
                 .build();
-            let schema = fastmcp_protocol::admit_final_schema(tool.definition().input_schema).unwrap();
+            let schema =
+                fastmcp_protocol::admit_final_schema(tool.definition().input_schema).unwrap();
             assert!(schema.validate(&serde_json::json!({})).is_ok());
             assert_eq!(
                 tool.transform_arguments(serde_json::json!({})).unwrap(),
@@ -2221,10 +2222,16 @@ mod tests {
     fn schema_default_annotations_alone_do_not_relax_required_arguments() {
         let mut parent = SearchToolFixture::new("annotation");
         parent.schema["properties"]["q"]["default"] = serde_json::json!("annotation-only");
-        let tool = TransformedTool::from_tool(parent).rename_arg("q", "query").build();
+        let tool = TransformedTool::from_tool(parent)
+            .rename_arg("q", "query")
+            .build();
         let schema = fastmcp_protocol::admit_final_schema(tool.definition().input_schema).unwrap();
         assert!(schema.validate(&serde_json::json!({})).is_err());
-        assert!(schema.validate(&serde_json::json!({"query": "explicit"})).is_ok());
+        assert!(
+            schema
+                .validate(&serde_json::json!({"query": "explicit"}))
+                .is_ok()
+        );
         assert_eq!(
             tool.transform_arguments(serde_json::json!({})).unwrap(),
             serde_json::json!({})
@@ -2265,8 +2272,16 @@ mod tests {
                 assert_eq!(property["default"], serde_json::json!(["configured"]));
                 assert_eq!(property["type"], "array");
                 let admitted = fastmcp_protocol::admit_final_schema(schema).unwrap();
-                assert!(admitted.validate(&serde_json::json!({"query": ["item"]})).is_ok());
-                assert!(admitted.validate(&serde_json::json!({"query": "item"})).is_err());
+                assert!(
+                    admitted
+                        .validate(&serde_json::json!({"query": ["item"]}))
+                        .is_ok()
+                );
+                assert!(
+                    admitted
+                        .validate(&serde_json::json!({"query": "item"}))
+                        .is_err()
+                );
             }
         }
     }
@@ -2309,6 +2324,7 @@ mod tests {
     #[test]
     fn router_dispatch_applies_defaults_but_preserves_explicit_required_and_type_checks() {
         use std::sync::Arc;
+
         use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, JsonRpcRequest};
 
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -2332,9 +2348,24 @@ mod tests {
                 router.add_tool(tool).unwrap();
                 let router = Arc::new(router);
                 for (id, arguments, rejected, expected) in [
-                    (1_i64, serde_json::json!({}), required, serde_json::json!({"q": "fallback"})),
-                    (2_i64, serde_json::json!({"query": ""}), false, serde_json::json!({"q": ""})),
-                    (3_i64, serde_json::json!({"query": null}), true, serde_json::json!(null)),
+                    (
+                        1_i64,
+                        serde_json::json!({}),
+                        required,
+                        serde_json::json!({"q": "fallback"}),
+                    ),
+                    (
+                        2_i64,
+                        serde_json::json!({"query": ""}),
+                        false,
+                        serde_json::json!({"q": ""}),
+                    ),
+                    (
+                        3_i64,
+                        serde_json::json!({"query": null}),
+                        true,
+                        serde_json::json!(null),
+                    ),
                 ] {
                     assert!(recorded.lock().unwrap().is_none());
                     let request = JsonRpcRequest::new(
@@ -2350,14 +2381,20 @@ mod tests {
                         id,
                     );
                     let context = McpContext::with_state(
-                        cx.clone(), id as u64, fastmcp_core::SessionState::new(),
+                        cx.clone(),
+                        id as u64,
+                        fastmcp_core::SessionState::new(),
                     );
                     let response = Arc::clone(&router)
                         .dispatch_stateless_owned(context, request)
                         .await
                         .unwrap();
                     assert_eq!(response["resultType"], "complete");
-                    assert_eq!(response["isError"], rejected);
+                    // Successful replies omit isError. Decode its typed wire
+                    // default instead of requiring an explicit false member.
+                    let payload: FinalCallToolResult =
+                        serde_json::from_value(response.clone()).unwrap();
+                    assert_eq!(payload.is_error, rejected);
                     let observed = recorded.lock().unwrap().take();
                     if rejected {
                         assert!(observed.is_none(), "rejected input must not reach the parent");
