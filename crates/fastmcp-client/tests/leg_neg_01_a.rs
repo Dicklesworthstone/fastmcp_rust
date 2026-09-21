@@ -691,6 +691,70 @@ fn leg_neg_01_a_positive() {
     );
     assert_no_child_at_all(&cancelled);
     cleanup(&cancelled_trace);
+
+    // The cancelled case above cannot tell which guard refused it. This can.
+    assert_fallback_guard_is_wired();
+}
+
+/// Structural proof that the Auto downgrade boundary still calls its guard.
+///
+/// WHY THIS IS NOT AN OBSERVATIONAL TEST, WHICH IS THE WHOLE POINT.
+/// `admit_auto_legacy_fallback` is `cx.checkpoint().map_err(|_| request_cancelled())`.
+/// The head of `try_connect_with_protocol_plan` is
+/// `if cx.checkpoint().is_err() { return Err(request_cancelled()) }`.
+/// Same predicate, same typed error. On a cancelled caller the two are
+/// OBSERVATIONALLY IDENTICAL, so no assertion over the public result can tell
+/// which one refused. Delete both calls below and `auto-cancelled-caller` above
+/// still passes, because the earlier checkpoint produces the same outcome.
+///
+/// That is why the recorded remedy - "write a test through the path" - cannot
+/// work here, and why the honest instrument is structural. ug2w5 named this
+/// instrument itself for the post-selection condition; it is the right one for
+/// the cancellation wiring too.
+///
+/// MUTATION BEHAVIOUR, which is what makes this a real check: removing either
+/// call site drops the count to one and fails. Moving one out of its function
+/// fails the enclosing-function assertion. Neither mutation is detectable from
+/// the outside.
+fn assert_fallback_guard_is_wired() {
+    let builder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builder.rs");
+    let source = std::fs::read_to_string(&builder)
+        .unwrap_or_else(|error| panic!("the shipped builder source must be readable: {error}"));
+
+    let mut enclosing = Vec::new();
+    let mut current = "<none>";
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() <= 4 {
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub async fn "))
+                .or_else(|| trimmed.strip_prefix("async fn "))
+            {
+                current = rest.split(['(', '<']).next().unwrap_or("<none>");
+            }
+        }
+        if trimmed.starts_with("crate::admit_auto_legacy_fallback(cx)?;") {
+            enclosing.push(current);
+        }
+    }
+
+    assert_eq!(
+        enclosing.len(),
+        2,
+        "the Auto downgrade boundary must call admit_auto_legacy_fallback at exactly its two \
+         legacy-spawn sites; found {enclosing:?}. A removed call is invisible to every \
+         observational case in this file, so this count is the only thing guarding it."
+    );
+    assert!(
+        enclosing.contains(&"try_connect_yielding"),
+        "one guarded spawn site must be in try_connect_yielding; found {enclosing:?}"
+    );
+    assert!(
+        enclosing.contains(&"try_connect_auto"),
+        "one guarded spawn site must be in try_connect_auto; found {enclosing:?}"
+    );
 }
 
 #[test]
