@@ -3133,3 +3133,122 @@ fn fnd_04_packed_ref_returns_none_for_an_absent_reference_or_table() {
          case that `revision_and_tree` falls through on"
     );
 }
+
+// ===========================================================================
+// FND-04-B-07 instrument disconfirmer (bd-mcp-fnd-04-b-th72)
+// ===========================================================================
+
+/// RH-1 DISCONFIRMER, NOT A RELAXATION. This test changes no verdict: it neither
+/// narrows `collect_deny_inventory`'s population nor touches a subcase. It exists
+/// because B-07's `require(hits.is_empty(), ..)` is only as meaningful as the
+/// "shipped" population it scans, and that population is wrong in two structural
+/// ways. RH-1 places the decision to narrow it with a separate owner, so this
+/// records the evidence that owner needs rather than acting on it.
+///
+/// GAP 1 -- an out-of-line test module. `#[cfg(test)] mod tests;` is a DECLARATION;
+/// the body lives in another file. This breaks the scan in BOTH directions.
+/// (a) FALSE POSITIVES: `shipped_source_files` walks the directory and reads that
+/// other file as shipped source, so its test code is scanned as production code.
+/// (b) FALSE NEGATIVES, which is worse and was NOT my first prediction: the
+/// declaration still satisfies the stripper's `starts_with("mod ")` probe, so
+/// `matching_brace_end` runs from a semicolon and matches the NEXT balanced brace
+/// group in the file -- a real shipped item. Everything from the attribute through
+/// that item is deleted from the scanned text and can never be denied. At this
+/// revision that removes 2,173 lines and 106 `fn`/`impl` items across four files,
+/// 2,149 lines of it from `fastmcp-core/src/lib.rs` -- the crate that owns the
+/// runtime bridge B-07 exists to police.
+///
+/// GAP 2 -- the stripper matches the LITERAL `#[cfg(test)]`. A module gated
+/// `#[cfg(all(test, ..))]` is equally test-only and is not recognised.
+///
+/// Measured at this revision with the same predicates `collect_deny_inventory`
+/// applies: 278 denied sites, of which 131 fall inside the 18 out-of-line
+/// `#[cfg(test)] mod X;` bodies (13,220 lines) and 103 inside three inline modules
+/// gated by a non-literal attribute -- `fastmcp-server/src/oidc.rs`
+/// (`signer_activation_tests`, 49), `fastmcp-transport/src/sse.rs` (`tests`, 48)
+/// and `fastmcp-server/src/extensions.rs` (`tests`, 6). The two sets are disjoint.
+/// That leaves 44 genuinely shipped sites: 84% of what B-07 denies is test code its
+/// own instrument cannot see.
+///
+/// Those counts are deliberately NOT asserted. They measure a moving population and
+/// would rot into a false failure the next time anyone adds a test. What is asserted
+/// is the MECHANISM, which holds until the stripper itself is changed.
+#[test]
+fn fnd_04_instrument_strip_cfg_test_modules_misses_two_kinds_of_test_module() {
+    // CONTROL. The form the stripper does handle, so that the two failures below
+    // are attributable to the module's SHAPE and not to a stripper that never
+    // strips anything at all.
+    let inline = concat!(
+        "pub fn shipped() {}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n    let _ = LabRuntime::new(1);\n}\n",
+        "pub fn also_shipped() {}\n"
+    );
+    let stripped_inline = strip_cfg_test_modules(inline);
+    assert!(
+        !stripped_inline.contains("LabRuntime::"),
+        "control failed: the inline form must be stripped, or this test proves \
+         nothing:\n{stripped_inline}"
+    );
+    assert!(
+        stripped_inline.contains("pub fn shipped()")
+            && stripped_inline.contains("pub fn also_shipped()"),
+        "the control must keep the surrounding shipped items"
+    );
+
+    // GAP 1. A declaration has no inline body, but it still passes the `mod ` probe,
+    // so the brace matcher runs on from a semicolon and consumes the next real item.
+    let declaration = concat!(
+        "pub fn shipped() {}\n",
+        "#[cfg(test)]\n",
+        "mod tests;\n",
+        "pub fn swallowed() {}\n",
+        "pub fn survives() { let _ = LabRuntime::new(1); }\n"
+    );
+    let stripped_declaration = strip_cfg_test_modules(declaration);
+    assert!(
+        !stripped_declaration.contains("fn swallowed"),
+        "a `#[cfg(test)] mod X;` declaration is expected to swallow the next balanced \
+         brace group. If this now holds, the stripper was fixed -- re-measure B-07's \
+         false-negative span before relying on this arm:\n{stripped_declaration}"
+    );
+    assert!(
+        stripped_declaration.contains("pub fn shipped()"),
+        "the deletion must start at the attribute, not before it"
+    );
+    assert!(
+        stripped_declaration.contains("LabRuntime::"),
+        "the deletion must stop at one brace group, not run to end of file"
+    );
+
+    // GAP 2. Same body, same test-only meaning, non-literal attribute.
+    let variant = concat!(
+        "pub fn shipped() {}\n",
+        "#[cfg(all(test, unix))]\n",
+        "mod tests {\n    let _ = LabRuntime::new(1);\n}\n",
+        "pub fn also_shipped() {}\n"
+    );
+    assert!(
+        strip_cfg_test_modules(variant).contains("LabRuntime::"),
+        "GAP 2 is closed: `#[cfg(all(test, ..))]` is now recognised. If that was \
+         fixed deliberately under RH-1, delete this arm and re-measure B-07"
+    );
+
+    // Neither gap is hypothetical: both shapes exist in the scanned population.
+    let shipped = shipped_source_files();
+    assert!(
+        shipped
+            .iter()
+            .any(|(path, _)| path == "crates/fastmcp-server/src/tests.rs"),
+        "GAP 1 is live: fastmcp-server/src/tests.rs is the body of the \
+         `#[cfg(test)] mod tests;` declared in that crate's lib.rs, and it is \
+         scanned as shipped source"
+    );
+    assert!(
+        shipped.iter().any(|(path, source)| {
+            path == "crates/fastmcp-transport/src/sse.rs" && source.contains("#[cfg(all(test")
+        }),
+        "GAP 2 is live: fastmcp-transport/src/sse.rs gates an inline test module \
+         with a non-literal cfg(test) attribute"
+    );
+}
