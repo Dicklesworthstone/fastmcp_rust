@@ -242,7 +242,16 @@ async fn f2ndd_join_or_watchdog<T>(
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut armed = false;
     std::future::poll_fn(move |task| match handle.poll_join(task) {
-        std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+        // Observing Ready is NOT enough: after the watchdog wakes us the result
+        // may simply BE there, which is exactly what a missed wakeup looks like.
+        // The discriminator is WHETHER WE SAW IT BEFORE THE WATCHDOG FIRED.
+        std::task::Poll::Ready(result) => {
+            if fired.load(std::sync::atomic::Ordering::SeqCst) {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Ready(Some(result))
+            }
+        }
         std::task::Poll::Pending => {
             if !armed {
                 armed = true;
