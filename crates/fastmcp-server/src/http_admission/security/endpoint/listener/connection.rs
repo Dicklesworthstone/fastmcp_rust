@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
-use asupersync::stream::StreamExt;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_transport::{TransportError, http::{HttpRequest, HttpResponse, HttpStatus}};
 
@@ -18,7 +17,7 @@ use super::super::super::{CorsResponseHeaders, HttpSecurityPolicy};
 use super::super::super::scope_policy::request::ScopeRequestPolicy;
 use crate::{
     AuthDispatchCustody, DualEraHttpEndpointError, DualEraHttpSseResponse,
-    FinalSubscriptionTerminalDelivery, Framed, HTTP_ACCEPT_CANCEL_POLL, HttpListenerShutdown,
+    FinalSubscriptionTerminalDelivery, Framed, HttpListenerShutdown,
     InboundRequestContext, InboundRequestTransport, JsonRpcRequest, LiveModernHttpSession,
     LiveModernHttpSessionRegistry, ModernSseDispatchElection, ModernSseOutcomeGate,
     NativeHttp1Codec, OwnedModernHttpDispatch, Server, ServerHttpEndpoint, ServerHttpEndpointError,
@@ -43,15 +42,14 @@ pub(super) async fn serve(
 ) {
     let body_limit = endpoint.server.http_config.handler_config.max_body_size;
     let mut framed = Framed::new(stream, SecuredCodec::new(Arc::clone(&policy), body_limit));
-    let read = async {
-        loop {
-            if shutdown.is_requested() || cx.checkpoint().is_err() { return None; }
-            if let Ok(request) = asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, framed.next()).await {
-                return request;
-            }
-        }
-    };
+    let mut writing_continue = false;
+    let read = super::ingress::receive(
+        cx, &shutdown, &mut framed, io.write_timeout, &mut writing_continue,
+    );
     let incoming = asupersync::time::timeout(cx.now(), io.request_timeout, read).await;
+    // A request timeout can interrupt the interim response midway through a
+    // short socket/TLS write. Close instead of appending a 408 to partial bytes.
+    if writing_continue { return; }
     let pipelined = !framed.read_buffer().is_empty();
     let mut framed = Framed::new(framed.into_inner(), native_http1_codec(&endpoint));
     let incoming = match incoming {
@@ -72,6 +70,8 @@ pub(super) async fn serve(
             return;
         }
         Ingress::Request { request, cors } => (request, cors),
+        // The ingress driver consumes interim decisions without dispatching.
+        Ingress::Continue => return,
     };
     if pipelined {
         buffered(cx, &shutdown, &mut framed, HttpResponse::bad_request(), Some(&cors), io).await;

@@ -2,17 +2,30 @@
 //! The existing H1 codec remains responsible for HTTP framing and body decoding.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use asupersync::Cx;
 use asupersync::http::h1::Request;
-use fastmcp_transport::http::HttpResponse;
+use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use asupersync::stream::StreamExt;
+use fastmcp_transport::http::{HttpResponse, HttpStatus};
 
 use super::super::super::{CorsResponseHeaders, HttpSecurityError, HttpSecurityHead, HttpSecurityPolicy};
-use crate::{BytesMut, Decoder, Encoder, Http1DecodeError, Http1Response, NativeHttp1Codec};
+use crate::{BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, Http1DecodeError, Http1Response, HttpListenerShutdown, NativeHttp1Codec};
 
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
+const MAX_EXPECTATION_MEMBERS: usize = 16;
+const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 pub(super) enum Ingress {
     Request { request: Request, cors: CorsResponseHeaders },
+    Immediate(HttpResponse),
+    // Head admission only, never a dispatch or authentication permit.
+    Continue,
+}
+
+enum AdmittedHead {
+    Post { cors: CorsResponseHeaders, send_continue: bool },
     Immediate(HttpResponse),
 }
 
@@ -38,7 +51,7 @@ impl SecuredCodec {
         Ingress::Immediate(response)
     }
 
-    fn head(&self, source: &[u8], end: usize) -> Result<HttpSecurityHead, HttpSecurityError> {
+    fn head(&self, source: &[u8], end: usize) -> Result<AdmittedHead, HttpSecurityError> {
         let text = std::str::from_utf8(&source[..end]).map_err(|_| HttpSecurityError::InvalidHeader)?;
         let mut lines = text.split("\r\n");
         let line = lines.next().ok_or(HttpSecurityError::InvalidHeader)?;
@@ -76,6 +89,10 @@ impl SecuredCodec {
             .collect::<Vec<_>>();
         if encodings.len() > 1 { return Err(HttpSecurityError::DuplicateHeader); }
         if length.is_some() && !encodings.is_empty() { return Err(HttpSecurityError::ContentLengthMismatch); }
+        // Do not encourage a body with framing the native codec cannot accept.
+        if encodings.iter().any(|(_, value)| !value.eq_ignore_ascii_case("chunked"))
+            || (version == "HTTP/1.0" && !encodings.is_empty())
+        { return Err(HttpSecurityError::InvalidHeader); }
         let length = length.map(|value| {
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(HttpSecurityError::ContentLengthMismatch);
@@ -92,8 +109,49 @@ impl SecuredCodec {
         } else if length.is_some_and(|length| length > self.body_limit) {
             return Err(HttpSecurityError::BodyTooLarge);
         }
-        Ok(head)
+        let expects_continue = match continue_expectation(&headers) {
+            Ok(expected) => expected,
+            Err(()) => {
+                let mut response = HttpResponse::new(HttpStatus(417))
+                    .with_header("cache-control", "no-store")
+                    .with_header("connection", "close");
+                if let HttpSecurityHead::Post(cors) = &head { cors.apply_to(&mut response); }
+                return Ok(AdmittedHead::Immediate(response));
+            }
+        };
+        match head {
+            HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response) => {
+                Ok(AdmittedHead::Immediate(response))
+            }
+            HttpSecurityHead::Post(cors) => {
+                // RFC 9110 10.1.1: never wait for content before acknowledging
+                // an admitted HTTP/1.1 expectation. HTTP/1.0 ignores it, and no
+                // informational response is needed once content has arrived.
+                let send_continue = expects_continue && version == "HTTP/1.1"
+                    && (length.is_some_and(|length| length != 0) || !encodings.is_empty())
+                    && source.len() == end + 4;
+                Ok(AdmittedHead::Post { cors, send_continue })
+            }
+        }
     }
+}
+
+// Expect is a list field. Repeated supported members request ONE interim
+// response; an unknown member must not be ignored next to 100-continue.
+fn continue_expectation(headers: &[(String, String)]) -> Result<bool, ()> {
+    let mut expected = false;
+    let mut members = 0_usize;
+    for (_, value) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("expect")) {
+        for member in value.split(',') {
+            members += 1;
+            if members > MAX_EXPECTATION_MEMBERS { return Err(()); }
+            let member = member.trim_matches([' ', '\t']);
+            if member.is_empty() { continue; }
+            if !member.eq_ignore_ascii_case("100-continue") { return Err(()); }
+            expected = true;
+        }
+    }
+    Ok(expected)
 }
 
 impl Decoder for SecuredCodec {
@@ -119,12 +177,15 @@ impl Decoder for SecuredCodec {
             if end > maximum { return Ok(Some(self.refusal(HttpSecurityError::HeaderLimit, source))); }
             match self.head(source, end) {
                 Err(error) => return Ok(Some(self.refusal(error, source))),
-                Ok(HttpSecurityHead::Preflight(response) | HttpSecurityHead::Metadata(response)) => {
+                Ok(AdmittedHead::Immediate(response)) => {
                     source.clear();
                     self.finished = true;
                     return Ok(Some(Ingress::Immediate(response)));
                 }
-                Ok(HttpSecurityHead::Post(cors)) => self.cors = Some(cors),
+                Ok(AdmittedHead::Post { cors, send_continue }) => {
+                    self.cors = Some(cors);
+                    if send_continue { return Ok(Some(Ingress::Continue)); }
+                }
             }
         }
         match self.inner.decode(source) {
@@ -143,6 +204,49 @@ impl Encoder<Http1Response> for SecuredCodec {
     type Error = Http1DecodeError;
     fn encode(&mut self, response: Http1Response, destination: &mut BytesMut) -> Result<(), Self::Error> {
         self.inner.encode(response, destination)
+    }
+}
+
+/// Read one request while servicing an admitted expectation on the same socket.
+/// The connection's outer request timeout spans this entire future, including
+/// the interim write: receiving the body never starts a second timeout budget.
+/// `writing_continue` stays set on abandonment/failure, so the connection cannot
+/// append a final error to a partially written informational response.
+pub(super) async fn receive<T: AsyncRead + AsyncWrite + Unpin>(
+    cx: &Cx,
+    shutdown: &HttpListenerShutdown,
+    framed: &mut Framed<T, SecuredCodec>,
+    write_timeout: Duration,
+    writing_continue: &mut bool,
+) -> Option<Result<Ingress, Http1DecodeError>> {
+    loop {
+        if shutdown.is_requested() || cx.checkpoint().is_err() { return None; }
+        let incoming = match asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, framed.next()).await {
+            Ok(incoming) => incoming,
+            Err(_) => continue,
+        };
+        if !matches!(&incoming, Some(Ok(Ingress::Continue))) { return incoming; }
+        *writing_continue = true;
+        let writer = framed.get_mut();
+        let write = async {
+            let mut writing = std::pin::pin!(async {
+                writer.write_all(CONTINUE_RESPONSE).await?;
+                writer.flush().await
+            });
+            loop {
+                if shutdown.is_requested() || cx.checkpoint().is_err() { return Err(()); }
+                // Retain the partially completed write across cancellation
+                // polls. Restarting write_all would duplicate response bytes.
+                match asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, writing.as_mut()).await {
+                    Ok(result) => return result.map_err(|_| ()),
+                    Err(_) => {},
+                }
+            }
+        };
+        if !matches!(asupersync::time::timeout(cx.now(), write_timeout, write).await, Ok(Ok(()))) {
+            return None;
+        }
+        *writing_continue = false;
     }
 }
 
@@ -300,5 +404,181 @@ mod tests {
         let mut success = HttpResponse::ok();
         cors.apply_to(&mut success);
         assert!(!success.headers.contains_key("www-authenticate"));
+    }
+
+    const EXPECT_HEAD: &str = "POST /mcp HTTP/1.1\r\nHost: service.example\r\nOrigin: https://app.example\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n";
+
+    #[test]
+    fn expect_continue_admits_the_head_once_without_consuming_or_dispatching_it() {
+        for framing in ["Content-Length: 2", "Transfer-Encoding: chunked"] {
+            let head = EXPECT_HEAD.replace("Content-Length: 2", framing);
+            let mut codec = codec();
+            let mut source = BytesMut::from(head.as_bytes());
+            assert!(matches!(codec.decode(&mut source).unwrap(), Some(Ingress::Continue)));
+            assert_eq!(source.as_ref(), head.as_bytes());
+            assert!(codec.decode(&mut source).unwrap().is_none(), "no second acknowledgement while waiting for body");
+            let body: &[u8] = if framing == "Content-Length: 2" { b"{}" } else { b"2\r\n{}\r\n0\r\n\r\n" };
+            source.extend_from_slice(body);
+            let Some(Ingress::Request { request, cors }) = codec.decode(&mut source).unwrap()
+                else { panic!("the same admitted head must decode its later body") };
+            assert_eq!(request.body, b"{}");
+            assert_eq!(cors.allowed_origin(), Some("https://app.example"));
+            assert!(codec.decode(&mut source).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn expect_continue_never_precedes_security_or_framing_refusal() {
+        for (from, to, expected) in [
+            ("Host: service.example", "Host: attacker.example", 403),
+            ("https://app.example", "https://attacker.example", 403),
+            ("Content-Length: 2", "Content-Length: 65", 413),
+            ("Content-Length: 2", "Content-Length: 2\r\nTransfer-Encoding: chunked", 400),
+            ("Content-Length: 2", "Transfer-Encoding: gzip", 400),
+            ("Expect: 100-continue", "Expect: 100-continue, unsupported", 417),
+            ("Expect: 100-continue", "Expect: 100-continue;extension=1", 417),
+        ] {
+            assert_eq!(status(&mut codec(), &EXPECT_HEAD.replace(from, to)), expected);
+        }
+    }
+
+    #[test]
+    fn expect_continue_lists_are_case_insensitive_bounded_and_acknowledged_once() {
+        let head = EXPECT_HEAD.replace("Expect: 100-continue", "eXpEcT: , 100-ConTinue,\r\nExpect: 100-continue");
+        let mut codec = codec();
+        let mut source = BytesMut::from(head.as_bytes());
+        assert!(matches!(codec.decode(&mut source).unwrap(), Some(Ingress::Continue)));
+        assert!(codec.decode(&mut source).unwrap().is_none());
+        let excess = vec!["100-continue"; MAX_EXPECTATION_MEMBERS + 1].join(",");
+        assert_eq!(status(&mut self::codec(), &EXPECT_HEAD.replace("100-continue", &excess)), 417);
+    }
+
+    #[test]
+    fn expect_continue_is_not_emitted_for_http10_buffered_content_or_bodyless_routes() {
+        let mut old = codec();
+        let mut source = BytesMut::from(EXPECT_HEAD.replace("HTTP/1.1", "HTTP/1.0").as_bytes());
+        assert!(old.decode(&mut source).unwrap().is_none());
+        source.extend_from_slice(b"{}");
+        assert!(matches!(old.decode(&mut source).unwrap(), Some(Ingress::Request { .. })));
+        let mut source = BytesMut::from(format!("{EXPECT_HEAD}{{}}").as_bytes());
+        assert!(matches!(codec().decode(&mut source).unwrap(), Some(Ingress::Request { .. })));
+        let mut source = BytesMut::from(EXPECT_HEAD.replace("Content-Length: 2", "Content-Length: 0").as_bytes());
+        assert!(matches!(codec().decode(&mut source).unwrap(), Some(Ingress::Request { .. })));
+        assert_eq!(status(&mut metadata_codec(), &format!("{METADATA_HEAD}Expect: 100-continue\r\n\r\n")), 200);
+        assert_eq!(status(&mut codec(), "OPTIONS /mcp HTTP/1.1\r\nHost: service.example\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: POST\r\nExpect: 100-continue\r\n\r\n"), 204);
+    }
+
+    #[test]
+    fn unsupported_expectation_is_an_empty_uncacheable_cors_bound_final_response() {
+        let mut source = BytesMut::from(EXPECT_HEAD.replace("100-continue", "private-expectation-canary").as_bytes());
+        let mut codec = codec();
+        let Some(Ingress::Immediate(response)) = codec.decode(&mut source).unwrap()
+            else { panic!("unsupported expectations must not wait for a body") };
+        assert_eq!(response.status.0, 417);
+        assert!(response.body.is_empty());
+        assert_eq!(response.headers["cache-control"], "no-store");
+        assert_eq!(response.headers["connection"], "close");
+        assert_eq!(response.headers["access-control-allow-origin"], "https://app.example");
+        assert!(!format!("{:?}", response.headers).contains("private-expectation-canary"));
+        assert!(source.is_empty());
+        assert!(codec.decode(&mut source).unwrap().is_none());
+    }
+
+    // A duplex peer that withholds its body until the COMPLETE interim response
+    // is flushed. Short writes and Pending polls exercise the production reader,
+    // not a second implementation of its state machine.
+    struct ExpectPeer {
+        head: std::io::Cursor<Vec<u8>>,
+        body: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        flushed: bool,
+        pending_write: bool,
+        fail_write: bool,
+        body_reads: usize,
+    }
+
+    impl AsyncRead for ExpectPeer {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, buf: &mut asupersync::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            use std::io::Read;
+            let this = self.get_mut();
+            let mut bytes = [0_u8; 512];
+            let limit = bytes.len().min(buf.remaining());
+            let count = if this.head.position() < this.head.get_ref().len() as u64 {
+                this.head.read(&mut bytes[..limit])?
+            } else {
+                if !this.flushed { return std::task::Poll::Pending; }
+                this.body_reads += 1;
+                this.body.read(&mut bytes[..limit])?
+            };
+            buf.put_slice(&bytes[..count]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ExpectPeer {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>, task: &mut std::task::Context<'_>, bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.fail_write && !this.written.is_empty() {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            if this.pending_write {
+                this.pending_write = false;
+                task.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            this.pending_write = true;
+            let count = bytes.len().min(3);
+            this.written.extend_from_slice(&bytes[..count]);
+            std::task::Poll::Ready(Ok(count))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            assert_eq!(this.written, CONTINUE_RESPONSE);
+            this.flushed = true;
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn expect_continue_reader_flushes_once_and_never_reads_body_after_failed_interim_write() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                for fail_write in [false, true] {
+                    let peer = ExpectPeer {
+                        head: std::io::Cursor::new(EXPECT_HEAD.as_bytes().to_vec()),
+                        body: std::io::Cursor::new(b"{}".to_vec()), written: Vec::new(),
+                        flushed: false, pending_write: false, fail_write, body_reads: 0,
+                    };
+                    let mut framed = Framed::new(peer, codec());
+                    let shutdown = HttpListenerShutdown::new(&cx);
+                    let mut writing_continue = false;
+                    let result = asupersync::time::timeout(cx.now(), Duration::from_secs(1), receive(
+                        &cx, &shutdown, &mut framed, Duration::from_secs(1), &mut writing_continue,
+                    )).await.expect("a peer waiting for Continue must not deadlock");
+                    if fail_write {
+                        assert!(result.is_none());
+                        assert!(writing_continue, "partial response must prevent a later final error write");
+                        assert_eq!(framed.get_ref().written, &CONTINUE_RESPONSE[..3]);
+                        assert_eq!(framed.get_ref().body_reads, 0);
+                    } else {
+                        let Some(Ok(Ingress::Request { request, .. })) = result
+                            else { panic!("flushed Continue must release the peer's request body") };
+                        assert_eq!(request.body, b"{}");
+                        assert!(!writing_continue);
+                        assert_eq!(framed.get_ref().written, CONTINUE_RESPONSE);
+                        assert_eq!(framed.get_ref().body_reads, 1);
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                }
+            });
     }
 }
