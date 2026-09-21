@@ -61699,6 +61699,12 @@ mod live_websocket_bind {
     }
 }
 
+// FROZEN-ID ALIAS -- ONE BEHAVIOUR, TWO RUNNABLE NAMES.
+// ahet.3.3's acceptance names this behaviour under two conventions, so both are
+// made runnable over a single body rather than duplicated: duplicated bodies
+// drift, and a frozen pair that has quietly stopped asserting the same thing is
+// worse than a single test.
+// A runner counting IDs reports 2 passed here. That is 1 behaviour.
 #[test]
 fn fnd_03_i_e2e_positive() {
     fnd_03_integration_e2e_positive();
@@ -61752,6 +61758,9 @@ fn fnd_03_integration_e2e_positive() {
     );
 }
 
+// FROZEN-ID ALIAS -- ONE BEHAVIOUR, TWO RUNNABLE NAMES. See the note on
+// `fnd_03_i_e2e_positive` above.
+// A runner counting IDs reports 2 passed here. That is 1 behaviour.
 #[test]
 fn fnd_03_i_e2e_planted_negative() {
     fnd_03_integration_e2e_planted_negative();
