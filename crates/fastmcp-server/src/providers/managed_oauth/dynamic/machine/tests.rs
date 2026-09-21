@@ -170,6 +170,7 @@ fn calls_preserve_exact_results_and_only_rewrite_published_names() {
         else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
     let completion = prompt.completion_handler().unwrap();
     let parameters: FinalCompletionParams = serde_json::from_value(json!({
+        "_meta":{},
         "ref":{"type":"ref/prompt","name":"machine/summarize"},
         "argument":{"name":"subject","value":"o"}
     })).unwrap();
@@ -361,6 +362,7 @@ fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completi
             else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let completion = prompt.completion_handler().unwrap();
         let params: FinalCompletionParams = serde_json::from_value(json!({
+            "_meta":{},
             "ref":{"type":"ref/prompt","name":"interactive/summarize"},
             "argument":{"name":"subject","value":"o"}
         })).unwrap();
