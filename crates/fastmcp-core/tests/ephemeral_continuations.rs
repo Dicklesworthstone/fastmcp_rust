@@ -198,3 +198,112 @@ fn protected_continuation_competing_wire_replays_have_one_successful_consumer() 
     });
     assert!(store.lock().unwrap().is_empty());
 }
+
+// ===========================================================================
+// bd-f2ndd UPSTREAM ISOLATION
+//
+// These two exercise asupersync's task/scope/join machinery and NOTHING of
+// ours, so a failure here places the defect upstream and a pass places it in
+// how fastmcp-server uses the API. They live in this file rather than a new
+// one because `crates` is a closed_scan_root and a new path widens the
+// unlisted-file count. This file already imports `asupersync::Cx`, which
+// makes it the least incongruous host -- note its own `scope.spawn`/`join`
+// are `std::thread::scope`, not asupersync's, so the two machineries below
+// are unrelated to the ones above.
+//
+// Both are POLL-bounded rather than TIME-bounded on purpose. A time bound
+// would need a timer driver, and whether a timer driver is present is one of
+// the things under suspicion -- a repro that depends on the mechanism it is
+// testing proves nothing. Neither can hang: both terminate after a fixed
+// number of polls and fail with a message.
+// ===========================================================================
+
+fn f2ndd_runtime() -> asupersync::runtime::Runtime {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor().expect("bd-f2ndd repro reactor"),
+        )
+        .build()
+        .expect("bd-f2ndd repro runtime")
+}
+
+/// The FOUR: body completes, scope empty, join parks anyway.
+#[test]
+fn f2ndd_join_settles_for_a_completed_task_in_an_empty_scope() {
+    f2ndd_runtime().block_on(async {
+        let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
+        let scope = cx.scope();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&finished);
+        let mut handle = cx
+            .spawn_in(&scope, move |child| async move {
+                let _ = child.checkpoint();
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("bd-f2ndd repro spawn_in must be admitted");
+
+        let mut ran = false;
+        for _ in 0..10_000 {
+            if finished.load(std::sync::atomic::Ordering::SeqCst) {
+                ran = true;
+                break;
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        assert!(ran, "bd-f2ndd repro: the spawned body never finished");
+
+        handle.abort();
+
+        let mut settled = false;
+        for _ in 0..10_000 {
+            if !matches!(handle.try_join(), Ok(None)) {
+                settled = true;
+                break;
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        assert!(
+            settled,
+            "bd-f2ndd: join did NOT settle for a task whose body COMPLETED in an EMPTY scope, \
+             with nothing of ours involved -- the defect is upstream in asupersync"
+        );
+    });
+}
+
+/// The FIFTH: a task parked in sleep, aborted. Does the abort wake it?
+#[test]
+fn f2ndd_abort_settles_a_task_parked_in_sleep() {
+    f2ndd_runtime().block_on(async {
+        let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
+        let scope = cx.scope();
+        let mut handle = cx
+            .spawn_in(&scope, move |child| async move {
+                loop {
+                    asupersync::time::sleep(child.now(), Duration::from_millis(100)).await;
+                    if child.checkpoint().is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("bd-f2ndd repro spawn_in must be admitted");
+
+        for _ in 0..1_000 {
+            asupersync::runtime::yield_now().await;
+        }
+        handle.abort();
+
+        let mut settled = false;
+        for _ in 0..10_000 {
+            if !matches!(handle.try_join(), Ok(None)) {
+                settled = true;
+                break;
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        assert!(
+            settled,
+            "bd-f2ndd: abort did NOT settle a task parked in sleep() on a runtime with no timer \
+             driver -- the cancellation check sits AFTER the sleep, so it is never evaluated"
+        );
+    });
+}
