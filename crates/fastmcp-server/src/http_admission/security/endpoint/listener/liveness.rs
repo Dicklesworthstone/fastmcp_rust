@@ -130,22 +130,11 @@ mod tests {
                     asupersync::Time::ZERO.saturating_add_nanos(u64::MAX),
                 ));
                 assert!(cx.timer_driver().is_none());
-                // Box the connection future rather than holding it inline. It
-                // embeds `ingress::receive`, so it is large, and the two other
-                // `connection::serve` call sites already box it -- the
-                // production path at listener.rs:287 does so through an
-                // explicit `Pin<Box<dyn Future>>`. This was the only site
-                // keeping it on the stack.
-                let connection = Box::pin(connection::serve(
-                    &cx,
-                    ConnectionIo::Plain(stream),
-                    Arc::clone(&bound.inner.endpoint),
-                    Arc::clone(&bound.inner.modern_sessions),
-                    HttpListenerShutdown::new(&cx),
-                    Arc::clone(&bound.policy),
-                    bound.io,
-                ));
-                let result = drive(&cx, connection).await;
+                let result = drive(&cx, connection::serve(
+                    &cx, ConnectionIo::Plain(stream), Arc::clone(&bound.inner.endpoint),
+                    Arc::clone(&bound.inner.modern_sessions), HttpListenerShutdown::new(&cx),
+                    Arc::clone(&bound.policy), bound.io,
+                )).await;
                 assert_eq!(result, Err(SecuredHttpEndpointError::TimerUnavailable));
                 assert_disconnected(&mut peer);
                 assert!(bound.inner.modern_sessions.sessions.lock().unwrap().is_empty());

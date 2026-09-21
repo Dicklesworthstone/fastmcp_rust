@@ -3,7 +3,6 @@
 //! This implementation shares the private catalog constructors with dynamic
 //! routing. Applications use `providers::ClientCredentialsProvider`.
 
-mod interaction;
 #[cfg(test)]
 mod tests;
 
@@ -27,7 +26,6 @@ use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult, RequestId};
 use serde_json::json;
 
-use interaction::{InteractiveMachineResponse, MachineInputs, interaction_error};
 use super::{ManagedOAuthResourceTemplate, build_templates};
 use super::super::{
     BoxFuture, CoreBackend, Forwarder, ManagedOAuthPrompt, ManagedOAuthResource, ManagedOAuthTool,
@@ -60,11 +58,9 @@ const CATALOG_FAILURE: &str = "Machine-authenticated upstream catalog acquisitio
 /// authority, exact results, resource URI matching and completion routing reuse
 /// the same handlers as the interactive provider, rather than a parallel router.
 ///
-/// By default only complete modern core results are forwarded. Explicitly
-/// installing `with_input_handler` enables bounded host-resolved input-required
-/// rounds, not transparent downstream continuation state. Neither path installs
-/// legacy execution, Tasks or subscriptions. No failed POST is retried and no
-/// runtime is created.
+/// This adapter supports modern complete core results. It does not install
+/// legacy execution, Tasks, subscriptions or automatic input-required answers.
+/// No operation is retried after a failed POST, and no runtime is created.
 ///
 /// ```ignore
 /// use fastmcp_server::providers::ClientCredentialsProvider;
@@ -99,7 +95,6 @@ impl ClientCredentialsProvider {
                 backend: Arc::new(MachineBackend {
                     source: Arc::clone(&source),
                     next_id: Arc::clone(&next_id),
-                    inputs: None,
                 }),
                 next_id,
                 limits: ManagedCoreLimits::default(),
@@ -113,7 +108,6 @@ impl ClientCredentialsProvider {
     /// Policies are already validated by the native client. Existing clones and
     /// registered handlers retain their policy. All clones still share one ID
     /// allocator for BOTH discovery and operation IDs, including catalog pages.
-    /// An explicitly installed input handler is retained with the new limits.
     pub fn with_limits(
         mut self, calls: ManagedCoreLimits, catalogs: ClientCredentialsCatalogLimits,
     ) -> Self {
@@ -203,14 +197,6 @@ impl ClientCredentialsProvider {
 
 // Both seams are private. The only production constructor installs the native
 // machine client; synthetic catalogs cannot mint public schema registrations.
-struct MachineCall {
-    request: CoreRequest,
-    discovery_id: RequestId,
-    request_id: RequestId,
-    limits: ManagedCoreLimits,
-    inputs: Option<Arc<MachineInputs>>,
-}
-
 trait MachineSource: Send + Sync {
     fn collect<'a>(
         &'a self, cx: &'a Cx, method: &'static str, ids: &'a AtomicU64,
@@ -218,7 +204,8 @@ trait MachineSource: Send + Sync {
     ) -> BoxFuture<'a, McpResult<Vec<CoreResult>>>;
 
     fn start<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, call: MachineCall,
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
+        discovery_id: RequestId, request_id: RequestId, limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>>;
 }
 
@@ -251,21 +238,11 @@ impl MachineSource for NativeMachineSource {
     }
 
     fn start<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, call: MachineCall,
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
+        discovery_id: RequestId, request_id: RequestId, limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>> {
         Box::pin(async move {
-            let MachineCall { request, discovery_id, request_id, limits, inputs } = call;
             let cancellation = ctx.request_cancellation();
-            if let Some(inputs) = inputs {
-                let operation = self.0.start_core_interaction_with_cancellation(
-                    cx, &cancellation, request, discovery_id, request_id, inputs.policy.limits(limits)?,
-                ).await.map_err(interaction_error)?;
-                // Preserve request identity/auth/quota/lease while giving host
-                // callbacks the exact Cx selected by request-owned dispatch.
-                return Ok(Box::new(InteractiveMachineResponse::new(
-                    operation, ctx.clone().with_request_cx(cx.clone()), inputs,
-                )) as Box<dyn MachineResponse>);
-            }
             let call = self.0.request_core_with_cancellation(
                 cx, &cancellation, request, discovery_id, request_id, limits,
             ).await.map_err(machine_error)?;
@@ -286,7 +263,6 @@ impl MachineResponse for NativeMachineResponse {
 struct MachineBackend {
     source: Arc<dyn MachineSource>,
     next_id: Arc<AtomicU64>,
-    inputs: Option<Arc<MachineInputs>>,
 }
 
 impl CoreBackend for MachineBackend {
@@ -297,21 +273,10 @@ impl CoreBackend for MachineBackend {
         Box::pin(async move {
             ctx.checkpoint()?;
             check_cx(cx)?;
-            let (request, inputs) = match &self.inputs {
-                Some(inputs) => match inputs.policy.select_request(&request)? {
-                    Some(selected) => (selected, Some(Arc::clone(inputs))),
-                    // Completion is not an input-required method. Do not send
-                    // extra capabilities or disable it when a host is installed.
-                    None => (request, None),
-                },
-                None => (request, None),
-            };
             // The operation's ID already came from Forwarder. Discovery needs
             // another ID from that same allocator, never a fixed or reused ID.
             let discovery_id = allocate_request_id(&self.next_id)?;
-            let mut response = self.source.start(ctx, cx, MachineCall {
-                request, discovery_id, request_id: id, limits, inputs,
-            }).await?;
+            let mut response = self.source.start(ctx, cx, request, discovery_id, id, limits).await?;
             loop {
                 ctx.checkpoint()?;
                 check_cx(cx)?;

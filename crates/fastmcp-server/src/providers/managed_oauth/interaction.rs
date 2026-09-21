@@ -90,9 +90,8 @@ pub enum ManagedOAuthInputResponseMode {
 }
 
 /// Limits apply across the entire forwarded operation, including host pauses.
-/// Request/frame/response/time limits come from the provider's `with_limits`;
+/// Request/frame/response/time limits come from `ManagedOAuthProvider::with_limits`;
 /// this policy never replaces them with a fresh budget for each continuation.
-/// Interactive-login and client-credentials providers share this policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedOAuthInputPolicy {
     capabilities: ManagedOAuthInputCapabilities,
@@ -152,13 +151,7 @@ impl ManagedOAuthInputPolicy {
         self.response_mode
     }
 
-    // Share method selection and locally declared capabilities across the two
-    // authentication transports without exposing policy fields or peer overrides.
-    pub(super) fn select_request(self, request: &CoreRequest) -> McpResult<Option<CoreRequest>> {
-        interaction_request(request, self.capabilities)
-    }
-
-    pub(super) fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
+    fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
         ManagedInteractionLimits::new(
             calls, self.maximum_continuations, self.maximum_input_responses,
         ).map_err(|_| McpError::invalid_params("Invalid managed OAuth input policy"))
@@ -236,7 +229,7 @@ impl CoreBackend for InteractiveBackend {
         id: RequestId, limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
-            let Some(interactive) = self.policy.select_request(&request)? else {
+            let Some(interactive) = interaction_request(&request, self.policy.capabilities)? else {
                 // completion/complete is not an MRTR method. Configuring a
                 // resolver must not disable the provider's completion handler.
                 return NativeBackend(self.session.clone()).execute(ctx, cx, request, id, limits).await;
@@ -301,10 +294,10 @@ async fn resolve_reply(
     input: Box<InputRequiredResult>,
 ) -> Result<ManagedInputReply, ManagedInteractionError> {
     // Check before invoking even the callback's synchronous future constructor.
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
+    ctx.checkpoint().map_err(host_error)?;
     check_cx(cx).map_err(host_error)?;
     let responses = handler.resolve(ctx, cx, input).await.map_err(host_error)?;
-    ctx.checkpoint().map_err(|_| host_cancelled())?;
+    ctx.checkpoint().map_err(host_error)?;
     check_cx(cx).map_err(host_error)?;
     Ok(ManagedInputReply {
         request_id: allocate_request_id(ids).map_err(host_error)?,
@@ -312,19 +305,9 @@ async fn resolve_reply(
     })
 }
 
-/// The cancellation disposition, shared by both paths that can reach it.
-///
-/// `McpContext::checkpoint` returns `Result<(), CancelledError>`, so it cannot
-/// route through `host_error`, which consumes an `McpError`. Cancellation is
-/// the only way `checkpoint` fails, which is exactly the branch `host_error`
-/// would have taken, so the two call sites map it here directly.
-fn host_cancelled() -> ManagedInteractionError {
-    ManagedInteractionError::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
-}
-
 fn host_error(error: McpError) -> ManagedInteractionError {
     if error.code == McpErrorCode::RequestCancelled {
-        host_cancelled()
+        ManagedInteractionError::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
     } else {
         // A host error can contain private answers or downstream identity.
         ManagedInteractionError::AbortedByHost
@@ -450,8 +433,8 @@ mod tests {
                 assert_eq!(input.request_state(), Some("opaque-state"));
                 match self.action {
                     Action::Decline => return Err(McpError::invalid_params("PRIVATE-HOST-ERROR")),
-                    Action::CancelRequest => { ctx.request_cancellation().cancel(); }
-                    Action::CancelContext => { cx.set_cancel_requested(true); }
+                    Action::CancelRequest => ctx.request_cancellation().cancel(),
+                    Action::CancelContext => cx.set_cancel_requested(true),
                     _ => {},
                 }
                 Ok(if matches!(self.action, Action::StateOnly) { None } else {

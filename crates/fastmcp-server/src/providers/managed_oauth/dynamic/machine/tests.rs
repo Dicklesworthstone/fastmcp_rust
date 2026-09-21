@@ -10,15 +10,10 @@ use std::pin::pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 use fastmcp_core::{McpErrorCode, McpRequestCancellation};
-use fastmcp_protocol::{FinalCompletionParams, FinalInputResponses, InputRequiredResult};
+use fastmcp_protocol::FinalCompletionParams;
 use serde_json::Value;
 use crate::handler::{CompletionHandler, PromptHandler, ResourceHandler, ToolHandler, UriParams};
-use crate::providers::managed_oauth::interaction::{
-    ManagedOAuthInputCapabilities, ManagedOAuthInputHandler, ManagedOAuthInputPolicy,
-    ManagedOAuthInputResponseMode,
-};
 
 const TOOL_RESULT: &str = r#"{"resultType":"complete","content":[{"type":"text","text":"machine answer"}],"isError":false,"x-exact":{"n":900719925474099312345,"d":1.20e+4}}"#;
 const RESOURCE_RESULT: &str = r#"{"resultType":"complete","contents":[{"uri":"note://documents/one","text":"document"}],"ttlMs":731,"cacheScope":"private"}"#;
@@ -42,8 +37,6 @@ struct Source {
     replies: Mutex<VecDeque<&'static str>>,
     calls: Mutex<Vec<Value>>,
     ids: Mutex<Vec<RequestId>>,
-    input_modes: Mutex<Vec<Option<ManagedOAuthInputResponseMode>>>,
-    call_policies: Mutex<Vec<String>>,
     cancel: AtomicBool,
     suspend: AtomicBool,
     fail: AtomicBool,
@@ -59,7 +52,6 @@ fn source(replies: Vec<&'static str>) -> Arc<Source> {
             ("resources/templates/list", vec![decode("resources/templates/list", json!({}), r#"{"resultType":"complete","resourceTemplates":[{"uriTemplate":"note://documents/{name}","name":"Notes"}],"ttlMs":0,"cacheScope":"private"}"#)]),
         ])),
         replies: Mutex::new(replies.into()), calls: Mutex::new(Vec::new()), ids: Mutex::new(Vec::new()),
-        input_modes: Mutex::new(Vec::new()), call_policies: Mutex::new(Vec::new()),
         cancel: AtomicBool::new(false), suspend: AtomicBool::new(false), fail: AtomicBool::new(false),
         drops: Arc::new(AtomicUsize::new(0)),
     })
@@ -78,17 +70,13 @@ impl MachineSource for Source {
     }
 
     fn start<'a>(
-        &'a self, ctx: &'a McpContext, _cx: &'a Cx, call: MachineCall,
+        &'a self, ctx: &'a McpContext, _cx: &'a Cx, request: CoreRequest,
+        discovery_id: RequestId, request_id: RequestId, _limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<Box<dyn MachineResponse>>> {
         Box::pin(async move {
-            let MachineCall { request, discovery_id, request_id, limits, inputs } = call;
             assert!(!discovery_id.correlates_with(&request_id));
             self.ids.lock().unwrap().extend([discovery_id, request_id]);
             self.calls.lock().unwrap().push(request.encode_params().unwrap().unwrap());
-            self.input_modes.lock().unwrap().push(inputs.as_ref().map(|inputs| inputs.policy.response_mode()));
-            // Debug observes the private numeric policy without adding public
-            // getters to the client solely for a server-side wiring test.
-            self.call_policies.lock().unwrap().push(format!("{limits:?}"));
             let wire = self.replies.lock().unwrap().pop_front().expect("one response per call");
             let result = request.decode_result(wire).expect("request-typed fixture response");
             Ok(Box::new(Response {
@@ -309,68 +297,4 @@ fn partial_pair_allocation_never_wraps_or_reuses_an_id() {
     assert_eq!(ids.load(Ordering::Relaxed), u64::MAX);
     assert!(next_pair(&ids).is_err());
     assert_eq!(ids.load(Ordering::Relaxed), u64::MAX);
-}
-
-struct NoInput;
-impl ManagedOAuthInputHandler for NoInput {
-    fn resolve<'a>(
-        &'a self, _ctx: &'a McpContext, _cx: &'a Cx, _input: Box<InputRequiredResult>,
-    ) -> BoxFuture<'a, McpResult<Option<FinalInputResponses>>> {
-        panic!("these complete response fixtures have no host input")
-    }
-}
-
-#[test]
-fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completion() {
-    for mode in [ManagedOAuthInputResponseMode::Complete, ManagedOAuthInputResponseMode::Partial] {
-        let source = source(vec![TOOL_RESULT, TOOL_RESULT, RESOURCE_RESULT, PROMPT_RESULT, RESOURCE_RESULT, COMPLETION_RESULT]);
-        let provider = ClientCredentialsProvider::from_source(source.clone());
-        let cx = Cx::for_testing();
-        let old_tool = ready(provider.tools(&cx)).unwrap().pop().unwrap();
-        let policy = ManagedOAuthInputPolicy::new(
-            ManagedOAuthInputCapabilities { roots: true, ..Default::default() }, 3, 8,
-        ).unwrap().with_response_mode(mode);
-        let calls = ManagedCoreLimits::new(4096, 4096, 8192, 32, Duration::from_secs(7)).unwrap();
-        let configured = provider.clone().with_input_handler(policy, Arc::new(NoInput))
-            .with_limits(calls, ClientCredentialsCatalogLimits::default())
-            .with_namespace("interactive").unwrap();
-        let ctx = McpContext::new(cx.clone(), 81);
-        assert!(ready(old_tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_ok());
-        let tool = ready(configured.tools(&cx)).unwrap().pop().unwrap();
-        assert_eq!(tool.catalog_definition().name, "interactive/lookup");
-        assert!(ready(tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_ok());
-        let resource = ready(configured.resources(&cx)).unwrap().pop().unwrap();
-        assert!(ready(resource.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).is_ok());
-        let prompt = ready(configured.prompts(&cx)).unwrap().pop().unwrap();
-        assert!(ready(prompt.get_final_async_in_request(&ctx, &cx, HashMap::new())).is_ok());
-        let template = ready(configured.resource_templates(&cx)).unwrap().pop().unwrap();
-        assert!(ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).is_ok());
-        let completion = prompt.completion_handler().unwrap();
-        let params: FinalCompletionParams = serde_json::from_value(json!({
-            "ref":{"type":"ref/prompt","name":"interactive/summarize"},
-            "argument":{"name":"subject","value":"o"}
-        })).unwrap();
-        assert!(ready(completion.complete_final_async_in_request(&ctx, &cx, params)).is_ok());
-        // Observe the actual MachineCall handed to the transport, not policy
-        // fields at construction. Native source owns authentication/HTTP; this
-        // test establishes only production policy routing and handler wiring.
-        assert_eq!(*source.input_modes.lock().unwrap(),
-            [None, Some(mode), Some(mode), Some(mode), Some(mode), None]);
-        let policies = source.call_policies.lock().unwrap();
-        assert_eq!(policies[0], format!("{:?}", ManagedCoreLimits::default()));
-        let configured_policy = format!("{calls:?}");
-        assert!(policies[1..].iter().all(|policy| policy == &configured_policy));
-        let calls = source.calls.lock().unwrap();
-        let capability_key = fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY;
-        assert_eq!(calls[0]["_meta"][capability_key], json!({}));
-        for request in &calls[1..5] {
-            assert_eq!(request["_meta"][capability_key], json!({"roots":{}}));
-            assert!(request["_meta"].get("authorization").is_none());
-        }
-        assert_eq!(calls[5]["_meta"][capability_key], json!({}));
-        let ids = source.ids.lock().unwrap();
-        for (index, id) in ids.iter().enumerate() {
-            assert!(ids[..index].iter().all(|previous| !id.correlates_with(previous)));
-        }
-    }
 }

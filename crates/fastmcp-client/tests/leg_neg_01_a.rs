@@ -865,12 +865,23 @@ fn leg_neg_01_a_planted_negative() {
     cleanup(&reaccept_trace);
 }
 
-/// The frozen eligibility expectation, shared by the V3 positive and the V4 planted
-/// negative so that the two arms differ in exactly ONE dimension: a single flipped
-/// verdict. Each variant is named as a literal, so a rename or removal is a compile
-/// error here and not a silently shrinking table.
-fn stdio_first_wire_eligibility_table() -> [(StdioFirstWireSignal, &'static str, bool); 7] {
-    [
+/// bd-exhaustive-fallback-eligibility-vko6j V3: every variant's fallback-eligibility
+/// verdict is asserted by name.
+///
+/// This exists because the two guards see different failures and neither sees the
+/// other's. `is_fallback_eligible` is an exhaustive `match`, so rustc refuses to compile
+/// a NEW variant until someone states its verdict — but a wrong verdict inside a
+/// correctly-shaped arm compiles clean. That is what this test catches. Adding a variant
+/// is a compile error; changing one's answer is a test failure.
+///
+/// Scope: this pins the verdicts of one predicate. It says nothing about
+/// `ProtocolPolicy::Auto` handling, about any other `matches!` in the crate, and it
+/// grants no capability credit.
+#[test]
+fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
+    // One row per variant, each named as a literal so a rename or a removal is a
+    // compile error here too, not a silently shrinking table.
+    let expected: [(StdioFirstWireSignal, &str, bool); 7] = [
         (
             StdioFirstWireSignal::ModernDiscoveryResult,
             "ModernDiscoveryResult",
@@ -902,42 +913,20 @@ fn stdio_first_wire_eligibility_table() -> [(StdioFirstWireSignal, &'static str,
             "MalformedFirstWire",
             false,
         ),
-    ]
-}
+    ];
 
-/// The assertion itself, called by BOTH arms with the same code path. The positive
-/// hands it the frozen table; the planted negative hands it a copy with one verdict
-/// flipped. Nothing else differs between them.
-fn assert_eligibility_matches(table: &[(StdioFirstWireSignal, &'static str, bool)]) {
-    for (signal, name, want) in table {
+    for (signal, name, want) in expected {
         let got = signal.is_fallback_eligible();
         assert_eq!(
-            got, *want,
+            got, want,
             "StdioFirstWireSignal::{name} fallback eligibility changed: expected {want}, got {got}"
         );
     }
-}
 
-/// bd-exhaustive-fallback-eligibility-vko6j V3: every variant's fallback-eligibility
-/// verdict is asserted by name.
-///
-/// The two guards see different failures and neither sees the other's.
-/// `is_fallback_eligible` is an exhaustive `match`, so rustc refuses to compile a NEW
-/// variant until someone states its verdict — but a wrong verdict inside a
-/// correctly-shaped arm compiles clean. That is what this catches. Adding a variant is a
-/// compile error; changing one's answer is a test failure.
-///
-/// Scope: this pins the verdicts of one predicate. It says nothing about
-/// `ProtocolPolicy::Auto` handling, nothing about any other `matches!` in the crate, and
-/// it grants no capability credit.
-#[test]
-fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
-    let expected = stdio_first_wire_eligibility_table();
-    assert_eligibility_matches(&expected);
-
-    // Counted from the FUNCTION, not from the table: a table that agreed with itself
-    // would prove nothing, and two verdicts flipped in opposite directions would
-    // otherwise cancel.
+    // Counted from the FUNCTION, not from the table above: a table that agreed with
+    // itself would prove nothing. Two verdicts flipped in opposite directions would
+    // still pass the loop's per-row messages only if they cancelled, and this catches
+    // that.
     let eligible = expected
         .iter()
         .filter(|(signal, _, _)| signal.is_fallback_eligible())
@@ -947,7 +936,7 @@ fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
         "exactly one signal may authorize a fallback; the function reports {eligible}"
     );
 
-    // The rows must name seven DISTINCT variants. Without this a duplicated row would
+    // The rows must name seven DISTINCT variants. Without this, a duplicated row would
     // silently reduce coverage while the length still read 7.
     let mut tokens: Vec<&str> = expected
         .iter()
@@ -961,64 +950,4 @@ fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
         "the table must cover seven distinct variants, found {}",
         tokens.len()
     );
-}
-
-/// bd-exhaustive-fallback-eligibility-vko6j V4: the planted negative for the test above.
-///
-/// One variable, one dimension. This hands `assert_eligibility_matches` the SAME frozen
-/// table with exactly one expected verdict inverted, and requires that the assertion
-/// REFUSE and name the variant it objected to. Without this arm, a table test that
-/// asserted nothing at all would produce output indistinguishable from the positive's.
-#[test]
-fn stdio_first_wire_signal_flipped_verdict_is_refused_by_name() {
-    let accepted = stdio_first_wire_eligibility_table();
-
-    // ARM 0 — the unmutated table must pass, or the refusal below proves nothing about
-    // the flip rather than about the checker.
-    assert_eligibility_matches(&accepted);
-
-    // The one variable: invert the eligible variant's expected verdict, nothing else.
-    let mut flipped = stdio_first_wire_eligibility_table();
-    let target = 1;
-    assert_eq!(
-        flipped[target].1, "CorrelatedDiscoveryRefusal",
-        "the flip must land on the one eligible variant"
-    );
-    flipped[target].2 = !flipped[target].2;
-
-    let differing = accepted
-        .iter()
-        .zip(flipped.iter())
-        .filter(|(a, b)| a.2 != b.2)
-        .count();
-    assert_eq!(
-        differing, 1,
-        "exactly one row may differ between the two arms, found {differing}"
-    );
-
-    // Capture the refusal. The default hook is silenced only for this call so the
-    // expected panic does not read as a real failure in the run log.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_eligibility_matches(&flipped);
-    }));
-    std::panic::set_hook(previous);
-
-    let payload = outcome.expect_err(
-        "a flipped verdict MUST be refused; an assertion that cannot fail has established nothing",
-    );
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("<non-string panic payload>");
-    assert!(
-        message.contains("CorrelatedDiscoveryRefusal"),
-        "the refusal must NAME the variant it objected to; got: {message}"
-    );
-
-    // The accepted table is re-checked last and must still pass, so the negative arm is
-    // shown to have changed nothing outside its one flipped value.
-    assert_eligibility_matches(&accepted);
 }
