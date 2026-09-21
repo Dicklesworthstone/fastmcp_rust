@@ -31158,6 +31158,13 @@ mod lib_unit_tests {
         }
     }
 
+    /// DIAGNOSTIC (bd-f2ndd). Records how far the SEND side gets, to split
+    /// "the server never sent the reverse request" from "it sent one and the
+    /// waiter never received it". Process-wide rather than per-test, which is
+    /// acceptable only because all five probes stall identically; a single
+    /// probe reaching a later stage would still raise the maximum.
+    static F2NDD_TOOL_STAGE: AtomicUsize = AtomicUsize::new(0);
+
     struct LiveLegacyRuntimeConnectionTool;
 
     impl ToolHandler for LiveLegacyRuntimeConnectionTool {
@@ -31181,6 +31188,7 @@ mod lib_unit_tests {
         }
 
         fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            F2NDD_TOOL_STAGE.fetch_max(1, Ordering::SeqCst); // handler entered
             let counter = ctx.get_state::<u64>("legacy-runtime-counter").unwrap_or(0) + 1;
             if !ctx.set_state("legacy-runtime-counter", counter) {
                 return Err(McpError::internal_error(
@@ -31194,7 +31202,9 @@ mod lib_unit_tests {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| McpError::invalid_params("sample must be a boolean"))?;
             let text = if sample {
+                F2NDD_TOOL_STAGE.fetch_max(2, Ordering::SeqCst); // about to block_on ctx.sample
                 let response = block_on(ctx.sample("legacy runtime sample", 16))?;
+                F2NDD_TOOL_STAGE.fetch_max(3, Ordering::SeqCst); // sampling RETURNED
                 format!("legacy-runtime-{counter}-{}", response.text)
             } else {
                 format!("legacy-runtime-{counter}-without-sampling")
@@ -43182,7 +43192,12 @@ mod lib_unit_tests {
                         match client_stage.load(Ordering::SeqCst) {
                             0 => "stage 0: never got past opening the SSE session -- connect, write, flush, or the endpoint-prefix read",
                             5 => "stage 5: session opened and setup POSTs done, spawning the tool call",
-                            6 => "stage 6: PARKED ON THE SSE WAIT for the server's sampling/createMessage reverse request -- it never arrived",
+                            6 => match F2NDD_TOOL_STAGE.load(Ordering::SeqCst) {
+                                0 => "stage 6/send 0: parked on the SSE wait AND THE TOOL HANDLER WAS NEVER ENTERED -- the tools/call never reached it, so nothing ever tried to send",
+                                1 => "stage 6/send 1: tool handler entered but it never reached ctx.sample -- it failed or returned before sampling",
+                                2 => "stage 6/send 2: tool handler is INSIDE block_on(ctx.sample(..)) and never came back -- the send side is parked too",
+                                _ => "stage 6/send 3: ctx.sample RETURNED on the server, so a reverse request was sent and answered -- the client waiter missed it",
+                            },
                             7 => "stage 7: reverse request received and response built, spawning the reverse POST",
                             1 => "parked on reverse_post.join -- the reverse-response POST never returned",
                             2 => "parked on tool_call.join -- the reverse POST returned but the tool call never settled",
