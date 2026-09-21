@@ -23,20 +23,30 @@
 //!
 //! | group | state here |
 //! |---|---|
-//! | `B-26 stale-owner-fenced-write`   | covered |
-//! | `B-27 lease-renew-expire-reclaim` | PARTIAL: renew and expire only. Reclaim is not asserted, because the reclaim path after an expired initial-work lease is not established by the trait's own contract text and I will not assert behaviour I have not read. |
-//! | `B-28 durable-time-authority`     | covered |
+//! | `B-26 stale-owner-fenced-write`      | covered |
+//! | `B-27 lease-renew-expire-reclaim`    | covered -- renew, expire AND reclaim |
+//! | `B-28 durable-time-authority`        | covered |
 //! | `B-31 private-update-revision-order` | PARTIAL: stale-generation refusal only. Ordering across concurrent writers is not asserted. |
-//! | `B-43 shutdown-drain-lease-release` | covered |
+//! | `B-34 restore-write-contract`        | covered |
+//! | `B-42 duplicate-execution-idempotency` | covered |
+//! | `B-43 shutdown-drain-lease-release`  | covered |
 //!
-//! The eighteen remaining groups -- `B-24`, `B-25`, `B-29`, `B-30`, `B-32`
-//! through `B-42` less those above, and `B-44` through `B-46` -- have no test
-//! here and no test anywhere in the tree. Four of them rest on vocabulary the
-//! shipped source does not yet carry at all: a word-boundary count over
-//! `crates/fastmcp-server/src/tasks.rs` gives `quota` = 2, `tombstone` = 0,
+//! SEVEN of twenty-three, one of them partial. **Sixteen groups have no test
+//! here and none anywhere in the tree**: B-24, B-25, B-29, B-30, B-32, B-33,
+//! B-35 through B-41, B-44, B-45, B-46.
+//!
+//! COUNT THIS FILE BY ITS FUNCTIONS, NOT BY ITS MENTIONS. The table above
+//! names groups precisely in order to say which are MISSING, so a scan that
+//! counts `B-nn` occurrences reads the gap list as coverage and scores this
+//! file at 23. Every group identifier in this file appears in a comment and
+//! none appears in code; the honest figure is the number of `fn bNN_*`
+//! definitions, which is seven.
+//!
+//! Four of the sixteen cannot be closed by writing tests at all. They rest on
+//! vocabulary the shipped source does not carry: word-boundary counts over
+//! `crates/fastmcp-server/src/tasks.rs` give `quota` = 2, `tombstone` = 0,
 //! `reconcil` = 0, `epoch` = 0, against `lease` = 191, `fence` = 64,
-//! `durable` = 157 and `generation` = 540. Those four are implementation gaps,
-//! not test gaps, and cannot be closed by writing tests.
+//! `durable` = 157 and `generation` = 540. Those are implementation gaps.
 //!
 //! # Feature gating, and which configuration a green here binds
 //!
@@ -276,6 +286,167 @@ fn b27_lease_renew_then_expire() {
             .expect("store writes succeed"),
         "a lease whose window has fully elapsed on the store's own clock must not renew"
     );
+
+    // RECLAIM. The expired lease is dropped by the store's own reclaim pass,
+    // and the retained initial work was never consumed by the take, so a
+    // different owner can now claim the same task. Without this the group
+    // would prove expiry but not that the work becomes available again --
+    // which is the whole point of an expiring lease.
+    let reclaimed = fixture
+        .store
+        .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "owner-b")
+        .expect("store writes succeed");
+    assert!(
+        reclaimed.is_some(),
+        "after the first owner's lease expires the work must be claimable by another owner"
+    );
+    let new_fence = fixture
+        .store
+        .begin_handoff_dispatch_for_owner_if_current(
+            &fixture.id,
+            snapshot.generation(),
+            "owner-b",
+        )
+        .expect("store writes succeed")
+        .expect("the reclaiming owner elects a fresh dispatch");
+    assert!(
+        fixture
+            .store
+            .renew_handoff_dispatch_if_current(
+                &fixture.id,
+                snapshot.generation(),
+                "owner-b",
+                new_fence
+            )
+            .expect("store writes succeed"),
+        "the reclaiming owner holds a live lease"
+    );
+    assert!(
+        !fixture
+            .store
+            .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", fence)
+            .expect("store writes succeed"),
+        "the evicted owner must not renew back into a task another owner now holds"
+    );
+}
+
+/// `B-34 restore-write-contract`: an owner may hand work back only with the
+/// exact lease it holds and the exact descriptor the store retained.
+fn b34_restore_write_contract() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let (snapshot, fence) = fixture.elect("owner-a");
+    let retained = FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "durable"}))
+        .expect("the descriptor the fixture created the task with");
+    let altered = FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "substituted"}))
+        .expect("a well-formed but different descriptor");
+
+    // The unauthorized variant is refused with a typed error, not a false.
+    // `false` would be indistinguishable from a legitimate lost race.
+    assert!(
+        fixture
+            .store
+            .restore_initial_work_if_current(
+                &fixture.id,
+                snapshot.generation(),
+                retained.clone()
+            )
+            .is_err(),
+        "a restore with no owner must be a typed refusal, not a quiet false"
+    );
+
+    // Wrong descriptor: the lease matches, so the store accepts the release,
+    // but the contract's return value reports that what was handed back is not
+    // what it retained.
+    assert!(
+        !fixture
+            .store
+            .restore_initial_work_for_owner_if_current(
+                &fixture.id,
+                snapshot.generation(),
+                "owner-a",
+                Some(fence),
+                altered
+            )
+            .expect("store writes succeed"),
+        "restoring a descriptor the store never retained must not report success"
+    );
+
+    // Wrong fence, on a fresh fixture so the arm above cannot have consumed
+    // the lease this one needs.
+    let other = Fixture::new(TASK, 600_000);
+    let (other_snapshot, other_fence) = other.elect("owner-a");
+    assert!(
+        !other
+            .store
+            .restore_initial_work_for_owner_if_current(
+                &other.id,
+                other_snapshot.generation(),
+                "owner-a",
+                Some(other_fence + 1),
+                retained.clone()
+            )
+            .expect("store writes succeed"),
+        "a fence one off the held lease must not restore"
+    );
+
+    // The accepted row, last, proving the refusals above were attributable to
+    // the one changed variable and not to a store left unable to accept
+    // anything.
+    assert!(
+        other
+            .store
+            .restore_initial_work_for_owner_if_current(
+                &other.id,
+                other_snapshot.generation(),
+                "owner-a",
+                Some(other_fence),
+                retained
+            )
+            .expect("store writes succeed"),
+        "the exact lease and the exact retained descriptor must restore"
+    );
+}
+
+/// `B-42 duplicate-execution-idempotency`: a held lease makes the work
+/// unclaimable by anyone, so two runners cannot execute the same task.
+fn b42_duplicate_execution_is_refused() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let snapshot = fixture.snapshot();
+
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "owner-a")
+            .expect("store writes succeed")
+            .is_some(),
+        "the first claim succeeds"
+    );
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "owner-a")
+            .expect("store writes succeed")
+            .is_none(),
+        "the SAME owner claiming twice must not get a second execution"
+    );
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "owner-b")
+            .expect("store writes succeed")
+            .is_none(),
+        "a second owner must not get a concurrent execution of the same task"
+    );
+
+    // An empty owner is a typed refusal rather than an anonymous claim. A
+    // `false`/`None` here would let an unattributable runner hold work.
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "")
+            .is_err(),
+        "an empty owner must be refused with an error, not silently declined"
+    );
 }
 
 /// `B-28 durable-time-authority`: retention time comes from the store's
@@ -396,6 +567,8 @@ fn task_02_b_positive() {
     b27_lease_renew_then_expire();
     b28_durable_time_authority();
     b31_stale_generation_is_refused();
+    b34_restore_write_contract();
+    b42_duplicate_execution_is_refused();
     b43_release_happens_exactly_once();
 }
 
