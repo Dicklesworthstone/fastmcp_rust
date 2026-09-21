@@ -1541,11 +1541,26 @@ fn b46_ops_readiness_cardinality_is_zero_before_entry() {
         "a runtime with no installed task service must not report ready"
     );
 
-    // 2. Retaining durable work is not readiness. The store already holds the
-    //    task created above, which the positive control just confirmed.
+    // 2. Retaining durable work is not readiness. The work is created AFTER the
+    //    runtime exists, which is what makes this assertion able to fail
+    //    independently of assertion 1 -- if accumulating durable rows ever
+    //    conferred readiness, only this ordering would catch it. An earlier
+    //    version asserted the same call over the task that PREDATES the
+    //    runtime, which merely restates assertion 1 and cannot fail if it
+    //    passed.
+    let (extra, extra_notification) = conformance_task("readiness-extra");
+    fixture
+        .store
+        .create_task_with_work(
+            extra,
+            extra_notification,
+            FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "durable"}))
+                .expect("a bounded work descriptor"),
+        )
+        .expect("the store accepts a second task within its capacity");
     assert!(
         !runtime.is_task_service_ready(),
-        "durable work retained in the store must not confer readiness"
+        "durable work created after the runtime must not confer readiness"
     );
 
     // 3. A clone does not create readiness and does not disturb the original.
