@@ -18,8 +18,8 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers THIRTEEN of the twenty-three
-//! named groups, one of those only in part. The table below is the authority;
+//! This file does NOT discharge the bead. It covers FIFTEEN of the twenty-three
+//! named groups, two of those only in part. The table below is the authority;
 //! keep this sentence and the table in agreement when either changes:
 //!
 //! | group | state here |
@@ -37,13 +37,15 @@
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
 //! | `B-45 anonymous-leaked-handle`       | covered |
+//! | `B-44 mrtr-nonuse`                   | covered -- the durable surface carries and needs no multi-round retry state |
+//! | `B-46 ops-readiness-cardinality`     | covered -- the ZERO case only; the one-entered-owner case needs a runner harness |
 //!
-//! THIRTEEN of twenty-three, one of them partial. **Ten groups have no test
-//! here and none anywhere in the tree**: B-25, B-33, B-36 through B-41,
-//! B-44, B-46.
+//! FIFTEEN of twenty-three, two of them partial. **Eight groups have no test
+//! here and none anywhere in the tree**: B-25, B-33, and B-36 through B-41.
 //!
-//! A RUN REPORTS 14 OUTCOMES, WHICH IS NOT 14 GROUPS AND NOT 23. Eleven group
-//! tests, one lease-window guard, and the two frozen IDs. This file has been
+//! A RUN REPORTS 19 OUTCOMES, WHICH IS NOT 19 GROUPS AND NOT 23. Sixteen
+//! group tests spread over fifteen groups, one lease-window guard, and the
+//! two frozen IDs. This file has been
 //! miscounted three times by three different methods -- 13 by mention count,
 //! 18 by a mixed regex, and 13-of-23 by reading the outcome total as a group
 //! total.
@@ -59,15 +61,17 @@
 //! A group may hold more than one test when its halves are independently
 //! meaningful; that is a feature of the coverage, not extra coverage.
 //!
-//! Of those thirteen, EIGHT are blocked on capability the shipped store does
-//! not have and cannot be closed by writing tests: B-25 and B-33
+//! Of the TEN that were missing, EIGHT are blocked on capability the shipped
+//! store does not have and cannot be closed by writing tests: B-25 and B-33
 //! (reconciliation, `reconcil` = 0 here though it appears in 21 other
 //! workspace src files), B-36 and B-41 (expiry index / tombstones,
 //! `sweeper` = 0), B-37 (quota, 2 occurrences in 19,260 lines), B-38 and B-40
 //! (protected payloads; tasks.rs:8460 states the store "deliberately
 //! implements only unprotected work" and `reencrypt` = 0 workspace-wide),
-//! B-39 (durable-time epoch, `epoch` = 0). FIVE remain as candidates: B-24,
-//! B-35, B-44, B-45, B-46, plus completing B-31's ordering half.
+//! B-39 (durable-time epoch, `epoch` = 0). The other TWO were B-44 and B-46,
+//! and both are now written -- so no writable candidate remains, and the
+//! eight above are the whole of the gap. Closing any of them is a change to
+//! the STORE, not another test file.
 //!
 //! A NOTE ON THAT SPLIT, because the obvious heuristic over-blocks: absence of
 //! a word from the source decides nothing on its own. It is decisive only
@@ -176,8 +180,8 @@ use fastmcp_protocol::tasks_extension::{
     Task, TaskStatusNotification, TaskStatusNotificationParams,
 };
 use fastmcp_server::{
-    FinalTaskRetentionDeadline, FinalTaskSnapshot, FinalTaskStore, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore,
+    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
+    FinalTaskStore, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
 };
 
 /// The in-memory store's elected dispatch lease, as declared by
@@ -1422,6 +1426,131 @@ fn b35_third_party_backend_conformance() {
     );
 }
 
+/// `B-44 mrtr-nonuse`. MRTR -- multi-round model-request tool retry -- is a
+/// CLIENT concept, defined at `crates/fastmcp-client/src/execution.rs:113`.
+/// The durable task path must neither require it nor expose it. It is not
+/// structurally unreachable from this package, which is why the group exists:
+/// `fastmcp-server/Cargo.toml` declares `proxy = ["dep:fastmcp-client"]`, so
+/// the client crate IS a dependency under the `proxy` feature. What this test
+/// holds is the narrower and checkable claim -- the durable surface itself
+/// carries no multi-round retry state and needs none to complete.
+///
+/// A non-use claim is the easiest kind to write vacuously, so this is built to
+/// fail in both directions. An absence assertion over a GUESSED key name
+/// returns a false zero whether or not the property holds, so the scan runs
+/// over the wire form's OWN keys, and a positive control establishes that the
+/// form is a populated task before its key set is allowed to mean anything.
+#[test]
+fn b44_mrtr_state_is_absent_from_the_durable_path() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let wire = fixture.task_wire_form();
+    let object = wire
+        .as_object()
+        .expect("the task wire form is a JSON object");
+
+    // POSITIVE CONTROL. Without it an empty or null wire form would satisfy
+    // every absence assertion below, and the test would pass proving nothing.
+    assert!(
+        object.contains_key("taskId") && object.contains_key("status"),
+        "the wire form must be a populated task before its key set means \
+         anything, but it is {object:?}"
+    );
+
+    // The absence assertion, enumerated over what IS there.
+    for key in object.keys() {
+        let lowered = key.to_ascii_lowercase();
+        for forbidden in ["mrtr", "round", "retry", "continuation", "resume"] {
+            assert!(
+                !lowered.contains(forbidden),
+                "the durable task wire form must carry no multi-round retry \
+                 state, but key `{key}` matches `{forbidden}`"
+            );
+        }
+    }
+
+    // And the lifecycle completes with nothing MRTR-shaped supplied: election
+    // and release go through the ordinary durable surface and no resume input
+    // is offered at any point.
+    let (snapshot, fence) = fixture.elect("owner-a");
+    assert!(
+        fixture
+            .store
+            .finish_handoff_dispatch_for_owner_if_current(
+                &fixture.id,
+                snapshot.generation(),
+                "owner-a",
+                fence
+            )
+            .expect("store writes succeed"),
+        "a durable dispatch must complete with no multi-round retry state supplied"
+    );
+}
+
+/// `B-46 ops-readiness-cardinality`. `FinalTaskRuntime::is_task_service_ready`
+/// is the public readiness observation. Its contract, stated at
+/// `fastmcp-server/src/tasks.rs:5902`, is that readiness begins ONLY when an
+/// entered runner is polled and holds its lease: "Merely installing a runner,
+/// retaining a runtime clone, or retaining durable work is not readiness."
+///
+/// The cardinality this asserts is the ZERO case -- with no runner ever
+/// entered, no number of runtimes, clones, or durable rows may report ready.
+/// That is the half that can be proved without an async runner harness. The
+/// one-owner case (exactly one entered runner holds readiness, and a second
+/// cannot) needs `install_task_service` plus a polled `run_service`, which
+/// this file has no harness for; it is NOT covered here and the header table
+/// says so rather than letting a partial pass as whole.
+///
+/// The positive control matters more than usual: "durable work does not confer
+/// readiness" is vacuous if there is no durable work, and every assertion here
+/// is a negative.
+#[test]
+fn b46_ops_readiness_cardinality_is_zero_before_entry() {
+    let fixture = Fixture::new(TASK, 600_000);
+
+    // POSITIVE CONTROL. The store really holds the task, so the negatives
+    // below are about readiness rather than about an empty store.
+    assert!(
+        fixture
+            .store
+            .get_task(&fixture.id)
+            .expect("store reads succeed")
+            .is_some(),
+        "the runtime must sit over a store that genuinely holds durable work, \
+         or 'durable work is not readiness' asserts nothing"
+    );
+
+    let runtime = FinalTaskRuntime::new(
+        Arc::clone(&fixture.store),
+        FinalTaskRuntimeConfig::new(600_000, None).expect("a positive ttl yields a policy"),
+        Arc::new(|_| {}),
+    );
+
+    // 1. A runtime that has never installed a service is not ready.
+    assert!(
+        !runtime.is_task_service_ready(),
+        "a runtime with no installed task service must not report ready"
+    );
+
+    // 2. Retaining durable work is not readiness. The store already holds the
+    //    task created above, which the positive control just confirmed.
+    assert!(
+        !runtime.is_task_service_ready(),
+        "durable work retained in the store must not confer readiness"
+    );
+
+    // 3. A clone does not create readiness and does not disturb the original.
+    //    Readiness is a property of an entered runner, not of handle count.
+    let cloned = runtime.clone();
+    assert!(
+        !cloned.is_task_service_ready(),
+        "cloning a runtime must not manufacture readiness"
+    );
+    assert!(
+        !runtime.is_task_service_ready(),
+        "observing a clone must not change the original's readiness"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Frozen IDs
 // ---------------------------------------------------------------------------
@@ -1443,6 +1572,8 @@ fn task_02_b_positive() {
     b42_duplicate_execution_is_refused();
     b45_anonymous_handle_is_refused_everywhere();
     b43_release_happens_exactly_once();
+    b44_mrtr_state_is_absent_from_the_durable_path();
+    b46_ops_readiness_cardinality_is_zero_before_entry();
 }
 
 #[test]
