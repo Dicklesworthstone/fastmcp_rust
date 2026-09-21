@@ -445,6 +445,12 @@ impl FinalResultCache {
     }
 
     /// Retains a fetched result only when its captured generation is current.
+    ///
+    /// A current, non-cacheable result supersedes any retained result for the
+    /// exact key. In particular, input-required and zero-TTL responses must not
+    /// leave an earlier complete result available as a later cache hit. This
+    /// does not invalidate other keys or advance the captured generation.
+    /// Invalidated fetches and failed TTL/size admission leave entries intact.
     pub fn insert_if_current_at(
         &mut self,
         key: FinalCacheKey,
@@ -457,6 +463,9 @@ impl FinalResultCache {
         }
 
         let Some((ttl, scope)) = final_cache_hints(&result) else {
+            if let Some(previous) = self.entries.remove(&key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+            }
             return FinalCacheInsert::NotCacheable;
         };
         let ttl_ms = match ttl.try_as_millis() {
@@ -464,6 +473,9 @@ impl FinalResultCache {
             Err(_) => return FinalCacheInsert::ExpiryOutOfRange,
         };
         if ttl_ms == 0 {
+            if let Some(previous) = self.entries.remove(&key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+            }
             return FinalCacheInsert::ImmediatelyStale;
         }
         let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl_ms)) else {
@@ -825,6 +837,253 @@ mod tests {
             cache.insert_if_current(input_key, generation, input_required),
             FinalCacheInsert::NotCacheable
         );
+    }
+
+    #[test]
+    fn revalidation_with_zero_ttl_retires_the_previously_fresh_result() {
+        // The two cases differ only in the new TTL. The old entry is still
+        // fresh in both, so a miss cannot be explained by its natural expiry.
+        for ttl in [0, 1] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let generation = cache.begin_fetch(cache_key.result_set());
+            let result = tools_result(ttl, "private", Some(r#""x-retained":"replacement""#));
+            let expected = result.encode().expect("replacement result encodes");
+            let inserted =
+                cache.insert_if_current_at(cache_key.clone(), generation, result, receipt);
+            assert_eq!(cache.begin_fetch(cache_key.result_set()), generation);
+            if ttl == 0 {
+                assert_eq!(inserted, FinalCacheInsert::ImmediatelyStale);
+                assert!(matches!(
+                    cache.lookup_at(&cache_key, receipt),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+                assert_eq!(cache.retained_bytes, 0);
+                assert_eq!(cache.stats().fills, 1);
+            } else {
+                assert_eq!(inserted, FinalCacheInsert::Stored);
+                let FinalCacheLookup::Fresh(fresh) = cache.lookup_at(&cache_key, receipt) else {
+                    panic!("positive-TTL replacement must remain usable");
+                };
+                assert_eq!(fresh.encode().expect("fresh result encodes"), expected);
+                assert!(matches!(
+                    cache.lookup_at(&cache_key, receipt + Duration::from_millis(1)),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+                ));
+                assert_eq!(cache.stats().fills, 2);
+            }
+            assert_eq!(cache.stats().evictions, 0);
+        }
+    }
+
+    #[test]
+    fn zero_ttl_revalidation_preserves_other_partitions_pages_and_generations() {
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let keys = [
+            key("credential-a", None),
+            key("credential-b", None),
+            key("credential-a", Some("page-2")),
+        ];
+        let generation = cache.begin_fetch(keys[0].result_set());
+        for cache_key in &keys {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+        let retained = cache.retained_bytes;
+        let removed = cache.entries[&keys[0]].encoded_bytes;
+        let stats = cache.stats();
+        // Repeating the retirement must not subtract the same bytes twice.
+        for _ in 0..2 {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    keys[0].clone(),
+                    generation,
+                    tools_result(0, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::ImmediatelyStale
+            );
+            assert_eq!(cache.retained_bytes, retained - removed);
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!(cache.stats(), stats);
+            assert_eq!(cache.begin_fetch(keys[0].result_set()), generation);
+        }
+        assert!(matches!(
+            cache.lookup_at(&keys[0], receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        for cache_key in &keys[1..] {
+            assert!(matches!(
+                cache.lookup_at(cache_key, receipt + Duration::from_millis(99)),
+                FinalCacheLookup::Fresh(_)
+            ));
+            assert!(matches!(
+                cache.lookup_at(cache_key, receipt + Duration::from_millis(100)),
+                FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+            ));
+        }
+        assert_eq!(cache.retained_bytes, 0);
+        // The exact key remains reusable without a cache-wide reset.
+        assert_eq!(
+            cache.insert_if_current_at(
+                keys[0].clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+    }
+
+    #[test]
+    fn obsolete_or_disabled_zero_ttl_revalidation_cannot_remove_a_retained_result() {
+        for disabled in [false, true] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let captured = cache.begin_fetch(cache_key.result_set());
+            if disabled {
+                cache.set_enabled(false);
+            } else {
+                cache.clear();
+                let current = cache.begin_fetch(cache_key.result_set());
+                assert_eq!(
+                    cache.insert_if_current_at(
+                        cache_key.clone(),
+                        current,
+                        tools_result(100, "private", None),
+                        receipt,
+                    ),
+                    FinalCacheInsert::Stored
+                );
+            }
+            let attempted_generation = if disabled {
+                // A current generation still confers no fill/retirement right
+                // while the cache is disabled.
+                cache.begin_fetch(cache_key.result_set())
+            } else {
+                captured
+            };
+            let retained = cache.retained_bytes;
+            let stats = cache.stats();
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    attempted_generation,
+                    tools_result(0, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.stats(), stats);
+            cache.set_enabled(true);
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+        }
+    }
+
+    fn resource_revalidation_fixture() -> (FinalCacheKey, CoreResult, CoreResult) {
+        let cache_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"info://server\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("info://server".to_owned()),
+        );
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"info://server\"").expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let complete = request
+            .decode_result(
+                r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("complete resource result is admitted");
+        let input_required = request
+            .decode_result(
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("input-required result retains inert cache lookalikes");
+        (cache_key, complete, input_required)
+    }
+
+    #[test]
+    fn input_required_revalidation_retires_complete_content_and_allows_later_refill() {
+        let (cache_key, complete, input_required) = resource_revalidation_fixture();
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, complete.clone(), receipt),
+            FinalCacheInsert::Stored
+        );
+        let stats = cache.stats();
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, input_required, receipt),
+            FinalCacheInsert::NotCacheable
+        );
+        assert_eq!(cache.stats(), stats);
+        assert_eq!(cache.retained_bytes, 0);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), generation);
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, complete, receipt),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn obsolete_input_required_revalidation_cannot_remove_newer_complete_content() {
+        let (cache_key, complete, input_required) = resource_revalidation_fixture();
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let obsolete = cache.begin_fetch(cache_key.result_set());
+        cache.invalidate_result_set(cache_key.result_set());
+        let current = cache.begin_fetch(cache_key.result_set());
+        let expected = complete.encode().expect("complete result encodes");
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), current, complete, receipt),
+            FinalCacheInsert::Stored
+        );
+        let retained = cache.retained_bytes;
+        let stats = cache.stats();
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), obsolete, input_required, receipt),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(cache.stats(), stats);
+        let FinalCacheLookup::Fresh(fresh) = cache.lookup_at(&cache_key, receipt) else {
+            panic!("an obsolete response cannot retire a current result");
+        };
+        assert_eq!(fresh.encode().expect("fresh result encodes"), expected);
     }
 
     #[test]
