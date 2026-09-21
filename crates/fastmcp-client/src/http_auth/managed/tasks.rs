@@ -39,6 +39,8 @@ use crate::sse::SseLimits;
 
 /// Opt-in bounded Task polling and host input resolution.
 pub mod driver;
+/// Credential-bound tool continuations that may complete or create a Task.
+pub mod interaction;
 /// Notification-driven multi-task observation with authenticated reconciliation.
 pub mod watch;
 
@@ -190,13 +192,34 @@ impl ManagedTasksClient {
         self.session.check(cx, cancellation)?;
         let deadline = deadline_after(cx, self.limits.timeout)?;
         let prepared = prepare(self.session.resource().as_str(), &self.metadata, &ids.operation, request, self.limits)?;
-        let discovery = discovery_request(&self.metadata)?;
-        let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?.ok_or(ManagedTasksError::InvalidRequest)?;
-        let discover_wire = encode_request(self.session.resource().as_str(), "server/discover", &ids.discovery, params, None, self.limits.request_bytes)?;
+        let round = self.prepare_round(ids, prepared)?;
         let credential = self.session.await_active(cx, cancellation, deadline, None, async {
             self.session.credential_with_cancellation(cx, cancellation).await
         }).await?;
-        let response = self.execute_bound(cx, cancellation, deadline, &credential, &discover_wire).await?;
+        self.execute_round(cx, cancellation, round, &credential, deadline, self.limits.records).await
+    }
+
+    // All serialization and local bounds precede renewal or network effects.
+    // Continuations use this same preparation without adding prior answers or
+    // requestState to discovery, which is not part of the tool continuation.
+    fn prepare_round(&self, ids: ManagedTaskRequestIds, prepared: PreparedTask) -> Result<PreparedTaskRound, ManagedTasksError> {
+        let discovery = discovery_request(&self.metadata)?;
+        let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?.ok_or(ManagedTasksError::InvalidRequest)?;
+        let discover_wire = encode_request(self.session.resource().as_str(), "server/discover", &ids.discovery, params, None, self.limits.request_bytes)?;
+        Ok(PreparedTaskRound { ids, prepared, discovery, discover_wire })
+    }
+
+    // Every round retains fresh discovery and exact Tasks-surface admission.
+    // The credential and absolute deadline belong to the caller: this method
+    // cannot silently renew them while replaying a server continuation state.
+    async fn execute_round(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        round: PreparedTaskRound, credential: &OAuthCredentialSnapshot,
+        deadline: Time, records: usize,
+    ) -> Result<ManagedTaskCall, ManagedTasksError> {
+        if records == 0 { return Err(ManagedTasksError::RecordLimit); }
+        let PreparedTaskRound { ids, prepared, discovery, discover_wire } = round;
+        let response = self.execute_bound(cx, cancellation, deadline, credential, &discover_wire).await?;
         require_json(&response)?;
         let bytes = self.session.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
             response.read_to_end(cx, self.limits.frame_bytes).await
@@ -207,8 +230,9 @@ impl ManagedTasksClient {
         admit_discovery(&discovered, &prepared.decoder)?;
         // No credential acquisition occurs between discovery and the operation:
         // a concurrent refresh may create a newer snapshot, never replace this one.
-        let response = self.execute_bound(cx, cancellation, deadline, &credential, &prepared.wire).await?;
-        ManagedTaskCall::from_response(response, prepared, ids.operation, self.limits, deadline)
+        let response = self.execute_bound(cx, cancellation, deadline, credential, &prepared.wire).await?;
+        let limits = ManagedTasksLimits { records: records.min(self.limits.records), ..self.limits };
+        ManagedTaskCall::from_response(response, prepared, ids.operation, limits, deadline)
     }
 
     async fn execute_bound(
@@ -235,6 +259,12 @@ impl ManagedTasksClient {
 // Keep large protocol vocabularies and body ownership off the async stack.
 enum TaskDecoder { Tool(Box<CoreRequest>), Get(TaskId), Update, Cancel }
 struct PreparedTask { wire: ModernHttpRequest, decoder: TaskDecoder, progress: Option<ProgressMarker> }
+struct PreparedTaskRound {
+    ids: ManagedTaskRequestIds,
+    prepared: PreparedTask,
+    discovery: CoreRequest,
+    discover_wire: ModernHttpRequest,
+}
 enum TaskBody { Json(Box<ManagedOAuthResponse>), Sse(Box<ManagedOAuthSseStream>) }
 
 /// One owned response. Pending reads take socket ownership before suspension;
