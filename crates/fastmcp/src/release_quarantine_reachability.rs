@@ -15,6 +15,14 @@
 //! inferred from source, exactly as A carries its unresolved provider
 //! observations. No function here reads the network, and none may.
 //!
+//! NO-CLAIM BOUNDARY. This role alone does not establish parent completion,
+//! aggregate MCP 2026-07-28 support, MCP 2024-11-05 preservation, automatic
+//! negotiation, profile maturity, conformance, publication, or release
+//! readiness. It carries zero protocol capability and no publication
+//! authority, and its bead earns zero capability credit by design. Its named
+//! consumer is the public REL-QUAR-00 surface named in the canonical package
+//! contract, and nothing else may cite it.
+//!
 //! THE RESTORATION BOUNDARY. Quarantine may be lifted only by an exact
 //! `REL-02` authorization receipt. Its ABSENCE is the quarantined state, so
 //! [`Rel02ReceiptState::Absent`] is what a passing evaluation records — not a
