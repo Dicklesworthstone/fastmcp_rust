@@ -294,10 +294,10 @@ async fn resolve_reply(
     input: Box<InputRequiredResult>,
 ) -> Result<ManagedInputReply, ManagedInteractionError> {
     // Check before invoking even the callback's synchronous future constructor.
-    ctx.checkpoint().map_err(host_error)?;
+    ctx.checkpoint().map_err(|_| host_cancelled())?;
     check_cx(cx).map_err(host_error)?;
     let responses = handler.resolve(ctx, cx, input).await.map_err(host_error)?;
-    ctx.checkpoint().map_err(host_error)?;
+    ctx.checkpoint().map_err(|_| host_cancelled())?;
     check_cx(cx).map_err(host_error)?;
     Ok(ManagedInputReply {
         request_id: allocate_request_id(ids).map_err(host_error)?,
@@ -305,9 +305,19 @@ async fn resolve_reply(
     })
 }
 
+/// The cancellation disposition, shared by both paths that can reach it.
+///
+/// `McpContext::checkpoint` returns `Result<(), CancelledError>`, so it cannot
+/// route through `host_error`, which consumes an `McpError`. Cancellation is
+/// the only way `checkpoint` fails, which is exactly the branch `host_error`
+/// would have taken, so the two call sites map it here directly.
+fn host_cancelled() -> ManagedInteractionError {
+    ManagedInteractionError::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
+}
+
 fn host_error(error: McpError) -> ManagedInteractionError {
     if error.code == McpErrorCode::RequestCancelled {
-        ManagedInteractionError::Core(fastmcp_client::http_auth::rpc::ManagedCoreError::Cancelled)
+        host_cancelled()
     } else {
         // A host error can contain private answers or downstream identity.
         ManagedInteractionError::AbortedByHost
