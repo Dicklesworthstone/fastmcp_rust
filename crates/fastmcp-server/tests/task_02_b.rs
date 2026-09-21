@@ -18,7 +18,7 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers EIGHT of the twenty-three
+//! This file does NOT discharge the bead. It covers TEN of the twenty-three
 //! named groups, one of those only in part. The table below is the authority;
 //! keep this sentence and the table in agreement when either changes:
 //!
@@ -28,22 +28,26 @@
 //! | `B-27 lease-renew-expire-reclaim`    | covered -- renew, expire AND reclaim |
 //! | `B-28 durable-time-authority`        | covered |
 //! | `B-29 backend-clock-discontinuity`   | covered -- narrow; see the test's own scope note |
+//! | `B-30 skewed-worker-time-domains`    | covered |
+//! | `B-32 deadline-renew-restart`        | covered |
 //! | `B-31 private-update-revision-order` | PARTIAL: stale-generation refusal only. Ordering across concurrent writers is not asserted. |
 //! | `B-34 restore-write-contract`        | covered |
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
 //!
-//! EIGHT of twenty-three, one of them partial. **Fifteen groups have no test
-//! here and none anywhere in the tree**: B-24, B-25, B-30, B-32, B-33,
-//! B-35 through B-41, B-44, B-45, B-46.
+//! TEN of twenty-three, one of them partial. **Thirteen groups have no test
+//! here and none anywhere in the tree**: B-24, B-25, B-33, B-35 through B-41,
+//! B-44, B-45, B-46.
 //!
-//! Of those fifteen, EIGHT are blocked on capability the shipped store does
+//! Of those thirteen, EIGHT are blocked on capability the shipped store does
 //! not have and cannot be closed by writing tests: B-25 and B-33
-//! (reconciliation), B-36 and B-41 (expiry index / tombstones), B-37 (quota),
-//! B-38 and B-40 (protected payloads; tasks.rs:8460 states the store
-//! "deliberately implements only unprotected work"), B-39 (durable-time
-//! epoch). SEVEN are candidates: B-24, B-30, B-32, B-35, B-44, B-45, B-46,
-//! plus completing B-31's ordering half.
+//! (reconciliation, `reconcil` = 0 here though it appears in 21 other
+//! workspace src files), B-36 and B-41 (expiry index / tombstones,
+//! `sweeper` = 0), B-37 (quota, 2 occurrences in 19,260 lines), B-38 and B-40
+//! (protected payloads; tasks.rs:8460 states the store "deliberately
+//! implements only unprotected work" and `reencrypt` = 0 workspace-wide),
+//! B-39 (durable-time epoch, `epoch` = 0). FIVE remain as candidates: B-24,
+//! B-35, B-44, B-45, B-46, plus completing B-31's ordering half.
 //!
 //! A NOTE ON THAT SPLIT, because the obvious heuristic over-blocks: absence of
 //! a word from the source decides nothing on its own. It is decisive only
@@ -697,6 +701,142 @@ fn b29_backend_clock_discontinuity() {
     );
 }
 
+/// `B-30 skewed-worker-time-domains`: no caller supplies time, so a worker's
+/// own clock cannot influence a lease decision.
+///
+/// The property is structural: every timing decision in the store reads
+/// `(self.clock)()`, and no method on the trait accepts an instant, a
+/// duration, or a deadline from its caller. Two workers therefore cannot
+/// disagree about time because neither of them is consulted. This test
+/// demonstrates the observable consequence rather than restating the shape --
+/// with the store's clock held still, no amount of work expires a lease, and
+/// one advance of that clock expires it immediately.
+#[test]
+fn b30_skewed_worker_time_domains() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let (snapshot, fence) = fixture.elect("owner-a");
+    let frozen = fixture.store.retention_clock_now();
+
+    // Real elapsed time and real work, with the store's clock held still.
+    // Under a wall clock these 200 operations would take measurable time; the
+    // lease must not care.
+    for i in 0..200 {
+        assert!(
+            fixture
+                .store
+                .renew_handoff_dispatch_if_current(
+                    &fixture.id,
+                    snapshot.generation(),
+                    "owner-a",
+                    fence
+                )
+                .expect("store writes succeed"),
+            "renewal {i} must succeed while the store's clock has not moved"
+        );
+        assert!(
+            !fixture
+                .store
+                .renew_handoff_dispatch_if_current(
+                    &fixture.id,
+                    snapshot.generation(),
+                    "owner-b",
+                    fence
+                )
+                .expect("store writes succeed"),
+            "a second worker must not win at iteration {i} either"
+        );
+    }
+    assert_eq!(
+        fixture.store.retention_clock_now(),
+        frozen,
+        "200 operations must not move an authority nobody supplied time to"
+    );
+
+    // One advance of the STORE's clock, and only that, ends the lease.
+    fixture.advance(ASSUMED_LEASE + Duration::from_secs(1));
+    assert!(
+        !fixture
+            .store
+            .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", fence)
+            .expect("store writes succeed"),
+        "the store's own clock is the only thing that can expire the lease"
+    );
+}
+
+/// `B-32 deadline-renew-restart`: renewing a dispatch lease must not extend
+/// the task's retention deadline, and a restart must not reset it.
+///
+/// These are two separate clocks and conflating them would be a real defect:
+/// a worker that renews forever would keep a task alive past its declared
+/// TTL. Source-backed -- `renew_handoff_dispatch_if_current` writes only
+/// `lease.recovery_expires_at` (tasks.rs:3149) and never touches the task's
+/// `expires_at`, which is what `task_retention_deadline_if_current` reports.
+#[test]
+fn b32_deadline_survives_renew_and_restart() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let (snapshot, fence) = fixture.elect("owner-a");
+
+    let deadline_at_start = fixture
+        .store
+        .task_retention_deadline_if_current(&fixture.id, snapshot.generation())
+        .expect("store reads succeed")
+        .expect("a live task has a deadline");
+    let FinalTaskRetentionDeadline::Finite(original) = deadline_at_start else {
+        panic!("a finite ttlMs must give a finite deadline, got {deadline_at_start:?}");
+    };
+
+    // Renew repeatedly, advancing well past a whole lease window in total.
+    for _ in 0..10 {
+        fixture.advance(Duration::from_secs(2));
+        assert!(
+            fixture
+                .store
+                .renew_handoff_dispatch_if_current(
+                    &fixture.id,
+                    snapshot.generation(),
+                    "owner-a",
+                    fence
+                )
+                .expect("store writes succeed"),
+            "renewal within the window succeeds"
+        );
+        let still = fixture
+            .store
+            .task_retention_deadline_if_current(&fixture.id, snapshot.generation())
+            .expect("store reads succeed")
+            .expect("the task is still retained");
+        assert_eq!(
+            still,
+            FinalTaskRetentionDeadline::Finite(original),
+            "renewing the LEASE must not move the TASK's retention deadline"
+        );
+    }
+
+    // RESTART: let the lease lapse, then let a new owner take over. The task's
+    // deadline is a property of the task, not of whoever is currently holding
+    // it, so it must be unchanged across the handover.
+    fixture.advance(ASSUMED_LEASE + Duration::from_secs(1));
+    let after_expiry = fixture.snapshot();
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&after_expiry, "owner-b")
+            .expect("store writes succeed")
+            .is_some(),
+        "a restarted worker picks the task up"
+    );
+    let after_restart = fixture
+        .store
+        .task_retention_deadline_if_current(&fixture.id, after_expiry.generation())
+        .expect("store reads succeed")
+        .expect("the task survived the handover");
+    assert_eq!(
+        after_restart,
+        FinalTaskRetentionDeadline::Finite(original),
+        "a restart must not reset the task's retention deadline"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Frozen IDs
 // ---------------------------------------------------------------------------
@@ -708,6 +848,8 @@ fn task_02_b_positive() {
     b27_lease_renew_then_expire();
     b28_durable_time_authority();
     b29_backend_clock_discontinuity();
+    b30_skewed_worker_time_domains();
+    b32_deadline_survives_renew_and_restart();
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
     b42_duplicate_execution_is_refused();
