@@ -99,12 +99,7 @@ impl AccessToken {
         if let Some(prefix) = leading.get(..6) {
             if prefix.eq_ignore_ascii_case("Bearer") {
                 let rest = &leading[6..];
-                if rest
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_whitespace)
-                    && rest.trim().is_empty()
-                {
+                if rest.chars().next().is_some_and(char::is_whitespace) && rest.trim().is_empty() {
                     return None;
                 }
             }
@@ -343,7 +338,9 @@ mod tests {
 
     #[test]
     fn legacy_in_band_missing_bearer_credential_uses_the_tokenizer_whitespace() {
-        for separator in [" ", "\t", "\r\n", "\u{0085}", "\u{00a0}", "\u{2003}", "\u{3000}"] {
+        for separator in [
+            " ", "\t", "\r\n", "\u{0085}", "\u{00a0}", "\u{2003}", "\u{3000}",
+        ] {
             for scheme in ["Bearer", "bearer", "BeArEr"] {
                 let missing = format!("{scheme}{separator}");
                 assert_eq!(AccessToken::parse_legacy_in_band(&missing), None);
@@ -383,6 +380,39 @@ mod tests {
             let value = format!("Bearer{separator}abc");
             assert!(AccessToken::parse_legacy_in_band(&value).is_some());
             assert_eq!(AccessToken::parse(&value), None);
+        }
+    }
+
+    #[test]
+    fn legacy_unicode_credentials_preserve_part_and_total_byte_bounds() {
+        for token in [
+            "x".repeat(super::MAX_ACCESS_TOKEN_BYTES),
+            "é".repeat(super::MAX_ACCESS_TOKEN_BYTES / "é".len()),
+        ] {
+            assert_eq!(token.len(), super::MAX_ACCESS_TOKEN_BYTES);
+            let padding_bytes = super::MAX_AUTHORIZATION_VALUE_BYTES
+                - "Bearer".len()
+                - "\u{00a0}".len()
+                - token.len();
+            let padding = " ".repeat(padding_bytes);
+            let exact = format!("Bearer{padding}\u{00a0}{token}");
+            assert_eq!(exact.len(), super::MAX_AUTHORIZATION_VALUE_BYTES);
+            let parsed = AccessToken::parse_legacy_in_band(&exact)
+                .expect("exact UTF-8 byte maxima must remain admissible");
+            assert_eq!(parsed.scheme, "Bearer");
+            assert_eq!(parsed.token, token);
+
+            // Change only one delimiter byte: each part still fits, but the
+            // complete input is now over its independent envelope bound.
+            let over_total = format!("Bearer {padding}\u{00a0}{token}");
+            assert_eq!(over_total.len(), super::MAX_AUTHORIZATION_VALUE_BYTES + 1);
+            assert!(AccessToken::parse_legacy_in_band(&over_total).is_none());
+
+            // Conversely, this envelope fits but the credential is one byte
+            // too long. Both bounds must be enforced independently.
+            let over_token = format!("Bearer\u{00a0}{token}x");
+            assert!(over_token.len() < super::MAX_AUTHORIZATION_VALUE_BYTES);
+            assert!(AccessToken::parse_legacy_in_band(&over_token).is_none());
         }
     }
 
