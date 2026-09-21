@@ -138,13 +138,30 @@ async fn resolve_reply(
     input: Box<InputRequiredResult>,
 ) -> Result<ClientCredentialsInputReply, ClientCredentialsInteractionError> {
     // A cancelled request must not even construct an application callback future.
-    ctx.checkpoint().map_err(host_error)?;
+    ctx.checkpoint().map_err(|_| host_cancelled())?;
     check_cx(cx).map_err(host_error)?;
     let input_responses = handler.resolve(ctx, cx, input).await.map_err(host_error)?;
-    ctx.checkpoint().map_err(host_error)?;
+    ctx.checkpoint().map_err(|_| host_cancelled())?;
     check_cx(cx).map_err(host_error)?;
     let (discovery_id, request_id) = next_pair(ids).map_err(host_error)?;
     Ok(ClientCredentialsInputReply { discovery_id, request_id, input_responses })
+}
+
+/// The cancellation disposition, shared by both paths that can reach it.
+///
+/// `McpContext::checkpoint` returns `Result<(), CancelledError>`, so it cannot
+/// route through `host_error`, which consumes an `McpError`. Cancellation is
+/// the only way `checkpoint` fails, which is exactly the branch `host_error`
+/// would have taken, so the two call sites map it here directly.
+///
+/// This mirrors `managed_oauth::interaction::host_cancelled` in shape but not
+/// in type: that one yields `ManagedInteractionError`, this module's error is
+/// `ClientCredentialsInteractionError`, and the cancelled variant is nested one
+/// level deeper. The two cannot share an implementation without a conversion.
+fn host_cancelled() -> ClientCredentialsInteractionError {
+    ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
+        ManagedCoreError::Cancelled,
+    ))
 }
 
 fn host_error(error: McpError) -> ClientCredentialsInteractionError {
