@@ -1519,8 +1519,18 @@ fn b46_ops_readiness_cardinality_is_zero_before_entry() {
          or 'durable work is not readiness' asserts nothing"
     );
 
+    // `fixture.store.clone()`, NOT `Arc::clone(&fixture.store)`. The parameter
+    // is `Arc<dyn FinalTaskStore>`, so the concrete `Arc<InMemoryFinalTaskStore>`
+    // has to unsize at the argument. With the associated-function form the
+    // expected type propagates INTO the call and fixes the turbofish to
+    // `Arc::<dyn FinalTaskStore>::clone`, whose parameter is then
+    // `&Arc<dyn FinalTaskStore>` -- and `&Arc<Concrete>` does not coerce to
+    // that, because unsizing applies to `Arc<Concrete>` and not behind the
+    // outer `&`. Method syntax resolves the receiver independently, returns
+    // `Arc<InMemoryFinalTaskStore>`, and coerces at the argument where it is
+    // legal. Every other call site in the workspace uses the method form.
     let runtime = FinalTaskRuntime::new(
-        Arc::clone(&fixture.store),
+        fixture.store.clone(),
         FinalTaskRuntimeConfig::new(600_000, None).expect("a positive ttl yields a policy"),
         Arc::new(|_| {}),
     );
