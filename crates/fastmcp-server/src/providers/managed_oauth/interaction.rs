@@ -90,8 +90,9 @@ pub enum ManagedOAuthInputResponseMode {
 }
 
 /// Limits apply across the entire forwarded operation, including host pauses.
-/// Request/frame/response/time limits come from `ManagedOAuthProvider::with_limits`;
+/// Request/frame/response/time limits come from the provider's `with_limits`;
 /// this policy never replaces them with a fresh budget for each continuation.
+/// Interactive-login and client-credentials providers share this policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedOAuthInputPolicy {
     capabilities: ManagedOAuthInputCapabilities,
@@ -151,7 +152,13 @@ impl ManagedOAuthInputPolicy {
         self.response_mode
     }
 
-    fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
+    // Share method selection and locally declared capabilities across the two
+    // authentication transports without exposing policy fields or peer overrides.
+    pub(super) fn select_request(self, request: &CoreRequest) -> McpResult<Option<CoreRequest>> {
+        interaction_request(request, self.capabilities)
+    }
+
+    pub(super) fn limits(self, calls: ManagedCoreLimits) -> McpResult<ManagedInteractionLimits> {
         ManagedInteractionLimits::new(
             calls, self.maximum_continuations, self.maximum_input_responses,
         ).map_err(|_| McpError::invalid_params("Invalid managed OAuth input policy"))
@@ -229,7 +236,7 @@ impl CoreBackend for InteractiveBackend {
         id: RequestId, limits: ManagedCoreLimits,
     ) -> BoxFuture<'a, McpResult<FinalCoreResult>> {
         Box::pin(async move {
-            let Some(interactive) = interaction_request(&request, self.policy.capabilities)? else {
+            let Some(interactive) = self.policy.select_request(&request)? else {
                 // completion/complete is not an MRTR method. Configuring a
                 // resolver must not disable the provider's completion handler.
                 return NativeBackend(self.session.clone()).execute(ctx, cx, request, id, limits).await;
@@ -443,8 +450,8 @@ mod tests {
                 assert_eq!(input.request_state(), Some("opaque-state"));
                 match self.action {
                     Action::Decline => return Err(McpError::invalid_params("PRIVATE-HOST-ERROR")),
-                    Action::CancelRequest => ctx.request_cancellation().cancel(),
-                    Action::CancelContext => cx.set_cancel_requested(true),
+                    Action::CancelRequest => { ctx.request_cancellation().cancel(); }
+                    Action::CancelContext => { cx.set_cancel_requested(true); }
                     _ => {},
                 }
                 Ok(if matches!(self.action, Action::StateOnly) { None } else {
