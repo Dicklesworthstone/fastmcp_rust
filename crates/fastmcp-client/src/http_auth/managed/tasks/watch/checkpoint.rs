@@ -29,6 +29,9 @@ use super::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
 };
 
+/// Owner-bound lifecycle records and explicitly protected atomic storage.
+pub mod resume;
+
 /// Hard bound checked before JSON parsing and while encoding a checkpoint.
 pub const MAX_TASK_WATCH_CHECKPOINT_BYTES: usize = 64 * 1024;
 const CHECKPOINT_FORMAT: &str = "fastmcp/task-watch";
