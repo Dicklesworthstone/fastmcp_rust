@@ -4244,4 +4244,61 @@ mod tests {
             panic!("Expected request");
         }
     }
+
+    // RH-5 pair for bd-mcp-fnd-04-b-th72 / commit 4d14db94. The two tests below
+    // are near-identical and differ in ONE dimension: whether the caller's
+    // budget is live. Everything else -- construction, call, and the assertions
+    // on terminal state -- is the same, so any difference in outcome is
+    // attributable to the budget and to nothing else.
+
+    /// POSITIVE: a live budget closes the transport and takes terminal state.
+    #[test]
+    fn async_stdio_close_with_live_budget_takes_terminal_state() {
+        let mut transport = AsyncStdioTransport::new();
+        assert!(!transport.closed, "a fresh transport is not terminal");
+
+        let cx = Cx::for_testing();
+        transport.close(&cx).expect("a live budget must permit the terminal flush");
+
+        assert!(transport.closed, "a permitted close takes terminal state");
+        // Idempotence: the already-closed branch performs no I/O and spends no
+        // budget, so a second close is Ok even though the first consumed one.
+        transport.close(&cx).expect("close is idempotent once terminal");
+    }
+
+    /// PLANTED NEGATIVE: an EXPIRED budget refuses, and -- the point of the
+    /// fix -- leaves the transport NON-TERMINAL so the buffered frame is not
+    /// stranded. Differs from the positive only in the budget.
+    #[test]
+    fn async_stdio_close_with_expired_budget_refuses_and_stays_retryable() {
+        let mut transport = AsyncStdioTransport::new();
+        assert!(!transport.closed, "a fresh transport is not terminal");
+
+        let expired_cx = Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+        );
+        let error = transport
+            .close(&expired_cx)
+            .expect_err("an expired budget must refuse the terminal flush");
+        assert!(
+            matches!(error, TransportError::Timeout | TransportError::Cancelled),
+            "refusal is reported as the caller's budget outcome, got {error:?}"
+        );
+
+        // THE ASSERTION THIS PAIR EXISTS FOR. Before the fix `closed` was set
+        // BEFORE the flush, so a refusal here would have stranded the buffered
+        // frame permanently: the already-closed branch returns Ok WITHOUT
+        // flushing, so no retry could ever emit it.
+        assert!(
+            !transport.closed,
+            "a refused close must leave the transport retryable, not terminal"
+        );
+
+        // And the refusal is attributable to the budget alone: the same
+        // transport closes cleanly once given a live one.
+        let live_cx = Cx::for_testing();
+        transport.close(&live_cx).expect("a retryable transport still closes");
+        assert!(transport.closed, "the retry takes terminal state");
+    }
+
 }
