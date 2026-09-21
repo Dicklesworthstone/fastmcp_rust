@@ -345,6 +345,7 @@ fn interaction_error(error: ManagedInteractionError) -> McpError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use fastmcp_client::http_auth::rpc::ManagedCoreError;
     use fastmcp_core::block_on;
     use fastmcp_protocol::FinalCompletionReference;
 
@@ -506,6 +507,100 @@ mod tests {
             assert_eq!(ids.load(Ordering::SeqCst), 1);
             assert!(!sibling.is_cancel_requested());
         }
+    }
+
+    /// The cancellation checkpoint that follows the host callback, graded by
+    /// variant name rather than by any weaker predicate.
+    ///
+    /// Every path out of `resolve_reply` that reaches cancellation is an
+    /// `Err`, so `is_err()` cannot grade this one. Two stronger-looking
+    /// predicates are also too coarse:
+    ///
+    /// * `AbortedByHost` is the other error this same call can produce, and
+    ///   the planted negative below reaches it by changing one field.
+    /// * `interaction_error(..).code` routes `Core(_)` through
+    ///   `upstream_error`, which maps `Cancelled` **and** `TimedOut` onto one
+    ///   `RequestCancelled` code. The separate test below proves that collapse.
+    ///
+    /// The three state assertions place the failure at the checkpoint after
+    /// the callback rather than at another guard in the same call: the host
+    /// ran exactly once, so both entry guards admitted it; no continuation ID
+    /// was allocated, so the failure precedes `allocate_request_id`; and `cx`
+    /// reports no cancellation request, which is what rules out the `check_cx`
+    /// guard that follows.
+    ///
+    /// That last step is worth stating exactly, because it is the weakest one.
+    /// `Cx::checkpoint` fails on cancellation *or* on budget exhaustion
+    /// (deadline, poll quota, cost), and `check_cx` maps every one of those
+    /// onto this same `Cancelled` variant. So the attribution holds because
+    /// `Cx::for_testing()` arms no budget, not because the variant could
+    /// distinguish the two guards -- it cannot.
+    #[test]
+    fn host_cancelled_requests_fail_the_post_callback_checkpoint_by_variant() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let cx = Cx::for_testing();
+        let ids = AtomicU64::new(7);
+        let host = Host { calls: AtomicUsize::new(0), action: Action::CancelRequest };
+
+        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+
+        assert!(
+            matches!(error, ManagedInteractionError::Core(ManagedCoreError::Cancelled)),
+            "the post-callback checkpoint must yield Core(Cancelled), not {error:?}",
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(!cx.is_cancel_requested());
+        assert_eq!(ids.load(Ordering::SeqCst), 7);
+    }
+
+    /// Planted negative for the test above. Exactly one input differs -- the
+    /// host's `action` -- and exactly one verdict flips: the named variant.
+    ///
+    /// A declining host stops the same call with the same observable state:
+    /// the callback still ran once, `cx` is still uncancelled, and no ID was
+    /// allocated. So every assertion the positive makes about state holds here
+    /// unchanged, and an `is_err()` positive would accept this row as though
+    /// it were the cancellation it exists to prove. Naming the variant is what
+    /// refuses it.
+    #[test]
+    fn host_cancelled_requests_fail_the_post_callback_checkpoint_planted_negative() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let cx = Cx::for_testing();
+        let ids = AtomicU64::new(7);
+        // Only `action` differs from the positive above.
+        let host = Host { calls: AtomicUsize::new(0), action: Action::Decline };
+
+        let error = block_on(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+
+        assert!(
+            matches!(error, ManagedInteractionError::AbortedByHost),
+            "a declining host must be refused as AbortedByHost, not {error:?}",
+        );
+        assert!(!matches!(error, ManagedInteractionError::Core(ManagedCoreError::Cancelled)));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(!cx.is_cancel_requested());
+        assert_eq!(ids.load(Ordering::SeqCst), 7);
+    }
+
+    /// Why the pair above names the variant instead of asserting the converted
+    /// code: `upstream_error` maps two distinct core errors onto one wire code,
+    /// so `interaction_error(..).code == RequestCancelled` cannot separate a
+    /// cancelled interaction from a timed-out one. The `AbortedByHost` row is
+    /// the control -- it proves the converted code does discriminate something,
+    /// so the two equal rows above it are a real collapse and not a converter
+    /// that answers `RequestCancelled` to everything.
+    #[test]
+    fn the_converted_code_cannot_separate_cancelled_from_timed_out() {
+        for variant in [ManagedCoreError::Cancelled, ManagedCoreError::TimedOut] {
+            assert_eq!(
+                interaction_error(ManagedInteractionError::Core(variant)).code,
+                McpErrorCode::RequestCancelled,
+            );
+        }
+        assert_eq!(
+            interaction_error(ManagedInteractionError::AbortedByHost).code,
+            McpErrorCode::InvalidRequest,
+        );
     }
 
     #[test]
