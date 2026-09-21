@@ -93,6 +93,29 @@ const DEADLINE_LANE_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
 /// Bound used for every manifest digest recomputation.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
+/// The frozen SHA-256 of `HTTP_03_A_EVALUATOR_MANIFEST_V1`, and of `..._B_...`.
+///
+/// These exist because the binding below was vacuous without them. Comparing
+/// the producer's published accessor against a local recomputation compares
+/// `sha256(M)` with `sha256(M)`: both accessors are literally
+/// `sha256_bounded(MANIFEST.as_bytes(), 64 * 1024)` over a `concat!` of fixed
+/// string literals, so the assertion held for every possible manifest and would
+/// have kept holding through any edit to one. An external constant is the only
+/// operand in the comparison that the manifest cannot move.
+///
+/// Freezing is sound *here specifically* because neither manifest interpolates
+/// anything: no `env!`, no build stamp, nothing that varies by host, feature or
+/// revision. A manifest that embedded a build-time value could not be frozen
+/// this way and would need a different instrument.
+///
+/// Derived independently of the crate under test - `hashlib.sha256` over the
+/// literals reconstructed from `http_executor.rs` - and agreeing with the same
+/// two values frozen by the A and B producer targets.
+const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
+    "9f68de2cfb47091ee101006cd67405a8764d6dd79781cf2abffabe1c54658818";
+const HTTP_03_B_MANIFEST_DIGEST_HEX: &str =
+    "23fb2f9a13130aea1c80891371979494a116ac978fd78d987de1152b18af7135";
+
 /// The bearer secret used for credential-binding observations. It must never
 /// reach a wire capture or a rendered diagnostic.
 const BEARER_SECRET: &str = "http-03-integration-bearer-secret";
@@ -273,11 +296,34 @@ impl JoinedManifest {
             HTTP_03_B_EVALUATOR_MANIFEST_V1,
         );
 
-        // The published digest must bind the published bytes. A digest that
-        // does not recompute means the two halves of the producer's own
-        // acceptance input have drifted apart.
+        // The published digest must bind the published bytes, AND both must bind
+        // a value neither of them can produce. The round trip alone is
+        // `sha256(M) == sha256(M)` - see HTTP_03_A_MANIFEST_DIGEST_HEX - so the
+        // frozen comparison is the assertion that can actually fail.
         let a_digest = recompute_digest(HTTP_03_A_EVALUATOR_MANIFEST_V1);
         let b_digest = recompute_digest(HTTP_03_B_EVALUATOR_MANIFEST_V1);
+        assert_eq!(
+            render_digest(&a_digest),
+            HTTP_03_A_MANIFEST_DIGEST_HEX,
+            "implementation A's manifest bytes changed: the ordered union below is being \
+             joined from a different acceptance input than the one this file was written against"
+        );
+        assert_eq!(
+            render_digest(&b_digest),
+            HTTP_03_B_MANIFEST_DIGEST_HEX,
+            "implementation B's manifest bytes changed: the ordered union below is being \
+             joined from a different acceptance input than the one this file was written against"
+        );
+        assert_eq!(
+            render_digest(&http_03_a_manifest_digest()),
+            HTTP_03_A_MANIFEST_DIGEST_HEX,
+            "implementation A's published accessor must return the frozen manifest digest"
+        );
+        assert_eq!(
+            render_digest(&http_03_b_manifest_digest()),
+            HTTP_03_B_MANIFEST_DIGEST_HEX,
+            "implementation B's published accessor must return the frozen manifest digest"
+        );
         assert_eq!(
             http_03_a_manifest_digest().as_bytes(),
             a_digest.as_bytes(),
@@ -3319,8 +3365,9 @@ fn http_03_i_positive() {
     // The behavioural proof that the recorded regime is the one in force lives
     // in HTTP-03.15, which only reaches `executor::Timeout(Idle)` if the armed
     // idle bound genuinely expires against a held-open, silent peer.
-    assert_eq!(receipt.a_digest.len(), 64);
-    assert_eq!(receipt.b_digest.len(), 64);
+    // Previously `.len() == 64`, which every hex string of any content passes.
+    assert_eq!(receipt.a_digest, HTTP_03_A_MANIFEST_DIGEST_HEX);
+    assert_eq!(receipt.b_digest, HTTP_03_B_MANIFEST_DIGEST_HEX);
     assert_ne!(receipt.a_digest, receipt.b_digest);
     assert!(!receipt.producer_a_revision.is_empty());
     assert!(!receipt.producer_a_tree.is_empty());
