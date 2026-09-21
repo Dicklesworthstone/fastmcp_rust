@@ -7044,6 +7044,12 @@ impl BoundHttpServer {
                             expire_live_modern_http_sessions(&reaper_sessions);
                         }
                     }
+                    // Nothing follows the loop, so 45 should be immediate after 44.
+                    // If 44 fires and 45 does not, the task body itself is not
+                    // finishing; if 45 fires and the join still parks, the stall is
+                    // in join/teardown rather than anywhere in this closure.
+                    #[cfg(test)]
+                    lib_unit_tests::record_f2ndd_reaper_stage(45);
                 })
                 .map_err(|error| {
                     McpError::internal_error(format!(
@@ -43370,7 +43376,8 @@ mod lib_unit_tests {
                         41 => " REAPER entered but never reached its first sleep",
                         42 => " REAPER PARKED IN sleep() AND NEVER RETURNED -- checkpoint() was NEVER EVALUATED, so the short-chunk mitigation never ran; this is a sleep that does not wake, not a cancellation that is not observed",
                         43 => " REAPER completed a sleep but checkpoint() returned Ok despite the abort -- the mitigation ran and did not see cancellation",
-                        _ => " REAPER observed cancellation and broke; the join is parked on something other than the loop",
+                        44 => " REAPER broke out of its loop but its TASK BODY NEVER FINISHED -- nothing follows the loop, so this would itself be a finding",
+                        _ => " REAPER ran to completion (task body finished) and the join STILL parked -- the stall is in join/teardown, not in the loop",
                     }
                 )
             })?;
