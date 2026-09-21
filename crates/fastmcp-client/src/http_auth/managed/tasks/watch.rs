@@ -20,12 +20,16 @@ use fastmcp_protocol::{CoreRequest, RequestId, SubscriptionFilter};
 
 use super::{
     BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
-    ManagedTasksClient, ManagedTasksError, OAuthSessionError, deadline_after,
+    ManagedTasksClient, ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError,
+    deadline_after, prepare,
 };
 use super::super::subscriptions::{
     ManagedSubscription, ManagedSubscriptionError, ManagedSubscriptionEvent,
     ManagedSubscriptionLimits,
 };
+
+/// Host-approved input resolution over a credential-pinned Task watch.
+pub mod drive;
 
 const MAX_WATCH_TASKS: usize = 128;
 const MAX_SELECTION_BYTES: usize = 64 * 1024;
@@ -242,6 +246,16 @@ impl ManagedTaskWatch {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ManagedTaskSnapshot>, ManagedTaskWatchError> {
+        self.next_snapshot_with_credential(cx, None).await
+    }
+
+    // Input-driving watches pin the original listen credential; observation-only
+    // callers retain the existing per-get credential acquisition behavior.
+    async fn next_snapshot_with_credential(
+        &mut self,
+        cx: &Cx,
+        credential: Option<&OAuthCredentialSnapshot>,
+    ) -> Result<Option<ManagedTaskSnapshot>, ManagedTaskWatchError> {
         if self.finished { return Ok(None); }
         // Transfer custody before the first await. Error/drop does not put this
         // response back into the watch, even while reconciling an initial get.
@@ -249,7 +263,8 @@ impl ManagedTaskWatch {
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
+        let expiry = credential.map(|credential| credential.expires_at);
+        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, expiry, async {
             Ok(async {
                 let (task_id, cause) = match self.state.initial.pop_front() {
                     Some(id) => (id, ManagedTaskSnapshotCause::Initial),
@@ -273,9 +288,19 @@ impl ManagedTaskWatch {
                 };
                 self.state.reserve_snapshot()?;
                 let ids = self.ids.next_pair()?;
-                let mut call = client.request_with_cancellation(
-                    cx, &cancellation, ids, ManagedTaskRequest::Get(task_id),
-                ).await?;
+                let mut call = match credential {
+                    Some(credential) => {
+                        let prepared = prepare(client.session.resource().as_str(), &client.metadata,
+                            &ids.operation, ManagedTaskRequest::Get(task_id), client.limits)?;
+                        let round = client.prepare_round(ids, prepared)?;
+                        let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
+                        client.execute_round(cx, &cancellation, round, credential,
+                            call_deadline, client.limits.records).await?
+                    }
+                    None => client.request_with_cancellation(
+                        cx, &cancellation, ids, ManagedTaskRequest::Get(task_id),
+                    ).await?,
+                };
                 let Some(ManagedTaskEvent::Snapshot(result)) = call.next_event(cx).await? else {
                     return Err(ManagedTaskWatchError::UnexpectedEvent);
                 };
@@ -283,6 +308,9 @@ impl ManagedTaskWatch {
             }.await)
         })).await??;
         client.session.check(cx, &cancellation)?;
+        if expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
+            return Err(OAuthSessionError::LoginRequired.into());
+        }
         if cx.now() >= deadline {
             return Err(OAuthSessionError::TimedOut.into());
         }
