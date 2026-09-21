@@ -176,8 +176,24 @@ def main():
         return 0
 
     closeable = [r for r in rows if r["disposition"] == "CLOSEABLE"]
+    # Finished work that reads as backlog: every criterion ticked, held only by
+    # graph edges, and still sitting at status `open`. `br ready` is not fooled
+    # -- it filters on blockers regardless of status -- but a human scanning raw
+    # status sees `open` and reads "not begun". That is a reporting hazard in
+    # the direction that makes a campaign look less done than it is, so it gets
+    # its own line rather than being inferred from the table.
+    hidden = [
+        r for r in rows
+        if r["ticked"] == r["criteria"]
+        and r["open_blockers"]
+        and r["status"] == "open"
+    ]
     print(f"fully-ticked, non-closed beads examined: {len(rows)}")
-    print(f"actually closeable today: {len(closeable)}\n")
+    print(f"actually closeable today: {len(closeable)}")
+    print(f"COMPLETE BUT READS AS BACKLOG (100% ticked, graph-blocked, status=open): {len(hidden)}")
+    for r in hidden:
+        print(f"    {r['id']:<48} {r['ticked']}/{r['criteria']}  blockers={r['open_blockers']}")
+    print()
     for row in rows:
         flag = " MULTI-SECTION" if row["sections"] > 1 else ""
         print(
