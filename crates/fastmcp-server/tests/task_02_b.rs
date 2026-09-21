@@ -31,7 +31,7 @@
 //! | `B-29 backend-clock-discontinuity`   | covered -- narrow; see the test's own scope note |
 //! | `B-30 skewed-worker-time-domains`    | covered |
 //! | `B-32 deadline-renew-restart`        | covered |
-//! | `B-31 private-update-revision-order` | PARTIAL: stale-generation refusal only. Ordering across concurrent writers is not asserted. |
+//! | `B-31 private-update-revision-order` | covered -- stale-generation refusal AND the ordering chain |
 //! | `B-34 restore-write-contract`        | covered |
 //! | `B-35 third-party-backend-conformance` | covered -- required surface only |
 //! | `B-42 duplicate-execution-idempotency` | covered |
@@ -46,7 +46,18 @@
 //! tests, one lease-window guard, and the two frozen IDs. This file has been
 //! miscounted three times by three different methods -- 13 by mention count,
 //! 18 by a mixed regex, and 13-of-23 by reading the outcome total as a group
-//! total. The group figure is the number of `fn bNN_*` definitions.
+//! total.
+//!
+//! THE GROUP FIGURE IS THE NUMBER OF DISTINCT `bNN` PREFIXES, NOT THE NUMBER
+//! OF `fn bNN_*` DEFINITIONS. Those were the same number until B-31 acquired
+//! a second test for its ordering half, and an earlier version of this note
+//! said "definitions" -- which now over-counts by one. The canonical
+//! expression:
+//!
+//!     grep -oE '^fn (b[0-9]+)_' file | sort -u | wc -l
+//!
+//! A group may hold more than one test when its halves are independently
+//! meaningful; that is a feature of the coverage, not extra coverage.
 //!
 //! Of those thirteen, EIGHT are blocked on capability the shipped store does
 //! not have and cannot be closed by writing tests: B-25 and B-33
@@ -582,7 +593,111 @@ fn b28_durable_time_authority() {
     );
 }
 
-/// `B-31 private-update-revision-order`, stale-generation half only.
+/// Builds a `working` replacement for TASK carrying a distinguishable stamp.
+fn stamped_replacement(stamp: &str) -> (Task, TaskStatusNotification) {
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "taskId": TASK,
+        "status": "working",
+        "createdAt": "2026-07-28T12:00:00.000Z",
+        "lastUpdatedAt": stamp,
+        "ttlMs": 600_000
+    }))
+    .expect("a well-formed stamped replacement");
+    let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
+        task: task.clone(),
+        meta: None,
+        additional: std::collections::BTreeMap::default(),
+    });
+    (task, notification)
+}
+
+/// `B-31 private-update-revision-order`, ORDERING half: applied writes form a
+/// chain, and a writer may only extend the head of it.
+///
+/// This is the property that makes concurrent writers safe without locks.
+/// Distinct from `B-24`, which is the SAME writer retrying an ambiguous
+/// commit; here two different writers race from the same read, and the
+/// question is whether the store admits an interleaving.
+///
+/// Source-backed: every applied replace allocates a fresh generation
+/// (tasks.rs:3646) and the CAS compares against the CURRENT one
+/// (tasks.rs:2542), so an expectation more than one step behind is as dead as
+/// one exactly one step behind -- there is no "catch up" path.
+#[test]
+fn b31_revision_order_is_a_chain() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let g0 = fixture.snapshot();
+
+    // TWO WRITERS READ THE SAME STATE. Both hold g0.
+    let writer_a = g0.clone();
+    let writer_b = g0.clone();
+
+    // Writer A wins the race.
+    let (task_a, notif_a) = stamped_replacement("2026-07-28T12:01:00.000Z");
+    assert!(
+        fixture
+            .store
+            .replace_task_if_current(&writer_a, task_a, notif_a)
+            .expect("store writes succeed"),
+        "the first writer at the head extends the chain"
+    );
+    let g1 = fixture.snapshot();
+    assert_ne!(g1.generation(), g0.generation(), "the head moved");
+
+    // Writer B loses, with the read it actually made. Its write does not
+    // interleave and does not overwrite A's.
+    let (task_b, notif_b) = stamped_replacement("2026-07-28T12:02:00.000Z");
+    assert!(
+        !fixture
+            .store
+            .replace_task_if_current(&writer_b, task_b, notif_b)
+            .expect("store writes succeed"),
+        "a writer racing from a superseded read must lose, not interleave"
+    );
+    assert_eq!(
+        fixture.task_wire_form()["lastUpdatedAt"],
+        "2026-07-28T12:01:00.000Z",
+        "the loser must not have overwritten the winner"
+    );
+
+    // Writer B re-reads and extends the new head. This is the only way
+    // forward, and it works.
+    let (task_b2, notif_b2) = stamped_replacement("2026-07-28T12:03:00.000Z");
+    assert!(
+        fixture
+            .store
+            .replace_task_if_current(&g1, task_b2, notif_b2)
+            .expect("store writes succeed"),
+        "a writer that re-reads the head may extend it"
+    );
+    let g2 = fixture.snapshot();
+    assert_eq!(
+        fixture.task_wire_form()["lastUpdatedAt"],
+        "2026-07-28T12:03:00.000Z",
+        "the re-read write applied"
+    );
+
+    // THE CHAIN PROPERTY: three distinct generations, and NO expectation from
+    // anywhere behind the head is usable. Two steps back is as dead as one --
+    // there is no catch-up path a stale writer could find.
+    assert_ne!(g2.generation(), g1.generation());
+    assert_ne!(g2.generation(), g0.generation());
+    let (stale, stale_notif) = stamped_replacement("2026-07-28T12:04:00.000Z");
+    assert!(
+        !fixture
+            .store
+            .replace_task_if_current(&g0, stale, stale_notif)
+            .expect("store writes succeed"),
+        "an expectation two generations behind the head must also be refused"
+    );
+    assert_eq!(
+        fixture.snapshot().generation(),
+        g2.generation(),
+        "the refused stale write consumed no generation"
+    );
+}
+
+/// `B-31 private-update-revision-order`, stale-generation half.
 #[test]
 fn b31_stale_generation_is_refused() {
     let fixture = Fixture::new(TASK, 600_000);
@@ -1303,6 +1418,7 @@ fn task_02_b_positive() {
     b32_deadline_survives_renew_and_restart();
     b24_persist_ambiguous_commit();
     b35_third_party_backend_conformance();
+    b31_revision_order_is_a_chain();
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
     b42_duplicate_execution_is_refused();
