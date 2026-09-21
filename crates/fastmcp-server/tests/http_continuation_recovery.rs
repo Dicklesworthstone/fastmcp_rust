@@ -7,6 +7,9 @@
 #![cfg(all(feature = "proxy", feature = "native-tls-roots"))]
 #![recursion_limit = "256"]
 
+#[path = "http_continuation_recovery/managed_provider.rs"]
+mod managed_provider;
+
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::io::Write;
@@ -294,7 +297,7 @@ async fn lose(peer:&Peer,cx:&Cx,pending:&mut RecoverableManagedContinuation,id:i
 }
 
 #[derive(Clone,Copy)]
-enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint }
+enum Case { Head, Body, Successor, NoJournal, Cancel, CloseOwner, Bytes, Attempts, Abandon, Endpoint, Provider(managed_provider::Case) }
 fn isolated(name:&str,case:Case) {
     if let Ok(selected)=std::env::var(CHILD) {assert_eq!(selected,name);run(case);return;}
     struct Root(std::path::PathBuf);
@@ -322,6 +325,10 @@ fn run(case:Case) {
         });
 }
 async fn scenario(cx:Cx,case:Case) {
+    if let Case::Provider(selected) = case {
+        managed_provider::scenario(cx, selected).await;
+        return;
+    }
     let peer=Peer::new(&cx,!matches!(case,Case::NoJournal)).await;
     let ((),session)=pair(peer.login(),ManagedOAuthSession::authorize(&cx,peer.client(),OAuthSessionPolicy::default(),browser)).await;
     let session=session.unwrap();

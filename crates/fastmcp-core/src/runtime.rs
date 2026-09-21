@@ -39,7 +39,7 @@
 /// Process-bound authenticated encryption for ephemeral protected state.
 pub mod envelope;
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::fmt;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -350,15 +350,19 @@ impl ProcessGenerationGuard {
     ///
     /// Installation is idempotent within a process image: the first caller
     /// draws the nonce and every later caller observes the same generation.
+    /// An inherited guard is verified before it can be returned to a caller.
     ///
     /// # Errors
     ///
     /// Returns [`ProcessGenerationError::EntropyUnavailable`] when the
     /// operating-system entropy source refuses the nonce draw. The guard is
     /// not installed in that case, so process-local state stays unusable
-    /// rather than falling back to a predictable nonce.
+    /// rather than falling back to a predictable nonce. Returns
+    /// [`ProcessGenerationError::ForkDetected`] if the installed generation
+    /// belongs to another process.
     pub fn install() -> Result<&'static Self, ProcessGenerationError> {
         if let Some(existing) = GUARD.get() {
+            existing.verify_current()?;
             return Ok(existing);
         }
         let nonce =
@@ -370,9 +374,11 @@ impl ProcessGenerationGuard {
                 generation: 0,
             },
         };
-        // A racing installer may win; its generation is equally valid and
-        // becomes the one every resource in this image is bound to.
-        Ok(GUARD.get_or_init(|| candidate))
+        // A racing installer may win; verify the published generation, not
+        // merely the candidate, before making its authority available.
+        let installed = GUARD.get_or_init(|| candidate);
+        installed.verify_current()?;
+        Ok(installed)
     }
 
     /// Returns the installed guard, or `None` when nothing has installed one.
@@ -449,6 +455,29 @@ thread_local! {
     /// concurrent blocking adapters can couple an adapter to a reactor being
     /// driven by another thread and starve sibling tasks on that runtime.
     static RUNTIME: OnceCell<Runtime> = const { OnceCell::new() };
+    static BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Keeps reentrancy rejection unwind-safe without holding a TLS borrow while
+/// user code is polled. A rejected nested entry must not reset the outer entry.
+struct BridgeEntry;
+
+impl BridgeEntry {
+    fn enter() -> Self {
+        BRIDGE_ACTIVE.with(|active| {
+            assert!(
+                !active.replace(true),
+                "nested fastmcp_core::runtime::block_on is not supported"
+            );
+        });
+        Self
+    }
+}
+
+impl Drop for BridgeEntry {
+    fn drop(&mut self) {
+        BRIDGE_ACTIVE.with(|active| active.set(false));
+    }
 }
 
 /// Blocks the current thread on the provided future.
@@ -461,24 +490,25 @@ thread_local! {
 /// Because we attach the reactor via [`RuntimeBuilder::with_reactor`], that
 /// ambient `Cx`'s I/O driver is backed by the calling thread's reactor.
 ///
+/// The process-generation guard is installed before the first runtime is
+/// created, including when the caller has not initialized any other FastMCP
+/// state. Subsequent calls verify that same generation before touching TLS.
+///
 /// # Panics
 ///
-/// Panics when a [`ProcessGenerationGuard`] is installed and this call is
-/// running in a different process generation than the one that installed it —
-/// that is, in a child of a post-initialization `fork()`. Driving an inherited
-/// runtime, reactor, and blocking pool from such a child is the unsupported
-/// configuration the guard exists to stop, and there is no return value here
-/// through which the refusal could be reported instead. A process that has not
-/// installed a guard is unaffected.
+/// Panics if the process-generation guard cannot be installed or verified,
+/// including in a child of a post-initialization `fork()`. Also panics on
+/// recursive calls on the same thread: an already-running current-thread
+/// executor cannot safely be driven recursively. Both normal completion and
+/// unwinding release the entry so that later independent calls remain usable.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    // The guard is checked before the thread-local runtime is touched, so a
-    // forked child never reaches `get_or_init` and never inherits a reactor
-    // or blocking pool minted in the parent generation.
-    if let Some(guard) = ProcessGenerationGuard::installed() {
-        if let Err(error) = guard.verify_current() {
-            panic!("refusing to drive a FastMCP runtime across a process generation: {error}");
-        }
-    }
+    // Installation is mandatory, not conditional on another subsystem having
+    // installed a guard. Otherwise the first bridge could mint a reactor and
+    // blocking pool with no generation record for a forked child to reject.
+    ProcessGenerationGuard::install().unwrap_or_else(|error| {
+        panic!("refusing to drive a FastMCP runtime across a process generation: {error}")
+    });
+    let _entry = BridgeEntry::enter();
 
     RUNTIME.with(|runtime| {
         let runtime = runtime.get_or_init(|| {
@@ -513,7 +543,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
-    use super::block_on;
+    use super::{ProcessGenerationGuard, block_on};
 
     #[test]
     fn block_on_runs_async_blocks() {
@@ -527,5 +557,78 @@ mod tests {
         let b = block_on(async { "b" });
         assert_eq!(a, "a");
         assert_eq!(b, "b");
+    }
+
+    #[test]
+    fn block_on_installs_guard_before_polling() {
+        const CHILD: &str = "FASTMCP_TEST_BRIDGE_FIRST_ENTRY";
+        // The global guard cannot be uninstalled. Run only this test in a
+        // fresh process to prove initialization order independently of the
+        // parallel test harness and all other guard users.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::block_on_installs_guard_before_polling",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh-process bridge test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(ProcessGenerationGuard::installed().is_none());
+        let generation = block_on(async {
+            let guard = ProcessGenerationGuard::installed()
+                .expect("the guard must exist before user code is polled");
+            guard.verify_current().unwrap();
+            guard.generation()
+        });
+        assert_eq!(generation.pid(), std::process::id());
+        assert_eq!(ProcessGenerationGuard::install().unwrap().generation(), generation);
+    }
+
+    #[test]
+    fn nested_bridge_is_rejected_without_poisoning_outer_entry() {
+        block_on(async {
+            for _ in 0..2 {
+                let error = std::panic::catch_unwind(|| block_on(async { 1 }));
+                assert!(error.is_err(), "each nested entry must be rejected");
+            }
+        });
+        assert_eq!(block_on(async { 7 }), 7);
+    }
+
+    #[test]
+    fn bridge_entry_is_released_when_the_future_panics() {
+        let error = std::panic::catch_unwind(|| {
+            block_on(async { panic!("bridge test panic") });
+        });
+        assert!(error.is_err());
+        assert_eq!(block_on(async { 11 }), 11);
+    }
+
+    #[test]
+    fn guard_install_is_idempotent_across_threads() {
+        let expected = ProcessGenerationGuard::install().unwrap().generation();
+        let installers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let guard = ProcessGenerationGuard::install().unwrap();
+                    guard.verify_current().unwrap();
+                    guard.generation()
+                })
+            })
+            .collect();
+        for installer in installers {
+            assert_eq!(installer.join().unwrap(), expected);
+        }
     }
 }

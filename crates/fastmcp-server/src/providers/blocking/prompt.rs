@@ -7,7 +7,9 @@ use std::time::Duration;
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
-use fastmcp_protocol::{CompleteResult, FinalGetPromptResult, FinalPrompt, Icon, Prompt, PromptMessage};
+use fastmcp_protocol::{
+    CompleteResult, FinalGetPromptResult, FinalPrompt, Icon, Prompt, PromptMessage,
+};
 
 use super::{BlockingHandlerLane, outcome};
 use crate::bidirectional::MrtrCompletedInputs;
@@ -37,39 +39,63 @@ impl<H: PromptHandler + 'static> BlockingPrompt<H> {
         if handler.declares_final_mrtr() {
             return Err(no_resume());
         }
-        Ok(Self { handler: Arc::new(handler), lane })
+        Ok(Self {
+            handler: Arc::new(handler),
+            lane,
+        })
     }
 
     fn legacy<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            outcome(self.lane.execute(ctx, cx, move |ctx| handler.get(ctx, arguments)).await)
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| handler.get(ctx, arguments))
+                    .await,
+            )
         })
     }
 
     fn complete<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            outcome(self.lane.execute(ctx, cx, move |ctx| handler.get_final(ctx, arguments)).await)
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| handler.get_final(ctx, arguments))
+                    .await,
+            )
         })
     }
 
     fn final_outcome<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         let handler = Arc::clone(&self.handler);
         Box::pin(async move {
-            outcome(self.lane.execute(ctx, cx, move |ctx| {
-                let result = handler.get_final_outcome(ctx, arguments)?;
-                match result {
-                    FinalMethodOutcome::Complete(_) => Ok(result),
-                    FinalMethodOutcome::InputRequired(_) => Err(no_resume()),
-                }
-            }).await)
+            outcome(
+                self.lane
+                    .execute(ctx, cx, move |ctx| {
+                        let result = handler.get_final_outcome(ctx, arguments)?;
+                        match result {
+                            FinalMethodOutcome::Complete(_) => Ok(result),
+                            FinalMethodOutcome::InputRequired(_) => Err(no_resume()),
+                        }
+                    })
+                    .await,
+            )
         })
     }
 }
@@ -79,52 +105,96 @@ fn no_resume() -> McpError {
 }
 
 impl<H: PromptHandler + 'static> PromptHandler for BlockingPrompt<H> {
-    fn definition(&self) -> Prompt { self.handler.definition() }
-    fn final_definition(&self) -> Option<FinalPrompt> { self.handler.final_definition() }
-    fn final_client_direct_https(&self) -> bool { self.handler.final_client_direct_https() }
-    fn final_title(&self) -> Option<&str> { self.handler.final_title() }
-    fn final_icons(&self) -> Option<&[RawIcon]> { self.handler.final_icons() }
-    fn final_metadata(&self) -> Option<&OpenMetadata> { self.handler.final_metadata() }
-    fn icon(&self) -> Option<&Icon> { self.handler.icon() }
-    fn version(&self) -> Option<&str> { self.handler.version() }
-    fn tags(&self) -> &[String] { self.handler.tags() }
-    fn timeout(&self) -> Option<Duration> { self.handler.timeout() }
+    fn definition(&self) -> Prompt {
+        self.handler.definition()
+    }
+    fn final_definition(&self) -> Option<FinalPrompt> {
+        self.handler.final_definition()
+    }
+    fn final_client_direct_https(&self) -> bool {
+        self.handler.final_client_direct_https()
+    }
+    fn final_title(&self) -> Option<&str> {
+        self.handler.final_title()
+    }
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.handler.final_icons()
+    }
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.handler.final_metadata()
+    }
+    fn icon(&self) -> Option<&Icon> {
+        self.handler.icon()
+    }
+    fn version(&self) -> Option<&str> {
+        self.handler.version()
+    }
+    fn tags(&self) -> &[String] {
+        self.handler.tags()
+    }
+    fn timeout(&self) -> Option<Duration> {
+        self.handler.timeout()
+    }
 
-    fn get(&self, _ctx: &McpContext, _arguments: HashMap<String, String>) -> McpResult<Vec<PromptMessage>> {
-        Err(McpError::invalid_request("blocking prompt requires asynchronous caller-owned dispatch"))
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Err(McpError::invalid_request(
+            "blocking prompt requires asynchronous caller-owned dispatch",
+        ))
     }
     fn get_async<'a>(
-        &'a self, ctx: &'a McpContext, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.legacy(ctx, ctx.cx(), arguments)
     }
     fn get_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.legacy(ctx, cx, arguments)
     }
     fn get_final_async<'a>(
-        &'a self, ctx: &'a McpContext, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         self.complete(ctx, ctx.cx(), arguments)
     }
     fn get_final_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalGetPromptResult>>> {
         self.complete(ctx, cx, arguments)
     }
     fn get_final_outcome_async<'a>(
-        &'a self, ctx: &'a McpContext, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         self.final_outcome(ctx, ctx.cx(), arguments)
     }
     fn get_final_outcome_async_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         self.final_outcome(ctx, cx, arguments)
     }
     fn get_final_outcome_async_resuming_in_request<'a>(
-        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: HashMap<String, String>,
+        &'a self,
+        ctx: &'a McpContext,
+        cx: &'a Cx,
+        arguments: HashMap<String, String>,
         resume: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
         if resume.is_some() {
@@ -137,12 +207,12 @@ impl<H: PromptHandler + 'static> PromptHandler for BlockingPrompt<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{
         ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta,
     };
-    use fastmcp_protocol::protocol_policy::ProtocolEra;
     use serde_json::json;
+    use std::sync::Mutex;
 
     type Calls = Arc<Mutex<Vec<(&'static str, HashMap<String, String>)>>>;
     struct Renderer {
@@ -152,13 +222,24 @@ mod tests {
         asks_input: bool,
     }
     fn definition() -> Prompt {
-        Prompt { name: "render".into(), description: Some("Renderer".into()),
-            arguments: vec![], icon: None, version: None, tags: vec![] }
+        Prompt {
+            name: "render".into(),
+            description: Some("Renderer".into()),
+            arguments: vec![],
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
     }
     fn request() -> CoreRequest {
-        CoreRequest::decode(ProtocolEra::Modern2026, "prompts/get", Some(&json!({
-            "name":"render", "_meta":FinalRequestMeta::new(ClientCapabilities::default())
-        }))).unwrap()
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "prompts/get",
+            Some(&json!({
+                "name":"render", "_meta":FinalRequestMeta::new(ClientCapabilities::default())
+            })),
+        )
+        .unwrap()
     }
     fn final_result() -> CompleteResult<FinalGetPromptResult> {
         let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = request().decode_result(r#"{
@@ -169,7 +250,12 @@ mod tests {
         result
     }
     fn encode(result: CompleteResult<FinalGetPromptResult>) -> String {
-        CoreResult::Final(FinalCoreResult::PromptsGet { result, diagnostic: None }).encode().unwrap()
+        CoreResult::Final(FinalCoreResult::PromptsGet {
+            result,
+            diagnostic: None,
+        })
+        .encode()
+        .unwrap()
     }
     impl Renderer {
         fn record(&self, ctx: &McpContext, hook: &'static str, arguments: HashMap<String, String>) {
@@ -180,49 +266,90 @@ mod tests {
         }
     }
     impl PromptHandler for Renderer {
-        fn definition(&self) -> Prompt { definition() }
-        fn declares_final_mrtr(&self) -> bool { self.resuming }
-        fn final_client_direct_https(&self) -> bool { true }
-        fn timeout(&self) -> Option<Duration> { Some(Duration::from_secs(3)) }
+        fn definition(&self) -> Prompt {
+            definition()
+        }
+        fn declares_final_mrtr(&self) -> bool {
+            self.resuming
+        }
+        fn final_client_direct_https(&self) -> bool {
+            true
+        }
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(3))
+        }
         fn final_definition(&self) -> Option<FinalPrompt> {
             Some(serde_json::from_value(json!({"name":"render","title":"Complete catalog",
                 "arguments":[{"name":"body","title":"Body","required":true},{"name":"style","title":"Style"}],
                 "_meta":{"com.example/prompt":true}})).unwrap())
         }
-        fn get(&self, ctx: &McpContext, arguments: HashMap<String, String>) -> McpResult<Vec<PromptMessage>> {
+        fn get(
+            &self,
+            ctx: &McpContext,
+            arguments: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
             self.record(ctx, "legacy", arguments);
-            Ok(vec![serde_json::from_value(json!({"role":"user","content":{"type":"text","text":"legacy-rendered"}})).unwrap()])
+            Ok(vec![
+                serde_json::from_value(
+                    json!({"role":"user","content":{"type":"text","text":"legacy-rendered"}}),
+                )
+                .unwrap(),
+            ])
         }
-        fn get_final(&self, ctx: &McpContext, arguments: HashMap<String, String>)
-            -> McpResult<CompleteResult<FinalGetPromptResult>>
-        {
+        fn get_final(
+            &self,
+            ctx: &McpContext,
+            arguments: HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
             self.record(ctx, "final", arguments);
             Ok(final_result())
         }
-        fn get_final_outcome(&self, ctx: &McpContext, arguments: HashMap<String, String>)
-            -> McpResult<FinalMethodOutcome<FinalGetPromptResult>>
-        {
+        fn get_final_outcome(
+            &self,
+            ctx: &McpContext,
+            arguments: HashMap<String, String>,
+        ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
             if self.asks_input {
                 self.record(ctx, "input", arguments);
-                let CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) = request()
-                    .decode_result(r#"{"resultType":"input_required","requestState":"opaque"}"#).unwrap()
-                    else { panic!("input-required fixture") };
+                let CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) =
+                    request()
+                        .decode_result(r#"{"resultType":"input_required","requestState":"opaque"}"#)
+                        .unwrap()
+                else {
+                    panic!("input-required fixture")
+                };
                 return Ok(FinalMethodOutcome::InputRequired(result));
             }
-            self.get_final(ctx, arguments).map(FinalMethodOutcome::Complete)
+            self.get_final(ctx, arguments)
+                .map(FinalMethodOutcome::Complete)
         }
     }
     fn runtime(pool: bool) -> asupersync::runtime::Runtime {
         let builder = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap());
-        if pool { builder.blocking_threads(0, 2).build().unwrap() } else { builder.build().unwrap() }
+        if pool {
+            builder.blocking_threads(0, 2).build().unwrap()
+        } else {
+            builder.build().unwrap()
+        }
     }
     fn renderer() -> (Renderer, Calls) {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        (Renderer { calls: Arc::clone(&calls), poller: std::thread::current().id(), resuming: false, asks_input: false }, calls)
+        (
+            Renderer {
+                calls: Arc::clone(&calls),
+                poller: std::thread::current().id(),
+                resuming: false,
+                asks_input: false,
+            },
+            calls,
+        )
     }
     fn arguments() -> HashMap<String, String> {
-        HashMap::from([("body".into(), "Unicode: 日本語\n{not metadata}".into()), ("_meta".into(), "ordinary data".into())])
+        HashMap::from([
+            ("body".into(), "Unicode: 日本語\n{not metadata}".into()),
+            ("_meta".into(), "ordinary data".into()),
+        ])
     }
 
     #[test]
@@ -237,12 +364,24 @@ mod tests {
             assert!(prompt.get_final(&ctx, arguments()).is_err());
             assert!(prompt.get_final_outcome(&ctx, arguments()).is_err());
             assert!(calls.lock().unwrap().is_empty());
-            for result in [prompt.get_async(&ctx, arguments()).await,
-                prompt.get_async_in_request(&ctx, ctx.cx(), arguments()).await] {
-                let Outcome::Ok(messages) = result else { panic!("legacy prompt must render") };
-                assert_eq!(serde_json::to_value(messages).unwrap()[0]["content"]["text"], "legacy-rendered");
+            for result in [
+                prompt.get_async(&ctx, arguments()).await,
+                prompt
+                    .get_async_in_request(&ctx, ctx.cx(), arguments())
+                    .await,
+            ] {
+                let Outcome::Ok(messages) = result else {
+                    panic!("legacy prompt must render")
+                };
+                assert_eq!(
+                    serde_json::to_value(messages).unwrap()[0]["content"]["text"],
+                    "legacy-rendered"
+                );
             }
-            assert_eq!(calls.lock().unwrap().as_slice(), &[("legacy", arguments()), ("legacy", arguments())]);
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[("legacy", arguments()), ("legacy", arguments())]
+            );
             assert_eq!(lane.in_flight().unwrap(), 0);
         });
     }
@@ -252,29 +391,50 @@ mod tests {
         runtime(true).block_on(async {
             let ctx = McpContext::new(Cx::current().unwrap(), 83);
             let (handler, calls) = renderer();
-            let prompt = BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap()).unwrap();
+            let prompt =
+                BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap())
+                    .unwrap();
             let expected = encode(final_result());
-            for result in [prompt.get_final_async(&ctx, arguments()).await,
-                prompt.get_final_async_in_request(&ctx, ctx.cx(), arguments()).await] {
-                let Outcome::Ok(result) = result else { panic!("final result expected") };
+            for result in [
+                prompt.get_final_async(&ctx, arguments()).await,
+                prompt
+                    .get_final_async_in_request(&ctx, ctx.cx(), arguments())
+                    .await,
+            ] {
+                let Outcome::Ok(result) = result else {
+                    panic!("final result expected")
+                };
                 assert_eq!(encode(result), expected);
             }
-            for result in [prompt.get_final_outcome_async(&ctx, arguments()).await,
-                prompt.get_final_outcome_async_in_request(&ctx, ctx.cx(), arguments()).await,
-                prompt.get_final_outcome_async_resuming_in_request(&ctx, ctx.cx(), arguments(), None).await] {
-                let Outcome::Ok(FinalMethodOutcome::Complete(result)) = result else { panic!("complete outcome expected") };
+            for result in [
+                prompt.get_final_outcome_async(&ctx, arguments()).await,
+                prompt
+                    .get_final_outcome_async_in_request(&ctx, ctx.cx(), arguments())
+                    .await,
+                prompt
+                    .get_final_outcome_async_resuming_in_request(&ctx, ctx.cx(), arguments(), None)
+                    .await,
+            ] {
+                let Outcome::Ok(FinalMethodOutcome::Complete(result)) = result else {
+                    panic!("complete outcome expected")
+                };
                 assert_eq!(encode(result), expected);
             }
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 5);
-            assert!(calls.iter().all(|(hook, values)| *hook == "final" && *values == arguments()));
+            assert!(
+                calls
+                    .iter()
+                    .all(|(hook, values)| *hook == "final" && *values == arguments())
+            );
         });
     }
 
     #[test]
     fn prompt_registration_keeps_required_presence_title_timeout_and_uri_policy() {
         let (handler, calls) = renderer();
-        let prompt = BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap()).unwrap();
+        let prompt =
+            BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap()).unwrap();
         let definition = serde_json::to_value(prompt.final_definition().unwrap()).unwrap();
         assert_eq!(definition["arguments"][0]["required"], true);
         assert!(definition["arguments"][1].get("required").is_none());
@@ -291,12 +451,22 @@ mod tests {
             runtime(case != 0).block_on(async {
                 let ctx = McpContext::new(Cx::current().unwrap(), 83);
                 let lane = BlockingHandlerLane::new(1).unwrap();
-                if case == 1 { lane.close().unwrap(); }
-                if case == 2 { ctx.request_cancellation().cancel(); }
+                if case == 1 {
+                    lane.close().unwrap();
+                }
+                if case == 2 {
+                    ctx.request_cancellation().cancel();
+                }
                 let (handler, calls) = renderer();
                 let prompt = BlockingPrompt::from_sync_hooks(handler, lane.clone()).unwrap();
-                assert!(matches!(prompt.get_async(&ctx, arguments()).await, Outcome::Err(_)));
-                assert!(matches!(prompt.get_final_outcome_async(&ctx, arguments()).await, Outcome::Err(_)));
+                assert!(matches!(
+                    prompt.get_async(&ctx, arguments()).await,
+                    Outcome::Err(_)
+                ));
+                assert!(matches!(
+                    prompt.get_final_outcome_async(&ctx, arguments()).await,
+                    Outcome::Err(_)
+                ));
                 assert!(calls.lock().unwrap().is_empty());
                 assert_eq!(lane.in_flight().unwrap(), 0);
             });
@@ -307,7 +477,9 @@ mod tests {
     fn declared_and_undeclared_mrtr_are_not_replaced_by_legacy_rendering() {
         let (mut handler, calls) = renderer();
         handler.resuming = true;
-        assert!(BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap()).is_err());
+        assert!(
+            BlockingPrompt::from_sync_hooks(handler, BlockingHandlerLane::new(1).unwrap()).is_err()
+        );
         assert!(calls.lock().unwrap().is_empty());
         runtime(true).block_on(async {
             let ctx = McpContext::new(Cx::current().unwrap(), 83);
@@ -315,7 +487,10 @@ mod tests {
             handler.asks_input = true;
             let lane = BlockingHandlerLane::new(1).unwrap();
             let prompt = BlockingPrompt::from_sync_hooks(handler, lane.clone()).unwrap();
-            assert!(matches!(prompt.get_final_outcome_async(&ctx, arguments()).await, Outcome::Err(_)));
+            assert!(matches!(
+                prompt.get_final_outcome_async(&ctx, arguments()).await,
+                Outcome::Err(_)
+            ));
             assert_eq!(calls.lock().unwrap().as_slice(), &[("input", arguments())]);
             assert_eq!(lane.in_flight().unwrap(), 0);
         });
@@ -325,8 +500,14 @@ mod tests {
     fn prompt_panic_is_redacted_and_the_same_lane_can_render_again() {
         struct Panics;
         impl PromptHandler for Panics {
-            fn definition(&self) -> Prompt { definition() }
-            fn get(&self, _ctx: &McpContext, _arguments: HashMap<String, String>) -> McpResult<Vec<PromptMessage>> {
+            fn definition(&self) -> Prompt {
+                definition()
+            }
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                _arguments: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
                 panic!("private-renderer-panic-canary")
             }
         }
@@ -334,11 +515,16 @@ mod tests {
             let ctx = McpContext::new(Cx::current().unwrap(), 83);
             let lane = BlockingHandlerLane::new(1).unwrap();
             let prompt = BlockingPrompt::from_sync_hooks(Panics, lane.clone()).unwrap();
-            let Outcome::Err(error) = prompt.get_async(&ctx, HashMap::new()).await else { panic!("panic must become an error") };
+            let Outcome::Err(error) = prompt.get_async(&ctx, HashMap::new()).await else {
+                panic!("panic must become an error")
+            };
             assert!(!format!("{error:?}").contains("private-renderer-panic-canary"));
             let (handler, calls) = renderer();
             let healthy = BlockingPrompt::from_sync_hooks(handler, lane.clone()).unwrap();
-            assert!(matches!(healthy.get_async(&ctx, arguments()).await, Outcome::Ok(_)));
+            assert!(matches!(
+                healthy.get_async(&ctx, arguments()).await,
+                Outcome::Ok(_)
+            ));
             assert_eq!(calls.lock().unwrap().len(), 1);
             assert_eq!(lane.in_flight().unwrap(), 0);
         });

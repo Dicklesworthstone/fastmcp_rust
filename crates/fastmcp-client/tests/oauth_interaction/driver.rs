@@ -15,6 +15,10 @@ mod task_subscriptions;
 #[path = "task_driver.rs"]
 mod task_driver;
 
+#[cfg(feature = "tasks")]
+#[path = "task_watch_recovery.rs"]
+mod task_watch_recovery;
+
 #[path = "catalogs.rs"]
 mod catalogs;
 

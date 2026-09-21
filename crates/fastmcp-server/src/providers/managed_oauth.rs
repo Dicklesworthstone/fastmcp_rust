@@ -11,15 +11,18 @@
 //! Catalogs are collected completely, with the managed client's page, byte,
 //! credential-generation and invalidation bounds, before any handlers are
 //! returned. Registration still belongs to the normal server builder/router.
-//! Each invocation performs exactly one managed core POST on the request-owned
-//! `Cx`; it never holds a route mutex, starts a runtime, or retries a failed
-//! operation. Native response admission, clean finite-SSE EOF, expiry and
-//! cancellation checks remain in the managed client.
+//! By default each invocation performs exactly one managed core POST on the
+//! request-owned `Cx`. The opt-in [`interaction`] adapter can resolve upstream
+//! input-required rounds through an explicitly supplied host callback, within
+//! one bounded operation. Neither path retries a failed operation, holds a route
+//! mutex, or starts a runtime. Native response admission, clean finite-SSE EOF,
+//! expiry and cancellation checks remain in the managed client.
 //!
-//! This provider intentionally advertises no reverse-input or extension
-//! capabilities. It forwards complete modern core results only: it does not
-//! claim legacy execution, MRTR or Tasks relay. An unexpected input-required or
-//! extension result is refused, not flattened or automatically replayed.
+//! The default provider advertises no reverse-input or extension capabilities.
+//! Host-resolved interactions advertise only locally configured input support;
+//! they do not relay upstream requestState to downstream clients. This provider
+//! does not claim legacy execution, transparent downstream MRTR, or Tasks relay.
+//! Unexpected input-required or extension results are never flattened.
 //!
 //! ```ignore
 //! use fastmcp_server::providers::managed_oauth::ManagedOAuthProvider;
@@ -39,6 +42,8 @@
 
 /// Authenticated, reversibly routed resource templates.
 pub mod dynamic;
+/// Opt-in, request-owned host resolution of upstream input-required workflows.
+pub mod interaction;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,9 +106,10 @@ impl ManagedOAuthProvider {
 
     /// Selects bounds already validated by the managed client. Use this before
     /// sharing provider clones; existing clones and handlers retain their policy.
+    /// An explicitly installed input handler is preserved with the new bounds.
     pub fn with_limits(mut self, calls: ManagedCoreLimits, catalogs: ManagedCatalogLimits) -> Self {
         self.forwarder = Arc::new(Forwarder {
-            backend: Arc::new(NativeBackend(self.session.clone())),
+            backend: Arc::clone(&self.forwarder.backend),
             next_id: Arc::clone(&self.forwarder.next_id),
             limits: calls,
         });
@@ -499,13 +505,16 @@ struct Forwarder {
     limits: ManagedCoreLimits,
 }
 
+fn allocate_request_id(next_id: &AtomicU64) -> McpResult<RequestId> {
+    let id = next_id
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| McpError::internal_error("Managed OAuth request ID space exhausted"))?;
+    Ok(RequestId::String(format!("managed-provider-{id}")))
+}
+
 impl Forwarder {
     fn allocate_id(&self) -> McpResult<RequestId> {
-        let id = self
-            .next_id
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| McpError::internal_error("Managed OAuth request ID space exhausted"))?;
-        Ok(RequestId::String(format!("managed-provider-{id}")))
+        allocate_request_id(&self.next_id)
     }
 
     async fn execute(&self, ctx: &McpContext, cx: &Cx, method: &str, parameters: Value)
@@ -525,8 +534,8 @@ impl Forwarder {
     }
 }
 
-// The production constructor always installs NativeBackend. Test injection is
-// private to this module and cannot grant an application schema bypass.
+// Production construction installs NativeBackend or the opt-in interaction
+// adapter. Test injection is private and cannot grant a schema bypass.
 trait CoreBackend: Send + Sync {
     fn execute<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, request: CoreRequest,
         id: RequestId, limits: ManagedCoreLimits) -> BoxFuture<'a, McpResult<FinalCoreResult>>;

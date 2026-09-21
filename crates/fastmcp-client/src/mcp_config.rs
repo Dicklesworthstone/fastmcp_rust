@@ -67,16 +67,28 @@ use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
 };
 
+mod input;
+mod parse;
+
+/// Default maximum serialized configuration file size, in bytes.
+///
+/// Use [`McpConfig::from_file_with_limit`] to choose an explicit larger or
+/// smaller bound. This is a configuration-file bound, not an MCP wire limit.
+pub const DEFAULT_MAX_CONFIG_FILE_BYTES: usize = 8 * 1024 * 1024;
+
 // ============================================================================
 // Configuration Types
 // ============================================================================
 
 /// MCP configuration file containing server definitions.
-#[derive(Clone, Default, Serialize, Deserialize)]
+///
+/// Accepts native `mcpServers`, TOML `mcp_servers`, and literal VS Code `servers`
+/// registries. Mixed registry dialects and unsupported VS Code execution or
+/// security controls are refused. Serialization retains the native format.
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConfig {
     /// Server configurations keyed by name.
-    #[serde(default)]
     pub mcp_servers: HashMap<String, ServerConfig>,
 }
 
@@ -541,6 +553,13 @@ pub enum ConfigError {
     NotFound(String),
     /// Failed to read configuration file.
     ReadError(std::io::Error),
+    /// Configuration file exceeded its serialized byte bound.
+    FileTooLarge {
+        /// Maximum bytes permitted for this read.
+        limit_bytes: usize,
+    },
+    /// A file byte limit was zero or could not accommodate an overflow probe.
+    InvalidFileByteLimit,
     /// Failed to parse configuration.
     ParseError(String),
     /// Server not found in configuration.
@@ -562,6 +581,12 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::NotFound(path) => write!(f, "Configuration file not found: {path}"),
             ConfigError::ReadError(e) => write!(f, "Failed to read configuration: {e}"),
+            ConfigError::FileTooLarge { limit_bytes } => {
+                write!(f, "Configuration file exceeds {limit_bytes} bytes")
+            }
+            ConfigError::InvalidFileByteLimit => {
+                f.write_str("Configuration file byte limit is zero or too large")
+            }
             ConfigError::ParseError(e) => write!(f, "Failed to parse configuration: {e}"),
             ConfigError::ServerNotFound(name) => write!(f, "Server not found: {name}"),
             ConfigError::ServerDisabled(name) => write!(f, "Server is disabled: {name}"),
@@ -604,22 +629,36 @@ impl McpConfig {
         Self::default()
     }
 
-    /// Loads configuration from a JSON file.
+    /// Loads configuration from a JSON, TOML, or JSONC file.
+    ///
+    /// `.toml` and `.jsonc` select those formats explicitly. The discovered
+    /// `.vscode/mcp.json` path accepts JSONC; other paths require strict JSON.
+    /// Parsing errors never trigger fallback to a different format. The read
+    /// is bounded by [`DEFAULT_MAX_CONFIG_FILE_BYTES`] before deserialization.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or parsed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ConfigError::NotFound(path.display().to_string())
-            } else {
-                ConfigError::ReadError(e)
-            }
-        })?;
+        Self::from_file_with_limit(path, DEFAULT_MAX_CONFIG_FILE_BYTES)
+    }
 
-        Self::from_json(&content)
+    /// Loads a configuration file with an explicit serialized byte limit.
+    ///
+    /// Reads at most `max_bytes + 1` bytes, including a one-byte overflow probe.
+    /// A file that grows during the read cannot bypass the bound through stale
+    /// metadata. An oversized file is refused, never parsed as a prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidFileByteLimit`] for zero or a limit whose
+    /// one-byte probe cannot fit in `u64`, [`ConfigError::FileTooLarge`] for
+    /// oversized input, or the existing read/parse errors for other failures.
+    pub fn from_file_with_limit(
+        path: impl AsRef<Path>,
+        max_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        input::load(path.as_ref(), max_bytes)
     }
 
     /// Parses configuration from a JSON string.
@@ -630,6 +669,21 @@ impl McpConfig {
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         serde_json::from_str(json)
             .map_err(|_| ConfigError::ParseError("Invalid JSON configuration".to_string()))
+    }
+
+    /// Parses configuration from JSON with comments and trailing commas.
+    ///
+    /// Unlike [`Self::from_json`], this accepts line/block comments and a
+    /// trailing comma after an object member or array element. It does not
+    /// accept JSON5 strings, unquoted keys, or variable substitution. VS Code
+    /// imports support literal stdio servers only; unsupported controls are
+    /// refused rather than silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted parse error for invalid or unsupported input.
+    pub fn from_jsonc(json: &str) -> Result<Self, ConfigError> {
+        parse::from_jsonc(json)
     }
 
     /// Parses configuration from a TOML string.
@@ -860,11 +914,13 @@ impl ConfigLoader {
     ///
     /// # Errors
     ///
-    /// Returns an error if no configuration file is found or parsing fails.
+    /// Returns an error if no configuration file is found, a candidate cannot
+    /// be read, or parsing fails. Only `NotFound` permits trying the next path.
     pub fn load(&self) -> Result<McpConfig, ConfigError> {
         for path in &self.search_paths {
-            if path.exists() {
-                return McpConfig::from_file(path);
+            match McpConfig::from_file(path) {
+                Err(ConfigError::NotFound(_)) => {}
+                result => return result,
             }
         }
 
@@ -885,8 +941,10 @@ impl ConfigLoader {
         let mut config = McpConfig::new();
 
         for path in &self.search_paths {
-            if path.exists() {
-                config.merge(McpConfig::from_file(path)?);
+            match McpConfig::from_file(path) {
+                Ok(loaded) => config.merge(loaded),
+                Err(ConfigError::NotFound(_)) => {}
+                Err(error) => return Err(error),
             }
         }
 

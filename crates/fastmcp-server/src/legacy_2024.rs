@@ -6,9 +6,11 @@
 //! perform authentication and authorization.  Those concerns are explicit
 //! integration responsibilities.
 
+mod admission;
+
 use std::collections::BTreeSet;
 
-use fastmcp_core::block_on;
+use admission::PreparedReceive;
 use fastmcp_protocol::JsonInteger;
 use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use fastmcp_protocol::methods::{
@@ -728,84 +730,44 @@ where
     /// Raw exact-2024 admission happens before any lifecycle or handler state
     /// mutation. Request failures become exact JSON-RPC errors; notification
     /// failures are returned because notifications cannot have responses.
+    /// This entry point invokes the synchronous request-ID hook directly. A
+    /// handler implemented through async overrides must use `receive_async`.
+    /// The adapter never constructs a handler future or enters a runtime here.
     pub fn receive(
         &mut self,
         binding: LegacyPeerBinding,
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
-        block_on(self.receive_async(binding, wire))
+        match self.prepare_receive(binding, wire)? {
+            PreparedReceive::Outbound(outbound) => Ok(outbound),
+            PreparedReceive::Dispatch { id, method, params } => {
+                let result = self.handler.handle_legacy_2024_with_request_id(
+                    &id,
+                    method,
+                    params.as_ref(),
+                );
+                Ok(self.finish_receive(id, method, params.as_ref(), result))
+            }
+        }
     }
 
-    /// Applies one inbound client-to-server JSON value without `block_on`.
+    /// Applies one inbound value by awaiting the admitted handler on the caller.
+    /// Shares wire, lifecycle, capability and result admission with `receive`;
+    /// only selection of the application execution hook differs.
     pub async fn receive_async(
         &mut self,
         binding: LegacyPeerBinding,
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
-        self.require_binding(binding)?;
-        let response_shaped = wire.as_object().is_some_and(|object| {
-            // A result/error member makes the frame response-shaped even when
-            // a malformed or conflicting method member is also present. An
-            // id-bearing frame without a method is likewise attempting to be
-            // a response. JSON-RPC must never answer either peer response
-            // attempt with another response.
-            object.contains_key("result")
-                || object.contains_key("error")
-                || (!object.contains_key("method") && object.contains_key("id"))
-        });
-        let request_id = response_id_from_wire(&wire);
-        let envelope = match decode_legacy_2024_11_05_envelope_classified(wire) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                // A valid envelope whose method-owned params content is
-                // malformed is an Invalid Params rejection; a valid envelope
-                // naming a method outside exact 2024-11-05 is Method Not
-                // Found (-32601) per JSON-RPC 2.0; envelope-structure
-                // failures keep -32600.
-                let error = match error {
-                    Legacy2024EnvelopeError::MethodParams(_) => {
-                        Legacy2024AdapterError::invalid_params(
-                            "invalid exact MCP 2024-11-05 parameters",
-                        )
-                    }
-                    Legacy2024EnvelopeError::Method(_) => Legacy2024AdapterError::method_not_found(
-                        "method is not part of exact MCP 2024-11-05",
-                    ),
-                    Legacy2024EnvelopeError::Envelope(_) => {
-                        Legacy2024AdapterError::invalid_request(
-                            "invalid exact MCP 2024-11-05 envelope",
-                        )
-                    }
-                };
-                return match (response_shaped, request_id) {
-                    // JSON-RPC never sends a response to a response. Keep the
-                    // pending reverse-request authority intact and surface a
-                    // peer/transport failure to the caller instead.
-                    (true, _) => Err(error),
-                    (false, Some(id)) => {
-                        Ok(Legacy2024Outbound::Response(error_response(id, error)))
-                    }
-                    (false, None) => Err(error),
-                };
-            }
-        };
-        match envelope {
-            Legacy2024Envelope::Request { method, id, params } => {
-                match self
-                    .receive_request_async(&id, method.name, params.as_ref())
-                    .await
-                {
-                    Ok(result) => Ok(Legacy2024Outbound::Response(success_response(id, result))),
-                    Err(error) => Ok(Legacy2024Outbound::Response(error_response(id, error))),
-                }
-            }
-            Legacy2024Envelope::Notification { method, params } => {
-                self.receive_notification(method.name, params.as_ref())?;
-                Ok(Legacy2024Outbound::NoResponse)
-            }
-            Legacy2024Envelope::Response { id, .. } | Legacy2024Envelope::Error { id, .. } => {
-                self.complete_reverse_request(id)?;
-                Ok(Legacy2024Outbound::NoResponse)
+        match self.prepare_receive(binding, wire)? {
+            PreparedReceive::Outbound(outbound) => Ok(outbound),
+            PreparedReceive::Dispatch { id, method, params } => {
+                let result = self.handler.handle_legacy_2024_with_request_id_async(
+                    &id,
+                    method,
+                    params.as_ref(),
+                ).await;
+                Ok(self.finish_receive(id, method, params.as_ref(), result))
             }
         }
     }
@@ -951,34 +913,6 @@ where
         }
     }
 
-    async fn receive_request_async(
-        &mut self,
-        request_id: &Value,
-        method: &'static str,
-        params: Option<&Value>,
-    ) -> Result<Value, Legacy2024AdapterError> {
-        match self.lifecycle {
-            Legacy2024Lifecycle::AwaitInitialize => {
-                if method != INITIALIZE {
-                    return Err(Legacy2024AdapterError::invalid_request(
-                        "initialize is the only request allowed before lifecycle admission",
-                    ));
-                }
-                self.admit_initialize(params)
-            }
-            Legacy2024Lifecycle::AwaitInitialized => Err(Legacy2024AdapterError::invalid_request(
-                "notifications/initialized is required before operating requests",
-            )),
-            Legacy2024Lifecycle::Operating => {
-                self.handle_operating_request_async(request_id, method, params)
-                    .await
-            }
-            Legacy2024Lifecycle::Closed => Err(Legacy2024AdapterError::invalid_request(
-                "legacy adapter lifecycle is closed",
-            )),
-        }
-    }
-
     fn receive_notification(
         &mut self,
         method: &'static str,
@@ -1088,85 +1022,6 @@ where
         });
         self.lifecycle = Legacy2024Lifecycle::AwaitInitialized;
         Ok(result)
-    }
-
-    async fn handle_operating_request_async(
-        &mut self,
-        request_id: &Value,
-        method: &'static str,
-        params: Option<&Value>,
-    ) -> Result<Value, Legacy2024AdapterError> {
-        match method {
-            PING => Ok(json!({})),
-            RESOURCES_SUBSCRIBE => {
-                // Live dispatch must resolve the URI and run on_subscribe
-                // before the adapter records the subscription. Adapter-only
-                // admission would keep as_proxy upstreams silent.
-                self.require_resource_subscribe_capability()?;
-                self.dispatch_operating_handler(request_id, method, params)
-                    .await?;
-                self.subscribe(params)
-            }
-            RESOURCES_UNSUBSCRIBE => {
-                self.require_resource_subscribe_capability()?;
-                self.dispatch_operating_handler(request_id, method, params)
-                    .await?;
-                self.unsubscribe(params)
-            }
-            LOGGING_SET_LEVEL => self.set_logging_level(params),
-            TOOLS_LIST
-            | TOOLS_CALL
-            | RESOURCES_LIST
-            | RESOURCES_TEMPLATES_LIST
-            | RESOURCES_READ
-            | PROMPTS_LIST
-            | PROMPTS_GET
-            | COMPLETION_COMPLETE => {
-                self.require_server_capability(method)?;
-                let result = self
-                    .handler
-                    .handle_legacy_2024_with_request_id_async(request_id, method, params)
-                    .await
-                    .map_err(|error| Legacy2024AdapterError {
-                        code: error.code().clone(),
-                        message: error.message().to_owned(),
-                    })?;
-                match method {
-                    TOOLS_CALL if self.application_tool_content => {
-                        validate_application_tool_result(result)
-                    }
-                    TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
-                        translate_legacy_2024_result(method, result).map_err(|_| {
-                            Legacy2024AdapterError {
-                        code: JsonInteger::from(-32603),
-                        message:
-                            "handler result is not losslessly representable in exact MCP 2024-11-05"
-                                .to_owned(),
-                    }
-                        })
-                    }
-                    _ => Ok(result),
-                }
-            }
-            _ => Err(Legacy2024AdapterError::method_not_found(
-                "method direction or lifecycle is not admitted by exact MCP 2024-11-05",
-            )),
-        }
-    }
-
-    async fn dispatch_operating_handler(
-        &mut self,
-        request_id: &Value,
-        method: &'static str,
-        params: Option<&Value>,
-    ) -> Result<Value, Legacy2024AdapterError> {
-        self.handler
-            .handle_legacy_2024_with_request_id_async(request_id, method, params)
-            .await
-            .map_err(|error| Legacy2024AdapterError {
-                code: error.code().clone(),
-                message: error.message().to_owned(),
-            })
     }
 
     fn require_server_capability(&self, method: &str) -> Result<(), Legacy2024AdapterError> {

@@ -2,7 +2,9 @@
 //!
 //! Notifications trigger fresh snapshots. Each acknowledged local update also
 //! triggers one reconciliation get, since a partial answer need not emit a
-//! notification. No timer polling, mutation retry or background worker is used.
+//! notification. Optional observation recovery retains the input ledger across
+//! reconnects and interrupted reconciliation reads. Mutations are never retried;
+//! no timer polling or background worker is used.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,6 +18,7 @@ use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInput
 use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FINAL_CLIENT_CAPABILITIES_META_KEY};
 
 use super::{ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient};
+use super::recovery::{ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveryState};
 use super::super::{
     BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError,
     OAuthCredentialSnapshot, OAuthSessionError, deadline_after, prepare,
@@ -32,12 +35,13 @@ pub struct ManagedTaskWatchDrivePolicy {
     maximum_updates: usize,
     maximum_input_keys: usize,
     maximum_input_bytes: usize,
+    recovery: Option<ManagedTaskRecoveryPolicy>,
 }
 
 impl Default for ManagedTaskWatchDrivePolicy {
     fn default() -> Self {
         Self { watch: ManagedTaskWatchPolicy::default(), maximum_updates: 32,
-            maximum_input_keys: 256, maximum_input_bytes: 1024 * 1024 }
+            maximum_input_keys: 256, maximum_input_bytes: 1024 * 1024, recovery: None }
     }
 }
 
@@ -49,7 +53,33 @@ impl ManagedTaskWatchDrivePolicy {
         if maximum_updates > 128 || maximum_input_keys > 4096
             || !(1..=4 * 1024 * 1024).contains(&maximum_input_bytes)
         { return Err(ManagedTaskDriverError::InvalidPolicy.into()); }
-        Ok(Self { watch, maximum_updates, maximum_input_keys, maximum_input_bytes })
+        Ok(Self { watch, maximum_updates, maximum_input_keys, maximum_input_bytes, recovery: None })
+    }
+
+    /// Opts into bounded observation recovery while retaining this run's input
+    /// history, update count, request IDs and original deadline. Reconnection
+    /// uses the same implementation as observation-only recovering watches.
+    /// The watch record budget is partitioned across the initial connection and
+    /// every permitted reconnect; each needs at least two records.
+    ///
+    /// A failed update is NEVER recovered or replayed. Only a lost observation
+    /// or the failed get AFTER an admitted update acknowledgement can recover.
+    /// The original credential remains pinned: expiry or a changed credential
+    /// during reconnect stops the run before more host input can be resolved.
+    pub fn with_recovery(
+        mut self,
+        recovery: ManagedTaskRecoveryPolicy,
+    ) -> Result<Self, ManagedTaskWatchDriveError> {
+        self.recovery = Some(recovery);
+        self.connection_policy()?;
+        Ok(self)
+    }
+
+    fn connection_policy(self) -> Result<ManagedTaskWatchPolicy, ManagedTaskWatchDriveError> {
+        match self.recovery {
+            Some(recovery) => Ok(recovery.connection_policy(self.watch)?),
+            None => Ok(self.watch),
+        }
     }
 }
 
@@ -58,8 +88,9 @@ impl ManagedTaskWatchDrivePolicy {
 pub enum ManagedTaskWatchDriveError {
     Watch(ManagedTaskWatchError),
     Input(ManagedTaskDriverError),
+    Recovery(ManagedTaskRecoveryError),
     /// A concurrent renewal changed the credential during listen admission.
-    /// No host callback or input update has run; start a new operation explicitly.
+    /// No subsequent host callback or input update has run under that credential.
     CredentialChanged,
 }
 
@@ -68,6 +99,7 @@ impl fmt::Display for ManagedTaskWatchDriveError {
         match self {
             Self::Watch(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
+            Self::Recovery(error) => error.fmt(f),
             Self::CredentialChanged => f.write_str("Task watch credential changed during admission"),
         }
     }
@@ -85,6 +117,15 @@ impl From<ManagedTasksError> for ManagedTaskWatchDriveError {
 impl From<OAuthSessionError> for ManagedTaskWatchDriveError {
     fn from(error: OAuthSessionError) -> Self { Self::Watch(error.into()) }
 }
+impl From<ManagedTaskRecoveryError> for ManagedTaskWatchDriveError {
+    fn from(error: ManagedTaskRecoveryError) -> Self {
+        match error {
+            ManagedTaskRecoveryError::Watch(error) => Self::Watch(error),
+            ManagedTaskRecoveryError::CredentialChanged => Self::CredentialChanged,
+            error => Self::Recovery(error),
+        }
+    }
+}
 
 impl ManagedTasksClient {
     /// Observes one existing Task and resolves input only through the supplied
@@ -97,9 +138,10 @@ impl ManagedTasksClient {
     /// keys are not answered again, and changing any previously observed input
     /// descriptor is rejected, including an as-yet-unanswered key.
     ///
-    /// This operation never creates/cancels a remote Task, reconnects or retries
-    /// a failed POST. Its ledger is process-local; restarting is not authority
-    /// to replay an update whose acknowledgement was lost.
+    /// This operation never creates/cancels a remote Task or retries a failed
+    /// mutation. Observation reconnect is opt-in through `with_recovery` and
+    /// keeps the same input ledger. The ledger is process-local; restarting is
+    /// not authority to replay an update whose acknowledgement was lost.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task_watching<R, F, O>(
         &self, cx: &Cx, task_id: TaskId, id_prefix: String,
@@ -115,10 +157,10 @@ impl ManagedTasksClient {
     }
 
     /// Pins the original subscription credential through snapshots, callbacks,
-    /// discovery and updates. Renewal cannot extend this run or change its
-    /// authorization. The deadline includes initial credential acquisition and
-    /// listen admission. Cancelling/dropping it releases owned work without
-    /// cancelling the ambient Cx, a sibling call or the remote Task.
+    /// discovery, reconnects and updates. Renewal cannot extend this run or
+    /// change its authorization. The deadline includes credential acquisition,
+    /// initial admission and every recovery delay. Cancelling/dropping releases
+    /// owned work without cancelling the ambient Cx, siblings or the remote Task.
     /// Synchronous host callbacks must return promptly and cooperate.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task_watching_with_cancellation<R, F, O>(
@@ -131,9 +173,11 @@ impl ManagedTasksClient {
         O: FnMut(&Task) -> Result<(), ManagedTaskWatchDriveError>,
     {
         self.session.check(cx, cancellation)?;
-        // Validate the selection and identity before acquiring/renewing a token.
+        // Validate selection, identity and the combined connection reservation
+        // before acquiring/renewing a token or making a network request.
         let _ = super::WatchState::new(vec![task_id.clone()], policy.watch.maximum_snapshots)?;
         let _ = super::WatchIds::new(id_prefix.clone())?;
+        let connection_policy = policy.connection_policy()?;
         let deadline = deadline_after(cx, policy.watch.timeout)?;
         let credential = self.session.await_active(cx, cancellation, deadline, None, async {
             self.session.credential_with_cancellation(cx, cancellation).await
@@ -141,21 +185,28 @@ impl ManagedTasksClient {
         self.session.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
             Ok(async {
                 let mut watch = Box::pin(self.watch_tasks_with_cancellation(cx, cancellation,
-                    vec![task_id.clone()], id_prefix, policy.watch)).await?;
+                    vec![task_id.clone()], id_prefix, connection_policy)).await?;
                 let generation = watch.subscription.as_ref()
                     .ok_or(ManagedTaskWatchError::Closed)?.credential_generation();
                 if generation != credential.generation {
                     return Err(ManagedTaskWatchDriveError::CredentialChanged);
                 }
                 watch.deadline = watch.deadline.min(deadline);
+                let mut recovery = policy.recovery.map(|recovery|
+                    RecoveryState::new(&watch, connection_policy, recovery));
                 let mut ledger = InputHistory::default();
                 let mut updates = 0;
                 let mut reconciled = None;
                 loop {
                     let task = match reconciled.take() {
                         Some(task) => task,
-                        None => Box::pin(watch.next_snapshot_with_credential(cx, Some(&credential))).await?
-                            .ok_or(ManagedTaskWatchError::UnexpectedEvent)?.task,
+                        None => {
+                            let snapshot = match recovery.as_mut() {
+                                Some(recovery) => Box::pin(recovery.next_snapshot(cx, &mut watch, Some(&credential))).await?,
+                                None => Box::pin(watch.next_snapshot_with_credential(cx, Some(&credential))).await?,
+                            };
+                            snapshot.ok_or(ManagedTaskWatchError::UnexpectedEvent)?.task
+                        }
                     };
                     check_drive(self, cx, cancellation, deadline, &credential)?;
                     observe(&task)?;
@@ -192,26 +243,49 @@ impl ManagedTasksClient {
                     let get_round = self.prepare_round(get_ids, get)?;
                     check_drive(self, cx, cancellation, deadline, &credential)?;
                     let call_deadline = deadline.min(deadline_after(cx, self.limits.timeout)?);
+                    // Deliberately outside observation recovery. Even an I/O
+                    // error here may mean the peer already accepted the update.
                     let mut call = self.execute_round(cx, cancellation, update_round,
                         &credential, call_deadline, self.limits.records).await?;
                     if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Updated(_))) {
                         return Err(ManagedTaskWatchError::UnexpectedEvent.into());
                     }
                     drop(call);
+                    // Retain acknowledgement BEFORE the observation can fail.
+                    // A replacement snapshot may still contain these input keys;
+                    // neither resolver work nor their answers may be repeated.
                     ledger = next_ledger;
                     updates += 1;
                     check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let call_deadline = deadline.min(deadline_after(cx, self.limits.timeout)?);
-                    let mut call = self.execute_round(cx, cancellation, get_round,
-                        &credential, call_deadline, self.limits.records).await?;
-                    let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
-                        return Err(ManagedTaskWatchError::UnexpectedEvent.into());
-                    };
-                    drop(call);
+                    let observed = async {
+                        let call_deadline = deadline.min(deadline_after(cx, self.limits.timeout)?);
+                        let mut call = self.execute_round(cx, cancellation, get_round,
+                            &credential, call_deadline, self.limits.records).await?;
+                        let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
+                            return Err(ManagedTaskWatchError::UnexpectedEvent);
+                        };
+                        Ok::<_, ManagedTaskWatchError>(snapshot.task)
+                    }.await;
                     check_drive(self, cx, cancellation, deadline, &credential)?;
-                    watch.finished = watch.state.record_snapshot(&snapshot.task)?;
-                    if watch.finished { watch.close(); }
-                    reconciled = Some(Box::new(snapshot.task));
+                    match observed {
+                        Ok(task) => {
+                            watch.finished = watch.state.record_snapshot(&task)?;
+                            if let Some(recovery) = recovery.as_mut() {
+                                recovery.record_snapshot(&watch, &task)?;
+                            }
+                            if watch.finished { watch.close(); }
+                            reconciled = Some(Box::new(task));
+                        }
+                        Err(error) => match recovery.as_mut() {
+                            Some(recovery) => {
+                                // Only a get after a validated ACK enters here.
+                                // The next loop obtains a fresh authoritative
+                                // snapshot, without rebuilding ledger or limits.
+                                Box::pin(recovery.reconnect_after(cx, &mut watch, Some(&credential), error)).await?;
+                            }
+                            None => return Err(error.into()),
+                        },
+                    }
                 }
             }.await)
         }).await?
@@ -400,5 +474,33 @@ mod tests {
         let roots = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{}}});
         assert!(matches!(admit_capabilities(&absent, &inputs()), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
         assert!(admit_capabilities(&roots, &inputs()).is_ok());
+    }
+
+    #[test]
+    fn combined_recovery_policy_preserves_input_limits_and_rejects_underfunded_streams() {
+        let ordinary = ManagedTaskWatchDrivePolicy::default();
+        assert!(ordinary.recovery.is_none());
+        assert_eq!(ordinary.connection_policy().unwrap(), ordinary.watch);
+        let recovering = ordinary.with_recovery(ManagedTaskRecoveryPolicy::default()).unwrap();
+        assert_eq!(recovering.maximum_updates, ordinary.maximum_updates);
+        assert_eq!(recovering.maximum_input_keys, ordinary.maximum_input_keys);
+        assert_eq!(recovering.maximum_input_bytes, ordinary.maximum_input_bytes);
+        assert_eq!(recovering.watch, ordinary.watch);
+        assert_eq!(recovering.connection_policy().unwrap(),
+            ManagedTaskRecoveryPolicy::default().connection_policy(ordinary.watch).unwrap());
+        let watch = ManagedTaskWatchPolicy::new(std::time::Duration::from_secs(60), 8, 9).unwrap();
+        let underfunded = ManagedTaskWatchDrivePolicy::new(watch, 2, 2, 1024).unwrap();
+        assert!(matches!(underfunded.with_recovery(ManagedTaskRecoveryPolicy::default()),
+            Err(ManagedTaskWatchDriveError::Recovery(ManagedTaskRecoveryError::InvalidPolicy))));
+    }
+
+    #[test]
+    fn recovery_preserves_typed_watch_and_credential_failures() {
+        assert!(matches!(ManagedTaskWatchDriveError::from(ManagedTaskRecoveryError::CredentialChanged),
+            ManagedTaskWatchDriveError::CredentialChanged));
+        assert!(matches!(ManagedTaskWatchDriveError::from(ManagedTaskRecoveryError::Watch(ManagedTaskWatchError::SnapshotLimit)),
+            ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::SnapshotLimit)));
+        assert!(matches!(ManagedTaskWatchDriveError::from(ManagedTaskRecoveryError::RecoveryLimit),
+            ManagedTaskWatchDriveError::Recovery(ManagedTaskRecoveryError::RecoveryLimit)));
     }
 }
