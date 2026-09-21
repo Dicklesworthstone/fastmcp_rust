@@ -270,8 +270,41 @@ mod tests {
             Ok(self.facts.lock().unwrap().clone())
         }
     }
+    /// Hosts `test` on a runtime whose timer driver is a [`VirtualClock`], so
+    /// `Cx::now` reads a clock the test controls instead of falling back to the
+    /// wall clock.
+    ///
+    /// None of the `Cx::for_testing*` constructors installs a timer driver, and
+    /// `Cx::now` then resolves to `wall_clock_now`. A caller clock built that
+    /// way has no fixed origin and advances between any two reads. Neither a
+    /// test of an *exact* deadline boundary nor a test whose premise is that
+    /// the caller clock does not move can be expressed against such a clock:
+    /// the deadline must be computed before the `Cx` exists, so it cannot be
+    /// made relative to a reading of it. Matches the runtime idiom already used
+    /// in `proxy.rs` and `fastmcp_client::http_auth::managed::logout`.
+    fn with_virtual_clock(test: impl FnOnce(&asupersync::runtime::Runtime)) {
+        // Not bound and never advanced: a fresh `VirtualClock` starts at
+        // `Time::ZERO` and stays there, which is the property both callers want.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::new(asupersync::time::VirtualClock::new()),
+            ))
+            .build()
+            .unwrap();
+        test(&runtime);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
     fn fixture(config: SseRevalidationPolicy) -> (Cx, Provider, SseAuthorizationLease) {
         let cx = Cx::for_testing();
+        let (provider, lease) = fixture_on(&cx, config);
+        (cx, provider, lease)
+    }
+
+    /// The fixture body, opened against a caller-supplied `Cx` so a test can
+    /// choose the clock the lease is established on. `fixture` keeps its
+    /// original signature for every test that does not care which clock it is.
+    fn fixture_on(cx: &Cx, config: SseRevalidationPolicy) -> (Provider, SseAuthorizationLease) {
         let mut facts = AuthContext::with_subject("lease-test-principal");
         facts.scopes = vec!["read".to_owned()];
         facts.claims = Some(serde_json::json!({"tenant":"original"}));
@@ -284,12 +317,12 @@ mod tests {
             .auth_provider(provider.clone()).build());
         let request = JsonRpcRequest::new("tools/list", None, RequestId::Number(7));
         let authorization = TransportAuthorization::from_singleton_header(Some("Bearer lease-test-token"));
-        let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
+        let receipt = server.preauthenticate_http_request(cx, &request, &authorization).unwrap();
         let scopes = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::exact(1).unwrap(), vec![
             ("tools/list".to_owned(), RequiredScopes::new(vec!["read".to_owned()]).unwrap()),
         ]).unwrap();
-        let lease = SseAuthorizationLease::new(&cx, server, &request, &authorization, &receipt, scopes, config).unwrap();
-        (cx, provider, lease)
+        let lease = SseAuthorizationLease::new(cx, server, &request, &authorization, &receipt, scopes, config).unwrap();
+        (provider, lease)
     }
     fn due(lease: &mut SseAuthorizationLease, cx: &Cx) { lease.next_check = cx.now(); }
 
@@ -352,24 +385,32 @@ mod tests {
     #[test]
     fn cached_verdict_obeys_a_later_readers_exact_deadline_boundary() {
         for expired in [false, true] {
-            let (_, provider, mut lease) = fixture(SseRevalidationPolicy::default());
-            let deadline = Time::from_nanos(u64::from(!expired));
-            let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(deadline));
-            assert_eq!(cx.now(), Time::ZERO);
-            assert!(cx.now() < lease.next_check && Instant::now() < lease.wall_expiry);
-            let result = lease.check(&cx);
-            if expired {
-                assert!(matches!(result, Err(SseAuthorizationError::TimedOut | SseAuthorizationError::Cancelled)));
-                assert!(lease.closed);
-                assert!(lease.facts.is_none());
-                assert_eq!(lease.check(&Cx::for_testing()), Err(SseAuthorizationError::Closed));
-            } else {
-                assert_eq!(result, Ok(()));
-                assert!(!lease.closed);
-                assert!(lease.facts.is_some());
-            }
-            assert_eq!(lease.checks, 0, "local liveness never spends provider work");
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            with_virtual_clock(|runtime| {
+                // The lease is opened by an unconstrained caller and then read by a
+                // later caller whose deadline sits exactly on the boundary. Both
+                // contexts are minted from this runtime, so they share one clock
+                // and the boundary is exact rather than approximate.
+                let opener = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let (provider, mut lease) = fixture_on(&opener, SseRevalidationPolicy::default());
+                let deadline = Time::from_nanos(u64::from(!expired));
+                let cx = runtime
+                    .request_cx_with_budget(asupersync::Budget::new().with_deadline(deadline));
+                assert_eq!(cx.now(), Time::ZERO);
+                assert!(cx.now() < lease.next_check && Instant::now() < lease.wall_expiry);
+                let result = lease.check(&cx);
+                if expired {
+                    assert!(matches!(result, Err(SseAuthorizationError::TimedOut | SseAuthorizationError::Cancelled)));
+                    assert!(lease.closed);
+                    assert!(lease.facts.is_none());
+                    assert_eq!(lease.check(&Cx::for_testing()), Err(SseAuthorizationError::Closed));
+                } else {
+                    assert_eq!(result, Ok(()));
+                    assert!(!lease.closed);
+                    assert!(lease.facts.is_some());
+                }
+                assert_eq!(lease.checks, 0, "local liveness never spends provider work");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            });
         }
     }
 
@@ -419,12 +460,17 @@ mod tests {
 
     #[test]
     fn monotonic_wall_expiry_still_triggers_when_the_caller_clock_does_not_move() {
-        let (cx, provider, mut lease) = fixture(SseRevalidationPolicy::default());
-        let caller_time = cx.now();
-        lease.wall_expiry = Instant::now();
-        provider.denied.store(true, Ordering::SeqCst);
-        assert_eq!(cx.now(), caller_time);
-        assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Rejected));
+        with_virtual_clock(|runtime| {
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (provider, mut lease) = fixture_on(&cx, SseRevalidationPolicy::default());
+            let caller_time = cx.now();
+            lease.wall_expiry = Instant::now();
+            provider.denied.store(true, Ordering::SeqCst);
+            // The premise in this test's name: a clock the runtime owns and
+            // nothing advances. Only the monotonic wall bound can fire.
+            assert_eq!(cx.now(), caller_time);
+            assert_eq!(lease.check(&cx), Err(SseAuthorizationError::Rejected));
+        });
     }
 
     #[test]
