@@ -327,6 +327,60 @@ fn assert_shipped_manifest() {
 // Frozen entry points
 // ---------------------------------------------------------------------------
 
+/// Planted negative for the frozen manifest anchor added in commit 32e8a1ea.
+///
+/// `assert_shipped_manifest` proves the published bytes hash to
+/// `HTTP_03_B_MANIFEST_DIGEST_HEX`. That is a positive, and on its own it does
+/// not establish that the anchor would REFUSE anything: an assertion that only
+/// ever sees the accepted input cannot show it discriminates. That is precisely
+/// how the producer/consumer comparison above came to be vacuous.
+///
+/// Each case below changes exactly one forbidden dimension the acceptance item
+/// names - reordering, a floor, an omitted group - leaves every other byte
+/// alone, and proves the digest moves off the anchor. The dimension is carried
+/// into every message, because these share one test and an assert block aborts
+/// at the first failure: without the label a red names the test and hides which
+/// dimension stopped discriminating.
+fn assert_manifest_digest_refuses_perturbation() {
+    use std::fmt::Write as _;
+
+    let text = HTTP_03_B_EVALUATOR_MANIFEST_V1;
+    let rows: Vec<&str> = text.split('\n').collect();
+
+    let mut reordered = rows.clone();
+    reordered.swap(4, 5);
+    let omitted: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| !row.starts_with("HTTP-03.25 "))
+        .collect();
+
+    let perturbations = [
+        ("reordering two case rows", reordered.join("\n")),
+        ("raising one declared floor", text.replacen("floor=5", "floor=6", 1)),
+        ("omitting one group row", omitted.join("\n")),
+    ];
+
+    for (dimension, perturbed) in perturbations {
+        assert_ne!(
+            perturbed, text,
+            "{dimension}: the planted perturbation must actually change the bytes, \
+             otherwise this case proves nothing"
+        );
+        let digest = sha256_bounded(perturbed.as_bytes(), 64 * 1024)
+            .expect("a perturbed manifest stays within the same bound");
+        let mut rendered = String::with_capacity(64);
+        for byte in digest.as_bytes() {
+            write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
+        }
+        assert_ne!(
+            rendered, HTTP_03_B_MANIFEST_DIGEST_HEX,
+            "{dimension}: the frozen anchor must refuse a manifest differing in this dimension"
+        );
+    }
+}
+
+
 #[test]
 fn http_03_b_positive() {
     assert_manifest_order(&POSITIVE_CASES);
@@ -352,6 +406,7 @@ fn http_03_b_positive() {
 fn http_03_b_planted_negative() {
     assert_manifest_order(&NEGATIVE_CASES);
     assert_shipped_manifest();
+    assert_manifest_digest_refuses_perturbation();
     assert_eq!(
         NEGATIVE_CASES.len(),
         MANIFEST_GROUP_ORDER.len(),
