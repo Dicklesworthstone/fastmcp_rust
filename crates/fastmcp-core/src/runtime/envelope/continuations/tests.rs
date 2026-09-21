@@ -136,3 +136,100 @@ fn continuation_store_limits_are_finite() {
         assert!(matches!(ContinuationStorePolicy::new(entries, bytes), Err(ContinuationStoreError::InvalidPolicy)));
     }
 }
+
+#[test]
+fn continuation_store_put_reclaims_expired_entry_capacity_without_explicit_prune() {
+    let cx = Cx::for_testing();
+    let (key, auth) = identity();
+    let mut store = store();
+    store.policy = ContinuationStorePolicy::new(2, 4096).unwrap();
+    let expired = put(&mut store, b"expired");
+    let live = put(&mut store, b"live");
+    // Plant expiry at the inclusive boundary without sleeps or wall-clock races.
+    store.entries.get_mut(&expired.0).unwrap().expires_at = 0;
+    let replacement = put(&mut store, b"replacement");
+    assert_eq!(store.len(), 2);
+    assert_eq!(store.sequence, 3);
+    assert_eq!(store.retained_bytes(), store.entries.values().map(Entry::charge).sum::<usize>());
+    assert!(matches!(store.take(&cx, &key, &auth, &expired), Err(ContinuationStoreError::Unavailable)));
+    assert_eq!(store.take(&cx, &key, &auth, &live).unwrap().as_bytes(), b"live");
+    assert_eq!(store.take(&cx, &key, &auth, &replacement).unwrap().as_bytes(), b"replacement");
+    assert_eq!(store.retained_bytes(), 0);
+}
+
+#[test]
+fn continuation_store_put_reclaims_cancelled_byte_capacity_without_eviction() {
+    let cx = Cx::for_testing();
+    let (key, auth) = identity();
+    let mut store = store();
+    let cancelled = McpRequestCancellation::new();
+    let old = store.put(&cx, &key, &auth, &cancelled, b"old", Duration::from_secs(60)).unwrap();
+    let live = put(&mut store, b"live");
+    // Plenty of entry slots: only the encrypted-byte budget forces reclamation.
+    let limit = store.retained_bytes();
+    store.policy = ContinuationStorePolicy::new(8, limit).unwrap();
+    cancelled.cancel();
+    let replacement = put(&mut store, b"new");
+    assert_eq!(store.len(), 2);
+    assert_eq!(store.retained_bytes(), limit);
+    assert_ne!(old.to_wire(), replacement.to_wire());
+    assert!(matches!(store.take(&cx, &key, &auth, &old), Err(ContinuationStoreError::Unavailable)));
+    assert_eq!(store.take(&cx, &key, &auth, &live).unwrap().as_bytes(), b"live");
+    assert_eq!(store.take(&cx, &key, &auth, &replacement).unwrap().as_bytes(), b"new");
+    assert_eq!(store.retained_bytes(), 0);
+}
+
+#[test]
+fn continuation_store_put_rechecks_quota_after_insufficient_reclamation() {
+    let cx = Cx::for_testing();
+    let (key, auth) = identity();
+    let mut store = store();
+    let expired = put(&mut store, b"old");
+    let live = put(&mut store, b"live");
+    let live_charge = store.entries[&live.0].charge();
+    store.policy = ContinuationStorePolicy::new(8, store.retained_bytes()).unwrap();
+    store.entries.get_mut(&expired.0).unwrap().expires_at = 0;
+    // Fits alone, but not alongside the still-live continuation.
+    assert!(matches!(store.put(&cx, &key, &auth, &McpRequestCancellation::new(),
+        b"larger than old", Duration::from_secs(60)), Err(ContinuationStoreError::Capacity)));
+    assert_eq!(store.sequence, 2);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.retained_bytes(), live_charge);
+    assert_eq!(store.take(&cx, &key, &auth, &live).unwrap().as_bytes(), b"live");
+}
+
+#[test]
+fn continuation_store_live_capacity_refusal_does_not_burn_identity() {
+    let cx = Cx::for_testing();
+    let (key, auth) = identity();
+    let mut store = store();
+    store.policy = ContinuationStorePolicy::new(1, 4096).unwrap();
+    let live = put(&mut store, b"live");
+    let charged = store.retained_bytes();
+    assert!(matches!(store.put(&cx, &key, &auth, &McpRequestCancellation::new(),
+        b"new", Duration::from_secs(60)), Err(ContinuationStoreError::Capacity)));
+    assert_eq!(store.sequence, 1);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.retained_bytes(), charged);
+    assert_eq!(store.take(&cx, &key, &auth, &live).unwrap().as_bytes(), b"live");
+}
+
+#[test]
+fn continuation_store_invalid_put_does_not_reclaim_or_reserve_identity() {
+    let cx = Cx::for_testing();
+    let (key, auth) = identity();
+    let mut store = store();
+    store.policy = ContinuationStorePolicy::new(1, 4096).unwrap();
+    let expired = put(&mut store, b"expired");
+    store.entries.get_mut(&expired.0).unwrap().expires_at = 0;
+    let charged = store.retained_bytes();
+    assert!(matches!(store.put(&cx, &key, &auth, &McpRequestCancellation::new(), b"new", Duration::ZERO),
+        Err(ContinuationStoreError::Protection(EnvelopeError::InvalidLifetime))));
+    let cancelled = McpRequestCancellation::new();
+    cancelled.cancel();
+    assert!(matches!(store.put(&cx, &key, &auth, &cancelled, b"new", Duration::from_secs(60)),
+        Err(ContinuationStoreError::Unavailable)));
+    assert_eq!(store.sequence, 1);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.retained_bytes(), charged);
+}

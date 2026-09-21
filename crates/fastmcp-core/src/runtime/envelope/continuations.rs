@@ -150,9 +150,11 @@ impl EphemeralContinuationStore {
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
     pub fn retained_bytes(&self) -> usize { self.retained_bytes }
 
-    /// Retains encrypted state without evicting any live entry. A unique
-    /// non-wrapping sequence is combined with 256 OS-random bits, preventing
-    /// handle reuse within this owner even after entries are consumed/pruned.
+    /// Retains encrypted state without evicting any live entry. On capacity
+    /// pressure, expired and explicitly cancelled entries are reclaimed before
+    /// refusing new work; no background cleanup worker is required for progress.
+    /// A unique non-wrapping sequence is combined with 256 OS-random bits,
+    /// preventing handle reuse even after entries are consumed/pruned.
     /// Failed sealing burns its reserved sequence; no partial entry is stored.
     /// `owner` is the application's continuation lifetime, not necessarily the
     /// one POST that produced an input-required result.
@@ -168,6 +170,17 @@ impl EphemeralContinuationStore {
             return Err(EnvelopeError::InvalidLifetime.into());
         }
         let charge = HEADER_BYTES + TAG_BYTES + plaintext.len() + ENTRY_IDENTITY_BYTES;
+        // A single impossible entry must not trigger cleanup or reserve an ID.
+        // Admission/authentication above also precede every retention mutation.
+        if charge > self.policy.maximum_bytes { return Err(ContinuationStoreError::Capacity); }
+        if self.entries.len() >= self.policy.maximum_entries
+            || self.retained_bytes.checked_add(charge)
+                .is_none_or(|total| total > self.policy.maximum_bytes)
+        {
+            // Only the pressure path scans the bounded collection. Recheck both
+            // quotas afterwards: pruning is not permission to evict live work.
+            self.prune(cx)?;
+        }
         let retained = self.retained_bytes.checked_add(charge)
             .filter(|total| *total <= self.policy.maximum_bytes).ok_or(ContinuationStoreError::Capacity)?;
         if self.entries.len() >= self.policy.maximum_entries { return Err(ContinuationStoreError::Capacity); }
@@ -218,7 +231,8 @@ impl EphemeralContinuationStore {
     }
 
     /// Reclaims only expired or explicitly cancelled entries, without decrypting
-    /// them or evicting live work. The caller drives cleanup; no timer is spawned.
+    /// them or evicting live work. The caller may drive eager cleanup; `put`
+    /// also invokes this on capacity pressure. No timer or worker is spawned.
     pub fn prune(&mut self, cx: &Cx) -> Result<usize, ContinuationStoreError> {
         self.protector.check(cx)?;
         let now = self.protector.elapsed()?;
