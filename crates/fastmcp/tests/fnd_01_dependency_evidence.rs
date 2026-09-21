@@ -56408,6 +56408,46 @@ original = "value"
         }
     }
 
+    /// RH-5 planted negative for the secure_file.rs admission (bd-fnd-01-sealed-owner-
+    /// draw-security-identifier-y5ydn). The three admissions above each landed WITH a
+    /// paired neighbour control; mine did not, so the entry was asserted rather than
+    /// proved. This is that proof, in the same three-part form: the admitted path takes
+    /// exactly one API, the SAME path rejects the other four, and a REAL sibling inherits
+    /// nothing.
+    ///
+    /// `managed.rs` is deliberately the sibling: it exists, it sits directly beside
+    /// secure_file.rs in `http_auth/`, and it handles managed-OAuth credential state, so
+    /// it is the most PLAUSIBLE path for a future widening to sweep in by accident. A
+    /// control is only worth the assertions it would actually catch. (Note the oauth
+    /// control above uses `oauth_extra.rs`, which does not exist on disk -- it still
+    /// exercises the `_ => false` arm, but it cannot catch a prefix widening over a real
+    /// file the way a real sibling can.)
+    ///
+    /// secure_file.rs is `#[cfg(target_os = "linux")]` (http_auth.rs:40), but this test
+    /// calls the pure string predicate and so runs on EVERY host -- which is the point:
+    /// the admission it guards is otherwise only reachable by a Linux run.
+    #[test]
+    fn fnd_01_state_partition_rng_secure_file_sealed_api_allowlist_exact() {
+        let secure_file_path = "crates/fastmcp-client/src/http_auth/secure_file.rs";
+        let neighboring_path = "crates/fastmcp-client/src/http_auth/managed.rs";
+        assert!(
+            state_partition_rng_sealed_api_is_allowlisted(secure_file_path, "draw_security_identifier"),
+            "the Linux credential blob store must admit draw_security_identifier"
+        );
+        for api in ["draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(secure_file_path, api),
+                "the Linux credential blob store must reject {api}"
+            );
+        }
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api),
+                "the neighbouring http_auth path must not inherit permission for {api}"
+            );
+        }
+    }
+
     fn state_partition_rng_source<'a>(inventory: &'a StatePartitionRngInventory, path: &str) -> VResult<&'a StatePartitionRngRustSource> {
         inventory.rust_sources.get(path).ok_or_else(|| Diagnostic::error("E_STATE_PARTITION_RNG_INVENTORY", "state-partition-rng").at(path))
     }
