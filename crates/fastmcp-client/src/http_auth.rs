@@ -15,7 +15,8 @@
 //!   other target — different path, authority, scheme, or query — yields
 //!   `None` rather than a downgraded or redirected credential.
 //! - The token is redacted from `Debug` output so credentials cannot leak
-//!   through diagnostics, and header-hostile bytes are refused at binding.
+//!   through diagnostics. Binding uses the same bounded `token68` grammar
+//!   as HTTP credential admission, before retaining or emitting a token.
 //! - Local revocation is shared by every clone. It stops subsequent header
 //!   construction without changing another independently bound credential.
 
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use fastmcp_core::McpRequestCancellation;
+use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
@@ -51,8 +52,8 @@ pub enum BearerBindingError {
     CleartextResource,
     /// The token is empty.
     EmptyToken,
-    /// The token contains bytes that cannot safely become an HTTP header
-    /// value.
+    /// The token exceeds the shared credential byte limit or does not use
+    /// the `token68` grammar required by a Bearer authorization field.
     InvalidTokenBytes,
 }
 
@@ -64,7 +65,7 @@ impl fmt::Display for BearerBindingError {
             }
             Self::EmptyToken => formatter.write_str("bearer token is empty"),
             Self::InvalidTokenBytes => {
-                formatter.write_str("bearer token contains header-hostile bytes")
+                formatter.write_str("bearer token exceeds the byte limit or violates token68 syntax")
             }
         }
     }
@@ -99,12 +100,17 @@ impl fmt::Debug for BoundBearerCredential {
 impl BoundBearerCredential {
     /// Binds a token to one admitted HTTPS resource.
     ///
+    /// RFC 6750 Bearer credentials use the same alphabet and trailing padding
+    /// as `token68`. The shared [`AccessToken::is_valid_token68`] validator
+    /// also enforces [`fastmcp_core::MAX_ACCESS_TOKEN_BYTES`]. No trimming,
+    /// escaping, padding repair, or other token normalization is performed.
+    ///
     /// # Errors
     ///
     /// Returns a typed [`BearerBindingError`] when the resource is not
-    /// `https` or the token is empty or header-hostile. There is no
-    /// cleartext escape hatch: an `http:` resource — remote, localhost, or
-    /// loopback — can never hold a credential.
+    /// `https` or the token is empty, oversized, or syntactically invalid.
+    /// There is no cleartext escape hatch: an `http:` resource — remote,
+    /// localhost, or loopback — can never hold a credential.
     pub fn bind(
         resource: CanonicalHttpUrl,
         token: impl Into<String>,
@@ -116,10 +122,10 @@ impl BoundBearerCredential {
         if token.is_empty() {
             return Err(BearerBindingError::EmptyToken);
         }
-        if token
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b' ')
-        {
+        // A safe header string is not necessarily a valid Bearer credential.
+        // Share the server's grammar and byte cap so direct binding cannot
+        // emit a token rejected before the verifier is even called.
+        if !AccessToken::is_valid_token68(&token) {
             return Err(BearerBindingError::InvalidTokenBytes);
         }
         Ok(Self {
@@ -448,5 +454,152 @@ mod tests {
         assert!(owned.is_revoked());
         assert_eq!(owned.authorization_for_target(&resource), None);
         assert!(!owner.is_cancel_requested());
+    }
+
+    #[test]
+    fn bearer_alphabet_and_trailing_padding_round_trip_http_admission() {
+        use fastmcp_core::AccessToken;
+        use std::time::{Duration, Instant};
+
+        let resource = url("https://mcp.example/api");
+        let now = Instant::now();
+        for token in ["A", "aZ09-._~+/", "abc=", "abc==", "a==="] {
+            let candidates = [
+                BoundBearerCredential::bind(resource.clone(), token).unwrap(),
+                BoundBearerCredential::bind_with_expiry(
+                    resource.clone(),
+                    token,
+                    now + Duration::from_secs(60),
+                )
+                .unwrap(),
+            ];
+            for credential in candidates {
+                let header = credential.authorization_at(&resource, now).unwrap();
+                assert_eq!(header, format!("Bearer {token}"));
+                let parsed = AccessToken::parse(&header).unwrap();
+                assert_eq!(parsed.scheme, "Bearer");
+                assert_eq!(parsed.token, token);
+            }
+        }
+    }
+
+    #[test]
+    fn both_bearer_constructors_refuse_invalid_grammar_without_repair() {
+        use std::time::Instant;
+
+        let resource = url("https://mcp.example/api");
+        let deadline = Instant::now();
+        // Delimiters and non-ASCII text can be ordinary header-value bytes,
+        // but they are not Bearer token68 credentials. '=' is padding only.
+        for token in [
+            "secret:tail",
+            "secret,tail",
+            "secret;tail",
+            "secret\"tail",
+            "secret\\tail",
+            "secret(tail)",
+            "secret%20tail",
+            "secret=tail",
+            "=secret",
+            "=",
+            "secreté",
+            "secret\u{a0}tail",
+            " secret",
+            "secret ",
+            "secret\ttail",
+            "secret\0tail",
+        ] {
+            for result in [
+                BoundBearerCredential::bind(resource.clone(), token),
+                BoundBearerCredential::bind_with_expiry(resource.clone(), token, deadline),
+            ] {
+                let error = result.expect_err("invalid credentials must fail during binding");
+                assert_eq!(error, BearerBindingError::InvalidTokenBytes);
+                assert!(!format!("{error:?} {error}").contains("secret"));
+            }
+        }
+        assert_eq!(
+            BoundBearerCredential::bind_with_expiry(resource, "", deadline).err(),
+            Some(BearerBindingError::EmptyToken)
+        );
+    }
+
+    #[test]
+    fn bearer_byte_limit_includes_padding_in_both_constructors() {
+        use fastmcp_core::{AccessToken, MAX_ACCESS_TOKEN_BYTES};
+        use std::time::{Duration, Instant};
+
+        let resource = url("https://mcp.example/api");
+        let now = Instant::now();
+        for padding in ["", "=="] {
+            let exact = format!("{}{padding}", "a".repeat(MAX_ACCESS_TOKEN_BYTES - padding.len()));
+            let excessive = format!("a{exact}");
+            assert_eq!(exact.len(), MAX_ACCESS_TOKEN_BYTES);
+            assert_eq!(excessive.len(), MAX_ACCESS_TOKEN_BYTES + 1);
+            for (token, accepted) in [(&exact, true), (&excessive, false)] {
+                for result in [
+                    BoundBearerCredential::bind(resource.clone(), token.as_str()),
+                    BoundBearerCredential::bind_with_expiry(
+                        resource.clone(),
+                        token.as_str(),
+                        now + Duration::from_secs(60),
+                    ),
+                ] {
+                    if accepted {
+                        let credential = result.unwrap();
+                        let header = credential.authorization_at(&resource, now).unwrap();
+                        assert_eq!(AccessToken::parse(&header).unwrap().token, *token);
+                    } else {
+                        assert_eq!(result.err(), Some(BearerBindingError::InvalidTokenBytes));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_request_headers_preserve_bound_tokens_and_resource_isolation() {
+        use fastmcp_core::{AccessToken, MAX_ACCESS_TOKEN_BYTES};
+        use fastmcp_protocol::FINAL_PROTOCOL_VERSION;
+
+        use crate::http_executor::ModernHttpRequest;
+
+        let resource = url("https://mcp.example/api");
+        for token in ["aZ09-._~+/==".to_owned(), "a".repeat(MAX_ACCESS_TOKEN_BYTES)] {
+            let credential = BoundBearerCredential::bind(resource.clone(), token.clone()).unwrap();
+            let make_request = |target| {
+                ModernHttpRequest::new(
+                    target,
+                    b"{}".to_vec(),
+                    FINAL_PROTOCOL_VERSION,
+                    "tools/call",
+                    None,
+                )
+                .unwrap()
+                .with_authorization(&credential)
+            };
+            let request = make_request(resource.as_str());
+            let mut headers = request
+                .headers()
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+            let (_, header) = headers.next().expect("bound target receives its credential");
+            assert!(headers.next().is_none());
+            assert_eq!(AccessToken::parse(header).unwrap().token, token);
+            let other = make_request("https://mcp.example/other");
+            assert!(
+                other
+                    .headers()
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+            );
+            credential.revoke();
+            assert!(
+                make_request(resource.as_str())
+                    .headers()
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+            );
+        }
     }
 }
