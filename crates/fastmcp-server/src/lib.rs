@@ -43122,10 +43122,41 @@ mod lib_unit_tests {
             })
             .map_err(|error| format!("legacy reverse-response client task was not admitted: {error}"))?;
 
-        let serve = bound.serve(cx).await;
-        client
-            .join(cx)
+        // DIAGNOSTIC BOUND (bd-f2ndd). THIS DOES NOT FIX THE STALL.
+        //
+        // These two awaits are the outermost in the probe and neither carried
+        // a bound, so a stalled child froze the whole test binary: libtest
+        // never printed a `test result:` line and the output that would name
+        // the cause was destroyed before anyone could read it. Bounding them
+        // converts a freeze into a named failure. The underlying stall is
+        // untouched.
+        //
+        // ONLY the outer awaits are bounded. Every inner join is left exactly
+        // as it was, because a timed join cancels, and cancellation alters the
+        // child task's authority -- which is the property these five tests
+        // exist to verify. Bounding here is safe for that reason: it fires
+        // only after every assertion has already run, and on firing the probe
+        // fails outright, so no later assertion observes the cancelled state.
+        //
+        // A healthy run completes these in well under the bound, so this is
+        // inert on success. If it fires, the stall is still present: raising
+        // the bound hides the defect and does not repair it.
+        let serve_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let serve = asupersync::time::timeout_at(serve_deadline, bound.serve(cx))
             .await
+            .map_err(|_| {
+                "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound, so the \
+                 server task never completed. The stall is NOT fixed; do not raise this bound."
+                    .to_string()
+            })?;
+        let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        asupersync::time::timeout_at(join_deadline, client.join(cx))
+            .await
+            .map_err(|_| {
+                "DIAGNOSTIC (bd-f2ndd): `client.join(cx)` was still pending at its bound, so the \
+                 client task never completed. The stall is NOT fixed; do not raise this bound."
+                    .to_string()
+            })?
             .map_err(|error| format!("legacy reverse-response client failed: {error:?}"))??;
         let shutdown =
             serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))?;
