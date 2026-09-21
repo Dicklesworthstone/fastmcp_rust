@@ -23,11 +23,11 @@ use fastmcp_protocol::sampling::SamplingToolLoopLimits;
 
 const FIRST_INPUTS: &str = r#"{"resultType":"input_required","requestState":"owned-first","inputRequests":{
     "root":{"method":"roots/list"},
-    "sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
+    "sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"seed"}}],"maxTokens":16,
         "tools":[{"name":"fixture","inputSchema":{"type":"object"}}]}}
 }}"#;
 const NEXT_INPUTS: &str = r#"{"resultType":"input_required","requestState":"owned-next","inputRequests":{
-    "sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
+    "sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"seed"}}],"maxTokens":16,
         "tools":[{"name":"fixture","inputSchema":{"type":"object"}}]}}
 }}"#;
 
@@ -46,7 +46,10 @@ impl SamplingHost for Host {
     {
         let first = self.models.is_multiple_of(2);
         self.models += 1;
-        assert_eq!(request.messages.len(), if first {0} else {2});
+        // A seeded conversation, because SamplingToolLoop::new rejects an empty
+        // `messages` with InvalidRequest. One tool round appends the assistant
+        // message and then the tool results, so a 1-message seed reaches 3.
+        assert_eq!(request.messages.len(), if first {1} else {3});
         let content = if first { json!({"type":"tool_use","id":"fixture-use","name":"fixture","input":{}}) }
             else { json!({"type":"text","text":"done"}) };
         Box::pin(std::future::ready(Ok(serde_json::from_value(json!({"role":"assistant","model":"fixture-model",
