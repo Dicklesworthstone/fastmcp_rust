@@ -44,7 +44,7 @@ mod schema_tool;
 pub mod managed_oauth;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
-pub use blocking::{BlockingHandlerLane, BlockingResource, BlockingTool};
+pub use blocking::{BlockingCompletion, BlockingHandlerLane, BlockingPrompt, BlockingResource, BlockingTool};
 #[cfg(feature = "apps")]
 pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};
 pub use schema_tool::{RegisteredSchemaTool, RegisteredSchemaToolError};

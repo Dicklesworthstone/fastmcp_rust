@@ -10,7 +10,11 @@
 //! cannot be preempted: its reservation remains charged until the closure really
 //! returns. The caller's runtime region retains ownership of that worker.
 
+mod completion;
+mod prompt;
 mod resource;
+pub use completion::BlockingCompletion;
+pub use prompt::BlockingPrompt;
 pub use resource::BlockingResource;
 
 use std::fmt;
