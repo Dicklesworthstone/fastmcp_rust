@@ -12,8 +12,9 @@
 //! Bearer scope is admitted separately, at most once across the entire set.
 //! Token68 challenges provide neither parameter, even on the Bearer scheme.
 //! This does not activate unsupported authentication schemes or splice their
-//! parameters into another challenge. No 403 escalation, DPoP, DCR, automatic
-//! login/retry, DNS pinning, or OIDC identity authentication is installed.
+//! parameters into another challenge. The separate [`step_up`] API supports
+//! explicitly approved 403 scope upgrades. No automatic login/retry, DPoP,
+//! DCR, DNS pinning, or OIDC identity authentication is installed.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -37,6 +38,9 @@ use super::{
 };
 use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
 use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+
+/// Bounded, host-approved scope upgrades without replaying failed operations.
+pub mod step_up;
 
 const MAX_HEADER_FIELDS: usize = 128;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -124,26 +128,7 @@ impl ResourceMetadataChallenge {
     ) -> Result<Self, OAuthChallengeError> {
         validate_https(&resource).map_err(|_| OAuthChallengeError::InvalidPolicy)?;
         if status != 401 { return Err(OAuthChallengeError::UnsupportedStatus { status }); }
-        if headers.len() > MAX_HEADER_FIELDS { return Err(OAuthChallengeError::LimitExceeded); }
-        let mut total = 0_usize;
-        let mut combined = String::new();
-        for (name, value) in headers {
-            total = total.saturating_add(name.len()).saturating_add(value.len());
-            if total > MAX_HEADER_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
-            if !AccessToken::is_valid_http_scheme(name) {
-                return Err(OAuthChallengeError::InvalidChallenge);
-            }
-            if !name.eq_ignore_ascii_case("www-authenticate") { continue; }
-            if value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t')) {
-                return Err(OAuthChallengeError::InvalidChallenge);
-            }
-            let additional = value.len().saturating_add(usize::from(!combined.is_empty()));
-            if additional > MAX_CHALLENGE_BYTES.saturating_sub(combined.len()) {
-                return Err(OAuthChallengeError::LimitExceeded);
-            }
-            if !combined.is_empty() { combined.push(','); }
-            combined.push_str(value);
-        }
+        let combined = combine_challenge_headers(headers)?;
         let mut parser = ChallengeParser { text: &combined, offset: 0, count: 0 };
         let mut saw_bearer = false;
         let mut metadata_url = None;
@@ -340,6 +325,32 @@ impl ChallengedOAuthDiscovery {
                 .await.map_err(|error| OAuthDiscoveryError::Login(error).into())
         }).await
     }
+}
+
+// Shared by initial-login and scope-upgrade admission. Keep repeated field
+// lines in order; converting to a map would lose duplicate/ambiguous hints.
+fn combine_challenge_headers(headers: &[(String, String)]) -> Result<String, OAuthChallengeError> {
+    if headers.len() > MAX_HEADER_FIELDS { return Err(OAuthChallengeError::LimitExceeded); }
+    let mut total = 0_usize;
+    let mut combined = String::new();
+    for (name, value) in headers {
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if total > MAX_HEADER_BYTES { return Err(OAuthChallengeError::LimitExceeded); }
+        if !AccessToken::is_valid_http_scheme(name) {
+            return Err(OAuthChallengeError::InvalidChallenge);
+        }
+        if !name.eq_ignore_ascii_case("www-authenticate") { continue; }
+        if value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t')) {
+            return Err(OAuthChallengeError::InvalidChallenge);
+        }
+        let additional = value.len().saturating_add(usize::from(!combined.is_empty()));
+        if additional > MAX_CHALLENGE_BYTES.saturating_sub(combined.len()) {
+            return Err(OAuthChallengeError::LimitExceeded);
+        }
+        if !combined.is_empty() { combined.push(','); }
+        combined.push_str(value);
+    }
+    Ok(combined)
 }
 
 fn metadata_url_from_text(text: &str) -> Result<CanonicalHttpUrl, OAuthChallengeError> {
@@ -604,7 +615,7 @@ mod tests {
         let oversized_value = format!("Bearer realm=\"{}\"", "x".repeat(MAX_VALUE_BYTES + 1));
         assert!(matches!(parse(&oversized_value), Err(OAuthChallengeError::LimitExceeded)));
         assert!(matches!(parse(&format!("Bearer {}=v", "x".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
-        assert!(matches!(parse(&format!("{} realm=v, Bearer", "X".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
+        assert!(matches!(parse(&format!("{} realm=v", "X".repeat(MAX_NAME_BYTES + 1))), Err(OAuthChallengeError::LimitExceeded)));
         let fields = (0..=MAX_PARAMETERS).map(|n| format!("p{n}=v")).collect::<Vec<_>>().join(",");
         assert!(matches!(parse(&format!("Bearer {fields}")), Err(OAuthChallengeError::LimitExceeded)));
         let schemes = format!("{}Bearer", "Other, ".repeat(MAX_CHALLENGES));
