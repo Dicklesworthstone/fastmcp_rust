@@ -1560,11 +1560,27 @@ impl Transport for AsyncStdioTransport {
         Ok(message)
     }
 
-    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
         if self.closed {
             return Ok(());
         }
+        // Observe the caller's budget BEFORE the terminal commit, so a cancelled
+        // or expired caller is not made to wait on the flush below. Ordering is
+        // load-bearing: refusing here leaves the transport NON-TERMINAL and
+        // retryable, so the buffered frame is not lost. Setting `closed` first
+        // and then refusing would strand those bytes permanently, because the
+        // already-closed branch above returns Ok without flushing.
+        //
+        // Placing the check after that branch keeps an idempotent close Ok:
+        // terminal state performs no I/O and has no budget to spend.
+        //
+        // This mirrors `SseWriter::close` (sse.rs), which is the established
+        // shape for a terminal flush in this crate.
+        stdio_checkpoint(cx)?;
         self.closed = true;
+        // `flush_unchecked` is correct HERE and only here: its contract is the
+        // commit phase of a two-phase send, where cancellation has already been
+        // observed. The checkpoint above is that observation.
         self.writer.flush_unchecked()?;
         Ok(())
     }
