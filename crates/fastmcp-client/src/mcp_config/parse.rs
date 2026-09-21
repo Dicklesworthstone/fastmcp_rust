@@ -7,13 +7,46 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use super::{ConfigError, McpConfig, ServerConfig};
 
 // `Option` distinguishes an absent registry from an explicitly empty one. A
-// present null is not an absent registry: deserializing T first rejects it.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+// present null is not an absent registry. Visit entries before collecting them
+// so a repeated server name cannot silently replace a command or disabled flag.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<HashMap<String, T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    struct RegistryVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for RegistryVisitor<T> {
+        type Value = HashMap<String, T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a server registry with unique names")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut servers = HashMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                match servers.entry(name) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(map.next_value::<T>()?);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        return Err(A::Error::custom(
+                            "duplicate server name in configuration registry",
+                        ));
+                    }
+                }
+            }
+            Ok(servers)
+        }
+    }
+
+    deserializer
+        .deserialize_map(RegistryVisitor::<T>(std::marker::PhantomData))
+        .map(Some)
 }
 
 #[derive(Deserialize)]
@@ -283,5 +316,58 @@ mod tests {
         }
         let config: McpConfig = serde_json::from_slice(&bytes).expect("valid normalized JSON");
         assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn duplicate_server_names_cannot_replace_disabled_definitions() {
+        let distinct = r#"{"first":{"command":"original","disabled":true},"second":{"command":"replacement"}}"#;
+        let duplicate = r#"{"first":{"command":"original","disabled":true},"first":{"command":"replacement"}}"#;
+        for registry in ["mcpServers", "mcp_servers", "servers"] {
+            let valid = format!(r#"{{"{registry}":{distinct}}}"#);
+            let invalid = format!(r#"{{"{registry}":{duplicate}}}"#);
+            for config in [
+                McpConfig::from_json(&valid).unwrap(),
+                McpConfig::from_jsonc(&valid).unwrap(),
+            ] {
+                assert_eq!(config.mcp_servers.len(), 2);
+                let first = config.get_server("first").unwrap();
+                assert_eq!(first.command, "original");
+                assert!(first.disabled);
+                assert_eq!(config.get_server("second").unwrap().command, "replacement");
+            }
+            assert!(McpConfig::from_json(&invalid).is_err(), "{registry}");
+            assert!(McpConfig::from_jsonc(&invalid).is_err(), "{registry}");
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_uses_decoded_names_and_also_rejects_identical_entries() {
+        for registry in ["mcpServers", "mcp_servers", "servers"] {
+            for entries in [
+                r#"{"same":{"command":"original"},"s\u0061me":{"command":"replacement"}}"#,
+                r#"{"same":{"command":"original"},"same":{"command":"original"}}"#,
+            ] {
+                let json = format!(r#"{{"{registry}":{entries}}}"#);
+                let error = serde_json::from_str::<McpConfig>(&json).unwrap_err();
+                assert!(error.to_string().contains("duplicate server name"));
+                assert!(McpConfig::from_jsonc(&json).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unique_registry_admission_keeps_empty_absent_null_and_toml_semantics() {
+        assert!(McpConfig::from_json("{}").unwrap().mcp_servers.is_empty());
+        for registry in ["mcpServers", "mcp_servers", "servers"] {
+            let empty = format!(r#"{{"{registry}":{{}}}}"#);
+            assert!(McpConfig::from_json(&empty).unwrap().mcp_servers.is_empty());
+            let null = format!(r#"{{"{registry}":null}}"#);
+            assert!(McpConfig::from_json(&null).is_err());
+        }
+        let toml = "[mcp_servers.first]\ncommand = \"original\"\ndisabled = true\n\n[mcp_servers.second]\ncommand = \"replacement\"\n";
+        let config = McpConfig::from_toml(toml).unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert!(config.get_server("first").unwrap().disabled);
+        assert_eq!(config.get_server("second").unwrap().command, "replacement");
     }
 }
