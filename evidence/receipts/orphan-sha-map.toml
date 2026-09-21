@@ -1012,3 +1012,87 @@ committed = "2026-08-30T18:13:20-04:00"
 orphan    = "ff8926bb3b19d0caf83d795f90e9af87be713d34"
 patch_id  = "86ac86d7c5bfa1869e7ad17bb7bc81de967d3fc7"
 committed = "2026-08-30T18:13:20-04:00"
+
+# ===========================================================================
+# SECOND REBASE EVENT -- 2026-09-21, `pull --rebase origin main` at 22:03.
+#
+# Recorded as its own section rather than merged into the totals above,
+# because those counts describe a different sweep at a different HEAD and
+# silently growing them would make both populations unreconstructable.
+#
+# Every row below is verified in BOTH directions at write time: the orphan is
+# unreachable from HEAD, the twin IS reachable, and both sides recompute to
+# the recorded patch_id. Control: a deliberately mismatched pair DIFFERS, so
+# the check discriminates rather than reporting every pair equivalent.
+#
+# The join is by PATCH-ID, not by commit subject. Subject survives a rebase
+# and is the right fallback when no better anchor exists, but two commits can
+# share a subject and a patch-id is a content hash of the change itself.
+# ===========================================================================
+
+[second_event]
+occurred      = "2026-09-21"
+cause         = "pull --rebase origin main"
+twinned       = 10
+twinless      = 0
+verified_by   = "MagentaOsprey"
+
+[[twinned]]
+orphan   = "4d14db94291faa008a370367d5953263e21c8779"
+twin     = "69304b9e1c4cb26a8da3ded071ad73c9c00552af"
+patch_id = "fcd5760d92b642eda045f517d2af6ac18fbf14ee"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "32e8a1ea9365a9393b67d773a48a395933e684fb"
+twin     = "2d4b01b8330d88347b5802c0890cc246ce306be7"
+patch_id = "cb83d59238de49ec066d3a462c305124b1182fe1"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "9daa7d37f0dbc25664405e5773ea350f3e656b45"
+twin     = "1d44d7c20d21ad77f1d705827fc7d6b8ee535ba2"
+patch_id = "0264acbaf60ca8380ff3593fb3f02f1cb21f09a6"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "6eca87c05ac9f23c2d398290de64aada6c5d96b2"
+twin     = "c8482dd083004e3f8905adb0be80cea3dcb1e6dd"
+patch_id = "7b2a3be9583a958621bf35a5fe46fa38821812a9"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "3b3422c74b28fa5bbead182fc107cf800a2a0dc0"
+twin     = "d9a93c66ce127fe493ff1e617f675ce54e37309f"
+patch_id = "d55a336589f9b6b819f1b8d7d11a44c805d3953f"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "657f572a9212e47fc72fb5886427765e08826fcb"
+twin     = "4ae009cf5dc410f4003121ee0d2383005db20cba"
+patch_id = "89a562e25cea7a2882d84e7dd597a1cf7febe5f0"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "bda0d2340ef32283471b30b1bf6c2307fdabe1e5"
+twin     = "931645aa8b59ac5f0cc002c03f5618c8e82b1299"
+patch_id = "8a5cfbcaaa78ed4170b1fdcbe40cf253b159fc89"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "878d235b426052936826d7945cd5db5da51356ec"
+twin     = "68e66f7248a9e8ecbdb8e5de1a26c76b4da0348e"
+patch_id = "612a26bdea027f43f8f68a9c199417c564fcf3d3"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "15976ed857a0ee852d41ce27a60ac388c19fc6e3"
+twin     = "acdb0d65e43a363db29aae99e2f8e8ceac7546af"
+patch_id = "5aab20396eb40d38fc1de5f60f35af3e434ee109"
+event    = "2026-09-21-rebase"
+
+[[twinned]]
+orphan   = "ce5d27235ad06c9d2068d3d263ce53d07274b1da"
+twin     = "d04862d06287042e94d8ec8707bf4b5ec746ca2d"
+patch_id = "b2deb5094882031d272ac189d70ca5bc907817c7"
+event    = "2026-09-21-rebase"
