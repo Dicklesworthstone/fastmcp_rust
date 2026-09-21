@@ -117,19 +117,46 @@ fn assert_continuation(wire: &Value, original: &Value, state: &str, has_root: bo
     params.as_object_mut().unwrap().remove("inputResponses");
     assert_eq!(&params, original);
 }
+// A child's panic goes to a file, not to the parent's inherited stdout.
+// libtest captures its own process's prints; it never sees a child's raw fd
+// writes, so an inherited stream is unattributable and an assertion on the
+// exit status alone reports only that some child exited non-zero.
+struct ChildLog(std::path::PathBuf);
+impl ChildLog {
+    fn create() -> (Self, std::fs::File) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        for _ in 0..64 {
+            let path = std::env::temp_dir().join(format!("fastmcp-host-execution-{}-{}.log",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return (Self(path), file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => panic!("cannot create isolated child log: {error}"),
+            }
+        }
+        panic!("child log name attempts exhausted");
+    }
+    fn read(&self) -> String { std::fs::read_to_string(&self.0).unwrap_or_default() }
+}
+impl Drop for ChildLog { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
 fn isolated_execution(name: &str, case: ExecutionCase) {
     if let Ok(selected) = std::env::var(CHILD) { assert_eq!(selected, name); run_execution(case); return; }
     let roots = RootFile::create();
+    let (log, output) = ChildLog::create();
+    let errors = output.try_clone().unwrap();
     struct Child(std::process::Child);
     impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
     let mut child = Child(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD, name).env("SSL_CERT_FILE", &roots.0).env_remove("SSL_CERT_DIR")
-        .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap());
+        .stdin(Stdio::null()).stdout(Stdio::from(output)).stderr(Stdio::from(errors)).spawn().unwrap());
     let end = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() { assert!(status.success()); return; }
-        assert!(Instant::now() < end, "typed-host execution exceeded its child bound");
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "child {name} exited {status}\n{}", log.read());
+            return;
+        }
+        assert!(Instant::now() < end, "typed-host execution exceeded its child bound\n{}", log.read());
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -225,20 +252,20 @@ fn run_execution(case: ExecutionCase) {
             let expected_posts = match case {
                 ExecutionCase::ModelLimit => {
                     assert!(matches!(result, Err(CoreInputExecutionError::Input(CoreInputSessionError::Input(
-                        CoreInputError::Sampling(SamplingInputError::ModelRoundLimit))))));
+                        CoreInputError::Sampling(SamplingInputError::ModelRoundLimit))))), "{:?}", result.as_ref().err());
                     assert_eq!((host.models, host.tools, host.approvals), (2, 1, 1));
                     2
                 }
                 ExecutionCase::OwnerClose | ExecutionCase::MachineClose => {
-                    assert!(matches!(result, Err(CoreInputExecutionError::OwnerClosed)));
+                    assert!(matches!(result, Err(CoreInputExecutionError::OwnerClosed)), "{:?}", result.as_ref().err());
                     assert_eq!((host.roots, host.models, host.tools), (1, 0, 0));
                     assert_eq!(host.drops.load(Ordering::SeqCst), 1);
                     if is_machine {2} else {1}
                 }
                 ExecutionCase::LostReply | ExecutionCase::NotifyRefusal => {
-                    assert!(result.is_err());
+                    assert!(result.is_err(), "expected an execution error, got Ok");
                     if matches!(case, ExecutionCase::NotifyRefusal) {
-                        assert!(matches!(result, Err(CoreInputExecutionError::AbortedByHost)));
+                        assert!(matches!(result, Err(CoreInputExecutionError::AbortedByHost)), "{:?}", result.as_ref().err());
                         assert_eq!(notifications, 1);
                     }
                     assert_eq!((host.models, host.tools), (2, 1));
