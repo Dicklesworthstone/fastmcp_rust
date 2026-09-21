@@ -56363,7 +56363,21 @@ original = "value"
     #[test]
     fn fnd_01_state_partition_rng_oauth_client_sealed_api_allowlist_exact() {
         let oauth_path = "crates/fastmcp-client/src/http_auth/oauth.rs";
-        let neighboring_path = "crates/fastmcp-client/src/http_auth/oauth_extra.rs";
+        // REAL sibling. This was "oauth_extra.rs", which does not exist on disk -- that
+        // directory holds discovery.rs, managed.rs, oauth.rs, rpc.rs, sampling.rs and
+        // secure_file.rs. A fictional path still exercises the `_ => false` arm, so the
+        // test was not wrong, but it could never catch the thing a neighbour control is
+        // FOR: a future widening to a prefix or directory sweeping in a file that
+        // actually exists. The private_key_jwt control below says "a real sibling" for
+        // exactly this reason; this one did not have one.
+        //
+        // STRICTLY STRONGER, not a relaxation: the assertion is unchanged and still
+        // requires NOT-allowlisted. It now asserts that over a path that could plausibly
+        // be added, so if sampling.rs is ever legitimately admitted this test fails and
+        // forces the control to be updated with it -- which is the intended coupling.
+        // sampling.rs is chosen over managed.rs so the two neighbour controls in this
+        // file cover different paths.
+        let neighboring_path = "crates/fastmcp-client/src/http_auth/sampling.rs";
         for api in ["draw_hmac_sha256_key", "draw_security_identifier"] {
             assert!(state_partition_rng_sealed_api_is_allowlisted(oauth_path, api), "the OAuth client must admit {api}");
             assert!(!state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api), "the neighboring client path must not inherit permission for {api}");
@@ -56418,10 +56432,10 @@ original = "value"
     /// `managed.rs` is deliberately the sibling: it exists, it sits directly beside
     /// secure_file.rs in `http_auth/`, and it handles managed-OAuth credential state, so
     /// it is the most PLAUSIBLE path for a future widening to sweep in by accident. A
-    /// control is only worth the assertions it would actually catch. (Note the oauth
-    /// control above uses `oauth_extra.rs`, which does not exist on disk -- it still
-    /// exercises the `_ => false` arm, but it cannot catch a prefix widening over a real
-    /// file the way a real sibling can.)
+    /// control is only worth the assertions it would actually catch. (The oauth control
+    /// above previously used `oauth_extra.rs`, which does not exist on disk; it now uses
+    /// `sampling.rs`. All four neighbour controls in this file name a real file and each
+    /// names a different one.)
     ///
     /// secure_file.rs is `#[cfg(target_os = "linux")]` (http_auth.rs:40), but this test
     /// calls the pure string predicate and so runs on EVERY host -- which is the point:
