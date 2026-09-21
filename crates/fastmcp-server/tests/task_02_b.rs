@@ -18,7 +18,7 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers TEN of the twenty-three
+//! This file does NOT discharge the bead. It covers ELEVEN of the twenty-three
 //! named groups, one of those only in part. The table below is the authority;
 //! keep this sentence and the table in agreement when either changes:
 //!
@@ -32,12 +32,19 @@
 //! | `B-32 deadline-renew-restart`        | covered |
 //! | `B-31 private-update-revision-order` | PARTIAL: stale-generation refusal only. Ordering across concurrent writers is not asserted. |
 //! | `B-34 restore-write-contract`        | covered |
+//! | `B-35 third-party-backend-conformance` | covered -- required surface only |
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
 //!
-//! TEN of twenty-three, one of them partial. **Thirteen groups have no test
-//! here and none anywhere in the tree**: B-24, B-25, B-33, B-35 through B-41,
+//! ELEVEN of twenty-three, one of them partial. **Twelve groups have no test
+//! here and none anywhere in the tree**: B-24, B-25, B-33, B-36 through B-41,
 //! B-44, B-45, B-46.
+//!
+//! A RUN REPORTS 14 OUTCOMES, WHICH IS NOT 14 GROUPS AND NOT 23. Eleven group
+//! tests, one lease-window guard, and the two frozen IDs. This file has been
+//! miscounted three times by three different methods -- 13 by mention count,
+//! 18 by a mixed regex, and 13-of-23 by reading the outcome total as a group
+//! total. The group figure is the number of `fn bNN_*` definitions.
 //!
 //! Of those thirteen, EIGHT are blocked on capability the shipped store does
 //! not have and cannot be closed by writing tests: B-25 and B-33
@@ -130,6 +137,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+
+use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::FinalTaskId;
 use fastmcp_protocol::tasks_extension::{
     Task, TaskStatusNotification, TaskStatusNotificationParams,
@@ -838,6 +849,295 @@ fn b32_deadline_survives_renew_and_restart() {
 }
 
 // ---------------------------------------------------------------------------
+// B-35: a second, out-of-crate backend
+// ---------------------------------------------------------------------------
+
+/// A minimal third-party backend implementing ONLY the ten methods
+/// `FinalTaskStore` requires, inheriting all twenty-seven defaults.
+///
+/// Its purpose is not to be useful. It exists so the conformance assertions
+/// below can be shown to test the TRAIT CONTRACT rather than one
+/// implementation's habits: any property asserted of both this and the
+/// shipped store is a property of the contract. Nothing here stands in for
+/// the shipped store -- `InMemoryFinalTaskStore` is exercised by the same
+/// function, so PL-3 is satisfied by the real subject and this backend only
+/// bounds what the assertions are allowed to mean.
+#[derive(Default)]
+struct MinimalBackend {
+    tasks: Mutex<BTreeMap<FinalTaskId, (Task, u64)>>,
+    cancellations: Mutex<BTreeSet<FinalTaskId>>,
+}
+
+impl MinimalBackend {
+    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<FinalTaskId, (Task, u64)>> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl FinalTaskStore for MinimalBackend {
+    fn create_task(&self, task: Task, _notification: TaskStatusNotification) -> McpResult<()> {
+        let id = task.base().task_id.clone();
+        if self.locked().insert(id, (task, 1)).is_some() {
+            return Err(McpError::invalid_params("duplicate task identifier"));
+        }
+        Ok(())
+    }
+
+    fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<Task>> {
+        Ok(self.locked().get(task_id).map(|(task, _)| task.clone()))
+    }
+
+    fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+        Ok(self
+            .locked()
+            .get(task_id)
+            .map(|(task, generation)| FinalTaskSnapshot::new(task.clone(), *generation)))
+    }
+
+    fn replace_task(&self, task: Task, _notification: TaskStatusNotification) -> McpResult<()> {
+        let id = task.base().task_id.clone();
+        let mut state = self.locked();
+        let Some((slot, generation)) = state.get_mut(&id) else {
+            return Err(McpError::invalid_params("unknown task identifier"));
+        };
+        *slot = task;
+        *generation += 1;
+        Ok(())
+    }
+
+    fn replace_task_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: Task,
+        _notification: TaskStatusNotification,
+    ) -> McpResult<bool> {
+        let id = task.base().task_id.clone();
+        let mut state = self.locked();
+        let Some((slot, generation)) = state.get_mut(&id) else {
+            return Ok(false);
+        };
+        if *generation != expected.generation() {
+            return Ok(false);
+        }
+        *slot = task;
+        *generation += 1;
+        Ok(true)
+    }
+
+    fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()> {
+        if !self.locked().contains_key(task_id) {
+            return Err(McpError::invalid_params("unknown task identifier"));
+        }
+        self.cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.clone());
+        Ok(())
+    }
+
+    fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+        let id = expected.task().base().task_id.clone();
+        if self.locked().get(&id).map(|(_, g)| *g) != Some(expected.generation()) {
+            return Ok(false);
+        }
+        self.request_cancellation(&id)?;
+        Ok(true)
+    }
+
+    fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+        Ok(self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(task_id))
+    }
+
+    fn retention_clock_now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn task_retention_deadline_if_current(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+    ) -> McpResult<Option<FinalTaskRetentionDeadline>> {
+        Ok(self
+            .locked()
+            .get(task_id)
+            .filter(|(_, current)| *current == generation)
+            .map(|_| FinalTaskRetentionDeadline::Unlimited))
+    }
+}
+
+/// Builds a `working` task and its notification, for either backend.
+fn conformance_task(task_id: &str) -> (Task, TaskStatusNotification) {
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-07-28T12:00:00.000Z",
+        "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+        "ttlMs": 600_000
+    }))
+    .expect("a well-formed working task");
+    let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
+        task: task.clone(),
+        meta: None,
+        additional: std::collections::BTreeMap::default(),
+    });
+    (task, notification)
+}
+
+/// Properties every `FinalTaskStore` must satisfy, whoever wrote it.
+///
+/// Deliberately confined to the ten REQUIRED methods. Anything asserted here
+/// of a capability a backend may legitimately decline would not be a contract
+/// property, it would be a preference.
+fn assert_required_surface_conformance(store: &dyn FinalTaskStore, backend: &str) {
+    let (task, notification) = conformance_task("conformance-subject");
+    let id = task.base().task_id.clone();
+    let missing = conformance_task("conformance-absent").0.base().task_id.clone();
+
+    assert!(
+        store
+            .get_task(&missing)
+            .unwrap_or_else(|error| panic!("{backend}: reading an unknown task is not an error: {error}"))
+            .is_none(),
+        "{backend}: an unknown task must read as absent, not as an error or a value"
+    );
+
+    store
+        .create_task(task, notification)
+        .unwrap_or_else(|error| panic!("{backend}: creating a working task must succeed: {error}"));
+
+    assert_eq!(
+        store
+            .get_task(&id)
+            .expect("reads succeed")
+            .expect("the created task is retained")
+            .base()
+            .task_id,
+        id,
+        "{backend}: a created task must read back under its own identifier"
+    );
+
+    let first = store
+        .get_task_snapshot(&id)
+        .expect("reads succeed")
+        .expect("the created task has a snapshot");
+    let second = store
+        .get_task_snapshot(&id)
+        .expect("reads succeed")
+        .expect("the created task still has a snapshot");
+    assert_eq!(
+        first.generation(),
+        second.generation(),
+        "{backend}: a generation must not change because it was read"
+    );
+
+    assert!(
+        store
+            .task_retention_deadline_if_current(&id, first.generation())
+            .expect("reads succeed")
+            .is_some(),
+        "{backend}: the current generation must resolve to a deadline"
+    );
+    assert!(
+        store
+            .task_retention_deadline_if_current(&id, first.generation().wrapping_add(1))
+            .expect("reads succeed")
+            .is_none(),
+        "{backend}: a generation that is not current must read as absent"
+    );
+
+    assert!(
+        !store
+            .is_cancellation_requested(&id)
+            .expect("reads succeed"),
+        "{backend}: a fresh task carries no cancellation intent"
+    );
+    store
+        .request_cancellation(&id)
+        .unwrap_or_else(|error| panic!("{backend}: cancelling a known task must succeed: {error}"));
+    assert!(
+        store
+            .is_cancellation_requested(&id)
+            .expect("reads succeed"),
+        "{backend}: cancellation intent must be durable once recorded"
+    );
+}
+
+/// `B-35 third-party-backend-conformance`.
+///
+/// Two claims, and they are different in kind.
+///
+/// FIRST, the trait is implementable from outside the crate at all. Nothing
+/// in this workspace implemented `FinalTaskStore` outside
+/// `crates/fastmcp-server/src`; `MinimalBackend` below is the first, and it
+/// compiles against the published surface using only public items. That is a
+/// property of the shipped API, not of a mock.
+///
+/// SECOND, the required-surface properties hold for both the shipped store
+/// and an unrelated implementation, which is what makes them CONTRACT
+/// properties rather than observations about one backend's habits.
+///
+/// PL-3 note: the shipped `InMemoryFinalTaskStore` is exercised by the same
+/// function, so the real subject is under test. `MinimalBackend` never stands
+/// in for it -- it only bounds what the shared assertions are allowed to
+/// claim.
+#[test]
+fn b35_third_party_backend_conformance() {
+    let shipped = InMemoryFinalTaskStore::new(4).expect("bounded store");
+    assert_required_surface_conformance(&shipped, "InMemoryFinalTaskStore");
+
+    let third_party = MinimalBackend::default();
+    assert_required_surface_conformance(&third_party, "MinimalBackend");
+
+    // The optional surface FAILS CLOSED on a backend that declined it. The
+    // trait's defaults return an error rather than a false or a None, so a
+    // caller cannot mistake "not implemented" for "declined this time" and
+    // create unexecutable work. Nothing in the tree tested this.
+    let (task, notification) = conformance_task("conformance-fail-closed");
+    assert!(
+        third_party
+            .create_task_with_work(
+                task,
+                notification,
+                FinalTaskWorkDescriptor::new(serde_json::json!({"operation": "x"}))
+                    .expect("bounded descriptor")
+            )
+            .is_err(),
+        "a backend without atomic task-work creation must refuse, not silently create a task"
+    );
+    assert!(
+        third_party
+            .handoff_dispatch_lease_heartbeat_interval()
+            .is_err(),
+        "a backend with no durable lease must not disclose a heartbeat interval"
+    );
+    assert!(
+        third_party
+            .begin_handoff_dispatch_for_owner_if_current(
+                &conformance_task("conformance-fail-closed").0.base().task_id.clone(),
+                1,
+                "owner-a"
+            )
+            .is_err(),
+        "a backend with no dispatch election must refuse rather than report a lost race"
+    );
+
+    // And the discriminator: the SHIPPED store implements those same three,
+    // so the assertions above distinguish backends instead of holding
+    // vacuously for everyone.
+    assert!(
+        shipped.handoff_dispatch_lease_heartbeat_interval().is_ok(),
+        "the shipped store does implement the optional surface, so failing closed is a \
+         real distinction and not a property of the trait itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Frozen IDs
 // ---------------------------------------------------------------------------
 
@@ -850,6 +1150,7 @@ fn task_02_b_positive() {
     b29_backend_clock_discontinuity();
     b30_skewed_worker_time_domains();
     b32_deadline_survives_renew_and_restart();
+    b35_third_party_backend_conformance();
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
     b42_duplicate_execution_is_refused();
