@@ -406,6 +406,23 @@ def main():
         print(f"\nR4 VERDICT: {'PASS' if ok else 'FAIL'}")
         return 0 if ok else 1
 
+    # A zero from this instrument is the answer most likely to be wrong and
+    # least likely to look wrong -- the first version of it reported lib.rs = 0
+    # because it treated `any(feature, test)` as test-only. So the census
+    # refuses to print ANY count until the known-positive arm has passed in
+    # this same invocation. R4 requires the control be run; this makes it
+    # impossible to read a number that the control did not stand behind.
+    control = census(REPO / PROXY)
+    control_found = set(control["shipped"]["CALL"])
+    control_missing = sorted(set(PROXY_EXPECTED_CALLS) - control_found)
+    if control_missing:
+        print("KNOWN-POSITIVE CONTROL FAILED -- no counts reported.", file=sys.stderr)
+        print(f"  did not find frozen proxy.rs sites: {control_missing}", file=sys.stderr)
+        print("  Run --validate for the full control output.", file=sys.stderr)
+        return 2
+    print(f"control: {len(PROXY_EXPECTED_CALLS)}/{len(PROXY_EXPECTED_CALLS)} "
+          f"frozen proxy.rs sites found; :46 import and :752/:1346 docs excluded\n")
+
     targets = args.files or [str(REPO / f) for f in BEAD_FILES]
     total = 0
     for path in targets:
