@@ -18,22 +18,40 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers five of the twenty-three
-//! named groups, and covers two of those only in part:
+//! This file does NOT discharge the bead. It covers EIGHT of the twenty-three
+//! named groups, one of those only in part. The table below is the authority;
+//! keep this sentence and the table in agreement when either changes:
 //!
 //! | group | state here |
 //! |---|---|
 //! | `B-26 stale-owner-fenced-write`      | covered |
 //! | `B-27 lease-renew-expire-reclaim`    | covered -- renew, expire AND reclaim |
 //! | `B-28 durable-time-authority`        | covered |
+//! | `B-29 backend-clock-discontinuity`   | covered -- narrow; see the test's own scope note |
 //! | `B-31 private-update-revision-order` | PARTIAL: stale-generation refusal only. Ordering across concurrent writers is not asserted. |
 //! | `B-34 restore-write-contract`        | covered |
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
 //!
-//! SEVEN of twenty-three, one of them partial. **Sixteen groups have no test
-//! here and none anywhere in the tree**: B-24, B-25, B-29, B-30, B-32, B-33,
+//! EIGHT of twenty-three, one of them partial. **Fifteen groups have no test
+//! here and none anywhere in the tree**: B-24, B-25, B-30, B-32, B-33,
 //! B-35 through B-41, B-44, B-45, B-46.
+//!
+//! Of those fifteen, EIGHT are blocked on capability the shipped store does
+//! not have and cannot be closed by writing tests: B-25 and B-33
+//! (reconciliation), B-36 and B-41 (expiry index / tombstones), B-37 (quota),
+//! B-38 and B-40 (protected payloads; tasks.rs:8460 states the store
+//! "deliberately implements only unprotected work"), B-39 (durable-time
+//! epoch). SEVEN are candidates: B-24, B-30, B-32, B-35, B-44, B-45, B-46,
+//! plus completing B-31's ordering half.
+//!
+//! A NOTE ON THAT SPLIT, because the obvious heuristic over-blocks: absence of
+//! a word from the source decides nothing on its own. It is decisive only
+//! when the STORE must implement the concept. Where the TEST supplies it, the
+//! word is irrelevant -- `discontinu` and `skew` appear nowhere in the
+//! workspace, yet B-29 above is written and passing, because the test injects
+//! the clock. The same applies to B-35, where the test would supply a second
+//! `FinalTaskStore` implementation.
 //!
 //! COUNT THIS FILE BY ITS `#[test]` FUNCTIONS, NOT BY ITS MENTIONS. The table
 //! above names groups precisely in order to say which are MISSING, so a scan
@@ -175,6 +193,16 @@ impl Fixture {
             base,
             id,
         }
+    }
+
+    /// Moves the store's authoritative clock BACKWARDS, to the given offset
+    /// from the fixture's base. Real monotonic clocks do not do this; a
+    /// durable backend reading a corrected or mis-synced host clock can.
+    fn rewind_to(&self, offset: Duration) {
+        self.advanced_ms.store(
+            u64::try_from(offset.as_millis()).expect("test offsets fit in u64 milliseconds"),
+            Ordering::SeqCst,
+        );
     }
 
     /// Moves the store's authoritative clock forward. Nothing here sleeps.
@@ -605,6 +633,70 @@ fn b43_release_happens_exactly_once() {
     );
 }
 
+/// `B-29 backend-clock-discontinuity`: a clock that goes BACKWARDS cannot undo
+/// a reclamation that already happened.
+///
+/// Scope, stated because it is narrow: the store has no documented behaviour
+/// for a regressing clock, and inventing one here would be asserting a
+/// requirement the source does not carry. What IS backed by the source is that
+/// reclamation is DESTRUCTIVE -- `reclaim_expired_in_memory_final_tasks`
+/// removes the lease from `handoff_leases` and advances the generation
+/// (tasks.rs:3720-3727). Neither is recoverable by any later clock reading, so
+/// the safety property survives a discontinuity by construction rather than by
+/// a guard. This test pins that, and pins that the authority still tracks the
+/// injected value exactly afterwards.
+#[test]
+fn b29_backend_clock_discontinuity() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let (snapshot, fence) = fixture.elect("owner-a");
+
+    // Expire the lease and force the reclaim pass to observe it.
+    fixture.advance(ASSUMED_LEASE + Duration::from_secs(1));
+    assert!(
+        !fixture
+            .store
+            .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", fence)
+            .expect("store writes succeed"),
+        "the lease must be gone before the clock is rewound, or this proves nothing"
+    );
+    let reclaimed_generation = fixture.snapshot().generation();
+    assert_ne!(
+        reclaimed_generation,
+        snapshot.generation(),
+        "the reclaim must have advanced the generation before the rewind"
+    );
+
+    // THE DISCONTINUITY: back to before the lease was ever issued.
+    fixture.rewind_to(Duration::ZERO);
+    assert_eq!(
+        fixture.store.retention_clock_now(),
+        fixture.clock_reads(),
+        "the authority must report the injected value after it regresses, not a latched maximum"
+    );
+
+    // The evicted owner cannot renew even though its lease window now appears
+    // to lie in the future again. The lease row is gone; time cannot restore it.
+    assert!(
+        !fixture
+            .store
+            .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", fence)
+            .expect("store writes succeed"),
+        "a clock regression must not resurrect a reclaimed lease"
+    );
+    assert_eq!(
+        fixture.snapshot().generation(),
+        reclaimed_generation,
+        "a clock regression must not roll the generation back"
+    );
+
+    // And the task itself is untouched by the regression.
+    assert_eq!(
+        fixture.task_wire_form()["taskId"],
+        TASK,
+        "the record must survive the discontinuity intact"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Frozen IDs
 // ---------------------------------------------------------------------------
@@ -615,6 +707,7 @@ fn task_02_b_positive() {
     b26_stale_owner_fenced_write();
     b27_lease_renew_then_expire();
     b28_durable_time_authority();
+    b29_backend_clock_discontinuity();
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
     b42_duplicate_execution_is_refused();
