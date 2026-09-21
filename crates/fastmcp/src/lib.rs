@@ -10361,6 +10361,7 @@ pub mod legacy_2024 {
 /// FND-01 A closed-child source-freeze enforcement.
 pub mod evidence_binding;
 pub mod release_quarantine;
+pub mod release_quarantine_reachability;
 
 // Testing helpers are opt-in and do not widen the production facade.
 #[cfg(any(feature = "testing", feature = "testing-lab"))]
