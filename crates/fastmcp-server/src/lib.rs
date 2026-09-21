@@ -43152,10 +43152,31 @@ mod lib_unit_tests {
                 // whichever side is stuck. Interrogate the client here, with
                 // the non-cancelling `try_join` this file already uses, so the
                 // message discriminates instead of implying a server fault.
+                // The client task's output is itself a Result, and the two
+                // `Ok(Some(..))` cases mean opposite things. Eleven `return Err`
+                // sites and twenty-three `?` propagations in that task return
+                // WITHOUT calling `caller_cx.cancel_with`, so a client that
+                // fails early never cancels, `serve` never leaves its accept
+                // loop, and the client's real error is never surfaced because
+                // the outer join is never reached. Collapsing that into "the
+                // server stalled" would be a third wrong localisation, so the
+                // error payload is reported verbatim.
                 let client_state = match client.try_join() {
-                    Ok(None) => "client task STILL PENDING -- the stall is upstream, in the client",
-                    Ok(Some(_)) => "client task COMPLETED -- the stall is in the server",
-                    Err(_) => "client task FAILED -- read its error, not this bound",
+                    Ok(None) => {
+                        "client STILL PENDING -- the stall is upstream, in the client".to_string()
+                    }
+                    Ok(Some(Ok(()))) => {
+                        "client COMPLETED OK -- it cancelled caller_cx, so the stall is in the \
+                         server"
+                            .to_string()
+                    }
+                    Ok(Some(Err(error))) => format!(
+                        "client FAILED WITHOUT CANCELLING and this is the real error, not a \
+                         stall: {error}"
+                    ),
+                    Err(error) => {
+                        format!("client task could not be joined: {error:?}")
+                    }
                 };
                 format!(
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
