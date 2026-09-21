@@ -18,12 +18,13 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers ELEVEN of the twenty-three
+//! This file does NOT discharge the bead. It covers TWELVE of the twenty-three
 //! named groups, one of those only in part. The table below is the authority;
 //! keep this sentence and the table in agreement when either changes:
 //!
 //! | group | state here |
 //! |---|---|
+//! | `B-24 persist-ambiguous-commit`      | covered |
 //! | `B-26 stale-owner-fenced-write`      | covered |
 //! | `B-27 lease-renew-expire-reclaim`    | covered -- renew, expire AND reclaim |
 //! | `B-28 durable-time-authority`        | covered |
@@ -36,8 +37,8 @@
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
 //!
-//! ELEVEN of twenty-three, one of them partial. **Twelve groups have no test
-//! here and none anywhere in the tree**: B-24, B-25, B-33, B-36 through B-41,
+//! TWELVE of twenty-three, one of them partial. **Eleven groups have no test
+//! here and none anywhere in the tree**: B-25, B-33, B-36 through B-41,
 //! B-44, B-45, B-46.
 //!
 //! A RUN REPORTS 14 OUTCOMES, WHICH IS NOT 14 GROUPS AND NOT 23. Eleven group
@@ -848,6 +849,77 @@ fn b32_deadline_survives_renew_and_restart() {
     );
 }
 
+/// `B-24 persist-ambiguous-commit`: a commit whose acknowledgement was lost is
+/// safe to retry, because the retry cannot apply it a second time.
+///
+/// This is the defect the generation CAS exists to prevent. A caller that
+/// issues `replace_task_if_current` and then loses the response cannot tell
+/// whether the write landed. Its only safe move is to retry with the same
+/// expectation -- so the store must make that retry a no-op rather than a
+/// second application.
+///
+/// Source-backed: a successful replace runs `replace_in_memory_final_task`,
+/// which allocates a new generation and inserts it (tasks.rs:3646-3659), so
+/// the retry's expected generation no longer matches and the guard at
+/// tasks.rs:2542 returns `Ok(false)` before touching anything.
+#[test]
+fn b24_persist_ambiguous_commit() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let before = fixture.snapshot();
+
+    let replacement: Task = serde_json::from_value(serde_json::json!({
+        "taskId": TASK,
+        "status": "working",
+        "createdAt": "2026-07-28T12:00:00.000Z",
+        "lastUpdatedAt": "2026-07-28T12:05:00.000Z",
+        "ttlMs": 600_000
+    }))
+    .expect("a well-formed replacement at the same identifier");
+    let notification = TaskStatusNotification::new(TaskStatusNotificationParams {
+        task: replacement.clone(),
+        meta: None,
+        additional: std::collections::BTreeMap::default(),
+    });
+
+    // The commit lands.
+    assert!(
+        fixture
+            .store
+            .replace_task_if_current(&before, replacement.clone(), notification.clone())
+            .expect("store writes succeed"),
+        "the first commit at the current generation must apply"
+    );
+    let after_commit = fixture.snapshot().generation();
+    assert_ne!(
+        after_commit,
+        before.generation(),
+        "a commit must consume the generation it was conditioned on"
+    );
+
+    // AMBIGUITY: the caller never saw that result. It retries the IDENTICAL
+    // call with the IDENTICAL expectation, which is the only thing it can
+    // safely do.
+    assert!(
+        !fixture
+            .store
+            .replace_task_if_current(&before, replacement, notification)
+            .expect("a stale expectation is a refusal, not a transport error"),
+        "a retried ambiguous commit must not apply a second time"
+    );
+
+    // Exactly one application: the retry moved nothing.
+    assert_eq!(
+        fixture.snapshot().generation(),
+        after_commit,
+        "a refused retry must not consume a further generation"
+    );
+    assert_eq!(
+        fixture.task_wire_form()["lastUpdatedAt"],
+        "2026-07-28T12:05:00.000Z",
+        "the record must show the replacement, applied once"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // B-35: a second, out-of-crate backend
 // ---------------------------------------------------------------------------
@@ -1150,6 +1222,7 @@ fn task_02_b_positive() {
     b29_backend_clock_discontinuity();
     b30_skewed_worker_time_domains();
     b32_deadline_survives_renew_and_restart();
+    b24_persist_ambiguous_commit();
     b35_third_party_backend_conformance();
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
