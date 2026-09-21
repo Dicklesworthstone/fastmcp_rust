@@ -63316,9 +63316,27 @@ fn fallible(value: Option<u8>) {
         }
     }
 
+    // SELF-IDENTIFYING VOID, not a bare refusal. The four other platform gates in
+    // this file return TYPED errors (E_UNQUALIFIED_PLATFORM at :2007 and :8768,
+    // OrdinaryEntryFailure at :64487), so a reader meets a structured refusal and
+    // knows it is about the host. This one was the only bare `panic!`, and a panic
+    // from a #[test] is indistinguishable from a property violation -- which is
+    // exactly why ordinary_b_r5_post_consume_runtime_uses_evidence_code sat
+    // unattributed for hours among nine other reds.
+    //
+    // This does NOT weaken the gate: it still panics, the test still fails, and no
+    // assertion is relaxed. It only says WHICH KIND of failure it is, so the next
+    // reader spends seconds instead of an hour. Same shape as the git-absence void
+    // in fnd_01_a_evidence_binding.rs:397.
     #[cfg(not(all(test, target_os = "linux", target_arch = "x86_64")))]
     fn assert_ordinary_attest_self_reexec(_test_id: &str, _plant: OrdinaryPlant) {
-        panic!("ordinary Attest self-reexec fixture requires Linux x86_64");
+        panic!(
+            "VOID, NOT A FINDING - ordinary Attest self-reexec fixture is compiled out on this \
+             host: it requires cfg(all(test, target_os = \"linux\", target_arch = \"x86_64\")). \
+             This failure says NOTHING about the property under test, which was never \
+             evaluated. To make it evaluable, run this target on a Linux x86_64 host under \
+             cargo test; the qualifying variant is directly above this one."
+        );
     }
 
     fn ordinary_utf8_path(path: &Path, subject: &str) -> Result<String, String> {
