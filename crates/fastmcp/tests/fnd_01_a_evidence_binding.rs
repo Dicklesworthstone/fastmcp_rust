@@ -1763,3 +1763,82 @@ fn fnd_01_a_workspace_input_identity_shapes_are_gated() {
         );
     }
 }
+
+/// PLANTED NEGATIVE for the LENGTH ARM of property 2 — the arm that had none.
+///
+/// `workspace_input_provenance_drift` refuses on a DISJUNCTION:
+/// `anchored.len() != row.byte_length || digest != row.sha256`. The digest arm
+/// is planted by `fnd_01_a_workspace_input_digest_move_is_refused`. Until this
+/// test existed, the LENGTH arm was never shown to fire, so deleting the length
+/// comparison entirely would have left every test in this file green — the
+/// clause would have been load-bearing in production and unmeasured in the
+/// suite. Sibling clauses of one disjunction are separate claims; demonstrating
+/// that one refuses says nothing about the other.
+///
+/// This moves `byte_length` by exactly one and leaves BOTH the revision and the
+/// digest untouched, so the length is the only arm that can refuse it. The
+/// attribution assertion checks that rather than assuming it: a length-only
+/// divergence must report a byte mismatch while the two digests in the SAME
+/// message still agree. A plant that tripped both arms would satisfy a bare
+/// "something was refused" check while proving nothing about the length.
+///
+/// `+ 1` cannot accidentally agree with the tree: `accepted` rows are exactly
+/// those already binding at their anchors, so each one's recorded length equals
+/// the anchor's length before the plant.
+#[test]
+fn fnd_01_a_workspace_input_length_move_is_refused() {
+    let rows = declared_workspace_input_rows();
+    let clean = workspace_input_provenance_drift(&rows);
+    let accepted: Vec<&WorkspaceInputRow> = rows
+        .iter()
+        .filter(|row| {
+            !clean
+                .iter()
+                .any(|line| line.starts_with(&format!("{} @", row.path)))
+        })
+        .collect();
+    assert!(
+        accepted.len() >= 2,
+        "this control needs two rows that already bind at their anchors, so the red below is \
+         caused by the plant rather than by pre-existing drift; found {}",
+        accepted.len(),
+    );
+
+    let target = accepted[0].path.clone();
+    let witness = accepted[1].path.clone();
+    let untouched_digest = accepted[0].sha256.clone();
+    let mut planted = rows.clone();
+    for row in &mut planted {
+        if row.path == target {
+            row.byte_length += 1;
+        }
+    }
+    assert_ne!(
+        planted, rows,
+        "the plant must actually change the table it is testing"
+    );
+
+    let drift = workspace_input_provenance_drift(&planted);
+    let refusal = drift
+        .iter()
+        .find(|line| line.starts_with(&format!("{target} @")))
+        .unwrap_or_else(|| {
+            panic!(
+                "a recorded byte_length moved away from its anchor's bytes, with the provenance \
+                 commit and the digest untouched, must be refused; got {drift:?}"
+            )
+        });
+    assert_eq!(
+        refusal.matches(untouched_digest.as_str()).count(),
+        2,
+        "the refusal must be attributable to the LENGTH: the recorded digest and the anchor's \
+         digest are unchanged and must both appear in the message, so a count other than two \
+         means the digest arm fired too and this plant proves nothing about the length: {refusal}"
+    );
+    assert!(
+        !drift
+            .iter()
+            .any(|line| line.starts_with(&format!("{witness} @"))),
+        "the plant changed exactly one row, so {witness} must remain green; got {drift:?}"
+    );
+}
