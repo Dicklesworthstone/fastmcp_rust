@@ -239,7 +239,10 @@ struct FinalCacheEntry {
     // `CoreResult` without changing the result shape.
     result: CoreResult,
     scope: CacheScope,
-    generation: FinalCacheGeneration,
+    // Cache toggles fence requests, not already-committed content. Retained
+    // entries keep their result-set revision and original expiry; lookup
+    // attaches the current lifecycle epoch to each returned page snapshot.
+    result_set_revision: u64,
     receipt: Instant,
     expires_at: Instant,
     encoded_bytes: usize,
@@ -319,16 +322,18 @@ impl FinalResultCache {
         self.enabled
     }
 
-    /// Enables or disables cache use.
+    /// Enables or disables cache use without discarding retained entries.
     ///
-    /// A change discards retained entries and fences outstanding fetches,
-    /// including fetches started while disabled. Repeating the current setting
-    /// is a no-op. An exhausted lifecycle epoch cannot be re-enabled.
+    /// A change fences outstanding fetches, including fetches started while
+    /// disabled. Retained entries remain subject to their original TTL and
+    /// notification-driven invalidation; disabling does not pause expiry.
+    /// Repeating the current setting is a no-op. Use [`Self::clear`] to discard
+    /// entries explicitly. Exhausting the lifecycle epoch discards entries and
+    /// permanently disables caching rather than reusing a request token.
     pub fn set_enabled(&mut self, enabled: bool) {
-        if self.enabled != enabled {
-            self.clear();
+        if self.enabled != enabled && self.advance_epoch() {
+            self.enabled = enabled;
         }
-        self.enabled = enabled && !self.epoch_exhausted;
     }
 
     /// Returns bounded aggregate cache counters.
@@ -344,11 +349,25 @@ impl FinalResultCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.retained_bytes = 0;
+        self.advance_epoch();
+    }
+
+    /// Fences requests and previously returned page snapshots without
+    /// invalidating committed content. Overflow is terminal, including when
+    /// it occurs while re-enabling a disabled cache.
+    fn advance_epoch(&mut self) -> bool {
+        if self.epoch_exhausted {
+            return false;
+        }
         if let Some(epoch) = self.epoch.checked_add(1) {
             self.epoch = epoch;
+            true
         } else {
+            self.entries.clear();
+            self.retained_bytes = 0;
             self.epoch_exhausted = true;
             self.enabled = false;
+            false
         }
     }
 
@@ -382,14 +401,15 @@ impl FinalResultCache {
             return FinalCachePageLookup::Miss(FinalCacheMiss::Disabled);
         }
 
+        let generation = self.begin_fetch(key.result_set());
         let Some(entry) = self.entries.get(key) else {
             self.stats.misses = self.stats.misses.saturating_add(1);
             return FinalCachePageLookup::Miss(FinalCacheMiss::Absent);
         };
-        let entry_generation = entry.generation;
+        let entry_revision = entry.result_set_revision;
         let expires_at = entry.expires_at;
 
-        let miss = if entry_generation != self.begin_fetch(key.result_set()) {
+        let miss = if entry_revision != generation.revision {
             Some(FinalCacheMiss::Invalidated)
         } else if now >= expires_at {
             Some(FinalCacheMiss::Stale)
@@ -414,7 +434,7 @@ impl FinalResultCache {
         self.stats.hits = self.stats.hits.saturating_add(1);
         FinalCachePageLookup::Fresh(Box::new(FinalCachePage {
             result,
-            generation: entry_generation,
+            generation,
             scope,
         }))
     }
@@ -473,7 +493,7 @@ impl FinalResultCache {
             FinalCacheEntry {
                 result,
                 scope,
-                generation: captured_generation,
+                result_set_revision: captured_generation.revision,
                 receipt,
                 expires_at,
                 encoded_bytes,
@@ -1114,49 +1134,383 @@ mod tests {
     fn disable_and_reenable_fence_both_prior_and_disabled_fetches() {
         let mut cache = FinalResultCache::default();
         let cache_key = key("credential-a", None);
+        let receipt = Instant::now();
         let before_disable = cache.begin_fetch(cache_key.result_set());
+        let original = tools_result(100, "private", Some(r#""x-retained":"original""#));
+        let expected = original.encode().expect("original result encodes");
         assert_eq!(
-            cache.insert_if_current(
-                cache_key.clone(),
-                before_disable,
-                tools_result(100, "private", None),
-            ),
+            cache.insert_if_current_at(cache_key.clone(), before_disable, original, receipt),
             FinalCacheInsert::Stored
         );
+        let retained_before = cache.retained_bytes;
+        let stats_before = cache.stats();
         cache.set_enabled(false);
-        assert_eq!(cache.retained_bytes, 0);
-        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, retained_before);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.stats(), stats_before);
         assert!(matches!(
-            cache.lookup(&cache_key),
+            cache.lookup_at(&cache_key, receipt),
             FinalCacheLookup::Miss(FinalCacheMiss::Disabled)
         ));
         let while_disabled = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                while_disabled,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
         cache.set_enabled(true);
         for captured in [before_disable, while_disabled] {
             assert_eq!(
-                cache.insert_if_current(
+                cache.insert_if_current_at(
                     cache_key.clone(),
                     captured,
-                    tools_result(100, "private", None),
+                    tools_result(100, "private", Some(r#""x-retained":"late""#)),
+                    receipt,
                 ),
                 FinalCacheInsert::InvalidatedDuringFetch
             );
         }
+        assert_eq!(cache.retained_bytes, retained_before);
+        let FinalCacheLookup::Fresh(retained) = cache.lookup_at(&cache_key, receipt) else {
+            panic!("re-enabling must make the original entry available");
+        };
+        assert_eq!(retained.encode().expect("retained result encodes"), expected);
+        assert_eq!(cache.stats().fills, 1, "late fills did not mutate the cache");
+
         let current = cache.begin_fetch(cache_key.result_set());
         assert_eq!(
-            cache.insert_if_current(
+            cache.insert_if_current_at(
                 cache_key.clone(),
                 current,
-                tools_result(100, "private", None)
+                tools_result(100, "private", None),
+                receipt,
             ),
             FinalCacheInsert::Stored
         );
         cache.set_enabled(true);
         assert_eq!(cache.begin_fetch(cache_key.result_set()), current);
         assert!(matches!(
-            cache.lookup(&cache_key),
+            cache.lookup_at(&cache_key, receipt),
             FinalCacheLookup::Fresh(_)
         ));
+    }
+
+    // These checks use explicit receipt/lookup instants rather than sleeps, so
+    // scheduler load cannot consume the short TTLs in the fixtures.
+    fn retained_cache_toggle_fixture() -> (FinalResultCache, FinalCacheKey, Instant) {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        (cache, cache_key, receipt)
+    }
+
+    #[test]
+    fn cache_toggle_preserves_original_ttl_and_byte_accounting() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        let retained = cache.retained_bytes;
+        let stats = cache.stats();
+        for _ in 0..3 {
+            cache.set_enabled(false);
+            cache.set_enabled(true);
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.stats(), stats);
+            let entry = cache.entries.get(&cache_key).expect("retained entry");
+            assert_eq!(entry.receipt, receipt);
+            assert_eq!(entry.expires_at, receipt + Duration::from_millis(100));
+        }
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt + Duration::from_millis(99)),
+            FinalCacheLookup::Fresh(_)
+        ));
+        // Change only the lookup instant to the original expiration boundary.
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt + Duration::from_millis(100)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.stats().stale, 1);
+        assert_eq!(cache.stats().fills, 1);
+    }
+
+    #[test]
+    fn cache_toggle_does_not_restore_notification_invalidated_content() {
+        // Both cases take the same disable/enable path. Only the presence of
+        // a catalog invalidation while disabled differs.
+        for invalidate in [false, true] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            cache.set_enabled(false);
+            let disabled_generation = cache.begin_fetch(cache_key.result_set());
+            if invalidate {
+                cache.invalidate_notification(&notification(
+                    "notifications/tools/list_changed",
+                    None,
+                ));
+            }
+            cache.set_enabled(true);
+            let lookup = cache.lookup_at(&cache_key, receipt);
+            if invalidate {
+                assert!(matches!(
+                    lookup,
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+                assert_eq!(cache.retained_bytes, 0);
+            } else {
+                assert!(matches!(lookup, FinalCacheLookup::Fresh(_)));
+                assert!(cache.retained_bytes > 0);
+            }
+            assert_eq!(cache.stats().invalidations, u64::from(invalidate));
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    disabled_generation,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+            let current = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key,
+                    current,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+    }
+
+    #[test]
+    fn cache_toggle_returns_current_page_epoch_without_resetting_revision() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        cache.invalidate_result_set(cache_key.result_set());
+        let revision_one = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(revision_one.revision, 1);
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                revision_one,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let FinalCachePageLookup::Fresh(before) = cache.lookup_page_at(&cache_key, receipt) else {
+            panic!("first page is fresh");
+        };
+        cache.set_enabled(false);
+        let disabled = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(false);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), disabled);
+        cache.set_enabled(true);
+        let FinalCachePageLookup::Fresh(after) = cache.lookup_page_at(&cache_key, receipt) else {
+            panic!("retained page is fresh after re-enabling");
+        };
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(after.generation, current);
+        assert_ne!(after.generation, before.generation);
+        assert_eq!(after.generation.revision, before.generation.revision);
+        assert_eq!(after.generation.result_set, before.generation.result_set);
+        assert_eq!(after.scope, before.scope);
+        assert_eq!(
+            after.result.encode().expect("retained page encodes"),
+            before.result.encode().expect("original page encodes")
+        );
+        // Old pagination snapshots must not become current fill authority.
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                before.generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        cache.set_enabled(true);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), current);
+    }
+
+    #[test]
+    fn cache_toggle_preserves_credential_cursor_and_policy_partitions() {
+        for scope in ["private", "public"] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let generation = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, scope, None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+            cache.set_enabled(false);
+            cache.set_enabled(true);
+            for different_key in [
+                key("credential-b", None),
+                key("credential-a", Some("")),
+                key_with_revisions("credential-a", None, 2, 1, 1, 1),
+            ] {
+                assert!(matches!(
+                    cache.lookup_at(&different_key, receipt),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+            }
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn cache_clear_while_disabled_removes_content_and_fences_every_old_fetch() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        let before_disable = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(false);
+        let before_clear = cache.begin_fetch(cache_key.result_set());
+        cache.clear();
+        assert!(!cache.is_enabled());
+        let after_clear = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(true);
+        assert!(cache.is_enabled());
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        for captured in [before_disable, before_clear, after_clear] {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    captured,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+        }
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key,
+                current,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+    }
+
+    #[test]
+    fn cache_toggle_exhaustion_clears_entries_and_cannot_reuse_tokens() {
+        for initial_epoch in [u64::MAX - 1, u64::MAX] {
+            let mut cache = FinalResultCache::default();
+            cache.epoch = initial_epoch;
+            let cache_key = key("credential-a", None);
+            let receipt = Instant::now();
+            let old = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    old,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+            cache.set_enabled(false);
+            if initial_epoch == u64::MAX - 1 {
+                assert!(!cache.epoch_exhausted);
+                assert!(cache.entries.contains_key(&cache_key));
+            }
+            let disabled = cache.begin_fetch(cache_key.result_set());
+            cache.set_enabled(true);
+            assert!(cache.epoch_exhausted);
+            assert!(!cache.is_enabled());
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.retained_bytes, 0);
+            for captured in [old, disabled] {
+                assert_eq!(
+                    cache.insert_if_current_at(
+                        cache_key.clone(),
+                        captured,
+                        tools_result(100, "private", None),
+                        receipt,
+                    ),
+                    FinalCacheInsert::InvalidatedDuringFetch
+                );
+            }
+            for enabled in [false, true, true] {
+                cache.set_enabled(enabled);
+                assert!(!cache.is_enabled());
+                assert_eq!(cache.epoch, u64::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_toggle_keeps_capacity_and_original_eviction_order() {
+        let mut cache = FinalResultCache::new(2);
+        let receipt = Instant::now();
+        let keys = [
+            key("credential-a", None),
+            key("credential-a", Some("page-2")),
+            key("credential-a", Some("page-3")),
+        ];
+        for (cache_key, offset_ms) in keys.iter().take(2).zip(0u64..2) {
+            let generation = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, "private", None),
+                    receipt + Duration::from_millis(offset_ms),
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+        let retained = cache.retained_bytes;
+        cache.set_enabled(false);
+        cache.set_enabled(true);
+        assert_eq!(cache.retained_bytes, retained);
+        let generation = cache.begin_fetch(keys[2].result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                keys[2].clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt + Duration::from_millis(2),
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.stats().fills, 3);
+        assert_eq!(cache.stats().evictions, 1);
+        assert!(!cache.entries.contains_key(&keys[0]));
+        assert!(cache.entries.contains_key(&keys[1]));
+        assert!(cache.entries.contains_key(&keys[2]));
+        let retained_after = cache.retained_bytes;
+        cache.recount_retained_bytes();
+        assert_eq!(cache.retained_bytes, retained_after);
+        assert!(cache.retained_bytes <= cache.max_bytes);
     }
 
     #[test]
