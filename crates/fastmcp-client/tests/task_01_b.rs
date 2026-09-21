@@ -24,22 +24,44 @@
 //!
 //! # How a run of this file must be cited
 //!
-//! Every item here is `#[cfg(all(unix, feature = "tasks"))]`, exactly as the
-//! inline originals were, so whether these IDs exist at all depends on the
-//! feature resolution of the run that cites them:
+//! This target declares `required-features = ["tasks"]` in
+//! `crates/fastmcp-client/Cargo.toml`, and every item is additionally
+//! `#[cfg(all(unix, feature = "tasks"))]`, as the inline originals were.
 //!
-//! - `cargo test --workspace ...` DOES discover them. `tasks` is opt-in on
-//!   every package, but the `fastmcp` facade declares
-//!   `default = ["legacy-2024-11-05", "tasks"]` and its `tasks` feature
-//!   includes `fastmcp-client/tasks`, so a workspace build activates the gate
-//!   by unification. This is the bead's declared runner.
-//! - `cargo test -p fastmcp-client` alone does NOT, unless `--features tasks`
-//!   is passed. It compiles both proofs away and reports a green having
-//!   executed nothing.
+//! CORRECTION, recorded because I got this wrong when I first wrote the file:
+//! I claimed a no-flags `-p fastmcp-client` run would "compile both proofs
+//! away and report a green having executed nothing." It would not have. The
+//! `use` block below is NOT cfg-gated, and `TASKS_EXTENSION` is re-exported
+//! from `fastmcp_protocol` only under `#[cfg(feature = "tasks")]`
+//! (`fastmcp-protocol/src/lib.rs:149`). So before the Cargo stanza existed
+//! this target failed E0432 and took all 23 test targets in this package down
+//! with it. A red, not a false green -- and not confined to this bead.
+//!
+//! With the stanza, the three behaviours are:
+//!
+//! - `cargo test --workspace ...` DISCOVERS them. `tasks` is opt-in on every
+//!   package, but the published facade `fastmcp-rust` declares
+//!   `default = ["legacy-2024-11-05", "tasks"]` and forwards it to the member
+//!   crates, so a workspace build satisfies the requirement by unification.
+//! - `cargo test -p fastmcp-client --features tasks` DISCOVERS them. This is
+//!   the runner card's invocation.
+//! - `cargo test -p fastmcp-client` alone SILENTLY SKIPS the whole target and
+//!   exits 0. `required-features` is what makes that quiet rather than loud,
+//!   which is precisely why the flag above is mandatory rather than advisory.
 //!
 //! A receipt citing these IDs must therefore carry the package selection, the
-//! feature set, and the target triple -- not just the exit status. The
-//! difference between the two runs above is silent in both.
+//! feature set and the target triple -- not just the exit status. The third
+//! case is indistinguishable from success by exit code alone.
+//!
+//! # Which configuration a green here binds
+//!
+//! `--features tasks` is NOT an exotic flag: it is what the published facade
+//! `fastmcp-rust` turns on by default, so a consumer depending on
+//! `fastmcp-rust` ships with Tasks active. A consumer depending directly on
+//! `fastmcp-client` does not, unless it opts in. A green here therefore binds
+//! the default facade configuration and the opt-in direct-dependency
+//! configuration -- not the default direct-dependency one, where these
+//! entrypoints do not exist at all.
 //!
 //! # Scope limit
 //!

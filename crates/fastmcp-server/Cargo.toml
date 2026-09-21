@@ -112,5 +112,19 @@ name = "http_continuation_recovery"
 path = "tests/http_continuation_recovery.rs"
 required-features = ["proxy", "native-tls-roots"]
 
+[[test]]
+# TASK-02-B's durability proofs (bd-mcp-task-02-b-x5r3). `FinalTaskStore`,
+# `InMemoryFinalTaskStore`, `FinalTaskSnapshot`, `FinalTaskWorkDescriptor` and
+# `FinalTaskRetentionDeadline` are all exported from `lib.rs` behind
+# `#[cfg(feature = "tasks")]`, and this package's default is
+# `["legacy-2024-11-05"]`. Without this stanza the target is always built and
+# always fails E0432, breaking every other test target here.
+#
+# As above: this stanza is exactly why the runner card must pass
+# `--features tasks`. It converts a loud compile failure into a silent skip.
+name = "task_02_b"
+path = "tests/task_02_b.rs"
+required-features = ["tasks"]
+
 [lints]
 workspace = true

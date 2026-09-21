@@ -38,6 +38,28 @@
 //! `durable` = 157 and `generation` = 540. Those four are implementation gaps,
 //! not test gaps, and cannot be closed by writing tests.
 //!
+//! # Feature gating, and which configuration a green here binds
+//!
+//! This target declares `required-features = ["tasks"]` in
+//! `crates/fastmcp-server/Cargo.toml`. It needs it: `FinalTaskStore`,
+//! `InMemoryFinalTaskStore`, `FinalTaskSnapshot`, `FinalTaskWorkDescriptor`
+//! and `FinalTaskRetentionDeadline` are all exported from `lib.rs` behind
+//! `#[cfg(feature = "tasks")]`, while this package defaults to
+//! `["legacy-2024-11-05"]`. Shipped without the stanza this file failed E0432
+//! and broke all 20 test targets in the package -- it did so once, on
+//! 2026-09-21, before the stanza was added.
+//!
+//! The stanza trades a loud compile failure for a SILENT SKIP, so
+//! `cargo test -p fastmcp-server` with no flags now exits 0 having discovered
+//! neither frozen ID. That is why the runner card passes `--features tasks`
+//! explicitly and why any receipt must cite the discovered count, not the
+//! exit status.
+//!
+//! Scope of a green: `tasks` is what the published facade `fastmcp-rust`
+//! enables by default, so this binds the default facade configuration. A
+//! consumer depending directly on `fastmcp-server` must opt in, and without
+//! opting in none of these entrypoints exist.
+//!
 //! # Why the clock is injected
 //!
 //! `InMemoryFinalTaskStore::with_clock` takes the monotonic retention clock as

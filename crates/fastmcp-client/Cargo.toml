@@ -56,5 +56,21 @@ rustix = { workspace = true, features = ["std", "event", "fs", "process"] }
 # Test-only context construction; production callers supply or inherit a Cx.
 asupersync = { workspace = true, features = ["test-internals"] }
 
+[[test]]
+# TASK-01-B's frozen proofs (bd-mcp-task-01-b-wivg). They were promoted out of
+# `#[cfg(test)] mod tests` for PL-3, and that promotion is what made this
+# stanza necessary: out of crate, the Tasks symbols they import are only
+# exported under `--features tasks`, so without this the target is always
+# built, always fails E0432 under default features, and takes every other test
+# target in this package down with it.
+#
+# This stanza is ALSO why the runner card must pass `--features tasks`
+# explicitly. `required-features` turns a compile error into a SILENT SKIP: a
+# no-flags run reports success having discovered none of the frozen IDs. That
+# is the failure mode AGENTS.md names, so the flag is mandatory, not optional.
+name = "task_01_b"
+path = "tests/task_01_b.rs"
+required-features = ["tasks"]
+
 [lints]
 workspace = true
