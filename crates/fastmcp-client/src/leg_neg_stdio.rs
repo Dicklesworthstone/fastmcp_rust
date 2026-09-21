@@ -197,18 +197,25 @@ impl StdioFirstWireSignal {
     ///
     /// # Adding a variant
     ///
-    /// This is a `matches!` against a single pattern, which means it is
-    /// `_ => false` by implication: **a new variant silently becomes
-    /// ineligible and nothing fails to compile.** That default is correct for
-    /// every variant added so far, because only a correlated refusal proves
-    /// the peer refused the modern method. If you ever add a variant that
-    /// SHOULD authorize a fallback, you must add it to the pattern here — no
-    /// exhaustiveness check will catch the omission, unlike [`Self::token`],
-    /// which is an exhaustive `match` and will refuse to compile until every
-    /// variant has a frozen manifest token.
+    /// This is an exhaustive `match` with one arm per variant, the same shape as
+    /// [`Self::token`] twelve lines above: **a new variant will not compile until
+    /// this function names it and states its verdict.** There is no `_` arm, so
+    /// eligibility is a decision that has to be written down rather than one a
+    /// variant inherits by default. Only a correlated refusal proves the peer
+    /// refused the modern method, which is why exactly one variant is eligible
+    /// today; a future variant that should authorize a fallback gets `true` here
+    /// and the compiler will insist you choose.
     #[must_use]
     pub const fn is_fallback_eligible(self) -> bool {
-        matches!(self, Self::CorrelatedDiscoveryRefusal)
+        match self {
+            Self::ModernDiscoveryResult => false,
+            Self::CorrelatedDiscoveryRefusal => true,
+            Self::UncorrelatedDiscoveryRefusal => false,
+            Self::RecognizedModernError => false,
+            Self::NoModernProbe => false,
+            Self::UnsupportedEraAdvertised => false,
+            Self::MalformedFirstWire => false,
+        }
     }
 }
 

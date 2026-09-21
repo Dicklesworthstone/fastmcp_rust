@@ -864,3 +864,90 @@ fn leg_neg_01_a_planted_negative() {
     assert!(reaccepted.probe_reaped());
     cleanup(&reaccept_trace);
 }
+
+/// bd-exhaustive-fallback-eligibility-vko6j V3: every variant's fallback-eligibility
+/// verdict is asserted by name.
+///
+/// This exists because the two guards see different failures and neither sees the
+/// other's. `is_fallback_eligible` is an exhaustive `match`, so rustc refuses to compile
+/// a NEW variant until someone states its verdict — but a wrong verdict inside a
+/// correctly-shaped arm compiles clean. That is what this test catches. Adding a variant
+/// is a compile error; changing one's answer is a test failure.
+///
+/// Scope: this pins the verdicts of one predicate. It says nothing about
+/// `ProtocolPolicy::Auto` handling, about any other `matches!` in the crate, and it
+/// grants no capability credit.
+#[test]
+fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
+    // One row per variant, each named as a literal so a rename or a removal is a
+    // compile error here too, not a silently shrinking table.
+    let expected: [(StdioFirstWireSignal, &str, bool); 7] = [
+        (
+            StdioFirstWireSignal::ModernDiscoveryResult,
+            "ModernDiscoveryResult",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+            "CorrelatedDiscoveryRefusal",
+            true,
+        ),
+        (
+            StdioFirstWireSignal::UncorrelatedDiscoveryRefusal,
+            "UncorrelatedDiscoveryRefusal",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::RecognizedModernError,
+            "RecognizedModernError",
+            false,
+        ),
+        (StdioFirstWireSignal::NoModernProbe, "NoModernProbe", false),
+        (
+            StdioFirstWireSignal::UnsupportedEraAdvertised,
+            "UnsupportedEraAdvertised",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::MalformedFirstWire,
+            "MalformedFirstWire",
+            false,
+        ),
+    ];
+
+    for (signal, name, want) in expected {
+        let got = signal.is_fallback_eligible();
+        assert_eq!(
+            got, want,
+            "StdioFirstWireSignal::{name} fallback eligibility changed: expected {want}, got {got}"
+        );
+    }
+
+    // Counted from the FUNCTION, not from the table above: a table that agreed with
+    // itself would prove nothing. Two verdicts flipped in opposite directions would
+    // still pass the loop's per-row messages only if they cancelled, and this catches
+    // that.
+    let eligible = expected
+        .iter()
+        .filter(|(signal, _, _)| signal.is_fallback_eligible())
+        .count();
+    assert_eq!(
+        eligible, 1,
+        "exactly one signal may authorize a fallback; the function reports {eligible}"
+    );
+
+    // The rows must name seven DISTINCT variants. Without this, a duplicated row would
+    // silently reduce coverage while the length still read 7.
+    let mut tokens: Vec<&str> = expected
+        .iter()
+        .map(|(signal, _, _)| signal.token())
+        .collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    assert_eq!(
+        tokens.len(),
+        7,
+        "the table must cover seven distinct variants, found {}",
+        tokens.len()
+    );
+}
