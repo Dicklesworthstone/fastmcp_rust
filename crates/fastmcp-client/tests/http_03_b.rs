@@ -242,11 +242,31 @@ fn assert_manifest_order(cases: &[ManifestCase; 13]) {
 /// against the cases this file actually executes.
 ///
 /// The manifest is deliberately not rebuilt here.
+/// THE ONE INSTRUMENT both the positive and the planted negative use.
+///
+/// Extracted deliberately rather than written twice. If the positive computes
+/// the digest one way and the negative reimplements it, the negative proves a
+/// property of SHA-256 - that different bytes hash differently - which was
+/// never in doubt, and it keeps passing if the guard it is supposed to protect
+/// is weakened or deleted. Sharing this function means breaking the instrument
+/// breaks BOTH directions, which is what makes the negative protect the
+/// positive rather than merely accompany it.
+fn manifest_digest_hex(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = sha256_bounded(text.as_bytes(), 64 * 1024)
+        .expect("a manifest under test stays within the published bound");
+    let mut rendered = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
+    }
+    rendered
+}
+
 /// `HTTP_03_B_EVALUATOR_MANIFEST_V1` is the producer-owned acceptance input the
 /// HTTP-03 integration join consumes; a locally authored copy would prove
 /// nothing about what ships.
 fn assert_shipped_manifest() {
-    use std::fmt::Write as _;
     let text = HTTP_03_B_EVALUATOR_MANIFEST_V1;
     assert!(
         text.ends_with('\n') && !text.contains('\r'),
@@ -312,12 +332,8 @@ fn assert_shipped_manifest() {
         "the published HTTP-03 B digest must bind the published manifest bytes"
     );
 
-    let mut rendered = String::with_capacity(64);
-    for byte in recomputed.as_bytes() {
-        write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
-    }
     assert_eq!(
-        rendered, HTTP_03_B_MANIFEST_DIGEST_HEX,
+        manifest_digest_hex(text), HTTP_03_B_MANIFEST_DIGEST_HEX,
         "the published manifest bytes changed: a reordering, an omitted group, floor or \
          negative, or any other edit fails this slice until the frozen digest is re-approved"
     );
@@ -342,8 +358,6 @@ fn assert_shipped_manifest() {
 /// at the first failure: without the label a red names the test and hides which
 /// dimension stopped discriminating.
 fn assert_manifest_digest_refuses_perturbation() {
-    use std::fmt::Write as _;
-
     let text = HTTP_03_B_EVALUATOR_MANIFEST_V1;
     let rows: Vec<&str> = text.split('\n').collect();
 
@@ -367,14 +381,8 @@ fn assert_manifest_digest_refuses_perturbation() {
             "{dimension}: the planted perturbation must actually change the bytes, \
              otherwise this case proves nothing"
         );
-        let digest = sha256_bounded(perturbed.as_bytes(), 64 * 1024)
-            .expect("a perturbed manifest stays within the same bound");
-        let mut rendered = String::with_capacity(64);
-        for byte in digest.as_bytes() {
-            write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
-        }
         assert_ne!(
-            rendered, HTTP_03_B_MANIFEST_DIGEST_HEX,
+            manifest_digest_hex(&perturbed), HTTP_03_B_MANIFEST_DIGEST_HEX,
             "{dimension}: the frozen anchor must refuse a manifest differing in this dimension"
         );
     }
