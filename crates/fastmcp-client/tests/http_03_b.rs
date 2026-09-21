@@ -191,6 +191,21 @@ const NEGATIVE_CASES: [ManifestCase; 13] = [
     },
 ];
 
+/// The frozen SHA-256 of `HTTP_03_B_EVALUATOR_MANIFEST_V1`, as 64 lowercase hex characters.
+///
+/// Acceptance requires that a digest mismatch FAILS this slice. The
+/// producer/consumer comparison below cannot establish that on its own: both
+/// sides recompute SHA-256 over the same published constant, so editing the
+/// manifest moves both sides together and the equality still holds. That check
+/// proves the two published halves agree on the bound; it cannot detect a change
+/// to the bytes. This constant is the independent anchor that can.
+///
+/// Anchoring it is sound because the manifest is a literal `concat!` of fixed
+/// strings - no `env!`, no build-time interpolation - so these bytes move only
+/// when someone edits them, which is exactly the event this must fail on.
+const HTTP_03_B_MANIFEST_DIGEST_HEX: &str =
+    "23fb2f9a13130aea1c80891371979494a116ac978fd78d987de1152b18af7135";
+
 /// The frozen group order both tables must equal.
 const MANIFEST_GROUP_ORDER: [&str; 13] = [
     "HTTP-03.14",
@@ -231,6 +246,7 @@ fn assert_manifest_order(cases: &[ManifestCase; 13]) {
 /// HTTP-03 integration join consumes; a locally authored copy would prove
 /// nothing about what ships.
 fn assert_shipped_manifest() {
+    use std::fmt::Write as _;
     let text = HTTP_03_B_EVALUATOR_MANIFEST_V1;
     assert!(
         text.ends_with('\n') && !text.contains('\r'),
@@ -294,6 +310,16 @@ fn assert_shipped_manifest() {
         http_03_b_manifest_digest().as_bytes(),
         recomputed.as_bytes(),
         "the published HTTP-03 B digest must bind the published manifest bytes"
+    );
+
+    let mut rendered = String::with_capacity(64);
+    for byte in recomputed.as_bytes() {
+        write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
+    }
+    assert_eq!(
+        rendered, HTTP_03_B_MANIFEST_DIGEST_HEX,
+        "the published manifest bytes changed: a reordering, an omitted group, floor or \
+         negative, or any other edit fails this slice until the frozen digest is re-approved"
     );
 }
 
