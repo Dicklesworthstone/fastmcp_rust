@@ -285,7 +285,14 @@ mod tests {
     fn with_virtual_clock(test: impl FnOnce(&asupersync::runtime::Runtime)) {
         // Not bound and never advanced: a fresh `VirtualClock` starts at
         // `Time::ZERO` and stays there, which is the property both callers want.
+        //
+        // No blocking threads: neither caller spawns blocking work, so this
+        // runtime exists only to mint contexts bound to the timer driver above.
+        // Declaring that bounds this helper's footprint the way the runtimes
+        // around it are bounded -- `logout::with_runtime` at (0, 0), and the
+        // `lib.rs` subscription runtimes at (2, MAX_DISPATCH_QUEUE_DEPTH).
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
             .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
                 Arc::new(asupersync::time::VirtualClock::new()),
             ))
