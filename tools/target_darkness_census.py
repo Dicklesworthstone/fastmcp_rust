@@ -131,7 +131,19 @@ def targets(crate: Path) -> list[dict]:
     out: list[dict] = []
     declared: set[Path] = set()
 
-    def add(kind: str, name: str, path: Path, required: list[str]) -> None:
+    # A target only makes a #[test] DISCOVERABLE if it carries a libtest harness.
+    # Cargo defaults `test` to true for lib/bin/test targets and FALSE for
+    # examples and benches. An example that compiles a file does not register its
+    # tests, so it cannot clear that file's darkness -- and this repo says so out
+    # loud: both `#[path]` includers of fnd_01_dependency_evidence.rs are examples
+    # carrying `test = false` with the comment "never execute it as an example
+    # test harness". Counting them as reachers made a genuinely class-1 file read
+    # as not dark at all.
+    HARNESS_BY_DEFAULT = {"lib": True, "bin": True, "test": True, "example": False, "bench": False}
+
+    def add(kind: str, name: str, path: Path, required: list[str], stanza: dict | None = None) -> None:
+        if not (stanza or {}).get("test", HARNESS_BY_DEFAULT[kind]):
+            return
         if path.is_file():
             # A required feature outside the default closure makes the whole
             # target absent from a default build.
@@ -151,12 +163,12 @@ def targets(crate: Path) -> list[dict]:
             rel = stanza.get("path") or f"{subdir[key]}/{stanza['name']}.rs"
             path = (crate / rel).resolve()
             declared.add(path)
-            add(key, stanza["name"], path, stanza.get("required-features", []))
+            add(key, stanza["name"], path, stanza.get("required-features", []), stanza)
 
     lib = manifest.get("lib", {})
     lib_path = (crate / lib.get("path", "src/lib.rs")).resolve()
     if lib_path.is_file() and lib_path not in declared:
-        add("lib", manifest["package"]["name"], lib_path, lib.get("required-features", []))
+        add("lib", manifest["package"]["name"], lib_path, lib.get("required-features", []), lib)
     main = (crate / "src/main.rs").resolve()
     if main.is_file() and main not in declared:
         add("bin", manifest["package"]["name"], main, [])
@@ -256,6 +268,7 @@ def census() -> dict:
     )
     detail: dict[str, dict[str, int]] = {k: defaultdict(int) for k in counts}
     inner_decl: dict[str, int] = defaultdict(int)
+    instance: dict[str, str] = {}
     by_target: dict[str, int] = defaultdict(int)
     files = sorted({p.resolve() for p in REPO.glob("crates/**/*.rs")} | {p.resolve() for p in REPO.glob("tools/**/*.rs")})
     for path in files:
@@ -279,23 +292,29 @@ def census() -> dict:
             # Only here can cfg_darkness_census speak: no outer gate took this
             # file, so its sites are governed by in-file enclosing and per-fn
             # cfgs alone. Precedence 3 > 4 within the file, as 02' orders them.
+            enc = fn = 0
             for enc_feat, _enc_any, fn_feat in analyze(path):
                 bucket = "class3_infile" if enc_feat else "class4" if fn_feat else "not_dark"
                 counts[bucket] += 1
                 detail[bucket][tag] += 1
+                enc += enc_feat
+                fn += bool(fn_feat) and not enc_feat
+            instance[str(path.relative_to(REPO))] = f"class3_infile={enc}" if enc else f"class4>={fn}"
             if all(r["decl_cfg"] for r in reachers if not r["target"]["gated"]):
                 inner_decl[tag] += sites
             by_target[tag] += sites
             continue
         counts[key] += sites
         detail[key][tag] += sites
+        instance[str(path.relative_to(REPO))] = key
         # Attribution keeps only the OUTERMOST gate; a run is governed by ALL of
         # them. Tally the inner declaration gate separately so the control can
         # predict a discovered count that attribution alone cannot.
         if all(r["decl_cfg"] for r in reachers if not r["target"]["gated"]):
             inner_decl[tag] += sites
         by_target[tag] += sites
-    return {"counts": counts, "detail": detail, "inner_decl": inner_decl, "by_target": by_target}
+    return {"counts": counts, "detail": detail, "inner_decl": inner_decl,
+            "by_target": by_target, "instance": instance}
 
 
 # The oauth_interaction target, run twice on the lane on 2026-09-21:
@@ -304,6 +323,23 @@ def census() -> dict:
 CONTROL_TARGET = "fastmcp-client:test:oauth_interaction"
 CONTROL_DISCOVERED = 127
 CONTROL_NEGATIVE = "fastmcp-client:test:clt_01_executor"
+
+# Instances that were EXECUTED on the lane earlier in bd-6o8cc, each re-derived
+# here rather than carried forward on its label. A taxonomy selects its own
+# population, so "class 3 under the old classifier" and "class 3 under this one"
+# share a name, not a referent; these rows are what make the transfer provable.
+# The class-3 count is anchored to a run (hz4 feature-off vs C2-B feature-on
+# moved exactly these 7). The class-4 file's tenth per-fn site is real but was
+# correctly absent from BOTH arms of its run -- all(not(legacy), ws) with legacy
+# default-on -- which is why that run's differential was 9 and this is `>= 9`.
+EXECUTED_INSTANCES = (
+    ("crates/fastmcp/tests/fnd_01_dependency_evidence.rs", "class1",
+     "class 1 -- hz3, the whole target vanishes without `testing-lab`"),
+    ("crates/fastmcp-client/tests/http_03_b_runtime.rs", "class3_infile=7",
+     "class 3 -- the 7 `mod authenticated_tls` tests, absent in hz4 and present in C2-B"),
+    ("crates/fastmcp/src/lib.rs", "class4>=9",
+     "class 4 -- the pre-registered differential of 9 per-fn feature sites"),
+)
 
 
 def run_controls(result: dict) -> None:
@@ -326,6 +362,19 @@ def run_controls(result: dict) -> None:
         )
     if d["class2"].get(CONTROL_NEGATIVE, 0) or result["inner_decl"].get(CONTROL_NEGATIVE, 0):
         sys.exit(f"CONTROL FAILED (negative): ungated {CONTROL_NEGATIVE} was attributed a gate")
+
+    # 02' requires one EXECUTED instance per class, checked before output is used.
+    # Classes 2 and 3-cross-file are covered above. These three re-derive the
+    # remaining executed instances from earlier in this bead, so a future edit
+    # that silently reclassifies one of them fails here instead of in a receipt.
+    for path, want, why in EXECUTED_INSTANCES:
+        got = result["instance"].get(path)
+        ok = got == want
+        if not ok and want.count(">=") == 1 and isinstance(got, str) and got.startswith(want.split(">=")[0]):
+            # A floor, not an equality: the run demonstrated at least this many.
+            ok = int(got.rsplit(">=", 1)[-1].lstrip("=")) >= int(want.rsplit(">=", 1)[-1])
+        if not ok:
+            sys.exit(f"CONTROL FAILED (executed instance): {path} was {why}, classifier now says {got}")
 
 
 def main() -> int:
