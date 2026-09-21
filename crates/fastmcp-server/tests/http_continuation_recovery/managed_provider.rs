@@ -77,7 +77,9 @@ impl ManagedOAuthInputHandler for Host {
                 Case::InvalidAnswers => {
                     return Ok(Some(answers(&["unrequested"], &self.answers)));
                 }
-                Case::PartialCancel if round > 0 => ctx.request_cancellation().cancel(),
+                Case::PartialCancel if round > 0 => {
+                    ctx.request_cancellation().cancel();
+                }
                 _ => {}
             }
             let keys: &[&str] = if self.case.partial() {
