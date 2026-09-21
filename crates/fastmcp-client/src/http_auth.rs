@@ -64,9 +64,9 @@ impl fmt::Display for BearerBindingError {
                 formatter.write_str("bearer credentials bind only to https resources")
             }
             Self::EmptyToken => formatter.write_str("bearer token is empty"),
-            Self::InvalidTokenBytes => {
-                formatter.write_str("bearer token exceeds the byte limit or violates token68 syntax")
-            }
+            Self::InvalidTokenBytes => formatter.write_str(
+                "bearer token exceeds the byte limit or violates token68 syntax",
+            ),
         }
     }
 }
@@ -458,8 +458,9 @@ mod tests {
 
     #[test]
     fn bearer_alphabet_and_trailing_padding_round_trip_http_admission() {
-        use fastmcp_core::AccessToken;
         use std::time::{Duration, Instant};
+
+        use fastmcp_core::AccessToken;
 
         let resource = url("https://mcp.example/api");
         let now = Instant::now();
@@ -526,13 +527,17 @@ mod tests {
 
     #[test]
     fn bearer_byte_limit_includes_padding_in_both_constructors() {
-        use fastmcp_core::{AccessToken, MAX_ACCESS_TOKEN_BYTES};
         use std::time::{Duration, Instant};
+
+        use fastmcp_core::{AccessToken, MAX_ACCESS_TOKEN_BYTES};
 
         let resource = url("https://mcp.example/api");
         let now = Instant::now();
         for padding in ["", "=="] {
-            let exact = format!("{}{padding}", "a".repeat(MAX_ACCESS_TOKEN_BYTES - padding.len()));
+            let exact = format!(
+                "{}{padding}",
+                "a".repeat(MAX_ACCESS_TOKEN_BYTES - padding.len())
+            );
             let excessive = format!("a{exact}");
             assert_eq!(exact.len(), MAX_ACCESS_TOKEN_BYTES);
             assert_eq!(excessive.len(), MAX_ACCESS_TOKEN_BYTES + 1);
@@ -566,7 +571,8 @@ mod tests {
 
         let resource = url("https://mcp.example/api");
         for token in ["aZ09-._~+/==".to_owned(), "a".repeat(MAX_ACCESS_TOKEN_BYTES)] {
-            let credential = BoundBearerCredential::bind(resource.clone(), token.clone()).unwrap();
+            let credential =
+                BoundBearerCredential::bind(resource.clone(), token.clone()).unwrap();
             let make_request = |target| {
                 ModernHttpRequest::new(
                     target,
@@ -581,11 +587,11 @@ mod tests {
             let request = make_request(resource.as_str());
             let mut headers = request
                 .headers()
-                .iter()
+                .into_iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"));
             let (_, header) = headers.next().expect("bound target receives its credential");
             assert!(headers.next().is_none());
-            assert_eq!(AccessToken::parse(header).unwrap().token, token);
+            assert_eq!(AccessToken::parse(&header).unwrap().token, token);
             let other = make_request("https://mcp.example/other");
             assert!(
                 other
