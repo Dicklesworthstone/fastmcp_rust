@@ -18,7 +18,7 @@
 //!
 //! # Coverage against the bead's 23 ordered groups -- READ THIS BEFORE CITING
 //!
-//! This file does NOT discharge the bead. It covers TWELVE of the twenty-three
+//! This file does NOT discharge the bead. It covers THIRTEEN of the twenty-three
 //! named groups, one of those only in part. The table below is the authority;
 //! keep this sentence and the table in agreement when either changes:
 //!
@@ -36,10 +36,11 @@
 //! | `B-35 third-party-backend-conformance` | covered -- required surface only |
 //! | `B-42 duplicate-execution-idempotency` | covered |
 //! | `B-43 shutdown-drain-lease-release`  | covered |
+//! | `B-45 anonymous-leaked-handle`       | covered |
 //!
-//! TWELVE of twenty-three, one of them partial. **Eleven groups have no test
+//! THIRTEEN of twenty-three, one of them partial. **Ten groups have no test
 //! here and none anywhere in the tree**: B-25, B-33, B-36 through B-41,
-//! B-44, B-45, B-46.
+//! B-44, B-46.
 //!
 //! A RUN REPORTS 14 OUTCOMES, WHICH IS NOT 14 GROUPS AND NOT 23. Eleven group
 //! tests, one lease-window guard, and the two frozen IDs. This file has been
@@ -920,6 +921,84 @@ fn b24_persist_ambiguous_commit() {
     );
 }
 
+/// `B-45 anonymous-leaked-handle`: no handoff surface accepts an anonymous
+/// owner, so a leaked handle cannot be exercised without attribution.
+///
+/// Every owner-bound entry point guards on `owner_id.is_empty()` and returns
+/// a typed error -- tasks.rs:2641, :2714, :2863. The distinction matters: a
+/// `false` or a `None` would be indistinguishable from a legitimately lost
+/// race, so an unattributable caller could retry forever and a reader of the
+/// logs could not tell it apart from contention. An `Err` says the call was
+/// malformed, not unlucky.
+///
+/// This covers all three guarded surfaces. `B-42` already exercises the third
+/// in passing; here the property is asserted as a property of the SURFACE
+/// rather than of one method.
+#[test]
+fn b45_anonymous_handle_is_refused_everywhere() {
+    let fixture = Fixture::new(TASK, 600_000);
+    let snapshot = fixture.snapshot();
+
+    // 1. Initial-work handoff.
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "")
+            .is_err(),
+        "initial-work handoff must refuse an anonymous owner with a typed error"
+    );
+
+    // 2. Accepted-input handoff.
+    assert!(
+        fixture
+            .store
+            .take_input_handoff_for_owner_if_current(&snapshot, "")
+            .is_err(),
+        "input handoff must refuse an anonymous owner with a typed error"
+    );
+
+    // 3. The handoff-completing replace.
+    let (replacement, notification) = conformance_task(TASK);
+    assert!(
+        fixture
+            .store
+            .replace_task_and_clear_input_for_handoff_if_current(
+                &snapshot,
+                "",
+                1,
+                false,
+                replacement,
+                notification
+            )
+            .is_err(),
+        "the handoff-completing replace must refuse an anonymous owner with a typed error"
+    );
+
+    // CONTROL: a NAMED owner reaches a real decision on the same surface, so
+    // the three refusals above are attributable to anonymity and not to the
+    // surface rejecting everything. This one succeeds; the point is only that
+    // it is not an Err.
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "owner-a")
+            .expect("a named owner is not a malformed call")
+            .is_some(),
+        "a named owner must reach a real outcome where an anonymous one is refused"
+    );
+
+    // And nothing the refusals touched changed: no lease was created by any
+    // of them, so the named owner above was the FIRST claimant.
+    assert!(
+        fixture
+            .store
+            .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "owner-b")
+            .expect("store writes succeed")
+            .is_none(),
+        "the named owner holds the only lease, so the anonymous attempts created none"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // B-35: a second, out-of-crate backend
 // ---------------------------------------------------------------------------
@@ -1227,6 +1306,7 @@ fn task_02_b_positive() {
     b31_stale_generation_is_refused();
     b34_restore_write_contract();
     b42_duplicate_execution_is_refused();
+    b45_anonymous_handle_is_refused_everywhere();
     b43_release_happens_exactly_once();
 }
 
