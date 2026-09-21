@@ -215,6 +215,40 @@ impl std::error::Error for CredentialSlotError {}
 /// compiler's rather than mine.
 const _: () = assert!(core::mem::size_of::<CredentialSlotError>() <= 128);
 
+/// `Copy` preservation, proven by the compiler rather than by reading derive lists.
+///
+/// This is the ENTIRE argument for reshaping the variant instead of boxing it. A
+/// `Box` anywhere inside removes `Copy` from all five of these types, and consumer
+/// code doing `let a = e; use(e);` stops compiling — a far wider break than the
+/// pattern-match adjustment that reshaping costs. Until now that argument lived only
+/// in prose, which is the same defect the size bound above was added to fix, sitting
+/// one argument over.
+///
+/// The guard is not a no-op: instantiated with a non-`Copy` type it fails with
+/// E0277, which was checked in both directions before this landed.
+const fn assert_copy<T: Copy>() {}
+const _: () = assert_copy::<SlotRevision>();
+const _: () = assert_copy::<SlotCommitIntent>();
+const _: () = assert_copy::<CredentialSlotError>();
+const _: () = assert_copy::<coordinator::CredentialAnchorState>();
+const _: () = assert_copy::<coordinator::CredentialAnchorSnapshot>();
+const _: () = assert_copy::<coordinator::CoordinatedSlotError>();
+
+/// The on-disk trusted-anchor encoding is unchanged by the variant reshape.
+///
+/// `SLOT_INTENT_BYTES` is what `SlotCommitIntent::to_bytes` writes and
+/// `from_trusted_bytes` validates, so it IS the persisted format: an intent written
+/// before a crash must still parse after one. Pinning it here means a change to
+/// `SLOT_REVISION_BYTES` or to the header/flag layout fails the build instead of
+/// silently invalidating every retained intent in the field.
+///
+/// Deliberately NOT pinned: `size_of::<SlotCommitIntent>()`. That is an in-memory
+/// layout, not a format, and it can move for reasons that harm nobody — a niche
+/// optimisation in a future compiler would break the build while the persisted bytes
+/// stayed identical. Pinning it would assert something this crate does not promise.
+const _: () = assert!(SLOT_REVISION_BYTES == 40);
+const _: () = assert!(SLOT_INTENT_BYTES == 153);
+
 impl From<AtomicFileError> for CredentialSlotError {
     fn from(error: AtomicFileError) -> Self { Self::Storage(error) }
 }
