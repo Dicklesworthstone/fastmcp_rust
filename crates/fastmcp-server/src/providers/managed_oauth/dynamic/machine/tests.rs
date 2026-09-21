@@ -166,14 +166,16 @@ fn calls_preserve_exact_results_and_only_rewrite_published_names() {
     ]))).is_ok());
     let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
     let outcome = ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
-    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+    assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+        else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
     let completion = prompt.completion_handler().unwrap();
     let parameters: FinalCompletionParams = serde_json::from_value(json!({
         "ref":{"type":"ref/prompt","name":"machine/summarize"},
         "argument":{"name":"subject","value":"o"}
     })).unwrap();
     let outcome = ready(completion.complete_final_async_in_request(&ctx, &cx, parameters));
-    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+    assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+        else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
     let calls = source.calls.lock().unwrap();
     assert_eq!(calls.len(), 5);
     assert_eq!(calls[0]["name"], "lookup");
@@ -338,27 +340,33 @@ fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completi
             .with_namespace("interactive").unwrap();
         let ctx = McpContext::new(cx.clone(), 81);
         let outcome = ready(old_tool.call_final_async_in_request(&ctx, &cx, json!({})));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let tool = ready(configured.tools(&cx)).unwrap().pop().unwrap();
         assert_eq!(tool.catalog_definition().name, "interactive/lookup");
         let outcome = ready(tool.call_final_async_in_request(&ctx, &cx, json!({})));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let resource = ready(configured.resources(&cx)).unwrap().pop().unwrap();
         let outcome = ready(resource.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let prompt = ready(configured.prompts(&cx)).unwrap().pop().unwrap();
         let outcome = ready(prompt.get_final_async_in_request(&ctx, &cx, HashMap::new()));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let template = ready(configured.resource_templates(&cx)).unwrap().pop().unwrap();
         let outcome = ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         let completion = prompt.completion_handler().unwrap();
         let params: FinalCompletionParams = serde_json::from_value(json!({
             "ref":{"type":"ref/prompt","name":"interactive/summarize"},
             "argument":{"name":"subject","value":"o"}
         })).unwrap();
         let outcome = ready(completion.complete_final_async_in_request(&ctx, &cx, params));
-        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
+        assert!(outcome.is_ok(), "{}", if outcome.is_err() { "Err" }
+            else if outcome.is_cancelled() { "Cancelled" } else { "Panicked" });
         // Observe the actual MachineCall handed to the transport, not policy
         // fields at construction. Native source owns authentication/HTTP; this
         // test establishes only production policy routing and handler wiring.
