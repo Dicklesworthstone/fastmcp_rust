@@ -21,6 +21,8 @@ use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskStatus, TaskTimestamp}
 /// Linux storage using the existing owner-private atomic-file primitive.
 #[cfg(target_os = "linux")]
 pub mod store;
+/// Fresh authenticated reconciliation before consuming a restored record.
+pub mod client;
 
 /// Hard ceiling for one encoded checkpoint, independent of store capacity.
 pub const MAX_TASK_RESUME_RECORD_BYTES: usize = 256 * 1024;

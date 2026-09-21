@@ -23,6 +23,10 @@ mod task_watch_recovery;
 #[path = "task_submission.rs"]
 mod task_submission;
 
+#[cfg(feature = "tasks")]
+#[path = "task_resume.rs"]
+mod task_resume;
+
 #[path = "catalogs.rs"]
 mod catalogs;
 
