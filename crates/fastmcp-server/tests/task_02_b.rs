@@ -35,12 +35,39 @@
 //! here and none anywhere in the tree**: B-24, B-25, B-29, B-30, B-32, B-33,
 //! B-35 through B-41, B-44, B-45, B-46.
 //!
-//! COUNT THIS FILE BY ITS FUNCTIONS, NOT BY ITS MENTIONS. The table above
-//! names groups precisely in order to say which are MISSING, so a scan that
-//! counts `B-nn` occurrences reads the gap list as coverage and scores this
-//! file at 23. Every group identifier in this file appears in a comment and
-//! none appears in code; the honest figure is the number of `fn bNN_*`
-//! definitions, which is seven.
+//! COUNT THIS FILE BY ITS `#[test]` FUNCTIONS, NOT BY ITS MENTIONS. The table
+//! above names groups precisely in order to say which are MISSING, so a scan
+//! counting `B-nn` occurrences reads the gap list as coverage. That has now
+//! happened twice to two different readers, scoring this file at 13 and then
+//! at 18 when the implemented figure was 5 and then 7. Every group identifier
+//! here appears in a comment and none appears in code.
+//!
+//! # What a run of this file reports, and how NOT to add it up
+//!
+//! There are **10** `#[test]` functions and **8** distinct behaviours.
+//!
+//! - Eight group tests -- `lease_window_is_the_one_this_file_assumes` and the
+//!   seven `bNN_*` -- each individually discoverable, each one behaviour.
+//! - `task_02_b_positive`, a frozen ID, which is a ROLL-UP that calls all
+//!   eight. It adds no behaviour. It exists because the acceptance criteria
+//!   name it as the positive, and an empty frozen positive would be a vacuous
+//!   test.
+//! - `task_02_b_planted_negative`, a frozen ID, the one behaviour not reached
+//!   by any group test.
+//!
+//! **So a full run executes each group body TWICE and reports 10 outcomes for
+//! 8 behaviours plus one negative.** A receipt must not read 10 outcomes as 10
+//! behaviours, and must not read a group's failure appearing twice as two
+//! defects. The countable figure against the bead's 23 required groups is the
+//! number of `fn bNN_*` tests, which is SEVEN.
+//!
+//! The groups were promoted to individual `#[test]`s on orchestrator ruling
+//! after review. The decisive reason was not cardinality: it is that seven
+//! behaviours inside one test means the FIRST FAILING ASSERT ABORTS THE REST,
+//! so a red would report one group and stay silent about six. Individually
+//! discoverable tests make all eight outcomes observable on a single run. The
+//! roll-up still has that defect internally, which is exactly why it must not
+//! be the only entry point.
 //!
 //! Four of the sixteen cannot be closed by writing tests at all. They rest on
 //! vocabulary the shipped source does not carry: word-boundary counts over
@@ -215,6 +242,7 @@ const TASK: &str = "durable-operation";
 /// against. Without this, a change to the store's lease would turn every
 /// "past expiry" advance below into a "still live" advance, and the affected
 /// tests would keep passing while asserting the opposite of their names.
+#[test]
 fn lease_window_is_the_one_this_file_assumes() {
     let fixture = Fixture::new(TASK, 600_000);
     let heartbeat = fixture
@@ -235,6 +263,7 @@ fn lease_window_is_the_one_this_file_assumes() {
 
 /// `B-26 stale-owner-fenced-write`: an owner that did not win the election
 /// cannot renew, and the winner still can.
+#[test]
 fn b26_stale_owner_fenced_write() {
     let fixture = Fixture::new(TASK, 600_000);
     let (snapshot, fence) = fixture.elect("owner-a");
@@ -263,6 +292,7 @@ fn b26_stale_owner_fenced_write() {
 }
 
 /// `B-27 lease-renew-expire-reclaim`, renew and expire halves only.
+#[test]
 fn b27_lease_renew_then_expire() {
     let fixture = Fixture::new(TASK, 600_000);
     let (snapshot, fence) = fixture.elect("owner-a");
@@ -332,6 +362,7 @@ fn b27_lease_renew_then_expire() {
 
 /// `B-34 restore-write-contract`: an owner may hand work back only with the
 /// exact lease it holds and the exact descriptor the store retained.
+#[test]
 fn b34_restore_write_contract() {
     let fixture = Fixture::new(TASK, 600_000);
     let (snapshot, fence) = fixture.elect("owner-a");
@@ -409,6 +440,7 @@ fn b34_restore_write_contract() {
 
 /// `B-42 duplicate-execution-idempotency`: a held lease makes the work
 /// unclaimable by anyone, so two runners cannot execute the same task.
+#[test]
 fn b42_duplicate_execution_is_refused() {
     let fixture = Fixture::new(TASK, 600_000);
     let snapshot = fixture.snapshot();
@@ -451,6 +483,7 @@ fn b42_duplicate_execution_is_refused() {
 
 /// `B-28 durable-time-authority`: retention time comes from the store's
 /// injected clock, never from the wall clock.
+#[test]
 fn b28_durable_time_authority() {
     let fixture = Fixture::new(TASK, 600_000);
 
@@ -491,6 +524,7 @@ fn b28_durable_time_authority() {
 }
 
 /// `B-31 private-update-revision-order`, stale-generation half only.
+#[test]
 fn b31_stale_generation_is_refused() {
     let fixture = Fixture::new(TASK, 600_000);
     let snapshot = fixture.snapshot();
@@ -519,6 +553,7 @@ fn b31_stale_generation_is_refused() {
 
 /// `B-43 shutdown-drain-lease-release`: a completed dispatch releases exactly
 /// once, and a second release is refused rather than double-counted.
+#[test]
 fn b43_release_happens_exactly_once() {
     let fixture = Fixture::new(TASK, 600_000);
     let (snapshot, fence) = fixture.elect("owner-a");
