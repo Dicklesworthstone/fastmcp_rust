@@ -198,16 +198,22 @@ def walk(root: Path) -> dict[Path, dict]:
     a second, ungated path to the same file correctly clears the flag.
     """
     reached: dict[Path, dict] = {}
-    stack: list[tuple[Path, bool, bool]] = [(root.resolve(), False, False)]
+    stack: list[tuple[Path, bool, bool, bool]] = [(root.resolve(), False, False, False)]
     while stack:
-        cur, decl_gated, file_gated = stack.pop()
+        cur, decl_gated, file_gated, plat_gated = stack.pop()
         if not cur.is_file():
             continue
         # The two gates are INDEPENDENT. Folding the declaration gate into the
         # file gate makes every site under a cfg'd `mod` look file-scoped, and
         # class 3 then reports zero -- which is how the control caught it.
         own = file_scope_feature(cur) is not None
-        state = {"decl_cfg": decl_gated, "file_cfg": own or file_gated}
+        # 02': "a cfg naming ONLY a platform predicate is reported SEPARATELY and
+        # never counted as dark". Tracked here so those sites get their own line
+        # instead of disappearing into "not dark", which would assert they build
+        # everywhere when they build on one platform.
+        own_plat = file_scope_cfg(cur) is not None and not own
+        state = {"decl_cfg": decl_gated, "file_cfg": own or file_gated,
+                 "plat_cfg": own_plat or plat_gated}
         prev = reached.get(cur)
         if prev is not None:
             merged = {k: prev[k] and state[k] for k in state}
@@ -221,7 +227,9 @@ def walk(root: Path) -> dict[Path, dict]:
             attrs, name = m.group("attrs") or "", m.group("name")
             explicit = PATH_ATTR.search(attrs)
             cfg = CFG_ATTR.search(attrs)
-            gated = state["decl_cfg"] or bool(cfg and FEATURE.search(cfg.group("pred")))
+            has_feat = bool(cfg and FEATURE.search(cfg.group("pred")))
+            gated = state["decl_cfg"] or has_feat
+            plat = state["plat_cfg"] or bool(cfg and not has_feat)
             if explicit:
                 candidates = [cur.parent / explicit.group(1)]
             else:
@@ -231,12 +239,19 @@ def walk(root: Path) -> dict[Path, dict]:
             for cand in candidates:
                 cand = cand.resolve()
                 if cand.is_file():
-                    stack.append((cand, gated, state["file_cfg"]))
+                    stack.append((cand, gated, state["file_cfg"], plat))
                     break
     return reached
 
 
 _FILE_CFG: dict[Path, str | None] = {}
+
+
+def file_scope_cfg(path: Path) -> str | None:
+    """The file's own `#![cfg(..)]`, whatever it names."""
+    src = mask(path.read_text(encoding="utf-8", errors="replace"))
+    m = INNER_CFG.search(src)
+    return m.group("pred").strip() if m else None
 
 
 def file_scope_feature(path: Path) -> str | None:
@@ -264,7 +279,8 @@ def census() -> dict:
                 owner.setdefault(path, tgt)
 
     counts = dict.fromkeys(
-        ("class1", "class2", "class3_xfile", "class3_infile", "class4", "not_dark", "unreached"), 0
+        ("class1", "class2", "class3_xfile", "class3_infile", "class4",
+         "platform_only", "not_dark", "unreached"), 0
     )
     detail: dict[str, dict[str, int]] = {k: defaultdict(int) for k in counts}
     inner_decl: dict[str, int] = defaultdict(int)
@@ -288,13 +304,20 @@ def census() -> dict:
             key = "class2"
         elif all(r["decl_cfg"] for r in reachers if not r["target"]["gated"]):
             key = "class3_xfile"
+
         else:
             # Only here can cfg_darkness_census speak: no outer gate took this
             # file, so its sites are governed by in-file enclosing and per-fn
             # cfgs alone. Precedence 3 > 4 within the file, as 02' orders them.
+            # A platform-only gate is NOT a darkness class, so it must not absorb
+            # a site that carries its own feature gate: it is an ADDITIONAL gate,
+            # and 02' counts the feature half. Only sites with no feature gate
+            # anywhere fall through to the separate platform report.
+            ungated_plat = all(r["plat_cfg"] for r in reachers if not r["target"]["gated"])
+            residual = "platform_only" if ungated_plat else "not_dark"
             enc = fn = 0
             for enc_feat, _enc_any, fn_feat in analyze(path):
-                bucket = "class3_infile" if enc_feat else "class4" if fn_feat else "not_dark"
+                bucket = "class3_infile" if enc_feat else "class4" if fn_feat else residual
                 counts[bucket] += 1
                 detail[bucket][tag] += 1
                 enc += enc_feat
@@ -393,6 +416,7 @@ def main() -> int:
     print(f"  class 3  cfg(feature=..) on a `mod` DECLARATION in an ancestor file   : {c['class3_xfile']}")
     print(f"  class 3  cfg(feature=..) on an enclosing item IN THE SAME FILE        : {c['class3_infile']}")
     print(f"  class 4  cfg(feature=..) on the test fn itself                        : {c['class4']}")
+    print(f"  platform-only cfg -- reported separately, NEVER counted as dark       : {c['platform_only']}")
     print(f"  NOT feature-dark                                                      : {c['not_dark']}")
     print(f"  reached by NO target -- never compiled; 02' has no cell for this      : {c['unreached']}")
     print(f"  TOTAL sites                                                           : {total}")
