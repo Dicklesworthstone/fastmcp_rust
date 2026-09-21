@@ -106,6 +106,7 @@ impl<H: Legacy2024Handler> Legacy2024ServerAdapter<H> {
                 PING => Ok(Some(json!({}))),
                 RESOURCES_SUBSCRIBE | RESOURCES_UNSUBSCRIBE => {
                     self.require_resource_subscribe_capability()?;
+                    self.admit_subscription_capacity(method, params)?;
                     Ok(None)
                 }
                 LOGGING_SET_LEVEL => self.set_logging_level(params).map(Some),
@@ -128,6 +129,30 @@ impl<H: Legacy2024Handler> Legacy2024ServerAdapter<H> {
                 "legacy adapter lifecycle is closed",
             )),
         }
+    }
+
+    fn admit_subscription_capacity(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), Legacy2024AdapterError> {
+        let uri = uri_param(params)?;
+        if method == RESOURCES_SUBSCRIBE
+            && !self.subscriptions.contains(uri)
+            && self.reservation_count >= LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64
+        {
+            return Err(Legacy2024AdapterError::invalid_request(
+                "legacy adapter reservation limit reached",
+            ));
+        }
+        // The receive future exclusively borrows this adapter until the
+        // selected handler completes or is dropped. No other receive/reverse
+        // request can consume its capacity across suspension. A read-only
+        // preflight is therefore sufficient: no provisional state or rollback
+        // is needed, and a failed/dropped handler leaves the snapshot intact.
+        // Repeated subscriptions cost no new slot; unsubscribe must work even
+        // at capacity so clients can release existing reservations.
+        Ok(())
     }
 
     pub(super) fn finish_receive(
@@ -356,5 +381,165 @@ mod tests {
         assert_eq!(ready(adapter.receive_async(binding(), json!({
             "jsonrpc":"2.0", "id":3, "method":PING,
         }))).unwrap(), Legacy2024Outbound::Response(json!({"jsonrpc":"2.0", "id":3, "result":{}})));
+    }
+
+    #[derive(Default)]
+    struct SubscriptionHandler {
+        calls: usize,
+        fail: bool,
+    }
+
+    impl Legacy2024Handler for SubscriptionHandler {
+        fn handle_legacy_2024(
+            &mut self,
+            method: &'static str,
+            _params: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
+            assert!(matches!(method, RESOURCES_SUBSCRIBE | RESOURCES_UNSUBSCRIBE));
+            self.calls += 1;
+            if self.fail {
+                Err(Legacy2024HandlerError::with_code(-32001, "subscription hook failed"))
+            } else {
+                Ok(json!({}))
+            }
+        }
+    }
+
+    fn receive_ready<H: Legacy2024Handler>(
+        adapter: &mut Legacy2024ServerAdapter<H>,
+        asynchronous: bool,
+        wire: Value,
+    ) -> Legacy2024Outbound {
+        if asynchronous {
+            ready(adapter.receive_async(binding(), wire)).unwrap()
+        } else {
+            adapter.receive(binding(), wire).unwrap()
+        }
+    }
+
+    fn subscription(method: &'static str, uri: &str) -> Value {
+        json!({"jsonrpc":"2.0", "id":"subscription-61", "method":method,
+            "params":{"uri":uri}})
+    }
+
+    fn assert_subscribed(response: Legacy2024Outbound) {
+        assert_eq!(response, Legacy2024Outbound::Response(json!({
+            "jsonrpc":"2.0", "id":"subscription-61", "result":{}
+        })));
+    }
+
+    fn assert_rejected(response: Legacy2024Outbound, code: i32) {
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("request failure must produce a response");
+        };
+        assert_eq!(response["id"], "subscription-61");
+        assert_eq!(response["error"]["code"], code);
+        assert!(response.get("result").is_none());
+    }
+
+    fn fill_reverse_to<H: Legacy2024Handler>(
+        adapter: &mut Legacy2024ServerAdapter<H>,
+        reservations: usize,
+    ) {
+        while adapter.snapshot().reservation_count < reservations as u64 {
+            let response = adapter.make_reverse_request(binding(), PING, json!({})).unwrap();
+            assert!(matches!(response, Legacy2024Outbound::ReverseRequest(_)));
+        }
+        assert_eq!(adapter.snapshot().reservation_count, reservations as u64);
+    }
+
+    #[test]
+    fn full_quota_rejects_before_side_effects_and_reverse_completion_restores_capacity() {
+        for asynchronous in [false, true] {
+            let mut adapter = adapter(SubscriptionHandler::default());
+            initialize(&mut adapter);
+            fill_reverse_to(&mut adapter, LEGACY_2024_MAX_ADAPTER_RESERVATIONS);
+            let before = adapter.snapshot();
+            let request = subscription(RESOURCES_SUBSCRIBE, "file:///quota");
+
+            assert_rejected(receive_ready(&mut adapter, asynchronous, request.clone()), -32600);
+            assert_eq!(adapter.handler.calls, 0);
+            assert_eq!(adapter.snapshot(), before);
+
+            // A real response, not a fixture counter edit, frees the shared slot.
+            assert_eq!(receive_ready(&mut adapter, asynchronous, json!({
+                "jsonrpc":"2.0", "id":1, "result":{}
+            })), Legacy2024Outbound::NoResponse);
+            assert_subscribed(receive_ready(&mut adapter, asynchronous, request));
+            assert_eq!(adapter.handler.calls, 1);
+            assert_eq!(adapter.snapshot().subscriptions, ["file:///quota"]);
+            assert_eq!(adapter.snapshot().reservation_count,
+                LEGACY_2024_MAX_ADAPTER_RESERVATIONS as u64);
+        }
+    }
+
+    #[test]
+    fn duplicate_subscribe_and_unsubscribe_remain_usable_at_capacity() {
+        for asynchronous in [false, true] {
+            let mut adapter = adapter(SubscriptionHandler::default());
+            initialize(&mut adapter);
+            let request = subscription(RESOURCES_SUBSCRIBE, "file:///existing");
+            assert_subscribed(receive_ready(&mut adapter, asynchronous, request.clone()));
+            fill_reverse_to(&mut adapter, LEGACY_2024_MAX_ADAPTER_RESERVATIONS);
+            let full = adapter.snapshot();
+
+            assert_subscribed(receive_ready(&mut adapter, asynchronous, request));
+            assert_eq!(adapter.snapshot(), full);
+            assert_eq!(adapter.handler.calls, 2);
+            assert_subscribed(receive_ready(&mut adapter, asynchronous,
+                subscription(RESOURCES_UNSUBSCRIBE, "file:///existing")));
+            assert_eq!(adapter.snapshot().reservation_count, full.reservation_count - 1);
+            assert!(adapter.snapshot().subscriptions.is_empty());
+            assert_subscribed(receive_ready(&mut adapter, asynchronous,
+                subscription(RESOURCES_SUBSCRIBE, "file:///replacement")));
+            assert_eq!(adapter.snapshot().reservation_count, full.reservation_count);
+            assert_eq!(adapter.snapshot().subscriptions, ["file:///replacement"]);
+            assert_eq!(adapter.handler.calls, 4);
+        }
+    }
+
+    #[test]
+    fn failed_subscription_hooks_never_charge_or_release_the_last_slot() {
+        for asynchronous in [false, true] {
+            let mut adapter = adapter(SubscriptionHandler::default());
+            initialize(&mut adapter);
+            fill_reverse_to(&mut adapter, LEGACY_2024_MAX_ADAPTER_RESERVATIONS - 1);
+            let before = adapter.snapshot();
+            let subscribe = subscription(RESOURCES_SUBSCRIBE, "file:///retryable");
+            let unsubscribe = subscription(RESOURCES_UNSUBSCRIBE, "file:///retryable");
+
+            adapter.handler.fail = true;
+            assert_rejected(receive_ready(&mut adapter, asynchronous, subscribe.clone()), -32001);
+            assert_eq!(adapter.snapshot(), before);
+            adapter.handler.fail = false;
+            assert_subscribed(receive_ready(&mut adapter, asynchronous, subscribe));
+            let subscribed = adapter.snapshot();
+            assert_eq!(subscribed.reservation_count, before.reservation_count + 1);
+
+            adapter.handler.fail = true;
+            assert_rejected(receive_ready(&mut adapter, asynchronous, unsubscribe.clone()), -32001);
+            assert_eq!(adapter.snapshot(), subscribed);
+            adapter.handler.fail = false;
+            assert_subscribed(receive_ready(&mut adapter, asynchronous, unsubscribe));
+            assert_eq!(adapter.snapshot(), before);
+            assert_eq!(adapter.handler.calls, 4);
+        }
+    }
+
+    #[test]
+    fn full_quota_refuses_even_construction_of_the_async_subscription_future() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut adapter = adapter(AsyncOnly {
+            polls: Arc::clone(&polls), drops: Arc::clone(&drops),
+        });
+        initialize(&mut adapter);
+        fill_reverse_to(&mut adapter, LEGACY_2024_MAX_ADAPTER_RESERVATIONS);
+        let before = adapter.snapshot();
+        assert_rejected(receive_ready(&mut adapter, true,
+            subscription(RESOURCES_SUBSCRIBE, "file:///must-not-start")), -32600);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.snapshot(), before);
     }
 }
