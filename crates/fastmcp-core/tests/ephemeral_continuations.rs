@@ -227,6 +227,41 @@ fn f2ndd_runtime() -> asupersync::runtime::Runtime {
         .expect("bd-f2ndd repro runtime")
 }
 
+/// Parks on `poll_join` with a live wake registration, rescued by a std::thread
+/// watchdog. Returns Some(..) if asupersync woke us, None if only the watchdog did.
+///
+/// The watchdog is a REAL thread and a REAL wall clock on purpose: asupersync's
+/// timer is among the suspects, and a self-waking poll loop busy-polls, which
+/// finds the result whenever it lands and therefore cannot observe a MISSED
+/// WAKEUP at all. That blindness is what invalidated the first version of these
+/// tests. `poll_join` rather than `try_join` because it keeps the waiter
+/// registered across polls; `try_join` registers nothing.
+async fn f2ndd_join_or_watchdog<T>(
+    handle: &mut asupersync::runtime::TaskHandle<T>,
+) -> Option<Result<T, asupersync::runtime::JoinError>> {
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut armed = false;
+    std::future::poll_fn(move |task| match handle.poll_join(task) {
+        std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+        std::task::Poll::Pending => {
+            if !armed {
+                armed = true;
+                let waker = task.waker().clone();
+                let flag = std::sync::Arc::clone(&fired);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    waker.wake();
+                });
+            } else if fired.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 /// The FOUR: body completes, scope empty, join parks anyway.
 #[test]
 fn f2ndd_join_settles_for_a_completed_task_in_an_empty_scope() {
@@ -254,18 +289,10 @@ fn f2ndd_join_settles_for_a_completed_task_in_an_empty_scope() {
 
         handle.abort();
 
-        let mut settled = false;
-        for _ in 0..10_000 {
-            if !matches!(handle.try_join(), Ok(None)) {
-                settled = true;
-                break;
-            }
-            asupersync::runtime::yield_now().await;
-        }
         assert!(
-            settled,
-            "bd-f2ndd: join did NOT settle for a task whose body COMPLETED in an EMPTY scope, \
-             with nothing of ours involved -- the defect is upstream in asupersync"
+            f2ndd_join_or_watchdog(&mut handle).await.is_some(),
+            "bd-f2ndd: join PARKED and was only released by the watchdog, for a task whose body \
+             COMPLETED in an EMPTY scope -- a missed wakeup with nothing of ours involved"
         );
     });
 }
@@ -292,18 +319,10 @@ fn f2ndd_abort_settles_a_task_parked_in_sleep() {
         }
         handle.abort();
 
-        let mut settled = false;
-        for _ in 0..10_000 {
-            if !matches!(handle.try_join(), Ok(None)) {
-                settled = true;
-                break;
-            }
-            asupersync::runtime::yield_now().await;
-        }
         assert!(
-            settled,
-            "bd-f2ndd: abort did NOT settle a task parked in sleep() on a runtime with no timer \
-             driver -- the cancellation check sits AFTER the sleep, so it is never evaluated"
+            f2ndd_join_or_watchdog(&mut handle).await.is_some(),
+            "bd-f2ndd: abort did NOT settle a task parked in sleep() -- the join was released only \
+             by the watchdog, so nothing woke the parked sleep"
         );
     });
 }
