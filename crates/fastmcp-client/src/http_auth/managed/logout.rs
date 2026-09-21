@@ -4,6 +4,7 @@
 //! snapshots stop constructing new Authorization headers immediately. Once the
 //! grant lock is acquired, the grant is removed from session state before any
 //! network await. Remote outcomes are diagnostic facts, never retry authority.
+//! One caller-bounded deadline covers acquisition and remote revocation together.
 //! Already-sent requests and headers cannot be recalled.
 
 use std::future::{Future, poll_fn};
@@ -90,7 +91,7 @@ impl Drop for LogoutHandoff<'_> {
 }
 
 impl ManagedOAuthSession {
-    /// Closes this shared login and attempts RFC 7009 revocation exactly once
+    /// Closes this shared login and attempts RFC 7009 revocation at most once
     /// for each retained token when a trusted endpoint is configured.
     ///
     /// If the caller is already cancelled or the session already closed, no new
@@ -99,6 +100,8 @@ impl ManagedOAuthSession {
     /// revoked and any retained grant is never put back into session state.
     /// Dropping a pending logout also retires its grant-handoff claim and
     /// restores the ordinary nonblocking, best-effort closed-session cleanup.
+    /// The acquisition timeout bounds the complete logout, including revocation;
+    /// obtaining the grant lock does not restart that budget.
     pub async fn logout(
         &self,
         cx: &Cx,
@@ -113,57 +116,72 @@ impl ManagedOAuthSession {
             return Err(OAuthSessionError::RuntimeTimerUnavailable);
         }
         let deadline = deadline_after(cx, self.inner.policy.acquisition_timeout)?;
+        if cx.now() >= deadline {
+            return Err(OAuthSessionError::TimedOut);
+        }
         let handoff = LogoutHandoff::begin(self)?;
 
-        let mut guard = match lock_grant(cx, deadline, Arc::clone(&self.inner.state)).await {
-            Ok(guard) => guard,
-            Err(remote) => return Ok(ManagedOAuthLogoutReport { remote }),
-        };
-        let state = guard.take();
-        drop(guard);
-        drop(handoff);
-        let Some(mut state) = state else {
-            return Ok(ManagedOAuthLogoutReport {
-                remote: ManagedOAuthRemoteRevocation::NoGrant,
-            });
-        };
+        let result = within_logout(cx, deadline, async {
+            let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.inner.state), cx)
+                .await
+                .map_err(|_| ManagedOAuthRemoteRevocation::Failed)?;
+            let state = guard.take();
+            drop(guard);
+            drop(handoff);
+            let Some(mut state) = state else {
+                return Ok(ManagedOAuthRemoteRevocation::NoGrant);
+            };
 
-        let remote = match self
-            .inner
-            .client
-            .revoke_credentials(cx, &mut state.credentials)
-            .await
-        {
-            Ok(report) => ManagedOAuthRemoteRevocation::Completed(report),
-            Err(OAuthRevocationError::EndpointUnavailable) => {
-                // Local closure still disposes the retained grant.
-                state.credentials.bearer_credential().revoke();
-                ManagedOAuthRemoteRevocation::EndpointUnavailable
-            }
-            Err(OAuthRevocationError::Cancelled) => ManagedOAuthRemoteRevocation::Cancelled,
-            Err(OAuthRevocationError::TimedOut) => ManagedOAuthRemoteRevocation::TimedOut,
-            Err(_) => ManagedOAuthRemoteRevocation::Failed,
-        };
+            // This grant has already left reusable session custody. Remote
+            // preflight can still refuse, but cannot undo local revocation.
+            state.credentials.bearer_credential().revoke();
+            check_logout(cx, deadline)?;
+            let remote = match self
+                .inner
+                .client
+                .revoke_credentials(cx, &mut state.credentials)
+                .await
+            {
+                Ok(report) => ManagedOAuthRemoteRevocation::Completed(report),
+                Err(OAuthRevocationError::EndpointUnavailable) => {
+                    ManagedOAuthRemoteRevocation::EndpointUnavailable
+                }
+                Err(OAuthRevocationError::Cancelled) => ManagedOAuthRemoteRevocation::Cancelled,
+                Err(OAuthRevocationError::TimedOut) => ManagedOAuthRemoteRevocation::TimedOut,
+                Err(_) => ManagedOAuthRemoteRevocation::Failed,
+            };
+            Ok(remote)
+        })
+        .await;
+        let remote = result.unwrap_or_else(std::convert::identity);
         Ok(ManagedOAuthLogoutReport { remote })
     }
 }
 
-async fn lock_grant(
+fn check_logout(cx: &Cx, deadline: Time) -> Result<(), ManagedOAuthRemoteRevocation> {
+    if cx.checkpoint().is_err() {
+        return Err(ManagedOAuthRemoteRevocation::Cancelled);
+    }
+    if cx.now() >= deadline {
+        return Err(ManagedOAuthRemoteRevocation::TimedOut);
+    }
+    Ok(())
+}
+
+// One owned operation spans every logout phase. In particular, do not use the
+// closed session's ordinary await_active guard: local closure is intentional
+// here and must not prevent the remaining single-attempt revocation work.
+async fn within_logout<T>(
     cx: &Cx,
     deadline: Time,
-    state: Arc<asupersync::sync::Mutex<Option<super::GrantState>>>,
-) -> Result<OwnedMutexGuard<Option<super::GrantState>>, ManagedOAuthRemoteRevocation> {
+    operation: impl Future<Output = Result<T, ManagedOAuthRemoteRevocation>>,
+) -> Result<T, ManagedOAuthRemoteRevocation> {
     let mut sleep = pin!(Sleep::new(deadline));
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = pin!(receiver.recv(cx));
-    let mut lock = pin!(OwnedMutexGuard::lock(state, cx));
+    let mut operation = pin!(operation);
     poll_fn(|task| {
-        if cx.checkpoint().is_err() {
-            return Poll::Ready(Err(ManagedOAuthRemoteRevocation::Cancelled));
-        }
-        if cx.now() >= deadline {
-            return Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut));
-        }
+        check_logout(cx, deadline)?;
         let _caller = Cx::set_current(Some(cx.clone()));
         if cancelled.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(ManagedOAuthRemoteRevocation::Cancelled));
@@ -171,11 +189,11 @@ async fn lock_grant(
         if sleep.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut));
         }
-        match lock.as_mut().poll(task) {
-            Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(ManagedOAuthRemoteRevocation::Failed)),
-            Poll::Pending => Poll::Pending,
-        }
+        let result = operation.as_mut().poll(task);
+        // User wakeups and a completing operation may consume the remaining
+        // budget during this poll. Withhold and drop their late result too.
+        check_logout(cx, deadline)?;
+        result
     })
     .await
 }
@@ -184,7 +202,7 @@ async fn lock_grant(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::task::{Context, Waker};
+    use std::task::{Context, Wake, Waker};
     use std::time::Duration;
 
     use asupersync::runtime::RuntimeBuilder;
@@ -364,6 +382,175 @@ mod tests {
             assert!(!session.inner.closed.is_cancel_requested());
             assert!(!session.inner.logout_handoff.load(Ordering::Acquire));
         }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct Owner(Arc<AtomicUsize>);
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn logout_wait_keeps_one_deadline_across_multiple_phases() {
+        for ready in [false, true] {
+            with_runtime(|cx, clock, timer| {
+                let first_phase = AtomicUsize::new(0);
+                let second_phase = AtomicUsize::new(0);
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let owner = Owner(Arc::clone(&dropped));
+                let operation = async {
+                    let _owner = owner;
+                    first_phase.fetch_add(1, Ordering::SeqCst);
+                    // Acquiring custody consumed most of the total budget.
+                    clock.advance(900_000_000);
+                    poll_fn(|_| {
+                        second_phase.fetch_add(1, Ordering::SeqCst);
+                        if ready {
+                            Poll::Ready(Ok(17_u8))
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                };
+                let mut waiting = Box::pin(within_logout(
+                    cx,
+                    Time::from_nanos(1_000_000_000),
+                    operation,
+                ));
+                let counter = Arc::new(WakeCount::default());
+                let waker = Waker::from(Arc::clone(&counter));
+                let mut task = Context::from_waker(&waker);
+                let result = waiting.as_mut().poll(&mut task);
+                assert_eq!(first_phase.load(Ordering::SeqCst), 1);
+                assert_eq!(second_phase.load(Ordering::SeqCst), 1);
+                if ready {
+                    assert_eq!(result, Poll::Ready(Ok(17)));
+                } else {
+                    assert!(result.is_pending());
+                    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                    assert!(waiting.as_mut().poll(&mut task).is_pending());
+                    assert_eq!(first_phase.load(Ordering::SeqCst), 1);
+                    assert_eq!(second_phase.load(Ordering::SeqCst), 2);
+                    let before = counter.0.load(Ordering::SeqCst);
+                    clock.advance(100_000_000);
+                    assert!(timer.process_timers() > 0);
+                    assert!(counter.0.load(Ordering::SeqCst) > before);
+                    assert_eq!(
+                        waiting.as_mut().poll(&mut task),
+                        Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut))
+                    );
+                    assert_eq!(second_phase.load(Ordering::SeqCst), 2);
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn logout_wait_rechecks_cancellation_and_expiry_before_publishing() {
+        for transition in [0, 1, 2] {
+            with_runtime(|cx, clock, _| {
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let operation = poll_fn(|_| {
+                    match transition {
+                        1 => cx.set_cancel_requested(true),
+                        2 => clock.advance(1_000_000_000),
+                        _ => {}
+                    }
+                    Poll::Ready(Ok(Owner(Arc::clone(&dropped))))
+                });
+                let mut waiting = Box::pin(within_logout(
+                    cx,
+                    Time::from_nanos(1_000_000_000),
+                    operation,
+                ));
+                let mut task = Context::from_waker(Waker::noop());
+                match (transition, waiting.as_mut().poll(&mut task)) {
+                    (0, Poll::Ready(Ok(owner))) => {
+                        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                        drop(owner);
+                    }
+                    (1, Poll::Ready(Err(ManagedOAuthRemoteRevocation::Cancelled)))
+                    | (2, Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut))) => {}
+                    _ => panic!("logout must not publish a result after its budget becomes inactive"),
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn abandoned_logout_wait_releases_its_operation_and_wake_registrations() {
+        with_runtime(|cx, clock, timer| {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let owner = Owner(Arc::clone(&dropped));
+            let operation = async move {
+                let _owner = owner;
+                std::future::pending::<Result<(), ManagedOAuthRemoteRevocation>>().await
+            };
+            let mut waiting = Box::pin(within_logout(
+                cx,
+                Time::from_nanos(1_000_000_000),
+                operation,
+            ));
+            let counter = Arc::new(WakeCount::default());
+            let waker = Waker::from(Arc::clone(&counter));
+            let mut task = Context::from_waker(&waker);
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+            assert!(timer.pending_count() > 0);
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            drop(waiting);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Arc::strong_count(&counter), 2);
+            let before = counter.0.load(Ordering::SeqCst);
+            clock.advance(1_000_000_000);
+            assert_eq!(timer.process_timers(), 0);
+            cx.set_cancel_requested(true);
+            assert_eq!(counter.0.load(Ordering::SeqCst), before);
+        });
+    }
+
+    #[test]
+    fn expired_logout_wait_never_polls_a_ready_operation() {
+        with_runtime(|cx, _, timer| {
+            let polls = AtomicUsize::new(0);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let owner = Owner(Arc::clone(&dropped));
+            let operation = async {
+                let _owner = owner;
+                polls.fetch_add(1, Ordering::SeqCst);
+                Ok(17_u8)
+            };
+            let mut waiting = Box::pin(within_logout(cx, cx.now(), operation));
+            let mut task = Context::from_waker(Waker::noop());
+            assert_eq!(
+                waiting.as_mut().poll(&mut task),
+                Poll::Ready(Err(ManagedOAuthRemoteRevocation::TimedOut))
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert!(cx.checkpoint().is_ok());
+        });
     }
 
     #[test]
