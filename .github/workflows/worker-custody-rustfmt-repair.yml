@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   repair-and-validate:
-    if: github.event.head_commit.message == 'ci: isolate one-shot worker custody formatting repair'
+    if: >-
+      github.event.head_commit.message == 'ci: isolate one-shot worker custody formatting repair'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -51,7 +52,7 @@ jobs:
             # Refuse concurrent main changes instead of overwriting them.
             git push origin HEAD:main
           fi
-          printf 'Validated source revision: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Source revision: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           git rev-parse HEAD
 
       - name: Verify committed formatting
