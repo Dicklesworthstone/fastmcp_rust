@@ -7151,6 +7151,8 @@ impl BoundHttpServer {
             modern_session_reaper.abort();
             #[cfg(test)]
             lib_unit_tests::record_f2ndd_serve_stage(32);
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_children_at_join(connection_children.tasks.len());
             let _ = modern_session_reaper.join(cx).await;
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             #[cfg(test)]
@@ -23572,6 +23574,18 @@ mod lib_unit_tests {
     /// DIAGNOSTIC (bd-f2ndd). Separate from the serve counter so a reaper
     /// stage cannot mask a serve stage under fetch_max.
     pub(super) static F2NDD_REAPER_STAGE: AtomicUsize = AtomicUsize::new(0);
+
+    /// DIAGNOSTIC (bd-f2ndd). Live siblings in `connection_scope` at the moment
+    /// the reaper is joined. The reaper and every connection child are spawned
+    /// into the SAME scope, and the reaper is joined BEFORE any child is
+    /// drained -- so a non-zero count here is the sibling the join may be
+    /// waiting on. +1 is stored so "recorded zero" is distinguishable from
+    /// "never recorded".
+    pub(super) static F2NDD_CHILDREN_AT_JOIN: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_f2ndd_children_at_join(count: usize) {
+        F2NDD_CHILDREN_AT_JOIN.fetch_max(count + 1, Ordering::SeqCst);
+    }
 
     pub(super) fn record_f2ndd_reaper_stage(stage: usize) {
         F2NDD_REAPER_STAGE.fetch_max(stage, Ordering::SeqCst);
@@ -43356,7 +43370,7 @@ mod lib_unit_tests {
                 format!(
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
-                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{} \
+                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{}{} \
                      The stall is NOT fixed; do not raise this bound.",
                     F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
                     match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
@@ -43378,6 +43392,11 @@ mod lib_unit_tests {
                         43 => " REAPER completed a sleep but checkpoint() returned Ok despite the abort -- the mitigation ran and did not see cancellation",
                         44 => " REAPER broke out of its loop but its TASK BODY NEVER FINISHED -- nothing follows the loop, so this would itself be a finding",
                         _ => " REAPER ran to completion (task body finished) and the join STILL parked -- the stall is in join/teardown, not in the loop",
+                    },
+                    match F2NDD_CHILDREN_AT_JOIN.load(Ordering::SeqCst) {
+                        0 => " (children-at-join NOT RECORDED)",
+                        1 => " (ZERO live connection children in connection_scope at the reaper join, so a live sibling is NOT what it waits on)",
+                        _ => " (LIVE connection children in connection_scope at the reaper join -- the reaper and every connection share that scope and the children are not drained until later in this same shutdown)",
                     }
                 )
             })?;
