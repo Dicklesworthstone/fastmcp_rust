@@ -77,39 +77,56 @@
 //! the clock. The same applies to B-35, where the test would supply a second
 //! `FinalTaskStore` implementation.
 //!
-//! COUNT THIS FILE BY ITS `#[test]` FUNCTIONS, NOT BY ITS MENTIONS. The table
-//! above names groups precisely in order to say which are MISSING, so a scan
-//! counting `B-nn` occurrences reads the gap list as coverage. That has now
-//! happened twice to two different readers, scoring this file at 13 and then
-//! at 18 when the implemented figure was 5 and then 7. Every group identifier
-//! here appears in a comment and none appears in code.
+//! # How to count this file, and the three numbers that are all true
 //!
-//! # What a run of this file reports, and how NOT to add it up
+//! THREE DIFFERENT QUANTITIES, ALL TRUE OF THIS FILE AT ONCE. Only one is
+//! measured against the bead's bar, which is stated in GROUPS:
 //!
-//! There are **10** `#[test]` functions and **8** distinct behaviours.
+//!     distinct bNN group prefixes   <- THE GROUP FIGURE, vs the AC's 23
+//!         grep -oE '^fn (b[0-9]+)_' file | sort -u | wc -l
+//!     fn bNN_* definitions          <- larger; a group may hold two tests
+//!         grep -cE '^fn b[0-9]+_' file
+//!     #[test] attributes            <- larger still; adds the guard, the
+//!                                      two frozen IDs, and any second test
+//!         grep -cE '^[[:space:]]*#\[test\]' file
 //!
-//! - Eight group tests -- `lease_window_is_the_one_this_file_assumes` and the
-//!   seven `bNN_*` -- each individually discoverable, each one behaviour.
-//! - `task_02_b_positive`, a frozen ID, which is a ROLL-UP that calls all
-//!   eight. It adds no behaviour. It exists because the acceptance criteria
-//!   name it as the positive, and an empty frozen positive would be a vacuous
-//!   test.
-//! - `task_02_b_planted_negative`, a frozen ID, the one behaviour not reached
-//!   by any group test.
+//! DO NOT count `#[test]` unanchored. This prose mentions the token, so
+//! `grep -c '#\[test\]'` scores three higher than the truth -- and one of the
+//! inflating lines is the warning against counting by mentions. Anchor it.
 //!
-//! **So a full run executes each group body TWICE and reports 10 outcomes for
-//! 8 behaviours plus one negative.** A receipt must not read 10 outcomes as 10
-//! behaviours, and must not read a group's failure appearing twice as two
-//! defects. The countable figure against the bead's 23 required groups is the
-//! number of `fn bNN_*` tests, which is SEVEN.
+//! Likewise do not count `B-nn` occurrences. The coverage table names groups
+//! in order to say which are MISSING, so a mention scan reads the gap list as
+//! coverage. Every group identifier in this file is in a comment; none is in
+//! code.
 //!
-//! The groups were promoted to individual `#[test]`s on orchestrator ruling
-//! after review. The decisive reason was not cardinality: it is that seven
-//! behaviours inside one test means the FIRST FAILING ASSERT ABORTS THE REST,
-//! so a red would report one group and stay silent about six. Individually
-//! discoverable tests make all eight outcomes observable on a single run. The
-//! roll-up still has that defect internally, which is exactly why it must not
-//! be the only entry point.
+//! THIS FILE HAS BEEN MISCOUNTED FOUR TIMES, BY FOUR DIFFERENT INSTRUMENTS,
+//! always upward: 13 by mention count, 18 by a mixed regex, 13-of-23 by
+//! reading a run's outcome total as a group total, and 20 tests by an
+//! unanchored `#[test]` count. The numbers were real every time; each was a
+//! count of something else. Re-derive with the expressions above rather than
+//! trusting any figure written in prose, including the ones below.
+//!
+//! # What a run reports, and how not to add it up
+//!
+//! Structure, which is stable even as the counts move:
+//!
+//! - One test per `bNN_*` group, plus a second where a group's halves are
+//!   independently meaningful (B-31 has two: the ordering chain and the
+//!   stale-generation refusal).
+//! - `lease_window_is_the_one_this_file_assumes`, a guard on the constant
+//!   this file's clock advances are calibrated against.
+//! - `task_02_b_positive`, a frozen ID and a ROLL-UP that calls every group
+//!   test above. It adds NO behaviour. It exists because the acceptance
+//!   criteria name it as the positive and an empty frozen positive would be a
+//!   vacuous test.
+//! - `task_02_b_planted_negative`, a frozen ID, the one behaviour no group
+//!   test reaches.
+//!
+//! **A full run therefore executes each group body TWICE** -- once standalone,
+//! once through the roll-up. A receipt must not read the outcome total as a
+//! behaviour count, nor a group failing twice as two defects. The roll-up
+//! keeps the first-failure-hides-siblings defect internally, which is exactly
+//! why it must not be the only entry point rather than a reason to delete it.
 //!
 //! Four of the sixteen cannot be closed by writing tests at all. They rest on
 //! vocabulary the shipped source does not carry: word-boundary counts over
