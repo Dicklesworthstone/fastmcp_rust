@@ -53,13 +53,45 @@ jobs:
           key: modern-no-legacy
 
       - name: Check formatting
+        id: formatting
         run: cargo fmt --all -- --check
 
+      # Keep every check fatal, but do not let a formatting failure hide
+      # compilation errors or regressions in the worker-custody tests.
+      - name: Test blocking handler worker custody
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p fastmcp-server --no-default-features --lib providers::blocking -- --nocapture
+
       - name: Test shipped no-legacy server graph
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p fastmcp-server --no-default-features --test srv_02_b -- --nocapture
 
       - name: Test shipped no-legacy multi-request lifecycle (GH #65)
+        if: ${{ !cancelled() }}
         run: cargo test --locked -p fastmcp-server --no-default-features --test srv_65_modern_multi_request -- --nocapture
 
-      - name: Lint shipped no-legacy server graph
-        run: cargo clippy --locked -p fastmcp-server --no-default-features --test srv_02_b --test srv_65_modern_multi_request -- -D warnings
+      - name: Lint shipped no-legacy server graph and worker-custody tests
+        if: ${{ !cancelled() }}
+        run: cargo clippy --locked -p fastmcp-server --no-default-features --lib --test srv_02_b --test srv_65_modern_multi_request -- -D warnings
+
+      - name: Capture rustfmt repair for the exact failing checkout
+        if: ${{ !cancelled() && steps.formatting.outcome == 'failure' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git rev-parse HEAD > "$RUNNER_TEMP/formatting-source-head.txt"
+          git diff --binary > "$RUNNER_TEMP/rustfmt.patch"
+          git diff --name-only -z | tar --null -T - -czf "$RUNNER_TEMP/rustfmt-sources.tar.gz"
+
+      - name: Upload rustfmt repair
+        if: ${{ !cancelled() && steps.formatting.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustfmt-repair-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/formatting-source-head.txt
+            ${{ runner.temp }}/rustfmt.patch
+            ${{ runner.temp }}/rustfmt-sources.tar.gz
+          if-no-files-found: error
+          retention-days: 1
