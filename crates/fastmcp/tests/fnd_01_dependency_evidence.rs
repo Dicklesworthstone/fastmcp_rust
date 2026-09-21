@@ -60007,6 +60007,33 @@ fn fallible(value: Option<u8>) {
             ("E_RECORD_COUNT_LINK_REGISTRY", |pins| pins.count_array_link.byte_length += 1),
             ("E_RECORD_COUNT_LINK_REGISTRY", |pins| pins.count_array_link.sha256 = WRONG_SHA256),
         ];
+        // COMPILE-TIME DIMENSION COUPLING. `cases.len() == 29` below guards ONE
+        // direction only: it fails if a case is REMOVED, and PASSES if a pin dimension
+        // is ADDED without a case -- leaving the new dimension silently unguarded while
+        // an assertion that looks like coverage enforcement reports success. 29 is a
+        // hand-maintained integer with nothing tying it to the struct it counts.
+        //
+        // Rust cannot count struct fields, but an exhaustive destructuring with NO `..`
+        // fails to COMPILE when a field is added anywhere in the tree below. That moves
+        // the failure from "silent gap discovered later" to "the build stops in front of
+        // the person adding the dimension", one screen from the case list they must
+        // extend. Five other exhaustive-destructure guards already use this idiom in
+        // this file; this is not a new convention.
+        //
+        // The binding count here is 29 BY CONSTRUCTION and must equal cases.len().
+        let FrozenPolicyMirrorPins {
+            policy: FileMirrorPin { byte_length: _, sha256: _ },
+            policy_shape:
+                PolicyShapeMirrorPin { row_count: _, scalar_count: _, variant_count: _, byte_length: _, sha256: _ },
+            policy_type: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+            record_schema: RecordSchemaMirrorPin { count: _, selector_count: _, byte_length: _, sha256: _ },
+            record_variant: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+            receipt_schema: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+            receipt_contract: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+            direct_field_type: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+            count_array_link: RegistryMirrorPin { count: _, byte_length: _, sha256: _ },
+        } = FROZEN_POLICY_MIRROR_PINS;
+
         assert_eq!(cases.len(), 29, "every D-M1 through D-M8 pin dimension has one planted negative");
         for (expected_code, mutate) in cases {
             let mut pins = FROZEN_POLICY_MIRROR_PINS;
