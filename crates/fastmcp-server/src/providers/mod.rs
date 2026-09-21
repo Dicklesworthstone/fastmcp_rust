@@ -31,7 +31,7 @@
 
 #![forbid(unsafe_code)]
 
-/// Caller-owned, bounded blocking execution for synchronous MCP tools.
+/// Caller-owned, bounded blocking execution for synchronous MCP handlers.
 pub mod blocking;
 
 mod filesystem;
@@ -44,7 +44,7 @@ mod schema_tool;
 pub mod managed_oauth;
 
 pub use filesystem::{FilesystemProvider, FilesystemProviderError, FilesystemResourceHandler};
-pub use blocking::{BlockingHandlerLane, BlockingTool};
+pub use blocking::{BlockingHandlerLane, BlockingResource, BlockingTool};
 #[cfg(feature = "apps")]
 pub use mcp_apps::{McpAppsUiResource, McpAppsUiResourceError};
 pub use schema_tool::{RegisteredSchemaTool, RegisteredSchemaToolError};

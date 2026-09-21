@@ -10,6 +10,9 @@
 //! cannot be preempted: its reservation remains charged until the closure really
 //! returns. The caller's runtime region retains ownership of that worker.
 
+mod resource;
+pub use resource::BlockingResource;
+
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
