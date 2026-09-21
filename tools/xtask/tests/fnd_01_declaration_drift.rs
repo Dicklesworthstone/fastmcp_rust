@@ -432,6 +432,34 @@ fn fnd_01_drift_detector_planted_negative() {
         "repairing one baselined drift must be detected as a stale baseline entry"
     );
 
+    // ARM C — PLANT A TOOLCHAIN REPAIR. Arms A and B both mutate the ROOT
+    // MANIFEST, so an evaluator that ignored its `toolchain` argument entirely
+    // and read the real file would pass both. Mutation-testing the arms against
+    // a deliberately broken evaluator found exactly that hole: `ignore_root`,
+    // `stuck_baseline`, `drop_edition` and `drop_version` were each caught, and
+    // `ignore_toolchain` was caught by nothing. This arm closes it by making one
+    // arm depend on that parameter and nothing else.
+    let declared_channel = policy
+        .split("\"RUSTUP_TOOLCHAIN\", \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the policy declares a pinned toolchain");
+    let repaired_toolchain = toml::from_str::<toml::Value>(&format!(
+        "[toolchain]\nchannel = \"{declared_channel}\"\n"
+    ))
+    .expect("synthetic toolchain manifest parses");
+    let arm_c = drifts_between(&policy, &parse("Cargo.toml"), &repaired_toolchain);
+    let repaired_c: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|k| !arm_c.contains_key(*k))
+        .collect();
+    assert_eq!(
+        repaired_c,
+        vec!["toolchain.channel"],
+        "an evaluator that ignores its toolchain input passes arms A and B; only this arm fails it"
+    );
+
     // ARM 0 AGAIN — byte-for-byte, not merely still-non-empty. The evaluator is
     // pure, so this cannot fail; asserting it is what proves the arms above
     // mutated their inputs rather than any shared state.
