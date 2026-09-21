@@ -857,8 +857,10 @@ fn auth_01_a_ambiguous_authorization_headers_are_refused_before_any_provider_cal
 ///
 /// `AuthRequest` is still BUILT for this request, with
 /// `transport_authorization: None` (`router.rs:113/126`) - but it is refused
-/// before the provider sees it, by the transport guard at `lib.rs:19893`,
-/// eleven lines ahead of the provider call at `lib.rs:19904`. So
+/// before the provider sees it, by the transport guard in
+/// `preauthenticate_http_request` - the `transport_authorization.is_none()` arm
+/// returning `native_http_authentication_rejection()` - which runs before
+/// `authenticate_request_without_commit` reaches `provider.authenticate`. So
 /// `provider_calls` does NOT move for the uncredentialed request: it stays at
 /// the single consultation the earlier credentialed request caused.
 ///
@@ -928,7 +930,7 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         // the shipped guard, this is now the assertion carrying the property.
         // Strengthened to the three-part idiom this file already uses for the
         // ambiguity refusal at :792-804, matching what
-        // `native_http_authentication_rejection` produces (`lib.rs:9650`).
+        // `native_http_authentication_rejection` produces.
         assert_eq!(
             response.status,
             HttpStatus::UNAUTHORIZED,
@@ -943,7 +945,8 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         assert!(
             response.body.is_empty(),
             "an empty body is what separates the authentication refusal from the \
-             credential-location refusal (`lib.rs:9656`), which renders the same status and \
+             credential-location refusal (`native_http_credential_location_rejection`), which \
+             renders the same status and \
              header but carries an `invalid_request` diagnostic"
         );
 
@@ -957,8 +960,19 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         // `observed_credentials == ["Bearer:true", "absent:false"]`, asserting
         // that the server consults the auth provider for an uncredentialed
         // request. The shipped design refuses BEFORE the provider:
-        // `lib.rs:19893` returns `native_http_authentication_rejection()`
-        // eleven lines ahead of the provider call at `lib.rs:19904`.
+        // `preauthenticate_http_request` returns
+        // `native_http_authentication_rejection()` from its
+        // `transport_authorization.is_none()` arm, before
+        // `authenticate_request_without_commit` reaches `provider.authenticate`.
+        //
+        // ANCHORED BY SYMBOL, NOT BY LINE. This rationale previously cited
+        // `lib.rs:19893` and `:19904` as "eleven lines" apart. Both rotted: by
+        // 2026-09-21 those lines held unrelated code and the two sites were 210
+        // lines apart in different functions. A line citation in a 28k-line file
+        // decays fast, and this one carries the whole justification for an
+        // authorised relaxation - a reviewer who checks a dead line number and
+        // finds unrelated code may read the relaxation as unjustified. Symbols
+        // survive motion; line numbers do not.
         //
         // The guard is DELIBERATE, not a regression. It landed in 75099bf1 on
         // 2026-09-05, "feat(auth): require Authorization header and reject
@@ -981,7 +995,8 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         assert_eq!(
             state.provider_calls, 1,
             "the provider was consulted for the uncredentialed request; the shipped guard at \
-             lib.rs:19893 must refuse it before any user-supplied provider code runs"
+             transport guard in preauthenticate_http_request must refuse it before any \
+             user-supplied provider code runs"
         );
         assert_eq!(
             state.observed_credentials,
@@ -1014,7 +1029,8 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         assert!(
             !rendered.contains("native HTTP must supply its credential through Authorization"),
             "the refusal echoed the provider's own denial text, which is a failure oracle; the \
-             shipped path replaces it with a fixed diagnostic at lib.rs:20109"
+             shipped path replaces it with the fixed diagnostic from \
+             native_http_authentication_rejection"
         );
 
         // Still usable: the refusal is not a wedge. Asserted directly rather
@@ -1040,7 +1056,7 @@ fn auth_01_a_admission_does_not_license_a_later_uncredentialed_request() {
         // until it matched a run. `observed_credentials` gains one entry per
         // PROVIDER INVOCATION (:222), and this test makes three requests:
         //   1. credentialed   -> provider consulted      -> "Bearer:true"
-        //   2. uncredentialed -> refused at lib.rs:19893
+        //   2. uncredentialed -> refused at the preauthenticate_http_request guard
         //                        BEFORE the provider     -> nothing recorded
         //   3. recovered      -> provider consulted      -> "Bearer:true"
         // Two entries, and the vector's LENGTH is itself the proof that the
