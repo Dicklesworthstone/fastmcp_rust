@@ -1,0 +1,109 @@
+name: Repair and validate worker-custody formatting
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/repair-worker-custody-formatting.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-custody-formatting-repair
+  cancel-in-progress: false
+
+jobs:
+  repair-and-validate:
+    # This is a one-shot repair, not an automatic formatter for later pushes.
+    if: >-
+      github.repository == 'Dicklesworthstone/fastmcp_rust' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.head_commit.message == 'ci: run one-shot worker-custody formatting repair'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-08-25
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: modern-no-legacy
+
+      - name: Apply pinned rustfmt and commit only its Rust changes
+        id: repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_head=$(git rev-parse HEAD)
+          cargo fmt --all
+          cargo fmt --all -- --check
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              *.rs) ;;
+              *) echo "Unexpected non-Rust change: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only -z)
+          if ! git diff --quiet; then
+            remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
+            if [[ "$remote_head" != "$source_head" ]]; then
+              echo "main advanced; refusing to commit against a stale checkout" >&2
+              exit 1
+            fi
+            git diff --stat
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add --update
+            git commit -m 'style: apply pinned rustfmt to worker-custody changes'
+            # No force push. A concurrent main update makes this fail safely.
+            git push origin HEAD:refs/heads/main
+          fi
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Validated source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      # GITHUB_TOKEN pushes do not start another workflow. Validate the exact
+      # formatted checkout here, with each check remaining independently fatal.
+      - name: Test blocking worker-custody adapters
+        if: ${{ !cancelled() && steps.repair.outcome == 'success' }}
+        run: cargo test --locked -p fastmcp-server --no-default-features --lib providers::blocking -- --nocapture
+
+      - name: Test standalone worker-custody regressions when present
+        if: ${{ !cancelled() && steps.repair.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          targets=(crates/fastmcp-server/tests/*worker_custody.rs)
+          if ((${#targets[@]} == 0)); then
+            echo 'Worker-custody coverage is in the adapter unit tests in this checkout.'
+          else
+            args=()
+            for path in "${targets[@]}"; do
+              target=${path##*/}
+              args+=(--test "${target%.rs}")
+            done
+            cargo test --locked -p fastmcp-server --no-default-features "${args[@]}" -- --nocapture
+          fi
+
+      - name: Test shipped no-legacy server graph
+        if: ${{ !cancelled() && steps.repair.outcome == 'success' }}
+        run: cargo test --locked -p fastmcp-server --no-default-features --test srv_02_b -- --nocapture
+
+      - name: Test shipped no-legacy multi-request lifecycle
+        if: ${{ !cancelled() && steps.repair.outcome == 'success' }}
+        run: cargo test --locked -p fastmcp-server --no-default-features --test srv_65_modern_multi_request -- --nocapture
+
+      - name: Lint shipped graph and blocking adapter unit tests
+        if: ${{ !cancelled() && steps.repair.outcome == 'success' }}
+        run: cargo clippy --locked -p fastmcp-server --no-default-features --lib --test srv_02_b --test srv_65_modern_multi_request -- -D warnings
