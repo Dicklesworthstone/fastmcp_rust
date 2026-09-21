@@ -90,9 +90,18 @@ const KNOWN_DRIFTS: &[&str] = &[
 ];
 
 /// Collects every declaration mismatch between the policy and the tree.
-fn observed_drifts() -> BTreeMap<String, (String, String)> {
-    let policy_src = read(POLICY);
-    let root = parse("Cargo.toml");
+/// The evaluator, pure and total: it reads nothing and decides only from the
+/// three inputs it is handed.
+///
+/// RH-5: this was originally written to read the three files itself, which made
+/// the two-way baseline claim UNTESTABLE — there was no way to hand it a tree
+/// that drifts differently from the real one. A detector whose own failure modes
+/// cannot be exercised is the shape this file exists to catch.
+fn drifts_between(
+    policy_src: &str,
+    root: &toml::Value,
+    toolchain: &toml::Value,
+) -> BTreeMap<String, (String, String)> {
     let mut out = BTreeMap::new();
 
     // 1-3. [workspace.package] scalars the policy freezes by name.
@@ -106,7 +115,7 @@ fn observed_drifts() -> BTreeMap<String, (String, String)> {
         ("workspace_package_rust_version", "rust-version"),
         ("workspace_package_license", "license"),
     ] {
-        let declared = scalar(&policy_src, policy_key);
+        let declared = scalar(policy_src, policy_key);
         let actual = wp.get(tree_key).and_then(toml::Value::as_str).map(str::to_owned);
         if let Some(declared) = declared {
             let actual = actual.unwrap_or_else(|| "(key absent)".to_owned());
@@ -123,7 +132,7 @@ fn observed_drifts() -> BTreeMap<String, (String, String)> {
         .and_then(|rest| rest.split('"').next())
         .map(str::to_owned)
     {
-        let actual = parse("rust-toolchain.toml")
+        let actual = toolchain
             .get("toolchain")
             .and_then(|t| t.get("channel"))
             .and_then(toml::Value::as_str)
@@ -210,6 +219,15 @@ fn observed_drifts() -> BTreeMap<String, (String, String)> {
         );
     }
     out
+}
+
+/// The real tree's drifts: the only place this file touches the filesystem.
+fn observed_drifts() -> BTreeMap<String, (String, String)> {
+    drifts_between(
+        &read(POLICY),
+        &parse("Cargo.toml"),
+        &parse("rust-toolchain.toml"),
+    )
 }
 
 /// Every `workspace_package_*` key this detector knows how to check.
@@ -334,5 +352,92 @@ fn fnd_01_detector_still_knows_every_policy_declaration_key() {
          exactly how this file would go silently narrow (bd-a61ej). Re-point the comparison at \
          the new name; do not simply delete the entry:\n{}",
         vanished.join("\n  ")
+    );
+}
+
+/// Returns the real inputs with one `[workspace.package]` scalar overridden.
+///
+/// The mutation is applied to the PARSED tree rather than by string-editing the
+/// manifest text, so it cannot accidentally hit a same-named key in another
+/// table — `edition` and `version` both appear in more than one place.
+fn root_with_package_scalar(key: &str, value: &str) -> toml::Value {
+    let mut root = parse("Cargo.toml");
+    root.get_mut("workspace")
+        .and_then(|w| w.get_mut("package"))
+        .and_then(toml::Value::as_table_mut)
+        .expect("root Cargo.toml must carry [workspace.package]")
+        .insert(key.to_owned(), toml::Value::String(value.to_owned()));
+    root
+}
+
+#[test]
+fn fnd_01_drift_detector_planted_negative() {
+    let policy = read(POLICY);
+    let toolchain = parse("rust-toolchain.toml");
+    let known: std::collections::BTreeSet<&str> = KNOWN_DRIFTS.iter().copied().collect();
+
+    // ARM 0 — the accepted row. Establishes that each arm's effect is
+    // attributable to the one field it changes and to nothing else. Without
+    // this, an evaluator that reported everything would pass every arm below.
+    let accepted = drifts_between(&policy, &parse("Cargo.toml"), &toolchain);
+    let accepted_keys: std::collections::BTreeSet<&str> =
+        accepted.keys().map(String::as_str).collect();
+    assert_eq!(
+        accepted_keys, known,
+        "the unmutated tree must observe exactly the baseline, or the arms below prove nothing"
+    );
+
+    // ARM A — PLANT A FRESH DRIFT. `edition` agrees today (policy and tree both
+    // "2024") and is not in KNOWN_DRIFTS, so changing only it must make the
+    // `fresh` set non-empty and name exactly that key. This is the direction a
+    // one-way baseline would also catch.
+    let arm_a = drifts_between(&policy, &root_with_package_scalar("edition", "2021"), &toolchain);
+    let fresh_a: Vec<&str> = arm_a
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !known.contains(k))
+        .collect();
+    assert_eq!(
+        fresh_a,
+        vec!["workspace.package.edition"],
+        "planting one fresh drift must surface exactly that key"
+    );
+    assert_eq!(
+        arm_a.len(),
+        accepted.len() + 1,
+        "arm A changes exactly one field and must add exactly one observation"
+    );
+
+    // ARM B — PLANT A REPAIR. This is the direction a ONE-WAY BASELINE CANNOT
+    // SEE, and it is the whole reason the detector asserts `known - seen` is
+    // empty. `workspace.package.version` is baselined as drifted (policy 0.3.2,
+    // tree 0.10.0); setting the tree to the policy's value repairs it, and the
+    // key must LEAVE the observed set so the staleness of KNOWN_DRIFTS is
+    // forced into the open instead of passing silently.
+    let declared_version =
+        scalar(&policy, "workspace_package_version").expect("the policy declares a version");
+    let arm_b = drifts_between(
+        &policy,
+        &root_with_package_scalar("version", &declared_version),
+        &toolchain,
+    );
+    let repaired_b: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|k| !arm_b.contains_key(*k))
+        .collect();
+    assert_eq!(
+        repaired_b,
+        vec!["workspace.package.version"],
+        "repairing one baselined drift must be detected as a stale baseline entry"
+    );
+
+    // ARM 0 AGAIN — byte-for-byte, not merely still-non-empty. The evaluator is
+    // pure, so this cannot fail; asserting it is what proves the arms above
+    // mutated their inputs rather than any shared state.
+    assert_eq!(
+        drifts_between(&policy, &parse("Cargo.toml"), &toolchain),
+        accepted,
+        "the accepted observation must be unchanged after the planted arms"
     );
 }
