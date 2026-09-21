@@ -42869,6 +42869,7 @@ mod lib_unit_tests {
                     &tool_call_body,
                     &opener_headers,
                 );
+                stage.store(5, Ordering::SeqCst);
                 let mut tool_call = client_cx
                     .spawn(move |_tool_call_cx| async move {
                         live_http_exchange(address, tool_call_request).await
@@ -42877,6 +42878,7 @@ mod lib_unit_tests {
                         format!("legacy sampling tool-call POST was not admitted: {error}")
                     })?;
 
+                stage.store(6, Ordering::SeqCst);
                 read_live_http_until(&mut sse, &mut received, b"\"method\":\"sampling/createMessage\"")
                     .await?;
                 let received_text = std::str::from_utf8(&received).map_err(|error| {
@@ -42985,6 +42987,7 @@ mod lib_unit_tests {
                     &reverse_body,
                     &reverse_headers,
                 );
+                stage.store(7, Ordering::SeqCst);
                 let mut reverse_post = client_cx
                     .spawn(move |_reverse_cx| async move { live_http_exchange(address, reverse_post).await })
                     .map_err(|error| {
@@ -43177,7 +43180,10 @@ mod lib_unit_tests {
                     Ok(None) => format!(
                         "client STILL PENDING -- the stall is upstream, in the client, {}",
                         match client_stage.load(Ordering::SeqCst) {
-                            0 => "before either join: still in setup, the SSE wait, or building the reverse response",
+                            0 => "stage 0: never got past opening the SSE session -- connect, write, flush, or the endpoint-prefix read",
+                            5 => "stage 5: session opened and setup POSTs done, spawning the tool call",
+                            6 => "stage 6: PARKED ON THE SSE WAIT for the server's sampling/createMessage reverse request -- it never arrived",
+                            7 => "stage 7: reverse request received and response built, spawning the reverse POST",
                             1 => "parked on reverse_post.join -- the reverse-response POST never returned",
                             2 => "parked on tool_call.join -- the reverse POST returned but the tool call never settled",
                             3 => "past every join: it stalled after its last join and before cancelling",
