@@ -131,6 +131,11 @@ impl ManagedTaskWatchCheckpoint {
         if bytes.len() > MAX_TASK_WATCH_CHECKPOINT_BYTES {
             return Err(ManagedTaskCheckpointError::TooLarge);
         }
+        // Serde's derived struct visitor also supports positional sequences.
+        // The portable format is an object, not an order-dependent tuple.
+        if bytes.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
+            return Err(ManagedTaskCheckpointError::InvalidDocument);
+        }
         let wire: CheckpointWire = serde_json::from_slice(bytes)
             .map_err(|_| ManagedTaskCheckpointError::InvalidDocument)?;
         if wire.format != CHECKPOINT_FORMAT || wire.version != CHECKPOINT_VERSION {
@@ -276,6 +281,15 @@ mod tests {
         let debug = format!("{decoded:?}");
         assert!(debug.contains("task_count: 2"));
         for secret in ["service.example", "second", "first"] { assert!(!debug.contains(secret)); }
+    }
+
+    #[test]
+    fn checkpoint_requires_an_object_even_when_a_sequence_has_all_valid_fields() {
+        let object = document().to_string();
+        assert!(ManagedTaskWatchCheckpoint::decode(object.as_bytes()).is_ok());
+        let sequence = json!([CHECKPOINT_FORMAT, 1, FINAL_PROTOCOL_VERSION,
+            "https://service.example/mcp", ["second", "first"]]).to_string();
+        assert!(matches!(ManagedTaskWatchCheckpoint::decode(sequence.as_bytes()), Err(ManagedTaskCheckpointError::InvalidDocument)));
     }
 
     #[test]

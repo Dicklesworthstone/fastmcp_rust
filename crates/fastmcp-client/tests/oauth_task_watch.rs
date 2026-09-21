@@ -29,6 +29,9 @@ use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta, FINAL_CLIENT_CAPABI
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TASKS_EXTENSION};
 use serde_json::{Value, json};
 
+#[path = "oauth_task_watch/checkpoint.rs"]
+mod checkpoint;
+
 const CHILD_CASE: &str = "FASTMCP_TEST_OAUTH_TASK_WATCH_CASE";
 // TEST ONLY, matching the existing public native OAuth fixtures. Trust is
 // installed only in the isolated child, never the host's permanent store.
@@ -40,16 +43,20 @@ const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM
 enum Case { Multi, CompletionRace, PartialAck, Interrupted, Cancel, SessionClose, Abandon, SnapshotLimit, WrongResponse, WrongTask, Precancel }
 
 fn isolated(name: &str, case: Case) {
+    isolated_run(name, || run_case(case));
+}
+
+fn isolated_run(name: &str, run: impl FnOnce()) {
     if let Ok(selected) = std::env::var(CHILD_CASE) {
         assert_eq!(selected, name);
-        run_case(case);
+        run();
         return;
     }
     struct Child(std::process::Child);
     impl Drop for Child {
         fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
     }
-    let root = std::env::temp_dir().join(format!("fastmcp-task-watch-ca-{}-{name}.pem", std::process::id()));
+    let root = std::env::temp_dir().join(format!("fastmcp-task-watch-ca-{}-{}.pem", std::process::id(), name.replace(':', "_")));
     std::fs::write(&root, ROOT).unwrap();
     let mut child = Child(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
