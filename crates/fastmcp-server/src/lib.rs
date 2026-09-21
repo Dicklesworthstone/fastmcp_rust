@@ -31213,6 +31213,80 @@ mod lib_unit_tests {
         }
     }
 
+    /// DIAGNOSTIC (bd-f2ndd). Same tool NAME and schema as
+    /// `LiveLegacyRuntimeConnectionTool`, but declares `ToolExecutionMode::Async`
+    /// and awaits `ctx.sample` directly instead of bridging it with `block_on`.
+    ///
+    /// This exists to answer one question and fixes nothing: would `ctx.sample`
+    /// have completed if the handler thread were free? Stage 21/22/23 distinguish
+    /// this hook from the blocking one's 1/2/3, so a run also reports WHICH hook
+    /// actually dispatched.
+    ///
+    /// It is a separate type rather than a change to the shared fixture because
+    /// `LiveLegacyRuntimeConnectionTool` is registered at eight sites and seven
+    /// of them pass today. Only the reverse-response probe swaps to this one.
+    ///
+    /// Note `call_async`'s trait default delegates to `call`, so declaring the
+    /// mode without supplying this hook would route straight back into the
+    /// `block_on` and be polled on the caller's runtime instead.
+    struct LiveLegacyReverseResponseAsyncTool;
+
+    impl ToolHandler for LiveLegacyReverseResponseAsyncTool {
+        fn definition(&self) -> Tool {
+            LiveLegacyRuntimeConnectionTool.definition()
+        }
+
+        fn execution_mode(&self) -> ToolExecutionMode {
+            ToolExecutionMode::Async
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Err(McpError::internal_error(
+                "bd-f2ndd async probe tool requires asynchronous caller-owned dispatch",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            arguments: serde_json::Value,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                F2NDD_TOOL_STAGE.fetch_max(21, Ordering::SeqCst);
+                let counter = ctx.get_state::<u64>("legacy-runtime-counter").unwrap_or(0) + 1;
+                if !ctx.set_state("legacy-runtime-counter", counter) {
+                    return asupersync::Outcome::Err(McpError::internal_error(
+                        "legacy connection state could not retain a counter",
+                    ));
+                }
+                ctx.report_progress(counter as f64, Some("legacy connection progress"));
+                let Some(sample) = arguments.get("sample").and_then(serde_json::Value::as_bool)
+                else {
+                    return asupersync::Outcome::Err(McpError::invalid_params(
+                        "sample must be a boolean",
+                    ));
+                };
+                let text = if sample {
+                    F2NDD_TOOL_STAGE.fetch_max(22, Ordering::SeqCst);
+                    match ctx.sample("legacy runtime sample", 16).await {
+                        Ok(response) => {
+                            F2NDD_TOOL_STAGE.fetch_max(23, Ordering::SeqCst);
+                            format!("legacy-runtime-{counter}-{}", response.text)
+                        }
+                        Err(error) => return asupersync::Outcome::Err(error),
+                    }
+                } else {
+                    format!("legacy-runtime-{counter}-without-sampling")
+                };
+                asupersync::Outcome::Ok(vec![Content::text(text)])
+            })
+        }
+    }
+
     struct LegacyRootsContextTool;
 
     impl ToolHandler for LegacyRootsContextTool {
@@ -42793,7 +42867,7 @@ mod lib_unit_tests {
         const TOOL_CALL_ID: i64 = 843;
 
         let server = Server::new("live-http-legacy-reverse-response", "1.0.0")
-            .tool(LiveLegacyRuntimeConnectionTool);
+            .tool(LiveLegacyReverseResponseAsyncTool);
         let server = if reverse_response_token.is_some() {
             let verifier = StaticTokenVerifier::new([
                 ("alpha", AuthContext::with_subject("alice")),
@@ -43196,6 +43270,9 @@ mod lib_unit_tests {
                                 0 => "stage 6/send 0: parked on the SSE wait AND THE TOOL HANDLER WAS NEVER ENTERED -- the tools/call never reached it, so nothing ever tried to send",
                                 1 => "stage 6/send 1: tool handler entered but it never reached ctx.sample -- it failed or returned before sampling",
                                 2 => "stage 6/send 2: tool handler is INSIDE block_on(ctx.sample(..)) and never came back -- the send side is parked too",
+                                21 => "stage 6/send 21: ASYNC hook entered but never reached ctx.sample",
+                                22 => "stage 6/send 22: ASYNC hook is AWAITING ctx.sample and it never resolved -- removing block_on did NOT free it, so there is a second defect",
+                                23 => "stage 6/send 23: ASYNC ctx.sample RESOLVED on the server; the client waiter missed a delivery that happened",
                                 _ => "stage 6/send 3: ctx.sample RETURNED on the server, so a reverse request was sent and answered -- the client waiter missed it",
                             },
                             7 => "stage 7: reverse request received and response built, spawning the reverse POST",
