@@ -93,7 +93,8 @@ impl AccessToken {
         // Special-case a common malformed Authorization value:
         // "Bearer " (scheme with a missing token) should be rejected, even though trimming
         // would otherwise collapse it into a single-word "Bearer" (which we treat as a
-        // bare token for non-header usages).
+        // bare token for non-header usages). Match the Unicode whitespace used
+        // by trim/split_whitespace so a non-ASCII separator cannot bypass this guard.
         let leading = value.trim_start();
         if let Some(prefix) = leading.get(..6) {
             if prefix.eq_ignore_ascii_case("Bearer") {
@@ -101,7 +102,7 @@ impl AccessToken {
                 if rest
                     .chars()
                     .next()
-                    .is_some_and(|ch| ch.is_ascii_whitespace())
+                    .is_some_and(char::is_whitespace)
                     && rest.trim().is_empty()
                 {
                     return None;
@@ -338,6 +339,51 @@ mod tests {
         assert!(!AccessToken::is_valid_token68(
             &"x".repeat(super::MAX_ACCESS_TOKEN_BYTES + 1)
         ));
+    }
+
+    #[test]
+    fn legacy_in_band_missing_bearer_credential_uses_the_tokenizer_whitespace() {
+        for separator in [" ", "\t", "\r\n", "\u{0085}", "\u{00a0}", "\u{2003}", "\u{3000}"] {
+            for scheme in ["Bearer", "bearer", "BeArEr"] {
+                let missing = format!("{scheme}{separator}");
+                assert_eq!(AccessToken::parse_legacy_in_band(&missing), None);
+                assert_eq!(
+                    AccessToken::parse_legacy_in_band(&format!(" \t{missing}")),
+                    None
+                );
+                // Change only the presence of the credential after the same
+                // delimiter: a genuine legacy credential must still parse.
+                let present = format!("{missing}abc");
+                let parsed = AccessToken::parse_legacy_in_band(&present)
+                    .expect("a legacy whitespace separator with a credential is valid");
+                assert_eq!(parsed.scheme, scheme);
+                assert_eq!(parsed.token, "abc");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_in_band_bare_bearer_is_distinct_from_a_missing_credential() {
+        for literal in ["Bearer", "bearer", "BeArEr"] {
+            let token = AccessToken::parse_legacy_in_band(literal)
+                .expect("an undelimited literal remains a supported bare token");
+            assert_eq!(token.scheme, "Bearer");
+            assert_eq!(token.token, literal);
+            assert_eq!(
+                AccessToken::parse_legacy_in_band(&format!("{literal}\u{2003}")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unicode_separators_do_not_relax_native_http_authorization() {
+        assert!(AccessToken::parse("Bearer abc").is_some());
+        for separator in ["\t", "\u{0085}", "\u{00a0}", "\u{2003}", "\u{3000}"] {
+            let value = format!("Bearer{separator}abc");
+            assert!(AccessToken::parse_legacy_in_band(&value).is_some());
+            assert_eq!(AccessToken::parse(&value), None);
+        }
     }
 
     #[test]
