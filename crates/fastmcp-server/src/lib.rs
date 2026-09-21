@@ -7117,6 +7117,8 @@ impl BoundHttpServer {
                     Err(error) => break Err(error),
                 }
             };
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(31);
             connection_shutdown.request();
             // Closing stateless issuance is a latched registry fence, not merely a
             // purge. A handler racing shutdown therefore cannot mint a new
@@ -7128,17 +7130,25 @@ impl BoundHttpServer {
             // aborting any unrelated or uncooperative connection.
             let terminal_receipt = server.final_subscriptions.terminate_with_receipt();
             modern_session_reaper.abort();
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(32);
             let _ = modern_session_reaper.join(cx).await;
             #[cfg(any(feature = "legacy-2024-11-05", test))]
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(33);
             close_live_http_sessions(cx, &self.legacy_sessions).await;
             // Phase one closes response-body admission before any uninterruptible
             // connection-child join can begin. Leave the SSE queues alive until
             // the elected terminal response has had its bounded opportunity to
             // flush.
             let closing_modern_sessions = detach_live_modern_http_sessions(&self.modern_sessions);
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(34);
             connection_children
                 .drain_terminal_controls(&terminal_receipt)
                 .await;
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(35);
             let unsettled_modern_dispatches =
                 finish_live_modern_http_sessions(&self.modern_sessions, closing_modern_sessions)
                     .await;
@@ -7149,6 +7159,8 @@ impl BoundHttpServer {
             connection_children
                 .tasks
                 .extend(unsettled_modern_dispatches);
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(36);
             let connection_shutdown = connection_children.drain_cooperative_shutdown().await;
             connection_children
                 .tasks
@@ -7156,6 +7168,8 @@ impl BoundHttpServer {
                     &self.modern_sessions,
                 ));
             connection_children.reap_finished();
+            #[cfg(test)]
+            lib_unit_tests::record_f2ndd_serve_stage(37);
             server.graceful_shutdown_returning();
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
@@ -23529,6 +23543,15 @@ mod lib_unit_tests {
 
     pub(super) fn record_http_session_lock_contention(session: usize) {
         http_overlap_control().record_lock_contention(session);
+    }
+
+    /// DIAGNOSTIC (bd-f2ndd). Under async dispatch the client completes and
+    /// cancels, yet `serve` still does not return -- so the stall moved to the
+    /// server and has no stage. This records how far serve's shutdown gets.
+    pub(super) static F2NDD_SERVE_STAGE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_f2ndd_serve_stage(stage: usize) {
+        F2NDD_SERVE_STAGE.fetch_max(stage, Ordering::SeqCst);
     }
 
     pub(super) fn record_live_http_listener_wait() {
@@ -43306,8 +43329,21 @@ mod lib_unit_tests {
                 format!(
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
-                     not localise the stall. {client_state}. The stall is NOT fixed; do not \
-                     raise this bound."
+                     not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}. \
+                     The stall is NOT fixed; do not raise this bound.",
+                    F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
+                    match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
+                        // Each marker is recorded BEFORE its await, so stage N
+                        // means the code reached N and is parked in what follows.
+                        0 => "serve never left its accept loop -- cancellation was not observed",
+                        31 => "left the loop but parked before the reaper join, in request/abort, which are synchronous",
+                        32 => "parked at modern_session_reaper.join",
+                        33 => "parked at close_live_http_sessions",
+                        34 => "parked at drain_terminal_controls",
+                        35 => "parked at finish_live_modern_http_sessions",
+                        36 => "parked at drain_cooperative_shutdown",
+                        _ => "past every shutdown await -- the stall is after them",
+                    }
                 )
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
