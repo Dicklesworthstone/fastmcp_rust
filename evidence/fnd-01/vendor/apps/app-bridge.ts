@@ -1,101 +1,104 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import {
-  CallToolRequest,
-  CallToolRequestSchema,
-  CallToolResult,
-  CallToolResultSchema,
-  CreateMessageRequest,
-  CreateMessageRequestSchema,
-  CreateMessageResult,
-  CreateMessageResultWithTools,
-  EmptyResult,
-  Implementation,
-  ListPromptsRequest,
-  ListPromptsRequestSchema,
-  ListPromptsResult,
-  ListPromptsResultSchema,
-  ListResourcesRequest,
-  ListResourcesRequestSchema,
-  ListResourcesResult,
-  ListResourcesResultSchema,
-  ListResourceTemplatesRequest,
-  ListResourceTemplatesRequestSchema,
-  ListResourceTemplatesResult,
-  ListResourceTemplatesResultSchema,
-  ListToolsRequest,
-  ListToolsRequestSchema,
-  ListToolsResultSchema,
-  LoggingMessageNotification,
-  LoggingMessageNotificationSchema,
-  PingRequest,
-  PingRequestSchema,
-  PromptListChangedNotification,
-  PromptListChangedNotificationSchema,
-  ReadResourceRequest,
-  ReadResourceRequestSchema,
-  ReadResourceResult,
-  ReadResourceResultSchema,
-  ResourceListChangedNotification,
-  ResourceListChangedNotificationSchema,
-  Tool,
-  ToolListChangedNotification,
-  ToolListChangedNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import {
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type {
   Protocol,
   ProtocolOptions,
   RequestOptions,
 } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  type CallToolRequest,
+  CallToolRequestSchema,
+  type CallToolResult,
+  CallToolResultSchema,
+  type CreateMessageRequest,
+  CreateMessageRequestSchema,
+  type CreateMessageResult,
+  type CreateMessageResultWithTools,
+  type EmptyResult,
+  type Implementation,
+  type ListPromptsRequest,
+  ListPromptsRequestSchema,
+  type ListPromptsResult,
+  ListPromptsResultSchema,
+  type ListResourcesRequest,
+  ListResourcesRequestSchema,
+  type ListResourcesResult,
+  ListResourcesResultSchema,
+  type ListResourceTemplatesRequest,
+  ListResourceTemplatesRequestSchema,
+  type ListResourceTemplatesResult,
+  ListResourceTemplatesResultSchema,
+  type ListToolsRequest,
+  ListToolsRequestSchema,
+  ListToolsResultSchema,
+  type LoggingMessageNotification,
+  LoggingMessageNotificationSchema,
+  type PingRequest,
+  PingRequestSchema,
+  type PromptListChangedNotification,
+  PromptListChangedNotificationSchema,
+  type ReadResourceRequest,
+  ReadResourceRequestSchema,
+  type ReadResourceResult,
+  ReadResourceResultSchema,
+  type ResourceListChangedNotification,
+  ResourceListChangedNotificationSchema,
+  type Tool,
+  type ToolListChangedNotification,
+  ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { ProtocolWithEvents } from "./events";
 
 import {
   type AppNotification,
   type AppRequest,
   type AppResult,
+  LATEST_PROTOCOL_VERSION,
+  type McpUiAppCapabilities,
+  type McpUiDownloadFileRequest,
+  McpUiDownloadFileRequestSchema,
+  type McpUiDownloadFileResult,
+  type McpUiHostCapabilities,
+  type McpUiHostContext,
+  type McpUiHostContextChangedNotification,
+  type McpUiInitializedNotification,
+  McpUiInitializedNotificationSchema,
+  type McpUiInitializeRequest,
+  McpUiInitializeRequestSchema,
+  type McpUiInitializeResult,
+  type McpUiMessageRequest,
+  McpUiMessageRequestSchema,
+  type McpUiMessageResult,
+  type McpUiOpenLinkRequest,
+  McpUiOpenLinkRequestSchema,
+  type McpUiOpenLinkResult,
+  type McpUiRequestDisplayModeRequest,
+  McpUiRequestDisplayModeRequestSchema,
+  type McpUiRequestDisplayModeResult,
+  type McpUiRequestTeardownNotification,
+  McpUiRequestTeardownNotificationSchema,
+  type McpUiResourcePermissions,
+  type McpUiResourceTeardownRequest,
+  McpUiResourceTeardownResultSchema,
+  type McpUiSandboxProxyReadyNotification,
+  McpUiSandboxProxyReadyNotificationSchema,
   type McpUiSandboxResourceReadyNotification,
   type McpUiSizeChangedNotification,
+  McpUiSizeChangedNotificationSchema,
   type McpUiToolCancelledNotification,
   type McpUiToolInputNotification,
   type McpUiToolInputPartialNotification,
+  type McpUiToolMeta,
   type McpUiToolResultNotification,
-  LATEST_PROTOCOL_VERSION,
-  McpUiAppCapabilities,
-  McpUiUpdateModelContextRequest,
+  type McpUiUpdateModelContextRequest,
   McpUiUpdateModelContextRequestSchema,
-  McpUiHostCapabilities,
-  McpUiHostContext,
-  McpUiHostContextChangedNotification,
-  McpUiInitializedNotification,
-  McpUiInitializedNotificationSchema,
-  McpUiInitializeRequest,
-  McpUiInitializeRequestSchema,
-  McpUiInitializeResult,
-  McpUiMessageRequest,
-  McpUiMessageRequestSchema,
-  McpUiMessageResult,
-  McpUiOpenLinkRequest,
-  McpUiOpenLinkRequestSchema,
-  McpUiOpenLinkResult,
-  McpUiDownloadFileRequest,
-  McpUiDownloadFileRequestSchema,
-  McpUiDownloadFileResult,
-  McpUiResourceTeardownRequest,
-  McpUiResourceTeardownResultSchema,
-  McpUiRequestTeardownNotification,
-  McpUiRequestTeardownNotificationSchema,
-  McpUiSandboxProxyReadyNotification,
-  McpUiSandboxProxyReadyNotificationSchema,
-  McpUiSizeChangedNotificationSchema,
-  McpUiRequestDisplayModeRequest,
-  McpUiRequestDisplayModeRequestSchema,
-  McpUiRequestDisplayModeResult,
-  McpUiResourcePermissions,
-  McpUiToolMeta,
 } from "./types";
+
+export { RESOURCE_MIME_TYPE, RESOURCE_URI_META_KEY } from "./app";
 export * from "./types";
-export { RESOURCE_URI_META_KEY, RESOURCE_MIME_TYPE } from "./app";
+
 import { RESOURCE_URI_META_KEY } from "./app";
+
 export { PostMessageTransport } from "./message-transport";
 
 /**
@@ -184,9 +187,7 @@ export function isToolVisibilityAppOnly(tool: Partial<Tool>): boolean {
  * iframe.setAttribute("allow", allow);
  * ```
  */
-export function buildAllowAttribute(
-  permissions: McpUiResourcePermissions | undefined,
-): string {
+export function buildAllowAttribute(permissions: McpUiResourcePermissions | undefined): string {
   if (!permissions) return "";
 
   const allowList: string[] = [];
@@ -227,9 +228,7 @@ export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION];
  *
  * @internal
  */
-type RequestHandlerExtra = Parameters<
-  Parameters<AppBridge["setRequestHandler"]>[1]
->[1];
+type RequestHandlerExtra = Parameters<Parameters<AppBridge["setRequestHandler"]>[1]>[1];
 
 /**
  * Maps DOM-style event names to their notification `params` types.
@@ -398,9 +397,7 @@ export class AppBridge extends ProtocolWithEvents<
 
     this._hostContext = options?.hostContext || {};
 
-    this.setRequestHandler(McpUiInitializeRequestSchema, (request) =>
-      this._oninitialize(request),
-    );
+    this.setRequestHandler(McpUiInitializeRequestSchema, (request) => this._oninitialize(request));
 
     this.setRequestHandler(PingRequestSchema, (request, extra) => {
       this.onping?.(request.params, extra);
@@ -409,13 +406,10 @@ export class AppBridge extends ProtocolWithEvents<
 
     // Default handler for requestDisplayMode - returns current mode from host context.
     // Hosts can override this by setting bridge.onrequestdisplaymode = ...
-    this.replaceRequestHandler(
-      McpUiRequestDisplayModeRequestSchema,
-      (request) => {
-        const currentMode = this._hostContext.displayMode ?? "inline";
-        return { mode: currentMode };
-      },
-    );
+    this.replaceRequestHandler(McpUiRequestDisplayModeRequestSchema, (request) => {
+      const currentMode = this._hostContext.displayMode ?? "inline";
+      return { mode: currentMode };
+    });
   }
 
   /**
@@ -513,16 +507,12 @@ export class AppBridge extends ProtocolWithEvents<
    * @see {@link app!App.sendSizeChanged `App.sendSizeChanged`} - the View method that sends these notifications
    * @deprecated Use {@link addEventListener `addEventListener("sizechange", handler)`} instead — it composes with other listeners and supports cleanup via {@link removeEventListener `removeEventListener`}.
    */
-  get onsizechange():
-    | ((params: McpUiSizeChangedNotification["params"]) => void)
-    | undefined {
+  get onsizechange(): ((params: McpUiSizeChangedNotification["params"]) => void) | undefined {
     return this.getEventHandler("sizechange");
   }
-  set onsizechange(
-    callback:
-      | ((params: McpUiSizeChangedNotification["params"]) => void)
-      | undefined,
-  ) {
+  set onsizechange(callback:
+    | ((params: McpUiSizeChangedNotification["params"]) => void)
+    | undefined,) {
     this.setEventHandler("sizechange", callback);
   }
 
@@ -562,11 +552,9 @@ export class AppBridge extends ProtocolWithEvents<
     | undefined {
     return this.getEventHandler("sandboxready");
   }
-  set onsandboxready(
-    callback:
-      | ((params: McpUiSandboxProxyReadyNotification["params"]) => void)
-      | undefined,
-  ) {
+  set onsandboxready(callback:
+    | ((params: McpUiSandboxProxyReadyNotification["params"]) => void)
+    | undefined,) {
     this.setEventHandler("sandboxready", callback);
   }
 
@@ -588,16 +576,12 @@ export class AppBridge extends ProtocolWithEvents<
    * @see {@link sendToolInput `sendToolInput`} for sending tool arguments to the View
    * @deprecated Use {@link addEventListener `addEventListener("initialized", handler)`} instead — it composes with other listeners and supports cleanup via {@link removeEventListener `removeEventListener`}.
    */
-  get oninitialized():
-    | ((params: McpUiInitializedNotification["params"]) => void)
-    | undefined {
+  get oninitialized(): ((params: McpUiInitializedNotification["params"]) => void) | undefined {
     return this.getEventHandler("initialized");
   }
-  set oninitialized(
-    callback:
-      | ((params: McpUiInitializedNotification["params"]) => void)
-      | undefined,
-  ) {
+  set oninitialized(callback:
+    | ((params: McpUiInitializedNotification["params"]) => void)
+    | undefined,) {
     this.setEventHandler("initialized", callback);
   }
 
@@ -642,23 +626,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onmessage() {
     return this._onmessage;
   }
-  set onmessage(
-    callback:
-      | ((
-          params: McpUiMessageRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<McpUiMessageResult>)
-      | undefined,
-  ) {
+  set onmessage(callback:
+    | ((
+        params: McpUiMessageRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<McpUiMessageResult>)
+    | undefined,) {
     this.warnIfRequestHandlerReplaced("onmessage", this._onmessage, callback);
     this._onmessage = callback;
-    this.replaceRequestHandler(
-      McpUiMessageRequestSchema,
-      async (request, extra) => {
-        if (!this._onmessage) throw new Error("No onmessage handler set");
-        return this._onmessage(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(McpUiMessageRequestSchema, async (request, extra) => {
+      if (!this._onmessage) throw new Error("No onmessage handler set");
+      return this._onmessage(request.params, extra);
+    });
   }
 
   /**
@@ -711,23 +690,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onopenlink() {
     return this._onopenlink;
   }
-  set onopenlink(
-    callback:
-      | ((
-          params: McpUiOpenLinkRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<McpUiOpenLinkResult>)
-      | undefined,
-  ) {
+  set onopenlink(callback:
+    | ((
+        params: McpUiOpenLinkRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<McpUiOpenLinkResult>)
+    | undefined,) {
     this.warnIfRequestHandlerReplaced("onopenlink", this._onopenlink, callback);
     this._onopenlink = callback;
-    this.replaceRequestHandler(
-      McpUiOpenLinkRequestSchema,
-      async (request, extra) => {
-        if (!this._onopenlink) throw new Error("No onopenlink handler set");
-        return this._onopenlink(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(McpUiOpenLinkRequestSchema, async (request, extra) => {
+      if (!this._onopenlink) throw new Error("No onopenlink handler set");
+      return this._onopenlink(request.params, extra);
+    });
   }
 
   /**
@@ -779,28 +753,18 @@ export class AppBridge extends ProtocolWithEvents<
   get ondownloadfile() {
     return this._ondownloadfile;
   }
-  set ondownloadfile(
-    callback:
-      | ((
-          params: McpUiDownloadFileRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<McpUiDownloadFileResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "ondownloadfile",
-      this._ondownloadfile,
-      callback,
-    );
+  set ondownloadfile(callback:
+    | ((
+        params: McpUiDownloadFileRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<McpUiDownloadFileResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("ondownloadfile", this._ondownloadfile, callback);
     this._ondownloadfile = callback;
-    this.replaceRequestHandler(
-      McpUiDownloadFileRequestSchema,
-      async (request, extra) => {
-        if (!this._ondownloadfile)
-          throw new Error("No ondownloadfile handler set");
-        return this._ondownloadfile(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(McpUiDownloadFileRequestSchema, async (request, extra) => {
+      if (!this._ondownloadfile) throw new Error("No ondownloadfile handler set");
+      return this._ondownloadfile(request.params, extra);
+    });
   }
 
   /**
@@ -832,11 +796,9 @@ export class AppBridge extends ProtocolWithEvents<
     | undefined {
     return this.getEventHandler("requestteardown");
   }
-  set onrequestteardown(
-    callback:
-      | ((params: McpUiRequestTeardownNotification["params"]) => void)
-      | undefined,
-  ) {
+  set onrequestteardown(callback:
+    | ((params: McpUiRequestTeardownNotification["params"]) => void)
+    | undefined,) {
     this.setEventHandler("requestteardown", callback);
   }
 
@@ -879,28 +841,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onrequestdisplaymode() {
     return this._onrequestdisplaymode;
   }
-  set onrequestdisplaymode(
-    callback:
-      | ((
-          params: McpUiRequestDisplayModeRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<McpUiRequestDisplayModeResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "onrequestdisplaymode",
-      this._onrequestdisplaymode,
-      callback,
-    );
+  set onrequestdisplaymode(callback:
+    | ((
+        params: McpUiRequestDisplayModeRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<McpUiRequestDisplayModeResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("onrequestdisplaymode", this._onrequestdisplaymode, callback);
     this._onrequestdisplaymode = callback;
-    this.replaceRequestHandler(
-      McpUiRequestDisplayModeRequestSchema,
-      async (request, extra) => {
-        if (!this._onrequestdisplaymode)
-          throw new Error("No onrequestdisplaymode handler set");
-        return this._onrequestdisplaymode(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(McpUiRequestDisplayModeRequestSchema, async (request, extra) => {
+      if (!this._onrequestdisplaymode) throw new Error("No onrequestdisplaymode handler set");
+      return this._onrequestdisplaymode(request.params, extra);
+    });
   }
 
   /**
@@ -930,16 +882,12 @@ export class AppBridge extends ProtocolWithEvents<
    * ```
    * @deprecated Use {@link addEventListener `addEventListener("loggingmessage", handler)`} instead — it composes with other listeners and supports cleanup via {@link removeEventListener `removeEventListener`}.
    */
-  get onloggingmessage():
-    | ((params: LoggingMessageNotification["params"]) => void)
-    | undefined {
+  get onloggingmessage(): ((params: LoggingMessageNotification["params"]) => void) | undefined {
     return this.getEventHandler("loggingmessage");
   }
-  set onloggingmessage(
-    callback:
-      | ((params: LoggingMessageNotification["params"]) => void)
-      | undefined,
-  ) {
+  set onloggingmessage(callback:
+    | ((params: LoggingMessageNotification["params"]) => void)
+    | undefined,) {
     this.setEventHandler("loggingmessage", callback);
   }
 
@@ -976,28 +924,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onupdatemodelcontext() {
     return this._onupdatemodelcontext;
   }
-  set onupdatemodelcontext(
-    callback:
-      | ((
-          params: McpUiUpdateModelContextRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<EmptyResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "onupdatemodelcontext",
-      this._onupdatemodelcontext,
-      callback,
-    );
+  set onupdatemodelcontext(callback:
+    | ((
+        params: McpUiUpdateModelContextRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<EmptyResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("onupdatemodelcontext", this._onupdatemodelcontext, callback);
     this._onupdatemodelcontext = callback;
-    this.replaceRequestHandler(
-      McpUiUpdateModelContextRequestSchema,
-      async (request, extra) => {
-        if (!this._onupdatemodelcontext)
-          throw new Error("No onupdatemodelcontext handler set");
-        return this._onupdatemodelcontext(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(McpUiUpdateModelContextRequestSchema, async (request, extra) => {
+      if (!this._onupdatemodelcontext) throw new Error("No onupdatemodelcontext handler set");
+      return this._onupdatemodelcontext(request.params, extra);
+    });
   }
 
   /**
@@ -1033,23 +971,15 @@ export class AppBridge extends ProtocolWithEvents<
   get oncalltool() {
     return this._oncalltool;
   }
-  set oncalltool(
-    callback:
-      | ((
-          params: CallToolRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<CallToolResult>)
-      | undefined,
-  ) {
+  set oncalltool(callback:
+    | ((params: CallToolRequest["params"], extra: RequestHandlerExtra) => Promise<CallToolResult>)
+    | undefined,) {
     this.warnIfRequestHandlerReplaced("oncalltool", this._oncalltool, callback);
     this._oncalltool = callback;
-    this.replaceRequestHandler(
-      CallToolRequestSchema,
-      async (request, extra) => {
-        if (!this._oncalltool) throw new Error("No oncalltool handler set");
-        return this._oncalltool(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      if (!this._oncalltool) throw new Error("No oncalltool handler set");
+      return this._oncalltool(request.params, extra);
+    });
   }
 
   /**
@@ -1081,18 +1011,13 @@ export class AppBridge extends ProtocolWithEvents<
    * @see `CreateMessageRequest` from @modelcontextprotocol/sdk for the request type
    * @see `CreateMessageResult` / `CreateMessageResultWithTools` from @modelcontextprotocol/sdk for result types
    */
-  set oncreatesamplingmessage(
-    callback: (
-      params: CreateMessageRequest["params"],
-      extra: RequestHandlerExtra,
-    ) => Promise<CreateMessageResult | CreateMessageResultWithTools>,
-  ) {
-    this.setRequestHandler(
-      CreateMessageRequestSchema,
-      async (request, extra) => {
-        return callback(request.params, extra);
-      },
-    );
+  set oncreatesamplingmessage(callback: (
+    params: CreateMessageRequest["params"],
+    extra: RequestHandlerExtra,
+  ) => Promise<CreateMessageResult | CreateMessageResultWithTools>,) {
+    this.setRequestHandler(CreateMessageRequestSchema, async (request, extra) => {
+      return callback(request.params, extra);
+    });
   }
 
   /**
@@ -1154,28 +1079,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onlistresources() {
     return this._onlistresources;
   }
-  set onlistresources(
-    callback:
-      | ((
-          params: ListResourcesRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<ListResourcesResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "onlistresources",
-      this._onlistresources,
-      callback,
-    );
+  set onlistresources(callback:
+    | ((
+        params: ListResourcesRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<ListResourcesResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("onlistresources", this._onlistresources, callback);
     this._onlistresources = callback;
-    this.replaceRequestHandler(
-      ListResourcesRequestSchema,
-      async (request, extra) => {
-        if (!this._onlistresources)
-          throw new Error("No onlistresources handler set");
-        return this._onlistresources(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(ListResourcesRequestSchema, async (request, extra) => {
+      if (!this._onlistresources) throw new Error("No onlistresources handler set");
+      return this._onlistresources(request.params, extra);
+    });
   }
 
   /**
@@ -1211,28 +1126,22 @@ export class AppBridge extends ProtocolWithEvents<
   get onlistresourcetemplates() {
     return this._onlistresourcetemplates;
   }
-  set onlistresourcetemplates(
-    callback:
-      | ((
-          params: ListResourceTemplatesRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<ListResourceTemplatesResult>)
-      | undefined,
-  ) {
+  set onlistresourcetemplates(callback:
+    | ((
+        params: ListResourceTemplatesRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<ListResourceTemplatesResult>)
+    | undefined,) {
     this.warnIfRequestHandlerReplaced(
       "onlistresourcetemplates",
       this._onlistresourcetemplates,
       callback,
     );
     this._onlistresourcetemplates = callback;
-    this.replaceRequestHandler(
-      ListResourceTemplatesRequestSchema,
-      async (request, extra) => {
-        if (!this._onlistresourcetemplates)
-          throw new Error("No onlistresourcetemplates handler set");
-        return this._onlistresourcetemplates(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(ListResourceTemplatesRequestSchema, async (request, extra) => {
+      if (!this._onlistresourcetemplates) throw new Error("No onlistresourcetemplates handler set");
+      return this._onlistresourcetemplates(request.params, extra);
+    });
   }
 
   /**
@@ -1268,28 +1177,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onreadresource() {
     return this._onreadresource;
   }
-  set onreadresource(
-    callback:
-      | ((
-          params: ReadResourceRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<ReadResourceResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "onreadresource",
-      this._onreadresource,
-      callback,
-    );
+  set onreadresource(callback:
+    | ((
+        params: ReadResourceRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<ReadResourceResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("onreadresource", this._onreadresource, callback);
     this._onreadresource = callback;
-    this.replaceRequestHandler(
-      ReadResourceRequestSchema,
-      async (request, extra) => {
-        if (!this._onreadresource)
-          throw new Error("No onreadresource handler set");
-        return this._onreadresource(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
+      if (!this._onreadresource) throw new Error("No onreadresource handler set");
+      return this._onreadresource(request.params, extra);
+    });
   }
 
   /**
@@ -1311,9 +1210,7 @@ export class AppBridge extends ProtocolWithEvents<
    *
    * @see `ResourceListChangedNotification` from @modelcontextprotocol/sdk for the notification type
    */
-  sendResourceListChanged(
-    params: ResourceListChangedNotification["params"] = {},
-  ) {
+  sendResourceListChanged(params: ResourceListChangedNotification["params"] = {}) {
     return this.notification({
       method: "notifications/resources/list_changed" as const,
       params,
@@ -1353,28 +1250,18 @@ export class AppBridge extends ProtocolWithEvents<
   get onlistprompts() {
     return this._onlistprompts;
   }
-  set onlistprompts(
-    callback:
-      | ((
-          params: ListPromptsRequest["params"],
-          extra: RequestHandlerExtra,
-        ) => Promise<ListPromptsResult>)
-      | undefined,
-  ) {
-    this.warnIfRequestHandlerReplaced(
-      "onlistprompts",
-      this._onlistprompts,
-      callback,
-    );
+  set onlistprompts(callback:
+    | ((
+        params: ListPromptsRequest["params"],
+        extra: RequestHandlerExtra,
+      ) => Promise<ListPromptsResult>)
+    | undefined,) {
+    this.warnIfRequestHandlerReplaced("onlistprompts", this._onlistprompts, callback);
     this._onlistprompts = callback;
-    this.replaceRequestHandler(
-      ListPromptsRequestSchema,
-      async (request, extra) => {
-        if (!this._onlistprompts)
-          throw new Error("No onlistprompts handler set");
-        return this._onlistprompts(request.params, extra);
-      },
-    );
+    this.replaceRequestHandler(ListPromptsRequestSchema, async (request, extra) => {
+      if (!this._onlistprompts) throw new Error("No onlistprompts handler set");
+      return this._onlistprompts(request.params, extra);
+    });
   }
 
   /**
@@ -1458,9 +1345,7 @@ export class AppBridge extends ProtocolWithEvents<
    * Handle the ui/initialize request from the guest.
    * @internal
    */
-  private async _oninitialize(
-    request: McpUiInitializeRequest,
-  ): Promise<McpUiInitializeResult> {
+  private async _oninitialize(request: McpUiInitializeRequest): Promise<McpUiInitializeResult> {
     const requestedVersion = request.params.protocolVersion;
 
     if (this._appInfo !== undefined) {
@@ -1475,9 +1360,7 @@ export class AppBridge extends ProtocolWithEvents<
     this._appCapabilities = request.params.appCapabilities;
     this._appInfo = request.params.appInfo;
 
-    const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(
-      requestedVersion,
-    )
+    const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion)
       ? requestedVersion
       : LATEST_PROTOCOL_VERSION;
 
@@ -1524,9 +1407,7 @@ export class AppBridge extends ProtocolWithEvents<
   setHostContext(hostContext: McpUiHostContext) {
     const changes: McpUiHostContext = {};
     let hasChanges = false;
-    for (const key of Object.keys(hostContext) as Array<
-      keyof McpUiHostContext
-    >) {
+    for (const key of Object.keys(hostContext) as Array<keyof McpUiHostContext>) {
       const oldValue = this._hostContext[key];
       const newValue = hostContext[key];
       if (deepEqual(oldValue, newValue)) {
@@ -1705,9 +1586,7 @@ export class AppBridge extends ProtocolWithEvents<
    * @internal
    * @see {@link onsandboxready `onsandboxready`} for handling the sandbox proxy ready notification
    */
-  sendSandboxResourceReady(
-    params: McpUiSandboxResourceReadyNotification["params"],
-  ) {
+  sendSandboxResourceReady(params: McpUiSandboxResourceReadyNotification["params"]) {
     return this.notification({
       method: "ui/notifications/sandbox-resource-ready" as const,
       params,
@@ -1738,10 +1617,7 @@ export class AppBridge extends ProtocolWithEvents<
    * }
    * ```
    */
-  teardownResource(
-    params: McpUiResourceTeardownRequest["params"],
-    options?: RequestOptions,
-  ) {
+  teardownResource(params: McpUiResourceTeardownRequest["params"], options?: RequestOptions) {
     return this.request(
       {
         method: "ui/resource-teardown" as const,
@@ -1765,11 +1641,7 @@ export class AppBridge extends ProtocolWithEvents<
    * @returns Promise resolving to the tool call result
    */
   callTool(params: CallToolRequest["params"], options?: RequestOptions) {
-    return this.request(
-      { method: "tools/call", params },
-      CallToolResultSchema,
-      options,
-    );
+    return this.request({ method: "tools/call", params }, CallToolResultSchema, options);
   }
 
   /**
@@ -1782,11 +1654,7 @@ export class AppBridge extends ProtocolWithEvents<
    * @returns Promise resolving to the list of tools
    */
   listTools(params: ListToolsRequest["params"], options?: RequestOptions) {
-    return this.request(
-      { method: "tools/list", params },
-      ListToolsResultSchema,
-      options,
-    );
+    return this.request({ method: "tools/list", params }, ListToolsResultSchema, options);
   }
 
   /**
@@ -1845,9 +1713,7 @@ export class AppBridge extends ProtocolWithEvents<
    */
   async connect(transport: Transport) {
     if (this.transport) {
-      throw new Error(
-        "AppBridge is already connected. Call close() before connecting again.",
-      );
+      throw new Error("AppBridge is already connected. Call close() before connecting again.");
     }
     this._initializedReceived = false;
     if (this._client) {
@@ -1860,16 +1726,13 @@ export class AppBridge extends ProtocolWithEvents<
 
       if (serverCapabilities.tools) {
         this.oncalltool = async (params, extra) => {
-          return this._client!.request(
-            { method: "tools/call", params },
-            CallToolResultSchema,
-            { signal: extra.signal },
-          );
+          return this._client!.request({ method: "tools/call", params }, CallToolResultSchema, {
+            signal: extra.signal,
+          });
         };
         if (serverCapabilities.tools.listChanged) {
-          this._client.setNotificationHandler(
-            ToolListChangedNotificationSchema,
-            (n) => this.sendToolListChanged(n.params),
+          this._client.setNotificationHandler(ToolListChangedNotificationSchema, (n) =>
+            this.sendToolListChanged(n.params),
           );
         }
       }
@@ -1896,9 +1759,8 @@ export class AppBridge extends ProtocolWithEvents<
           );
         };
         if (serverCapabilities.resources.listChanged) {
-          this._client.setNotificationHandler(
-            ResourceListChangedNotificationSchema,
-            (n) => this.sendResourceListChanged(n.params),
+          this._client.setNotificationHandler(ResourceListChangedNotificationSchema, (n) =>
+            this.sendResourceListChanged(n.params),
           );
         }
       }
@@ -1911,9 +1773,8 @@ export class AppBridge extends ProtocolWithEvents<
           );
         };
         if (serverCapabilities.prompts.listChanged) {
-          this._client.setNotificationHandler(
-            PromptListChangedNotificationSchema,
-            (n) => this.sendPromptListChanged(n.params),
+          this._client.setNotificationHandler(PromptListChangedNotificationSchema, (n) =>
+            this.sendPromptListChanged(n.params),
           );
         }
       }

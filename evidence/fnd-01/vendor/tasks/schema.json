@@ -35,18 +35,11 @@
               "type": "string"
             }
           },
-          "required": [
-            "taskId"
-          ],
+          "required": ["taskId"],
           "additionalProperties": false
         }
       },
-      "required": [
-        "jsonrpc",
-        "id",
-        "method",
-        "params"
-      ],
+      "required": ["jsonrpc", "id", "method", "params"],
       "additionalProperties": false
     },
     "CancelTaskResult": {
@@ -75,9 +68,7 @@
                   "type": "string"
                 }
               },
-              "required": [
-                "taskId"
-              ],
+              "required": ["taskId"],
               "additionalProperties": false
             }
           },
@@ -120,13 +111,7 @@
           "type": "number"
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
       "additionalProperties": false
     },
     "CompletedTask": {
@@ -170,14 +155,7 @@
           "additionalProperties": {}
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs",
-        "result"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
       "additionalProperties": false
     },
     "CreateTaskResult": {
@@ -208,9 +186,7 @@
                       "type": "string"
                     }
                   },
-                  "required": [
-                    "taskId"
-                  ],
+                  "required": ["taskId"],
                   "additionalProperties": false
                 }
               },
@@ -272,13 +248,7 @@
               "type": "number"
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
           "additionalProperties": false
         }
       ]
@@ -319,13 +289,7 @@
               "type": "number"
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
           "additionalProperties": false
         },
         {
@@ -366,22 +330,11 @@
                 "type": "string"
               },
               "additionalProperties": {
-                "anyOf": [
-                  {},
-                  {},
-                  {}
-                ]
+                "anyOf": [{}, {}, {}]
               }
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs",
-            "inputRequests"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "inputRequests"],
           "additionalProperties": false
         },
         {
@@ -424,14 +377,7 @@
               "additionalProperties": {}
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs",
-            "result"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
           "additionalProperties": false
         },
         {
@@ -474,14 +420,7 @@
               "additionalProperties": {}
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs",
-            "error"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
           "additionalProperties": false
         },
         {
@@ -517,13 +456,7 @@
               "type": "number"
             }
           },
-          "required": [
-            "taskId",
-            "status",
-            "createdAt",
-            "lastUpdatedAt",
-            "ttlMs"
-          ],
+          "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
           "additionalProperties": false
         }
       ]
@@ -569,14 +502,7 @@
           "additionalProperties": {}
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs",
-        "error"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
       "additionalProperties": false
     },
     "GetTaskRequest": {
@@ -610,18 +536,11 @@
               "type": "string"
             }
           },
-          "required": [
-            "taskId"
-          ],
+          "required": ["taskId"],
           "additionalProperties": false
         }
       },
-      "required": [
-        "jsonrpc",
-        "id",
-        "method",
-        "params"
-      ],
+      "required": ["jsonrpc", "id", "method", "params"],
       "additionalProperties": false
     },
     "GetTaskResult": {
@@ -652,9 +571,7 @@
                       "type": "string"
                     }
                   },
-                  "required": [
-                    "taskId"
-                  ],
+                  "required": ["taskId"],
                   "additionalProperties": false
                 }
               },
@@ -698,13 +615,7 @@
                   "type": "number"
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
               "additionalProperties": false
             },
             {
@@ -745,11 +656,7 @@
                     "type": "string"
                   },
                   "additionalProperties": {
-                    "anyOf": [
-                      {},
-                      {},
-                      {}
-                    ]
+                    "anyOf": [{}, {}, {}]
                   }
                 }
               },
@@ -803,14 +710,7 @@
                   "additionalProperties": {}
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs",
-                "result"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
               "additionalProperties": false
             },
             {
@@ -853,14 +753,7 @@
                   "additionalProperties": {}
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs",
-                "error"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
               "additionalProperties": false
             },
             {
@@ -896,13 +789,7 @@
                   "type": "number"
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
               "additionalProperties": false
             }
           ]
@@ -911,11 +798,7 @@
     },
     "InputRequest": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "anyOf": [
-        {},
-        {},
-        {}
-      ]
+      "anyOf": [{}, {}, {}]
     },
     "InputRequests": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -924,11 +807,7 @@
         "type": "string"
       },
       "additionalProperties": {
-        "anyOf": [
-          {},
-          {},
-          {}
-        ]
+        "anyOf": [{}, {}, {}]
       }
     },
     "InputRequiredTask": {
@@ -970,31 +849,16 @@
             "type": "string"
           },
           "additionalProperties": {
-            "anyOf": [
-              {},
-              {},
-              {}
-            ]
+            "anyOf": [{}, {}, {}]
           }
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs",
-        "inputRequests"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "inputRequests"],
       "additionalProperties": false
     },
     "InputResponse": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "anyOf": [
-        {},
-        {},
-        {}
-      ]
+      "anyOf": [{}, {}, {}]
     },
     "InputResponses": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1003,11 +867,7 @@
         "type": "string"
       },
       "additionalProperties": {
-        "anyOf": [
-          {},
-          {},
-          {}
-        ]
+        "anyOf": [{}, {}, {}]
       }
     },
     "Task": {
@@ -1064,13 +924,7 @@
           "type": "number"
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
       "additionalProperties": false
     },
     "TaskStatusNotificationParams": {
@@ -1124,13 +978,7 @@
                   "type": "number"
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
               "additionalProperties": false
             },
             {
@@ -1171,11 +1019,7 @@
                     "type": "string"
                   },
                   "additionalProperties": {
-                    "anyOf": [
-                      {},
-                      {},
-                      {}
-                    ]
+                    "anyOf": [{}, {}, {}]
                   }
                 }
               },
@@ -1229,14 +1073,7 @@
                   "additionalProperties": {}
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs",
-                "result"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
               "additionalProperties": false
             },
             {
@@ -1279,14 +1116,7 @@
                   "additionalProperties": {}
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs",
-                "error"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
               "additionalProperties": false
             },
             {
@@ -1322,13 +1152,7 @@
                   "type": "number"
                 }
               },
-              "required": [
-                "taskId",
-                "status",
-                "createdAt",
-                "lastUpdatedAt",
-                "ttlMs"
-              ],
+              "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
               "additionalProperties": false
             }
           ]
@@ -1404,13 +1228,7 @@
                       "type": "number"
                     }
                   },
-                  "required": [
-                    "taskId",
-                    "status",
-                    "createdAt",
-                    "lastUpdatedAt",
-                    "ttlMs"
-                  ],
+                  "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
                   "additionalProperties": false
                 },
                 {
@@ -1451,11 +1269,7 @@
                         "type": "string"
                       },
                       "additionalProperties": {
-                        "anyOf": [
-                          {},
-                          {},
-                          {}
-                        ]
+                        "anyOf": [{}, {}, {}]
                       }
                     }
                   },
@@ -1509,14 +1323,7 @@
                       "additionalProperties": {}
                     }
                   },
-                  "required": [
-                    "taskId",
-                    "status",
-                    "createdAt",
-                    "lastUpdatedAt",
-                    "ttlMs",
-                    "result"
-                  ],
+                  "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
                   "additionalProperties": false
                 },
                 {
@@ -1559,14 +1366,7 @@
                       "additionalProperties": {}
                     }
                   },
-                  "required": [
-                    "taskId",
-                    "status",
-                    "createdAt",
-                    "lastUpdatedAt",
-                    "ttlMs",
-                    "error"
-                  ],
+                  "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
                   "additionalProperties": false
                 },
                 {
@@ -1602,13 +1402,7 @@
                       "type": "number"
                     }
                   },
-                  "required": [
-                    "taskId",
-                    "status",
-                    "createdAt",
-                    "lastUpdatedAt",
-                    "ttlMs"
-                  ],
+                  "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
                   "additionalProperties": false
                 }
               ]
@@ -1623,11 +1417,7 @@
           ]
         }
       },
-      "required": [
-        "jsonrpc",
-        "method",
-        "params"
-      ],
+      "required": ["jsonrpc", "method", "params"],
       "additionalProperties": false
     },
     "TaskStatus": {
@@ -1727,27 +1517,15 @@
                 "type": "string"
               },
               "additionalProperties": {
-                "anyOf": [
-                  {},
-                  {},
-                  {}
-                ]
+                "anyOf": [{}, {}, {}]
               }
             }
           },
-          "required": [
-            "taskId",
-            "inputResponses"
-          ],
+          "required": ["taskId", "inputResponses"],
           "additionalProperties": false
         }
       },
-      "required": [
-        "jsonrpc",
-        "id",
-        "method",
-        "params"
-      ],
+      "required": ["jsonrpc", "id", "method", "params"],
       "additionalProperties": false
     },
     "UpdateTaskResult": {
@@ -1776,9 +1554,7 @@
                   "type": "string"
                 }
               },
-              "required": [
-                "taskId"
-              ],
+              "required": ["taskId"],
               "additionalProperties": false
             }
           },
@@ -1821,13 +1597,7 @@
           "type": "number"
         }
       },
-      "required": [
-        "taskId",
-        "status",
-        "createdAt",
-        "lastUpdatedAt",
-        "ttlMs"
-      ],
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
       "additionalProperties": false
     }
   }

@@ -9,15 +9,8 @@
     "version": "0.3.9"
   },
   "features": {
-    "atp-cli": [
-      "dep:clap",
-      "tls",
-      "dep:rustls-native-certs"
-    ],
-    "atpd-daemon": [
-      "cli",
-      "dep:tracing-subscriber"
-    ],
+    "atp-cli": ["dep:clap", "tls", "dep:rustls-native-certs"],
+    "atpd-daemon": ["cli", "dep:tracing-subscriber"],
     "benchmark-adapters": [
       "dep:async-trait",
       "dep:tokio",
@@ -92,58 +85,30 @@
       "config-file",
       "tracing-integration"
     ],
-    "compression": [
-      "dep:flate2",
-      "dep:brotli"
-    ],
-    "config-file": [
-      "dep:toml"
-    ],
+    "compression": ["dep:flate2", "dep:brotli"],
+    "config-file": ["dep:toml"],
     "criterion-benches": [],
     "debug-server": [],
-    "default": [
-      "proc-macros",
-      "nightly-outcome-try"
-    ],
+    "default": ["proc-macros", "nightly-outcome-try"],
     "deterministic-mode": [],
-    "fuzz": [
-      "dep:arbitrary",
-      "dep:opentelemetry-proto"
-    ],
+    "fuzz": ["dep:arbitrary", "dep:opentelemetry-proto"],
     "h3-websocket-e2e": [],
-    "http3": [
-      "quic"
-    ],
-    "io-uring": [
-      "dep:io-uring"
-    ],
-    "kafka": [
-      "dep:rdkafka"
-    ],
-    "lab-stack-traces": [
-      "dep:backtrace",
-      "dep:rustc-demangle"
-    ],
+    "http3": ["quic"],
+    "io-uring": ["dep:io-uring"],
+    "kafka": ["dep:rdkafka"],
+    "lab-stack-traces": ["dep:backtrace", "dep:rustc-demangle"],
     "legacy-internal-test-harnesses": [],
     "lock-metrics": [],
-    "loom-tests": [
-      "dep:loom"
-    ],
+    "loom-tests": ["dep:loom"],
     "messaging-fabric": [],
-    "metrics": [
-      "dep:opentelemetry",
-      "dep:opentelemetry_sdk",
-      "dep:regex"
-    ],
+    "metrics": ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:regex"],
     "mysql": [],
     "native-runtime": [],
     "nightly-outcome-try": [],
     "obligation-cleanup-e2e": [],
     "obligation-leak-detection": [],
     "postgres": [],
-    "proc-macros": [
-      "dep:asupersync-macros"
-    ],
+    "proc-macros": ["dep:asupersync-macros"],
     "quic": [],
     "raptorq-roundtrip-e2e": [],
     "real-service-e2e": [
@@ -155,16 +120,9 @@
     "runtime-metrics": [],
     "serialization-golden-harnesses": [],
     "simd-intrinsics": [],
-    "sqlite": [
-      "dep:rusqlite",
-      "dep:sqlparser"
-    ],
+    "sqlite": ["dep:rusqlite", "dep:sqlparser"],
     "tailscale-path-provider": [],
-    "test-internals": [
-      "dep:tracing",
-      "dep:tracing-subscriber",
-      "dep:visibility"
-    ],
+    "test-internals": ["dep:tracing", "dep:tracing-subscriber", "dep:visibility"],
     "tls": [
       "dep:rustls",
       "dep:rustls-pki-types",
@@ -172,44 +130,18 @@
       "dep:rustls-pemfile",
       "dep:x509-parser"
     ],
-    "tls-native-roots": [
-      "tls",
-      "dep:rustls-native-certs"
-    ],
-    "tls-webpki-roots": [
-      "tls",
-      "dep:webpki-roots"
-    ],
+    "tls-native-roots": ["tls", "dep:rustls-native-certs"],
+    "tls-webpki-roots": ["tls", "dep:webpki-roots"],
     "tokio-compat": [],
-    "tower": [
-      "dep:tower"
-    ],
-    "trace-compression": [
-      "dep:lz4_flex"
-    ],
-    "tracing-integration": [
-      "dep:tracing"
-    ],
+    "tower": ["dep:tower"],
+    "trace-compression": ["dep:lz4_flex"],
+    "tracing-integration": ["dep:tracing"],
     "waker-profiling": [],
-    "wasm-browser-deterministic": [
-      "wasm-runtime",
-      "deterministic-mode",
-      "browser-trace"
-    ],
-    "wasm-browser-dev": [
-      "wasm-runtime",
-      "browser-io"
-    ],
-    "wasm-browser-minimal": [
-      "wasm-runtime"
-    ],
+    "wasm-browser-deterministic": ["wasm-runtime", "deterministic-mode", "browser-trace"],
+    "wasm-browser-dev": ["wasm-runtime", "browser-io"],
+    "wasm-browser-minimal": ["wasm-runtime"],
     "wasm-browser-preview": [],
-    "wasm-browser-prod": [
-      "wasm-runtime",
-      "browser-io"
-    ],
-    "wasm-runtime": [
-      "wasm-browser-preview"
-    ]
+    "wasm-browser-prod": ["wasm-runtime", "browser-io"],
+    "wasm-runtime": ["wasm-browser-preview"]
   }
 }

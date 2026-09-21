@@ -3667,12 +3667,7 @@
           "description": "Rich context about the host environment."
         }
       },
-      "required": [
-        "protocolVersion",
-        "hostInfo",
-        "hostCapabilities",
-        "hostContext"
-      ],
+      "required": ["protocolVersion", "hostInfo", "hostCapabilities", "hostContext"],
       "additionalProperties": {}
     },
     "McpUiInitializedNotification": {

@@ -26,9 +26,7 @@
     "prepack": "npm run build",
     "prepare": "npm run build"
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "bin": {
     "conformance": "dist/index.js"
   },
