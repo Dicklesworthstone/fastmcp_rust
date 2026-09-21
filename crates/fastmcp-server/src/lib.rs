@@ -43145,9 +43145,24 @@ mod lib_unit_tests {
         let serve = asupersync::time::timeout_at(serve_deadline, bound.serve(cx))
             .await
             .map_err(|_| {
-                "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound, so the \
-                 server task never completed. The stall is NOT fixed; do not raise this bound."
-                    .to_string()
+                // `serve` returns only once the client task cancels `caller_cx`,
+                // so it is DOWNSTREAM of the client and is awaited first purely
+                // to drive the server. "serve pending" therefore does NOT
+                // localise the stall on its own -- it is the expected reading
+                // whichever side is stuck. Interrogate the client here, with
+                // the non-cancelling `try_join` this file already uses, so the
+                // message discriminates instead of implying a server fault.
+                let client_state = match client.try_join() {
+                    Ok(None) => "client task STILL PENDING -- the stall is upstream, in the client",
+                    Ok(Some(_)) => "client task COMPLETED -- the stall is in the server",
+                    Err(_) => "client task FAILED -- read its error, not this bound",
+                };
+                format!(
+                    "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
+                     serve completes only when the client cancels caller_cx, so this alone does \
+                     not localise the stall. {client_state}. The stall is NOT fixed; do not \
+                     raise this bound."
+                )
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
         asupersync::time::timeout_at(join_deadline, client.join(cx))
