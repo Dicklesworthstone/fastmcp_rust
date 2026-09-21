@@ -319,32 +319,46 @@ fn b27_lease_renew_then_expire() {
 
     // RECLAIM. The expired lease is dropped by the store's own reclaim pass,
     // and the retained initial work was never consumed by the take, so a
-    // different owner can now claim the same task. Without this the group
-    // would prove expiry but not that the work becomes available again --
-    // which is the whole point of an expiring lease.
+    // different owner can claim the same task.
+    //
+    // THE GENERATION ADVANCES ACROSS THE RECLAIM. `tasks.rs:3720-3727` fences
+    // the abandoned claimant on purpose: "Without this generation advance, a
+    // late drop from the old worker could release a newer worker's lease." So
+    // the reclaiming owner must RE-READ, and the pre-expiry snapshot is
+    // deliberately dead. Asserting that advance is the point of this half --
+    // an earlier version of this test reused the stale generation, which is
+    // what the 03:27Z gate caught.
+    let after_expiry = fixture.snapshot();
+    assert_ne!(
+        after_expiry.generation(),
+        snapshot.generation(),
+        "reclaiming an expired lease must advance the generation; without it a late drop \
+         from the evicted owner could release the next owner's lease"
+    );
+
     let reclaimed = fixture
         .store
-        .take_initial_work_handoff_for_owner_if_current(&fixture.snapshot(), "owner-b")
+        .take_initial_work_handoff_for_owner_if_current(&after_expiry, "owner-b")
         .expect("store writes succeed");
     assert!(
         reclaimed.is_some(),
-        "after the first owner's lease expires the work must be claimable by another owner"
+        "after the first owner's lease expires the retained work must be claimable again"
     );
     let new_fence = fixture
         .store
         .begin_handoff_dispatch_for_owner_if_current(
             &fixture.id,
-            snapshot.generation(),
+            after_expiry.generation(),
             "owner-b",
         )
         .expect("store writes succeed")
-        .expect("the reclaiming owner elects a fresh dispatch");
+        .expect("the reclaiming owner elects a fresh dispatch at the advanced generation");
     assert!(
         fixture
             .store
             .renew_handoff_dispatch_if_current(
                 &fixture.id,
-                snapshot.generation(),
+                after_expiry.generation(),
                 "owner-b",
                 new_fence
             )
@@ -356,7 +370,7 @@ fn b27_lease_renew_then_expire() {
             .store
             .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", fence)
             .expect("store writes succeed"),
-        "the evicted owner must not renew back into a task another owner now holds"
+        "the evicted owner must not renew back in -- its generation is stale AND its lease is gone"
     );
 }
 
