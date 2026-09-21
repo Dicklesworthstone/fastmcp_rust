@@ -155,7 +155,7 @@ fn calls_preserve_exact_results_and_only_rewrite_published_names() {
     let actual = CoreResult::Final(FinalCoreResult::ToolsCall { result, diagnostic: None }).encode().unwrap();
     let expected = decode("tools/call", json!({"name":"lookup"}), TOOL_RESULT).encode().unwrap();
     assert_eq!(actual, expected);
-    assert!(actual.contains("900719925474099312345") && actual.contains("1.20e+4"));
+    assert!(actual.contains("900719925474099312345") && actual.contains("1.20e+4"), "{actual}");
     let resource = ready(provider.resources(&cx)).unwrap().pop().unwrap();
     let result = ready(resource.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).unwrap();
     assert_eq!(CoreResult::Final(FinalCoreResult::ResourcesRead { result, diagnostic: None }).encode().unwrap(),
@@ -165,13 +165,15 @@ fn calls_preserve_exact_results_and_only_rewrite_published_names() {
         ("subject".to_owned(), "日本語".to_owned())
     ]))).is_ok());
     let template = ready(provider.resource_templates(&cx)).unwrap().pop().unwrap();
-    assert!(ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).is_ok());
+    let outcome = ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
+    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
     let completion = prompt.completion_handler().unwrap();
     let parameters: FinalCompletionParams = serde_json::from_value(json!({
         "ref":{"type":"ref/prompt","name":"machine/summarize"},
         "argument":{"name":"subject","value":"o"}
     })).unwrap();
-    assert!(ready(completion.complete_final_async_in_request(&ctx, &cx, parameters)).is_ok());
+    let outcome = ready(completion.complete_final_async_in_request(&ctx, &cx, parameters));
+    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
     let calls = source.calls.lock().unwrap();
     assert_eq!(calls.len(), 5);
     assert_eq!(calls[0]["name"], "lookup");
@@ -181,7 +183,7 @@ fn calls_preserve_exact_results_and_only_rewrite_published_names() {
     assert_eq!(calls[2]["arguments"]["subject"], "日本語");
     assert_eq!(calls[4]["ref"]["name"], "summarize");
     for call in calls.iter() {
-        assert!(call["_meta"].get("authorization").is_none());
+        assert!(call["_meta"].get("authorization").is_none(), "{:?}", call["_meta"]);
         assert_eq!(call["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY], json!({}));
     }
     let ids = source.ids.lock().unwrap();
@@ -335,22 +337,28 @@ fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completi
             .with_limits(calls, ClientCredentialsCatalogLimits::default())
             .with_namespace("interactive").unwrap();
         let ctx = McpContext::new(cx.clone(), 81);
-        assert!(ready(old_tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_ok());
+        let outcome = ready(old_tool.call_final_async_in_request(&ctx, &cx, json!({})));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         let tool = ready(configured.tools(&cx)).unwrap().pop().unwrap();
         assert_eq!(tool.catalog_definition().name, "interactive/lookup");
-        assert!(ready(tool.call_final_async_in_request(&ctx, &cx, json!({}))).is_ok());
+        let outcome = ready(tool.call_final_async_in_request(&ctx, &cx, json!({})));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         let resource = ready(configured.resources(&cx)).unwrap().pop().unwrap();
-        assert!(ready(resource.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).is_ok());
+        let outcome = ready(resource.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         let prompt = ready(configured.prompts(&cx)).unwrap().pop().unwrap();
-        assert!(ready(prompt.get_final_async_in_request(&ctx, &cx, HashMap::new())).is_ok());
+        let outcome = ready(prompt.get_final_async_in_request(&ctx, &cx, HashMap::new()));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         let template = ready(configured.resource_templates(&cx)).unwrap().pop().unwrap();
-        assert!(ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new())).is_ok());
+        let outcome = ready(template.read_final_async_with_uri_in_request(&ctx, &cx, "note://documents/one", &UriParams::new()));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         let completion = prompt.completion_handler().unwrap();
         let params: FinalCompletionParams = serde_json::from_value(json!({
             "ref":{"type":"ref/prompt","name":"interactive/summarize"},
             "argument":{"name":"subject","value":"o"}
         })).unwrap();
-        assert!(ready(completion.complete_final_async_in_request(&ctx, &cx, params)).is_ok());
+        let outcome = ready(completion.complete_final_async_in_request(&ctx, &cx, params));
+        assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err());
         // Observe the actual MachineCall handed to the transport, not policy
         // fields at construction. Native source owns authentication/HTTP; this
         // test establishes only production policy routing and handler wiring.
@@ -359,18 +367,18 @@ fn configured_inputs_reach_all_execution_routes_but_not_old_handlers_or_completi
         let policies = source.call_policies.lock().unwrap();
         assert_eq!(policies[0], format!("{:?}", ManagedCoreLimits::default()));
         let configured_policy = format!("{calls:?}");
-        assert!(policies[1..].iter().all(|policy| policy == &configured_policy));
+        assert!(policies[1..].iter().all(|policy| policy == &configured_policy), "policies {policies:?} against {configured_policy}");
         let calls = source.calls.lock().unwrap();
         let capability_key = fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY;
         assert_eq!(calls[0]["_meta"][capability_key], json!({}));
         for request in &calls[1..5] {
             assert_eq!(request["_meta"][capability_key], json!({"roots":{}}));
-            assert!(request["_meta"].get("authorization").is_none());
+            assert!(request["_meta"].get("authorization").is_none(), "{:?}", request["_meta"]);
         }
         assert_eq!(calls[5]["_meta"][capability_key], json!({}));
         let ids = source.ids.lock().unwrap();
         for (index, id) in ids.iter().enumerate() {
-            assert!(ids[..index].iter().all(|previous| !id.correlates_with(previous)));
+            assert!(ids[..index].iter().all(|previous| !id.correlates_with(previous)), "id {index} of {} correlates with an earlier one", ids.len());
         }
     }
 }
