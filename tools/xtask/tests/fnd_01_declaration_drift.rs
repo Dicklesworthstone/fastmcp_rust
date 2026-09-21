@@ -116,7 +116,10 @@ fn drifts_between(
         ("workspace_package_license", "license"),
     ] {
         let declared = scalar(policy_src, policy_key);
-        let actual = wp.get(tree_key).and_then(toml::Value::as_str).map(str::to_owned);
+        let actual = wp
+            .get(tree_key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
         if let Some(declared) = declared {
             let actual = actual.unwrap_or_else(|| "(key absent)".to_owned());
             if declared != actual {
@@ -325,8 +328,10 @@ fn fnd_01_policy_declarations_have_not_drifted_further() {
 #[test]
 fn fnd_01_detector_still_knows_every_policy_declaration_key() {
     let declared = policy_package_keys();
-    let watched: std::collections::BTreeSet<String> =
-        WATCHED_POLICY_KEYS.iter().map(|k| (*k).to_owned()).collect();
+    let watched: std::collections::BTreeSet<String> = WATCHED_POLICY_KEYS
+        .iter()
+        .map(|k| (*k).to_owned())
+        .collect();
 
     // POSITIVE CONTROL. The policy declares these keys today, so an empty read
     // means this test stopped parsing the policy — not that the policy is empty.
@@ -391,7 +396,11 @@ fn fnd_01_drift_detector_planted_negative() {
     // "2024") and is not in KNOWN_DRIFTS, so changing only it must make the
     // `fresh` set non-empty and name exactly that key. This is the direction a
     // one-way baseline would also catch.
-    let arm_a = drifts_between(&policy, &root_with_package_scalar("edition", "2021"), &toolchain);
+    let arm_a = drifts_between(
+        &policy,
+        &root_with_package_scalar("edition", "2021"),
+        &toolchain,
+    );
     let fresh_a: Vec<&str> = arm_a
         .keys()
         .map(String::as_str)
@@ -444,10 +453,9 @@ fn fnd_01_drift_detector_planted_negative() {
         .nth(1)
         .and_then(|rest| rest.split('"').next())
         .expect("the policy declares a pinned toolchain");
-    let repaired_toolchain = toml::from_str::<toml::Value>(&format!(
-        "[toolchain]\nchannel = \"{declared_channel}\"\n"
-    ))
-    .expect("synthetic toolchain manifest parses");
+    let repaired_toolchain =
+        toml::from_str::<toml::Value>(&format!("[toolchain]\nchannel = \"{declared_channel}\"\n"))
+            .expect("synthetic toolchain manifest parses");
     let arm_c = drifts_between(&policy, &parse("Cargo.toml"), &repaired_toolchain);
     let repaired_c: Vec<&str> = known
         .iter()

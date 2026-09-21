@@ -434,9 +434,13 @@ fn task_02_b_planted_negative() {
     assert!(
         !fixture
             .store
-            .renew_handoff_dispatch_if_current(&fixture.id, snapshot.generation(), "owner-a", stale_fence)
-            .expect("a stale fence is a refusal, not a transport error")
-            ,
+            .renew_handoff_dispatch_if_current(
+                &fixture.id,
+                snapshot.generation(),
+                "owner-a",
+                stale_fence
+            )
+            .expect("a stale fence is a refusal, not a transport error"),
         "a fence one generation off must be refused"
     );
     assert!(
