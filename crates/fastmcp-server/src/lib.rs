@@ -42805,6 +42805,13 @@ mod lib_unit_tests {
             .local_addr()
             .map_err(|error| format!("legacy reverse-response address failed: {error}"))?;
         let caller_cx = cx.clone();
+        // DIAGNOSTIC (bd-f2ndd). The outer bound established the stall is in
+        // the client; the client's task-locals are unreachable from outside
+        // it, so record which join it last entered. An atomic store is not
+        // an await and cancels nothing, so no join semantics and no child
+        // authority are affected.
+        let client_stage = Arc::new(AtomicUsize::new(0));
+        let stage = Arc::clone(&client_stage);
         let mut client = cx
             .spawn(move |client_cx| async move {
                 let opener_headers = reverse_response_token
@@ -43044,6 +43051,7 @@ mod lib_unit_tests {
                             "legacy sampling cancellation was not accepted: {cancellation_response:?}"
                         ));
                     }
+                    stage.store(11, Ordering::SeqCst);
                     let _ = tool_call.join(&client_cx).await.map_err(|error| {
                         caller_cx.cancel_with(
                             CancelKind::User,
@@ -43051,6 +43059,7 @@ mod lib_unit_tests {
                         );
                         format!("legacy sampling cancelled tool-call POST failed: {error:?}")
                     })??;
+                    stage.store(12, Ordering::SeqCst);
                     let _ = reverse_post.join(&client_cx).await.map_err(|error| {
                         caller_cx.cancel_with(
                             CancelKind::User,
@@ -43059,6 +43068,7 @@ mod lib_unit_tests {
                         format!("wrong-ID reverse-response POST failed after settlement: {error:?}")
                     })??;
                 } else {
+                    stage.store(1, Ordering::SeqCst);
                     let reverse_response = reverse_post.join(&client_cx).await.map_err(|error| {
                         format!("legacy sampling reverse-response POST failed: {error:?}")
                     })??;
@@ -43098,6 +43108,7 @@ mod lib_unit_tests {
                             "matching reverse-response POST was not accepted: {reverse_response:?}"
                         ));
                     }
+                    stage.store(2, Ordering::SeqCst);
                     let tool_call_response = tool_call.join(&client_cx).await.map_err(|error| {
                         format!("legacy sampling tool-call POST failed: {error:?}")
                     })??;
@@ -43114,6 +43125,7 @@ mod lib_unit_tests {
                     .await?;
                 }
 
+                stage.store(3, Ordering::SeqCst);
                 caller_cx.cancel_with(
                     CancelKind::User,
                     Some("legacy reverse-response POST probe complete"),
@@ -43162,9 +43174,18 @@ mod lib_unit_tests {
                 // server stalled" would be a third wrong localisation, so the
                 // error payload is reported verbatim.
                 let client_state = match client.try_join() {
-                    Ok(None) => {
-                        "client STILL PENDING -- the stall is upstream, in the client".to_string()
-                    }
+                    Ok(None) => format!(
+                        "client STILL PENDING -- the stall is upstream, in the client, {}",
+                        match client_stage.load(Ordering::SeqCst) {
+                            0 => "before either join: still in setup, the SSE wait, or building the reverse response",
+                            1 => "parked on reverse_post.join -- the reverse-response POST never returned",
+                            2 => "parked on tool_call.join -- the reverse POST returned but the tool call never settled",
+                            3 => "past every join: it stalled after its last join and before cancelling",
+                            11 => "wrong-ID arm: parked on tool_call.join",
+                            12 => "wrong-ID arm: parked on reverse_post.join",
+                            _ => "unrecognised client stage",
+                        }
+                    ),
                     Ok(Some(Ok(()))) => {
                         "client COMPLETED OK -- it cancelled caller_cx, so the stall is in the \
                          server"
