@@ -31245,6 +31245,11 @@ mod lib_unit_tests {
             _ctx: &McpContext,
             _arguments: serde_json::Value,
         ) -> McpResult<Vec<Content>> {
+            // Distinct stage: without it, a sync dispatch that this hook
+            // REJECTS would leave the counter at 0 and be reported as
+            // "handler never entered", which is false and would read as
+            // evidence about the server rather than about this probe.
+            F2NDD_TOOL_STAGE.fetch_max(9, Ordering::SeqCst);
             Err(McpError::internal_error(
                 "bd-f2ndd async probe tool requires asynchronous caller-owned dispatch",
             ))
@@ -43270,6 +43275,7 @@ mod lib_unit_tests {
                                 0 => "stage 6/send 0: parked on the SSE wait AND THE TOOL HANDLER WAS NEVER ENTERED -- the tools/call never reached it, so nothing ever tried to send",
                                 1 => "stage 6/send 1: tool handler entered but it never reached ctx.sample -- it failed or returned before sampling",
                                 2 => "stage 6/send 2: tool handler is INSIDE block_on(ctx.sample(..)) and never came back -- the send side is parked too",
+                                9 => "stage 6/send 9: THE ASYNC PROBE REJECTED A SYNC DISPATCH -- execution_mode(Async) was not honoured on this path, so the counterfactual was NEVER TESTED and a failure here says nothing about a second defect",
                                 21 => "stage 6/send 21: ASYNC hook entered but never reached ctx.sample",
                                 22 => "stage 6/send 22: ASYNC hook is AWAITING ctx.sample and it never resolved -- removing block_on did NOT free it, so there is a second defect",
                                 23 => "stage 6/send 23: ASYNC ctx.sample RESOLVED on the server; the client waiter missed a delivery that happened",
