@@ -163,7 +163,20 @@ pub enum CredentialSlotError {
     RevisionMismatch,
     Empty,
     GenerationExhausted,
-    CommitUncertain(SlotCommitIntent),
+    /// The commit's durability is unknown. Carries only what identifies WHICH
+    /// commit is in doubt -- deliberately not a `SlotCommitIntent`.
+    ///
+    /// Reconciliation takes its intent from independently retained custody, as
+    /// `recover` documents and `SlotCommitIntent::from_trusted_bytes` requires:
+    /// the caller persists `PreparedSlotMutation::intent()` BEFORE committing.
+    /// An intent rebuilt from this in-memory error would be a sidecar in the
+    /// same rollback domain, which is the one source that rule excludes. So the
+    /// binding key and authorization are not restated here; the caller supplied
+    /// both to open the slot and still holds them.
+    CommitUncertain {
+        previous: Option<SlotRevision>,
+        proposed: SlotRevision,
+    },
 }
 
 impl fmt::Display for CredentialSlotError {
@@ -175,12 +188,67 @@ impl fmt::Display for CredentialSlotError {
             Self::RevisionMismatch => f.write_str("protected credential slot revision disagrees with trusted custody"),
             Self::Empty => f.write_str("protected credential slot has no payload"),
             Self::GenerationExhausted => f.write_str("protected credential slot generation exhausted"),
-            Self::CommitUncertain(_) => f.write_str("protected credential slot commit requires intent reconciliation"),
+            Self::CommitUncertain { .. } => f.write_str("protected credential slot commit requires intent reconciliation"),
         }
     }
 }
 
 impl std::error::Error for CredentialSlotError {}
+
+/// The size this error is allowed to reach, enforced by the compiler rather than
+/// by arithmetic. `CredentialSlotError` is returned by 31 functions across this
+/// subtree, so one oversized variant sets every one of their `Result` layouts.
+///
+/// 128 is clippy's `large-error-threshold`. Before this bound existed the type
+/// was ~152 bytes, driven by `CommitUncertain` carrying a whole
+/// `SlotCommitIntent` (`SLOT_INTENT_BYTES` = 153).
+///
+/// Measured by `rustc` on the exact shapes, not computed: 152 before, 88 after.
+///
+/// The assert exists because I predicted that replacement size twice by hand and
+/// was wrong both times -- 81 by forgetting that `Option<SlotRevision>` is 48 and
+/// not 41 (neither `u64` nor `[u8; 32]` offers a niche for the discriminant), then
+/// 96 by adding a discriminant byte the variant layout does not need. The true 88
+/// came from `size_of`. Only the 152 was ever reliable, and only because
+/// `SLOT_INTENT_BYTES` = 153 corroborated it independently. A layout number with
+/// no corroboration does not get to be load-bearing, so this one is the
+/// compiler's rather than mine.
+const _: () = assert!(core::mem::size_of::<CredentialSlotError>() <= 128);
+
+/// `Copy` preservation, proven by the compiler rather than by reading derive lists.
+///
+/// This is the ENTIRE argument for reshaping the variant instead of boxing it. A
+/// `Box` anywhere inside removes `Copy` from all five of these types, and consumer
+/// code doing `let a = e; use(e);` stops compiling — a far wider break than the
+/// pattern-match adjustment that reshaping costs. Until now that argument lived only
+/// in prose, which is the same defect the size bound above was added to fix, sitting
+/// one argument over.
+///
+/// The guard is not a no-op: instantiated with a non-`Copy` type it fails with
+/// E0277, which was checked in both directions before this landed.
+const fn assert_copy<T: Copy>() {}
+const _: () = assert_copy::<SlotRevision>();
+const _: () = assert_copy::<SlotCommitIntent>();
+const _: () = assert_copy::<CredentialSlotError>();
+const _: () = assert_copy::<coordinator::CredentialAnchorState>();
+const _: () = assert_copy::<coordinator::CredentialAnchorSnapshot>();
+const _: () = assert_copy::<coordinator::CoordinatedSlotError>();
+
+/// The on-disk trusted-anchor encoding is unchanged by the variant reshape.
+///
+/// `SLOT_INTENT_BYTES` is what `SlotCommitIntent::to_bytes` writes and
+/// `from_trusted_bytes` validates, so it IS the persisted format: an intent written
+/// before a crash must still parse after one. Pinning it here means a change to
+/// `SLOT_REVISION_BYTES` or to the header/flag layout fails the build instead of
+/// silently invalidating every retained intent in the field.
+///
+/// Deliberately NOT pinned: `size_of::<SlotCommitIntent>()`. That is an in-memory
+/// layout, not a format, and it can move for reasons that harm nobody — a niche
+/// optimisation in a future compiler would break the build while the persisted bytes
+/// stayed identical. Pinning it would assert something this crate does not promise.
+const _: () = assert!(SLOT_REVISION_BYTES == 40);
+const _: () = assert!(SLOT_INTENT_BYTES == 153);
+
 impl From<AtomicFileError> for CredentialSlotError {
     fn from(error: AtomicFileError) -> Self { Self::Storage(error) }
 }
@@ -307,7 +375,12 @@ impl DurableCredentialSlot {
                 self.current = Some(mutation.intent.proposed);
                 Ok(SlotCommit { revision: mutation.intent.proposed, consumed: mutation.consumed })
             }
-            Err(AtomicFileError::CommitUncertain { .. }) => Err(CredentialSlotError::CommitUncertain(mutation.intent)),
+            Err(AtomicFileError::CommitUncertain { .. }) => {
+                Err(CredentialSlotError::CommitUncertain {
+                    previous: mutation.intent.previous,
+                    proposed: mutation.intent.proposed,
+                })
+            }
             Err(error) => Err(error.into()),
         }
     }

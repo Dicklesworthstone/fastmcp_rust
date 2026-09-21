@@ -232,6 +232,75 @@ const NEGATIVE_CASES: [ManifestCase; 13] = [
 ];
 
 /// The canonical group order the manifest freezes.
+/// The frozen SHA-256 of `HTTP_03_A_EVALUATOR_MANIFEST_V1`, 64 lowercase hex characters.
+///
+/// The producer/consumer comparison at the end of `assert_shipped_manifest`
+/// cannot establish the acceptance item's "digest mismatch fails this slice":
+/// both sides recompute SHA-256 over the same published constant, so editing
+/// the manifest moves both and the equality still holds. It is
+/// `observed == observed`. This constant is the independent anchor that can
+/// fail, and the B half carries the identical fix.
+///
+/// Sound because the manifest is a literal `concat!` of fixed strings with no
+/// `env!` and no build-time interpolation: these bytes move only when someone
+/// edits them, which is exactly the event this must catch.
+const HTTP_03_A_MANIFEST_DIGEST_HEX: &str =
+    "9f68de2cfb47091ee101006cd67405a8764d6dd79781cf2abffabe1c54658818";
+
+/// THE ONE INSTRUMENT both the positive and the planted negative use.
+///
+/// Shared deliberately. If each side rendered the digest with its own copy of
+/// this loop, the negative would prove only that SHA-256 separates different
+/// bytes - never in doubt - and would keep passing if the anchor it guards were
+/// weakened or deleted. Sharing means breaking the instrument breaks both.
+fn manifest_digest_hex(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = sha256_bounded(text.as_bytes(), 64 * 1024)
+        .expect("a manifest under test stays within the published bound");
+    let mut rendered = String::with_capacity(64);
+    for byte in digest.as_bytes() {
+        write!(rendered, "{byte:02x}").expect("writing hex into a String cannot fail");
+    }
+    rendered
+}
+
+/// Planted negative for the anchor above: three one-variable perturbations,
+/// each changing exactly one forbidden dimension the acceptance item names and
+/// leaving every other byte alone. The dimension is carried into every message
+/// because these share one test and an assert block aborts at the first
+/// failure.
+fn assert_manifest_digest_refuses_perturbation() {
+    let text = HTTP_03_A_EVALUATOR_MANIFEST_V1;
+    let rows: Vec<&str> = text.split('\n').collect();
+
+    let mut reordered = rows.clone();
+    reordered.swap(4, 5);
+    let omitted: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| !row.starts_with("HTTP-03.12 "))
+        .collect();
+
+    let perturbations = [
+        ("reordering two case rows", reordered.join("\n")),
+        ("raising one declared floor", text.replacen("floor=2", "floor=3", 1)),
+        ("omitting one group row", omitted.join("\n")),
+    ];
+
+    for (dimension, perturbed) in perturbations {
+        assert_ne!(
+            perturbed, text,
+            "{dimension}: the planted perturbation must actually change the bytes, \
+             otherwise this case proves nothing"
+        );
+        assert_ne!(
+            manifest_digest_hex(&perturbed), HTTP_03_A_MANIFEST_DIGEST_HEX,
+            "{dimension}: the frozen anchor must refuse a manifest differing in this dimension"
+        );
+    }
+}
+
 const MANIFEST_GROUP_ORDER: [&str; 13] = [
     "HTTP-03.01",
     "HTTP-03.02",
@@ -346,6 +415,12 @@ fn assert_shipped_manifest() {
         http_03_a_manifest_digest().as_bytes(),
         recomputed.as_bytes(),
         "the published HTTP-03 A digest must bind the published manifest bytes"
+    );
+
+    assert_eq!(
+        manifest_digest_hex(text), HTTP_03_A_MANIFEST_DIGEST_HEX,
+        "the published manifest bytes changed: a reordering, an omitted group, floor or \
+         negative, or any other edit fails this slice until the frozen digest is re-approved"
     );
 }
 
@@ -485,6 +560,7 @@ fn http_03_a_positive() {
 fn http_03_a_planted_negative() {
     assert_manifest_order(&NEGATIVE_CASES);
     assert_shipped_manifest();
+    assert_manifest_digest_refuses_perturbation();
     assert_eq!(
         NEGATIVE_CASES.len(),
         MANIFEST_GROUP_ORDER.len(),

@@ -1191,6 +1191,127 @@ fn assert_workspace_input_tables_are_live(source: &str) {
     );
 }
 
+/// A Git object name is a full 40-character SHA-1, never an abbreviation.
+///
+/// Deliberately NOT derived from `SHA256_HEX_LENGTH`: an object name and a
+/// content digest are different widths from different algorithms, and tying one
+/// constant to the other would let a future migration of either silently move
+/// the other.
+const WORKSPACE_INPUT_REVISION_HEX_LENGTH: usize = 40;
+
+fn is_lowercase_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Gates the SHAPE of every identity field, before any comparison reads it.
+///
+/// EQUALITY BETWEEN TWO MALFORMED VALUES IS STILL EQUALITY. The pure checker
+/// asserts set-equality over the path columns of two tables that are edited
+/// together, so a path malformed identically in both joins cleanly and proves
+/// nothing; the join in `declared_workspace_input_rows` inherits that hazard
+/// through the same key. Comparing the fields is not checking them.
+///
+/// TWO OF THESE GATES CLOSE A ROUTE TO A FALSE FINDING, which is worse than a
+/// missed one — a red gets investigated as though it were real, and the
+/// investigation is of a defect that does not exist:
+///
+///   ABBREVIATED ANCHOR   `git cat-file blob f8a47e3:<path>` RESOLVES, so
+///                        `blob_at_revision` succeeds and property 2 passes.
+///                        But `commits_touching` emits `%H` — full 40-hex — and
+///                        the position lookup is exact string equality, so a
+///                        correct anchor is reported as "absent from this
+///                        path's full history at all". Nothing but a shape gate
+///                        stands between an abbreviation and that accusation.
+///   UPPERCASE DIGEST     `live_sha256_hex` renders through `{byte:02x}`, which
+///                        is lowercase. A digest declared in uppercase is the
+///                        SAME VALUE and compares unequal, so
+///                        `workspace_input_provenance_drift` reports CONTENT
+///                        DRIFT against an anchor holding exactly those bytes.
+///
+/// Rejecting absolute and `..`-escaping paths is the third: `walk_regular_files`
+/// enumerates workspace-relative keys only, so an escaping key can never equal
+/// anything it is compared against, and a set-equality check over two columns
+/// that both hold it still passes.
+///
+/// RETURNS EVERY VIOLATION RATHER THAN ASSERTING ON THE FIRST. An assert block
+/// aborts, so a malformed first row would hide the rest of the table and a
+/// second look would report a table that was never fully examined. Each field
+/// contributes at most one violation, so the count means "how many fields are
+/// malformed" rather than "how many rules happened to overlap".
+///
+/// WHAT IT DELIBERATELY DOES NOT DO: it never reads a file, resolves a
+/// revision, or checks that the digest matches the length. Those are properties
+/// 2 and 3, they read bytes, and folding a shape check into a content check
+/// would leave the shape unchecked on every path where the content check is
+/// skipped or VOID — which on an RCH worker without `.git` is all of them.
+fn workspace_input_shape_violations(rows: &[WorkspaceInputRow]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for row in rows {
+        let path = &row.path;
+
+        if path.is_empty() {
+            violations.push(
+                "a bound row carries an empty path, which joins the two tables on nothing"
+                    .to_owned(),
+            );
+        } else if path.starts_with('/') {
+            violations.push(format!(
+                "{path}: an absolute path can never equal a `walk_regular_files` key, which is \
+                 always workspace-relative"
+            ));
+        } else if path.split('/').any(|component| component == "..") {
+            violations.push(format!(
+                "{path}: a `..` component escapes the workspace this freeze is defined over"
+            ));
+        } else if path.contains('\\') {
+            violations.push(format!(
+                "{path}: a backslash is an ordinary path character here, not a separator, so \
+                 this key names a different file than it reads as"
+            ));
+        }
+
+        if row.byte_length == 0 {
+            violations.push(format!(
+                "{path}: a zero byte_length names an empty bound input; the remaining numeric \
+                 shape is already gated by the parse in `declared_workspace_input_rows`"
+            ));
+        }
+
+        if row.sha256.len() != SHA256_HEX_LENGTH {
+            violations.push(format!(
+                "{path}: sha256 `{}` is {} characters, not {SHA256_HEX_LENGTH}",
+                row.sha256,
+                row.sha256.len()
+            ));
+        } else if !is_lowercase_hex(&row.sha256) {
+            violations.push(format!(
+                "{path}: sha256 `{}` is not lowercase hex, so it compares unequal to a \
+                 `live_sha256_hex` rendering of the very bytes it records",
+                row.sha256
+            ));
+        }
+
+        if row.revision.len() != WORKSPACE_INPUT_REVISION_HEX_LENGTH {
+            violations.push(format!(
+                "{path}: anchor `{}` is {} characters, not {WORKSPACE_INPUT_REVISION_HEX_LENGTH}; \
+                 git resolves an abbreviation, so this passes property 2 and then fails property \
+                 3 as an anchor missing from its own path's history",
+                row.revision,
+                row.revision.len()
+            ));
+        } else if !is_lowercase_hex(&row.revision) {
+            violations.push(format!(
+                "{path}: anchor `{}` is not lowercase hex, so it cannot equal a `%H` commit name",
+                row.revision
+            ));
+        }
+    }
+    violations
+}
+
 /// Joins the binding table to the provenance table by path.
 ///
 /// The two tables are declared separately and the pure checker already proves
@@ -1215,7 +1336,7 @@ fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
         "every bound workspace input must carry exactly one provenance row"
     );
 
-    bindings
+    let rows = bindings
         .iter()
         .map(|binding| {
             let [path, byte_length, sha256] = binding.as_slice() else {
@@ -1238,7 +1359,18 @@ fn declared_workspace_input_rows() -> Vec<WorkspaceInputRow> {
                 revision,
             }
         })
-        .collect()
+        .collect::<Vec<WorkspaceInputRow>>();
+
+    let violations = workspace_input_shape_violations(&rows);
+    assert!(
+        violations.is_empty(),
+        "{} workspace input identity field(s) are malformed, so a comparison over them could \
+         succeed on two equally-wrong values:\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+
+    rows
 }
 
 /// Every commit touching `path`, newest first, WITHOUT history simplification.
@@ -1540,4 +1672,94 @@ fn fnd_01_a_workspace_input_stale_anchor_is_refused() {
         "the refusal must name how far behind the anchor is and which commit moved it last; got \
          {reported}"
     );
+}
+
+/// AC4: the identity fields are SHAPE-GATED, not merely compared for equality.
+///
+/// The control comes first and is load-bearing. If the recorded rows already
+/// carried a violation, every plant below would be indistinguishable from the
+/// baseline and the test would pass while measuring nothing — the same vacuity
+/// this bead was filed about, reproduced inside its own repair.
+///
+/// Each plant changes EXACTLY ONE FIELD of a real recorded row and asserts a
+/// count of one, so a gate that fired for the wrong reason, or a mutation that
+/// tripped two rules at once, fails here rather than being credited.
+///
+/// THE TWO ANCHOR PLANTS ARE THE POINT. An abbreviated or uppercased object
+/// name is not a corrupt value — git resolves the first and the second is the
+/// same number. Both would survive every byte-reading check in this file and
+/// then surface as a property-3 accusation against an anchor that is correct.
+/// Shape is the only layer that can distinguish them, which is precisely why
+/// "compared for equality" is not enough.
+///
+/// NO-CLAIM BOUNDARY: this proves the gate discriminates. It says nothing about
+/// whether the recorded anchors are the right commits — that is property 3, it
+/// reads Git object storage, and it is tested separately and expected to fire.
+#[test]
+fn fnd_01_a_workspace_input_identity_shapes_are_gated() {
+    let live = declared_workspace_input_rows();
+    let baseline_violations = workspace_input_shape_violations(&live);
+    assert!(
+        baseline_violations.is_empty(),
+        "control: the recorded rows must be well-shaped or no plant below is attributable: {}",
+        baseline_violations.join("; ")
+    );
+
+    let baseline = live
+        .first()
+        .expect("declared_workspace_input_rows refuses a zero-row parse")
+        .clone();
+
+    let plants: [(&str, fn(&mut WorkspaceInputRow), &str); 7] = [
+        ("abbreviated anchor", |row| row.revision.truncate(7), "not 40"),
+        (
+            "uppercased anchor",
+            |row| row.revision = row.revision.to_ascii_uppercase(),
+            "not lowercase hex",
+        ),
+        (
+            "truncated digest",
+            |row| {
+                row.sha256.pop();
+            },
+            "not 64",
+        ),
+        (
+            "uppercased digest",
+            |row| row.sha256 = row.sha256.to_ascii_uppercase(),
+            "not lowercase hex",
+        ),
+        (
+            "escaping path",
+            |row| row.path = format!("../{}", row.path),
+            "escapes the workspace",
+        ),
+        (
+            "absolute path",
+            |row| row.path = format!("/{}", row.path),
+            "absolute path",
+        ),
+        ("empty bound input", |row| row.byte_length = 0, "zero byte_length"),
+    ];
+
+    for (label, plant, expected) in plants {
+        let mut planted = baseline.clone();
+        plant(&mut planted);
+        assert_ne!(
+            planted, baseline,
+            "{label}: a plant that changes nothing cannot demonstrate a gate"
+        );
+
+        let violations = workspace_input_shape_violations(std::slice::from_ref(&planted));
+        assert_eq!(
+            violations.len(),
+            1,
+            "{label}: expected exactly one violation, got {violations:?}"
+        );
+        assert!(
+            violations[0].contains(expected),
+            "{label}: the violation does not name the property it refused: {}",
+            violations[0]
+        );
+    }
 }
