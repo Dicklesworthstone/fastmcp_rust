@@ -1895,6 +1895,11 @@ async fn run_modern_blocking_dispatch(
     let (sender, mut receiver) = asupersync::channel::oneshot::channel();
     let task = crate::blocking_dispatch_pool().spawn(move || {
         let _permit = permit;
+        // This is a pool thread, never the async driver, so a handler that
+        // bridges an async operation here cannot starve the thread that would
+        // complete it. Declaring that keeps bd-6rfrg's detection from rejecting
+        // the path it is supposed to protect.
+        let _lane = fastmcp_core::runtime::enter_blocking_lane();
         let result = crate::catch_extension_unwind(dispatch);
         let _ = sender.send_blocking(result);
     });

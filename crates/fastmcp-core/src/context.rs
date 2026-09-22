@@ -522,6 +522,32 @@ impl SamplingStopReason {
     }
 }
 
+/// The disposition for a sampling request made from a position where its own
+/// completion can never be delivered (bd-6rfrg).
+///
+/// `InvalidRequest` and not `InternalError` on purpose: the router redacts
+/// `InternalError` through `sanitized_handler_internal_error`, so an internal
+/// code here would reach the user as "handler returned an opaque internal
+/// failure" and the hazard would stay exactly as unnameable as the hang it
+/// replaces. The whole value of this error is the text.
+///
+/// Elicitation and roots reach the peer through the same reverse-request
+/// mechanism and are therefore exposed to the same bridge, but they are outside
+/// bd-6rfrg's scope and are deliberately NOT guarded here. Extending the
+/// detection to them is one call to
+/// `crate::runtime::bridge_would_starve_its_driver` each.
+fn sampling_bridge_would_deadlock() -> crate::McpError {
+    crate::McpError::new(
+        crate::McpErrorCode::InvalidRequest,
+        "Sampling cannot complete from here: this request is bridged with \
+         fastmcp_core::block_on from inside a task context, so the thread that would \
+         deliver the client's response is blocked by the bridge itself. Implement \
+         ToolHandler's async call hook and declare ToolExecutionMode::Async instead of \
+         calling block_on from the synchronous `call` method, or run the handler on a \
+         dedicated blocking lane.",
+    )
+}
+
 /// A no-op sampling sender that always returns an error.
 ///
 /// Used when the client doesn't support sampling.
@@ -3583,6 +3609,20 @@ impl McpContext {
                 "Sampling not available: client does not support sampling capability",
             )
         })?;
+        // bd-6rfrg. A synchronous handler reaches this await by bridging it with
+        // `fastmcp_core::block_on`, because `ToolHandler::call` is required and
+        // synchronous while this method is not. On a thread that is driving the
+        // runtime, that bridge occupies the only thread able to deliver the
+        // peer's response, and the symptom is a hang -- no error, no timeout,
+        // and the evidence destroyed along with the request. Name the position
+        // instead of parking in it.
+        //
+        // Placed AFTER the sender lookup deliberately: a context with no
+        // sampling capability fails immediately and harmlessly, so that error is
+        // the true cause and keeps precedence over this one.
+        if crate::runtime::bridge_would_starve_its_driver() {
+            return Err(sampling_bridge_would_deadlock());
+        }
 
         let response = sender.create_message(request).await?;
         self.ensure_live()

@@ -6296,6 +6296,8 @@ where
             let (dispatch_sender, mut dispatch_receiver) = asupersync::channel::oneshot::channel();
             let blocking_dispatch = blocking_dispatch_pool().spawn(move || {
                 let _blocking_dispatch_permit = blocking_dispatch_permit;
+                // A pool thread is never the async driver (bd-6rfrg).
+                let _lane = fastmcp_core::runtime::enter_blocking_lane();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     dispatch(blocking_cx)
                 }))
@@ -16478,6 +16480,8 @@ impl Server {
                 blocking_children.push(BlockingTaskGuard(blocking_dispatch_pool().spawn(
                     move || {
                         let _permit = permit;
+                        // A pool thread is never the async driver (bd-6rfrg).
+                        let _lane = fastmcp_core::runtime::enter_blocking_lane();
                         poll_on_cx(&request_cx, dispatch(request_cx.clone()));
                     },
                 )));
