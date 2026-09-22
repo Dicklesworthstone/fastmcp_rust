@@ -12,7 +12,7 @@
 //! storage custody, and prevent deletion/rollback of committed controls. This
 //! is not an independent anti-rollback anchor or exactly-once execution proof.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -260,6 +260,17 @@ pub struct TaskInputJournal {
     pending: Option<TaskInputJournalChange>,
     persistence: Box<dyn TaskInputJournalPersistence>,
 }
+
+// Authentication-independent transfer of admitted controls. Both drivers keep
+// their own transport/policy types; neither needs to fabricate an OAuth policy
+// or maintain a second journal codec, state machine or persistence contract.
+pub(crate) struct TaskInputJournalState {
+    pub(crate) entries: BTreeMap<String, ([u8; 32], bool)>,
+    pub(crate) bytes: usize,
+    pub(crate) state: TaskInputUpdateState,
+    pub(crate) acknowledged: usize,
+    pub(crate) request_id: Option<RequestId>,
+}
 impl fmt::Debug for TaskInputJournal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskInputJournal").field("record", &self.record)
@@ -286,23 +297,35 @@ impl TaskInputJournal {
     pub(super) fn admit(&self, resource: &CanonicalHttpUrl, task: &TaskId,
         policy: ManagedTaskWatchDrivePolicy) -> Result<InputHistory, TaskInputJournalError>
     {
+        let state = self.admit_driver(resource, task, policy.maximum_updates,
+            policy.maximum_input_keys, policy.maximum_input_bytes)?;
+        Ok(InputHistory { entries: state.entries, bytes: state.bytes })
+    }
+    pub(crate) fn admit_driver(&self, resource: &CanonicalHttpUrl, task: &TaskId,
+        maximum_updates: usize, maximum_input_keys: usize, maximum_input_bytes: usize,
+    ) -> Result<TaskInputJournalState, TaskInputJournalError>
+    {
         let record = self.record()?;
         if resource.as_str() != self.binding.resource().as_str() || task != &record.task_id {
             return Err(TaskInputJournalError::BindingMismatch);
         }
-        if record.history.entries.len() > policy.maximum_input_keys
-            || record.history.bytes > policy.maximum_input_bytes
-            || record.acknowledged > policy.maximum_updates
+        if record.history.entries.len() > maximum_input_keys
+            || record.history.bytes > maximum_input_bytes
+            || record.acknowledged > maximum_updates
         { return Err(TaskInputJournalError::Capacity); }
-        Ok(record.history.clone())
+        Ok(TaskInputJournalState {
+            entries: record.history.entries.clone(), bytes: record.history.bytes,
+            state: record.state, acknowledged: record.acknowledged,
+            request_id: record.last_id.clone().map(RequestId::String),
+        })
     }
-    pub(super) fn check_task(&self, task: &Task) -> Result<(), TaskInputJournalError> {
+    pub(crate) fn check_task(&self, task: &Task) -> Result<(), TaskInputJournalError> {
         if self.record.task_id != task.base().task_id
             || self.record.created_at.as_ref().is_some_and(|created| created != task.base().created_at.as_str())
         { return Err(TaskInputJournalError::TaskChanged); }
         Ok(())
     }
-    pub(super) fn can_update(&self) -> Result<(), TaskInputJournalError> {
+    pub(crate) fn can_update(&self) -> Result<(), TaskInputJournalError> {
         if self.record()?.state == TaskInputUpdateState::Unconfirmed {
             return Err(TaskInputJournalError::ReconciliationRequired);
         }
@@ -315,18 +338,24 @@ impl TaskInputJournal {
     pub(super) fn intent(&self, task: &Task, history: &InputHistory,
         keys: impl Iterator<Item = String>, id: &RequestId,
     ) -> Result<TaskInputJournalChange, TaskInputJournalError> {
+        self.intent_from_history(task, &history.entries, history.bytes, keys, id)
+    }
+    pub(crate) fn intent_from_history(&self, task: &Task,
+        entries: &BTreeMap<String, ([u8; 32], bool)>, bytes: usize,
+        keys: impl Iterator<Item = String>, id: &RequestId,
+    ) -> Result<TaskInputJournalChange, TaskInputJournalError> {
         self.can_update()?;
         self.check_task(task)?;
         let RequestId::String(id) = id else { return Err(TaskInputJournalError::InvalidRecord); };
         if self.record.ids.contains(id) { return Err(TaskInputJournalError::IdentityReused); }
         if self.record.acknowledged >= MAX_UPDATES { return Err(TaskInputJournalError::Capacity); }
         // A successor cannot erase or rewrite an already-recorded descriptor.
-        if self.record.history.entries.iter().any(|(key, entry)| history.entries.get(key) != Some(entry)) {
+        if self.record.history.entries.iter().any(|(key, entry)| entries.get(key) != Some(entry)) {
             return Err(TaskInputJournalError::InvalidRecord);
         }
         let mut proposed = self.record.clone();
         proposed.created_at = Some(task.base().created_at.as_str().to_owned());
-        proposed.history = history.clone();
+        proposed.history = InputHistory { entries: entries.clone(), bytes };
         proposed.pending_keys = keys.collect();
         proposed.ids.insert(id.clone());
         proposed.last_id = Some(id.clone());
@@ -335,7 +364,7 @@ impl TaskInputJournal {
         proposed.encode()?;
         Ok(TaskInputJournalChange { expected: self.record.clone(), proposed })
     }
-    pub(super) fn acknowledgement(&self) -> Result<TaskInputJournalChange, TaskInputJournalError> {
+    pub(crate) fn acknowledgement(&self) -> Result<TaskInputJournalChange, TaskInputJournalError> {
         let current = self.record()?;
         if current.state != TaskInputUpdateState::Unconfirmed { return Err(TaskInputJournalError::InvalidRecord); }
         let mut proposed = current.clone();
@@ -349,7 +378,7 @@ impl TaskInputJournal {
         proposed.encode()?;
         Ok(TaskInputJournalChange { expected: current.clone(), proposed })
     }
-    pub(super) async fn persist(&mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+    pub(crate) async fn persist(&mut self, cx: &Cx, cancellation: &McpRequestCancellation,
         deadline: Time, change: TaskInputJournalChange) -> Result<(), TaskInputJournalError>
     {
         check(cx, cancellation, deadline)?;
