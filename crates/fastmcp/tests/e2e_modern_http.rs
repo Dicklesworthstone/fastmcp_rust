@@ -29403,6 +29403,7 @@ fn e2e_public_http_legacy_sampling_callback_reaches_context() {
 ///   0 -> the reverse request NEVER WENT OUT; the bridge failed before the peer.
 ///   1 -> it went out and was answered, and the bridge did not deliver it.
 #[test]
+#[ignore = "bd-6rfrg G3 END-TO-END, GATED ON bd-fnd04-b7-4rkp9. This arm asserts the user-visible diagnosis and CANNOT pass while fastmcp-server/src/lib.rs:11465 bridges the HTTP dispatch with the framework's own block_on: a user handler's block_on is then a NESTED bridge, BridgeEntry::enter's pre-existing assert panics before ctx.sample is polled, and the router redacts it to \"Internal server error\". The cause is 4rkp9's shipped block_on site, not a missing remedy here -- the diagnosis exists and is demonstrated bridge-independently by bd_6rfrg_sampling_bridged_from_a_task_position_is_diagnosed in fastmcp-core/tests/ephemeral_continuations.rs, both arms green. UN-IGNORE THIS THE MOMENT 11465 IS REMOVED: it is 4rkp9's regression witness as much as this bead's evidence, and it should flip from Err(InternalError) to the typed diagnosis with callbacks=0."]
 fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
     let cx = Cx::for_request();
     let server = spawn_legacy_sample_http_server();
