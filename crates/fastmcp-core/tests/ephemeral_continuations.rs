@@ -470,3 +470,84 @@ fn f2ndd_join_is_woken_in_a_scope_that_has_hosted_and_reaped_children() {
         }
     });
 }
+
+// ===========================================================================
+// bd-6rfrg G5: the DIAGNOSIS, demonstrated without the TRAP.
+//
+// WHY THESE LIVE HERE AND NOT IN THE END-TO-END FIXTURE. The public-API
+// reproduction in crates/fastmcp/tests/e2e_modern_http.rs shows the hazard, but
+// it cannot show the diagnosis today: the framework bridges its own HTTP
+// dispatch at fastmcp-server/src/lib.rs:11465, so a user's `block_on` is a
+// NESTED bridge, `BridgeEntry::enter`'s pre-existing assert fires before
+// `ctx.sample` is ever polled, and the router redacts the panic. Removing that
+// framework bridge is bd-fnd04-b7-4rkp9's work, and the orchestrator has gated
+// it on this bead having a diagnostic that survives the removal.
+//
+// That gate is circular if the only evidence is end-to-end: the diagnosis
+// cannot be demonstrated through the trap until the bridge is gone, and the
+// bridge may not go until the diagnosis is demonstrated. It is not circular if
+// the diagnosis is demonstrated DIRECTLY -- by putting the code in the position
+// the predicate names and asserting the disposition. That needs no HTTP, no
+// reverse request, and no framework bridge, so it runs today and keeps running
+// after 4rkp9 lands.
+//
+// THE POSITION, stated exactly: `bridge_would_starve_its_driver` is true when a
+// task context was already installed at bridge entry AND the thread is not a
+// declared blocking lane. `Cx::set_current` installs that context here, which is
+// the same ambient-Cx condition a handler polled inside a runtime task has. The
+// predicate does NOT test for a nested bridge, which is why the diagnosis is
+// bridge-INDEPENDENT and why bfd4008a satisfies the gate's property rather than
+// merely postponing it.
+// ===========================================================================
+
+/// A context with sampling configured, so the capability-absent branch of
+/// `sample_with_request` cannot be what answers.
+fn bd_6rfrg_sampling_context() -> fastmcp_core::McpContext {
+    fastmcp_core::McpContext::new(Cx::for_testing(), 6_001)
+        .with_sampling(std::sync::Arc::new(fastmcp_core::NoOpSamplingSender))
+}
+
+/// bd-6rfrg G3/G5. In the starving position the failure is NAMED.
+#[test]
+fn bd_6rfrg_sampling_bridged_from_a_task_position_is_diagnosed() {
+    let ctx = bd_6rfrg_sampling_context();
+    // The one variable: a task context installed before the bridge is entered.
+    let _ambient = Cx::set_current(Some(Cx::for_testing()));
+    // NOTE: the predicate is deliberately NOT asserted here. It reads state that
+    // `block_on` records at bridge ENTRY, so outside the bridge it is false by
+    // construction and an assertion on it would pin the wrong moment. The first
+    // draft of this test asserted `p() || !p()` to show it was publicly
+    // callable -- a tautology that cannot fail, which is the exact defect class
+    // this bead's own G5 was written to forbid. Public callability is proven by
+    // this file compiling, not by an assert.
+    let error = fastmcp_core::block_on(ctx.sample("bd-6rfrg probe", 16))
+        .expect_err("sampling bridged from a task position must not report success");
+    assert!(
+        error.message.contains("block_on"),
+        "G3: the diagnosis must name the bridge the user reached for: {error:?}"
+    );
+    assert!(
+        error.message.contains("ToolExecutionMode::Async"),
+        "G3: naming the problem without naming the remedy leaves the user as stuck as the \
+         hang did: {error:?}"
+    );
+}
+
+/// bd-6rfrg G5's PLANTED NEGATIVE, and it is the same call one position over.
+///
+/// No task context is installed, so the bridge is not occupying anyone's driver
+/// and the diagnosis must NOT fire. If this arm were also diagnosed, the
+/// predicate would be rejecting every bridge rather than discriminating by
+/// position, and the assertion above would be worthless. RH-5.
+#[test]
+fn bd_6rfrg_the_same_bridge_outside_a_task_position_is_not_diagnosed() {
+    let ctx = bd_6rfrg_sampling_context();
+    let error = fastmcp_core::block_on(ctx.sample("bd-6rfrg probe", 16))
+        .expect_err("the no-op sampling sender always reports an error");
+    assert!(
+        !error.message.contains("block_on"),
+        "G5 NEGATIVE FAILED: a bridge with no task context was diagnosed as starving a driver, \
+         so the predicate does not discriminate by position and the positive arm proves \
+         nothing: {error:?}"
+    );
+}
