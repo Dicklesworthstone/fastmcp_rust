@@ -462,12 +462,33 @@ mod embedded_inputs {
         SamplingInputError, SamplingInputLimits, resolve_sampling_inputs,
     };
     use fastmcp_protocol::{
-        ExactJsonValue, FinalEmbeddedInputRequest, InputRequiredResult, RequestId, ResultMeta,
+        ClientCapabilities, CoreRequest, ExactJsonValue, FinalEmbeddedInputRequest,
+        FinalRequestMeta, InputRequiredResult, RequestId, ResultMeta, exact_json_to_serde,
         parse_exact_json,
     };
+    use fastmcp_protocol::protocol_policy::ProtocolEra;
+
+    fn original(capabilities: Value) -> CoreRequest {
+        let mut meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        meta[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY] = capabilities;
+        CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&json!({
+            "_meta":meta,"name":"effect","arguments":{"unchanged":"yes"}
+        }))).unwrap()
+    }
+
+    fn all() -> CoreRequest {
+        original(json!({"roots":{},"sampling":{"tools":{},"context":{}}}))
+    }
 
     fn descriptor() -> String {
         serde_json::to_string(&FinalEmbeddedInputRequest::Sampling(request())).unwrap()
+    }
+
+    fn plain_descriptor() -> Value {
+        json!({"method":"sampling/createMessage","params":{
+            "messages":[{"role":"user","content":{"type":"text","text":"weather"}}],
+            "maxTokens":100
+        }})
     }
 
     fn challenge(raw: Option<&str>, state: Option<&str>) -> InputRequiredResult {
@@ -499,7 +520,7 @@ mod embedded_inputs {
             let retained = input.clone();
             let mut host = Host::new(vec![final_response(), final_response()], vec![]);
             let reply = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                input, RequestId::Number(55), SamplingInputLimits::default(), &mut host)).unwrap();
+                &all(), input, RequestId::Number(55), SamplingInputLimits::default(), &mut host)).unwrap();
             assert!(reply.request_id.correlates_with(&RequestId::Number(55)));
             let responses = reply.input_responses.unwrap();
             responses.validate_against_input_required(&retained).unwrap();
@@ -522,7 +543,7 @@ mod embedded_inputs {
                 let mut host = Host::new(vec![], vec![]);
                 let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 0, 0, 0, 2, 2).unwrap();
                 let reply = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                    challenge(raw, Some("")), RequestId::Number(56), limits, &mut host)).unwrap();
+                    &original(json!({})), challenge(raw, Some("")), RequestId::Number(56), limits, &mut host)).unwrap();
                 assert_eq!(reply.input_responses.is_some(), raw.is_some());
                 if let Some(responses) = reply.input_responses { assert!(responses.is_empty()); }
                 assert!(host.requests.is_empty());
@@ -542,10 +563,160 @@ mod embedded_inputs {
                 let raw = format!(r#"{{"first":{},"later":{later}}}"#, descriptor());
                 let mut host = Host::new(vec![], vec![]);
                 assert_eq!(complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                    challenge(Some(&raw), None), RequestId::Number(57), SamplingInputLimits::default(), &mut host)).err(), Some(expected));
+                    &all(), challenge(Some(&raw), None), RequestId::Number(57), SamplingInputLimits::default(), &mut host)).err(), Some(expected));
                 assert!(host.requests.is_empty());
                 assert!(host.calls.is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn sampling_requires_the_original_requests_actual_base_capability() {
+        with_cx(|cx, _, _| {
+            let raw = json!({"input":plain_descriptor()}).to_string();
+            for (capabilities, succeeds) in [
+                (json!({}), false),
+                (json!({"unknown":{"sampling":{}}}), false),
+                (json!({"sampling":{}}), true),
+                (json!({"sampling":{"unknown":{}}}), true),
+            ] {
+                let original = original(capabilities);
+                let before = original.encode_params().unwrap();
+                let mut host = Host::new(vec![final_response()], vec![]);
+                let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    &original, challenge(Some(&raw), None), RequestId::Number(70),
+                    SamplingInputLimits::default(), &mut host));
+                if succeeds {
+                    assert_eq!(result.unwrap().input_responses.unwrap().len(), 1);
+                    assert_eq!(host.requests.len(), 1);
+                } else {
+                    assert_eq!(result.err(), Some(SamplingInputError::CapabilityNotAdvertised));
+                    assert!(host.requests.is_empty());
+                }
+                assert_eq!(host.approvals, 0);
+                assert!(host.calls.is_empty());
+                assert_eq!(original.encode_params().unwrap(), before);
+            }
+        });
+    }
+
+    #[test]
+    fn tool_choice_only_later_sibling_requires_tools_before_any_host_effect() {
+        with_cx(|cx, _, _| {
+            for choice in [json!({}), json!({"mode":"none"})] {
+                let first = plain_descriptor();
+                let mut later = first.clone();
+                later["params"]["toolChoice"] = choice.clone();
+                let raw = format!(r#"{{"first":{first},"later":{later}}}"#);
+                for (capabilities, succeeds) in [
+                    (json!({"sampling":{}}), false),
+                    (json!({"sampling":{"unknown":{"tools":{}}}}), false),
+                    (json!({"sampling":{"tools":{}}}), true),
+                ] {
+                    let original = original(capabilities);
+                    let mut host = Host::new(vec![final_response(), final_response()], vec![]);
+                    let input = challenge(Some(&raw), Some("opaque"));
+                    let retained = input.clone();
+                    let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                        &original, input, RequestId::Number(71), SamplingInputLimits::default(), &mut host));
+                    if succeeds {
+                        result.unwrap().input_responses.unwrap().validate_against_input_required(&retained).unwrap();
+                        assert_eq!(host.requests.len(), 2);
+                        assert_eq!(host.requests[1]["toolChoice"], choice);
+                        assert!(host.requests[1].get("tools").is_none());
+                    } else {
+                        assert_eq!(result.err(), Some(SamplingInputError::CapabilityNotAdvertised));
+                        assert!(host.requests.is_empty());
+                    }
+                    assert_eq!(host.approvals, 0);
+                    assert!(host.calls.is_empty());
+                    assert_eq!(retained.request_state(), Some("opaque"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_sampling_presence_in_a_later_sibling_prevents_all_host_callbacks() {
+        with_cx(|cx, _, _| {
+            let first = plain_descriptor();
+            let mut invalid = vec![json!({"method":"sampling/createMessage","params":[]})];
+            for field in ["tools", "toolChoice", "includeContext"] {
+                let mut later = first.clone();
+                later["params"][field] = Value::Null;
+                invalid.push(later);
+            }
+            for choice in [json!([]), json!(["auto"]), json!({"mode":null})] {
+                let mut later = first.clone();
+                later["params"]["toolChoice"] = choice;
+                invalid.push(later);
+            }
+            for later in invalid {
+                let raw = format!(r#"{{"first":{first},"later":{later}}}"#);
+                let mut host = Host::new(vec![], vec![]);
+                let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                    &all(), challenge(Some(&raw), None), RequestId::Number(72),
+                    SamplingInputLimits::default(), &mut host));
+                assert_eq!(result.err(), Some(SamplingInputError::InvalidInput));
+                assert!(host.requests.is_empty());
+                assert_eq!(host.approvals, 0);
+                assert!(host.calls.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn advisory_context_is_omitted_without_a_grant_and_preserved_with_one() {
+        with_cx(|cx, _, _| {
+            for hint in [None, Some("none"), Some("thisServer"), Some("allServers")] {
+                let mut descriptor = plain_descriptor();
+                if let Some(hint) = hint { descriptor["params"]["includeContext"] = json!(hint); }
+                let raw = json!({"input":descriptor.clone()}).to_string();
+                for (capabilities, context_advertised) in [
+                    (json!({"sampling":{}}), false),
+                    (json!({"sampling":{"unknown":{"context":{}}}}), false),
+                    (json!({"sampling":{"context":{}}}), true),
+                ] {
+                    let original = original(capabilities);
+                    let before = original.encode_params().unwrap();
+                    let input = challenge(Some(&raw), Some("  opaque\0  "));
+                    let retained = input.clone();
+                    let mut host = Host::new(vec![final_response()], vec![]);
+                    let reply = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                        &original, input, RequestId::Number(73), SamplingInputLimits::default(), &mut host)).unwrap();
+                    reply.input_responses.unwrap().validate_against_input_required(&retained).unwrap();
+                    let ignored = !context_advertised && hint.is_some_and(|hint| hint != "none");
+                    let expected = if ignored { None } else { hint.map(|hint| json!(hint)) };
+                    assert_eq!(host.requests.len(), 1);
+                    assert_eq!(host.requests[0].get("includeContext"), expected.as_ref());
+                    assert_eq!(host.requests[0]["messages"], descriptor["params"]["messages"]);
+                    assert_eq!(host.approvals, 0);
+                    assert!(host.calls.is_empty());
+                    let retained_descriptor = exact_json_to_serde(
+                        retained.input_requests().unwrap().get("input").unwrap()).unwrap();
+                    assert_eq!(retained_descriptor, descriptor);
+                    assert_eq!(retained.request_state(), Some("  opaque\0  "));
+                    assert_eq!(original.encode_params().unwrap(), before);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn continuation_request_cannot_replace_the_original_admission_context() {
+        with_cx(|cx, _, _| {
+            let mut params = all().encode_params().unwrap().unwrap();
+            params["requestState"] = json!("already-a-continuation");
+            let continuation = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+            let raw = json!({"input":plain_descriptor()}).to_string();
+            let mut host = Host::new(vec![], vec![]);
+            assert_eq!(complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
+                &continuation, challenge(Some(&raw), None), RequestId::Number(74),
+                SamplingInputLimits::default(), &mut host)).err(), Some(SamplingInputError::InvalidRequest));
+            assert!(host.requests.is_empty());
+            assert_eq!(host.approvals, 0);
+            assert!(host.calls.is_empty());
+            assert_eq!(continuation.encode_params().unwrap().unwrap(), params);
         });
     }
 
@@ -555,7 +726,7 @@ mod embedded_inputs {
             let mut host = Host::new(vec![response(call("a")), final_response(), response(call("b"))],
                 vec![answer("a")]);
             let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                challenge(Some(&two_inputs()), None), RequestId::Number(58),
+                &all(), challenge(Some(&two_inputs()), None), RequestId::Number(58),
                 limits(SamplingRunLimits::default(), 3, 8), &mut host)).err().unwrap();
             assert_eq!(error, SamplingInputError::ModelRoundLimit);
             assert_eq!(host.requests.len(), 3);
@@ -570,7 +741,7 @@ mod embedded_inputs {
             let mut host = Host::new(vec![response(call("a")), final_response(),
                 response(json!([call("b"), call("c")]))], vec![answer("a")]);
             let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                challenge(Some(&two_inputs()), None), RequestId::Number(59),
+                &all(), challenge(Some(&two_inputs()), None), RequestId::Number(59),
                 limits(SamplingRunLimits::default(), 8, 2), &mut host)).err().unwrap();
             assert_eq!(error, SamplingInputError::ToolCallLimit);
             assert_eq!(host.approvals, 1);
@@ -587,7 +758,7 @@ mod embedded_inputs {
             let mut host = Host::new(vec![response(call("a")), final_response(), response(call("b"))],
                 vec![answer("a"), answer("b")]);
             let error = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                challenge(Some(&two_inputs()), None), RequestId::Number(60), limits(run, 8, 8), &mut host)).err().unwrap();
+                &all(), challenge(Some(&two_inputs()), None), RequestId::Number(60), limits(run, 8, 8), &mut host)).err().unwrap();
             assert_eq!(error, SamplingInputError::ToolResultByteLimit);
             assert_eq!(host.requests.len(), 3);
             assert_eq!(host.calls, ["a", "b"]);
@@ -603,14 +774,14 @@ mod embedded_inputs {
                     maximum, 4096).unwrap();
                 let mut host = Host::new(vec![final_response(), final_response()], vec![]);
                 let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                    challenge(Some(&raw), None), RequestId::Number(61), limits, &mut host));
+                    &all(), challenge(Some(&raw), None), RequestId::Number(61), limits, &mut host));
                 if succeeds { assert!(result.is_ok()); assert_eq!(host.requests.len(), 2); }
                 else { assert_eq!(result.err(), Some(SamplingInputError::InputByteLimit)); assert!(host.requests.is_empty()); }
             }
             let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 1, 2, 0, 4096, 4096).unwrap();
             let mut host = Host::new(vec![], vec![]);
             assert_eq!(complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                challenge(Some(&raw), None), RequestId::Number(62), limits, &mut host)).err(), Some(SamplingInputError::InputLimit));
+                &all(), challenge(Some(&raw), None), RequestId::Number(62), limits, &mut host)).err(), Some(SamplingInputError::InputLimit));
             assert!(host.requests.is_empty());
         });
     }
@@ -624,7 +795,7 @@ mod embedded_inputs {
                 let limits = SamplingInputLimits::new(SamplingRunLimits::default(), 2, 2, 0, 4096, maximum).unwrap();
                 let mut host = Host::new(vec![final_response(), final_response()], vec![]);
                 let result = complete(resolve_sampling_inputs(&cx, &McpRequestCancellation::new(),
-                    challenge(Some(&two_inputs()), None), RequestId::Number(63), limits, &mut host));
+                    &all(), challenge(Some(&two_inputs()), None), RequestId::Number(63), limits, &mut host));
                 if succeeds { assert_eq!(serde_json::to_string(&result.unwrap().input_responses.unwrap()).unwrap(), expected); }
                 else { assert_eq!(result.err(), Some(SamplingInputError::ReplyByteLimit)); }
                 assert_eq!(host.requests.len(), 2);
@@ -639,12 +810,13 @@ mod embedded_inputs {
             host.after_first_model = Some((clock.clone(), 3_000_000));
             host.pending_model_index = Some(2);
             let cancellation = McpRequestCancellation::new();
+            let original = all();
             let run = SamplingRunLimits::new(SamplingToolLoopLimits::default(), Duration::from_millis(5), 4096).unwrap();
             let counter = Arc::new(WakeCount::default());
             let waker = Waker::from(counter.clone());
             let mut task = Context::from_waker(&waker);
             let mut future = Box::pin(resolve_sampling_inputs(&cx, &cancellation,
-                challenge(Some(&two_inputs()), None), RequestId::Number(64), limits(run, 8, 8), &mut host));
+                &original, challenge(Some(&two_inputs()), None), RequestId::Number(64), limits(run, 8, 8), &mut host));
             assert!(future.as_mut().poll(&mut task).is_pending());
             assert_eq!(cx.now().as_nanos(), 3_000_000);
             clock.advance(2_000_000);
@@ -666,11 +838,12 @@ mod embedded_inputs {
             let mut host = Host::new(vec![final_response(), final_response()], vec![]);
             host.pending_model_index = Some(2);
             let cancellation = McpRequestCancellation::new();
+            let original = all();
             let counter = Arc::new(WakeCount::default());
             let waker = Waker::from(counter.clone());
             let mut task = Context::from_waker(&waker);
             let mut future = Box::pin(resolve_sampling_inputs(&cx, &cancellation,
-                challenge(Some(&two_inputs()), None), RequestId::Number(65), SamplingInputLimits::default(), &mut host));
+                &original, challenge(Some(&two_inputs()), None), RequestId::Number(65), SamplingInputLimits::default(), &mut host));
             assert!(future.as_mut().poll(&mut task).is_pending());
             cancellation.cancel();
             assert!(counter.0.load(Ordering::SeqCst) > 0);

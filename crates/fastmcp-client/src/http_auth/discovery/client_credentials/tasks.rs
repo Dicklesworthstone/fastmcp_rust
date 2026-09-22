@@ -10,6 +10,8 @@
 pub mod subscriptions;
 /// Bounded lifecycle polling with machine-owner and caller cancellation.
 pub mod driver;
+/// Owned Task-capable tool submission, explicit core input, and delivery evidence.
+pub mod submission;
 
 use std::fmt;
 use std::io::{self, Write};
