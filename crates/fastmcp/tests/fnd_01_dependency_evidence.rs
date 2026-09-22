@@ -13,9 +13,9 @@
 // inert copy of the crate-only attribute.
 #![cfg_attr(windows, feature(windows_by_handle))]
 
-const FROZEN_POLICY_BYTES: usize = 913542;
+const FROZEN_POLICY_BYTES: usize = 933058;
 const FROZEN_POLICY_SHA256: &str =
-    "e7b80ad2316b1ef23b2ff4e38f4a0ce0a2518fee8baa4d09b039a169f1d6851e";
+    "89297aa76e1ae7bf3860aded030abc647f5bb73abc3826eefb31cc04ff3eed0d";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 

@@ -13110,3 +13110,298 @@ registry_bytes = 42659
 registry_sha256 = "fbbd20fcc1f1bff40354ff0f3a7755870b98f9c6fe1b64d5395cb73d77c464c7"
 verifier_authority_rule = "before allocation the complete canonical registry must be nonempty and no larger than bounds.max_policy_shape_registry_bytes. The verifier pins schema_id, schema_version, all three row counts, canonical registry byte length, and SHA-256 in compiled code; the policy's mirror counts/digest can only be checked against those external constants and can never authorize a changed root key/type, row, field, optionality, variant, child relationship, or inline value shape"
 validation_order = "before interpreting any policy value semantically, validate the root scalar/table/array-table key classes and root scalar types, parse and validate the externally pinned shape/type/variant registry, recursively walk the generic TOML tree against every exact row and compiled direct-value type, apply all four conditional optional branches and only the fixture inline exception, reject every unknown/missing/mistyped node, and only then run registry-specific semantic checks"
+
+# ---------------------------------------------------------------------------
+# CANONICAL OBSERVATION ENCODINGS AND MUTATION ALGEBRA (bd-fnd01-b1-document-canonical-encodings-bca57)
+#
+# Comment-only landing. It adds no key, table, or value, so the parsed policy is
+# unchanged; only the whole-file byte binding moves. It documents, in the style
+# of workspace_snapshot.canonical_encoding in this file, how the declared
+# baseline_observation_sha256 and violating_observation_sha256 rows are computed,
+# so a maintainer can reproduce them from committed preimages without a build.
+#
+# Author of both texts: MagentaOsprey (bca57 implementer). Each was frozen before
+# any checker existed and is reproduced here VERBATIM from bca57 comments 5440 and
+# 5441. Recovery rule: take the lines strictly between a BEGIN and its END line,
+# remove the leading "# " from each (a line that is exactly "#" stands for an empty
+# line), join with LF and end with one LF; the result hashes to the stated sha256.
+# Line references inside the texts are to the verifier revision they cite, not to
+# this file or to the current verifier; cite by symbol.
+#
+# BEGIN bca57_C1_spec_v1.md (bca57 comment 5440) sha256 ddb215265befd2625459f5b27572988c2fdd2ca7f1be49dc7b94c277c45296b7
+# # bca57 C1(a)+(b) — FROZEN 2026-09-22, BEFORE ANY CHECKER EXISTS
+# # Author: MagentaOsprey (implementer). C6 evidence: this artifact is fixed FIRST; no line of the
+# # C2 checker has been written at the time of freezing, and the first-attempt C2 result will be
+# # reported before any revision of this text.
+# # Derived by READING the producer's structure (observation_digest and its helpers), never by
+# # adjusting prose until digests matched.
+# # Subject read: crates/fastmcp/tests/fnd_01_dependency_evidence.rs
+# #   observation_digest :28471, ObservationEncoder :28259, encode_toml_observation :28305,
+# #   encode_json_observation :28352, toml_pointer_observation :28390, json_pointer_observation :28425,
+# #   parse_pointer :28036, StrictJson :24001
+#
+# ## PRIMITIVES (all integers BIG-ENDIAN, no padding, no alignment)
+#     byte(b)        one raw byte
+#     u32(n)         4-byte big-endian unsigned
+#     u64(n)         8-byte big-endian unsigned
+#     sized_u32(s)   u32(len(s)) followed by the len(s) raw bytes of s
+#     sized_u64(s)   u64(len(s)) followed by the len(s) raw bytes of s
+# A running byte-length bound (`max_receipt_toml_bytes`) refuses over-long encodings; it changes no
+# accepted byte.
+#
+# ## FRAME — identical for all three observation modes
+#     ASCII "FND01OBSv1" followed by NUL            (11 bytes: 46 4E 44 30 31 4F 42 53 76 31 00)
+#     byte(kind)                                    0x01 canonical_selected_toml
+#                                                   0x02 canonical_selected_json
+#                                                   0x03 raw_source_bytes
+#     sized_u32(source_path)                        the row's `source_path`, UTF-8
+#     u32(selector_count)                           1, or 2 when `secondary_selector` is present
+#     for each selector IN ORDER: sized_u32(selector)   primary first, then secondary
+#     <body, per mode>
+#     digest = SHA-256(all of the above)
+# The selector list is `[selector]` or `[selector, secondary_selector]`; ORDER IS NEVER SORTED.
+# `raw_source_bytes` REFUSES a second selector.
+#
+# ## SELECTOR RESOLUTION (JSON-Pointer-like; identical rules for TOML and JSON)
+# Syntax: must begin with "/", must not be exactly "/", at most 512 bytes, ASCII only, no ASCII
+# control bytes. Split on "/" after the leading "/"; every component must be non-empty; at most 16
+# components. Within a component "~0" decodes to "~" and "~1" decodes to "/"; a "~" followed by
+# anything else is an error.
+# Walk left to right from the document root:
+#   - at a table/object: look the component up as a key. MISSING KEY -> ABSENT (not an error).
+#   - at an array, component parses as an unsigned integer: index it. OUT OF RANGE -> ABSENT.
+#     (Parsed with a plain integer parse, so a non-canonical spelling such as "007" resolves to 7.)
+#   - at an array, component does not parse as an integer: it MUST contain "=", read as
+#     `key=expected`. Select the unique element that is a table/object whose `key` is a STRING
+#     exactly equal to `expected`. ZERO matches -> ABSENT. TWO OR MORE -> ERROR, "ambiguous named
+#     array selector". A component with no "=" here is an error.
+#   - at any scalar (i.e. path continues past a leaf) -> ABSENT.
+# ABSENT is a value, encoded as the single byte 0x00. It is NOT an error and NOT an empty string.
+#
+# ## BODY, kind 0x01 `canonical_selected_toml`
+# For each selector in order, emit the encoding of the resolved TOML value:
+#     absent      0x00
+#     boolean     0x02, then one byte 0x00 (false) or 0x01 (true)
+#     integer     0x03, then 8 bytes: the i64 big-endian two's-complement value
+#     float       0x04, then 8 bytes: the IEEE-754 binary64 BIT PATTERN, big-endian
+#                 (f64::to_bits — NOT a decimal rendering)
+#     string      0x05, then sized_u64(UTF-8 bytes)
+#     array       0x06, then u64(element count), then each element encoded by these same rules
+#     table       0x07, then u64(entry count), then for each entry, in ASCENDING ORDER OF THE KEY'S
+#                 RAW UTF-8 BYTES: sized_u32(key bytes), then the value by these same rules
+#     datetime    0x09, then sized_u64(the datetime's canonical TOML rendering, UTF-8)
+# Table ordering is BY KEY BYTES, not by document order and not by any locale collation.
+#
+# ## BODY, kind 0x02 `canonical_selected_json`
+# Same shape, one added tag and one different number rule:
+#     absent      0x00
+#     null        0x01
+#     boolean     0x02, then one byte 0x00/0x01
+#     string      0x05, then sized_u64(UTF-8 bytes)
+#     array       0x06, then u64(element count), then each element
+#     object      0x07, then u64(entry count), then for each entry, ASCENDING BY KEY UTF-8 BYTES:
+#                 sized_u32(key bytes), then the value
+#     number      0x0a, then sized_u64(the number's canonical textual rendering, UTF-8)
+# NOTE ON OBJECT ORDER: the producer iterates a BTreeMap<String, _>, so ordering is byte-wise
+# ascending by key. There is no explicit sort in the JSON path; the ordering comes from the
+# container. The OBSERVABLE RULE is identical to the TOML table rule, and an implementer should
+# sort explicitly rather than rely on their own language's map order.
+# NOTE: 0x03/0x04/0x09 (TOML integer/float/datetime) NEVER appear under kind 0x02, and 0x01 (null)
+# and 0x0a (number) NEVER appear under kind 0x01. The tag spaces overlap but are not interchangeable.
+#
+# ## BODY, kind 0x03 `raw_source_bytes`
+# Exactly one selector, and it must have exactly two components: "bytes" followed by either "end" or
+# a component that parses as an unsigned integer. The selector is VALIDATED and then DISCARDED — it
+# does not choose a sub-range and does not otherwise affect the bytes. The body is:
+#     byte(0x08)
+#     sized_u64(the complete file bytes)
+# So the digest covers the whole file, with its length, under the frame above.
+#
+# ## (b) THE DOCUMENT RULE — A RULE, NOT A FOURTH ENCODING
+# `baseline_mode = "canonical_source_value"` is NOT a byte format and there is no
+# "canonical_source_value encoding" to look for. It states WHICH DOCUMENT is fed to the encoding
+# named by `observation_mode`:
+#     baseline_observation_sha256  = <the row's observation_mode encoding> over the PRISTINE
+#                                    committed document at `source_path`
+#     violating_observation_sha256 = THE SAME ENCODING, THE SAME frame, the same source_path and
+#                                    the same selectors, over the OVERLAID document — the pristine
+#                                    document with the row's ONE declared mutation applied
+# Nothing in the frame changes between the two digests: not the kind byte, not the source_path, not
+# the selector list. The ONLY difference is the document the selectors resolve against. Any
+# maintainer who reproduces a baseline digest has, by construction, everything needed to reproduce
+# its violating partner except the mutation semantics, which are C1(c).
+#
+# ## WHAT THIS SECTION DOES NOT COVER
+# The mutation algebra (C1(c)) — the 9 operations and the single integrity_mode — is written
+# separately. Until it is, the 188 violating rows remain unreproducible, and C3 is unmet.
+# END bca57_C1_spec_v1.md
+#
+# BEGIN bca57_C1c_spec_v1.md (bca57 comment 5441) sha256 fe6ec6667fead2f00bdc5cfccda6ab1ae3a14a32453d774967b4bef134806b30
+# # bca57 C1(c): the mutation algebra, the fixture axis, and the overlaid document
+#
+# Companion to `bca57_C1_spec_v1.md` (C1(a) byte encodings and C1(b) document rule, frozen at
+# sha256 ddb215265befd2625459f5b27572988c2fdd2ca7f1be49dc7b94c277c45296b7). Written from the
+# producer's STRUCTURE at `crates/fastmcp/tests/fnd_01_dependency_evidence.rs` blob 0d7c5579144a
+# (HEAD bb3cd3a1), cited by symbol. No checker line exists at the time this file is frozen.
+#
+# ## 1. Which document a violating digest observes
+#
+# Each `[[semantic_assertion]]` row carries `baseline_observation_sha256` and
+# `violating_observation_sha256`. Its NEGATIVE CASE is the `[[negative_case]]` whose `id` equals the
+# assertion `id` with the leading `"<family>."` removed (`assertion_negative_id`).
+#
+# - baseline digest: the C1(a) encoding of the assertion's selectors over the PRISTINE committed file
+#   at `source_path`.
+# - violating digest: the same encoding (same kind byte, same `source_path` string, same selector
+#   list) over the OVERLAID document of that negative case, but only when the case's `target_path`
+#   equals the assertion's `source_path` (`assertion_document`). If the paths differ, the overlay
+#   does not apply and the observation is of the pristine file.
+#
+# ## 2. The overlaid document (`Overlay::checked`)
+#
+# Let `P` be the committed bytes at the case's `target_path`.
+#
+# - `operation = "replace_bytes"`: apply the byte mutation (section 5) to a copy of `P`, giving `B`.
+#   The observed document is `B` itself: raw bytes for `raw_source_bytes`, `B` parsed as TOML or
+#   strict JSON for the structured modes. `B` is NOT re-serialized.
+# - any other operation, TOML source: parse `P`; apply the structured mutation (sections 3 and 4) to
+#   the value tree; serialize it with the `toml` crate (`toml::to_string`); parse that text again.
+#   The observed document is the RE-PARSED tree.
+# - any other operation, JSON source: the case MUST name a fixture (structured JSON mutation without
+#   a typed fixture is refused). Parse `P` strictly; apply the JSON fixture (section 4); serialize
+#   (`serde_json::to_vec`); parse again strictly. The observed document is the re-parsed tree.
+#
+# Consequences a hand-reproducer needs:
+# - The C1(a) encodings consume the VALUE TREE, never the serialized text. The re-serialization is
+#   observable only if the round trip changes a VALUE. The claim that it is value-preserving for
+#   every row is NOT asserted here. C2's first attempt tests it by encoding the mutated tree
+#   directly, and any disagreeing row will be named.
+# - A `raw_source_bytes` assertion hashes BYTES. If its case were a structured mutation, the bytes
+#   would be `toml::to_string` output, which is a serializer's byte format and not a specification.
+#   This spec covers `raw_source_bytes` violating digests ONLY where the case is `replace_bytes`.
+#   C2 asserts that this holds for all 6 raw assertions and refuses any row where it does not.
+#
+# Guards that refuse a case (they do not change the digest of a case that passes): the mutated bytes
+# equal `P` (`E_MUTATION_NOOP`), the file-size bound, and the virtual family and tree digests
+# (section 6) equal their pristine values.
+#
+# ## 3. Pointers inside mutations
+#
+# `target_selector` / `secondary_selector` use the C1(a) pointer grammar (`parse_pointer`: begins
+# "/", not "/", <=512 ASCII bytes, no controls, <=16 non-empty components, ~0 -> "~", ~1 -> "/").
+# Array components are a canonical decimal index (no sign, no leading zero, < length) or `key=value`
+# matching EXACTLY ONE element whose table member `key` is the string `value`.
+#
+# DIFFERENCE FROM OBSERVATION SELECTORS: when a mutation pointer does not resolve (missing key,
+# index out of range, zero or several `key=value` matches, traversal through a scalar), the CASE IS
+# REFUSED. It never yields the ABSENT value that an observation selector yields.
+#
+# TOML tables in this build are ordered by key (the `toml` crate is built WITHOUT `preserve_order`;
+# `toml::Table` is a BTreeMap, so iteration is ascending by key, compared as UTF-8 bytes). "The first
+# value of a table" below means the value of the byte-wise smallest key.
+#
+# `mutation_key(case)` = "fnd01_" followed by the first 12 lowercase hex characters of
+# SHA-256(UTF-8 bytes of the case `id`).
+#
+# ## 4. Structured operations (TOML) and fixture applications
+#
+# A case's `argument` is required and non-empty for insert, replace, toggle_bool, increment,
+# append_feature, rename_key and replace_bytes. It is absent for duplicate and swap, and absent for
+# remove unless the case uses a fixture. `swap` requires `secondary_selector`; no other operation
+# may carry it (`validate_mutation_field_relevance`).
+#
+# If `argument` begins with `"fixture:"`, the rest is a `[[mutation_fixture]]` `id`, and the case
+# applies that FIXTURE (4b) INSTEAD of its operation's semantics (4a). This applies to 51 cases.
+#
+# ### 4a. The nine operations, when no fixture is bound
+#
+# Let `T` be the value at `target_selector` (which must resolve).
+#
+# - `remove`: delete `T` from its parent. A table loses that key; an array loses that element, and
+#   later elements shift down one index.
+# - `insert`: with `A = argument`:
+#   - `T` is a table: if `A` parses as a TOML DOCUMENT, that document must be non-empty and share no
+#     top-level key with `T`, and its members are added to `T`. (An `A` that parses but is empty,
+#     for example only whitespace or a comment, REFUSES; it does not fall back.) If `A` does not
+#     parse as TOML, add member `mutation_key(case) = A` as a string, refusing if that key exists.
+#   - `T` is an array: append the string `A`.
+#   - `T` is a string: append `"|"` then `A`.
+#   - otherwise (integer, float, boolean, datetime): replace `T` with the 2-element array
+#     `[T, "A"]`.
+# - `replace`: the replacement is typed by `T`. If `T` is a boolean and `A` is exactly `true` or
+#   `false`, it is that boolean. If `T` is an integer and `A` parses as a Rust `i64`
+#   (optional leading `+` or `-`, decimal digits, in range), it is that integer. If `T` is a float
+#   and `A` parses as a Rust `f64`, it is that float. In every other case the replacement is the
+#   STRING `A`. Refused if the replacement equals `T`.
+# - `toggle_bool`: `T` must be a boolean. `A` must be `true-to-false` when `T` is true, or
+#   `false-to-true` when `T` is false. `T` becomes `!T`.
+# - `increment`: `A` must be the canonical decimal of a nonzero i64 (so `+5` and `05` are refused).
+#   `T` must be an integer; `T` becomes `T + A`, refused on i64 overflow.
+# - `append_feature`: `T` must be an array. Append the string `A`, refused if an element already
+#   equals the string `A`.
+# - `swap`: the two selectors must differ and neither may be a component-prefix of the other. Let
+#   `X` be the value at the target and `Y` the value at the secondary selector; refused if they are
+#   equal. The target becomes `Y` and the secondary becomes `X`.
+# - `duplicate`:
+#   - if `T`'s PARENT is an array, insert a copy of `T` immediately after it (index + 1);
+#   - otherwise, if `T` is an array, append a copy of its FIRST element (refused if empty);
+#   - otherwise, if `T` is a table, add member `mutation_key(case)` = a copy of its first value in
+#     key order (refused if empty or if that key exists);
+#   - otherwise replace `T` with `[T, T]`.
+# - `replace_bytes`: see section 5. It is never a structured operation.
+# - (`rename_key` is in the policy's allowed set and has ZERO rows. It is not part of the nine, and a
+#   C5 checker REFUSES it by design.)
+#
+# ### 4b. The five fixture applications (`apply_toml_fixture`; JSON analogue `apply_json_fixture`)
+#
+# `V` is the fixture's `value`. For a JSON source, `V` is first converted from TOML to JSON
+# (`fixture_json_value`): string -> string, integer -> integer number, finite float -> number
+# (non-finite is refused), boolean -> boolean, array -> array, table -> object; a datetime is
+# refused.
+#
+# "Compatible shape": both values are strings, integers, floats, booleans or datetimes (both the
+# same kind), or both are tables; or both are arrays where either is empty or every pair of elements
+# across them is compatible. For JSON: null, boolean, number, string and object pair with
+# themselves, with the same array rule.
+#
+# - `replace_value`: `T` must differ from `V` and have a compatible shape. `T` becomes `V`.
+# - `remove_exact_value`: `T` must EQUAL `V`. Remove `T` as `remove` does.
+# - `insert_array_element`: `T` must be an array that contains no element equal to `V`, and whose
+#   every element is compatible with `V`. Append `V`.
+# - `insert_table_member`: `V` must be a table with EXACTLY the two keys `relative_selector` and
+#   `value`. `relative_selector` must be a one-component pointer `/k`. `T` must be a table without
+#   key `k`. Add `k = value`.
+# - `replace_table_member`: `V` is the same two-key table. `relative_selector` may have several
+#   components and is resolved RELATIVE TO `T`. Every array component along the target path and
+#   along the relative path must be a `key=value` identity, never a bare index into an array of
+#   tables. The final component names an EXISTING table member whose current value differs from
+#   `value` and is shape-compatible with it. That member becomes `value`.
+#
+# ## 5. Byte mutations (`replace_bytes`, `apply_byte_mutation`)
+#
+# `target_selector` is exactly `/bytes/<X>`. `A` is one of:
+# - `append-hex:<hh...>`: requires `X = end`; append the decoded bytes (lowercase hex, even
+#   length, non-empty).
+# - `truncate:<n>`: requires `X = end`; `n` is canonical positive decimal; remove the last `n`
+#   bytes (refused if `n` > length).
+# - `xor:<hh>`: `X` is a canonical decimal offset; XOR the single byte at `X` with the mask
+#   (offset + 1 must not exceed the length).
+# - `insert-cr-before-lf`: `X` is a canonical decimal offset whose byte is `0x0a`; insert `0x0d` at
+#   `X`, so the LF moves to `X + 1`.
+#
+# ## 6. `integrity_mode = "rebind_virtual_hashes"` (the only allowed mode, 188 of 188)
+#
+# After the mutation, the producer recomputes the VIRTUAL source-family digest and the virtual
+# source-tree digest with the mutated file's bytes substituted for the target path
+# (`virtual_source_subset_digest`), and refuses the case if either equals its pristine declared
+# value. These digests feed the family and tree integrity checks. They are NOT inputs to any
+# observation encoding, and they never change the observed document or its digest. For C3's purpose
+# they are a precondition, not a transform.
+#
+# ## 7. Scope statement
+#
+# Sections 1-5 are every transform between a committed file and the document a violating digest
+# observes. With C1(a), they are claimed sufficient to reproduce all 188 violating digests by hand,
+# subject to the round-trip value-preservation question in section 2, which C2's first attempt
+# settles and reports per row.
+# END bca57_C1c_spec_v1.md
