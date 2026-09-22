@@ -68098,6 +68098,19 @@ fn fallible(value: Option<u8>) {
             String::from_utf8(bytes).expect("an ASCII string with one ASCII byte changed is UTF-8")
         }
 
+        /// Row 0's `schema_closure` array in an in-memory manifest copy.
+        fn ta_row0_closure_mut(manifest: &mut toml::Value) -> &mut Vec<toml::Value> {
+            match manifest.get_mut("apps").and_then(|apps| apps.get_mut("standard_reuse")).and_then(|rows| rows.get_mut(0)).and_then(|row| row.get_mut("schema_closure")) {
+                Some(toml::Value::Array(names)) => names,
+                _ => panic!("row 0 schema_closure is an array"),
+            }
+        }
+
+        /// A closure member list as strings, for asserting an arm's precondition.
+        fn ta_member_names(names: &[toml::Value]) -> Vec<&str> {
+            names.iter().map(|name| name.as_str().expect("a closure member is a string")).collect()
+        }
+
         #[test]
         fn fnd_01_tasks_apps_standard_reuse_closure_recompute_positive() {
             let manifest = committed_tasks_apps_manifest();
@@ -68158,6 +68171,31 @@ fn fallible(value: Option<u8>) {
             assert_eq!(refused_c.refusals, vec![ta_err(TA_CLOSURE_CODE, TA_CLOSURE_SUBJECT, "canonical_root_payload")], "the moved rule is refused by name");
             assert_eq!(refused_c.rows_hashed, 0, "a moved rule is refused before any row is hashed");
             assert!(refused_c.reproduced.is_empty(), "nothing reproduces under a moved rule");
+
+            // ARM (d), added by the bar author's amendment (5449): ORDER AND DUPLICATE INVARIANCE. Every
+            // committed closure array is already in ascending byte order and duplicate-free, so arms
+            // (a)-(c) cannot fail the schema_name_order rule. Each variant below ASSERTS that its input is
+            // not canonical (a variant that happened to be canonical would bind nothing), then must still
+            // reproduce exactly the baseline report: 21 of 21, no refusal, D2 unchanged. (d1) changes
+            // ORDER only and (d2) changes DUPLICATION only, so removing the sort fails (d1) and removing
+            // the dedup fails (d2).
+            let mut arm_d1 = committed.clone();
+            let names = ta_row0_closure_mut(&mut arm_d1);
+            names.reverse();
+            let reordered = ta_member_names(names);
+            assert!(reordered.windows(2).any(|pair| pair[0].as_bytes() > pair[1].as_bytes()), "arm (d1) must NOT be in ascending byte order, or it binds nothing: {reordered:?}");
+            assert_ne!(arm_d1, committed, "arm (d1) must actually change the manifest");
+            assert_eq!(ta_recompute_standard_reuse_closures(&arm_d1).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())), baseline, "a reordered closure still reproduces 21 of 21 with D2 unchanged");
+
+            let mut arm_d2 = committed.clone();
+            let names = ta_row0_closure_mut(&mut arm_d2);
+            let repeated = names[0].clone();
+            names.insert(1, repeated);
+            let duplicated = ta_member_names(names);
+            assert_eq!(duplicated[0], duplicated[1], "arm (d2) must contain a duplicate, or it binds nothing");
+            assert!(duplicated.windows(2).all(|pair| pair[0].as_bytes() <= pair[1].as_bytes()), "arm (d2) keeps ascending order, so it varies duplication alone: {duplicated:?}");
+            assert_ne!(arm_d2, committed, "arm (d2) must actually change the manifest");
+            assert_eq!(ta_recompute_standard_reuse_closures(&arm_d2).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())), baseline, "a closure with a repeated member still reproduces 21 of 21 with D2 unchanged");
 
             assert_eq!(
                 ta_recompute_standard_reuse_closures(&committed).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
