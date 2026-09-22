@@ -271,3 +271,6 @@ fn unavailable_saved_task_is_not_recreated_or_reported_complete() {
 fn restored_watch_rejects_a_foreign_task_snapshot_without_publication() {
     isolated_checkpoint("checkpoint::restored_watch_rejects_a_foreign_task_snapshot_without_publication", CheckpointCase::WrongTask);
 }
+
+#[path = "checkpoint/persistence.rs"]
+mod persistence;

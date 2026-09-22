@@ -218,3 +218,6 @@ fn changed_ciphertext_is_not_reinterpreted_as_an_empty_store() {
         TaskResumeStoreLimits::default()), Err(TaskResumeStoreError::Resume(TaskResumeError::Protection))));
     assert_eq!(directory.bytes(), bytes, "refusal must not overwrite the corrupted evidence");
 }
+
+#[path = "task_resume_store/lifecycle.rs"]
+mod lifecycle;
