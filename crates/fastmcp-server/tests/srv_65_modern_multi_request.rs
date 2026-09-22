@@ -1658,3 +1658,411 @@ mod post_receive_failure {
         run(true);
     }
 }
+
+// ===========================================================================
+// bd-6rfrg G1: the sampling hazard, reproduced through the PUBLIC trait.
+//
+// `ToolHandler::call` is REQUIRED and synchronous (handler.rs:1666) and its own
+// doc comment calls it "the default implementation point. Override this for
+// simple synchronous tools." (handler.rs:1663), while `McpContext::sample` is
+// `async` (context.rs:3534). A user who follows the required method and the
+// documentation has to bridge the two, and `fastmcp_core::block_on` is the
+// bridge this workspace exports. Nothing in the trait, the doc, or the compiler
+// tells them not to.
+//
+// The two handlers below carry the SAME body and differ in exactly one
+// property: which trait method it hangs off. `SyncSamplingTool` implements only
+// the required sync `call` and bridges with `block_on`, leaving every async hook
+// at its default. `AsyncSamplingTool` overrides the async final hook and awaits
+// `ctx.sample` directly. Both answer through the same server, the same scripted
+// transport, and the same result construction (`Echo`), so a difference between
+// their outcomes is a property of the API shape and not of the fixture.
+//
+// THE ASYNC ARM IS THE CONTROL, AND IT EXISTS TO MAKE A REFUTATION POSSIBLE.
+// `sample_with_request` returns an error IMMEDIATELY when no sampling sender is
+// configured (context.rs:3580), and an early error is neither a deadlock nor
+// evidence against one. So a sync arm that does not complete means nothing
+// unless the async arm, in the same fixture, completes with the sampled text.
+// `AsyncSamplingTool::call` therefore refuses rather than delegating: if the
+// router ever reaches the control through the sync bridge, the control fails
+// loudly instead of passing for the wrong reason.
+// ===========================================================================
+
+/// The prompt the fixture's handlers sample with.
+const SAMPLING_PROMPT: &str = "bd-6rfrg: does a sync handler get its completion?";
+
+/// What the scripted client answers `sampling/createMessage` with. Distinct
+/// from [`SAMPLING_PROMPT`] so a returned value proves a ROUND TRIP happened
+/// rather than an echo of the request.
+const SAMPLED_TEXT: &str = "bd-6rfrg-sampled-completion";
+
+/// Wall-clock grace the sampling transport keeps `recv` alive after its script
+/// drains, so the server's reverse `sampling/createMessage` request has
+/// somewhere to be answered. Bounded: `recv` reports `Closed` at the end of it
+/// whatever happened, so the pump can never park in `recv` forever.
+const SAMPLING_RECV_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound on one sampling scenario, deliberately shorter than
+/// [`SCENARIO_DEADLINE`] because the hazard arm is EXPECTED to consume it.
+///
+/// It is self-validating rather than guessed: the control arm runs under this
+/// same bound and a healthy sampling round trip finishes in milliseconds, so a
+/// control that completes proves the bound was adequate on the machine that
+/// produced the run. A bound that only ever fires is indistinguishable from a
+/// bound that is too short.
+const SAMPLING_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Which trait method carries the handler body. The only variable.
+#[derive(Clone, Copy, Debug)]
+enum SamplingArm {
+    /// The required sync `call`, bridging `ctx.sample` with `block_on`.
+    RequiredSyncCall,
+    /// The async final hook, awaiting `ctx.sample` directly. The control.
+    DeclaredAsync,
+}
+
+/// What one arm did, inside the bound. Recorded rather than asserted, so the
+/// reproduction reports a refutation as readily as a confirmation.
+#[derive(Debug)]
+enum SamplingOutcome {
+    /// The tool answered. Carries the text it returned.
+    Completed(String),
+    /// The tool answered with a JSON-RPC error. Carries its message.
+    Errored(String),
+    /// Nothing came back inside [`SAMPLING_DEADLINE`]. This is the hazard: no
+    /// error, no timeout, no diagnostic, and the evidence destroyed with it.
+    NoOutcomeWithinBound { sampling_requests: usize },
+    /// The pump returned but produced no response correlated to the call.
+    NoCorrelatedResponse {
+        observed: Vec<Option<fastmcp_protocol::RequestId>>,
+    },
+}
+
+#[derive(Default)]
+struct SamplingScriptedState {
+    incoming: VecDeque<JsonRpcMessage>,
+    outgoing: Vec<JsonRpcMessage>,
+    sampling_requests: usize,
+}
+
+/// A scripted transport that ANSWERS the server's reverse sampling request
+/// instead of only recording it, so `ctx.sample` can actually complete.
+struct SamplingScriptedTransport {
+    state: Arc<Mutex<SamplingScriptedState>>,
+}
+
+#[derive(Clone)]
+struct SamplingScriptedProbe(Arc<Mutex<SamplingScriptedState>>);
+
+impl SamplingScriptedProbe {
+    fn responses(&self) -> Vec<JsonRpcResponse> {
+        self.0
+            .lock()
+            .expect("sampling transport mutex must not be poisoned")
+            .outgoing
+            .iter()
+            .filter_map(|message| match message {
+                JsonRpcMessage::Response(response) => Some(response.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sampling_requests(&self) -> usize {
+        self.0
+            .lock()
+            .expect("sampling transport mutex must not be poisoned")
+            .sampling_requests
+    }
+}
+
+impl Transport for SamplingScriptedTransport {
+    fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("sampling transport mutex must not be poisoned");
+        state.outgoing.push(message.clone());
+        // Answer the reverse request the same way a sampling-capable client
+        // would: same id, assistant role, one text block. Built through
+        // `CreateMessageResult` rather than a hand-written object so the member
+        // names and the content discriminator come from the protocol crate.
+        if let JsonRpcMessage::Request(request) = message
+            && request.method == "sampling/createMessage"
+            && let Some(id) = request.id.clone()
+        {
+            state.sampling_requests += 1;
+            let result = serde_json::to_value(fastmcp_protocol::CreateMessageResult::text(
+                SAMPLED_TEXT,
+                "bd-6rfrg-fixture-model",
+            ))
+            .expect("a CreateMessageResult serializes to JSON");
+            state
+                .incoming
+                .push_back(JsonRpcMessage::Response(JsonRpcResponse::success(
+                    id, result,
+                )));
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        let deadline = std::time::Instant::now() + SAMPLING_RECV_GRACE;
+        loop {
+            let next = self
+                .state
+                .lock()
+                .expect("sampling transport mutex must not be poisoned")
+                .incoming
+                .pop_front();
+            if let Some(message) = next {
+                return Ok(message);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TransportError::Closed);
+            }
+            // The lock is released before this sleep: a handler answering a
+            // reverse request must be able to reach `send` while `recv` waits.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+/// The `Tool` both arms advertise, differing only in name. Reuses `Echo`'s
+/// schema so argument validation cannot become the reason an arm fails.
+fn sampling_tool_definition(name: &str) -> Tool {
+    let mut definition = Echo.definition();
+    definition.name = name.to_owned();
+    definition.description =
+        Some("bd-6rfrg fixture: requests a completion from inside the handler".to_owned());
+    definition
+}
+
+/// The obvious sync tool that samples. Overrides NOTHING else, which is the
+/// whole point: the user picked no execution mode and implemented the one
+/// method the trait requires.
+struct SyncSamplingTool;
+
+impl ToolHandler for SyncSamplingTool {
+    fn definition(&self) -> Tool {
+        sampling_tool_definition("sync_sample")
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        // The bridge a user reaches for, because `call` is sync and `sample`
+        // is not. Returning through `Echo` keeps this arm's result shape
+        // identical to the control's.
+        let response = block_on(ctx.sample(SAMPLING_PROMPT, 16))?;
+        Echo.call(ctx, serde_json::json!({ "value": response.text }))
+    }
+}
+
+/// The same body reached through the async hook. The control.
+struct AsyncSamplingTool;
+
+impl ToolHandler for AsyncSamplingTool {
+    fn execution_mode(&self) -> fastmcp_server::ToolExecutionMode {
+        fastmcp_server::ToolExecutionMode::Async
+    }
+
+    fn definition(&self) -> Tool {
+        sampling_tool_definition("async_sample")
+    }
+
+    /// Refuses instead of delegating. If the router reaches the control through
+    /// the sync bridge, the control must fail loudly rather than pass for the
+    /// wrong reason.
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Err(fastmcp_core::McpError::internal_error(
+            "bd-6rfrg control reached through the SYNC path; the control proves nothing",
+        ))
+    }
+
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _arguments: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = McpOutcome<FinalToolOutcome>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let sampled = match ctx.sample(SAMPLING_PROMPT, 16).await {
+                Ok(response) => response.text,
+                Err(error) => return McpOutcome::Err(error),
+            };
+            match Echo.call_final(ctx, serde_json::json!({ "value": sampled })) {
+                Ok(result) => McpOutcome::Ok(FinalToolOutcome::Complete(result)),
+                Err(error) => McpOutcome::Err(error),
+            }
+        })
+    }
+}
+
+/// The ordinary handshake a sampling-capable client performs, then one
+/// `tools/call`. Sampling is advertised in `initialize` capabilities AND in the
+/// modern `_meta` envelope, because both are legitimate client behaviour and
+/// the fixture must not depend on which one this dispatcher reads.
+fn sampling_request_script(tool: &str) -> Vec<JsonRpcRequest> {
+    let mut meta = modern_meta();
+    meta["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+        "sampling": {},
+        "tools": {"listChanged": true},
+    });
+    vec![
+        JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": MODERN_PROTOCOL_VERSION,
+                "capabilities": {"sampling": {}},
+                "clientInfo": {"name": "bd-6rfrg-sampling-probe", "version": "0.0.1"},
+                "_meta": meta.clone(),
+            })),
+            1_i64,
+        ),
+        JsonRpcRequest::notification("notifications/initialized", None),
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": tool,
+                "arguments": {"value": "unused"},
+                "_meta": meta,
+            })),
+            3_i64,
+        ),
+    ]
+}
+
+/// Drives one arm under an external bound and RECORDS what happened.
+///
+/// The bound is a real wall clock on the test thread, outside the server's
+/// runtime and outside asupersync's timer, because a receipt for a hang cannot
+/// be produced by a process that hung. On expiry the worker thread is
+/// deliberately NOT joined: it is the thread that is stuck, and joining it
+/// would move the hang into the assertion.
+fn run_sampling_arm(arm: SamplingArm) -> SamplingOutcome {
+    let tool_name = match arm {
+        SamplingArm::RequiredSyncCall => "sync_sample",
+        SamplingArm::DeclaredAsync => "async_sample",
+    };
+    let state = Arc::new(Mutex::new(SamplingScriptedState {
+        incoming: sampling_request_script(tool_name)
+            .into_iter()
+            .map(JsonRpcMessage::Request)
+            .collect(),
+        ..SamplingScriptedState::default()
+    }));
+    let probe = SamplingScriptedProbe(Arc::clone(&state));
+    let transport = SamplingScriptedTransport {
+        state: Arc::clone(&state),
+    };
+    let (tx, rx) = mpsc::channel();
+    let probe_for_thread = probe.clone();
+    let _worker = std::thread::Builder::new()
+        .name(format!("bd-6rfrg-{tool_name}"))
+        .spawn(move || {
+            block_on(async move {
+                let cx = Cx::current().expect("the asupersync runtime installs a current Cx");
+                let server = match arm {
+                    SamplingArm::RequiredSyncCall => {
+                        Server::new("bd-6rfrg", "1.0.0").tool(SyncSamplingTool)
+                    }
+                    SamplingArm::DeclaredAsync => {
+                        Server::new("bd-6rfrg", "1.0.0").tool(AsyncSamplingTool)
+                    }
+                }
+                .tool(Echo)
+                .build();
+                // Keep the caller's current-thread executor free to drive
+                // request children while the blocking pool owns the sync
+                // transport loop, exactly as `run_scenario` above does.
+                if let Ok(mut pump) = cx.spawn_blocking(move |pump_cx| {
+                    server.run_transport_returning_with_cx(&pump_cx, transport)
+                }) {
+                    let _ = pump.join(&cx).await;
+                }
+            });
+            let _ = tx.send(probe_for_thread.responses());
+        })
+        .expect("the sampling arm worker thread must start");
+
+    match rx.recv_timeout(SAMPLING_DEADLINE) {
+        Ok(responses) => {
+            let wanted = JsonRpcRequest::new("probe", None, 3_i64).id;
+            match responses.iter().find(|response| response.id == wanted) {
+                Some(response) => match (&response.result, &response.error) {
+                    (Some(result), _) => SamplingOutcome::Completed(
+                        result["content"][0]["text"]
+                            .as_str()
+                            .unwrap_or("<no text content>")
+                            .to_owned(),
+                    ),
+                    (None, Some(error)) => SamplingOutcome::Errored(error.message.clone()),
+                    (None, None) => {
+                        SamplingOutcome::Errored("<neither result nor error>".to_owned())
+                    }
+                },
+                None => SamplingOutcome::NoCorrelatedResponse {
+                    observed: responses
+                        .iter()
+                        .map(|response| response.id.clone())
+                        .collect(),
+                },
+            }
+        }
+        Err(_) => SamplingOutcome::NoOutcomeWithinBound {
+            sampling_requests: probe.sampling_requests(),
+        },
+    }
+}
+
+/// bd-6rfrg G1, the control. Sampling must be LIVE in this fixture, or the
+/// sync arm's outcome is uninterpretable in either direction.
+///
+/// This is also G5's planted negative for the test below: a near-identical
+/// handler, differing only in which trait method carries the body, that
+/// demonstrates the assertion there CAN come out the other way.
+#[test]
+fn bd_6rfrg_sampling_is_live_when_the_handler_awaits_it_directly() {
+    let outcome = run_sampling_arm(SamplingArm::DeclaredAsync);
+    match &outcome {
+        SamplingOutcome::Completed(text) => assert_eq!(
+            text, SAMPLED_TEXT,
+            "the control must carry the text the scripted client SAMPLED, not an echo \
+             of the prompt: a round trip is what makes sampling 'live'"
+        ),
+        other => panic!(
+            "bd-6rfrg CONTROL FAILED, so the hazard arm proves nothing in either \
+             direction: an async handler awaiting ctx.sample did not complete: {other:?}"
+        ),
+    }
+}
+
+/// bd-6rfrg G1, the subject. Reproduced through the public trait, not through
+/// bd-f2ndd's probe.
+///
+/// THIS TEST ASSERTS THAT THE HAZARD EXISTS. Green means the same handler body
+/// that completes through the async hook does NOT complete through the required
+/// sync method. Red means the premise of bd-6rfrg is wrong, and the failure
+/// message is the refutation report rather than a reason to adjust the fixture
+/// until it hangs. Whoever removes the hazard must update this test
+/// deliberately; its name says what it characterises.
+///
+/// Run with `--nocapture` to read which non-completing class occurred:
+/// `NoOutcomeWithinBound` is the silent hang the bead was filed for, while
+/// `Errored` would mean the failure is already nameable.
+#[test]
+fn bd_6rfrg_the_required_sync_call_cannot_complete_the_same_sampling_body() {
+    let outcome = run_sampling_arm(SamplingArm::RequiredSyncCall);
+    println!("bd-6rfrg G1 sync arm: {outcome:?}");
+    assert!(
+        !matches!(outcome, SamplingOutcome::Completed(_)),
+        "REFUTATION, NOT A FIXTURE BUG: the obvious sync tool that samples \
+         COMPLETED through the required `call` method, so bd-6rfrg's premise is \
+         wrong and the bead should be closed as not-a-defect rather than \
+         remedied. Outcome: {outcome:?}"
+    );
+}
