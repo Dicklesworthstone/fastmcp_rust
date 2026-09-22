@@ -29,6 +29,8 @@ use super::super::subscriptions::{
     ManagedSubscriptionLimits,
 };
 
+/// Portable endpoint-bound selections for freshly authorized observation after restart.
+pub mod checkpoint;
 /// Host-approved input resolution over a credential-pinned Task watch.
 pub mod drive;
 /// Bounded observation-only reconnection and snapshot reconciliation.

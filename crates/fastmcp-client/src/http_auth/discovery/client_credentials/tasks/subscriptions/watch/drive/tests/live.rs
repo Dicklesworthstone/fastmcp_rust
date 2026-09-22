@@ -35,10 +35,14 @@ const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM
 enum Case { PartialInputs, RejectUpdate, CancelResolver, ObservationOnly, PartialAck, Multi, Abandon }
 
 fn isolated(name: &str, case: Case) {
+    isolated_run(name, || run(case));
+}
+
+fn isolated_run(name: &str, scenario: impl FnOnce()) {
     let name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
     if let Ok(selected) = std::env::var(CHILD) {
         assert_eq!(selected, name);
-        run(case);
+        scenario();
         return;
     }
     struct Root(std::path::PathBuf);
@@ -313,3 +317,5 @@ fn tls_partial_ack_prevents_initial_gets() { isolated("tls_partial_ack_prevents_
 fn tls_multiple_tasks_use_one_credential_and_ignore_late_terminals() { isolated("tls_multiple_tasks_use_one_credential_and_ignore_late_terminals",Case::Multi); }
 #[test]
 fn tls_abandoned_watch_read_releases_socket() { isolated("tls_abandoned_watch_read_releases_socket",Case::Abandon); }
+
+mod recovery;

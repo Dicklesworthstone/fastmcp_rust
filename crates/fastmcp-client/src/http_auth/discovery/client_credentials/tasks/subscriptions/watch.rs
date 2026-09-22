@@ -8,6 +8,8 @@
 
 /// Host-authorized input resolution driven by Task notifications.
 pub mod drive;
+/// Opt-in bounded observation recovery and natural credential renewal.
+pub mod recovery;
 
 use std::collections::VecDeque;
 use std::fmt;
