@@ -227,43 +227,58 @@ fn f2ndd_runtime() -> asupersync::runtime::Runtime {
         .expect("bd-f2ndd repro runtime")
 }
 
-/// Parks on `poll_join` with a live wake registration, rescued by a std::thread
-/// watchdog. Returns Some(..) if asupersync woke us, None if only the watchdog did.
+/// Outcome of a bounded join attempt. Three values because a green is only
+/// meaningful if the joiner actually PARKED -- "woke promptly" and "never
+/// waited" produce identical output and identical wall clocks otherwise.
+#[derive(Debug)]
+enum F2nddJoin<T> {
+    /// poll_join was Ready on the first poll: the joiner never parked, so no
+    /// wakeup was exercised. VACUOUS -- not a pass.
+    NeverParked(T),
+    /// Parked, then woken by asupersync before the watchdog fired. The only
+    /// outcome unreachable under the missed-wakeup hypothesis.
+    WokenBeforeWatchdog(T),
+    /// Parked and released only by the watchdog: a missed wakeup.
+    OnlyWatchdog,
+}
+
+/// Parks on `poll_join`, releasing `release` on the first park so the task under
+/// test completes only AFTER the joiner is committed to waiting -- which is the
+/// mechanism `serve` exercises and which a body that finishes first cannot test.
 ///
-/// The watchdog is a REAL thread and a REAL wall clock on purpose: asupersync's
-/// timer is among the suspects, and a self-waking poll loop busy-polls, which
-/// finds the result whenever it lands and therefore cannot observe a MISSED
-/// WAKEUP at all. That blindness is what invalidated the first version of these
-/// tests. `poll_join` rather than `try_join` because it keeps the waiter
-/// registered across polls; `try_join` registers nothing.
-async fn f2ndd_join_or_watchdog<T>(
+/// `poll_join` rather than `try_join`: it keeps the waiter registered across
+/// polls, where `try_join` registers nothing and so can never miss a wakeup.
+/// The bound is a real std::thread on a real wall clock, deliberately outside
+/// asupersync's timer, because that timer is among the suspects and a
+/// self-waking loop reintroduces busy-poll blindness.
+async fn f2ndd_bounded_join<T>(
     handle: &mut asupersync::runtime::TaskHandle<T>,
-) -> Option<Result<T, asupersync::runtime::JoinError>> {
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> F2nddJoin<Result<T, asupersync::runtime::JoinError>> {
+    use std::sync::atomic::Ordering::SeqCst;
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut armed = false;
     std::future::poll_fn(move |task| match handle.poll_join(task) {
-        // Observing Ready is NOT enough: after the watchdog wakes us the result
-        // may simply BE there, which is exactly what a missed wakeup looks like.
-        // The discriminator is WHETHER WE SAW IT BEFORE THE WATCHDOG FIRED.
-        std::task::Poll::Ready(result) => {
-            if fired.load(std::sync::atomic::Ordering::SeqCst) {
-                std::task::Poll::Ready(None)
-            } else {
-                std::task::Poll::Ready(Some(result))
-            }
-        }
+        std::task::Poll::Ready(result) => std::task::Poll::Ready(if !armed {
+            F2nddJoin::NeverParked(result)
+        } else if fired.load(SeqCst) {
+            F2nddJoin::OnlyWatchdog
+        } else {
+            F2nddJoin::WokenBeforeWatchdog(result)
+        }),
         std::task::Poll::Pending => {
             if !armed {
                 armed = true;
+                release.store(true, SeqCst);
                 let waker = task.waker().clone();
                 let flag = std::sync::Arc::clone(&fired);
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(2));
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    flag.store(true, SeqCst);
                     waker.wake();
                 });
-            } else if fired.load(std::sync::atomic::Ordering::SeqCst) {
-                return std::task::Poll::Ready(None);
+            } else if fired.load(SeqCst) {
+                return std::task::Poll::Ready(F2nddJoin::OnlyWatchdog);
             }
             std::task::Poll::Pending
         }
@@ -271,44 +286,43 @@ async fn f2ndd_join_or_watchdog<T>(
     .await
 }
 
-/// The FOUR: body completes, scope empty, join parks anyway.
+/// The FOUR: the joiner parks, THEN the task completes. Must the joiner be woken?
 #[test]
-fn f2ndd_join_settles_for_a_completed_task_in_an_empty_scope() {
+fn f2ndd_join_is_woken_when_the_task_completes_while_it_waits() {
     f2ndd_runtime().block_on(async {
+        use std::sync::atomic::Ordering::SeqCst;
         let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
         let scope = cx.scope();
-        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&finished);
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_release = std::sync::Arc::clone(&release);
         let mut handle = cx
             .spawn_in(&scope, move |child| async move {
+                // Stay alive until the joiner has parked, so the join cannot be
+                // Ready on its first poll.
+                while !child_release.load(SeqCst) {
+                    asupersync::runtime::yield_now().await;
+                }
                 let _ = child.checkpoint();
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })
             .expect("bd-f2ndd repro spawn_in must be admitted");
 
-        let mut ran = false;
-        for _ in 0..10_000 {
-            if finished.load(std::sync::atomic::Ordering::SeqCst) {
-                ran = true;
-                break;
-            }
-            asupersync::runtime::yield_now().await;
-        }
-        assert!(ran, "bd-f2ndd repro: the spawned body never finished");
-
         handle.abort();
-
-        assert!(
-            f2ndd_join_or_watchdog(&mut handle).await.is_some(),
-            "bd-f2ndd: join PARKED and was only released by the watchdog, for a task whose body \
-             COMPLETED in an EMPTY scope -- a missed wakeup with nothing of ours involved"
-        );
+        match f2ndd_bounded_join(&mut handle, release).await {
+            F2nddJoin::WokenBeforeWatchdog(_) => {}
+            F2nddJoin::NeverParked(_) => {
+                panic!("bd-f2ndd repro VACUOUS: the joiner never parked, so no wakeup was tested")
+            }
+            F2nddJoin::OnlyWatchdog => panic!(
+                "bd-f2ndd: the joiner parked and was released ONLY by the watchdog -- the task \
+                 completed while it waited and nothing woke it, with nothing of ours involved"
+            ),
+        }
     });
 }
 
-/// The FIFTH: a task parked in sleep, aborted. Does the abort wake it?
+/// The FIFTH: a task parked in sleep, aborted. Is the joiner woken?
 #[test]
-fn f2ndd_abort_settles_a_task_parked_in_sleep() {
+fn f2ndd_abort_wakes_the_joiner_of_a_task_parked_in_sleep() {
     f2ndd_runtime().block_on(async {
         let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
         let scope = cx.scope();
@@ -327,11 +341,18 @@ fn f2ndd_abort_settles_a_task_parked_in_sleep() {
             asupersync::runtime::yield_now().await;
         }
         handle.abort();
-
-        assert!(
-            f2ndd_join_or_watchdog(&mut handle).await.is_some(),
-            "bd-f2ndd: abort did NOT settle a task parked in sleep() -- the join was released only \
-             by the watchdog, so nothing woke the parked sleep"
-        );
+        // No release flag: this task's liveness comes from its own sleep loop.
+        let unused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match f2ndd_bounded_join(&mut handle, unused).await {
+            F2nddJoin::WokenBeforeWatchdog(_) => {}
+            F2nddJoin::NeverParked(_) => panic!(
+                "bd-f2ndd repro VACUOUS: the joiner never parked, so the sleeping task had \
+                 already settled and no wakeup was tested"
+            ),
+            F2nddJoin::OnlyWatchdog => panic!(
+                "bd-f2ndd: abort did NOT wake the joiner of a task parked in sleep() -- released \
+                 only by the watchdog"
+            ),
+        }
     });
 }
