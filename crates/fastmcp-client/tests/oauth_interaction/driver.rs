@@ -31,6 +31,10 @@ mod task_resume;
 #[path = "task_creation_persistence.rs"]
 mod task_creation_persistence;
 
+#[cfg(feature = "tasks")]
+#[path = "task_cancellation.rs"]
+mod task_cancellation;
+
 #[path = "catalogs.rs"]
 mod catalogs;
 
