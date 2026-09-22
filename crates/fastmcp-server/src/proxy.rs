@@ -1957,6 +1957,7 @@ fn sampling_request_from_create_message_params(
             };
             Ok(SamplingRequestMessage {
                 role: match message.role {
+                    fastmcp_protocol::Role::System => SamplingRole::System,
                     fastmcp_protocol::Role::User => SamplingRole::User,
                     fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
                 },

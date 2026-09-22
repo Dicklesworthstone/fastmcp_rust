@@ -2017,6 +2017,8 @@ pub struct ResourceContent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// System role.
+    System,
     /// User role.
     User,
     /// Assistant role.
@@ -2817,12 +2819,15 @@ mod tests {
 
     #[test]
     fn role_serialization() {
+        assert_eq!(serde_json::to_value(Role::System).unwrap(), "system");
         assert_eq!(serde_json::to_value(Role::User).unwrap(), "user");
         assert_eq!(serde_json::to_value(Role::Assistant).unwrap(), "assistant");
     }
 
     #[test]
     fn role_deserialization() {
+        let system: Role = serde_json::from_value(json!("system")).expect("deserialize");
+        assert_eq!(system, Role::System);
         let user: Role = serde_json::from_value(json!("user")).expect("deserialize");
         assert_eq!(user, Role::User);
         let assistant: Role = serde_json::from_value(json!("assistant")).expect("deserialize");

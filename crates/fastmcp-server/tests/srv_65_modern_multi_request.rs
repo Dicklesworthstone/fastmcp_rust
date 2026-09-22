@@ -2084,9 +2084,15 @@ mod bd_6rfrg_sampling_bridge {
                     },
                 }
             }
-            Err(_) => SamplingOutcome::NoOutcomeWithinBound {
-                sampling_requests: probe.sampling_requests(),
-            },
+            Err(_) => {
+                let outcome = SamplingOutcome::NoOutcomeWithinBound {
+                    sampling_requests: probe.sampling_requests(),
+                };
+                if let SamplingOutcome::NoOutcomeWithinBound { sampling_requests } = &outcome {
+                    let _ = *sampling_requests;
+                }
+                outcome
+            }
         }
     }
 

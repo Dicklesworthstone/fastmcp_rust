@@ -447,6 +447,8 @@ impl SamplingRequestMessage {
 /// Role in a sampling message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplingRole {
+    /// System message.
+    System,
     /// User message.
     User,
     /// Assistant message.
@@ -1071,6 +1073,8 @@ pub const MAX_PROMPT_GET_DEPTH: u32 = 10;
 /// Role of one prompt message returned through [`McpContext::get_prompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMessageRole {
+    /// System-authored prompt turn.
+    System,
     /// User-authored prompt turn.
     User,
     /// Assistant-authored prompt turn.

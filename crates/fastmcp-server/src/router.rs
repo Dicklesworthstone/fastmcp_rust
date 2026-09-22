@@ -8806,6 +8806,7 @@ impl RouterPromptCaller {
                 .into_iter()
                 .map(|message| PromptMessageItem {
                     role: match message.role {
+                        Role::System => PromptMessageRole::System,
                         Role::User => PromptMessageRole::User,
                         Role::Assistant => PromptMessageRole::Assistant,
                     },
@@ -8907,6 +8908,7 @@ impl RouterPromptCaller {
                 .into_iter()
                 .map(|message| PromptMessageItem {
                     role: match message.role {
+                        Role::System => PromptMessageRole::System,
                         Role::User => PromptMessageRole::User,
                         Role::Assistant => PromptMessageRole::Assistant,
                     },

@@ -1858,6 +1858,7 @@ fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<
             };
             Ok(SamplingRequestMessage {
                 role: match message.role {
+                    fastmcp_protocol::Role::System => SamplingRole::System,
                     fastmcp_protocol::Role::User => SamplingRole::User,
                     fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
                 },

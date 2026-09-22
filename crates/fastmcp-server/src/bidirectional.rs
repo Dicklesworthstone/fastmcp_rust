@@ -838,6 +838,7 @@ impl SamplingSender for TransportSamplingSender {
                     .into_iter()
                     .map(|m| fastmcp_protocol::SamplingMessage {
                         role: match m.role {
+                            SamplingRole::System => fastmcp_protocol::Role::System,
                             SamplingRole::User => fastmcp_protocol::Role::User,
                             SamplingRole::Assistant => fastmcp_protocol::Role::Assistant,
                         },

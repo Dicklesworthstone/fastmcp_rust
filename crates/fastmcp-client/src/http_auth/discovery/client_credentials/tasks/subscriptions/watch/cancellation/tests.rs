@@ -171,7 +171,9 @@ fn machine_cancel_preflight_expiry_revocation_and_local_stop_do_not_spend_attemp
                     Arc::get_mut(scope.binding.as_mut().unwrap()).unwrap().expires_at = Instant::now();
                 }
                 1 => handle.scope.binding.as_ref().unwrap().bearer.revoke(),
-                2 => cancel.cancel(),
+                2 => {
+                    cancel.cancel();
+                }
                 _ => client.client.close(),
             }
             assert!(matches!(handle.request_cancel_with_cancellation(&cx, &cancel).await,

@@ -5066,9 +5066,10 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             impl fastmcp_server::ToolHandler for #handler_name {
                 fn definition(&self) -> fastmcp_protocol::Tool {
-                    let properties: std::collections::HashMap<String, serde_json::Value> = vec![
-                        #(#property_entries),*
-                    ].into_iter().collect();
+                    let properties: ::std::collections::HashMap<
+                        ::std::string::String,
+                        serde_json::Value,
+                    > = vec![#(#property_entries),*].into_iter().collect();
 
                     let required: Vec<String> = vec![#(#required_params.to_string()),*];
 
@@ -6432,11 +6433,13 @@ fn generate_fields_schema(
             let deny_unknown_fields = serde_attrs.deny_unknown_fields;
             quote! {
                 {
-                    let properties: std::collections::HashMap<String, serde_json::Value> = vec![
-                        #(#property_entries),*
-                    ].into_iter().collect();
+                    let properties: ::std::collections::HashMap<
+                        ::std::string::String,
+                        serde_json::Value,
+                    > = vec![#(#property_entries),*].into_iter().collect();
 
-                    let required: Vec<String> = vec![#(#required_fields.to_string()),*];
+                    let required: ::std::vec::Vec<::std::string::String> =
+                        vec![#(#required_fields.to_string()),*];
 
                     let mut schema = serde_json::json!({
                         "type": "object",
@@ -6603,7 +6606,7 @@ fn generate_enum_schema(
                             serde_json::json!({
                                 "type": "object",
                                 "properties": {
-                                    #variant_name: #payload_schema
+                                    #variant_name: (#payload_schema)
                                 },
                                 "required": [#variant_name],
                                 "additionalProperties": false
