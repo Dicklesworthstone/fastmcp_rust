@@ -213,3 +213,133 @@ fn failed_initial_protection_preserves_absence_and_existing_durable_records() {
     assert_eq!(directory.bytes(), bytes);
     assert_eq!(vault.seals.load(Ordering::SeqCst), 2);
 }
+
+mod restart_handoff {
+    use super::*;
+    use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::ManagedTaskWatchCheckpoint;
+    use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::TaskResumeReconciliation;
+    use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::restart::{
+        TaskResumeRestartItem, TaskResumeRestartOutcome,
+    };
+
+    #[test]
+    fn active_then_terminal_restart_changes_use_the_existing_atomic_store() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let original = record(&cx, &owner, "one");
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        store.insert(&cx, &owner, original.clone()).unwrap();
+        let task = observed("working", 2);
+        let updated = TaskResumeChange::from_snapshot(&cx, &owner, &original, &task).unwrap().replacement().unwrap().clone();
+        let selection = ManagedTaskWatchCheckpoint::decode(&serde_json::to_vec(&json!({
+            "format":"fastmcp/task-watch", "version":1, "protocolVersion":"2026-07-28",
+            "resource":owner.resource().as_str(), "taskIds":["one"],
+        })).unwrap()).unwrap();
+        // Typed outcome fixture: this case tests the public storage handoff,
+        // not the network authentication which produces real restart items.
+        let active = TaskResumeRestartItem { previous: original.clone(),
+            outcome: TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Active {
+                task: Box::new(task), record: updated.clone(), selection,
+            }) };
+        let change = active.storage_change(&cx, &owner).unwrap();
+        change.apply(&cx, &owner, &mut store).unwrap();
+        assert_eq!(active.previous, original, "storage must not consume result custody");
+        drop(store);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        assert_eq!(store.get(&cx, &owner, updated.key()).unwrap(), Some(updated.clone()));
+        let terminal = TaskResumeRestartItem { previous: updated,
+            outcome: TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(Box::new(observed("cancelled", 3)))) };
+        assert!(matches!(&terminal.outcome, TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(_))));
+        terminal.storage_change(&cx, &owner).unwrap().apply(&cx, &owner, &mut store).unwrap();
+        drop(store);
+        let store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        assert!(store.get(&cx, &owner, terminal.previous.key()).unwrap().is_none());
+        assert_eq!(vault.seals.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unavailable_restart_disposal_preserves_newer_work_and_failed_terminal_results() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let original = record(&cx, &owner, "one");
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        store.insert(&cx, &owner, original.clone()).unwrap();
+        let unavailable = TaskResumeRestartItem { previous: original.clone(), outcome: TaskResumeRestartOutcome::Unavailable };
+        let old_cleanup = unavailable.storage_change(&cx, &owner).unwrap();
+        let newer = TaskResumeChange::from_snapshot(&cx, &owner, &original, &observed("working", 2)).unwrap();
+        newer.apply(&cx, &owner, &mut store).unwrap();
+        let bytes = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(old_cleanup.apply(&cx, &owner, &mut store),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert_eq!(directory.bytes(), bytes);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+        let current = store.get(&cx, &owner, original.key()).unwrap().unwrap();
+        let payload: Task = serde_json::from_value(json!({"taskId":"one", "status":"completed",
+            "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":"2020-01-01T00:00:03Z",
+            "ttlMs":null, "result":{"content":[{"type":"text","text":"PRIVATE-RESULT"}]}})).unwrap();
+        let terminal = TaskResumeRestartItem { previous: current.clone(),
+            outcome: TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(Box::new(payload))) };
+        let cleanup = terminal.storage_change(&cx, &owner).unwrap();
+        vault.fail_seal.store(true, Ordering::SeqCst);
+        assert!(matches!(cleanup.apply(&cx, &owner, &mut store),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Protection))));
+        assert_eq!(directory.bytes(), bytes);
+        assert_eq!(store.get(&cx, &owner, current.key()).unwrap(), Some(current));
+        let TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(task)) = &terminal.outcome
+            else { panic!("storage failure cannot erase terminal custody"); };
+        assert!(serde_json::to_string(task).unwrap().contains("PRIVATE-RESULT"));
+        assert!(!cleanup.previous().encode().unwrap().windows(7).any(|part| part == b"PRIVATE"));
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals + 1, "no hidden storage retry");
+    }
+
+    #[test]
+    fn explicit_unavailable_change_removes_a_protected_expired_record() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let mut vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut encoded = record(&cx, &owner, "one").encode().unwrap();
+        let length = encoded.len();
+        encoded[length - 16..].copy_from_slice(&1_577_836_802_000_000_000_i128.to_be_bytes());
+        let expired = TaskResumeRecord::decode(&encoded).unwrap();
+        let mut manifest = b"FMTRST01".to_vec();
+        manifest.extend_from_slice(owner.associated_data());
+        manifest.extend_from_slice(&1_u64.to_be_bytes());
+        manifest.extend_from_slice(&1_u16.to_be_bytes());
+        manifest.extend_from_slice(expired.key().as_bytes());
+        manifest.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        manifest.extend_from_slice(&encoded);
+        let sealed = vault.seal(&cx, owner.associated_data(), &manifest, 65536).unwrap();
+        let mut file = directory.file(&cx);
+        file.replace(&cx, None, &sealed).unwrap();
+        drop(file);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        assert!(store.get(&cx, &owner, expired.key()).unwrap().is_none());
+        assert!(matches!(TaskResumeChange::from_snapshot(&cx, &owner, &expired, &observed("working", 2)),
+            Err(TaskResumeError::Unavailable)), "cleanup must not reactivate expired controls");
+        let item = TaskResumeRestartItem { previous: expired, outcome: TaskResumeRestartOutcome::Unavailable };
+        let change = item.storage_change(&cx, &owner).unwrap();
+        assert!(change.replacement().is_none());
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(change.apply(&cx, &binding("other", 4), &mut store),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Unavailable))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+        change.apply(&cx, &owner, &mut store).unwrap();
+        assert_ne!(directory.bytes(), before);
+        drop(store);
+        let mut reopened = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(change.apply(&cx, &owner, &mut reopened),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+    }
+}

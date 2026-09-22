@@ -28,7 +28,7 @@ use crate::http_auth::managed::tasks::watch::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
 };
 use super::{admit_record, reconcile_controls};
-use super::super::{TaskResumeBinding, TaskResumeError, TaskResumeKey, TaskResumeRecord, wall_now};
+use super::super::{TaskResumeBinding, TaskResumeError, TaskResumeKey, TaskResumeRecord, checkpoint, wall_now};
 
 /// An immutable compare-and-replace (or compare-and-remove) of one saved record.
 /// The expected version includes exact controls and original retention, not
@@ -61,6 +61,26 @@ impl TaskResumeChange {
         Self::prepare_at(current, previous, task, wall_now())
     }
 
+    /// Explicitly discard exactly these local lookup controls. This supports
+    /// expired records, unavailable restart outcomes and deliberate host
+    /// disposition without claiming that the remote Task stopped or completed.
+    /// Current host-verified binding is still mandatory; stored identity is not
+    /// authorization. No network, storage or cancellation effect happens here.
+    ///
+    /// Handle or durably save any terminal result BEFORE preparing its removal.
+    /// A failed/abandoned observation or cancel request is not an instruction to
+    /// discard its checkpoint. The host must make that disposition explicitly.
+    /// Applying the command compares the entire physical record, including
+    /// expired-but-unpruned controls. It never deletes a changed/newer version.
+    pub fn discard(
+        cx: &Cx, current: &TaskResumeBinding, previous: &TaskResumeRecord,
+    ) -> Result<Self, TaskResumeError> {
+        checkpoint(cx)?;
+        if previous.binding != current.digest { return Err(TaskResumeError::Unavailable); }
+        previous.validate()?;
+        Ok(Self { previous: previous.clone(), replacement: None })
+    }
+
     fn prepare_at(
         current: &TaskResumeBinding, previous: &TaskResumeRecord, task: &Task, now: i128,
     ) -> Result<Self, TaskResumeError> {
@@ -88,6 +108,8 @@ impl TaskResumeChange {
     /// acknowledge the already-durable record without rewriting the manifest.
     /// Uncertain writes retain the store's existing quarantine/reconciliation
     /// behavior. This operation is not automatically retried or idempotent.
+    /// Expiration still forbids replacement/resumption, but does not prevent
+    /// current-owner removal of the exact expired physical version.
     #[cfg(target_os = "linux")]
     pub fn apply<P: super::super::store::TaskResumeProtector>(
         &self,
@@ -95,22 +117,14 @@ impl TaskResumeChange {
         current: &TaskResumeBinding,
         store: &mut super::super::store::TaskResumeStore<P>,
     ) -> Result<(), super::super::store::TaskResumeStoreError> {
+        let Some(record) = &self.replacement else {
+            return store.remove_expected(cx, current, &self.previous);
+        };
         self.previous.admit(cx, current)?;
         let actual = store.get(cx, current, self.key())?;
         self.admit_expected(actual.as_ref())?;
-        match &self.replacement {
-            Some(record) if record == &self.previous => Ok(()),
-            Some(record) => {
-                store.put(cx, current, record.clone())?;
-                Ok(())
-            }
-            None => {
-                if !store.remove(cx, current, self.key())? {
-                    return Err(TaskResumeError::ConflictingSnapshot.into());
-                }
-                Ok(())
-            }
-        }
+        if record != &self.previous { store.put(cx, current, record.clone())?; }
+        Ok(())
     }
 }
 

@@ -18,6 +18,7 @@ use crate::http_auth::managed::{OAuthSessionError, deadline_after};
 use crate::http_auth::managed::tasks::ManagedTasksClient;
 use crate::http_auth::managed::tasks::watch::{ManagedTaskWatchError, WatchIds};
 use super::{TaskResumeReconciliation, TaskResumeReconciliationError};
+use super::lifecycle::TaskResumeChange;
 use super::super::{TaskResumeBinding, TaskResumeError, TaskResumeKey, TaskResumeRecord, checkpoint};
 
 const MAX_RESTART_RECORDS: usize = 128;
@@ -180,6 +181,54 @@ pub enum TaskResumeRestartOutcome {
 pub struct TaskResumeRestartItem {
     pub previous: TaskResumeRecord,
     pub outcome: TaskResumeRestartOutcome,
+}
+
+impl TaskResumeRestartItem {
+    /// Explicitly prepare this delivered outcome's conditional storage change.
+    /// Active records are compared with their fresh Task and watch selection;
+    /// terminal Tasks prepare removal only after full control reconciliation.
+    /// Unavailable (including expired) records prepare exact-version disposal,
+    /// without distinguishing absent, forbidden and expired remote identities.
+    ///
+    /// Call only AFTER handling or durably recording a terminal result. This
+    /// method neither invokes storage nor consumes the item: the real result
+    /// remains available if preparing/applying its checkpoint change fails.
+    /// No payload, input or credential is passed to the resulting command.
+    ///
+    /// Apply the command in the host's owned storage lane before starting a new
+    /// persistence-backed watch from an active record. Missing/changed expected
+    /// versions fail rather than deleting or overwriting newer work. After an
+    /// uncertain write reconcile storage, never repeat creation or blindly retry.
+    /// A terminal whose retention has since expired requires an explicit host
+    /// disposition through TaskResumeChange::discard instead of renewed resume
+    /// authority. Neither this method nor discard proves remote quiescence.
+    ///
+    /// Publicly assembled items are not authentication evidence. Current owner
+    /// facts and the selected managed login remain the host's responsibility.
+    pub fn storage_change(
+        &self, cx: &Cx, current: &TaskResumeBinding,
+    ) -> Result<TaskResumeChange, TaskResumeError> {
+        checkpoint(cx)?;
+        if self.previous.binding != current.digest { return Err(TaskResumeError::Unavailable); }
+        self.previous.validate()?;
+        match &self.outcome {
+            TaskResumeRestartOutcome::Unavailable => TaskResumeChange::discard(cx, current, &self.previous),
+            TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Active { task, record, selection }) => {
+                if selection.resource().as_str() != current.resource().as_str()
+                    || selection.task_ids().len() != 1
+                    || selection.task_ids().first() != Some(self.previous.task_id())
+                { return Err(TaskResumeError::ConflictingSnapshot); }
+                let change = TaskResumeChange::from_snapshot(cx, current, &self.previous, task)?;
+                if change.replacement() != Some(record) { return Err(TaskResumeError::ConflictingSnapshot); }
+                Ok(change)
+            }
+            TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(task)) => {
+                let change = TaskResumeChange::from_snapshot(cx, current, &self.previous, task)?;
+                if change.replacement().is_some() { return Err(TaskResumeError::InvalidRecord); }
+                Ok(change)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -461,5 +510,111 @@ mod tests {
         let staged = plan.records().next().unwrap();
         assert!(staged.admit_at(&binding(1), expiry - 1).is_ok());
         assert_eq!(staged.admit_at(&binding(1), expiry), Err(TaskResumeError::Unavailable));
+    }
+
+    fn handoff_task(status: &str, second: u8) -> fastmcp_protocol::tasks_extension::Task {
+        use serde_json::json;
+        let mut value = json!({"taskId":"handoff", "status":status,
+            "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":format!("2020-01-01T00:00:{second:02}Z"),
+            "ttlMs":null, "pollIntervalMs":10});
+        match status {
+            "input_required" => value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}}),
+            "completed" => value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]}),
+            _ => {},
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn handoff_item(cx: &Cx, terminal: bool) -> TaskResumeRestartItem {
+        use crate::http_auth::managed::tasks::watch::checkpoint::ManagedTaskWatchCheckpoint;
+        let owner = binding(1);
+        let previous = TaskResumeRecord::capture(cx, &owner, &handoff_task("working", 1), Duration::from_secs(60)).unwrap();
+        let task = handoff_task(if terminal { "completed" } else { "input_required" }, 2);
+        let outcome = if terminal {
+            TaskResumeReconciliation::Terminal(Box::new(task))
+        } else {
+            let record = super::super::reconcile_controls(&previous, &owner, &task, super::super::super::wall_now()).unwrap().unwrap();
+            let selection = ManagedTaskWatchCheckpoint::decode(&serde_json::to_vec(&serde_json::json!({
+                "format":"fastmcp/task-watch", "version":1, "protocolVersion":"2026-07-28",
+                "resource":owner.resource().as_str(), "taskIds":["handoff"],
+            })).unwrap()).unwrap();
+            TaskResumeReconciliation::Active { task: Box::new(task), record, selection }
+        };
+        TaskResumeRestartItem { previous, outcome: TaskResumeRestartOutcome::Reconciled(outcome) }
+    }
+
+    #[test]
+    fn unavailable_disposal_keeps_exact_controls_and_requires_current_owner() {
+        let cx = Cx::for_testing();
+        let item = TaskResumeRestartItem { previous: record(), outcome: TaskResumeRestartOutcome::Unavailable };
+        let encoded = item.previous.encode().unwrap();
+        let change = item.storage_change(&cx, &binding(1)).unwrap();
+        assert_eq!(change.previous().encode().unwrap(), encoded);
+        assert!(change.replacement().is_none());
+        assert!(matches!(item.storage_change(&cx, &binding(2)), Err(TaskResumeError::Unavailable)));
+        assert_eq!(item.previous.encode().unwrap(), encoded);
+        assert!(!format!("{change:?}").contains("opaque"));
+        assert!(item.storage_change(&cx, &binding(1)).is_ok());
+    }
+
+    #[test]
+    fn active_restart_handoff_carries_only_the_validated_record_change() {
+        let cx = Cx::for_testing();
+        let item = handoff_item(&cx, false);
+        let original = item.previous.encode().unwrap();
+        let change = item.storage_change(&cx, &binding(1)).unwrap();
+        let TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Active { task, record, .. }) = &item.outcome
+            else { panic!("active fixture required"); };
+        assert_eq!(change.replacement(), Some(record));
+        assert_eq!(change.previous().encode().unwrap(), original);
+        assert!(!record.encode().unwrap().windows(7).any(|part| part == b"PRIVATE"));
+        assert!(serde_json::to_string(task).unwrap().contains("PRIVATE-INPUT"));
+    }
+
+    #[test]
+    fn inconsistent_active_record_or_selection_cannot_prepare_persistence() {
+        let cx = Cx::for_testing();
+        for field in 0..3 {
+            let mut item = handoff_item(&cx, false);
+            let original = item.previous.encode().unwrap();
+            if let TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Active { record, selection, .. }) = &mut item.outcome {
+                match field {
+                    0 => record.poll_interval_ms = Some(20),
+                    1 => record.retain_until -= 1,
+                    _ => *selection = crate::http_auth::managed::tasks::watch::checkpoint::ManagedTaskWatchCheckpoint::decode(
+                        br#"{"format":"fastmcp/task-watch","version":1,"protocolVersion":"2026-07-28","resource":"https://mcp.example/other","taskIds":["handoff"]}"#,
+                    ).unwrap(),
+                }
+            }
+            assert!(matches!(item.storage_change(&cx, &binding(1)), Err(TaskResumeError::ConflictingSnapshot)));
+            assert_eq!(item.previous.encode().unwrap(), original);
+        }
+        assert!(handoff_item(&cx, false).storage_change(&cx, &binding(1)).is_ok());
+    }
+
+    #[test]
+    fn terminal_handoff_preserves_result_and_rejects_fabricated_terminal_kind() {
+        let cx = Cx::for_testing();
+        let mut item = handoff_item(&cx, true);
+        let change = item.storage_change(&cx, &binding(1)).unwrap();
+        assert!(change.replacement().is_none());
+        let TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(task)) = &item.outcome
+            else { panic!("terminal fixture required"); };
+        assert!(serde_json::to_string(task).unwrap().contains("PRIVATE-RESULT"));
+        assert!(!format!("{change:?}").contains("PRIVATE"));
+        item.outcome = TaskResumeRestartOutcome::Reconciled(TaskResumeReconciliation::Terminal(Box::new(handoff_task("working", 2))));
+        assert!(matches!(item.storage_change(&cx, &binding(1)), Err(TaskResumeError::InvalidRecord)));
+    }
+
+    #[test]
+    fn explicit_discard_does_not_relax_live_expiry_or_structural_validation() {
+        let cx = Cx::for_testing();
+        let mut previous = record();
+        previous.retain_until = super::super::super::timestamp_nanos(&previous.created_at).unwrap() + 2_000_000_000;
+        assert_eq!(previous.admit_at(&binding(1), previous.retain_until), Err(TaskResumeError::Unavailable));
+        assert!(TaskResumeChange::discard(&cx, &binding(1), &previous).unwrap().replacement().is_none());
+        previous.poll_interval_ms = Some(0);
+        assert!(matches!(TaskResumeChange::discard(&cx, &binding(1), &previous), Err(TaskResumeError::InvalidRecord)));
+        assert!(matches!(TaskResumeChange::discard(&cx, &binding(2), &previous), Err(TaskResumeError::Unavailable)));
     }
 }
