@@ -239,10 +239,11 @@ impl ManagedTasksClient {
         admit_client(plan.binding, &current, self.session.resource().as_str())?;
         let ids = WatchIds::new(id_prefix)?;
         let deadline = deadline_after(cx, plan.policy.timeout)?;
+        let finished = plan.records.is_empty();
         Ok(ManagedTaskRestart {
             client: self.clone(), current, records: plan.records.into_values().collect(),
             ids, cancellation: cancellation.clone(), deadline,
-            pending_record: None, pending_outcome: None, ready: true, finished: false,
+            pending_record: None, pending_outcome: None, ready: !finished, finished,
             attempted: 0, delivered: 0,
         })
     }
@@ -341,7 +342,10 @@ impl ManagedTaskRestart {
         let previous = self.pending_record.take().ok_or(TaskResumeError::InvalidRecord)?;
         let outcome = self.pending_outcome.take().ok_or(TaskResumeError::InvalidRecord)?;
         self.delivered += 1;
-        self.ready = true;
+        // Completion is elected with the last delivery, not a later read which
+        // might occur after the login closes or the original deadline expires.
+        self.finished = self.records.is_empty();
+        self.ready = !self.finished;
         Ok(Some(TaskResumeRestartItem { previous, outcome }))
     }
 
@@ -450,12 +454,12 @@ mod tests {
     fn expired_controls_can_be_staged_but_are_never_live_authority() {
         let cx = Cx::for_testing();
         let mut expired = record();
-        expired.retain_until = timestamp_for_expired_record();
+        let expiry = super::super::super::timestamp_nanos(&expired.created_at).unwrap() + 2_000_000_000;
+        expired.retain_until = expiry;
         let plan = TaskResumeRestartPlan::from_records(&cx, &binding(1), [expired], TaskResumeRestartPolicy::default()).unwrap();
         assert_eq!(plan.len(), 1);
-        assert_eq!(plan.records().next().unwrap().admit_at(&binding(1), i128::MAX), Err(TaskResumeError::Unavailable));
-    }
-    fn timestamp_for_expired_record() -> i128 {
-        super::super::super::timestamp_nanos(&record().created_at).unwrap() + 2_000_000_000
+        let staged = plan.records().next().unwrap();
+        assert!(staged.admit_at(&binding(1), expiry - 1).is_ok());
+        assert_eq!(staged.admit_at(&binding(1), expiry), Err(TaskResumeError::Unavailable));
     }
 }
