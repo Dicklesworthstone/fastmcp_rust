@@ -118,3 +118,55 @@ fn watched_task_public_precancellation_never_enters_host_callbacks() {
 
 #[cfg(all(unix, feature = "native-tls-roots"))]
 mod live;
+
+#[test]
+fn machine_input_update_receipts_cannot_be_overwritten_by_failed_admission() {
+    let mut progress = UpdateProgress::default();
+    assert_eq!(progress.state, TaskInputUpdateState::NotAttempted);
+    assert!(progress.acknowledge().is_err());
+    assert!(progress.begin(RequestId::Number(1), 0).is_err());
+    assert!(progress.request_id.is_none());
+    progress.begin(RequestId::Number(5), 2).unwrap();
+    assert_eq!(progress.state, TaskInputUpdateState::Unconfirmed);
+    assert!(progress.begin(RequestId::Number(9), 2).is_err());
+    assert_eq!(progress.request_id, Some(RequestId::Number(5)));
+    progress.acknowledge().unwrap();
+    assert_eq!(progress.acknowledged, 1);
+    assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+    assert!(progress.acknowledge().is_err());
+    assert!(progress.begin(RequestId::Number(9), 1).is_err());
+    assert_eq!(progress.request_id, Some(RequestId::Number(5)));
+    assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+    progress.begin(RequestId::Number(9), 2).unwrap();
+    assert_eq!(progress.state, TaskInputUpdateState::Unconfirmed);
+    assert_eq!(progress.acknowledged, 1, "an uncertain successor must retain earlier receipts");
+}
+
+#[test]
+fn machine_owned_input_admission_fails_before_grant_for_invalid_ids_and_cancel() {
+    runtime().block_on(async {
+        let cx = Cx::current().unwrap();
+        let client = consumer();
+        assert!(matches!(Box::pin(client.watch_task_inputs(&cx, TaskId::parse("one").unwrap(),
+            "bad:prefix".to_owned(), ClientCredentialsTaskWatchDrivePolicy::default())).await,
+            Err(ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::InvalidIdPrefix))));
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        assert!(Box::pin(client.watch_task_inputs_with_cancellation(&cx, &cancellation,
+            TaskId::parse("one").unwrap(), "input".to_owned(), ClientCredentialsTaskWatchDrivePolicy::default())).await.is_err());
+        assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+    });
+}
+
+#[test]
+fn machine_input_driver_preserves_typed_cancel_and_closed_outcomes() {
+    assert!(matches!(ClientCredentialsTaskWatchDriveError::from(
+        CancellableClientCredentialsTaskWatchError::CancellationRequested),
+        ClientCredentialsTaskWatchDriveError::CancellationRequested));
+    assert!(matches!(ClientCredentialsTaskWatchDriveError::from(
+        CancellableClientCredentialsTaskWatchError::Closed),
+        ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Closed)));
+    assert!(matches!(ClientCredentialsTaskWatchDriveError::from(
+        CancellableClientCredentialsTaskWatchError::Watch(ClientCredentialsTaskWatchError::Interrupted)),
+        ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Interrupted)));
+}
