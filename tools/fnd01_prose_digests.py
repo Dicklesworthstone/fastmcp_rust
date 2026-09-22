@@ -1646,7 +1646,10 @@ class Mutation:
 
 def first_isolated_probe_assertion(w: World) -> int:
     """The first TOML assertion on a probe manifest whose selection is a string no other
-    assertion on the same source can see (neither selector is a prefix of the other)."""
+    assertion on the same source can see (neither selector is a prefix of the other), reached
+    by a plain path: an identity component (<key>=<literal>) is excluded, because mutating the
+    identity key's own value would unresolve the selector instead of changing the value
+    (run 1 of 040d9619 planted against /package/name=sha1_smol/name and failed that way)."""
     rows = w.doc(DV)["semantic_assertion"]
 
     def parts(selector: str) -> list:
@@ -1654,6 +1657,8 @@ def first_isolated_probe_assertion(w: World) -> int:
 
     for index, row in enumerate(rows):
         if row["observation_mode"] != "canonical_selected_toml" or "/probes/" not in row["source_path"]:
+            continue
+        if "=" in row["selector"]:
             continue
         if not isinstance(resolve_pointer(w.doc(row["source_path"]), row["selector"]), str):
             continue
