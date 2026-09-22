@@ -1649,11 +1649,22 @@ pub trait ToolHandler: Send + Sync {
 
     /// Declares how this handler must be driven by live transports.
     ///
-    /// The router freezes this value at registration. The default protects
-    /// synchronous implementations by moving their request dispatch to a
-    /// bounded blocking lane. Hand-written handlers that override an async
-    /// call hook must return [`ToolExecutionMode::Async`]; `#[tool]` emits the
-    /// declaration automatically for `async fn` tools.
+    /// The router freezes this value at registration. Hand-written handlers
+    /// that override an async call hook must return
+    /// [`ToolExecutionMode::Async`]; `#[tool]` emits the declaration
+    /// automatically for `async fn` tools.
+    ///
+    /// # The blocking-lane move is conditional (bd-6rfrg)
+    ///
+    /// [`ToolExecutionMode::Blocking`] moves request dispatch onto a dedicated
+    /// blocking pool thread on the paths that consult it -- modern owned
+    /// dispatch, the legacy HTTP blocking arm, and the sequential pump. Other
+    /// paths reach the handler through [`Self::call_async_in_request`]'s
+    /// default delegation without consulting this value, and there the
+    /// synchronous [`Self::call`] runs on the thread that is polling it. So
+    /// declaring `Blocking` -- or accepting it as the default -- is not a
+    /// guarantee that the handler is off the async driver, and code that
+    /// depends on being off it must not rely on this declaration alone.
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Blocking
     }
@@ -1663,6 +1674,23 @@ pub trait ToolHandler: Send + Sync {
     /// This is the default implementation point. Override this for simple
     /// synchronous tools. Returns `McpResult` which is converted to `McpOutcome`
     /// by the async wrapper.
+    ///
+    /// # Do not bridge an async context capability from here (bd-6rfrg)
+    ///
+    /// This method is synchronous and [`McpContext::sample`] is not, so the
+    /// obvious way to sample from a simple tool is to wrap the await in
+    /// `fastmcp_core::block_on`. Do not. On a thread that is driving the
+    /// runtime, that bridge blocks the only thread able to deliver the client's
+    /// response, and the request can never complete. Sampling detects this
+    /// position and returns an error naming it rather than parking, but the
+    /// error is a diagnosis, not a way to make the call work.
+    ///
+    /// A tool that needs a context capability which reaches the peer --
+    /// sampling, elicitation, roots -- belongs on an async hook
+    /// ([`Self::call_async`] or [`Self::call_final_outcome_async`]) with
+    /// [`ToolExecutionMode::Async`] declared. Note that declaring the mode
+    /// without supplying an async hook changes nothing, because
+    /// [`Self::call_async`]'s default delegates straight back to this method.
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>>;
 
     /// Calls the tool asynchronously with the given arguments.

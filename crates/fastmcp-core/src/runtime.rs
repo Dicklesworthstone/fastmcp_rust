@@ -456,11 +456,69 @@ thread_local! {
     /// driven by another thread and starve sibling tasks on that runtime.
     static RUNTIME: OnceCell<Runtime> = const { OnceCell::new() };
     static BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the live bridge entry on this thread was made from INSIDE a task
+    /// context.
+    ///
+    /// Recorded at entry because that is the only moment it is observable:
+    /// `Runtime::block_on` installs its own ambient `Cx` for the duration of the
+    /// poll, so afterwards a bridge entered from a task and a bridge entered
+    /// from a bare thread look identical.
+    static BRIDGE_NESTED_IN_TASK: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread is a dedicated blocking lane whose owner keeps an
+    /// async driver running elsewhere.
+    ///
+    /// A pool thread is never the driver, so bridging an async operation on one
+    /// cannot starve the thread that would complete it. Without this
+    /// distinction the detection below would reject the paths that work today.
+    static BLOCKING_LANE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Declares the current thread a dedicated blocking lane until dropped.
+///
+/// Set this on threads owned by a blocking pool, never on an async worker: it
+/// is an assertion that some OTHER thread is driving the runtime, which is what
+/// makes a blocking bridge safe here.
+#[must_use = "the lane declaration ends when the guard is dropped"]
+pub struct BlockingLaneGuard {
+    previous: bool,
+}
+
+impl Drop for BlockingLaneGuard {
+    fn drop(&mut self) {
+        BLOCKING_LANE.with(|lane| lane.set(self.previous));
+    }
+}
+
+/// Enters a dedicated blocking lane on the current thread.
+pub fn enter_blocking_lane() -> BlockingLaneGuard {
+    BlockingLaneGuard {
+        previous: BLOCKING_LANE.with(|lane| lane.replace(true)),
+    }
+}
+
+/// Reports whether an async operation awaited here is being driven by a bridge
+/// that would block the only thread able to complete it.
+///
+/// True when [`block_on`] was entered from inside a task context on a thread
+/// that is not a dedicated blocking lane. In that position the bridge occupies
+/// the driver, so an operation whose completion arrives through that driver --
+/// a reverse request to the peer, for instance -- can never become ready, and
+/// the symptom is a hang with no error and no timeout.
+///
+/// This reports a POSITION, not an outcome. A caller that can return an error
+/// should use it to name the situation instead of parking; it deliberately does
+/// not gate [`block_on`] itself, whose signature has no error channel and whose
+/// other uses are unaffected.
+#[must_use]
+pub fn bridge_would_starve_its_driver() -> bool {
+    BRIDGE_NESTED_IN_TASK.with(Cell::get) && !BLOCKING_LANE.with(Cell::get)
 }
 
 /// Keeps reentrancy rejection unwind-safe without holding a TLS borrow while
 /// user code is polled. A rejected nested entry must not reset the outer entry.
-struct BridgeEntry;
+struct BridgeEntry {
+    previous_nested_in_task: bool,
+}
 
 impl BridgeEntry {
     fn enter() -> Self {
@@ -470,12 +528,20 @@ impl BridgeEntry {
                 "nested fastmcp_core::runtime::block_on is not supported"
             );
         });
-        Self
+        // Read the ambient context BEFORE the runtime installs its own. A
+        // rejected nested entry panics above and never reaches here, so this
+        // records only the live entry, and the prior value is restored on drop
+        // rather than assumed false.
+        Self {
+            previous_nested_in_task: BRIDGE_NESTED_IN_TASK
+                .with(|nested| nested.replace(asupersync::Cx::is_active())),
+        }
     }
 }
 
 impl Drop for BridgeEntry {
     fn drop(&mut self) {
+        BRIDGE_NESTED_IN_TASK.with(|nested| nested.set(self.previous_nested_in_task));
         BRIDGE_ACTIVE.with(|active| active.set(false));
     }
 }
