@@ -1,4 +1,14 @@
-//! FND-01 A: closed-child source-freeze enforcement, proven from outside.
+//! FND-01 public-surface proofs, held outside the library.
+//!
+//! Two roles share this target because both prove shipped behaviour from the
+//! outside and neither is named by any frozen contract, so adding to it
+//! disturbs no pin, marker or quiet window:
+//!
+//! * **A** — closed-child source-freeze enforcement (the original contents of
+//!   this file, unchanged below).
+//! * **B** — execution of the shipped public example
+//!   `fastmcp-rust/example:fnd_01_sdk_batch`, `zz0r` items 1 and 2, at the end
+//!   of this file.
 //!
 //! External consumer of the packaged `fastmcp-rust` facade: it reaches the
 //! capability the way a downstream crate does, via `use fastmcp_rust::...`,
@@ -1840,5 +1850,357 @@ fn fnd_01_a_workspace_input_length_move_is_refused() {
             .iter()
             .any(|line| line.starts_with(&format!("{witness} @"))),
         "the plant changed exactly one row, so {witness} must remain green; got {drift:?}"
+    );
+}
+
+// ===========================================================================
+// FND-01 B — the shipped public example, executed (zz0r items 1 and 2)
+// ===========================================================================
+//
+// `FND-01-B-PL-1-TARGET-MAP-V1` surface 4 is the public example
+// `fastmcp-rust/example:fnd_01_sdk_batch`, which declares exactly two frozen
+// command cases. Until these tests, the only coverage of that surface was
+// `sdk_test_rch_bytes`, a `#[cfg(test)]` fixture inside the verifier that
+// hand-builds a JSON blob with placeholder digests (`0000...`, `1111...`).
+// PL-3 says `cfg(test)` behaviour cannot prove shipped behaviour, so that
+// fixture cannot discharge item 1 however green it is — item 1's own wording,
+// "through the shipped, non-`cfg(test)` public surface", names precisely that
+// gap. Everything below runs the real binary as a subprocess and asserts on
+// its own stdout and exit status.
+//
+// Identity is the tuple, per the map: the bare ids `fnd_01_b_positive` and
+// `fnd_01_b_planted_negative` do not exist and are deliberately not used.
+
+/// Absolute path of a `fnd_01_sdk_batch` example binary built on the same
+/// worker as this test.
+///
+/// Cargo exports `CARGO_BIN_EXE_<name>` for `[[bin]]` targets only and has no
+/// equivalent for `[[example]]`. Deriving `target/<profile>/examples/…` by
+/// construction breaks under `--target` and, worse, silently accepts a binary
+/// left behind by an earlier revision — which would prove a past tree's
+/// behaviour while reporting green for this one. The runner therefore supplies
+/// the path, exactly as the verifier already requires for the evidence harness
+/// through `FASTMCP_FND01_PUBLIC_HARNESS_BIN`.
+///
+/// Absence is a hard failure and never a skip: a test that cannot find its
+/// subject must not report success.
+const SDK_BATCH_BIN_ENV: &str = "FASTMCP_FND01_SDK_BATCH_BIN";
+
+/// The two command cases frozen by the map. Order is load-bearing only for
+/// message legibility; both are required.
+const FROZEN_SDK_BATCH_MODES: [&str; 2] =
+    ["sdk-batch-run-json", "sdk-batch-run-planted-negative-json"];
+
+/// What the runner emits when argv does not select a frozen mode.
+const SDK_RUNNER_MODE_DETAIL: &str = "E_SDK_RUNNER_MODE: expected one frozen SDK batch mode";
+
+struct SdkBatchRun {
+    argv: Vec<String>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl SdkBatchRun {
+    /// The emitted record as JSON, or a panic naming what was actually printed.
+    /// Parsing rather than string-matching keeps the assertions independent of
+    /// member ordering, which `serde_json` does not promise to preserve.
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{} must print one JSON record on stdout; parse failed: {error}\n\
+                 exit: {:?}\nstdout: {:?}\nstderr: {:?}",
+                self.describe(),
+                self.exit_code,
+                self.stdout,
+                self.stderr,
+            )
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!("fnd_01_sdk_batch {:?}", self.argv)
+    }
+
+    /// The `code` field of a no-credit record, when there is one. Used to tell
+    /// an upstream precondition failure apart from a defect in the surface.
+    fn no_credit_code(&self) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+    }
+}
+
+fn sdk_batch_binary() -> PathBuf {
+    let raw = std::env::var_os(SDK_BATCH_BIN_ENV).unwrap_or_else(|| {
+        panic!(
+            "{SDK_BATCH_BIN_ENV} must hold the absolute path of a fnd_01_sdk_batch example \
+             binary built on this worker. Build it with\n    cargo build --locked -p \
+             fastmcp-rust --example fnd_01_sdk_batch\nand export the resulting \
+             target/<profile>/examples/fnd_01_sdk_batch path. This test refuses to guess the \
+             path, because a guessed path resolves to whatever a previous revision left there \
+             and would report green for behaviour this tree never produced."
+        )
+    });
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_absolute(),
+        "{SDK_BATCH_BIN_ENV} must be absolute so the subject cannot depend on the working \
+         directory of the run; got {}",
+        path.display()
+    );
+    assert!(
+        path.is_file(),
+        "{SDK_BATCH_BIN_ENV} names {}, which is not a regular file",
+        path.display()
+    );
+    path
+}
+
+fn run_sdk_batch(arguments: &[&str]) -> SdkBatchRun {
+    let binary = sdk_batch_binary();
+    let output = std::process::Command::new(&binary)
+        .args(arguments)
+        .current_dir(workspace_root())
+        .output()
+        .unwrap_or_else(|error| panic!("execute {} {arguments:?}: {error}", binary.display()));
+    SdkBatchRun {
+        argv: arguments.iter().map(|value| (*value).to_owned()).collect(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Item 1, dispatch half: both frozen modes are actually selected by the
+/// shipped binary.
+///
+/// Evaluator: the example process itself. Observed field: exit status and the
+/// `code` member of its printed record. Predicate: neither frozen mode reaches
+/// the closed-dispatch refusal. Minimum count: 2.
+///
+/// This deliberately asserts *reachability of the run path*, not success of the
+/// run: `sdk-batch-run-json` additionally requires a clean checkout and an
+/// error-free verifier report, so binding this test to exit 0 would make it
+/// report on the state of the whole campaign instead of on dispatch.
+#[test]
+fn fnd_01_b_sdk_batch_frozen_modes_reach_the_run_path_positive() {
+    for mode in FROZEN_SDK_BATCH_MODES {
+        let run = run_sdk_batch(&[mode]);
+        assert_ne!(
+            run.exit_code,
+            Some(2),
+            "{} is a frozen command case and must not reach the closed-dispatch refusal; \
+             stdout: {}",
+            run.describe(),
+            run.stdout,
+        );
+        let record = run.json();
+        assert_ne!(
+            record.get("detail").and_then(serde_json::Value::as_str),
+            Some(SDK_RUNNER_MODE_DETAIL),
+            "{} must not be refused as an unknown mode",
+            run.describe(),
+        );
+    }
+}
+
+/// Item 2, dispatch half: a one-variable plant on the same frozen modes.
+///
+/// The only variable changed against the positive above is argv — one extra
+/// element beside an otherwise correct mode name, and separately an unknown
+/// mode name. `main` guards on `arguments.len() == 2`, so the arity plant keeps
+/// the mode string byte-identical and still must be refused.
+///
+/// Evaluator: the example process. Observed field: exit status plus the whole
+/// emitted record. Predicate: exact typed refusal, and no credit granted.
+/// Minimum count: 3.
+#[test]
+fn fnd_01_b_sdk_batch_mode_dispatch_planted_negative() {
+    let expected = serde_json::json!({
+        "format": "fastmcp-fnd01-sdk-no-credit-v1",
+        "proof_class": "producer_rejected",
+        "capability_credit": false,
+        "support_claim": false,
+        "code": "sdk_batch_execution_failed",
+        "detail": SDK_RUNNER_MODE_DETAIL,
+    });
+
+    let mut plants: Vec<Vec<&str>> = vec![vec!["sdk-batch-run-json-but-not-really"]];
+    for mode in FROZEN_SDK_BATCH_MODES {
+        // The forbidden dimension is arity alone: the mode name is unchanged.
+        plants.push(vec![mode, "extra"]);
+    }
+
+    for plant in &plants {
+        let run = run_sdk_batch(plant);
+        assert_eq!(
+            run.exit_code,
+            Some(2),
+            "{} must reach the closed-dispatch refusal with exit 2; stdout: {} stderr: {}",
+            run.describe(),
+            run.stdout,
+            run.stderr,
+        );
+        assert_eq!(
+            run.json(),
+            expected,
+            "{} must emit the exact frozen refusal record",
+            run.describe(),
+        );
+        assert!(
+            run.stdout.ends_with('\n'),
+            "{} must terminate its record with a newline",
+            run.describe(),
+        );
+    }
+
+    // The plant must be able to fail: the same binary, one argv element fewer,
+    // does not produce this record. Without this the assertions above would
+    // pass against a binary that refused everything.
+    let control = run_sdk_batch(&[FROZEN_SDK_BATCH_MODES[0]]);
+    assert_ne!(
+        control.json(),
+        expected,
+        "the control removes exactly the planted argv element and must NOT be refused as an \
+         unknown mode; if it is, this test proves nothing about arity",
+    );
+}
+
+/// Item 1, execution half: map surface 4's first frozen command case, run
+/// through the real example binary.
+///
+/// Evaluator: the example process. Observed field: exit status and the
+/// `format` / `producer` / `proof_class` / credit members of its receipt.
+/// Predicate: the shipped runner admits a batch and grants no credit while
+/// doing so. Minimum count: 1.
+///
+/// PRECONDITION, stated so a red here is attributable: `sdk-batch-run-json`
+/// calls `sdk_prepare_batch`, which refuses a dirty checkout
+/// (`E_SDK_RUNNER_DIRTY`), and `sdk_admit_batch`, which runs the full FND-01
+/// verifier and refuses on any error (`E_SDK_RUNNER_VERIFIER`). This case
+/// therefore cannot pass while the verifier has failures, and the assertion
+/// message below names which of the two fired.
+#[test]
+fn fnd_01_b_sdk_batch_run_positive() {
+    let run = run_sdk_batch(&["sdk-batch-run-json"]);
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "sdk-batch-run-json must admit the batch. Upstream precondition, if any: {:?}. \
+         Full record: {}",
+        run.no_credit_code(),
+        run.stdout,
+    );
+    let record = run.json();
+    assert_eq!(
+        record.get("format").and_then(serde_json::Value::as_str),
+        Some("fastmcp-fnd01-sdk-batch-v3"),
+        "frozen receipt format; got {record}",
+    );
+    assert_eq!(
+        record.get("producer").and_then(serde_json::Value::as_str),
+        Some("sdk-batch-run-json"),
+        "the receipt must name the command case that produced it; got {record}",
+    );
+    assert_eq!(
+        record
+            .get("proof_class")
+            .and_then(serde_json::Value::as_str),
+        Some("batch_execution"),
+        "frozen proof class; got {record}",
+    );
+    assert_eq!(
+        record.get("capability_credit"),
+        Some(&serde_json::Value::Bool(false)),
+        "the runner may never grant capability credit; got {record}",
+    );
+    assert_eq!(
+        record.get("support_claim"),
+        Some(&serde_json::Value::Bool(false)),
+        "the runner may never assert a support claim; got {record}",
+    );
+    assert!(
+        record
+            .get("receipt")
+            .is_some_and(serde_json::Value::is_object),
+        "the admitted receipt body must be present; got {record}",
+    );
+}
+
+/// Item 2, execution half: map surface 4's second frozen command case.
+///
+/// Differs from the positive above in exactly one variable — argv — and the
+/// shipped runner itself plants exactly one field
+/// (`typescript.offline_closure_sha256`), proves the candidate is rejected,
+/// and proves the pristine body is byte-for-byte unchanged and re-admissible.
+/// This test asserts those emitted proofs rather than restating them.
+///
+/// Evaluator: the example process. Observed field: the planted-negative record.
+/// Predicate: typed refusal reached, one field changed, no mutable state moved.
+/// Minimum count: 1. Same precondition as the positive.
+#[test]
+fn fnd_01_b_sdk_batch_run_planted_negative() {
+    let run = run_sdk_batch(&["sdk-batch-run-planted-negative-json"]);
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "the planted-negative case must complete its oracle. Upstream precondition, if any: \
+         {:?}. Full record: {}",
+        run.no_credit_code(),
+        run.stdout,
+    );
+    let record = run.json();
+    for (member, expected) in [
+        (
+            "format",
+            serde_json::json!("fastmcp-fnd01-sdk-planted-negative-v1"),
+        ),
+        (
+            "producer",
+            serde_json::json!("sdk-batch-run-planted-negative-json"),
+        ),
+        ("proof_class", serde_json::json!("planted_negative")),
+        (
+            "changed_field",
+            serde_json::json!("typescript.offline_closure_sha256"),
+        ),
+        (
+            "expected_diagnostic",
+            serde_json::json!("E_SDK_EXECUTION_FACTS"),
+        ),
+        ("candidate_rejected", serde_json::json!(true)),
+        ("receipt_binding_recomputed", serde_json::json!(true)),
+        ("pristine_body_unchanged", serde_json::json!(true)),
+        ("pristine_reaccepted", serde_json::json!(true)),
+        ("capability_credit", serde_json::json!(false)),
+        ("support_claim", serde_json::json!(false)),
+    ] {
+        assert_eq!(
+            record.get(member),
+            Some(&expected),
+            "planted-negative member {member} must be {expected}; got {record}",
+        );
+    }
+
+    // One variable, and it really moved: the runner reports both sides of the
+    // single planted digest, and they must differ. Equal digests would mean the
+    // plant was a no-op and the refusal below proves nothing.
+    let from = record
+        .get("from_sha256")
+        .and_then(serde_json::Value::as_str);
+    let to = record.get("to_sha256").and_then(serde_json::Value::as_str);
+    assert!(
+        from.is_some() && to.is_some(),
+        "both sides of the planted digest must be reported; got {record}",
+    );
+    assert_ne!(
+        from, to,
+        "the planted digest must differ from the pristine one, or nothing was planted",
     );
 }

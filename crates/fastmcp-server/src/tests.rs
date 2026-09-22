@@ -5753,6 +5753,146 @@ mod ctx_read_resource_tests {
             .expect("nested resource read should succeed");
         assert_eq!(result.first_text(), Some("reader-auth"));
     }
+
+    // ========================================================================
+    // bd-v9ev3 area (d): reading the payload the redaction hides.
+    //
+    // The four (d) tests let a handler's panic escape into the server's
+    // extension-unwind catch, which converts it to a payload-free
+    // `InternalError`, while the process panic hook prints a fixed redaction
+    // constant instead of the message. Neither surface can name what fired,
+    // which is why area (d) has no observed root cause.
+    //
+    // The hook governs what is PRINTED. `catch_unwind` still RETURNS the
+    // payload. A handler that catches its own unwind can therefore read the
+    // message the redaction withholds, with no change to any shipped path.
+    // ========================================================================
+
+    /// Renders a caught panic payload as text, naming the shapes it does not
+    /// recognise rather than collapsing them into an empty string.
+    fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(text) = payload.downcast_ref::<&'static str>() {
+            (*text).to_string()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "PANIC WITH A NON-STRING PAYLOAD".to_string()
+        }
+    }
+
+    /// Reproduces the (d) shape and reports what it observes instead of
+    /// propagating it.
+    ///
+    /// The body is identical whether or not a bridge is already active on this
+    /// thread; only the caller differs. That is what makes the negative below
+    /// near-identical to the positive.
+    struct BridgeProbeResource;
+
+    impl ResourceHandler for BridgeProbeResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "probe://bridge".to_string(),
+                name: "bridge_probe".to_string(),
+                description: Some("Reports the payload of its own nested bridge".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            ctx.set_state("test_key", "probe_value");
+
+            let observed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fastmcp_core::block_on(ctx.read_resource("session://state"))
+            })) {
+                Ok(Ok(inner)) => format!(
+                    "NO PANIC: inner read returned {}",
+                    inner.first_text().unwrap_or("(no content)")
+                ),
+                Ok(Err(error)) => format!("NO PANIC: inner read returned Err {error}"),
+                Err(payload) => panic_payload_text(payload.as_ref()),
+            };
+
+            Ok(vec![ResourceContent {
+                uri: "probe://bridge".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(observed),
+                blob: None,
+            }])
+        }
+    }
+
+    /// Builds the (d) fixture: a probe handler and the resource it reads.
+    fn bridge_probe_context() -> McpContext {
+        let mut router = Router::new();
+        router.add_resource(SessionStateResource);
+        router.add_resource(BridgeProbeResource);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        McpContext::with_state(Cx::for_testing(), 1, session_state).with_resource_reader(reader)
+    }
+
+    /// POSITIVE. bd-v9ev3 (d): names the assertion the redaction hides.
+    ///
+    /// This test can refute the diagnosis it was written for. If the payload is
+    /// any other message, or no panic occurs at all, the assertion fails and
+    /// prints what actually happened.
+    #[test]
+    fn a_nested_bridge_from_a_sync_handler_panics_with_the_reentrancy_rejection() {
+        let ctx = bridge_probe_context();
+
+        // The outer bridge. The handler it dispatches to enters a second one,
+        // which is the position the four (d) tests reach.
+        let observed = fastmcp_core::block_on(ctx.read_resource("probe://bridge"))
+            .expect("the probe catches its own unwind, so the outer read must succeed")
+            .first_text()
+            .expect("the probe reports its observation as text")
+            .to_string();
+
+        assert_eq!(
+            observed, "nested fastmcp_core::runtime::block_on is not supported",
+            "the payload behind the extension-panic redaction is not the reentrancy \
+             rejection, so bd-v9ev3's (d) chain is refuted and this is what fired instead"
+        );
+    }
+
+    /// NEAR-IDENTICAL NEGATIVE (RH-5). Same handler, same method, same closure,
+    /// same runtime, same fixture.
+    ///
+    /// The single varied dimension is whether a bridge is ALREADY ACTIVE on this
+    /// thread when the handler runs: here the handler is invoked directly rather
+    /// than from inside an outer `block_on`, so its bridge is the first entry
+    /// rather than the second. Without this control, the positive above would be
+    /// consistent with the handler panicking for some reason unrelated to
+    /// nesting.
+    #[test]
+    fn the_same_handler_completes_when_no_bridge_is_already_active() {
+        let ctx = bridge_probe_context();
+
+        let observed = BridgeProbeResource
+            .read(&ctx)
+            .expect("the probe handler returns Ok on the unnested path")
+            .first()
+            .and_then(|content| content.text.clone())
+            .expect("the probe reports its observation as text");
+
+        assert_eq!(
+            observed, "NO PANIC: inner read returned probe_value",
+            "the first bridge entry must not be rejected, and the inner read must \
+             observe the state the handler set; if this fails, the positive above \
+             is not evidence about nesting"
+        );
+    }
 }
 
 // ============================================================================
