@@ -2941,17 +2941,21 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // Preserve the elected fence for the runner's automatic cancellation
         // retirement. Releasing it here would strand a `working` task with
         // cancellation intent after a supervisor error/drop race.
-        if state.cancellation_requests.contains(task_id) {
-            return Ok(false);
-        }
-        state.handoff_leases.remove(task_id);
-        Ok(state.generations.get(task_id) == Some(&generation)
-            && state
+        if state.cancellation_requests.contains(task_id)
+            || state.generations.get(task_id) != Some(&generation)
+            || !state
                 .tasks
                 .get(task_id)
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
-            && !state.cancellation_requests.contains(task_id)
-            && state.initial_work.get(task_id) == Some(&work_descriptor))
+            || state.initial_work.get(task_id) != Some(&work_descriptor)
+        {
+            return Ok(false);
+        }
+        // Restoration relinquishes this exact owner's live claim. Validate
+        // the retained payload before releasing it: a rejected substitution
+        // must not let another runner start the still-owned operation.
+        state.handoff_leases.remove(task_id);
+        Ok(true)
     }
 
     fn next_accepted_input_snapshot_after(
@@ -3040,17 +3044,21 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         // See the initial-work restoration path above. A cancellation winner
         // must retain this exact fence until the runner records the terminal
         // cancellation outcome.
-        if state.cancellation_requests.contains(task_id) {
-            return Ok(false);
-        }
-        state.handoff_leases.remove(task_id);
-        Ok(state.generations.get(task_id) == Some(&generation)
-            && state
+        if state.cancellation_requests.contains(task_id)
+            || state.generations.get(task_id) != Some(&generation)
+            || !state
                 .tasks
                 .get(task_id)
                 .is_some_and(|task| matches!(task, FinalTask::Working(_)))
-            && !state.cancellation_requests.contains(task_id)
-            && state.accepted_inputs.get(task_id) == Some(&input_responses))
+            || state.accepted_inputs.get(task_id) != Some(&input_responses)
+        {
+            return Ok(false);
+        }
+        // Input equality is part of the atomic restoration predicate, not a
+        // post-release result. A mismatched response leaves the owner and its
+        // dispatch fence live for a matching retry or terminal transition.
+        state.handoff_leases.remove(task_id);
+        Ok(true)
     }
 
     fn begin_handoff_dispatch_if_current(
@@ -8692,6 +8700,43 @@ mod tests {
         )
     }
 
+    fn final_task_restoration_snapshot(
+        store: &InMemoryFinalTaskStore,
+        task_id: &FinalTaskId,
+    ) -> (serde_json::Value, Option<Instant>, Option<Instant>) {
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = state.handoff_leases.get(task_id);
+        (
+            serde_json::json!({
+                "task": state.tasks.get(task_id),
+                "principal": state.authenticated_principals.get(task_id).map(Sha256Digest::as_bytes),
+                "generation": state.generations.get(task_id),
+                "nextGeneration": state.next_generation,
+                "nextDispatchFence": state.next_dispatch_fence,
+                "workDescriptor": state.work_descriptors.get(task_id).map(FinalTaskWorkDescriptor::as_value),
+                "initialWork": state.initial_work.get(task_id).map(FinalTaskWorkDescriptor::as_value),
+                "acceptedInputs": state.accepted_inputs.get(task_id),
+                "inputKeyHistory": state.input_key_history.get(task_id).map(|history| {
+                    serde_json::json!({"keys": history.keys, "keyBytes": history.key_bytes})
+                }),
+                "notification": state.latest_notifications.get(task_id),
+                "cancellation": state.cancellation_requests.contains(task_id),
+                "lease": lease.map(|lease| serde_json::json!({
+                    "generation": lease.generation,
+                    "initial": lease.kind == InMemoryFinalTaskHandoffKind::Initial,
+                    "elected": lease.dispatch_elected,
+                    "owner": lease.owner_id,
+                    "fence": lease.dispatch_fence,
+                })),
+            }),
+            state.expires_at.get(task_id).copied(),
+            lease.and_then(|lease| lease.recovery_expires_at),
+        )
+    }
+
     fn final_update_precommit_fixture(
         boundary: StdDuration,
     ) -> (Arc<InMemoryFinalTaskStore>, FinalTaskRuntime, FinalTaskId) {
@@ -9983,6 +10028,259 @@ mod tests {
             state.tasks.get(&task_id),
             Some(FinalTask::Working(_))
         ));
+    }
+
+    #[test]
+    fn task_02_final_initial_restoration_rejects_changed_payload_without_releasing_owner() {
+        for elected in [false, true] {
+            let (store, _now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-initial-restore-owner", 60_000);
+            let task_id = task.base().task_id.clone();
+            let descriptor = final_test_work_descriptor();
+            store
+                .create_task_with_authenticated_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    descriptor.clone(),
+                    Sha256Digest::from_bytes([7; 32]),
+                )
+                .expect("initial task retains its owner and operation");
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("initial snapshot is readable")
+                .expect("initial task is retained");
+            store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "original-owner")
+                .expect("initial claim is readable")
+                .expect("original owner claims initial work");
+            let fence = elected.then(|| {
+                store
+                    .begin_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "original-owner",
+                    )
+                    .expect("initial election is readable")
+                    .expect("original owner elects dispatch")
+            });
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            let altered = FinalTaskWorkDescriptor::new(serde_json::json!({
+                "handler": "tasks-test",
+                "payload": {"fixture": "substituted-task"}
+            }))
+            .expect("altered descriptor is structurally valid");
+            assert_ne!(altered, descriptor);
+            for (generation, candidate) in [
+                (snapshot.generation(), altered),
+                (snapshot.generation() + 1, descriptor.clone()),
+            ] {
+                assert!(
+                    !store
+                        .restore_initial_work_for_owner_if_current(
+                            &task_id,
+                            generation,
+                            "original-owner",
+                            fence,
+                            candidate,
+                        )
+                        .expect("mismatched initial restoration returns a refusal")
+                );
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&snapshot, "second-owner")
+                        .expect("competing initial claim is readable")
+                        .is_none(),
+                    "a rejected restore cannot expose still-owned work to another runner"
+                );
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+            }
+            assert!(
+                store
+                    .restore_initial_work_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "original-owner",
+                        fence,
+                        descriptor.clone(),
+                    )
+                    .expect("the matching initial restoration remains available")
+            );
+            let successor = store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "second-owner")
+                .expect("successor initial claim is readable")
+                .expect("matching restoration releases work to a successor");
+            assert_eq!(successor.work_descriptor, descriptor);
+            let successor_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "second-owner",
+                )
+                .expect("successor election is readable")
+                .expect("successor elects dispatch");
+            if let Some(fence) = fence {
+                assert_ne!(successor_fence, fence);
+            }
+            let completed = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Completed,
+                    None,
+                )
+                .expect("successor terminal base is valid"),
+                result: serde_json::from_value(serde_json::json!({"content": []}))
+                    .expect("terminal result is valid"),
+            };
+            assert!(
+                store
+                    .replace_task_and_clear_input_for_handoff_if_current(
+                        &snapshot,
+                        "second-owner",
+                        successor_fence,
+                        false,
+                        completed.clone(),
+                        final_task_notification(&completed),
+                    )
+                    .expect("successor completes under its own fence")
+            );
+            let terminal = final_task_restoration_snapshot(&store, &task_id);
+            assert!(
+                !store
+                    .restore_initial_work_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "second-owner",
+                        Some(successor_fence),
+                        descriptor,
+                    )
+                    .expect("terminal initial restoration returns a refusal")
+            );
+            assert_eq!(final_task_restoration_snapshot(&store, &task_id), terminal);
+        }
+    }
+
+    #[test]
+    fn task_02_final_input_restoration_rejects_changed_payload_without_releasing_owner() {
+        for elected in [false, true] {
+            let (store, _now) = in_memory_store_with_test_clock(1);
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            let inputs: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+                "roots": {"roots": [{"uri": "file:///retained-input"}]}
+            }))
+            .expect("original accepted input is typed");
+            let task_id = create_accepted_final_input(&runtime, inputs.clone());
+            let snapshot = store
+                .get_task_snapshot(&task_id)
+                .expect("resumed snapshot is readable")
+                .expect("resumed task is retained");
+            store
+                .take_input_handoff_for_owner_if_current(&snapshot, "original-owner")
+                .expect("input claim is readable")
+                .expect("original owner claims accepted input");
+            let fence = elected.then(|| {
+                store
+                    .begin_handoff_dispatch_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "original-owner",
+                    )
+                    .expect("resumed election is readable")
+                    .expect("original owner elects resumed dispatch")
+            });
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            let altered: FinalTaskInputResponses = serde_json::from_value(serde_json::json!({
+                "roots": {"roots": [{"uri": "file:///substituted-input"}]}
+            }))
+            .expect("altered accepted input is also typed");
+            for (generation, candidate) in [
+                (snapshot.generation(), altered),
+                (snapshot.generation() + 1, inputs.clone()),
+            ] {
+                assert!(
+                    !store
+                        .restore_input_for_owner_if_current(
+                            &task_id,
+                            generation,
+                            "original-owner",
+                            fence,
+                            candidate,
+                        )
+                        .expect("mismatched input restoration returns a refusal")
+                );
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                assert!(
+                    store
+                        .take_input_handoff_for_owner_if_current(&snapshot, "second-owner")
+                        .expect("competing input claim is readable")
+                        .is_none(),
+                    "a rejected restore cannot expose still-owned inputs to another runner"
+                );
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+            }
+            assert!(
+                store
+                    .restore_input_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "original-owner",
+                        fence,
+                        inputs.clone(),
+                    )
+                    .expect("the matching input restoration remains available")
+            );
+            let successor = store
+                .take_input_handoff_for_owner_if_current(&snapshot, "second-owner")
+                .expect("successor input claim is readable")
+                .expect("matching restoration releases inputs to a successor");
+            assert_eq!(successor.input_responses, inputs);
+            let successor_fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "second-owner",
+                )
+                .expect("successor resumed election is readable")
+                .expect("successor elects resumed dispatch");
+            if let Some(fence) = fence {
+                assert_ne!(successor_fence, fence);
+            }
+            let completed = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Completed,
+                    None,
+                )
+                .expect("successor terminal base is valid"),
+                result: serde_json::from_value(serde_json::json!({"content": []}))
+                    .expect("terminal result is valid"),
+            };
+            assert!(
+                store
+                    .replace_task_and_clear_input_for_handoff_if_current(
+                        &snapshot,
+                        "second-owner",
+                        successor_fence,
+                        false,
+                        completed.clone(),
+                        final_task_notification(&completed),
+                    )
+                    .expect("successor completes with its resumed fence")
+            );
+            let terminal = final_task_restoration_snapshot(&store, &task_id);
+            assert!(
+                !store
+                    .restore_input_for_owner_if_current(
+                        &task_id,
+                        snapshot.generation(),
+                        "second-owner",
+                        Some(successor_fence),
+                        inputs,
+                    )
+                    .expect("terminal input restoration returns a refusal")
+            );
+            assert_eq!(final_task_restoration_snapshot(&store, &task_id), terminal);
+        }
     }
 
     #[test]
