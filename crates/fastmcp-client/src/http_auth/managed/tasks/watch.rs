@@ -29,6 +29,8 @@ use super::super::subscriptions::{
     ManagedSubscriptionLimits,
 };
 
+/// Explicit remote cancellation coordinated with single-Task observation.
+pub mod cancellation;
 /// Portable endpoint-bound selections for freshly authorized observation after restart.
 pub mod checkpoint;
 /// Host-approved input resolution over a credential-pinned Task watch.
