@@ -6,6 +6,8 @@
 //! replay the creating call or any old input answer. The caller explicitly
 //! persists an updated control record or removes the terminal/unavailable one.
 
+/// Initial insert-only checkpoints for newly accepted Tasks.
+pub mod creation;
 /// Persistence-gated Task observation and explicit terminal acknowledgement.
 pub mod lifecycle;
 

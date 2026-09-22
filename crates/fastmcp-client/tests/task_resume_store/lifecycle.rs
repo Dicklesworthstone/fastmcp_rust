@@ -132,3 +132,84 @@ fn missing_or_wrong_owner_changes_cannot_recreate_or_remove_a_record() {
         assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
     }
 }
+
+use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::creation::{
+    TaskResumeCapturePolicy, TaskResumeInsert,
+};
+
+#[test]
+fn accepted_task_initial_insert_reopens_without_persisting_input_payloads() {
+    let cx = Cx::for_testing();
+    let directory = Directory::new();
+    let vault = TestVault::default();
+    let owner = binding("one", 4);
+    let insert = TaskResumeInsert::capture(&cx, &owner, &observed("input_required", 2),
+        TaskResumeCapturePolicy::new(Duration::from_secs(60)).unwrap()).unwrap();
+    assert!(!insert.record().encode().unwrap().windows(7).any(|part| part == b"PRIVATE"));
+    let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+    insert.apply(&cx, &owner, &mut store).unwrap();
+    drop(store);
+    let reopened = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+    assert_eq!(reopened.get(&cx, &owner, insert.key()).unwrap().as_ref(), Some(insert.record()));
+    assert_eq!(vault.seals.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn duplicate_initial_insert_never_overwrites_identical_or_newer_controls() {
+    let cx = Cx::for_testing();
+    let directory = Directory::new();
+    let vault = TestVault::default();
+    let owner = binding("one", 4);
+    let original = record(&cx, &owner, "one");
+    let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+    store.insert(&cx, &owner, original.clone()).unwrap();
+    let bytes = directory.bytes();
+    let policy = TaskResumeCapturePolicy::new(Duration::from_secs(60)).unwrap();
+    for candidate in [original.clone(), TaskResumeInsert::capture(&cx, &owner,
+        &observed("working", 2), policy).unwrap().record().clone()]
+    {
+        assert!(matches!(store.insert(&cx, &owner, candidate),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert_eq!(directory.bytes(), bytes);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(store.get(&cx, &owner, original.key()).unwrap(), Some(original));
+}
+
+#[test]
+fn initial_insert_admits_capacity_and_owner_before_protection() {
+    let cx = Cx::for_testing();
+    let directory = Directory::new();
+    let vault = TestVault::default();
+    let owner = binding("one", 4);
+    let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 1);
+    let first = record(&cx, &owner, "one");
+    store.insert(&cx, &owner, first.clone()).unwrap();
+    let bytes = directory.bytes();
+    assert!(matches!(store.insert(&cx, &owner, record(&cx, &owner, "two")),
+        Err(TaskResumeStoreError::Resume(TaskResumeError::Capacity))));
+    assert!(matches!(store.insert(&cx, &binding("other", 4), first),
+        Err(TaskResumeStoreError::Resume(TaskResumeError::Unavailable))));
+    assert_eq!(directory.bytes(), bytes);
+    assert_eq!(vault.seals.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_initial_protection_preserves_absence_and_existing_durable_records() {
+    let cx = Cx::for_testing();
+    let directory = Directory::new();
+    let vault = TestVault::default();
+    let owner = binding("one", 4);
+    let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+    let first = record(&cx, &owner, "one");
+    store.insert(&cx, &owner, first.clone()).unwrap();
+    let bytes = directory.bytes();
+    let second = record(&cx, &owner, "two");
+    vault.fail_seal.store(true, Ordering::SeqCst);
+    assert!(matches!(store.insert(&cx, &owner, second.clone()),
+        Err(TaskResumeStoreError::Resume(TaskResumeError::Protection))));
+    assert!(store.get(&cx, &owner, second.key()).unwrap().is_none());
+    assert_eq!(store.get(&cx, &owner, first.key()).unwrap(), Some(first));
+    assert_eq!(directory.bytes(), bytes);
+    assert_eq!(vault.seals.load(Ordering::SeqCst), 2);
+}
