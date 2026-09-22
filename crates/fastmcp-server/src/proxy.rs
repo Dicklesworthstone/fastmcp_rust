@@ -84,7 +84,7 @@ use fastmcp_protocol::{
 use fastmcp_protocol::{
     CreateMessageResult, InitializeParams, InitializeResult, ListRootsResult, Root,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::bidirectional::{MrtrCompletedInputs, MrtrInputKind};
@@ -969,12 +969,64 @@ impl ProxyTypedCatalog {
     /// admitted them prevents `tools/list` from becoming an unbound,
     /// caller-asserted stand-in for the whole upstream protocol selection.
     fn from_backend<B: ProxyBackend + ?Sized>(backend: &mut B) -> McpResult<Self> {
-        Ok(Self {
+        let catalog = Self {
             tools: backend.list_tool_catalog()?,
             resources: backend.list_resource_catalog()?,
             resource_templates: backend.list_resource_template_catalog()?,
             prompts: backend.list_prompt_catalog()?,
-        })
+        };
+        catalog.admit_bounds()?;
+        Ok(catalog)
+    }
+
+    fn admit_bounds(&self) -> McpResult<()> {
+        match &self.tools {
+            ProxyToolCatalog::Legacy(entries) => {
+                ProxyCatalogAdmission::admit_materialized("tools/list", entries, &[])?;
+            }
+            ProxyToolCatalog::Final(catalog) => ProxyCatalogAdmission::admit_materialized(
+                "tools/list",
+                &catalog.entries,
+                &catalog.cache_hints,
+            )?,
+        }
+        match &self.resources {
+            ProxyResourceCatalog::Legacy(entries) => {
+                ProxyCatalogAdmission::admit_materialized("resources/list", entries, &[])?;
+            }
+            ProxyResourceCatalog::Final(catalog) => ProxyCatalogAdmission::admit_materialized(
+                "resources/list",
+                &catalog.entries,
+                &catalog.cache_hints,
+            )?,
+        }
+        match &self.resource_templates {
+            ProxyResourceTemplateCatalog::Legacy(entries) => {
+                ProxyCatalogAdmission::admit_materialized(
+                    "resources/templates/list",
+                    entries,
+                    &[],
+                )?;
+            }
+            ProxyResourceTemplateCatalog::Final(catalog) => {
+                ProxyCatalogAdmission::admit_materialized(
+                    "resources/templates/list",
+                    &catalog.entries,
+                    &catalog.cache_hints,
+                )?;
+            }
+        }
+        match &self.prompts {
+            ProxyPromptCatalog::Legacy(entries) => {
+                ProxyCatalogAdmission::admit_materialized("prompts/list", entries, &[])?;
+            }
+            ProxyPromptCatalog::Final(catalog) => ProxyCatalogAdmission::admit_materialized(
+                "prompts/list",
+                &catalog.entries,
+                &catalog.cache_hints,
+            )?,
+        }
+        Ok(())
     }
 
     /// Returns final tools when the upstream negotiation selected MCP 2026-07-28.
@@ -2530,27 +2582,152 @@ fn handler_prompt_to_legacy(message: PromptMessage) -> McpResult<LegacyPromptMes
 /// into unbounded work.
 const MAX_MODERN_PROXY_CATALOG_PAGES: usize = 64;
 
+/// Maximum entries retained while materializing one proxy catalog family.
+pub const MAX_PROXY_CATALOG_ENTRIES: usize = 100_000;
+
+/// Maximum aggregate compact-JSON bytes retained for one proxy catalog family.
+///
+/// Accounting includes entries, continuation cursors and exact page cache
+/// hints. This local proxy bound is deliberately smaller than the general
+/// automatic-pagination ceiling because a proxy retains all four catalog
+/// families before registering any downstream handler.
+pub const MAX_PROXY_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Admission is committed only after the complete candidate page fits. A
+/// refused page cannot consume capacity or expose a partially extended catalog.
+#[derive(Default)]
+struct ProxyCatalogAdmission {
+    entries: usize,
+    encoded_bytes: usize,
+}
+
+impl ProxyCatalogAdmission {
+    fn admit_page<T: Serialize>(
+        &mut self,
+        method: &str,
+        entries: &[T],
+        next_cursor: Option<&str>,
+        cache_hint: Option<&ProxyCatalogCacheHint>,
+    ) -> McpResult<()> {
+        self.admit_encoded(method, entries.len(), |counter| {
+            serde_json::to_writer(&mut *counter, entries)?;
+            if let Some(cursor) = next_cursor {
+                serde_json::to_writer(&mut *counter, cursor)?;
+            }
+            if let Some(hint) = cache_hint {
+                serde_json::to_writer(counter, &(&hint.ttl_ms, hint.cache_scope))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn admit_materialized<T: Serialize>(
+        method: &str,
+        entries: &[T],
+        cache_hints: &[ProxyCatalogCacheHint],
+    ) -> McpResult<()> {
+        if cache_hints.len() > MAX_MODERN_PROXY_CATALOG_PAGES {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+            )));
+        }
+        Self::default().admit_encoded(method, entries.len(), |counter| {
+            serde_json::to_writer(&mut *counter, entries)?;
+            for hint in cache_hints {
+                serde_json::to_writer(&mut *counter, &(&hint.ttl_ms, hint.cache_scope))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn admit_encoded(
+        &mut self,
+        method: &str,
+        entry_count: usize,
+        encode: impl FnOnce(&mut ProxyCatalogByteCounter) -> serde_json::Result<()>,
+    ) -> McpResult<()> {
+        if entry_count > MAX_PROXY_CATALOG_ENTRIES.saturating_sub(self.entries) {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {method} catalog exceeded its {MAX_PROXY_CATALOG_ENTRIES}-entry limit"
+            )));
+        }
+        let mut counter = ProxyCatalogByteCounter {
+            remaining: MAX_PROXY_CATALOG_BYTES.saturating_sub(self.encoded_bytes),
+            written: 0,
+            exceeded: false,
+        };
+        // Stream into a counting sink instead of allocating a second JSON
+        // copy of an already decoded, potentially oversized upstream page.
+        if encode(&mut counter).is_err() {
+            return Err(McpError::invalid_request(if counter.exceeded {
+                format!("Proxy {method} catalog exceeded its {MAX_PROXY_CATALOG_BYTES}-byte limit")
+            } else {
+                format!("Proxy {method} catalog could not encode its admitted entries")
+            }));
+        }
+        self.entries += entry_count;
+        self.encoded_bytes += counter.written;
+        Ok(())
+    }
+}
+
+struct ProxyCatalogByteCounter {
+    remaining: usize,
+    written: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for ProxyCatalogByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            self.exceeded = true;
+            return Err(std::io::Error::other("Proxy catalog byte limit exceeded"));
+        }
+        self.remaining -= bytes.len();
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Collects one paginated modern catalog without accepting a cursor cycle.
 ///
 /// The caller owns selected-era decoding; this helper owns only the invariant
 /// shared by tools, resources, templates, and prompts. Returning an error
 /// drops the locally accumulated entries, so the caller cannot construct a
 /// partial proxy catalog after an invalid cursor sequence.
-fn collect_modern_proxy_catalog_pages<T>(
+fn collect_modern_proxy_catalog_pages<T: Serialize>(
     method: &str,
     mut fetch_page: impl FnMut(
         Option<&str>,
     ) -> McpResult<(Vec<T>, Option<String>, ProxyCatalogCacheHint)>,
 ) -> McpResult<ProxyFinalCatalog<T>> {
+    collect_proxy_catalog_pages("modern", method, |cursor| {
+        fetch_page(cursor).map(|(entries, cursor, hint)| (entries, cursor, Some(hint)))
+    })
+}
+
+fn collect_proxy_catalog_pages<T: Serialize>(
+    era: &str,
+    method: &str,
+    mut fetch_page: impl FnMut(
+        Option<&str>,
+    ) -> McpResult<(Vec<T>, Option<String>, Option<ProxyCatalogCacheHint>)>,
+) -> McpResult<ProxyFinalCatalog<T>> {
     let mut entries = Vec::new();
     let mut cache_hints = Vec::new();
     let mut cursor = None;
     let mut observed_cursors = HashSet::new();
+    let mut admission = ProxyCatalogAdmission::default();
 
     for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
         let (page, next_cursor, cache_hint) = fetch_page(cursor.as_deref())?;
+        admission.admit_page(method, &page, next_cursor.as_deref(), cache_hint.as_ref())?;
         entries.extend(page);
-        cache_hints.push(cache_hint);
+        cache_hints.extend(cache_hint);
 
         let Some(next_cursor) = next_cursor else {
             return Ok(ProxyFinalCatalog {
@@ -2560,19 +2737,19 @@ fn collect_modern_proxy_catalog_pages<T>(
         };
         if cursor.as_deref() == Some(next_cursor.as_str()) {
             return Err(McpError::invalid_request(format!(
-                "Proxy modern {method} catalog returned a non-advancing cursor"
+                "Proxy {era} {method} catalog returned a non-advancing cursor"
             )));
         }
         if !observed_cursors.insert(next_cursor.clone()) {
             return Err(McpError::invalid_request(format!(
-                "Proxy modern {method} catalog returned a repeated cursor"
+                "Proxy {era} {method} catalog returned a repeated cursor"
             )));
         }
         cursor = Some(next_cursor);
     }
 
     Err(McpError::invalid_request(format!(
-        "Proxy modern {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+        "Proxy {era} {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
     )))
 }
 
@@ -4062,6 +4239,7 @@ impl ProxyCatalog {
             final_prompt_cache_hints,
         };
         catalog.admit_catalog_shape()?;
+        catalog.admit_bounds()?;
         Ok(catalog)
     }
 
@@ -4130,6 +4308,37 @@ impl ProxyCatalog {
                 "Proxy catalog must declare an exact legacy or final era",
             )),
         }
+    }
+
+    fn admit_bounds(&self) -> McpResult<()> {
+        ProxyCatalogAdmission::admit_materialized("tools/list", &self.tools, &[])?;
+        ProxyCatalogAdmission::admit_materialized(
+            "tools/list",
+            &self.final_tools,
+            &self.final_tool_cache_hints,
+        )?;
+        ProxyCatalogAdmission::admit_materialized("resources/list", &self.resources, &[])?;
+        ProxyCatalogAdmission::admit_materialized(
+            "resources/list",
+            &self.final_resources,
+            &self.final_resource_cache_hints,
+        )?;
+        ProxyCatalogAdmission::admit_materialized(
+            "resources/templates/list",
+            &self.resource_templates,
+            &[],
+        )?;
+        ProxyCatalogAdmission::admit_materialized(
+            "resources/templates/list",
+            &self.final_resource_templates,
+            &self.final_resource_template_cache_hints,
+        )?;
+        ProxyCatalogAdmission::admit_materialized("prompts/list", &self.prompts, &[])?;
+        ProxyCatalogAdmission::admit_materialized(
+            "prompts/list",
+            &self.final_prompts,
+            &self.final_prompt_cache_hints,
+        )
     }
 }
 
@@ -5202,7 +5411,7 @@ impl ProxyHttpClient {
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
-    async fn collect_legacy_catalog_pages<T>(
+    async fn collect_legacy_catalog_pages<T: Serialize>(
         &mut self,
         method: &str,
         mut decode: impl FnMut(CoreResult) -> McpResult<(Vec<T>, Option<String>)>,
@@ -5210,6 +5419,7 @@ impl ProxyHttpClient {
         let mut entries = Vec::new();
         let mut cursor = None;
         let mut observed_cursors = HashSet::new();
+        let mut admission = ProxyCatalogAdmission::default();
 
         for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
             let result = self
@@ -5219,6 +5429,7 @@ impl ProxyHttpClient {
                 )
                 .await?;
             let (page, next_cursor) = decode(result)?;
+            admission.admit_page(method, &page, next_cursor.as_deref(), None)?;
             entries.extend(page);
             let Some(next_cursor) = next_cursor else {
                 return Ok(entries);
@@ -8424,7 +8635,7 @@ impl ProxyClient {
         ProxyCatalog::from_typed_catalog(self.catalog_typed_with_cx(cx).await?)
     }
 
-    async fn collect_catalog_pages<T>(
+    async fn collect_catalog_pages<T: Serialize>(
         &self,
         ctx: &McpContext,
         method: &str,
@@ -8436,6 +8647,7 @@ impl ProxyClient {
         let mut catalog = ProxyFinalCatalog::new(Vec::new());
         let mut cursor = None;
         let mut observed_cursors = HashSet::new();
+        let mut admission = ProxyCatalogAdmission::default();
         let era = if self.upstream_binding.map(|binding| binding.era())
             == Some(ProtocolEra::Legacy2024)
         {
@@ -8475,6 +8687,7 @@ impl ProxyClient {
                 }
             };
             let (entries, next_cursor, hint) = decode(result)?;
+            admission.admit_page(method, &entries, next_cursor.as_deref(), hint.as_ref())?;
             catalog.entries.extend(entries);
             catalog.cache_hints.extend(hint);
             let Some(next_cursor) = next_cursor else {
@@ -8518,6 +8731,7 @@ impl ProxyClient {
     /// evidence: a caller can describe a catalog but cannot assert the era of
     /// an otherwise unbound proxy route.
     pub(crate) fn admit_typed_catalog(&self, catalog: &ProxyTypedCatalog) -> McpResult<()> {
+        catalog.admit_bounds()?;
         self.require_bound_era(catalog.era()?, "typed catalog")
     }
 
@@ -8529,6 +8743,7 @@ impl ProxyClient {
     /// [`Self::catalog_typed`], which retain the backend's typed era evidence.
     pub(crate) fn admit_catalog(&self, catalog: &ProxyCatalog) -> McpResult<()> {
         catalog.admit_catalog_shape()?;
+        catalog.admit_bounds()?;
         let catalog_era = catalog.era()?;
         if let Some(binding) = self.upstream_binding {
             if binding.era() != catalog_era {
@@ -19171,6 +19386,165 @@ IFS= read -r end
         assert_eq!(catalog.cache_hints[0].cache_scope, CacheScope::Public);
         assert_eq!(catalog.cache_hints[1].ttl_ms.as_str(), "0");
         assert_eq!(catalog.cache_hints[1].cache_scope, CacheScope::Private);
+    }
+
+    #[test]
+    fn proxy_catalog_item_limit_accepts_boundary_and_rejects_one_more_atomically() {
+        for extra in [0, 1] {
+            let mut retained = vec![7u8];
+            let mut requests = 0;
+            let replacement = super::collect_proxy_catalog_pages(
+                "legacy",
+                "resources/list",
+                |cursor| {
+                    requests += 1;
+                    match cursor {
+                        None => Ok((
+                            vec![0u8; super::MAX_PROXY_CATALOG_ENTRIES - 1],
+                            Some("next-page".to_owned()),
+                            None,
+                        )),
+                        Some("next-page") => Ok((vec![1u8; 1 + extra], None, None)),
+                        _ => panic!("only the two bounded pages may be fetched"),
+                    }
+                },
+            );
+            assert_eq!(requests, 2);
+            if extra == 0 {
+                retained = replacement.expect("exact item limit is admitted").entries;
+                assert_eq!(retained.len(), super::MAX_PROXY_CATALOG_ENTRIES);
+                assert_eq!(retained.last(), Some(&1));
+            } else {
+                let error = replacement.expect_err("one additional item must be rejected");
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert!(error.message.contains("entry limit"));
+                assert_eq!(retained, vec![7], "failed pages cannot replace the catalog");
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_byte_limit_counts_cursors_and_exact_hints_before_commit() {
+        let hint = ProxyCatalogCacheHint::new(
+            serde_json::from_str("922337203685477580812345678901234567890").unwrap(),
+            CacheScope::Private,
+        );
+        let prefix = vec!["first".to_owned()];
+        let cursor = "opaque-\"cursor";
+        let hint_bytes = serde_json::to_vec(&(&hint.ttl_ms, hint.cache_scope))
+            .unwrap()
+            .len();
+        let fixed_bytes = serde_json::to_vec(&prefix).unwrap().len()
+            + serde_json::to_vec(cursor).unwrap().len()
+            + hint_bytes * 2
+            + serde_json::to_vec(&vec![String::new()]).unwrap().len();
+
+        for extra in [0, 1] {
+            let mut retained = vec!["previous-catalog".to_owned()];
+            let mut requests = 0;
+            let replacement = super::collect_modern_proxy_catalog_pages(
+                "prompts/list",
+                |requested| {
+                    requests += 1;
+                    match requested {
+                        None => Ok((prefix.clone(), Some(cursor.to_owned()), hint.clone())),
+                        Some(value) if value == cursor => Ok((
+                            vec!["x".repeat(super::MAX_PROXY_CATALOG_BYTES - fixed_bytes + extra)],
+                            None,
+                            hint.clone(),
+                        )),
+                        _ => panic!("only the exact opaque cursor may be fetched"),
+                    }
+                },
+            );
+            assert_eq!(requests, 2);
+            if extra == 0 {
+                let catalog = replacement.expect("exact aggregate byte limit is admitted");
+                assert_eq!(catalog.cache_hints, vec![hint.clone(), hint.clone()]);
+                retained = catalog.entries;
+                assert_eq!(retained[0], "first");
+                assert_eq!(retained[1].len(), super::MAX_PROXY_CATALOG_BYTES - fixed_bytes);
+            } else {
+                let error = replacement.expect_err("one additional encoded byte is rejected");
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert!(error.message.contains("byte limit"));
+                assert_eq!(retained, vec!["previous-catalog".to_owned()]);
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_failed_page_preserves_admission_and_allows_valid_successor() {
+        let mut admission = super::ProxyCatalogAdmission::default();
+        admission
+            .admit_page("tools/list", &["accepted"], None, None)
+            .unwrap();
+        let before = (admission.entries, admission.encoded_bytes);
+        let oversized = "x".repeat(super::MAX_PROXY_CATALOG_BYTES);
+        let error = admission
+            .admit_page("tools/list", &[oversized], None, None)
+            .expect_err("the bounded sink must stop an oversized serialization");
+        assert!(error.message.contains("byte limit"));
+        assert_eq!((admission.entries, admission.encoded_bytes), before);
+        admission
+            .admit_page("tools/list", &["successor"], None, None)
+            .unwrap();
+        assert_eq!(admission.entries, before.0 + 1);
+    }
+
+    #[test]
+    fn public_proxy_catalog_bounds_custom_backend_before_era_admission() {
+        for extra in [0, 1] {
+            let mut tool = final_catalog_tool();
+            tool.description = Some(String::new());
+            let framing = serde_json::to_vec(&vec![tool.clone()]).unwrap().len();
+            tool.description = Some("x".repeat(super::MAX_PROXY_CATALOG_BYTES - framing + extra));
+            let proxy = ProxyClient::from_backend(FinalCatalogBackend {
+                tool,
+                reject_exact_catalog: false,
+            });
+            let result = proxy.catalog_typed();
+            if extra == 0 {
+                let catalog = result.expect("a custom catalog at the byte limit is admitted");
+                assert_eq!(catalog.final_tools().unwrap().len(), 1);
+                assert_eq!(
+                    proxy.observed_protocol_era().unwrap(),
+                    Some(ProtocolEra::Modern2026)
+                );
+            } else {
+                let error = result.expect_err("one extra custom-backend byte is rejected");
+                assert!(error.message.contains("byte limit"));
+                assert_eq!(
+                    proxy.observed_protocol_era().unwrap(),
+                    None,
+                    "an oversized custom catalog cannot establish route evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_empty_page_hints_and_cursor_bytes_share_the_bound() {
+        let hint = ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), CacheScope::Public);
+        let mut admission = super::ProxyCatalogAdmission::default();
+        admission
+            .admit_page::<u8>("tools/list", &[], Some("first-cursor"), Some(&hint))
+            .unwrap();
+        assert_eq!(admission.entries, 0);
+        let expected = serde_json::to_vec(&Vec::<u8>::new()).unwrap().len()
+            + serde_json::to_vec("first-cursor").unwrap().len()
+            + serde_json::to_vec(&(&hint.ttl_ms, hint.cache_scope))
+                .unwrap()
+                .len();
+        assert_eq!(admission.encoded_bytes, expected);
+        let before = admission.encoded_bytes;
+        let cursor = "x".repeat(super::MAX_PROXY_CATALOG_BYTES);
+        let error = admission
+            .admit_page::<u8>("tools/list", &[], Some(&cursor), Some(&hint))
+            .expect_err("an empty page cannot smuggle an unbounded retained cursor");
+        assert!(error.message.contains("byte limit"));
+        assert_eq!(admission.encoded_bytes, before);
+        assert_eq!(admission.entries, 0);
     }
 
     #[test]
