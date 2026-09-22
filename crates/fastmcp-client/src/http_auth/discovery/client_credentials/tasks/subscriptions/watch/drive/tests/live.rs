@@ -324,3 +324,5 @@ mod cancellation;
 mod input_journal;
 
 mod resume;
+
+mod persisted_resume;

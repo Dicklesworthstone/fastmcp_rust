@@ -14,6 +14,8 @@ mod bridge;
 mod completion;
 mod prompt;
 mod resource;
+#[cfg(test)]
+mod resuming;
 pub use completion::BlockingCompletion;
 pub use prompt::BlockingPrompt;
 pub use resource::BlockingResource;
@@ -237,8 +239,9 @@ async fn wait<T>(ctx: &McpContext, operation: impl Future<Output = McpResult<T>>
 /// complete results and declared Tasks creation descriptors. Catalog, schema,
 /// authorization and output-validation boundaries remain the ordinary router's.
 ///
-/// Async handlers and MRTR-resuming handlers are rejected at construction: their
-/// async/resume hooks cannot be silently replaced with a synchronous hook.
+/// `new` rejects async and MRTR-resuming handlers rather than silently replacing
+/// their hooks. `from_sync_resuming_hook` explicitly selects a synchronous hook
+/// for both the initial modern call and every admitted MRTR continuation.
 /// Synchronous trait entry points refuse rather than introduce an inline path.
 /// Invoke through async router/server dispatch. Registration hooks and handler
 /// destructors must not block; this adapter offloads execution, not registration.
@@ -246,7 +249,13 @@ pub struct BlockingTool<H> {
     handler: Arc<H>,
     lane: BlockingHandlerLane,
     tasks: bool,
+    resume_hook: Option<Arc<ToolResumeHook<H>>>,
 }
+
+type ToolResumeHook<H> = dyn Fn(
+    &H, &McpContext, Value, Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalToolOutcome> + Send + Sync;
+
 impl<H: ToolHandler + 'static> BlockingTool<H> {
     /// Wraps synchronous local execution without changing catalog or schema
     /// admission. The shared lane must be supplied explicitly by the host.
@@ -258,7 +267,40 @@ impl<H: ToolHandler + 'static> BlockingTool<H> {
             return Err(McpError::invalid_params("blocking tool cannot replace an upstream proxy executor"));
         }
         let tasks = handler.declares_final_tasks();
-        Ok(Self { handler: Arc::new(handler), lane, tasks })
+        Ok(Self { handler: Arc::new(handler), lane, tasks, resume_hook: None })
+    }
+
+    /// Runs a synchronous, resumable modern tool on the caller's blocking pool.
+    ///
+    /// The selected hook receives `None` on the initial call and the router's
+    /// admitted, type-bound inputs on a continuation. It may return another
+    /// `InputRequired` outcome for a later round. No worker is retained while
+    /// the client supplies input: each round acquires its own bounded slot and
+    /// uses that round's request-owned context. The router, not this adapter,
+    /// owns continuation tokens, input validation and one-use replay admission.
+    ///
+    /// This explicitly replaces the modern outcome hook, including any existing
+    /// async resumption override. The handler must declare blocking execution;
+    /// async handlers and upstream proxies are not silently converted. Legacy
+    /// calls still use `ToolHandler::call`. Complete-only final entry points
+    /// refuse before running work, since they cannot represent suspension.
+    /// Catalog, output-schema, timeout and Tasks declarations remain the original
+    /// handler's. Declare Tasks support there before returning `CreateTask`.
+    pub fn from_sync_resuming_hook<F>(
+        handler: H, lane: BlockingHandlerLane, hook: F,
+    ) -> McpResult<Self>
+    where
+        F: Fn(&H, &McpContext, Value, Option<&MrtrCompletedInputs>)
+                -> McpResult<FinalToolOutcome> + Send + Sync + 'static,
+    {
+        if handler.execution_mode() != ToolExecutionMode::Blocking {
+            return Err(McpError::invalid_params("resuming blocking tool requires synchronous execution"));
+        }
+        if handler.upstream_final_tool_schema_registration().is_some() {
+            return Err(McpError::invalid_params("blocking tool cannot replace an upstream proxy executor"));
+        }
+        let tasks = handler.declares_final_tasks();
+        Ok(Self { handler: Arc::new(handler), lane, tasks, resume_hook: Some(Arc::new(hook)) })
     }
 
     fn legacy<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
@@ -270,19 +312,39 @@ impl<H: ToolHandler + 'static> BlockingTool<H> {
     fn complete<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
         -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>>
     {
+        if self.resume_hook.is_some() {
+            return Box::pin(async { Outcome::Err(McpError::invalid_request(
+                "resuming blocking tool requires final outcome dispatch",
+            )) });
+        }
         let handler = Arc::clone(&self.handler);
         Box::pin(async move { outcome(self.lane.execute(ctx, cx, move |ctx| handler.call_final(ctx, arguments)).await) })
     }
-    fn final_outcome<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
+    fn final_outcome<'a>(
+        &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value,
+        resume: Option<&'a MrtrCompletedInputs>,
+    )
         -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
     {
+        if resume.is_some() && self.resume_hook.is_none() {
+            return Box::pin(async { Outcome::Err(McpError::invalid_request(
+                "blocking tool has no synchronous resume hook",
+            )) });
+        }
         let handler = Arc::clone(&self.handler);
+        let hook = self.resume_hook.clone();
         #[cfg(feature = "tasks")]
         let declares_tasks = self.tasks;
         Box::pin(async move {
+            // The async caller may disappear while its pool job is still on
+            // the stack. Retain the admitted inputs, never a borrowed retry.
+            let resume = resume.cloned();
             outcome(self.lane.execute(ctx, cx, move |ctx| {
-                let result = handler.call_final_outcome(ctx, arguments)?;
-                if matches!(&result, FinalToolOutcome::InputRequired(_)) {
+                let result = match &hook {
+                    Some(hook) => hook(handler.as_ref(), ctx, arguments, resume.as_ref()),
+                    None => handler.call_final_outcome(ctx, arguments),
+                }?;
+                if hook.is_none() && matches!(&result, FinalToolOutcome::InputRequired(_)) {
                     return Err(McpError::invalid_request("blocking tool has no synchronous resume hook"));
                 }
                 #[cfg(feature = "tasks")]
@@ -316,6 +378,7 @@ impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
     fn timeout(&self) -> Option<Duration> { self.handler.timeout() }
     fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Async }
     fn declares_final_tasks(&self) -> bool { self.tasks }
+    fn declares_final_mrtr(&self) -> bool { self.resume_hook.is_some() }
 
     fn call(&self, _ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
         Err(McpError::invalid_request("blocking tool requires asynchronous caller-owned dispatch"))
@@ -334,17 +397,14 @@ impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
     { self.complete(ctx, cx, arguments) }
     fn call_final_outcome_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
         -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    { self.final_outcome(ctx, ctx.cx(), arguments) }
+    { self.final_outcome(ctx, ctx.cx(), arguments, None) }
     fn call_final_outcome_async_in_request<'a>(&'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value)
         -> BoxFuture<'a, McpOutcome<FinalToolOutcome>>
-    { self.final_outcome(ctx, cx, arguments) }
+    { self.final_outcome(ctx, cx, arguments, None) }
     fn call_final_outcome_async_resuming_in_request<'a>(
         &'a self, ctx: &'a McpContext, cx: &'a Cx, arguments: Value, resume: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
-        if resume.is_some() {
-            return Box::pin(async { Outcome::Err(McpError::invalid_request("blocking tool has no synchronous resume hook")) });
-        }
-        self.final_outcome(ctx, cx, arguments)
+        self.final_outcome(ctx, cx, arguments, resume)
     }
 }
 

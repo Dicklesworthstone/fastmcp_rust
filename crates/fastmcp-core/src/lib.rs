@@ -2261,951 +2261,1008 @@ pub use uri::{
 // `fastmcp-core` directly.
 pub use asupersync::{Budget, Cx, Outcome, RegionId, Scope, TaskId};
 
+/// In-crate copies of the LIMIT-01 A/B frozen tests, kept per bd-600a3.
+///
+/// The frozen IDs are owned by the `limit_01_a` / `limit_01_b` integration
+/// targets. At crate root these copies had the same bare libtest names, so
+/// `--exact limit_01_a_positive` over `--all-targets` discovered 4, not 2
+/// (bd-mcp-limit-01-a-jp6g / -b-bhws). Inside this module they run as
+/// `tests::limit_01_*` and the bare names stay unique to the frozen targets.
 #[cfg(test)]
-fn limit_01_a_bound_rows() -> [(crate::ProtocolLimit, usize, usize); 6] {
-    [
-        (
-            crate::ProtocolLimit::JsonRpcBodyBytes,
-            crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
-            crate::HARD_JSON_RPC_MAX_BODY_BYTES,
-        ),
-        (
-            crate::ProtocolLimit::MetadataEntries,
-            crate::DEFAULT_METADATA_MAX_ENTRIES as usize,
-            crate::HARD_METADATA_MAX_ENTRIES as usize,
-        ),
-        (
-            crate::ProtocolLimit::MetadataBytes,
-            crate::DEFAULT_METADATA_MAX_BYTES,
-            crate::HARD_METADATA_MAX_BYTES,
-        ),
-        (
-            crate::ProtocolLimit::UriBytes,
-            crate::DEFAULT_URI_MAX_BYTES,
-            crate::HARD_URI_MAX_BYTES,
-        ),
-        (
-            crate::ProtocolLimit::CancellationReasonBytes,
-            crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
-            crate::HARD_CANCELLATION_REASON_MAX_BYTES,
-        ),
-        (
-            crate::ProtocolLimit::CursorBytes,
-            crate::DEFAULT_CURSOR_MAX_BYTES,
-            crate::HARD_CURSOR_MAX_BYTES,
-        ),
-    ]
-}
+mod tests {
+    #[cfg(test)]
+    fn limit_01_a_bound_rows() -> [(crate::ProtocolLimit, usize, usize); 6] {
+        [
+            (
+                crate::ProtocolLimit::JsonRpcBodyBytes,
+                crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+                crate::HARD_JSON_RPC_MAX_BODY_BYTES,
+            ),
+            (
+                crate::ProtocolLimit::MetadataEntries,
+                crate::DEFAULT_METADATA_MAX_ENTRIES as usize,
+                crate::HARD_METADATA_MAX_ENTRIES as usize,
+            ),
+            (
+                crate::ProtocolLimit::MetadataBytes,
+                crate::DEFAULT_METADATA_MAX_BYTES,
+                crate::HARD_METADATA_MAX_BYTES,
+            ),
+            (
+                crate::ProtocolLimit::UriBytes,
+                crate::DEFAULT_URI_MAX_BYTES,
+                crate::HARD_URI_MAX_BYTES,
+            ),
+            (
+                crate::ProtocolLimit::CancellationReasonBytes,
+                crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
+                crate::HARD_CANCELLATION_REASON_MAX_BYTES,
+            ),
+            (
+                crate::ProtocolLimit::CursorBytes,
+                crate::DEFAULT_CURSOR_MAX_BYTES,
+                crate::HARD_CURSOR_MAX_BYTES,
+            ),
+        ]
+    }
 
-/// LIMIT-01 A positive: six catalog rows, sealed partitions, and N-1/N charges.
-#[cfg(test)]
-#[test]
-fn limit_01_a_positive() {
-    let defaults = crate::ProtocolLimits::try_new(
-        crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
-        crate::DEFAULT_METADATA_MAX_ENTRIES,
-        crate::DEFAULT_METADATA_MAX_BYTES,
-        crate::DEFAULT_URI_MAX_BYTES,
-        crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
-        crate::DEFAULT_CURSOR_MAX_BYTES,
-    )
-    .expect("documented defaults must admit");
-    defaults.validate().expect("defaults remain valid");
-    let snapshot = defaults.snapshot();
-    assert_eq!(
-        snapshot.generation(),
-        crate::PROTOCOL_LIMITS_INITIAL_GENERATION
-    );
-    for (limit, default, ceiling) in limit_01_a_bound_rows() {
+    /// LIMIT-01 A positive: six catalog rows, sealed partitions, and N-1/N charges.
+    #[cfg(test)]
+    #[test]
+    fn limit_01_a_positive() {
+        let defaults = crate::ProtocolLimits::try_new(
+            crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+            crate::DEFAULT_METADATA_MAX_ENTRIES,
+            crate::DEFAULT_METADATA_MAX_BYTES,
+            crate::DEFAULT_URI_MAX_BYTES,
+            crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
+            crate::DEFAULT_CURSOR_MAX_BYTES,
+        )
+        .expect("documented defaults must admit");
+        defaults.validate().expect("defaults remain valid");
+        let snapshot = defaults.snapshot();
         assert_eq!(
-            snapshot.configured_units(limit).expect("countable row"),
-            default
+            snapshot.generation(),
+            crate::PROTOCOL_LIMITS_INITIAL_GENERATION
         );
-        assert_eq!(
-            crate::ProtocolLimits::hard_ceiling(limit).expect("countable row"),
-            ceiling
-        );
-        let at_ceiling = crate::ProtocolLimits::builder()
-            .json_rpc_max_body_bytes(if limit == crate::ProtocolLimit::JsonRpcBodyBytes {
+        for (limit, default, ceiling) in limit_01_a_bound_rows() {
+            assert_eq!(
+                snapshot.configured_units(limit).expect("countable row"),
+                default
+            );
+            assert_eq!(
+                crate::ProtocolLimits::hard_ceiling(limit).expect("countable row"),
                 ceiling
-            } else {
-                crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES
-            })
-            .metadata_max_entries(if limit == crate::ProtocolLimit::MetadataEntries {
-                u16::try_from(ceiling).expect("metadata entries fit u16")
-            } else {
-                crate::DEFAULT_METADATA_MAX_ENTRIES
-            })
-            .metadata_max_bytes(if limit == crate::ProtocolLimit::MetadataBytes {
-                ceiling
-            } else {
-                crate::DEFAULT_METADATA_MAX_BYTES
-            })
-            .uri_max_bytes(if limit == crate::ProtocolLimit::UriBytes {
-                ceiling
-            } else {
-                crate::DEFAULT_URI_MAX_BYTES
-            })
-            .cancellation_reason_max_bytes(
-                if limit == crate::ProtocolLimit::CancellationReasonBytes {
+            );
+            let at_ceiling = crate::ProtocolLimits::builder()
+                .json_rpc_max_body_bytes(if limit == crate::ProtocolLimit::JsonRpcBodyBytes {
                     ceiling
                 } else {
-                    crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES
-                },
-            )
-            .cursor_max_bytes(if limit == crate::ProtocolLimit::CursorBytes {
+                    crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES
+                })
+                .metadata_max_entries(if limit == crate::ProtocolLimit::MetadataEntries {
+                    u16::try_from(ceiling).expect("metadata entries fit u16")
+                } else {
+                    crate::DEFAULT_METADATA_MAX_ENTRIES
+                })
+                .metadata_max_bytes(if limit == crate::ProtocolLimit::MetadataBytes {
+                    ceiling
+                } else {
+                    crate::DEFAULT_METADATA_MAX_BYTES
+                })
+                .uri_max_bytes(if limit == crate::ProtocolLimit::UriBytes {
+                    ceiling
+                } else {
+                    crate::DEFAULT_URI_MAX_BYTES
+                })
+                .cancellation_reason_max_bytes(
+                    if limit == crate::ProtocolLimit::CancellationReasonBytes {
+                        ceiling
+                    } else {
+                        crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES
+                    },
+                )
+                .cursor_max_bytes(if limit == crate::ProtocolLimit::CursorBytes {
+                    ceiling
+                } else {
+                    crate::DEFAULT_CURSOR_MAX_BYTES
+                })
+                .build()
+                .expect("hard ceiling must admit");
+            assert_eq!(
+                at_ceiling.configured_units(limit).expect("countable row"),
                 ceiling
-            } else {
-                crate::DEFAULT_CURSOR_MAX_BYTES
+            );
+            assert_eq!(
+                snapshot
+                    .try_charge(limit, default - 1, 1)
+                    .expect("N-1 admits"),
+                default
+            );
+            assert_eq!(
+                snapshot.try_charge(limit, 0, default).expect("N admits"),
+                default
+            );
+        }
+
+        assert_eq!(
+            crate::ProtocolLimits::hard_ceiling(crate::ProtocolLimit::LogicalExchangeWallClock),
+            Err(crate::ProtocolLimitsError::NotCountable {
+                limit: crate::ProtocolLimit::LogicalExchangeWallClock,
             })
-            .build()
-            .expect("hard ceiling must admit");
-        assert_eq!(
-            at_ceiling.configured_units(limit).expect("countable row"),
-            ceiling
         );
         assert_eq!(
-            snapshot
-                .try_charge(limit, default - 1, 1)
-                .expect("N-1 admits"),
-            default
+            snapshot.configured_units(crate::ProtocolLimit::LogicalExchangeWallClock),
+            Err(crate::ProtocolLimitsError::NotCountable {
+                limit: crate::ProtocolLimit::LogicalExchangeWallClock,
+            })
         );
-        assert_eq!(
-            snapshot.try_charge(limit, 0, default).expect("N admits"),
-            default
-        );
-    }
 
-    assert_eq!(
-        crate::ProtocolLimits::hard_ceiling(crate::ProtocolLimit::LogicalExchangeWallClock),
-        Err(crate::ProtocolLimitsError::NotCountable {
-            limit: crate::ProtocolLimit::LogicalExchangeWallClock,
-        })
-    );
-    assert_eq!(
-        snapshot.configured_units(crate::ProtocolLimit::LogicalExchangeWallClock),
-        Err(crate::ProtocolLimitsError::NotCountable {
-            limit: crate::ProtocolLimit::LogicalExchangeWallClock,
-        })
-    );
-
-    let later = crate::ProtocolLimits::try_new(
-        crate::HARD_JSON_RPC_MAX_BODY_BYTES,
-        crate::HARD_METADATA_MAX_ENTRIES,
-        crate::HARD_METADATA_MAX_BYTES,
-        crate::HARD_URI_MAX_BYTES,
-        crate::HARD_CANCELLATION_REASON_MAX_BYTES,
-        crate::HARD_CURSOR_MAX_BYTES,
-    )
-    .expect("hard ceilings must admit");
-    assert_eq!(snapshot, defaults.snapshot());
-    assert_ne!(later.snapshot(), snapshot);
-
-    let pre_auth = crate::AdmissionPartition::pre_auth(
-        crate::PreAuthSourceBucketKey::from_listener_and_source(
-            "mcp.example.test",
-            "tcp:203.0.113.8",
+        let later = crate::ProtocolLimits::try_new(
+            crate::HARD_JSON_RPC_MAX_BODY_BYTES,
+            crate::HARD_METADATA_MAX_ENTRIES,
+            crate::HARD_METADATA_MAX_BYTES,
+            crate::HARD_URI_MAX_BYTES,
+            crate::HARD_CANCELLATION_REASON_MAX_BYTES,
+            crate::HARD_CURSOR_MAX_BYTES,
         )
-        .expect("transport-observed source is admitted"),
-    );
-    assert!(pre_auth.is_pre_auth());
-    assert!(!pre_auth.is_verified());
-    let verified = crate::AdmissionPartition::verified(
-        crate::QuotaPartitionKey::from_verified_security_facts(
-            "static-token",
-            1,
-            "https://issuer.example.test",
-            "https://mcp.example.test/mcp",
-            "tenant-a",
-            "subject-a",
-        )
-        .expect("verified security facts mint a partition key"),
-    );
-    assert!(verified.is_verified());
-    let flow = crate::AdmissionPartition::authorization_flow(
-        crate::AuthorizationFlowQuotaKey::from_configured_flow(
-            "https://issuer.example.test",
-            "https://mcp.example.test/mcp",
-            "registered-client-1",
-            "loopback",
-            "oauth-authorization-code",
-        )
-        .expect("configured flow is admitted"),
-    );
-    assert!(!flow.is_verified());
-    assert!(!flow.is_pre_auth());
+        .expect("hard ceilings must admit");
+        assert_eq!(snapshot, defaults.snapshot());
+        assert_ne!(later.snapshot(), snapshot);
 
-    // -----------------------------------------------------------------------
-    // Ordered acceptance rows and the three canonical LIMIT-01 A receipts.
-    // -----------------------------------------------------------------------
-
-    // AC-LIMIT-A-01-BOUNDS — numeric floor 6, digest LIMIT01-A-BOUNDS-v1 over
-    // ordered row ID / default / ceiling / result fields.
-    let bound_rows = crate::limit_01_rows::run_bound_rows();
-    assert_eq!(bound_rows.len(), 6, "AC-LIMIT-A-01 numeric floor is 6 rows");
-    let bounds = crate::limit_01_rows::bounds_receipt(&bound_rows);
-    assert_eq!(bounds.len(), 1 + 6, "the bounds receipt carries a header and six ordered rows");
-    assert_eq!(
-        bounds[0],
-        format!(
-            "LIMIT01-A-BOUNDS-v1 rows=6 generation={}",
-            crate::PROTOCOL_LIMITS_INITIAL_GENERATION
-        )
-    );
-    for (index, (id, limit, default, ceiling)) in
-        crate::limit_01_rows::bound_rows().into_iter().enumerate()
-    {
-        // Each row's declared refusal above its ceiling is the row's own bound,
-        // so a diagnostic naming the wrong bound fails here.
-        assert_eq!(
-            bounds[1 + index],
-            format!(
-                "{id} configured={default} ceiling={ceiling} generation={} refused={:?}",
-                crate::PROTOCOL_LIMITS_INITIAL_GENERATION,
-                crate::ProtocolLimitsError::ExceedsHardCeiling { limit }
-            ),
-            "bounds receipt row {index} must be the frozen {id} tuple"
-        );
-    }
-
-    // AC-LIMIT-A-02-PARTITIONS — numeric floor 5, digest LIMIT01-A-PARTITIONS-v1
-    // over ordered discriminant / generation / result fields.
-    let partition_rows = crate::limit_01_rows::run_partition_rows();
-    assert_eq!(
-        partition_rows.len(),
-        5,
-        "AC-LIMIT-A-02 numeric floor is 5 rows"
-    );
-    let partitions = crate::limit_01_rows::partitions_receipt(&partition_rows);
-    assert_eq!(partitions.len(), 1 + 5);
-    assert_eq!(partitions[0], "LIMIT01-A-PARTITIONS-v1 rows=5");
-    for (index, (id, discriminant)) in [
-        ("LIMIT-A-02.01", "PreAuth"),
-        ("LIMIT-A-02.02", "Verified"),
-        ("LIMIT-A-02.03", "AuthorizationFlow"),
-        ("LIMIT-A-02.04", "refused"),
-        ("LIMIT-A-02.05", "refused"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let row = &partition_rows[index];
-        assert_eq!(row.id, id, "partition row {index} is out of acceptance order");
-        assert_eq!(row.discriminant, discriminant, "{id}: wrong discriminant");
-        assert_eq!(
-            row.generation,
-            crate::PROTOCOL_LIMITS_INITIAL_GENERATION,
-            "{id}: the request snapshot generation must not move"
-        );
-        // Every row re-offers its own raw input to the sealed path. If any
-        // constructor were unsealed so a request-supplied value could mint a
-        // partition, this flips to false.
-        assert!(
-            row.non_authorizing,
-            "{id}: a request-supplied identifier must never mint a partition key"
-        );
-        assert!(
-            partitions[1 + index].starts_with(&format!("{id} discriminant={discriminant}")),
-            "partitions receipt row {index} must be {id}"
-        );
-    }
-    // No raw value manufactured a Verified partition: the only Verified row is
-    // the one built from verified security facts.
-    assert_eq!(
-        partition_rows
-            .iter()
-            .filter(|row| row.discriminant == "Verified")
-            .count(),
-        1,
-        "exactly one row may reach the verified domain, and only from verified facts"
-    );
-    for id in ["LIMIT-A-02.04", "LIMIT-A-02.05"] {
-        let row = partition_rows
-            .iter()
-            .find(|row| row.id == id)
-            .expect("refusal row present");
-        assert_eq!(
-            row.result,
-            Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier),
-            "{id}: the sealed refusal must be the typed request-supplied error"
-        );
-    }
-
-    // AC-LIMIT-A-03-ARITHMETIC — numeric floor 4, digest LIMIT01-A-ARITHMETIC-v1
-    // over ordered inputs / results / counters.
-    let arithmetic_rows = crate::limit_01_rows::run_arithmetic_rows();
-    assert_eq!(
-        arithmetic_rows.len(),
-        4,
-        "AC-LIMIT-A-03 numeric floor is 4 rows"
-    );
-    let row_limit = crate::ProtocolLimit::MetadataEntries;
-    let available = crate::DEFAULT_METADATA_MAX_ENTRIES as usize;
-    let expected_arithmetic = [
-        (
-            "LIMIT-A-03.01",
-            available - 1,
-            Ok(available - 1),
-            available - 1,
-        ),
-        ("LIMIT-A-03.02", available, Ok(available), available),
-        (
-            "LIMIT-A-03.03",
-            1,
-            Err(crate::ProtocolLimitsError::ChargeExceedsLimit {
-                limit: row_limit,
-                requested: available + 1,
-                ceiling: available,
-            }),
-            // The refused N+1 leaves the retained counter exactly where the
-            // admitted N left it: no wrap, no partial advance.
-            available,
-        ),
-        (
-            "LIMIT-A-03.04",
-            1,
-            Err(crate::ProtocolLimitsError::ChargeOverflow { limit: row_limit }),
-            available,
-        ),
-    ];
-    for (index, (id, requested, result, retained)) in expected_arithmetic.into_iter().enumerate() {
-        let row = &arithmetic_rows[index];
-        assert_eq!(row.id, id, "arithmetic row {index} is out of acceptance order");
-        assert_eq!(row.requested, requested, "{id}: wrong requested units");
-        assert_eq!(row.available, available, "{id}: wrong available units");
-        assert_eq!(row.result, result, "{id}: wrong public result");
-        assert_eq!(row.retained, retained, "{id}: wrong retained counter");
-    }
-    let arithmetic = crate::limit_01_rows::arithmetic_receipt(&arithmetic_rows);
-    assert_eq!(arithmetic.len(), 1 + 4);
-    assert_eq!(arithmetic[0], "LIMIT01-A-ARITHMETIC-v1 rows=4");
-}
-
-/// LIMIT-01 A planted negative: one-row N+1 and raw identifiers leave state unchanged.
-#[cfg(test)]
-#[test]
-fn limit_01_a_planted_negative() {
-    let limits = crate::ProtocolLimits::try_new(
-        crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
-        crate::DEFAULT_METADATA_MAX_ENTRIES,
-        crate::DEFAULT_METADATA_MAX_BYTES,
-        crate::DEFAULT_URI_MAX_BYTES,
-        crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
-        crate::DEFAULT_CURSOR_MAX_BYTES,
-    )
-    .expect("documented defaults must admit");
-    let snapshot_before = limits.snapshot();
-    let mut admitted = 0_usize;
-    let planted = crate::ProtocolLimit::MetadataEntries;
-    let ceiling = limits.configured_units(planted).expect("countable row");
-    let refused = limits
-        .try_charge(planted, ceiling, 1)
-        .expect_err("N+1 must refuse");
-    assert_eq!(
-        refused,
-        crate::ProtocolLimitsError::ChargeExceedsLimit {
-            limit: planted,
-            requested: ceiling + 1,
-            ceiling,
-        }
-    );
-    let overflow = limits
-        .try_charge(planted, usize::MAX, 1)
-        .expect_err("overflow must refuse");
-    assert_eq!(
-        overflow,
-        crate::ProtocolLimitsError::ChargeOverflow { limit: planted }
-    );
-    assert_eq!(admitted, 0);
-    admitted = limits
-        .try_charge(planted, admitted, ceiling)
-        .expect("exact N still admits after refused N+1");
-    assert_eq!(admitted, ceiling);
-    assert_eq!(limits.snapshot(), snapshot_before);
-    assert_eq!(
-        crate::ProtocolLimits::builder()
-            .metadata_max_entries(crate::HARD_METADATA_MAX_ENTRIES + 1)
-            .build()
-            .expect_err("ceiling+1 must refuse configuration"),
-        crate::ProtocolLimitsError::ExceedsHardCeiling {
-            limit: crate::ProtocolLimit::MetadataEntries,
-        }
-    );
-    assert_eq!(limits.snapshot(), snapshot_before);
-
-    let partition_before = crate::AdmissionPartition::pre_auth(
-        crate::PreAuthSourceBucketKey::from_listener_and_source(
-            "mcp.example.test",
-            "tcp:203.0.113.8",
-        )
-        .expect("transport-observed source is admitted"),
-    );
-    assert_eq!(
-        crate::QuotaPartitionKey::try_from_request_identifier("raw-request-id"),
-        Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier)
-    );
-    assert_eq!(
-        crate::AdmissionPartition::try_from_request_identifier("raw-request-id"),
-        Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier)
-    );
-    assert!(partition_before.is_pre_auth());
-    assert!(!partition_before.is_verified());
-    assert_eq!(limits.snapshot(), snapshot_before);
-
-    // -----------------------------------------------------------------------
-    // The canonical receipts are unchanged across the refused one-variable
-    // mutation — and are proved sensitive first, so "unchanged" means something.
-    // -----------------------------------------------------------------------
-
-    let bounds_before = crate::limit_01_rows::bounds_receipt(&crate::limit_01_rows::run_bound_rows());
-    let partitions_before =
-        crate::limit_01_rows::partitions_receipt(&crate::limit_01_rows::run_partition_rows());
-    let arithmetic_before =
-        crate::limit_01_rows::arithmetic_receipt(&crate::limit_01_rows::run_arithmetic_rows());
-
-    // SENSITIVITY: a receipt that cannot change cannot witness anything. Perturb
-    // exactly one observed field in each row set and require the digest to move.
-    // If these pass while the digest is a constant string, the equality checks
-    // below would be worthless.
-    let mut perturbed_bounds = crate::limit_01_rows::run_bound_rows();
-    perturbed_bounds[1].configured += 1;
-    assert_ne!(
-        crate::limit_01_rows::bounds_receipt(&perturbed_bounds),
-        bounds_before,
-        "LIMIT01-A-BOUNDS-v1 must observe the configured field"
-    );
-    let mut perturbed_partitions = crate::limit_01_rows::run_partition_rows();
-    perturbed_partitions[0].non_authorizing = !perturbed_partitions[0].non_authorizing;
-    assert_ne!(
-        crate::limit_01_rows::partitions_receipt(&perturbed_partitions),
-        partitions_before,
-        "LIMIT01-A-PARTITIONS-v1 must observe the non-authorizing-key status"
-    );
-    let mut perturbed_arithmetic = crate::limit_01_rows::run_arithmetic_rows();
-    perturbed_arithmetic[3].retained += 1;
-    assert_ne!(
-        crate::limit_01_rows::arithmetic_receipt(&perturbed_arithmetic),
-        arithmetic_before,
-        "LIMIT01-A-ARITHMETIC-v1 must observe the retained counter"
-    );
-
-    // THE ONE VARIABLE: a single catalog row moves from its ceiling N to N+1.
-    // Every other row keeps its documented value.
-    let mutated = crate::limit_01_rows::build_with_override(
-        crate::ProtocolLimit::CursorBytes,
-        crate::HARD_CURSOR_MAX_BYTES + 1,
-    )
-    .expect_err("one row at ceiling+1 must refuse the whole configuration");
-    assert_eq!(
-        mutated,
-        crate::ProtocolLimitsError::ExceedsHardCeiling {
-            limit: crate::ProtocolLimit::CursorBytes,
-        }
-    );
-    // The same builder with that one row at exactly N still admits, so the
-    // refusal above is attributable to the single changed variable and nothing
-    // else in the configuration.
-    crate::limit_01_rows::build_with_override(
-        crate::ProtocolLimit::CursorBytes,
-        crate::HARD_CURSOR_MAX_BYTES,
-    )
-    .expect("the same configuration at exactly N must still admit");
-
-    // No snapshot, counter, or admitted-work state moved.
-    assert_eq!(
-        crate::limit_01_rows::bounds_receipt(&crate::limit_01_rows::run_bound_rows()),
-        bounds_before,
-        "the refused row must leave LIMIT01-A-BOUNDS-v1 byte-identical"
-    );
-    assert_eq!(
-        crate::limit_01_rows::partitions_receipt(&crate::limit_01_rows::run_partition_rows()),
-        partitions_before,
-        "the refused row must leave LIMIT01-A-PARTITIONS-v1 byte-identical"
-    );
-    assert_eq!(
-        crate::limit_01_rows::arithmetic_receipt(&crate::limit_01_rows::run_arithmetic_rows()),
-        arithmetic_before,
-        "the refused row must leave LIMIT01-A-ARITHMETIC-v1 byte-identical"
-    );
-    assert_eq!(limits.snapshot(), snapshot_before);
-}
-
-#[cfg(test)]
-fn limit_01_b_limits() -> crate::ProtocolLimits {
-    crate::ProtocolLimits::try_new(
-        crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
-        crate::DEFAULT_METADATA_MAX_ENTRIES,
-        crate::DEFAULT_METADATA_MAX_BYTES,
-        crate::DEFAULT_URI_MAX_BYTES,
-        crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
-        crate::DEFAULT_CURSOR_MAX_BYTES,
-    )
-    .expect("documented defaults must admit")
-}
-
-#[cfg(test)]
-fn limit_01_b_partition(source: &str) -> crate::AdmissionPartition {
-    crate::AdmissionPartition::pre_auth(
-        crate::PreAuthSourceBucketKey::from_listener_and_source("mcp.example.test", source)
+        let pre_auth = crate::AdmissionPartition::pre_auth(
+            crate::PreAuthSourceBucketKey::from_listener_and_source(
+                "mcp.example.test",
+                "tcp:203.0.113.8",
+            )
             .expect("transport-observed source is admitted"),
-    )
-}
+        );
+        assert!(pre_auth.is_pre_auth());
+        assert!(!pre_auth.is_verified());
+        let verified = crate::AdmissionPartition::verified(
+            crate::QuotaPartitionKey::from_verified_security_facts(
+                "static-token",
+                1,
+                "https://issuer.example.test",
+                "https://mcp.example.test/mcp",
+                "tenant-a",
+                "subject-a",
+            )
+            .expect("verified security facts mint a partition key"),
+        );
+        assert!(verified.is_verified());
+        let flow = crate::AdmissionPartition::authorization_flow(
+            crate::AuthorizationFlowQuotaKey::from_configured_flow(
+                "https://issuer.example.test",
+                "https://mcp.example.test/mcp",
+                "registered-client-1",
+                "loopback",
+                "oauth-authorization-code",
+            )
+            .expect("configured flow is admitted"),
+        );
+        assert!(!flow.is_verified());
+        assert!(!flow.is_pre_auth());
 
-/// LIMIT-01 B positive: reserve N-1/N, commit/release lifecycle, two-partition fairness.
-#[cfg(test)]
-#[test]
-fn limit_01_b_positive() {
-    const N: usize = 4;
-    let snapshot = limit_01_b_limits();
-    let controller =
-        crate::AdmissionController::with_capacity(snapshot.snapshot(), N).expect("capacity N");
-    let partition = limit_01_b_partition("tcp:203.0.113.8");
+        // -----------------------------------------------------------------------
+        // Ordered acceptance rows and the three canonical LIMIT-01 A receipts.
+        // -----------------------------------------------------------------------
 
-    let mut held_n_minus_one = controller
-        .reserve(partition.clone(), N - 1)
-        .expect("N-1 admits");
-    assert_eq!(controller.global_in_use(), N - 1);
-    assert_eq!(controller.partition_in_use(&partition), N - 1);
-    held_n_minus_one.release().expect("release N-1");
-    assert_eq!(controller.global_in_use(), 0);
-    assert_eq!(controller.release_count(), 1);
-
-    let mut held_n = controller.reserve(partition.clone(), N).expect("N admits");
-    assert_eq!(controller.global_in_use(), N);
-    assert_eq!(
-        controller
-            .reserve(partition.clone(), 1)
-            .expect_err("N+1 partition"),
-        crate::AdmissionError::PartitionCapacityExceeded {
-            requested: 1,
-            in_use: N,
-            limit: N,
+        // AC-LIMIT-A-01-BOUNDS — numeric floor 6, digest LIMIT01-A-BOUNDS-v1 over
+        // ordered row ID / default / ceiling / result fields.
+        let bound_rows = crate::limit_01_rows::run_bound_rows();
+        assert_eq!(bound_rows.len(), 6, "AC-LIMIT-A-01 numeric floor is 6 rows");
+        let bounds = crate::limit_01_rows::bounds_receipt(&bound_rows);
+        assert_eq!(
+            bounds.len(),
+            1 + 6,
+            "the bounds receipt carries a header and six ordered rows"
+        );
+        assert_eq!(
+            bounds[0],
+            format!(
+                "LIMIT01-A-BOUNDS-v1 rows=6 generation={}",
+                crate::PROTOCOL_LIMITS_INITIAL_GENERATION
+            )
+        );
+        for (index, (id, limit, default, ceiling)) in
+            crate::limit_01_rows::bound_rows().into_iter().enumerate()
+        {
+            // Each row's declared refusal above its ceiling is the row's own bound,
+            // so a diagnostic naming the wrong bound fails here.
+            assert_eq!(
+                bounds[1 + index],
+                format!(
+                    "{id} configured={default} ceiling={ceiling} generation={} refused={:?}",
+                    crate::PROTOCOL_LIMITS_INITIAL_GENERATION,
+                    crate::ProtocolLimitsError::ExceedsHardCeiling { limit }
+                ),
+                "bounds receipt row {index} must be the frozen {id} tuple"
+            );
         }
-    );
-    assert_eq!(controller.global_in_use(), N);
-    held_n.commit().expect("commit transfers occupancy");
-    assert_eq!(controller.global_in_use(), N);
-    assert_eq!(controller.committed_work(), N);
-    held_n.release().expect("release committed work");
-    assert_eq!(controller.global_in_use(), 0);
-    assert_eq!(controller.committed_work(), 0);
-    assert_eq!(controller.release_count(), 2);
 
-    {
-        let _dropped = controller
-            .reserve(partition.clone(), 1)
-            .expect("drop path admits");
-        assert_eq!(controller.global_in_use(), 1);
-    }
-    assert_eq!(controller.global_in_use(), 0);
-    assert_eq!(controller.release_count(), 3);
-
-    let mut expired = controller
-        .reserve_with_deadline(partition.clone(), 1, std::time::Instant::now())
-        .expect("deadline reserve still holds occupancy");
-    assert_eq!(
-        expired.commit().expect_err("expired commit rejects"),
-        crate::AdmissionError::DeadlineExceeded
-    );
-    assert_eq!(controller.global_in_use(), 1);
-    assert_eq!(controller.committed_work(), 0);
-    expired.release().expect("release after commit-reject");
-    assert_eq!(controller.global_in_use(), 0);
-
-    let peer = crate::AdmissionController::with_capacities(snapshot.snapshot(), 2, 2)
-        .expect("fairness capacities");
-    let left = limit_01_b_partition("tcp:203.0.113.10");
-    let right = limit_01_b_partition("tcp:203.0.113.11");
-    let mut left_hold = peer
-        .reserve(left.clone(), 2)
-        .expect("left saturates global");
-    assert_eq!(
-        peer.reserve(right.clone(), 1)
-            .expect_err("saturated global rejects the other partition"),
-        crate::AdmissionError::GlobalCapacityExceeded {
-            requested: 1,
-            in_use: 2,
-            limit: 2,
+        // AC-LIMIT-A-02-PARTITIONS — numeric floor 5, digest LIMIT01-A-PARTITIONS-v1
+        // over ordered discriminant / generation / result fields.
+        let partition_rows = crate::limit_01_rows::run_partition_rows();
+        assert_eq!(
+            partition_rows.len(),
+            5,
+            "AC-LIMIT-A-02 numeric floor is 5 rows"
+        );
+        let partitions = crate::limit_01_rows::partitions_receipt(&partition_rows);
+        assert_eq!(partitions.len(), 1 + 5);
+        assert_eq!(partitions[0], "LIMIT01-A-PARTITIONS-v1 rows=5");
+        for (index, (id, discriminant)) in [
+            ("LIMIT-A-02.01", "PreAuth"),
+            ("LIMIT-A-02.02", "Verified"),
+            ("LIMIT-A-02.03", "AuthorizationFlow"),
+            ("LIMIT-A-02.04", "refused"),
+            ("LIMIT-A-02.05", "refused"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = &partition_rows[index];
+            assert_eq!(
+                row.id, id,
+                "partition row {index} is out of acceptance order"
+            );
+            assert_eq!(row.discriminant, discriminant, "{id}: wrong discriminant");
+            assert_eq!(
+                row.generation,
+                crate::PROTOCOL_LIMITS_INITIAL_GENERATION,
+                "{id}: the request snapshot generation must not move"
+            );
+            // Every row re-offers its own raw input to the sealed path. If any
+            // constructor were unsealed so a request-supplied value could mint a
+            // partition, this flips to false.
+            assert!(
+                row.non_authorizing,
+                "{id}: a request-supplied identifier must never mint a partition key"
+            );
+            assert!(
+                partitions[1 + index].starts_with(&format!("{id} discriminant={discriminant}")),
+                "partitions receipt row {index} must be {id}"
+            );
         }
-    );
-    assert_eq!(peer.partition_in_use(&right), 0);
-    assert_eq!(peer.partition_in_use(&left), 2);
-    left_hold.release().expect("left release frees global");
-    let mut right_hold = peer
-        .reserve(right.clone(), 1)
-        .expect("release admits only the eligible other partition");
-    assert_eq!(peer.partition_in_use(&left), 0);
-    assert_eq!(peer.partition_in_use(&right), 1);
-    assert_eq!(peer.global_in_use(), 1);
-    assert_eq!(peer.admission_count(), 2);
-    right_hold.release().expect("right release");
-    assert_eq!(peer.live_reservation_count(), 0);
+        // No raw value manufactured a Verified partition: the only Verified row is
+        // the one built from verified security facts.
+        assert_eq!(
+            partition_rows
+                .iter()
+                .filter(|row| row.discriminant == "Verified")
+                .count(),
+            1,
+            "exactly one row may reach the verified domain, and only from verified facts"
+        );
+        for id in ["LIMIT-A-02.04", "LIMIT-A-02.05"] {
+            let row = partition_rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("refusal row present");
+            assert_eq!(
+                row.result,
+                Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier),
+                "{id}: the sealed refusal must be the typed request-supplied error"
+            );
+        }
 
-    let leak_probe =
-        crate::AdmissionController::with_capacity(snapshot.snapshot(), 1).expect("capacity one");
-    let leak_partition = limit_01_b_partition("tcp:203.0.113.12");
-    for cycle in 0..64 {
-        let mut reservation = leak_probe
-            .reserve(leak_partition.clone(), 1)
-            .expect("capacity-one cycle admits");
-        assert_eq!(leak_probe.live_reservation_count(), 1);
-        reservation.release().expect("capacity-one cycle releases");
-        assert_eq!(leak_probe.live_reservation_count(), 0);
-        assert_eq!(leak_probe.global_in_use(), 0);
-        assert_eq!(leak_probe.release_count(), cycle + 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Ordered acceptance rows and the three canonical LIMIT-01 B receipts.
-    // -----------------------------------------------------------------------
-
-    use crate::limit_01_rows::{B_GLOBAL_CAPACITY, B_PARTITION_CAPACITY, Counters, Terminal};
-
-    // AC-LIMIT-B-01-RESERVE — numeric floor 6, digest LIMIT01-B-RESERVE-v1 over
-    // ordered capacity / request / result / counter fields.
-    let reserve_rows = crate::limit_01_rows::run_reserve_rows();
-    assert_eq!(
-        reserve_rows.len(),
-        6,
-        "AC-LIMIT-B-01 numeric floor is 6 rows"
-    );
-    // Tuple: id, binding ceiling, requested, state, diagnostic, global_in_use,
-    // partition_in_use, live. The global rows carry two live prefill
-    // reservations on OTHER partitions, so their expected live count is the
-    // prefill plus this row's own outcome.
-    let expected_reserve: [(
-        &str,
-        &str,
-        usize,
-        &str,
-        Option<crate::AdmissionError>,
-        usize,
-        usize,
-        usize,
-    ); 6] = [
-        // Per-partition ceiling: N-1, N, N+1. No prefill.
-        ("LIMIT-B-01.01", "partition", B_PARTITION_CAPACITY - 1, "held", None, 2, 2, 1),
-        ("LIMIT-B-01.02", "partition", B_PARTITION_CAPACITY, "held", None, 3, 3, 1),
-        (
-            "LIMIT-B-01.03",
-            "partition",
-            B_PARTITION_CAPACITY + 1,
-            "none",
-            Some(crate::AdmissionError::PartitionCapacityExceeded {
-                requested: B_PARTITION_CAPACITY + 1,
-                in_use: 0,
-                limit: B_PARTITION_CAPACITY,
-            }),
-            0,
-            0,
-            0,
-        ),
-        // Controller-wide ceiling with four units prefilled elsewhere across two
-        // reservations: N-1, N, N+1.
-        ("LIMIT-B-01.04", "global", 1, "held", None, 5, 1, 3),
-        ("LIMIT-B-01.05", "global", 2, "held", None, 6, 2, 3),
-        (
-            "LIMIT-B-01.06",
-            "global",
-            3,
-            "none",
-            Some(crate::AdmissionError::GlobalCapacityExceeded {
-                requested: 3,
-                in_use: 4,
-                limit: B_GLOBAL_CAPACITY,
-            }),
+        // AC-LIMIT-A-03-ARITHMETIC — numeric floor 4, digest LIMIT01-A-ARITHMETIC-v1
+        // over ordered inputs / results / counters.
+        let arithmetic_rows = crate::limit_01_rows::run_arithmetic_rows();
+        assert_eq!(
+            arithmetic_rows.len(),
             4,
-            0,
-            2,
-        ),
-    ];
-    for (index, (id, ceiling, requested, state, diagnostic, global, partition, live)) in
-        expected_reserve.into_iter().enumerate()
-    {
-        let row = &reserve_rows[index];
-        assert_eq!(row.id, id, "reserve row {index} is out of acceptance order");
-        assert_eq!(row.ceiling, ceiling, "{id}: wrong binding ceiling");
-        assert_eq!(row.requested, requested, "{id}: wrong requested units");
-        assert_eq!(row.state, state, "{id}: wrong reservation state");
-        assert_eq!(row.diagnostic, diagnostic, "{id}: wrong rejection diagnostic");
-        assert_eq!(row.after.global_in_use, global, "{id}: wrong global_in_use");
-        assert_eq!(
-            row.after.partition_in_use, partition,
-            "{id}: wrong partition_in_use"
+            "AC-LIMIT-A-03 numeric floor is 4 rows"
         );
-        // Each successful reserve increments each applicable counter exactly
-        // once; a refusal retains no reservation of its own.
-        assert_eq!(
-            row.after.live, live,
-            "{id}: wrong live reservation count after the attempt"
-        );
-        // No attempt on any row has settled yet, so nothing has been released.
-        assert_eq!(row.after.release_count, 0, "{id}: nothing may have released");
-        assert_eq!(row.after.committed_work, 0, "{id}: reserve must not commit");
+        let row_limit = crate::ProtocolLimit::MetadataEntries;
+        let available = crate::DEFAULT_METADATA_MAX_ENTRIES as usize;
+        let expected_arithmetic = [
+            (
+                "LIMIT-A-03.01",
+                available - 1,
+                Ok(available - 1),
+                available - 1,
+            ),
+            ("LIMIT-A-03.02", available, Ok(available), available),
+            (
+                "LIMIT-A-03.03",
+                1,
+                Err(crate::ProtocolLimitsError::ChargeExceedsLimit {
+                    limit: row_limit,
+                    requested: available + 1,
+                    ceiling: available,
+                }),
+                // The refused N+1 leaves the retained counter exactly where the
+                // admitted N left it: no wrap, no partial advance.
+                available,
+            ),
+            (
+                "LIMIT-A-03.04",
+                1,
+                Err(crate::ProtocolLimitsError::ChargeOverflow { limit: row_limit }),
+                available,
+            ),
+        ];
+        for (index, (id, requested, result, retained)) in
+            expected_arithmetic.into_iter().enumerate()
+        {
+            let row = &arithmetic_rows[index];
+            assert_eq!(
+                row.id, id,
+                "arithmetic row {index} is out of acceptance order"
+            );
+            assert_eq!(row.requested, requested, "{id}: wrong requested units");
+            assert_eq!(row.available, available, "{id}: wrong available units");
+            assert_eq!(row.result, result, "{id}: wrong public result");
+            assert_eq!(row.retained, retained, "{id}: wrong retained counter");
+        }
+        let arithmetic = crate::limit_01_rows::arithmetic_receipt(&arithmetic_rows);
+        assert_eq!(arithmetic.len(), 1 + 4);
+        assert_eq!(arithmetic[0], "LIMIT01-A-ARITHMETIC-v1 rows=4");
     }
-    let reserve = crate::limit_01_rows::reserve_receipt(&reserve_rows);
-    assert_eq!(reserve.len(), 1 + 6);
-    assert_eq!(
-        reserve[0],
-        format!(
-            "LIMIT01-B-RESERVE-v1 rows=6 global={B_GLOBAL_CAPACITY} partition={B_PARTITION_CAPACITY}"
+
+    /// LIMIT-01 A planted negative: one-row N+1 and raw identifiers leave state unchanged.
+    #[cfg(test)]
+    #[test]
+    fn limit_01_a_planted_negative() {
+        let limits = crate::ProtocolLimits::try_new(
+            crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+            crate::DEFAULT_METADATA_MAX_ENTRIES,
+            crate::DEFAULT_METADATA_MAX_BYTES,
+            crate::DEFAULT_URI_MAX_BYTES,
+            crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
+            crate::DEFAULT_CURSOR_MAX_BYTES,
         )
-    );
-
-    // AC-LIMIT-B-02-LIFECYCLE — numeric floor 6, digest LIMIT01-B-LIFECYCLE-v1
-    // over ordered lifecycle / result / counter fields. All six named terminal
-    // rows, including cancellation.
-    let lifecycle_rows = crate::limit_01_rows::run_lifecycle_rows();
-    assert_eq!(
-        lifecycle_rows.len(),
-        6,
-        "AC-LIMIT-B-02 numeric floor is 6 rows"
-    );
-    let discharged = Counters {
-        global_in_use: 0,
-        partition_in_use: 0,
-        committed_work: 0,
-        release_count: 1,
-        live: 0,
-    };
-    for (index, (id, terminal, state)) in [
-        ("LIMIT-B-02.01", Terminal::CommitSuccess, "committed"),
-        ("LIMIT-B-02.02", Terminal::CommitReject, "released"),
-        ("LIMIT-B-02.03", Terminal::ExplicitRelease, "released"),
-        ("LIMIT-B-02.04", Terminal::Cancellation, "cancelled"),
-        ("LIMIT-B-02.05", Terminal::Deadline, "deadline-exceeded"),
-        ("LIMIT-B-02.06", Terminal::Drop, "dropped"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let row = &lifecycle_rows[index];
-        assert_eq!(row.id, id, "lifecycle row {index} is out of acceptance order");
-        assert_eq!(row.terminal, terminal, "{id}: wrong terminal disposition");
-        assert_eq!(row.state, state, "{id}: wrong reservation state");
-        // Every terminal path releases each charge exactly once: release_count
-        // is 1, never 0 (leaked) and never 2 (double-released).
+        .expect("documented defaults must admit");
+        let snapshot_before = limits.snapshot();
+        let mut admitted = 0_usize;
+        let planted = crate::ProtocolLimit::MetadataEntries;
+        let ceiling = limits.configured_units(planted).expect("countable row");
+        let refused = limits
+            .try_charge(planted, ceiling, 1)
+            .expect_err("N+1 must refuse");
         assert_eq!(
-            row.after, discharged,
-            "{id}: every terminal path must discharge exactly once"
+            refused,
+            crate::ProtocolLimitsError::ChargeExceedsLimit {
+                limit: planted,
+                requested: ceiling + 1,
+                ceiling,
+            }
         );
-        // Neither a repeated commit nor a repeated release may be accepted.
-        if row.terminal == Terminal::Drop {
-            assert_eq!(row.repeated_commit, None);
-            assert_eq!(row.repeated_release, None);
-        } else {
+        let overflow = limits
+            .try_charge(planted, usize::MAX, 1)
+            .expect_err("overflow must refuse");
+        assert_eq!(
+            overflow,
+            crate::ProtocolLimitsError::ChargeOverflow { limit: planted }
+        );
+        assert_eq!(admitted, 0);
+        admitted = limits
+            .try_charge(planted, admitted, ceiling)
+            .expect("exact N still admits after refused N+1");
+        assert_eq!(admitted, ceiling);
+        assert_eq!(limits.snapshot(), snapshot_before);
+        assert_eq!(
+            crate::ProtocolLimits::builder()
+                .metadata_max_entries(crate::HARD_METADATA_MAX_ENTRIES + 1)
+                .build()
+                .expect_err("ceiling+1 must refuse configuration"),
+            crate::ProtocolLimitsError::ExceedsHardCeiling {
+                limit: crate::ProtocolLimit::MetadataEntries,
+            }
+        );
+        assert_eq!(limits.snapshot(), snapshot_before);
+
+        let partition_before = crate::AdmissionPartition::pre_auth(
+            crate::PreAuthSourceBucketKey::from_listener_and_source(
+                "mcp.example.test",
+                "tcp:203.0.113.8",
+            )
+            .expect("transport-observed source is admitted"),
+        );
+        assert_eq!(
+            crate::QuotaPartitionKey::try_from_request_identifier("raw-request-id"),
+            Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier)
+        );
+        assert_eq!(
+            crate::AdmissionPartition::try_from_request_identifier("raw-request-id"),
+            Err(crate::SealedAdmissionKeyError::RequestSuppliedIdentifier)
+        );
+        assert!(partition_before.is_pre_auth());
+        assert!(!partition_before.is_verified());
+        assert_eq!(limits.snapshot(), snapshot_before);
+
+        // -----------------------------------------------------------------------
+        // The canonical receipts are unchanged across the refused one-variable
+        // mutation — and are proved sensitive first, so "unchanged" means something.
+        // -----------------------------------------------------------------------
+
+        let bounds_before =
+            crate::limit_01_rows::bounds_receipt(&crate::limit_01_rows::run_bound_rows());
+        let partitions_before =
+            crate::limit_01_rows::partitions_receipt(&crate::limit_01_rows::run_partition_rows());
+        let arithmetic_before =
+            crate::limit_01_rows::arithmetic_receipt(&crate::limit_01_rows::run_arithmetic_rows());
+
+        // SENSITIVITY: a receipt that cannot change cannot witness anything. Perturb
+        // exactly one observed field in each row set and require the digest to move.
+        // If these pass while the digest is a constant string, the equality checks
+        // below would be worthless.
+        let mut perturbed_bounds = crate::limit_01_rows::run_bound_rows();
+        perturbed_bounds[1].configured += 1;
+        assert_ne!(
+            crate::limit_01_rows::bounds_receipt(&perturbed_bounds),
+            bounds_before,
+            "LIMIT01-A-BOUNDS-v1 must observe the configured field"
+        );
+        let mut perturbed_partitions = crate::limit_01_rows::run_partition_rows();
+        perturbed_partitions[0].non_authorizing = !perturbed_partitions[0].non_authorizing;
+        assert_ne!(
+            crate::limit_01_rows::partitions_receipt(&perturbed_partitions),
+            partitions_before,
+            "LIMIT01-A-PARTITIONS-v1 must observe the non-authorizing-key status"
+        );
+        let mut perturbed_arithmetic = crate::limit_01_rows::run_arithmetic_rows();
+        perturbed_arithmetic[3].retained += 1;
+        assert_ne!(
+            crate::limit_01_rows::arithmetic_receipt(&perturbed_arithmetic),
+            arithmetic_before,
+            "LIMIT01-A-ARITHMETIC-v1 must observe the retained counter"
+        );
+
+        // THE ONE VARIABLE: a single catalog row moves from its ceiling N to N+1.
+        // Every other row keeps its documented value.
+        let mutated = crate::limit_01_rows::build_with_override(
+            crate::ProtocolLimit::CursorBytes,
+            crate::HARD_CURSOR_MAX_BYTES + 1,
+        )
+        .expect_err("one row at ceiling+1 must refuse the whole configuration");
+        assert_eq!(
+            mutated,
+            crate::ProtocolLimitsError::ExceedsHardCeiling {
+                limit: crate::ProtocolLimit::CursorBytes,
+            }
+        );
+        // The same builder with that one row at exactly N still admits, so the
+        // refusal above is attributable to the single changed variable and nothing
+        // else in the configuration.
+        crate::limit_01_rows::build_with_override(
+            crate::ProtocolLimit::CursorBytes,
+            crate::HARD_CURSOR_MAX_BYTES,
+        )
+        .expect("the same configuration at exactly N must still admit");
+
+        // No snapshot, counter, or admitted-work state moved.
+        assert_eq!(
+            crate::limit_01_rows::bounds_receipt(&crate::limit_01_rows::run_bound_rows()),
+            bounds_before,
+            "the refused row must leave LIMIT01-A-BOUNDS-v1 byte-identical"
+        );
+        assert_eq!(
+            crate::limit_01_rows::partitions_receipt(&crate::limit_01_rows::run_partition_rows()),
+            partitions_before,
+            "the refused row must leave LIMIT01-A-PARTITIONS-v1 byte-identical"
+        );
+        assert_eq!(
+            crate::limit_01_rows::arithmetic_receipt(&crate::limit_01_rows::run_arithmetic_rows()),
+            arithmetic_before,
+            "the refused row must leave LIMIT01-A-ARITHMETIC-v1 byte-identical"
+        );
+        assert_eq!(limits.snapshot(), snapshot_before);
+    }
+
+    #[cfg(test)]
+    fn limit_01_b_limits() -> crate::ProtocolLimits {
+        crate::ProtocolLimits::try_new(
+            crate::DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+            crate::DEFAULT_METADATA_MAX_ENTRIES,
+            crate::DEFAULT_METADATA_MAX_BYTES,
+            crate::DEFAULT_URI_MAX_BYTES,
+            crate::DEFAULT_CANCELLATION_REASON_MAX_BYTES,
+            crate::DEFAULT_CURSOR_MAX_BYTES,
+        )
+        .expect("documented defaults must admit")
+    }
+
+    #[cfg(test)]
+    fn limit_01_b_partition(source: &str) -> crate::AdmissionPartition {
+        crate::AdmissionPartition::pre_auth(
+            crate::PreAuthSourceBucketKey::from_listener_and_source("mcp.example.test", source)
+                .expect("transport-observed source is admitted"),
+        )
+    }
+
+    /// LIMIT-01 B positive: reserve N-1/N, commit/release lifecycle, two-partition fairness.
+    #[cfg(test)]
+    #[test]
+    fn limit_01_b_positive() {
+        const N: usize = 4;
+        let snapshot = limit_01_b_limits();
+        let controller =
+            crate::AdmissionController::with_capacity(snapshot.snapshot(), N).expect("capacity N");
+        let partition = limit_01_b_partition("tcp:203.0.113.8");
+
+        let mut held_n_minus_one = controller
+            .reserve(partition.clone(), N - 1)
+            .expect("N-1 admits");
+        assert_eq!(controller.global_in_use(), N - 1);
+        assert_eq!(controller.partition_in_use(&partition), N - 1);
+        held_n_minus_one.release().expect("release N-1");
+        assert_eq!(controller.global_in_use(), 0);
+        assert_eq!(controller.release_count(), 1);
+
+        let mut held_n = controller.reserve(partition.clone(), N).expect("N admits");
+        assert_eq!(controller.global_in_use(), N);
+        assert_eq!(
+            controller
+                .reserve(partition.clone(), 1)
+                .expect_err("N+1 partition"),
+            crate::AdmissionError::PartitionCapacityExceeded {
+                requested: 1,
+                in_use: N,
+                limit: N,
+            }
+        );
+        assert_eq!(controller.global_in_use(), N);
+        held_n.commit().expect("commit transfers occupancy");
+        assert_eq!(controller.global_in_use(), N);
+        assert_eq!(controller.committed_work(), N);
+        held_n.release().expect("release committed work");
+        assert_eq!(controller.global_in_use(), 0);
+        assert_eq!(controller.committed_work(), 0);
+        assert_eq!(controller.release_count(), 2);
+
+        {
+            let _dropped = controller
+                .reserve(partition.clone(), 1)
+                .expect("drop path admits");
+            assert_eq!(controller.global_in_use(), 1);
+        }
+        assert_eq!(controller.global_in_use(), 0);
+        assert_eq!(controller.release_count(), 3);
+
+        let mut expired = controller
+            .reserve_with_deadline(partition.clone(), 1, std::time::Instant::now())
+            .expect("deadline reserve still holds occupancy");
+        assert_eq!(
+            expired.commit().expect_err("expired commit rejects"),
+            crate::AdmissionError::DeadlineExceeded
+        );
+        assert_eq!(controller.global_in_use(), 1);
+        assert_eq!(controller.committed_work(), 0);
+        expired.release().expect("release after commit-reject");
+        assert_eq!(controller.global_in_use(), 0);
+
+        let peer = crate::AdmissionController::with_capacities(snapshot.snapshot(), 2, 2)
+            .expect("fairness capacities");
+        let left = limit_01_b_partition("tcp:203.0.113.10");
+        let right = limit_01_b_partition("tcp:203.0.113.11");
+        let mut left_hold = peer
+            .reserve(left.clone(), 2)
+            .expect("left saturates global");
+        assert_eq!(
+            peer.reserve(right.clone(), 1)
+                .expect_err("saturated global rejects the other partition"),
+            crate::AdmissionError::GlobalCapacityExceeded {
+                requested: 1,
+                in_use: 2,
+                limit: 2,
+            }
+        );
+        assert_eq!(peer.partition_in_use(&right), 0);
+        assert_eq!(peer.partition_in_use(&left), 2);
+        left_hold.release().expect("left release frees global");
+        let mut right_hold = peer
+            .reserve(right.clone(), 1)
+            .expect("release admits only the eligible other partition");
+        assert_eq!(peer.partition_in_use(&left), 0);
+        assert_eq!(peer.partition_in_use(&right), 1);
+        assert_eq!(peer.global_in_use(), 1);
+        assert_eq!(peer.admission_count(), 2);
+        right_hold.release().expect("right release");
+        assert_eq!(peer.live_reservation_count(), 0);
+
+        let leak_probe = crate::AdmissionController::with_capacity(snapshot.snapshot(), 1)
+            .expect("capacity one");
+        let leak_partition = limit_01_b_partition("tcp:203.0.113.12");
+        for cycle in 0..64 {
+            let mut reservation = leak_probe
+                .reserve(leak_partition.clone(), 1)
+                .expect("capacity-one cycle admits");
+            assert_eq!(leak_probe.live_reservation_count(), 1);
+            reservation.release().expect("capacity-one cycle releases");
+            assert_eq!(leak_probe.live_reservation_count(), 0);
+            assert_eq!(leak_probe.global_in_use(), 0);
+            assert_eq!(leak_probe.release_count(), cycle + 1);
+        }
+
+        // -----------------------------------------------------------------------
+        // Ordered acceptance rows and the three canonical LIMIT-01 B receipts.
+        // -----------------------------------------------------------------------
+
+        use crate::limit_01_rows::{B_GLOBAL_CAPACITY, B_PARTITION_CAPACITY, Counters, Terminal};
+
+        // AC-LIMIT-B-01-RESERVE — numeric floor 6, digest LIMIT01-B-RESERVE-v1 over
+        // ordered capacity / request / result / counter fields.
+        let reserve_rows = crate::limit_01_rows::run_reserve_rows();
+        assert_eq!(
+            reserve_rows.len(),
+            6,
+            "AC-LIMIT-B-01 numeric floor is 6 rows"
+        );
+        // Tuple: id, binding ceiling, requested, state, diagnostic, global_in_use,
+        // partition_in_use, live. The global rows carry two live prefill
+        // reservations on OTHER partitions, so their expected live count is the
+        // prefill plus this row's own outcome.
+        let expected_reserve: [(
+            &str,
+            &str,
+            usize,
+            &str,
+            Option<crate::AdmissionError>,
+            usize,
+            usize,
+            usize,
+        ); 6] = [
+            // Per-partition ceiling: N-1, N, N+1. No prefill.
+            (
+                "LIMIT-B-01.01",
+                "partition",
+                B_PARTITION_CAPACITY - 1,
+                "held",
+                None,
+                2,
+                2,
+                1,
+            ),
+            (
+                "LIMIT-B-01.02",
+                "partition",
+                B_PARTITION_CAPACITY,
+                "held",
+                None,
+                3,
+                3,
+                1,
+            ),
+            (
+                "LIMIT-B-01.03",
+                "partition",
+                B_PARTITION_CAPACITY + 1,
+                "none",
+                Some(crate::AdmissionError::PartitionCapacityExceeded {
+                    requested: B_PARTITION_CAPACITY + 1,
+                    in_use: 0,
+                    limit: B_PARTITION_CAPACITY,
+                }),
+                0,
+                0,
+                0,
+            ),
+            // Controller-wide ceiling with four units prefilled elsewhere across two
+            // reservations: N-1, N, N+1.
+            ("LIMIT-B-01.04", "global", 1, "held", None, 5, 1, 3),
+            ("LIMIT-B-01.05", "global", 2, "held", None, 6, 2, 3),
+            (
+                "LIMIT-B-01.06",
+                "global",
+                3,
+                "none",
+                Some(crate::AdmissionError::GlobalCapacityExceeded {
+                    requested: 3,
+                    in_use: 4,
+                    limit: B_GLOBAL_CAPACITY,
+                }),
+                4,
+                0,
+                2,
+            ),
+        ];
+        for (index, (id, ceiling, requested, state, diagnostic, global, partition, live)) in
+            expected_reserve.into_iter().enumerate()
+        {
+            let row = &reserve_rows[index];
+            assert_eq!(row.id, id, "reserve row {index} is out of acceptance order");
+            assert_eq!(row.ceiling, ceiling, "{id}: wrong binding ceiling");
+            assert_eq!(row.requested, requested, "{id}: wrong requested units");
+            assert_eq!(row.state, state, "{id}: wrong reservation state");
             assert_eq!(
-                row.repeated_commit,
-                Some(Err(crate::AdmissionError::AlreadySettled)),
-                "{id}: a repeated commit must reject"
+                row.diagnostic, diagnostic,
+                "{id}: wrong rejection diagnostic"
             );
+            assert_eq!(row.after.global_in_use, global, "{id}: wrong global_in_use");
             assert_eq!(
-                row.repeated_release,
-                Some(Err(crate::AdmissionError::AlreadySettled)),
-                "{id}: a repeated release must reject"
+                row.after.partition_in_use, partition,
+                "{id}: wrong partition_in_use"
+            );
+            // Each successful reserve increments each applicable counter exactly
+            // once; a refusal retains no reservation of its own.
+            assert_eq!(
+                row.after.live, live,
+                "{id}: wrong live reservation count after the attempt"
+            );
+            // No attempt on any row has settled yet, so nothing has been released.
+            assert_eq!(
+                row.after.release_count, 0,
+                "{id}: nothing may have released"
+            );
+            assert_eq!(row.after.committed_work, 0, "{id}: reserve must not commit");
+        }
+        let reserve = crate::limit_01_rows::reserve_receipt(&reserve_rows);
+        assert_eq!(reserve.len(), 1 + 6);
+        assert_eq!(
+            reserve[0],
+            format!(
+                "LIMIT01-B-RESERVE-v1 rows=6 global={B_GLOBAL_CAPACITY} partition={B_PARTITION_CAPACITY}"
+            )
+        );
+
+        // AC-LIMIT-B-02-LIFECYCLE — numeric floor 6, digest LIMIT01-B-LIFECYCLE-v1
+        // over ordered lifecycle / result / counter fields. All six named terminal
+        // rows, including cancellation.
+        let lifecycle_rows = crate::limit_01_rows::run_lifecycle_rows();
+        assert_eq!(
+            lifecycle_rows.len(),
+            6,
+            "AC-LIMIT-B-02 numeric floor is 6 rows"
+        );
+        let discharged = Counters {
+            global_in_use: 0,
+            partition_in_use: 0,
+            committed_work: 0,
+            release_count: 1,
+            live: 0,
+        };
+        for (index, (id, terminal, state)) in [
+            ("LIMIT-B-02.01", Terminal::CommitSuccess, "committed"),
+            ("LIMIT-B-02.02", Terminal::CommitReject, "released"),
+            ("LIMIT-B-02.03", Terminal::ExplicitRelease, "released"),
+            ("LIMIT-B-02.04", Terminal::Cancellation, "cancelled"),
+            ("LIMIT-B-02.05", Terminal::Deadline, "deadline-exceeded"),
+            ("LIMIT-B-02.06", Terminal::Drop, "dropped"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = &lifecycle_rows[index];
+            assert_eq!(
+                row.id, id,
+                "lifecycle row {index} is out of acceptance order"
+            );
+            assert_eq!(row.terminal, terminal, "{id}: wrong terminal disposition");
+            assert_eq!(row.state, state, "{id}: wrong reservation state");
+            // Every terminal path releases each charge exactly once: release_count
+            // is 1, never 0 (leaked) and never 2 (double-released).
+            assert_eq!(
+                row.after, discharged,
+                "{id}: every terminal path must discharge exactly once"
+            );
+            // Neither a repeated commit nor a repeated release may be accepted.
+            if row.terminal == Terminal::Drop {
+                assert_eq!(row.repeated_commit, None);
+                assert_eq!(row.repeated_release, None);
+            } else {
+                assert_eq!(
+                    row.repeated_commit,
+                    Some(Err(crate::AdmissionError::AlreadySettled)),
+                    "{id}: a repeated commit must reject"
+                );
+                assert_eq!(
+                    row.repeated_release,
+                    Some(Err(crate::AdmissionError::AlreadySettled)),
+                    "{id}: a repeated release must reject"
+                );
+            }
+        }
+        // The cancellation row is present and really exercised the shipped
+        // `AdmissionReservation::cancel` entrypoint.
+        assert!(
+            lifecycle_rows
+                .iter()
+                .any(|row| row.terminal == Terminal::Cancellation),
+            "AC-LIMIT-B-02 requires a cancellation terminal row"
+        );
+        let lifecycle = crate::limit_01_rows::lifecycle_receipt(&lifecycle_rows);
+        assert_eq!(lifecycle.len(), 1 + 6);
+        assert_eq!(lifecycle[0], "LIMIT01-B-LIFECYCLE-v1 rows=6");
+
+        // AC-LIMIT-B-03-FAIRNESS — numeric floor 4, digest LIMIT01-B-FAIRNESS-v1
+        // over ordered partition / request / outcome / counter fields.
+        let fairness_rows = crate::limit_01_rows::run_fairness_rows();
+        assert_eq!(
+            fairness_rows.len(),
+            4,
+            "AC-LIMIT-B-03 numeric floor is 4 rows"
+        );
+        let expected_fairness: [(&str, &str, &str, usize, usize, usize); 4] = [
+            // (id, partition, outcome, global, left, right)
+            ("LIMIT-B-03.01", "left", "admitted", 2, 2, 0),
+            ("LIMIT-B-03.02", "right", "refused", 2, 2, 0),
+            ("LIMIT-B-03.03", "right", "admitted", 1, 0, 1),
+            ("LIMIT-B-03.04", "right", "refused", 1, 0, 1),
+        ];
+        for (index, (id, partition, outcome, global, left, right)) in
+            expected_fairness.into_iter().enumerate()
+        {
+            let row = &fairness_rows[index];
+            assert_eq!(
+                row.id, id,
+                "fairness row {index} is out of acceptance order"
+            );
+            assert_eq!(row.partition, partition, "{id}: wrong acting partition");
+            assert_eq!(row.outcome, outcome, "{id}: wrong outcome");
+            // Saturation never exceeds global N.
+            assert!(row.global_in_use <= 2, "{id}: global occupancy exceeded N");
+            assert_eq!(row.global_in_use, global, "{id}: wrong global counter");
+            assert_eq!(row.left_in_use, left, "{id}: wrong left partition counter");
+            assert_eq!(
+                row.right_in_use, right,
+                "{id}: wrong right partition counter"
             );
         }
+        // One partition cannot retain another partition's charge: once left
+        // releases, its counter is zero even while right holds.
+        assert_eq!(fairness_rows[2].left_in_use, 0);
+        assert_eq!(fairness_rows[2].right_in_use, 1);
+        // The refusals are the typed boundary errors, and they name different
+        // ceilings: .02 is refused globally, .04 by the peer's own partition row.
+        assert_eq!(
+            fairness_rows[1].diagnostic,
+            Some(crate::AdmissionError::GlobalCapacityExceeded {
+                requested: 1,
+                in_use: 2,
+                limit: 2,
+            })
+        );
+        assert_eq!(
+            fairness_rows[3].diagnostic,
+            Some(crate::AdmissionError::PartitionCapacityExceeded {
+                requested: 2,
+                in_use: 1,
+                limit: 2,
+            })
+        );
+        let fairness = crate::limit_01_rows::fairness_receipt(&fairness_rows);
+        assert_eq!(fairness.len(), 1 + 4);
+        assert_eq!(fairness[0], "LIMIT01-B-FAIRNESS-v1 rows=4");
     }
-    // The cancellation row is present and really exercised the shipped
-    // `AdmissionReservation::cancel` entrypoint.
-    assert!(
-        lifecycle_rows
-            .iter()
-            .any(|row| row.terminal == Terminal::Cancellation),
-        "AC-LIMIT-B-02 requires a cancellation terminal row"
-    );
-    let lifecycle = crate::limit_01_rows::lifecycle_receipt(&lifecycle_rows);
-    assert_eq!(lifecycle.len(), 1 + 6);
-    assert_eq!(lifecycle[0], "LIMIT01-B-LIFECYCLE-v1 rows=6");
 
-    // AC-LIMIT-B-03-FAIRNESS — numeric floor 4, digest LIMIT01-B-FAIRNESS-v1
-    // over ordered partition / request / outcome / counter fields.
-    let fairness_rows = crate::limit_01_rows::run_fairness_rows();
-    assert_eq!(
-        fairness_rows.len(),
-        4,
-        "AC-LIMIT-B-03 numeric floor is 4 rows"
-    );
-    let expected_fairness: [(&str, &str, &str, usize, usize, usize); 4] = [
-        // (id, partition, outcome, global, left, right)
-        ("LIMIT-B-03.01", "left", "admitted", 2, 2, 0),
-        ("LIMIT-B-03.02", "right", "refused", 2, 2, 0),
-        ("LIMIT-B-03.03", "right", "admitted", 1, 0, 1),
-        ("LIMIT-B-03.04", "right", "refused", 1, 0, 1),
-    ];
-    for (index, (id, partition, outcome, global, left, right)) in
-        expected_fairness.into_iter().enumerate()
-    {
-        let row = &fairness_rows[index];
-        assert_eq!(row.id, id, "fairness row {index} is out of acceptance order");
-        assert_eq!(row.partition, partition, "{id}: wrong acting partition");
-        assert_eq!(row.outcome, outcome, "{id}: wrong outcome");
-        // Saturation never exceeds global N.
-        assert!(row.global_in_use <= 2, "{id}: global occupancy exceeded N");
-        assert_eq!(row.global_in_use, global, "{id}: wrong global counter");
-        assert_eq!(row.left_in_use, left, "{id}: wrong left partition counter");
-        assert_eq!(row.right_in_use, right, "{id}: wrong right partition counter");
-    }
-    // One partition cannot retain another partition's charge: once left
-    // releases, its counter is zero even while right holds.
-    assert_eq!(fairness_rows[2].left_in_use, 0);
-    assert_eq!(fairness_rows[2].right_in_use, 1);
-    // The refusals are the typed boundary errors, and they name different
-    // ceilings: .02 is refused globally, .04 by the peer's own partition row.
-    assert_eq!(
-        fairness_rows[1].diagnostic,
-        Some(crate::AdmissionError::GlobalCapacityExceeded {
-            requested: 1,
-            in_use: 2,
-            limit: 2,
-        })
-    );
-    assert_eq!(
-        fairness_rows[3].diagnostic,
-        Some(crate::AdmissionError::PartitionCapacityExceeded {
-            requested: 2,
-            in_use: 1,
-            limit: 2,
-        })
-    );
-    let fairness = crate::limit_01_rows::fairness_receipt(&fairness_rows);
-    assert_eq!(fairness.len(), 1 + 4);
-    assert_eq!(fairness[0], "LIMIT01-B-FAIRNESS-v1 rows=4");
-}
+    /// LIMIT-01 B planted negative: one-variable N+1 and second release leave counters unchanged.
+    #[cfg(test)]
+    #[test]
+    fn limit_01_b_planted_negative() {
+        let snapshot = limit_01_b_limits();
+        let controller = crate::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2)
+            .expect("capacities");
+        let left = limit_01_b_partition("tcp:203.0.113.10");
+        let right = limit_01_b_partition("tcp:203.0.113.11");
+        let mut left_hold = controller.reserve(left.clone(), 1).expect("left holds 1");
+        let before_global = controller.global_in_use();
+        let before_left = controller.partition_in_use(&left);
+        let before_right = controller.partition_in_use(&right);
+        let before_committed = controller.committed_work();
+        let before_releases = controller.release_count();
+        let before_admitted = controller.admission_count();
+        assert_eq!(
+            controller
+                .reserve(right.clone(), 3)
+                .expect_err("partition N+1 rejects"),
+            crate::AdmissionError::PartitionCapacityExceeded {
+                requested: 3,
+                in_use: 0,
+                limit: 2,
+            }
+        );
+        assert_eq!(controller.global_in_use(), before_global);
+        assert_eq!(controller.partition_in_use(&left), before_left);
+        assert_eq!(controller.partition_in_use(&right), before_right);
+        assert_eq!(controller.committed_work(), before_committed);
+        assert_eq!(controller.release_count(), before_releases);
+        assert_eq!(controller.admission_count(), before_admitted);
+        assert_eq!(controller.live_reservation_count(), 1);
 
-/// LIMIT-01 B planted negative: one-variable N+1 and second release leave counters unchanged.
-#[cfg(test)]
-#[test]
-fn limit_01_b_planted_negative() {
-    let snapshot = limit_01_b_limits();
-    let controller =
-        crate::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2).expect("capacities");
-    let left = limit_01_b_partition("tcp:203.0.113.10");
-    let right = limit_01_b_partition("tcp:203.0.113.11");
-    let mut left_hold = controller.reserve(left.clone(), 1).expect("left holds 1");
-    let before_global = controller.global_in_use();
-    let before_left = controller.partition_in_use(&left);
-    let before_right = controller.partition_in_use(&right);
-    let before_committed = controller.committed_work();
-    let before_releases = controller.release_count();
-    let before_admitted = controller.admission_count();
-    assert_eq!(
-        controller
-            .reserve(right.clone(), 3)
-            .expect_err("partition N+1 rejects"),
-        crate::AdmissionError::PartitionCapacityExceeded {
-            requested: 3,
-            in_use: 0,
-            limit: 2,
-        }
-    );
-    assert_eq!(controller.global_in_use(), before_global);
-    assert_eq!(controller.partition_in_use(&left), before_left);
-    assert_eq!(controller.partition_in_use(&right), before_right);
-    assert_eq!(controller.committed_work(), before_committed);
-    assert_eq!(controller.release_count(), before_releases);
-    assert_eq!(controller.admission_count(), before_admitted);
-    assert_eq!(controller.live_reservation_count(), 1);
-
-    left_hold.release().expect("first release");
-    let after_first = (
-        controller.global_in_use(),
-        controller.partition_in_use(&left),
-        controller.committed_work(),
-        controller.release_count(),
-        controller.live_reservation_count(),
-        controller.admission_count(),
-    );
-    assert_eq!(after_first.4, 0, "a released reservation is not retained");
-    assert_eq!(
-        left_hold
-            .release()
-            .expect_err("second release is already settled"),
-        crate::AdmissionError::AlreadySettled
-    );
-    assert_eq!(
-        (
+        left_hold.release().expect("first release");
+        let after_first = (
             controller.global_in_use(),
             controller.partition_in_use(&left),
             controller.committed_work(),
             controller.release_count(),
             controller.live_reservation_count(),
             controller.admission_count(),
-        ),
-        after_first
-    );
+        );
+        assert_eq!(after_first.4, 0, "a released reservation is not retained");
+        assert_eq!(
+            left_hold
+                .release()
+                .expect_err("second release is already settled"),
+            crate::AdmissionError::AlreadySettled
+        );
+        assert_eq!(
+            (
+                controller.global_in_use(),
+                controller.partition_in_use(&left),
+                controller.committed_work(),
+                controller.release_count(),
+                controller.live_reservation_count(),
+                controller.admission_count(),
+            ),
+            after_first
+        );
 
-    // -----------------------------------------------------------------------
-    // The canonical receipts are unchanged across the refused one-variable
-    // mutation — and are proved sensitive first, so "unchanged" means something.
-    // -----------------------------------------------------------------------
+        // -----------------------------------------------------------------------
+        // The canonical receipts are unchanged across the refused one-variable
+        // mutation — and are proved sensitive first, so "unchanged" means something.
+        // -----------------------------------------------------------------------
 
-    let reserve_before = crate::limit_01_rows::reserve_receipt(&crate::limit_01_rows::run_reserve_rows());
-    let lifecycle_before =
-        crate::limit_01_rows::lifecycle_receipt(&crate::limit_01_rows::run_lifecycle_rows());
-    let fairness_before =
-        crate::limit_01_rows::fairness_receipt(&crate::limit_01_rows::run_fairness_rows());
+        let reserve_before =
+            crate::limit_01_rows::reserve_receipt(&crate::limit_01_rows::run_reserve_rows());
+        let lifecycle_before =
+            crate::limit_01_rows::lifecycle_receipt(&crate::limit_01_rows::run_lifecycle_rows());
+        let fairness_before =
+            crate::limit_01_rows::fairness_receipt(&crate::limit_01_rows::run_fairness_rows());
 
-    // SENSITIVITY: perturb exactly one observed field per row set and require
-    // the digest to move. A digest that cannot change witnesses nothing.
-    let mut perturbed_reserve = crate::limit_01_rows::run_reserve_rows();
-    perturbed_reserve[0].after.global_in_use += 1;
-    assert_ne!(
-        crate::limit_01_rows::reserve_receipt(&perturbed_reserve),
-        reserve_before,
-        "LIMIT01-B-RESERVE-v1 must observe global_in_use"
-    );
-    let mut perturbed_lifecycle = crate::limit_01_rows::run_lifecycle_rows();
-    perturbed_lifecycle[3].after.release_count += 1;
-    assert_ne!(
-        crate::limit_01_rows::lifecycle_receipt(&perturbed_lifecycle),
-        lifecycle_before,
-        "LIMIT01-B-LIFECYCLE-v1 must observe the release counter"
-    );
-    let mut perturbed_fairness = crate::limit_01_rows::run_fairness_rows();
-    perturbed_fairness[1].right_in_use += 1;
-    assert_ne!(
-        crate::limit_01_rows::fairness_receipt(&perturbed_fairness),
-        fairness_before,
-        "LIMIT01-B-FAIRNESS-v1 must observe the peer partition counter"
-    );
+        // SENSITIVITY: perturb exactly one observed field per row set and require
+        // the digest to move. A digest that cannot change witnesses nothing.
+        let mut perturbed_reserve = crate::limit_01_rows::run_reserve_rows();
+        perturbed_reserve[0].after.global_in_use += 1;
+        assert_ne!(
+            crate::limit_01_rows::reserve_receipt(&perturbed_reserve),
+            reserve_before,
+            "LIMIT01-B-RESERVE-v1 must observe global_in_use"
+        );
+        let mut perturbed_lifecycle = crate::limit_01_rows::run_lifecycle_rows();
+        perturbed_lifecycle[3].after.release_count += 1;
+        assert_ne!(
+            crate::limit_01_rows::lifecycle_receipt(&perturbed_lifecycle),
+            lifecycle_before,
+            "LIMIT01-B-LIFECYCLE-v1 must observe the release counter"
+        );
+        let mut perturbed_fairness = crate::limit_01_rows::run_fairness_rows();
+        perturbed_fairness[1].right_in_use += 1;
+        assert_ne!(
+            crate::limit_01_rows::fairness_receipt(&perturbed_fairness),
+            fairness_before,
+            "LIMIT01-B-FAIRNESS-v1 must observe the peer partition counter"
+        );
 
-    // THE ONE VARIABLE: on a fresh controller holding the identical prefix, only
-    // the requested units move from the partition ceiling N to N+1.
-    let probe = crate::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2)
-        .expect("capacities");
-    let probe_partition = limit_01_b_partition("tcp:203.0.113.13");
-    let mut at_n = probe
-        .reserve(probe_partition.clone(), 2)
-        .expect("N still admits, so the refusal below is the one changed variable");
-    at_n.release().expect("release the control reservation");
-    let refused = probe
-        .reserve(probe_partition.clone(), 3)
-        .expect_err("N+1 must refuse");
-    assert_eq!(
-        refused,
-        crate::AdmissionError::PartitionCapacityExceeded {
-            requested: 3,
-            in_use: 0,
-            limit: 2,
-        }
-    );
-    assert_eq!(probe.live_reservation_count(), 0);
+        // THE ONE VARIABLE: on a fresh controller holding the identical prefix, only
+        // the requested units move from the partition ceiling N to N+1.
+        let probe = crate::AdmissionController::with_capacities(snapshot.snapshot(), 4, 2)
+            .expect("capacities");
+        let probe_partition = limit_01_b_partition("tcp:203.0.113.13");
+        let mut at_n = probe
+            .reserve(probe_partition.clone(), 2)
+            .expect("N still admits, so the refusal below is the one changed variable");
+        at_n.release().expect("release the control reservation");
+        let refused = probe
+            .reserve(probe_partition.clone(), 3)
+            .expect_err("N+1 must refuse");
+        assert_eq!(
+            refused,
+            crate::AdmissionError::PartitionCapacityExceeded {
+                requested: 3,
+                in_use: 0,
+                limit: 2,
+            }
+        );
+        assert_eq!(probe.live_reservation_count(), 0);
 
-    // Neither counter nor canonical state digest moved.
-    assert_eq!(
-        crate::limit_01_rows::reserve_receipt(&crate::limit_01_rows::run_reserve_rows()),
-        reserve_before,
-        "the refused N+1 must leave LIMIT01-B-RESERVE-v1 byte-identical"
-    );
-    assert_eq!(
-        crate::limit_01_rows::lifecycle_receipt(&crate::limit_01_rows::run_lifecycle_rows()),
-        lifecycle_before,
-        "the refused N+1 must leave LIMIT01-B-LIFECYCLE-v1 byte-identical"
-    );
-    assert_eq!(
-        crate::limit_01_rows::fairness_receipt(&crate::limit_01_rows::run_fairness_rows()),
-        fairness_before,
-        "the refused N+1 must leave LIMIT01-B-FAIRNESS-v1 byte-identical"
-    );
+        // Neither counter nor canonical state digest moved.
+        assert_eq!(
+            crate::limit_01_rows::reserve_receipt(&crate::limit_01_rows::run_reserve_rows()),
+            reserve_before,
+            "the refused N+1 must leave LIMIT01-B-RESERVE-v1 byte-identical"
+        );
+        assert_eq!(
+            crate::limit_01_rows::lifecycle_receipt(&crate::limit_01_rows::run_lifecycle_rows()),
+            lifecycle_before,
+            "the refused N+1 must leave LIMIT01-B-LIFECYCLE-v1 byte-identical"
+        );
+        assert_eq!(
+            crate::limit_01_rows::fairness_receipt(&crate::limit_01_rows::run_fairness_rows()),
+            fairness_before,
+            "the refused N+1 must leave LIMIT01-B-FAIRNESS-v1 byte-identical"
+        );
+    }
 }

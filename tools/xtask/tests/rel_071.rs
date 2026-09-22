@@ -50,6 +50,18 @@ fn flip_one_hex_char(digest: &str) -> String {
     chars.into_iter().collect()
 }
 
+/// The crates.io package/archive category pin. It is a function rather than an
+/// inline assertion so the planted negative can run this exact assertion
+/// against a mutated record; an inline pin could only ever see the committed
+/// fixture, and an assertion no arm can fail binds nothing.
+fn assert_crates_io_archive_bound(observations: &Observations) {
+    assert_eq!(
+        observations.archive_sha256,
+        "65a1fe2947e01290c216e6255de55828295a0c615ed0db5435beabf241766b13",
+        "category: crates.io package/archive"
+    );
+}
+
 #[test]
 fn rel_071_positive() {
     let observations = load();
@@ -74,6 +86,7 @@ fn rel_071_positive() {
         observations.credential_presence.required_entry_count, 4,
         "category: credential-presence metadata"
     );
+    assert_crates_io_archive_bound(&observations);
     // The anchor is what keeps the digest columns from being the release
     // restating its own manifest.
     assert!(
@@ -243,6 +256,35 @@ fn rel_071_planted_negative() {
         vec![Code::MalformedCommit],
         "equal-but-malformed commits must be refused:\n{}",
         refused_g.render()
+    );
+
+    // ARM H — the crates.io package/archive pin, shown to fail. One
+    // hexadecimal character of the archive digest, nothing else. The pin must
+    // refuse it by its own category name, and relation (1) must refuse it
+    // independently, so the category is bound by the literal and by the
+    // archive/advertised relation rather than by either alone.
+    let mut arm_h = load();
+    arm_h.archive_sha256 = flip_one_hex_char(&arm_h.archive_sha256);
+    assert_ne!(
+        arm_h.archive_sha256, accepted.archive_sha256,
+        "the mutation must actually change the record"
+    );
+    let pin_payload = std::panic::catch_unwind(|| assert_crates_io_archive_bound(&arm_h))
+        .expect_err("the archive pin must refuse a divergent archive digest");
+    let pin_message = pin_payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        pin_message.contains("category: crates.io package/archive"),
+        "the pin must fail for the archive category and nothing else: {pin_message:?}"
+    );
+    let refused_h = rel_071::evaluate(&arm_h);
+    assert_eq!(
+        refused_h.codes(),
+        vec![Code::ArchiveDigestMismatch],
+        "the archive relation must refuse it independently of the pin:\n{}",
+        refused_h.render()
     );
 
     // The accepted row is re-evaluated last and must still be admitted, and its

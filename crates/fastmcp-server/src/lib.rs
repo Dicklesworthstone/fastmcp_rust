@@ -7032,9 +7032,13 @@ impl BoundHttpServer {
                         // never evaluated -- a different failure from it returning Ok.
                         #[cfg(test)]
                         lib_unit_tests::record_f2ndd_reaper_stage(42);
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_park(reaper_cx.is_cancel_requested());
                         asupersync::time::sleep(reaper_cx.now(), REAP_PARK_CHUNK).await;
                         #[cfg(test)]
                         lib_unit_tests::record_f2ndd_reaper_stage(43);
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_sleep_return();
                         if reaper_cx.checkpoint().is_err() {
                             #[cfg(test)]
                             lib_unit_tests::record_f2ndd_reaper_stage(44);
@@ -23593,6 +23597,29 @@ mod lib_unit_tests {
 
     pub(super) fn record_f2ndd_reaper_stage(stage: usize) {
         F2NDD_REAPER_STAGE.fetch_max(stage, Ordering::SeqCst);
+    }
+
+    /// DIAGNOSTIC (bd-f2ndd). How many REAP_PARK_CHUNK sleeps have RETURNED.
+    /// Zero at a stage-42 stall means the timer never fired once in this
+    /// process; a positive count means sleeps did wake until one did not.
+    /// Like every f2ndd counter this is process-global and never reset, so it
+    /// is only attributable to one probe when that probe runs alone in its
+    /// own test process (`--exact`, one name per invocation).
+    pub(super) static F2NDD_REAPER_SLEEP_RETURNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// DIAGNOSTIC (bd-f2ndd). Whether cancellation had already been requested
+    /// on the reaper's cx when its MOST RECENT sleep began: 0 never recorded,
+    /// 1 not yet requested, 2 already requested. A stage-42 stall with 1 is a
+    /// sleep that began before the abort and was never polled again after it.
+    pub(super) static F2NDD_REAPER_CANCEL_AT_LAST_PARK: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_f2ndd_reaper_sleep_return() {
+        F2NDD_REAPER_SLEEP_RETURNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn record_f2ndd_reaper_park(cancel_requested: bool) {
+        let state = if cancel_requested { 2 } else { 1 };
+        F2NDD_REAPER_CANCEL_AT_LAST_PARK.store(state, Ordering::SeqCst);
     }
 
     pub(super) fn record_f2ndd_serve_stage(stage: usize) {
@@ -43375,6 +43402,8 @@ mod lib_unit_tests {
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
                      not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{}{} \
+                     REAPER SLEEP RETURNS {}; CANCEL AT LAST PARK {} (0 unrecorded, 1 not yet \
+                     requested, 2 already requested). \
                      The stall is NOT fixed; do not raise this bound.",
                     F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
                     match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
@@ -43401,7 +43430,9 @@ mod lib_unit_tests {
                         0 => " (children-at-join NOT RECORDED)",
                         1 => " (ZERO live connection children in connection_scope at the reaper join, so a live sibling is NOT what it waits on)",
                         _ => " (LIVE connection children in connection_scope at the reaper join -- the reaper and every connection share that scope and the children are not drained until later in this same shutdown)",
-                    }
+                    },
+                    F2NDD_REAPER_SLEEP_RETURNS.load(Ordering::SeqCst),
+                    F2NDD_REAPER_CANCEL_AT_LAST_PARK.load(Ordering::SeqCst),
                 )
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
@@ -48021,6 +48052,378 @@ mod lib_unit_tests {
                 Ok::<(), McpError>(())
             })
             .expect("returning bounded cleanup failure must preserve ownership and errors");
+    }
+
+    // bd-gl2we: the `returning_subscription_*` family fails intermittently
+    // through two races around a stdio listen's acknowledgement (comment 5403).
+    // These pairs FORCE each interleaving instead of waiting for load to find
+    // it. Each pair differs only in the ordering it forces, and each records
+    // that the ordering was actually reached, so a pass on an unforced run
+    // cannot pass silently. They are deliberately outside the family's
+    // `returning_subscription_*` prefix and its denominator.
+    //
+    // The first test of each pair pins the CURRENT outcome of a candidate
+    // defect as a mechanism proof, not as a contract: the pump-first test is
+    // bd-gl2we finding F1 (stdio shutdown loses a pending graceful election)
+    // and the under-recv-lock test is F2 (an acknowledgement sent during an
+    // unsplit transport's `recv` fails the connection), both in comment 5412.
+    // A fix ruled by the subscription surface's owner must INVERT that
+    // expectation under a separate RH-3 semantic review; never regenerate
+    // these assertions to green without it.
+
+    #[test]
+    fn forced_subscription_ack_order_pump_first_loses_graceful_completion() {
+        forced_subscription_shutdown_order_case(true);
+    }
+
+    #[test]
+    fn forced_subscription_ack_order_active_first_keeps_graceful_completion() {
+        forced_subscription_shutdown_order_case(false);
+    }
+
+    #[test]
+    fn forced_subscription_ack_order_under_recv_lock_reports_notification_stage() {
+        forced_subscription_recv_lock_order_case(true);
+    }
+
+    #[test]
+    fn forced_subscription_ack_order_outside_recv_lock_reports_receive_stage() {
+        forced_subscription_recv_lock_order_case(false);
+    }
+
+    /// Election phases of every live final-subscription lease. The entry list
+    /// is copied out before any phase lock is taken, so this never holds the
+    /// registry mutex and an election mutex at once.
+    fn final_subscription_phases(
+        registry: &FinalSubscriptionRegistry,
+    ) -> Vec<FinalSubscriptionPhase> {
+        let elections: Vec<_> = registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .values()
+            .map(|entry| Arc::clone(&entry.election))
+            .collect();
+        elections
+            .iter()
+            .map(|election| {
+                *election
+                    .phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect()
+    }
+
+    /// `Active` is published by the opener only after its acknowledgement
+    /// callback has returned, so reaching it proves the acknowledgement was
+    /// already attempted.
+    fn wait_for_single_active_final_subscription(
+        registry: &FinalSubscriptionRegistry,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if final_subscription_phases(registry) == [FinalSubscriptionPhase::Active] {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// EOF shutdown against a listen whose acknowledgement callback has run.
+    /// `pump_first` holds the opener inside that callback, before it can
+    /// publish `Active`, until shutdown has cancelled the request: `terminate`
+    /// then records `ServerTerminationPending(0)` and the generic cancellation
+    /// that follows it defeats the opener's deferred election. Otherwise the
+    /// pump holds EOF until the opener has published `Active`, and shutdown
+    /// elects the graceful completion directly.
+    fn forced_subscription_shutdown_order_case(pump_first: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("forced shutdown-order reactor"))
+            .blocking_threads(2, MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("forced shutdown-order runtime");
+        let server = Server::new("forced-subscription-shutdown-order", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto is available in this test profile")
+            .build();
+        let active = Arc::clone(&server.active_requests);
+        let active_for_callback = Arc::clone(&active);
+        let registry = Arc::clone(&server.final_subscriptions);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_for_send = Arc::clone(&sent);
+        let forced = Arc::new(AtomicBool::new(false));
+        let forced_by_callback = Arc::clone(&forced);
+        let forced_by_recv = Arc::clone(&forced);
+        let (acknowledged, acknowledgement) = sync_channel(1);
+        runtime
+            .block_on(async move {
+                let cx = Cx::current().expect("caller runtime Cx");
+                let mut pump = cx
+                    .spawn_blocking(move |pump_cx| {
+                        let mut phase = 0;
+                        server.run_loop_returning_legacy(
+                            &pump_cx,
+                            move |_| {
+                                let current = phase;
+                                phase += 1;
+                                match current {
+                                    0 => Ok(modern_discovery_opening_request()),
+                                    1 => Ok(modern_subscriptions_listen_request(910)),
+                                    2 => {
+                                        acknowledgement
+                                            .recv_timeout(Duration::from_secs(2))
+                                            .expect("real subscription must acknowledge");
+                                        if !pump_first
+                                            && wait_for_single_active_final_subscription(
+                                                &registry,
+                                                Duration::from_secs(2),
+                                            )
+                                        {
+                                            forced_by_recv.store(true, Ordering::Release);
+                                        }
+                                        Err(TransportError::Closed)
+                                    }
+                                    _ => panic!("unexpected receive after EOF"),
+                                }
+                            },
+                            move |_, message| {
+                                sent_for_send.lock().unwrap().push(message.clone());
+                                Ok(())
+                            },
+                            Arc::new(move |notification| {
+                                if notification.method != "notifications/subscriptions/acknowledged"
+                                {
+                                    return;
+                                }
+                                acknowledged
+                                    .send(())
+                                    .expect("receive pump owns acknowledgement channel");
+                                if !pump_first {
+                                    return;
+                                }
+                                let deadline = Instant::now() + Duration::from_secs(2);
+                                while Instant::now() < deadline {
+                                    if active_for_callback
+                                        .lock()
+                                        .unwrap()
+                                        .values()
+                                        .any(|owner| owner.cancellation.is_cancel_requested())
+                                    {
+                                        forced_by_callback.store(true, Ordering::Release);
+                                        return;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }),
+                            None,
+                            "test",
+                        )
+                    })
+                    .expect("caller runtime admits receive pump");
+                asupersync::time::timeout(cx.now(), Duration::from_secs(3), pump.join(&cx))
+                    .await
+                    .expect("forced shutdown-order pump must settle")
+                    .expect("forced shutdown-order pump must not panic")
+            })
+            .expect("EOF after an acknowledged listen is a clean close");
+        assert!(
+            forced.load(Ordering::Acquire),
+            "the {} interleaving was not forced",
+            if pump_first {
+                "pump-first"
+            } else {
+                "active-first"
+            }
+        );
+        assert!(active.lock().unwrap().is_empty());
+        let sent = sent.lock().unwrap();
+        let responses: Vec<_> = sent
+            .iter()
+            .filter_map(|message| match message {
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(RequestId::Number(910)) =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .collect();
+        if pump_first {
+            assert!(
+                responses.is_empty(),
+                "a cancelled pending election suppresses every response: {responses:?}"
+            );
+        } else {
+            assert_eq!(responses.len(), 1, "{responses:?}");
+            assert!(final_subscription_completion_response(responses[0]));
+        }
+    }
+
+    /// An invalid response frame after an acknowledged listen, on an unsplit
+    /// transport. Both variants send the same frames and run the same
+    /// release-then-wait-for-`Active` step; only its location differs.
+    /// `ack_under_recv_lock` runs it inside `recv`, which `SharedTransport`
+    /// calls with its mutex held, so the acknowledgement's `try_lock` fails and
+    /// the post-receive connection-failure guard wins. Otherwise it runs in
+    /// middleware for an inline request, after `recv` has released the mutex.
+    fn forced_subscription_recv_lock_order_case(ack_under_recv_lock: bool) {
+        struct ForcedAckOrderTransport {
+            control: Arc<NonQuiescentLegacyControl>,
+            registry: Arc<FinalSubscriptionRegistry>,
+            forced: Arc<AtomicBool>,
+            acknowledgements_written: Arc<AtomicUsize>,
+            phase: usize,
+            ack_under_recv_lock: bool,
+        }
+
+        struct ForcedAckOrderMiddleware {
+            control: Arc<NonQuiescentLegacyControl>,
+            registry: Arc<std::sync::OnceLock<Arc<FinalSubscriptionRegistry>>>,
+            forced: Arc<AtomicBool>,
+            ack_under_recv_lock: bool,
+        }
+
+        impl Middleware for ForcedAckOrderMiddleware {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                if request.method == SUBSCRIPTIONS_LISTEN {
+                    self.control.wait_until_released();
+                } else if !self.ack_under_recv_lock && request.id == Some(RequestId::Number(907)) {
+                    self.control.release();
+                    let registry = self
+                        .registry
+                        .get()
+                        .expect("registry is published before the pump starts");
+                    if wait_for_single_active_final_subscription(registry, Duration::from_secs(2)) {
+                        self.forced.store(true, Ordering::Release);
+                    }
+                }
+                Ok(MiddlewareDecision::Continue)
+            }
+        }
+
+        impl Transport for ForcedAckOrderTransport {
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                if let JsonRpcMessage::Request(request) = message
+                    && request.method == "notifications/subscriptions/acknowledged"
+                {
+                    self.acknowledgements_written.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                let phase = self.phase;
+                self.phase = self.phase.saturating_add(1);
+                match phase {
+                    0 => Ok(modern_discovery_opening_request()),
+                    1 => Ok(modern_subscriptions_listen_request(911)),
+                    2 => Ok(modern_discovery_request(907)),
+                    3 => {
+                        if self.ack_under_recv_lock {
+                            self.control.release();
+                            if wait_for_single_active_final_subscription(
+                                &self.registry,
+                                Duration::from_secs(2),
+                            ) {
+                                self.forced.store(true, Ordering::Release);
+                            }
+                        }
+                        let mut response =
+                            JsonRpcResponse::success(RequestId::Number(912), serde_json::json!({}));
+                        response.jsonrpc = "1.0".into();
+                        Ok(JsonRpcMessage::Response(response))
+                    }
+                    _ => Err(TransportError::Timeout),
+                }
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let control = Arc::new(NonQuiescentLegacyControl::default());
+        let forced = Arc::new(AtomicBool::new(false));
+        let acknowledgements_written = Arc::new(AtomicUsize::new(0));
+        let registry_cell = Arc::new(std::sync::OnceLock::new());
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("forced recv-lock reactor"))
+            .blocking_threads(2, MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("forced recv-lock runtime");
+        let server = Server::new("forced-subscription-recv-lock-order", "1.0.0")
+            .protocol_policy(ProtocolPolicy::Auto)
+            .expect("Auto is available in this test profile")
+            .middleware(ForcedAckOrderMiddleware {
+                control: Arc::clone(&control),
+                registry: Arc::clone(&registry_cell),
+                forced: Arc::clone(&forced),
+                ack_under_recv_lock,
+            })
+            .build();
+        let registry = Arc::clone(&server.final_subscriptions);
+        assert!(registry_cell.set(Arc::clone(&registry)).is_ok());
+        let active = Arc::clone(&server.active_requests);
+        let transport = ForcedAckOrderTransport {
+            control: Arc::clone(&control),
+            registry,
+            forced: Arc::clone(&forced),
+            acknowledgements_written: Arc::clone(&acknowledgements_written),
+            phase: 0,
+            ack_under_recv_lock,
+        };
+        let result = runtime.block_on(async move {
+            let cx = Cx::current().expect("caller runtime Cx");
+            let mut pump = cx
+                .spawn_blocking(move |pump_cx| {
+                    server.run_transport_returning_with_cx(&pump_cx, transport)
+                })
+                .expect("caller runtime admits receive pump");
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), pump.join(&cx))
+                .await
+                .expect("forced recv-lock pump must settle")
+                .expect("forced recv-lock pump must not panic")
+        });
+        control.release();
+        assert!(
+            forced.load(Ordering::Acquire),
+            "the {} interleaving was not forced",
+            if ack_under_recv_lock {
+                "under-recv-lock"
+            } else {
+                "outside-recv-lock"
+            }
+        );
+        let error = result.expect_err("an invalid response frame terminates the connection");
+        let data = error.data.as_ref().expect("typed run failure");
+        if ack_under_recv_lock {
+            assert_eq!(
+                acknowledgements_written.load(Ordering::Acquire),
+                0,
+                "{error:?}"
+            );
+            assert_eq!(data["stage"], "notification", "{error:?}");
+            assert_eq!(data["kind"], "send_failure", "{error:?}");
+        } else {
+            assert_eq!(
+                acknowledgements_written.load(Ordering::Acquire),
+                1,
+                "{error:?}"
+            );
+            assert_eq!(data["stage"], "receive", "{error:?}");
+            assert_eq!(data["kind"], "invalid_response", "{error:?}");
+        }
+        assert!(active.lock().unwrap().is_empty());
     }
 
     #[test]

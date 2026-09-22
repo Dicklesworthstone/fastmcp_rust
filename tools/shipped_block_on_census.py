@@ -31,6 +31,7 @@ Doc comments never reach classification; masking removes them.
 Usage:
   tools/shipped_block_on_census.py <file>...        # census
   tools/shipped_block_on_census.py --validate       # R4: positive + negative
+  tools/shipped_block_on_census.py --validate --proxy <file>  # controls on a planted copy
   tools/shipped_block_on_census.py --naive-control <file>
 """
 
@@ -48,13 +49,48 @@ ROUTER = "crates/fastmcp-server/src/router.rs"
 LIB = "crates/fastmcp-server/src/lib.rs"
 BEAD_FILES = [PROXY, LEGACY, ROUTER, LIB]
 
-# Frozen baseline at 4e48b86a, from the bead's R1.
+# The known-positive and known-negative controls, frozen BY SYMBOL.
+#
+# The bead's R1 baseline was 18 proxy.rs call sites at 4e48b86a, first frozen
+# here as line numbers (:4644 .. :7092). Outside edits moved every one of them
+# +216..+229 lines without changing a call, and the line-frozen control went
+# RED over an unchanged population (bd-fnd04-b7-shipped-block-on-proxy-4rkp9).
+# Each site is now (enclosing item path, ordinal among CALLs in that item),
+# derived FROM those 18 baseline lines, so the control still names the same 18
+# calls and survives any edit that does not rename or remove one. A renamed or
+# removed site fails the control loudly; that is a change to the subject, and
+# the control must say so rather than follow it.
 PROXY_EXPECTED_CALLS = [
-    4644, 5089, 5383, 5475, 5550, 5596, 5709, 6316,
-    6336, 6359, 6379, 6459, 6554, 6693, 6830, 7069, 7075, 7092,
+    ("impl ProxyFinalTaskRelay :: fn open_listener", 1),                       # :4644 @4e48b86a
+    ("impl ProxyHttpClient :: fn ensure_legacy_initialized", 1),               # :5089
+    ("impl ProxyHttpClient :: fn request_legacy_response", 1),                 # :5383
+    ("impl ProxyHttpClient :: fn request_result_with_context_and_final_progress", 1),  # :5475
+    ("impl ProxyHttpClient :: fn request_legacy_response_unscoped", 1),        # :5550
+    ("impl ProxyHttpClient :: fn cancel_legacy_request", 1),                   # :5596
+    ("impl ProxyBackend for ProxyHttpClient :: fn start_legacy_request_with_context", 1),  # :5709
+    ("impl ProxyBackend for ProxyHttpClient :: fn call_tool_final_outcome", 1),  # :6316
+    ("impl ProxyBackend for ProxyHttpClient :: fn get_final_task", 1),         # :6336
+    ("impl ProxyBackend for ProxyHttpClient :: fn update_final_task", 1),      # :6359
+    ("impl ProxyBackend for ProxyHttpClient :: fn cancel_final_task", 1),      # :6379
+    ("impl ProxyBackend for ProxyHttpClient :: fn open_final_task_listener", 1),  # :6459
+    ("impl ProxyBackend for ProxyHttpClient :: fn next_incremental_catalog_listener", 1),  # :6554
+    ("impl ProxyBackend for ProxyHttpClient :: fn next_incremental_final_task_listener", 1),  # :6693
+    ("impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener :: fn next", 1),  # :6830
+    ("fn receive_modern_response", 1),                                          # :7069
+    ("fn receive_modern_response", 2),                                          # :7075
+    ("fn receive_modern_response", 3),                                          # :7092
 ]
-PROXY_EXPECTED_IMPORT = 46
-PROXY_EXPECTED_DOCS = [752, 1346]
+# Known negatives, frozen by CONTENT. The import is the one top-level `use`
+# statement naming the symbol (found by its own regex, not by classify());
+# the doc comments are matched on their exact trimmed text. Each anchor must
+# resolve to EXACTLY one place: a line-frozen negative "passes" on whatever
+# empty line it drifts onto, which is how :1346 kept passing after its doc
+# comment moved to :1399.
+PROXY_IMPORT_STMT = re.compile(r"\buse\b[^;]*\bblock_on\b[^;]*;")
+PROXY_EXPECTED_DOCS = [
+    "/// not nest `block_on` on a second current-thread runtime. The default",  # :752 @4e48b86a
+    "/// gateway serve runtime. Starting the pump inside `block_on` orphans it",  # :1346
+]
 
 
 def mask(src):
@@ -288,6 +324,45 @@ def classify(masked, start):
     return "CALL" if is_call else "OTHER"
 
 
+# An item header at the start of a line: `fn name`, `impl ..`, `mod name`,
+# `trait name`, with the usual qualifiers. Anchoring to line starts keeps
+# return-position `impl Trait` and `fn(..)` pointer types out.
+ITEM_HEAD = re.compile(
+    r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?(?:default[ \t]+)?(?:const[ \t]+)?(?:async[ \t]+)?"
+    r"(?:unsafe[ \t]+)?(?:extern[ \t]+(?:\"[^\"]*\"[ \t]+)?)?"
+    r"(fn[ \t]+\w+|impl\b|mod[ \t]+\w+|trait[ \t]+\w+)",
+    re.M,
+)
+
+
+def item_spans(masked):
+    """(body_start, body_end, label) for every braced fn/impl/mod/trait item.
+
+    The label is the item's header up to its body brace, whitespace-collapsed:
+    `fn name` for functions, the whole `impl<..> Trait for Type where ..` for
+    impls. Declarations ending in `;` before any `{` have no body and no span.
+    """
+    spans = []
+    for m in ITEM_HEAD.finditer(masked):
+        kind = m.group(1)
+        brace = masked.find("{", m.end())
+        semi = masked.find(";", m.end())
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue
+        if kind.startswith("impl"):
+            label = " ".join(masked[m.start(1) : brace].split())
+        else:
+            label = " ".join(kind.split())
+        spans.append((brace, match_brace(masked, brace), label))
+    return spans
+
+
+def item_path(spans, offset):
+    """Enclosing items of `offset`, outermost first, joined with ` :: `."""
+    enclosing = sorted((s for s in spans if s[0] <= offset < s[1]), key=lambda s: s[0])
+    return " :: ".join(label for _, _, label in enclosing)
+
+
 def census(path):
     src = Path(path).read_text(encoding="utf-8", errors="replace")
     masked = mask(src)
@@ -308,15 +383,23 @@ def census(path):
             first_cfg = line_of(starts, m.start())
             break
 
+    spans = item_spans(masked)
     raw = [m.start() for m in re.finditer(re.escape(SYMBOL), src)]
     found = {"CALL": [], "IMPORT": [], "OTHER": []}
     shipped = {"CALL": [], "IMPORT": [], "OTHER": []}
+    # Every CALL keyed by (enclosing item path, ordinal among CALLs in that
+    # path), which is what the known-positive control is frozen against.
+    call_keys, seen = {}, {}
     for off in [m.start() for m in re.finditer(re.escape(SYMBOL), masked)]:
         kind = classify(masked, off)
         ln = line_of(starts, off)
         found[kind].append(ln)
         if not in_region(regions, off):
             shipped[kind].append(ln)
+        if kind == "CALL":
+            where = item_path(spans, off)
+            seen[where] = seen.get(where, 0) + 1
+            call_keys[(where, seen[where])] = ln
     return {
         "path": path,
         "lines": src.count("\n") + 1,
@@ -326,7 +409,88 @@ def census(path):
         "test_regions": len(regions),
         "all": found,
         "shipped": shipped,
+        "call_keys": call_keys,
+        "src_lines": src.split("\n"),
+        "masked": masked,
+        "starts": starts,
+        "spans": spans,
     }
+
+
+def run_controls(report):
+    """R4's two controls against a proxy.rs census. Returns (ok, output lines).
+
+    Shared by --validate and by the census gate, so the gate cannot pass on a
+    weaker check than the one --validate reports.
+    """
+    out, ok = [], True
+    shipped = set(report["shipped"]["CALL"])
+    keys = report["call_keys"]
+
+    out.append("R4 CONTROL 1 -- KNOWN POSITIVE: proxy.rs shipped block_on CALL sites, by symbol")
+    resolved, missing, unshipped = [], [], []
+    for key in PROXY_EXPECTED_CALLS:
+        line = keys.get(key)
+        if line is None:
+            missing.append(key)
+        elif line not in shipped:
+            unshipped.append((key, line))
+        else:
+            resolved.append(line)
+    out.append(f"  expected {len(PROXY_EXPECTED_CALLS)}, resolved and shipped {len(resolved)}")
+    # R4's predicate is that the instrument FINDS the 18 and REJECTS the
+    # import and doc comments. It does not say the 18 are the whole
+    # population -- the bead itself calls them "the verified-by-position
+    # floor". So a miss is a control failure and an extra is a finding.
+    for key in missing:
+        ok = False
+        out.append(f"  FAIL -- MISSING (the control case it should catch): {key[0]} #{key[1]}")
+    for key, line in unshipped:
+        ok = False
+        out.append(f"  FAIL -- FOUND BUT CLASSIFIED TEST-ONLY: {key[0]} #{key[1]} at :{line}")
+    if not missing and not unshipped:
+        out.append(f"  all {len(PROXY_EXPECTED_CALLS)} baseline sites found: sensitivity established")
+        out.append(f"  now at lines {resolved}")
+    extra = sorted(shipped - set(resolved))
+    if extra:
+        out.append(f"\n  BEYOND THE BASELINE -- {len(extra)} further SHIPPED call sites: {extra}")
+        out.append(f"  The first test-only cfg is at line {report['first_test_cfg_line']}; sites past it")
+        out.append("  are invisible to a positional rule. They are feature-gated, NOT")
+        out.append("  test-gated, so they are shipped code. Requires adjudication by the")
+        out.append("  criteria author: R1's end state is positional, R5's guard is total.")
+
+    out.append("\nR4 CONTROL 2 -- KNOWN NEGATIVE: the import and the two doc comments, by content")
+    masked, starts = report["masked"], report["starts"]
+    imports = [m for m in PROXY_IMPORT_STMT.finditer(masked)
+               if not item_path(report["spans"], m.start())]
+    if len(imports) != 1:
+        ok = False
+        out.append(f"  FAIL: expected exactly 1 top-level `use` naming {SYMBOL}, found {len(imports)}")
+    else:
+        stmt = imports[0]
+        sym = stmt.start() + re.search(rf"\b{SYMBOL}\b", stmt.group(0)).start()
+        line = line_of(starts, sym)
+        if line in report["all"]["CALL"]:
+            ok = False
+            out.append(f"  FAIL: the import at :{line} is counted as a CALL")
+        elif line not in report["all"]["IMPORT"]:
+            ok = False
+            out.append(f"  FAIL: the import at :{line} is not classified IMPORT")
+        else:
+            out.append(f"  :{line} import  -> classified IMPORT, not a CALL")
+    trimmed = [s.strip() for s in report["src_lines"]]
+    for doc in PROXY_EXPECTED_DOCS:
+        at = [i + 1 for i, s in enumerate(trimmed) if s == doc]
+        if len(at) != 1:
+            ok = False
+            out.append(f"  FAIL: doc anchor resolves to {len(at)} lines, not 1: {doc!r}")
+            continue
+        if any(at[0] in v for v in report["all"].values()):
+            ok = False
+            out.append(f"  FAIL: doc comment :{at[0]} survived masking")
+        else:
+            out.append(f"  :{at[0]} doc comment -> removed by masking, never classified")
+    return ok, out
 
 
 def naive_regions(src):
@@ -345,6 +509,8 @@ def main():
     parser.add_argument("files", nargs="*", help="source files (default: the bead's four)")
     parser.add_argument("--validate", action="store_true", help="R4 positive+negative controls")
     parser.add_argument("--naive-control", metavar="FILE", help="show the unmasked over-count")
+    parser.add_argument("--proxy", metavar="FILE",
+                        help="run the controls against this proxy.rs (planted-control demonstrations)")
     args = parser.parse_args()
 
     if args.naive_control:
@@ -358,47 +524,11 @@ def main():
         print(f"  over-count factor             : {ratio:.2f}x")
         return 0
 
+    proxy = Path(args.proxy) if args.proxy else REPO / PROXY
     if args.validate:
-        report = census(REPO / PROXY)
-        calls = report["shipped"]["CALL"]
-        ok = True
-
-        print("R4 CONTROL 1 -- KNOWN POSITIVE: proxy.rs shipped block_on CALL sites")
-        print(f"  expected {len(PROXY_EXPECTED_CALLS)}, found {len(calls)}")
-        missing = sorted(set(PROXY_EXPECTED_CALLS) - set(calls))
-        extra = sorted(set(calls) - set(PROXY_EXPECTED_CALLS))
-        # R4's predicate is that the instrument FINDS the 18 and REJECTS the
-        # import and doc comments. It does not say the 18 are the whole
-        # population -- the bead itself calls them "the verified-by-position
-        # floor". So a miss is a control failure and an extra is a finding.
-        if missing:
-            ok = False
-            print(f"  FAIL -- MISSING (the control case it should catch): {missing}")
-        else:
-            print(f"  all {len(PROXY_EXPECTED_CALLS)} baseline sites found: sensitivity established")
-        if extra:
-            print(f"\n  BEYOND THE BASELINE -- {len(extra)} further SHIPPED call sites: {extra}")
-            print("  These are past the first #[cfg(test)] at 8166, which is why the")
-            print("  positional rule cannot see them. They are feature-gated, NOT")
-            print("  test-gated, so they are shipped code. Requires adjudication by the")
-            print("  criteria author: R1's end state is positional, R5's guard is total.")
-
-        print("\nR4 CONTROL 2 -- KNOWN NEGATIVE: the import and the two doc comments")
-        imports = report["all"]["IMPORT"]
-        if PROXY_EXPECTED_IMPORT in calls:
-            ok = False
-            print(f"  FAIL: :{PROXY_EXPECTED_IMPORT} counted as a CALL")
-        else:
-            seen = PROXY_EXPECTED_IMPORT in imports
-            print(f"  :{PROXY_EXPECTED_IMPORT} import  -> not a CALL (classified IMPORT: {seen})")
-        for doc in PROXY_EXPECTED_DOCS:
-            every = [d for v in report["all"].values() for d in v if d == doc]
-            if every:
-                ok = False
-                print(f"  FAIL: doc comment :{doc} survived masking")
-            else:
-                print(f"  :{doc} doc comment -> removed by masking, never classified")
-
+        report = census(proxy)
+        ok, lines = run_controls(report)
+        print("\n".join(lines))
         print(f"\n  raw grep matches {report['raw_matches']} = "
               f"CALL {len(report['all']['CALL'])} + IMPORT {len(report['all']['IMPORT'])} "
               f"+ OTHER {len(report['all']['OTHER'])} + "
@@ -412,16 +542,16 @@ def main():
     # refuses to print ANY count until the known-positive arm has passed in
     # this same invocation. R4 requires the control be run; this makes it
     # impossible to read a number that the control did not stand behind.
-    control = census(REPO / PROXY)
-    control_found = set(control["shipped"]["CALL"])
-    control_missing = sorted(set(PROXY_EXPECTED_CALLS) - control_found)
-    if control_missing:
-        print("KNOWN-POSITIVE CONTROL FAILED -- no counts reported.", file=sys.stderr)
-        print(f"  did not find frozen proxy.rs sites: {control_missing}", file=sys.stderr)
+    ok, lines = run_controls(census(proxy))
+    if not ok:
+        print("R4 CONTROL FAILED -- no counts reported.", file=sys.stderr)
+        for line in lines:
+            if "FAIL" in line:
+                print(line, file=sys.stderr)
         print("  Run --validate for the full control output.", file=sys.stderr)
         return 2
-    print(f"control: {len(PROXY_EXPECTED_CALLS)}/{len(PROXY_EXPECTED_CALLS)} "
-          f"frozen proxy.rs sites found; :46 import and :752/:1346 docs excluded\n")
+    print(f"control: {len(PROXY_EXPECTED_CALLS)}/{len(PROXY_EXPECTED_CALLS)} frozen proxy.rs "
+          f"sites found by symbol; the import and both doc comments excluded\n")
 
     targets = args.files or [str(REPO / f) for f in BEAD_FILES]
     total = 0
