@@ -1125,6 +1125,12 @@ pub const MAX_GUARDED_RESOLVED_ADDRESSES: usize = 64;
 pub const MAX_GUARDED_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 /// Longest TLS handshake timeout this vertical admits.
 pub const MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum body bytes one [`GuardedHttpRequest`] may carry.
+pub const MAX_GUARDED_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum bytes of a [`GuardedHttpRequest`] content-type or authorization value.
+pub const MAX_GUARDED_REQUEST_HEADER_VALUE_BYTES: usize = 8 * 1024;
+/// Maximum certificates supplied to one [`GuardedRootSet`].
+pub const MAX_GUARDED_ROOT_SET_CERTIFICATES: usize = 32;
 
 /// Test-only resolver seam whose complete answer set is checked before any connection.
 ///
@@ -1476,6 +1482,10 @@ pub enum GuardedHttpFetchError {
     UnexpectedContentEncoding(String),
     /// Response fields exceeded the fixed transport header bound.
     ResponseHeadersTooLarge,
+    /// A [`GuardedHttpRequest`] value failed validation. This happens at
+    /// construction, so no fetcher method, resolver, or socket is reached.
+    /// The reason is static text and never echoes the rejected value.
+    InvalidRequest(&'static str),
 }
 
 impl std::fmt::Display for GuardedHttpFetchError {
@@ -1516,6 +1526,7 @@ impl std::fmt::Display for GuardedHttpFetchError {
             Self::ResponseHeadersTooLarge => {
                 formatter.write_str("guarded response headers too large")
             }
+            Self::InvalidRequest(reason) => write!(formatter, "invalid guarded request: {reason}"),
         }
     }
 }
@@ -1795,6 +1806,487 @@ impl GuardedHttpFetcher {
         })
         .await
     }
+}
+
+/// Domain separator for the root-set identity preimage. Changing it changes
+/// every custom-root identity, so it is versioned.
+const GUARDED_ROOT_SET_IDENTITY_DOMAIN: &[u8] = b"FND05ROOTSETv1\0";
+/// Prefix of the root identity a [`GuardedRootSet`] fetcher reports.
+const GUARDED_ROOT_SET_IDENTITY_PREFIX: &str = "custom-roots.sha256.";
+/// Upper bound of the identity preimage: domain, length-prefixed caller
+/// revision, certificate count, and every length-prefixed certificate at its
+/// maximum size.
+const MAX_GUARDED_ROOT_SET_IDENTITY_PREIMAGE_BYTES: usize = GUARDED_ROOT_SET_IDENTITY_DOMAIN.len()
+    + 4
+    + MAX_GUARDED_ROOT_POLICY_REVISION_BYTES
+    + 4
+    + MAX_GUARDED_ROOT_SET_CERTIFICATES * (4 + MAX_GUARDED_LEAF_CERTIFICATE_BYTES);
+
+/// A transport-level request value for [`GuardedHttpFetcher::post`].
+///
+/// It carries exactly a content type, the body bytes, and an optional
+/// authorization value, and nothing else. It holds no OAuth semantics: the
+/// body is opaque bytes, and the authorization value is an opaque field value
+/// that the caller composes.
+///
+/// Every field is validated at construction, so a value that exists is
+/// already admissible: `post` cannot receive an invalid request, and no
+/// refusal here can reach a resolver or a socket. A content type or
+/// authorization value must be non-empty, at most
+/// [`MAX_GUARDED_REQUEST_HEADER_VALUE_BYTES`], made only of visible ASCII,
+/// SP, and HTAB (so CR, LF, NUL, other controls, DEL, and non-ASCII are
+/// refused), and must not begin or end with SP or HTAB. The body is at most
+/// [`MAX_GUARDED_REQUEST_BODY_BYTES`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuardedHttpRequest {
+    content_type: String,
+    body: Vec<u8>,
+    authorization: Option<String>,
+}
+
+impl GuardedHttpRequest {
+    /// Build a request with a validated content type and a bounded body.
+    pub fn new(
+        content_type: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let content_type = content_type.into();
+        let body = body.into();
+        if body.len() > MAX_GUARDED_REQUEST_BODY_BYTES {
+            return Err(GuardedHttpFetchError::InvalidRequest("request body bound"));
+        }
+        if !is_guarded_request_field_value(&content_type) {
+            return Err(GuardedHttpFetchError::InvalidRequest("content type"));
+        }
+        Ok(Self {
+            content_type,
+            body,
+            authorization: None,
+        })
+    }
+
+    /// Attach a validated authorization field value.
+    ///
+    /// On refusal the value is dropped and never echoed; the typed error
+    /// carries only static text.
+    pub fn with_authorization(
+        mut self,
+        value: impl Into<String>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let value = value.into();
+        if !is_guarded_request_field_value(&value) {
+            return Err(GuardedHttpFetchError::InvalidRequest("authorization value"));
+        }
+        self.authorization = Some(value);
+        Ok(self)
+    }
+
+    /// The validated content type.
+    #[must_use]
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    /// The body bytes.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Whether an authorization value is attached. The value itself is not
+    /// readable back from this type.
+    #[must_use]
+    pub fn has_authorization(&self) -> bool {
+        self.authorization.is_some()
+    }
+}
+
+/// Shows the body by length only and the authorization value as a redaction
+/// marker, so a credential never reaches a log through `Debug`.
+impl std::fmt::Debug for GuardedHttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpRequest")
+            .field("content_type", &self.content_type)
+            .field("body_len", &self.body.len())
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+fn is_guarded_request_field_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_GUARDED_REQUEST_HEADER_VALUE_BYTES
+        && bytes
+            .iter()
+            .all(|&byte| matches!(byte, b'\t' | b' ' | 0x21..=0x7e))
+        && !matches!(bytes.first(), Some(b'\t' | b' '))
+        && !matches!(bytes.last(), Some(b'\t' | b' '))
+}
+
+/// Encode the exact request bytes [`GuardedHttpFetcher::post`] writes for
+/// `request` to `url`.
+///
+/// This is not a second serializer. `post` sends the request built by the
+/// same private composer, and asupersync's `Http1Client` encodes it with the
+/// same public `Http1ClientCodec` used here. The frozen shape is the request
+/// line `POST <target> HTTP/1.1`, then `Host`, `Content-Type`,
+/// `Content-Length` (the body's byte length in decimal), `Authorization`
+/// (only when supplied), `Accept-Encoding: identity`, and `Connection: close`,
+/// then the body. It never emits `Transfer-Encoding`.
+pub fn guarded_encode_post_request(
+    url: &GuardedHttpsUrl,
+    request: &GuardedHttpRequest,
+) -> Result<Vec<u8>, GuardedHttpFetchError> {
+    let mut encoded = asupersync::bytes::BytesMut::new();
+    asupersync::codec::Encoder::encode(
+        &mut asupersync::http::h1::Http1ClientCodec::new(),
+        guarded_compose_post_request(url, request),
+        &mut encoded,
+    )
+    .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
+    Ok(encoded.as_ref().to_vec())
+}
+
+/// The one composer for guarded POST requests, shared by
+/// [`guarded_encode_post_request`] and [`GuardedHttpFetcher::post`].
+fn guarded_compose_post_request(
+    url: &GuardedHttpsUrl,
+    request: &GuardedHttpRequest,
+) -> NativeHttpRequest {
+    let mut builder = NativeHttpRequest::post(url.target.clone())
+        .header("Host", url.authority())
+        .header("Content-Type", request.content_type.clone())
+        .header("Content-Length", request.body.len().to_string());
+    if let Some(authorization) = request.authorization.as_ref() {
+        builder = builder.header("Authorization", authorization.clone());
+    }
+    builder
+        .header("Accept-Encoding", "identity")
+        .header("Connection", "close")
+        .body(request.body.clone())
+        .build()
+}
+
+/// A transport-owned, non-empty set of DER trust anchors that REPLACES the
+/// WebPKI roots for one fetcher and never widens them.
+///
+/// A fetcher built from a root set trusts exactly these certificates: its
+/// connector is built by adding only them, and it never adds WebPKI or native
+/// roots. That matters because asupersync's connector builder accumulates
+/// roots, so any such call would silently widen trust. No constructor accepts
+/// a caller connector.
+///
+/// Construction checks every certificate the same way the connector's root
+/// store will: each must be non-empty, at most
+/// [`MAX_GUARDED_LEAF_CERTIFICATE_BYTES`], and accepted by an asupersync
+/// [`RootCertStore`](asupersync::tls::RootCertStore). A certificate the store
+/// would reject is refused here rather than silently dropped later, so the
+/// identity a fetcher reports covers only anchors it actually trusts. At most
+/// [`MAX_GUARDED_ROOT_SET_CERTIFICATES`] certificates may be supplied.
+/// Certificates are kept sorted by DER bytes with duplicates removed, so the
+/// set, and the identity folded from it, do not depend on supply order.
+///
+/// No `BasicConstraints CA:TRUE` gate is applied. asupersync's strict-CA mode
+/// drops a non-CA certificate without reporting it, which would let the
+/// reported identity name an anchor that is not trusted. A caller that
+/// supplies a leaf certificate here is pinning it deliberately.
+#[derive(Clone)]
+pub struct GuardedRootSet {
+    certificates: Vec<asupersync::tls::Certificate>,
+}
+
+impl GuardedRootSet {
+    /// Build a non-empty root set from DER certificates.
+    pub fn new(
+        certificates: impl IntoIterator<Item = asupersync::tls::Certificate>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let mut admitted: Vec<asupersync::tls::Certificate> = Vec::new();
+        for certificate in certificates {
+            if admitted.len() == MAX_GUARDED_ROOT_SET_CERTIFICATES {
+                return Err(GuardedHttpFetchError::InvalidPolicy(
+                    "root set certificate count",
+                ));
+            }
+            let der_len = certificate.as_der().len();
+            if der_len == 0 || der_len > MAX_GUARDED_LEAF_CERTIFICATE_BYTES {
+                return Err(GuardedHttpFetchError::InvalidPolicy(
+                    "root certificate size",
+                ));
+            }
+            if asupersync::tls::RootCertStore::empty()
+                .add(&certificate)
+                .is_err()
+            {
+                return Err(GuardedHttpFetchError::InvalidPolicy("root certificate"));
+            }
+            admitted.push(certificate);
+        }
+        if admitted.is_empty() {
+            return Err(GuardedHttpFetchError::InvalidPolicy("empty root set"));
+        }
+        admitted.sort_unstable_by(|left, right| left.as_der().cmp(right.as_der()));
+        admitted.dedup_by(|left, right| left.as_der() == right.as_der());
+        Ok(Self {
+            certificates: admitted,
+        })
+    }
+
+    /// Number of distinct certificates in the set.
+    #[must_use]
+    pub fn certificate_count(&self) -> usize {
+        self.certificates.len()
+    }
+}
+
+impl std::fmt::Debug for GuardedRootSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedRootSet")
+            .field("certificate_count", &self.certificates.len())
+            .finish()
+    }
+}
+
+impl GuardedHttpFetcher {
+    /// Build a fetcher that trusts exactly `roots` instead of WebPKI.
+    ///
+    /// Everything else matches [`Self::new`]: the native resolver with the
+    /// policy deadline, the public-address fence, SNI and hostname validation
+    /// against the original host, `http/1.1` ALPN, early data disabled, and
+    /// the policy's finite handshake timeout.
+    ///
+    /// ROOT IDENTITY. The fetcher does not report the caller's
+    /// `root_policy_revision` unchanged, because that label would then claim
+    /// a trust configuration it does not have. It stores a policy whose
+    /// revision is `custom-roots.sha256.` followed by the lowercase hex
+    /// SHA-256 of `FND05ROOTSETv1` NUL, the caller revision (u32 big-endian
+    /// length, then bytes), the certificate count (u32 big-endian), and each
+    /// certificate in DER-sorted order (u32 big-endian length, then DER).
+    /// [`Self::policy`], [`Self::root_identity`], and every fetch's
+    /// [`GuardedHttpPeerProvenance::root_policy_revision`] report that value.
+    /// For a fetcher from this constructor, the field doc's statement that the
+    /// roots are fixed WebPKI roots does not apply.
+    pub fn with_root_set(
+        policy: GuardedHttpFetchPolicy,
+        roots: &GuardedRootSet,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let resolver = guarded_native_resolver(&policy);
+        Self::with_root_set_and_resolver(policy, roots, resolver)
+    }
+
+    /// [`Self::with_root_set`] resolving through a caller-supplied resolver.
+    ///
+    /// The resolver seam is the one [`Self::with_resolver`] exposes, with the
+    /// same guarantees: its answers are fenced by the public-address check
+    /// before any connection.
+    pub fn with_root_set_and_resolver(
+        policy: GuardedHttpFetchPolicy,
+        roots: &GuardedRootSet,
+        resolver: Arc<dyn GuardedHttpResolver>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let connector = guarded_root_set_connector(roots, policy.tls_handshake_timeout)?;
+        let policy = guarded_root_set_policy(&policy, roots)?;
+        Ok(Self {
+            resolver,
+            policy,
+            connector,
+            #[cfg(test)]
+            test_loopback_authority: None,
+            #[cfg(test)]
+            test_exchange: None,
+        })
+    }
+
+    /// Test-only real-wire root-set fetcher for one loopback listener.
+    ///
+    /// It uses the shipped root-set connector and identity fold. Only the
+    /// loopback authority escape is test-only, exactly as in
+    /// `new_loopback_test_authority`.
+    #[cfg(test)]
+    fn new_loopback_test_authority_with_root_set(
+        policy: GuardedHttpFetchPolicy,
+        loopback_authority: SocketAddr,
+        roots: &GuardedRootSet,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        if !loopback_authority.ip().is_loopback() {
+            return Err(GuardedHttpFetchError::InvalidPolicy(
+                "test loopback authority",
+            ));
+        }
+        let resolver = Arc::new(StaticGuardedResolverForLoopback {
+            address: loopback_authority.ip(),
+        });
+        let mut fetcher = Self::with_root_set_and_resolver(policy, roots, resolver)?;
+        fetcher.test_loopback_authority = Some(loopback_authority);
+        Ok(fetcher)
+    }
+
+    /// The root identity this fetcher reports in provenance, observable
+    /// before any fetch.
+    ///
+    /// For a WebPKI fetcher it is the caller's `root_policy_revision`. For a
+    /// root-set fetcher it is the folded identity described on
+    /// [`Self::with_root_set`].
+    #[must_use]
+    pub fn root_identity(&self) -> &str {
+        self.policy.root_policy_revision()
+    }
+
+    /// POST one request over a fresh connection.
+    ///
+    /// Resolution, the public-address fence, the per-phase deadline, TCP, TLS,
+    /// provenance, and response admission are the same as for
+    /// [`Self::fetch`], which this method leaves unchanged. The response passes
+    /// through [`guarded_admit_native_response`], the admission `fetch` uses.
+    /// The request bytes are exactly [`guarded_encode_post_request`]'s output.
+    ///
+    /// A redirect is never followed or replayed. This method sends one request
+    /// and returns; a 3xx comes back as [`GuardedHttpRedirect`] data.
+    pub async fn post(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        guarded_fetch_checkpoint(cx)?;
+        let fetch_deadline = time::wall_now() + self.policy.deadline;
+        let answers = self
+            .resolve_all(cx, fetch_deadline, url.host.clone())
+            .await?;
+        #[cfg(test)]
+        let selected_address = guarded_select_address_with_test_loopback(
+            answers,
+            url.port(),
+            self.test_loopback_authority,
+        )?;
+        #[cfg(not(test))]
+        let selected_address = guarded_select_address(answers, url.port())?;
+        guarded_fetch_checkpoint(cx)?;
+
+        let connector = self.connector.clone();
+        let host = url.host.clone();
+        let native_request = guarded_compose_post_request(url, request);
+        let policy = self.policy.clone();
+        let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let tcp = NativeTcpStream::connect(selected_address)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            tcp.set_nodelay(true)
+                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let tls = connector
+                .connect(&host, tcp)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
+            let provenance = guarded_peer_provenance(&tls, host, selected_address, &policy)?;
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let (response, _stream, _body_withheld) =
+                NativeHttp1Client::request_with_io_and_max_body_size(
+                    tls,
+                    native_request,
+                    policy.response_body_bytes,
+                )
+                .await
+                .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
+            guarded_admit_native_response(
+                response.status,
+                response.headers,
+                response.body,
+                policy.response_body_bytes,
+                provenance,
+            )
+        })
+        .await?;
+        guarded_fetch_checkpoint(cx)?;
+        Ok(response)
+    }
+}
+
+/// The production resolver configuration [`GuardedHttpFetcher::new`] uses.
+fn guarded_native_resolver(policy: &GuardedHttpFetchPolicy) -> Arc<dyn GuardedHttpResolver> {
+    Arc::new(NativeGuardedResolver::new(Arc::new(
+        NativeDnsResolver::with_config(ResolverConfig {
+            timeout: policy.deadline,
+            retries: 0,
+            happy_eyeballs: false,
+            ..ResolverConfig::default()
+        }),
+    )))
+}
+
+/// The root-set connector. It adds only the set's certificates and never
+/// calls `with_webpki_roots` or `with_native_roots`, so trust is replaced,
+/// never widened. ALPN, early data, and the handshake timeout match
+/// [`GuardedHttpFetcher::new`].
+fn guarded_root_set_connector(
+    roots: &GuardedRootSet,
+    tls_handshake_timeout: Duration,
+) -> Result<TlsConnector, GuardedHttpFetchError> {
+    TlsConnector::builder()
+        .add_root_certificates(roots.certificates.iter().cloned())
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .enable_early_data(false)
+        .handshake_timeout(tls_handshake_timeout)
+        .build()
+        .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))
+}
+
+/// The caller policy with its revision replaced by the folded root identity.
+/// It goes back through [`GuardedHttpFetchPolicy::new`], so every policy
+/// invariant is re-checked on the value the fetcher stores.
+fn guarded_root_set_policy(
+    policy: &GuardedHttpFetchPolicy,
+    roots: &GuardedRootSet,
+) -> Result<GuardedHttpFetchPolicy, GuardedHttpFetchError> {
+    GuardedHttpFetchPolicy::new(
+        policy.response_body_bytes,
+        policy.deadline,
+        policy.tls_handshake_timeout,
+        guarded_root_set_identity(&policy.root_policy_revision, roots)?,
+    )
+}
+
+fn guarded_root_set_identity(
+    caller_revision: &str,
+    roots: &GuardedRootSet,
+) -> Result<String, GuardedHttpFetchError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    fn push_length_prefixed(
+        preimage: &mut Vec<u8>,
+        bytes: &[u8],
+    ) -> Result<(), GuardedHttpFetchError> {
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| GuardedHttpFetchError::InvalidPolicy("root set identity bound"))?;
+        preimage.extend_from_slice(&length.to_be_bytes());
+        preimage.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(GUARDED_ROOT_SET_IDENTITY_DOMAIN);
+    push_length_prefixed(&mut preimage, caller_revision.as_bytes())?;
+    let count = u32::try_from(roots.certificates.len())
+        .map_err(|_| GuardedHttpFetchError::InvalidPolicy("root set identity bound"))?;
+    preimage.extend_from_slice(&count.to_be_bytes());
+    for certificate in &roots.certificates {
+        push_length_prefixed(&mut preimage, certificate.as_der())?;
+    }
+    let digest = sha256_bounded(&preimage, MAX_GUARDED_ROOT_SET_IDENTITY_PREIMAGE_BYTES)
+        .map_err(|_| GuardedHttpFetchError::InvalidPolicy("root set identity bound"))?;
+    let mut identity = String::with_capacity(GUARDED_ROOT_SET_IDENTITY_PREFIX.len() + 64);
+    identity.push_str(GUARDED_ROOT_SET_IDENTITY_PREFIX);
+    for byte in digest.as_bytes() {
+        identity.push(char::from(HEX[usize::from(byte >> 4)]));
+        identity.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(identity)
 }
 
 /// Admit one already-received HTTP response head and body, applying the whole
@@ -6958,6 +7450,410 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
                 .clone();
             (results, requests)
         })
+    }
+
+    /// An independent self-signed CA (`FastMCP OAuth TEST ONLY Root`), copied
+    /// from the fastmcp-client OAuth fixture. The loopback chain does not
+    /// chain to it, so it is the "CA outside the root set" for X7(ii).
+    const GUARDED_OUTSIDE_ROOT_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgICA+kwCgYIKoZIzj0EAwIwJzElMCMGA1UEAwwcRmFzdE1D
+UCBPQXV0aCBURVNUIE9OTFkgUm9vdDAeFw0yMDAxMDEwMDAwMDBaFw00OTEyMzEw
+MDAwMDBaMCcxJTAjBgNVBAMMHEZhc3RNQ1AgT0F1dGggVEVTVCBPTkxZIFJvb3Qw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS5t2O8JZ0hNjgI38E9Ov6i6mKoDRGo
+ApMsykFkvgb6Zm9/5gCZ90eIKw7aWgK6iNs7lbtVY9mysZBIqm6pKQO2o0UwQzAS
+BgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQU6QNI
+rmvMiLoV3jIoCyohXARwI8gwCgYIKoZIzj0EAwIDSAAwRQIgCKOrW3vhzUJ2EyuY
+vQUTdqGFhy0zEHj4ITFLvXPz1X8CIQCLKD4EKCvS/zkBSu/6uee1WV9d97UpK3yW
+X/aCEJ5+hA==
+-----END CERTIFICATE-----";
+
+    fn guarded_outside_root() -> Certificate {
+        Certificate::from_pem(GUARDED_OUTSIDE_ROOT_PEM)
+            .expect("outside fixture CA")
+            .into_iter()
+            .next()
+            .expect("one outside fixture CA")
+    }
+
+    /// Reads one complete request: the header block, then exactly
+    /// `Content-Length` body bytes. The header-only reader above cannot see a
+    /// POST body, which X7(i) compares byte for byte.
+    async fn guarded_loopback_read_full_request(
+        tls: &mut asupersync::tls::TlsStream<NativeTcpStream>,
+    ) -> Result<Vec<u8>, String> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            if request.len() > 8 * 1024 {
+                return Err("loopback POST header block exceeded its bound".to_owned());
+            }
+            let read = tls
+                .read(&mut chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                return Err("loopback POST ended before the header terminator".to_owned());
+            }
+            request.extend_from_slice(&chunk[..read]);
+        };
+        let head = std::str::from_utf8(&request[..header_end])
+            .map_err(|_| "loopback POST header block is not UTF-8".to_owned())?;
+        let content_length = head
+            .split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>())
+            .transpose()
+            .map_err(|_| "loopback POST Content-Length is not decimal".to_owned())?
+            .unwrap_or(0);
+        let total = header_end + content_length;
+        if total > MAX_GUARDED_REQUEST_BODY_BYTES + 8 * 1024 {
+            return Err("loopback POST exceeded the request bound".to_owned());
+        }
+        while request.len() < total {
+            let read = tls
+                .read(&mut chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                return Err("loopback POST ended before its declared body".to_owned());
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        if request.len() != total {
+            return Err("loopback POST sent bytes past its declared body".to_owned());
+        }
+        Ok(request)
+    }
+
+    /// What the POST loopback server observed.
+    #[derive(Debug, Default)]
+    struct GuardedLoopbackPostObservation {
+        /// TCP connections accepted, including refused TLS handshakes and any
+        /// connection that arrives during the trailing quiet window.
+        accepted_connections: usize,
+        /// Complete requests read after a successful TLS handshake.
+        requests: Vec<Vec<u8>>,
+    }
+
+    /// The POST counterpart of `guarded_loopback_serve`, with the same
+    /// PER-PHASE budgets (#2678). One response slot is consumed per accepted
+    /// connection. A connection whose TLS handshake fails is counted, gets no
+    /// HTTP bytes, and consumes its slot. After the last slot the server keeps
+    /// accepting for `quiet_window`, so a follow-up connection (a followed
+    /// redirect, say) is counted rather than missed.
+    ///
+    /// Each response is written, flushed, and closed with close_notify. A
+    /// write alone can leave encrypted bytes buffered in the TLS session when
+    /// the socket is not writable, and dropping the stream then loses them.
+    async fn guarded_loopback_serve_posts(
+        cx: Cx,
+        phase_budget: Duration,
+        quiet_window: Duration,
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        observation: Arc<Mutex<GuardedLoopbackPostObservation>>,
+    ) -> Result<(), String> {
+        let acceptor = guarded_loopback_acceptor();
+        for response in responses {
+            cx.checkpoint()
+                .map_err(|_| "loopback POST server cancelled before accept".to_owned())?;
+            let (stream, _) = time::timeout_at(time::wall_now() + phase_budget, listener.accept())
+                .await
+                .map_err(|_| format!("loopback TEST HARNESS bound: accept phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?
+                .map_err(|error| error.to_string())?;
+            observation
+                .lock()
+                .expect("loopback POST observation lock")
+                .accepted_connections += 1;
+            let tls = time::timeout_at(time::wall_now() + phase_budget, acceptor.accept(stream))
+                .await
+                .map_err(|_| format!("loopback TEST HARNESS bound: TLS-handshake phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?;
+            let Ok(mut tls) = tls else {
+                continue;
+            };
+            let request = time::timeout_at(
+                time::wall_now() + phase_budget,
+                guarded_loopback_read_full_request(&mut tls),
+            )
+            .await
+            .map_err(|_| format!("loopback TEST HARNESS bound: HTTP-read phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))??;
+            observation
+                .lock()
+                .expect("loopback POST observation lock")
+                .requests
+                .push(request);
+            time::timeout_at(time::wall_now() + phase_budget, async {
+                tls.write_all(&response).await?;
+                tls.flush().await?;
+                tls.shutdown().await
+            })
+            .await
+            .map_err(|_| format!("loopback TEST HARNESS bound: HTTP-write phase exceeded its {phase_budget:?} per-phase budget; this is the harness deadline, not a failure of the code under test"))?
+            .map_err(|error| error.to_string())?;
+        }
+        if let Ok(accepted) =
+            time::timeout_at(time::wall_now() + quiet_window, listener.accept()).await
+        {
+            accepted.map_err(|error| error.to_string())?;
+            observation
+                .lock()
+                .expect("loopback POST observation lock")
+                .accepted_connections += 1;
+        }
+        Ok(())
+    }
+
+    /// One root-set POST attempt: the set the fetcher trusts, the request, and
+    /// the host used in the URL.
+    struct GuardedLoopbackPostAttempt {
+        roots: GuardedRootSet,
+        request: GuardedHttpRequest,
+        host: &'static str,
+    }
+
+    /// The results of a POST loopback run, with each attempt's URL and the
+    /// root identity its fetcher reported before posting.
+    struct GuardedLoopbackPostRun {
+        results: Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
+        urls: Vec<GuardedHttpsUrl>,
+        root_identities: Vec<String>,
+        observation: GuardedLoopbackPostObservation,
+    }
+
+    fn guarded_loopback_posts(
+        attempts: Vec<GuardedLoopbackPostAttempt>,
+        responses: Vec<Vec<u8>>,
+    ) -> GuardedLoopbackPostRun {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime installs loopback context");
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("bind loopback listener");
+            let authority = listener.local_addr().expect("loopback listener address");
+            // Per-phase, as in `guarded_loopback_fetches`.
+            let phase_budget = Duration::from_secs(10);
+            let quiet_window = Duration::from_millis(500);
+            let observation = Arc::new(Mutex::new(GuardedLoopbackPostObservation::default()));
+            let server_observation = Arc::clone(&observation);
+            let mut server = cx
+                .spawn(move |server_cx| {
+                    guarded_loopback_serve_posts(
+                        server_cx,
+                        phase_budget,
+                        quiet_window,
+                        listener,
+                        responses,
+                        server_observation,
+                    )
+                })
+                .expect("spawn loopback POST server");
+            let mut results = Vec::with_capacity(attempts.len());
+            let mut urls = Vec::with_capacity(attempts.len());
+            let mut root_identities = Vec::with_capacity(attempts.len());
+            for attempt in attempts {
+                let fetcher = GuardedHttpFetcher::new_loopback_test_authority_with_root_set(
+                    guarded_test_policy_with_handshake(
+                        1024,
+                        Duration::from_secs(1),
+                        Duration::from_millis(100),
+                    ),
+                    authority,
+                    &attempt.roots,
+                )
+                .expect("private loopback root-set fetcher");
+                let url = GuardedHttpsUrl::parse(&format!(
+                    "https://{}:{}/token",
+                    attempt.host,
+                    authority.port()
+                ))
+                .expect("loopback POST URL");
+                root_identities.push(fetcher.root_identity().to_owned());
+                results.push(fetcher.post(&cx, &url, &attempt.request).await);
+                urls.push(url);
+            }
+            let join_deadline =
+                time::wall_now() + phase_budget + quiet_window + Duration::from_secs(1);
+            match time::timeout_at(join_deadline, server.join(&cx)).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => panic!("loopback POST server: {error}"),
+                Ok(Err(error)) => panic!("loopback POST server task: {error}"),
+                Err(_) => {
+                    server.abort();
+                    let settlement_deadline = time::wall_now() + Duration::from_millis(250);
+                    match time::timeout_at(settlement_deadline, server.join(&cx)).await {
+                        Ok(Ok(Ok(()))) => panic!("loopback POST server exceeded its join deadline"),
+                        Ok(Ok(Err(error))) => {
+                            panic!("loopback POST server exceeded join deadline: {error}")
+                        }
+                        Ok(Err(error)) => {
+                            panic!("loopback POST server cancellation settled: {error}")
+                        }
+                        Err(error) => panic!(
+                            "loopback POST server failed bounded cancellation settlement: {error:?}"
+                        ),
+                    }
+                }
+            }
+            let observation =
+                std::mem::take(&mut *observation.lock().expect("loopback POST observation lock"));
+            GuardedLoopbackPostRun {
+                results,
+                urls,
+                root_identities,
+                observation,
+            }
+        })
+    }
+
+    fn guarded_loopback_member_roots() -> GuardedRootSet {
+        GuardedRootSet::new([guarded_loopback_root()]).expect("member root set")
+    }
+
+    /// X7(i), lower proof class (cfg(test) loopback, PL-3): the bytes the
+    /// server receives equal `guarded_encode_post_request`'s output.
+    #[test]
+    fn fnd_05_guarded_post_wire_bytes_match_encoder() {
+        let request = GuardedHttpRequest::new(
+            "application/x-www-form-urlencoded",
+            b"grant_type=opaque&scope=wire".to_vec(),
+        )
+        .expect("admissible POST body")
+        .with_authorization("Basic d2lyZS1wcm9vZg==")
+        .expect("admissible authorization value");
+        let run = guarded_loopback_posts(
+            vec![GuardedLoopbackPostAttempt {
+                roots: guarded_loopback_member_roots(),
+                request: request.clone(),
+                host: "foobar.com",
+            }],
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()],
+        );
+
+        let expected = guarded_encode_post_request(&run.urls[0], &request)
+            .expect("encoder output for the posted request");
+        assert_eq!(
+            run.observation.requests,
+            vec![expected],
+            "wire bytes must equal the public encoder's bytes"
+        );
+        assert_eq!(run.observation.accepted_connections, 1);
+        let response = run
+            .results
+            .into_iter()
+            .next()
+            .expect("one result")
+            .expect("POST over the member root set succeeds");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        assert_eq!(response.redirect, None);
+        assert_eq!(
+            response.provenance.root_policy_revision, run.root_identities[0],
+            "provenance reports the folded root identity"
+        );
+        assert!(
+            run.root_identities[0].starts_with("custom-roots.sha256."),
+            "a root-set fetcher must not report the caller's WebPKI label: {}",
+            run.root_identities[0]
+        );
+    }
+
+    /// X7(ii), lower proof class: the same chain is accepted under a set that
+    /// holds its CA and refused, with a typed TLS error and no HTTP bytes,
+    /// under a set that holds only an unrelated CA.
+    #[test]
+    fn fnd_05_guarded_root_set_wire_admits_member_refuses_nonmember() {
+        let request =
+            GuardedHttpRequest::new("application/json", b"{}".to_vec()).expect("admissible body");
+        let run = guarded_loopback_posts(
+            vec![
+                GuardedLoopbackPostAttempt {
+                    roots: GuardedRootSet::new([guarded_outside_root()])
+                        .expect("non-member root set"),
+                    request: request.clone(),
+                    host: "foobar.com",
+                },
+                GuardedLoopbackPostAttempt {
+                    roots: guarded_loopback_member_roots(),
+                    request: request.clone(),
+                    host: "foobar.com",
+                },
+            ],
+            vec![
+                b"HTTP/1.1 500 Unreachable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ],
+        );
+
+        assert!(
+            matches!(run.results[0], Err(GuardedHttpFetchError::Tls(_))),
+            "a chain outside the root set must be a typed TLS refusal: {:?}",
+            run.results[0]
+        );
+        assert_eq!(
+            run.results[1].as_ref().map(|response| response.status),
+            Ok(200),
+            "the same chain under its own CA is admitted"
+        );
+        assert_eq!(
+            run.observation.accepted_connections, 2,
+            "both attempts reached the listener"
+        );
+        let expected = guarded_encode_post_request(&run.urls[1], &request)
+            .expect("encoder output for the admitted request");
+        assert_eq!(
+            run.observation.requests,
+            vec![expected],
+            "the refused attempt wrote no HTTP bytes; only the admitted one did"
+        );
+        assert_ne!(
+            run.root_identities[0], run.root_identities[1],
+            "different root sets report different identities"
+        );
+    }
+
+    /// X7(iii), lower proof class: a 3xx answer to POST is reported as data,
+    /// and the server sees exactly one connection and one request, including
+    /// during a quiet window after the response.
+    #[test]
+    fn fnd_05_guarded_post_redirect_is_reported_not_followed() {
+        let request =
+            GuardedHttpRequest::new("application/json", b"{\"a\":1}".to_vec()).expect("body");
+        let run = guarded_loopback_posts(
+            vec![GuardedLoopbackPostAttempt {
+                roots: guarded_loopback_member_roots(),
+                request,
+                host: "foobar.com",
+            }],
+            vec![b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://foobar.com/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()],
+        );
+
+        let response = run
+            .results
+            .into_iter()
+            .next()
+            .expect("one result")
+            .expect("redirect response is data, not an error");
+        assert_eq!(
+            response.redirect,
+            Some(GuardedHttpRedirect {
+                status: 307,
+                location: Some("https://foobar.com/elsewhere".to_owned()),
+            })
+        );
+        assert_eq!(
+            run.observation.requests.len(),
+            1,
+            "POST must not replay after a redirect"
+        );
+        assert_eq!(
+            run.observation.accepted_connections, 1,
+            "no follow-up connection may open, even after the response"
+        );
     }
 
     impl GuardedHttpResolver for StaticGuardedResolver {

@@ -67,6 +67,11 @@ pub use http::{
     guarded_admit_native_response,
 };
 pub use http::{
+    GuardedHttpRequest, GuardedRootSet, MAX_GUARDED_REQUEST_BODY_BYTES,
+    MAX_GUARDED_REQUEST_HEADER_VALUE_BYTES, MAX_GUARDED_ROOT_SET_CERTIFICATES,
+    guarded_encode_post_request,
+};
+pub use http::{
     HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
     HttpResponse, HttpResponseRepresentation, HttpStatus, ModernHttpRequestAdmission,
     ModernHttpSseCollector, ModernHttpSseCollectorError, NativeGuardedResolver,
