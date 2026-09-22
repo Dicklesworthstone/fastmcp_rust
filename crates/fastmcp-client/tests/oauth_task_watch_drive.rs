@@ -402,3 +402,6 @@ fn lost_update_acknowledgement_never_retries_or_reconciles_uncertain_effects() {
 fn changed_unanswered_key_after_partial_update_never_reaches_the_host_again() {
     isolated("changed_unanswered_key_after_partial_update_never_reaches_the_host_again", Case::ChangedKey);
 }
+
+#[path = "oauth_task_watch_drive/journal.rs"]
+mod journal;
