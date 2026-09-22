@@ -149,6 +149,7 @@ class World:
         self.repo = repo
         self.raw_override: dict[str, bytes] = {}
         self.parsed: dict[str, dict] = {}
+        self.parsed_json: dict[str, object] = {}
 
     def raw(self, path: str) -> bytes:
         if path in self.raw_override:
@@ -163,19 +164,30 @@ class World:
             self.parsed[path] = tomllib.loads(self.text(path))
         return self.parsed[path]
 
+    def json(self, path: str):
+        if path not in self.parsed_json:
+            self.parsed_json[path] = strict_json(self.raw(path))
+        return self.parsed_json[path]
+
     def clone(self) -> "World":
         other = World(self.repo)
         other.raw_override = dict(self.raw_override)
         other.parsed = dict(self.parsed)  # shared until mutable_doc copies one
+        other.parsed_json = dict(self.parsed_json)
         return other
 
     def mutable_doc(self, path: str) -> dict:
         self.parsed[path] = copy.deepcopy(self.doc(path))
         return self.parsed[path]
 
+    def mutable_json(self, path: str):
+        self.parsed_json[path] = copy.deepcopy(self.json(path))
+        return self.parsed_json[path]
+
     def set_raw(self, path: str, data: bytes) -> None:
         self.raw_override[path] = data
         self.parsed.pop(path, None)
+        self.parsed_json.pop(path, None)
 
 
 # --------------------------------------------------------------------------------------------
@@ -932,7 +944,7 @@ def observation_bytes(w: World, row: dict) -> bytes:
     if mode == "canonical_selected_toml":
         tree, encode = w.doc(row["source_path"]), fnd01_toml_value
     else:
-        tree, encode = strict_json(w.raw(row["source_path"])), fnd01_json_value
+        tree, encode = w.json(row["source_path"]), fnd01_json_value
     for selector in selectors:
         value = resolve_pointer(tree, selector)
         out += b"\x00" if value is ABSENT else encode(value)
@@ -941,6 +953,175 @@ def observation_bytes(w: World, row: dict) -> bytes:
 
 def observation_builder(index: int) -> Callable[[World], bytes]:
     return lambda w: observation_bytes(w, w.doc(DV)["semantic_assertion"][index])
+
+
+# ---- stage 2: violating observations -----------------------------------------------------------
+
+
+def pointer_parent(tree, pointer: str):
+    """Resolve every component but the last (with resolve_pointer's rules); return (container, slot)
+    where slot is a dict key, or a list index for a canonical decimal or an identity component."""
+    head, _, last = pointer.rpartition("/")
+    container = resolve_pointer(tree, head)
+    if container is ABSENT:
+        raise ValueError(f"parent of {pointer!r} does not resolve")
+    last = last.replace("~1", "/").replace("~0", "~")
+    if isinstance(container, dict):
+        return container, last
+    if isinstance(container, list):
+        if re.fullmatch(r"0|[1-9][0-9]*", last):
+            return container, int(last)
+        if "=" in last:
+            key, literal = last.split("=", 1)
+            matches = [index for index, item in enumerate(container) if isinstance(item, dict) and item.get(key) == literal]
+            if len(matches) != 1:
+                raise ValueError(f"identity component {last!r} matches {len(matches)} elements")
+            return container, matches[0]
+    raise ValueError(f"{pointer!r} does not end in a table member or an array slot")
+
+
+def typed_like(original, argument: str):
+    """READING (replace/insert with a literal argument): the argument string takes the TOML type of
+    the value it replaces -- integer for an integer, boolean for a boolean, else the string."""
+    if isinstance(original, bool):
+        if argument not in ("true", "false"):
+            raise ValueError(f"boolean replacement {argument!r}")
+        return argument == "true"
+    if isinstance(original, int):
+        return int(argument)
+    return argument
+
+
+# READING dependency-verification semantic_assertion[i].violating_observation_sha256
+#   keys: the assertion's violation_mode exact_observation_sha256 and its observation keys (as the
+#         baseline reading above); the ONE [[negative_case]] whose validator equals the assertion id
+#         (mutation_contract assertion_registry_is_only_oracle_authority, one_recipe_per_id);
+#         mutation_contract (allowed_operations, selector_grammar, replace_bytes_argument_grammar,
+#         mutation_execution_isolation: "create a fresh bounded in-memory copy of only target_path
+#         bytes, apply exactly that recipe"); fixture_contract (reference_prefix "fixture:",
+#         applications, table_member_relative_selector_grammar "appended component-wise to the
+#         negative case target_selector"); [[mutation_fixture]] rows.
+#   The violating observation is the FND01OBSv1 observation of the SAME assertion (same selector
+#   tuple) over the mutated in-memory copy of its source; integrity_mode rebind_virtual_hashes
+#   rebinds only virtual hashes elsewhere and does not change the observed source.
+#   OPEN TOKENS -- the prose names each operation and its argument requirement but not its effect;
+#   one reading per operation, fixed here before any violating digest is computed:
+#     remove        delete the selected node: a table member is removed; an array element is removed
+#                   and later elements shift down (so an index selector then sees its successor); a
+#                   fixture argument (remove_exact_value) must equal the selected value first.
+#     insert        a fixture insert_table_member sets <target_selector><relative_selector> (the
+#                   member must be absent); a fixture insert_array_element, or a literal argument on
+#                   an array target, APPENDS at the end; a literal argument on a table target is one
+#                   TOML key/value line, parsed and added as a new member (the key must be absent).
+#     replace       a fixture replace_value replaces the selected value; replace_table_member sets
+#                   <target_selector><relative_selector> (the member must exist); a literal argument
+#                   is typed like the value it replaces (typed_like).
+#     swap          exchange the values at target_selector and secondary_selector.
+#     duplicate     insert a deep copy of the selected array element IMMEDIATELY AFTER it.
+#     toggle_bool   argument false-to-true / true-to-false; the current value must be the "from" side.
+#     increment     add the argument, read as a decimal integer, to the selected integer.
+#     append_feature append the argument string to the end of the selected string array.
+#     replace_bytes /bytes/<n> is offset n and /bytes/end is the file length; xor:<hh> XORs the one
+#                   byte at the offset; truncate:<n> removes the n bytes that end at the offset;
+#                   append-hex:<hex> inserts the decoded bytes at the offset; insert-cr-before-lf
+#                   requires an LF at the offset and inserts one CR before it.
+#   A recipe whose precondition does not hold (absent member present, false-to-true on true, ...)
+#   raises in the builder, which the runner records as VOID.
+def apply_recipe(w: World, case: dict) -> None:
+    fixtures = {row["id"]: row for row in w.doc(DV)["mutation_fixture"]}
+    path, selector, operation = case["target_path"], case["target_selector"], case["operation"]
+    argument = case.get("argument")
+    fixture = None
+    if isinstance(argument, str) and argument.startswith("fixture:"):
+        fixture = fixtures[argument[len("fixture:"):]]
+    if operation == "replace_bytes":
+        data = bytearray(w.raw(path))
+        location = selector.removeprefix("/bytes/")
+        offset = len(data) if location == "end" else int(location)
+        kind, _, value = argument.partition(":")
+        if kind == "xor":
+            data[offset] ^= int(value, 16)
+        elif kind == "truncate":
+            count = int(value)
+            if count > offset:
+                raise ValueError("truncate reaches before byte zero")
+            del data[offset - count:offset]
+        elif kind == "append-hex":
+            data[offset:offset] = bytes.fromhex(value)
+        elif argument == "insert-cr-before-lf":
+            if data[offset:offset + 1] != b"\n":
+                raise ValueError("insert-cr-before-lf offset is not an LF")
+            data[offset:offset] = b"\r"
+        else:
+            raise ValueError(f"replace_bytes argument {argument!r}")
+        w.set_raw(path, bytes(data))
+        return
+    tree = w.mutable_json(path) if path.endswith(".json") else w.mutable_doc(path)
+    container, slot = pointer_parent(tree, selector)
+    if operation == "remove":
+        if fixture is not None and container[slot] != fixture["value"]:
+            raise ValueError("remove_exact_value fixture does not equal the selected value")
+        del container[slot]
+    elif operation == "insert":
+        target = container[slot]
+        if fixture is not None and fixture["application"] == "insert_table_member":
+            member_parent, member = pointer_parent(target, fixture["value"]["relative_selector"])
+            if member in member_parent:
+                raise ValueError("insert_table_member target already present")
+            member_parent[member] = copy.deepcopy(fixture["value"]["value"])
+        elif fixture is not None:
+            target.append(copy.deepcopy(fixture["value"]))
+        elif isinstance(target, list):
+            target.append(argument)
+        else:
+            addition = tomllib.loads(argument)
+            if len(addition) != 1 or next(iter(addition)) in target:
+                raise ValueError("insert line is not one new key/value")
+            target.update(addition)
+    elif operation == "replace":
+        if fixture is not None and fixture["application"] == "replace_table_member":
+            member_parent, member = pointer_parent(container[slot], fixture["value"]["relative_selector"])
+            if member not in member_parent:
+                raise ValueError("replace_table_member key is absent")
+            member_parent[member] = copy.deepcopy(fixture["value"]["value"])
+        elif fixture is not None:
+            container[slot] = copy.deepcopy(fixture["value"])
+        else:
+            container[slot] = typed_like(container[slot], argument)
+    elif operation == "swap":
+        other_container, other_slot = pointer_parent(tree, case["secondary_selector"])
+        container[slot], other_container[other_slot] = other_container[other_slot], container[slot]
+    elif operation == "duplicate":
+        if not isinstance(container, list):
+            raise ValueError("duplicate target is not an array element")
+        container.insert(slot + 1, copy.deepcopy(container[slot]))
+    elif operation == "toggle_bool":
+        source, _, destination = argument.partition("-to-")
+        if container[slot] is not (source == "true"):
+            raise ValueError(f"toggle_bool {argument!r} precondition does not hold")
+        container[slot] = destination == "true"
+    elif operation == "increment":
+        if isinstance(container[slot], bool) or not isinstance(container[slot], int):
+            raise ValueError("increment target is not an integer")
+        container[slot] = container[slot] + int(argument)
+    elif operation == "append_feature":
+        container[slot].append(argument)
+    else:
+        raise Underdetermined(f"operation {operation!r} has no reading")
+
+
+def violating_builder(index: int) -> Callable[[World], bytes]:
+    def build(w: World) -> bytes:
+        dv = w.doc(DV)
+        row = dv["semantic_assertion"][index]
+        cases = [case for case in dv["negative_case"] if case["validator"] == row["id"]]
+        if len(cases) != 1:
+            raise ValueError(f"{len(cases)} negative_case rows name validator {row['id']}")
+        mutated = w.clone()
+        apply_recipe(mutated, cases[0])
+        return observation_bytes(mutated, row)
+
+    return build
 
 
 # ---- security vectors (Class B) ---------------------------------------------------------------
@@ -1350,9 +1531,11 @@ def build_targets(w: World) -> list[Target]:
                build_index_json_registry),
         Target(DV, "repository_surface_contract.agent_behavior_rule_registry_sha256", "A", None, build_agent_rule_registry),
         unattempted(DV, "command_matrix_contract.gate_command_authority_sha256", "A",
-                    "reading not yet written: the preimage needs the 206-command expansion of the 17 "
-                    "command_templates through command_expansion_registry, with exact target/profile/"
-                    "resolver/network-mode substitution; deferred to a later pre-registration commit"),
+                    ABSENT_TOOL_OUTPUT.format(
+                        "gate_command_authority_preimage is computed 'from the published command-results "
+                        "rows', a derived integration output that is not committed; re-deriving those rows "
+                        "from the 17 command_templates would be a second construction this digest's prose "
+                        "does not state")),
         Target(DV, "source_tree.sha256", "TREE", None, build_source_tree),
         unattempted(DV, "advisory_database_contract.source_tree_sha256", "TREE",
                     ABSENT_TOOL_OUTPUT.format("the RustSec advisory-db tree at commit 7c7ccac5 (1192 files, "
@@ -1373,10 +1556,8 @@ def build_targets(w: World) -> list[Target]:
     for index in range(len(dv["semantic_assertion"])):
         targets.append(Target(DV, f"semantic_assertion[{index}].baseline_observation_sha256", "OBS", None,
                               observation_builder(index)))
-        targets.append(unattempted(
-            DV, f"semantic_assertion[{index}].violating_observation_sha256", "OBS",
-            "reading not yet written: the violating observation first applies the case's mutation "
-            "recipe (9 operations; per-operation semantics to be pre-registered in a later commit)"))
+        targets.append(Target(DV, f"semantic_assertion[{index}].violating_observation_sha256", "OBS", None,
+                              violating_builder(index)))
     for index in range(len(sv["case"])):
         targets.append(Target(SV, f"case[{index}].sha256", "B", f"case[{index}].byte_length", security_vector_builder(index)))
     targets.append(Target(AUTH, "phase_b_authority_table.full_input_digest", "A", None, build_auth_full_input))
@@ -1783,6 +1964,22 @@ def mutations(w: World) -> list[Mutation]:
         row["selector"], row["secondary_selector"] = before[1], before[0]
         return before, (row["selector"], row["secondary_selector"])
 
+    recipe_site = ("evidence/fnd-01/media-dependencies.toml", "/crate/0/license")
+    recipe_case = next(
+        index for index, case in enumerate(w.doc(DV)["negative_case"])
+        if (case["target_path"], case["target_selector"]) == recipe_site
+    )
+    recipe_assertion = next(
+        index for index, row in enumerate(w.doc(DV)["semantic_assertion"])
+        if row["id"] == w.doc(DV)["negative_case"][recipe_case]["validator"]
+    )
+
+    def obs_recipe_argument(w):
+        case = w.mutable_doc(DV)["negative_case"][recipe_case]
+        before = case["argument"]
+        case["argument"] = replace_one_char(before, 0)
+        return before, case["argument"]
+
     child = (DV, "closed_child_handoff_contract.registry_sha256")
     document = (DV, "bootstrap_manifest_contract.canonical_document_sha256")
     tree = (DV, "source_tree.sha256")
@@ -1810,7 +2007,15 @@ def mutations(w: World) -> list[Mutation]:
         Mutation("OBS", f"(b) one byte of the declared digest: semantic_assertion[{probe}]", obs, True, obs_digest,
                  dependents=((registry, registry_reason),)),
         Mutation("OBS", f"(c) one reordering of the selector tuple of swap assertion semantic_assertion[{swap}]", swapped, True,
-                 obs_order, dependents=((registry, registry_reason),)),
+                 obs_order, dependents=(
+                     (registry, registry_reason),
+                     ((DV, f"semantic_assertion[{swap}].violating_observation_sha256"),
+                      "the violating observation encodes the same selector tuple"),
+                 )),
+        Mutation("OBS", f"(a) one byte of one recipe argument: negative_case[{recipe_case}] {recipe_site[1]} (violating path)",
+                 (DV, f"semantic_assertion[{recipe_assertion}].violating_observation_sha256"), True, obs_recipe_argument,
+                 dependents=(((DV, "mutation_contract.canonical_recipe_sha256"),
+                              "argument is a canonical_recipe_fields member of the FND01MUTv2 registry"),)),
     ]
 
 
@@ -1970,7 +2175,8 @@ def main() -> int:
     exhaustive = tally["UNATTEMPTED"] == 0
     print(f"exhaustive: {'yes' if exhaustive else 'NO -- ' + str(tally['UNATTEMPTED']) + ' UNATTEMPTED (J8)'}")
     red = bool(errors) or not reconciled or bool(failures)
-    print("RESULT: " + ("RED" if red else "GREEN (reconciled, exhaustive population screen, self-test passed)"))
+    print("RESULT: " + ("RED" if red else "GREEN instrument: every base field classified, totals reconciled (PL-1), "
+                        "self-test passed; outcomes above are the result, and misses are not failures of the run"))
     return 1 if red else 0
 
 
