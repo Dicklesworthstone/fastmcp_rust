@@ -3696,18 +3696,17 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
         Type::Array(array) => {
             let items = type_to_json_schema(&array.elem);
             let length = &array.len;
-            let length_binding = Ident::new("__fastmcp_array_length", Span::mixed_site());
-            return quote! {{
-                // Array lengths have a usize expected type in Rust. Preserve
-                // that context for unsuffixed literals and const expressions.
-                let #length_binding: usize = #length;
+            return quote! {
+                // Keep the usize const-expression context without a generated
+                // local that could resolve to a caller's same-named constant.
+                // Unit arrays carry no element payload, even for large lengths.
                 serde_json::json!({
                     "type": "array",
                     "items": #items,
-                    "minItems": #length_binding,
-                    "maxItems": #length_binding,
+                    "minItems": ([(); #length].len()),
+                    "maxItems": ([(); #length].len()),
                 })
-            }};
+            };
         }
         Type::Paren(paren) => return type_to_json_schema(&paren.elem),
         Type::Group(group) => return type_to_json_schema(&group.elem),
