@@ -125,6 +125,7 @@ fn assert_inert(coordinator: &HttpFallbackCoordinator, context: &str) {
         state.era_cache_mutations, 0,
         "{context}: no era or discovery cache entry may be written"
     );
+    assert_eq!(coordinator.advertised_message_post_target(), None);
 }
 
 #[test]
@@ -217,7 +218,7 @@ fn leg_neg_01_b_positive() {
 
     assert_eq!(
         selecting
-            .admit_endpoint_event(LEGACY_SSE_TARGET)
+            .admit_endpoint_event(LEGACY_MESSAGE_TARGET)
             .expect("the first valid endpoint event selects the exact-2024 era"),
         ProtocolEra::Legacy2024
     );
@@ -225,11 +226,15 @@ fn leg_neg_01_b_positive() {
     assert_eq!(selecting.state().endpoint_events_admitted, 1);
     assert_eq!(selecting.state().credential_mutations, 0);
     assert_eq!(selecting.state().era_cache_mutations, 0);
+    assert_eq!(
+        selecting.advertised_message_post_target(),
+        Some(LEGACY_MESSAGE_TARGET)
+    );
 
     // A second event cannot re-select or change the era.
     let selected_state = selecting.state();
     assert_eq!(
-        selecting.admit_endpoint_event(LEGACY_SSE_TARGET),
+        selecting.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
         Err(HttpFallbackError::DuplicateEndpointEvent)
     );
     assert_eq!(selecting.state(), selected_state);
@@ -239,7 +244,7 @@ fn leg_neg_01_b_positive() {
     let mut session_query = authorized_and_opened();
     assert_eq!(
         session_query
-            .admit_endpoint_event(&format!("{LEGACY_SSE_TARGET}?session_id=abc123"))
+            .admit_endpoint_event(&format!("{LEGACY_MESSAGE_TARGET}?session_id=abc123"))
             .expect("a session query extends the configured target"),
         ProtocolEra::Legacy2024
     );
@@ -300,26 +305,27 @@ fn leg_neg_01_b_positive() {
     }
     for mismatched in [
         "https://mcp.example.test/other",
-        "https://other.example.test/sse",
-        "http://mcp.example.test/sse",
-        "https://mcp.example.test/sse/extra",
-        "https://mcp.example.test/messages",
+        "https://other.example.test/messages",
+        "http://mcp.example.test/messages",
+        "https://mcp.example.test/messages/extra",
+        LEGACY_SSE_TARGET,
     ] {
         let mut coordinator = authorized_and_opened();
         let before = coordinator.state();
         assert_eq!(
             coordinator.admit_endpoint_event(mismatched),
             Err(HttpFallbackError::EndpointEventTargetMismatch),
-            "{mismatched} is not the configured legacy target"
+            "{mismatched} is not the configured legacy message POST target"
         );
         assert_eq!(coordinator.state(), before);
         assert_eq!(coordinator.selected_era(), None);
+        assert_eq!(coordinator.advertised_message_post_target(), None);
     }
 
     // An endpoint event without an authorized, opened GET selects nothing.
     let mut unauthorized = coordinator();
     assert_eq!(
-        unauthorized.admit_endpoint_event(LEGACY_SSE_TARGET),
+        unauthorized.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
         Err(HttpFallbackError::EndpointEventWithoutAuthorization)
     );
     assert_eq!(unauthorized.state(), pristine());
@@ -332,7 +338,7 @@ fn leg_neg_01_b_positive() {
         Ok(FallbackDecision::ModernRetained)
     ));
     assert_eq!(
-        recognized.admit_endpoint_event(LEGACY_SSE_TARGET),
+        recognized.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
         Err(HttpFallbackError::EndpointEventWithoutAuthorization)
     );
     assert_inert(&recognized, "recognized modern cannot reach selection");
@@ -477,28 +483,16 @@ fn authorized_and_opened() -> HttpFallbackCoordinator {
 
 /// Structural proof that a legacy `GET` authorization has exactly one issuer.
 ///
-/// WHY THIS CANNOT BE AN OBSERVATIONAL TEST, WHICH IS THE WHOLE POINT.
-/// Every case above drives the coordinator through its own public methods, so
-/// each one is conditional on the caller choosing to ask. They prove that *this*
-/// coordinator refuses an ineligible row; none of them can prove that a legacy
-/// `GET` has no other door. The property that makes "downgrade-resistant" mean
-/// anything is that [`LegacyGetPermit`] is unforgeable: private fields, no
-/// public constructor, and exactly one struct-literal site, inside `observe`.
-/// That is a claim about the shipped source, and no value assertion reaches it.
+/// Every behavioral case drives the coordinator through its public methods.
+/// This complementary source check guards the shipped permit's private fields,
+/// accessor-only inherent impl, and single construction site inside `observe`.
+/// It does not establish that a live transport consults the coordinator.
 ///
-/// WHAT THIS DELIBERATELY DOES NOT CLAIM. It does not show that any production
-/// path consults the coordinator - as of this commit nothing outside `lib.rs`
-/// re-exports names it at all, and wiring it is LEG-HTTP-01's work, not this
-/// leaf's. This guard fixes the boundary so that whoever wires it cannot
-/// quietly route around it.
-///
-/// MUTATION BEHAVIOUR, which is what makes this a real check rather than a
-/// restatement: adding `pub fn new` to the permit, publishing a field, adding a
-/// second construction site, deleting the only one, adding a third field, or
-/// renaming either anchor out from under the guard each produce a distinct
-/// failure. All seven were run against a mutated copy of the shipped source
-/// before this was committed; the two anchor cases exist because an earlier
-/// draft passed vacuously when it could not find its own subject.
+/// The former two-field layout did not bind the issuing coordinator. The
+/// reviewed layout now requires the private `owner: Arc<()>` as well as target
+/// and attempt, and the public behavioral regressions below exercise that
+/// ownership. No constructor, public field, or extra issuance site is allowed.
+/// This line-oriented check is not an AST proof of arbitrary Rust syntax.
 fn assert_permit_issuance_is_sole_sourced() {
     let leg_neg = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/leg_neg.rs");
     let source = std::fs::read_to_string(&leg_neg)
@@ -578,11 +572,11 @@ fn assert_permit_issuance_is_sole_sourced() {
         ));
     }
 
-    // (4): every field is private, so no external crate can build one literally.
+    // (4): require the complete private binding, not merely a field count.
     let mut public_fields = Vec::new();
+    let mut fields = Vec::new();
     let mut inside = false;
     let mut saw_struct = false;
-    let mut field_count = 0_usize;
     for line in source.lines() {
         if line.starts_with("pub struct LegacyGetPermit {") {
             inside = true;
@@ -593,12 +587,12 @@ fn assert_permit_issuance_is_sole_sourced() {
             if line == "}" {
                 break;
             }
-            let trimmed = line.trim_start();
+            let trimmed = line.trim();
             if trimmed.contains(':') && !trimmed.starts_with("//") {
-                field_count += 1;
+                fields.push(trimmed.to_owned());
             }
-            if let Some(rest) = trimmed.strip_prefix("pub ") {
-                public_fields.push(rest.split(':').next().unwrap_or("<none>").to_owned());
+            if trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+                public_fields.push(trimmed.to_owned());
             }
         }
     }
@@ -608,9 +602,10 @@ fn assert_permit_issuance_is_sole_sourced() {
                 .to_owned(),
         );
     }
-    if saw_struct && field_count != 2 {
+    if saw_struct && fields != ["target: String,", "attempt_id: u64,", "owner: Arc<()>,"] {
         violations.push(format!(
-            "LegacyGetPermit must carry exactly its two bound fields; found {field_count}"
+            "LegacyGetPermit must carry its private target, attempt and allocation owner; \
+             found {fields:?}"
         ));
     }
     if !public_fields.is_empty() {
@@ -643,7 +638,7 @@ fn leg_neg_01_b_planted_negative() {
     assert_eq!(accepted_target, LEGACY_SSE_TARGET);
     assert_eq!(
         accepted
-            .admit_endpoint_event(LEGACY_SSE_TARGET)
+            .admit_endpoint_event(LEGACY_MESSAGE_TARGET)
             .expect("the accepted row selects on its first valid endpoint event"),
         ProtocolEra::Legacy2024
     );
@@ -703,7 +698,7 @@ fn leg_neg_01_b_planted_negative() {
 
     // Proceeding as if it had been eligible reaches the typed refusal.
     assert_eq!(
-        planted.admit_endpoint_event(LEGACY_SSE_TARGET),
+        planted.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
         Err(HttpFallbackError::EndpointEventWithoutAuthorization),
         "no endpoint event may be admitted without an authorized, opened GET"
     );
@@ -730,4 +725,244 @@ fn leg_neg_01_b_planted_negative() {
     // The coordinator's own endpoint binding is untouched by the refusal.
     assert_eq!(planted.legacy_sse_target(), LEGACY_SSE_TARGET);
     assert_eq!(planted.bundle_key(), accepted.bundle_key());
+}
+
+fn authorize(coordinator: &mut HttpFallbackCoordinator) -> FallbackDecision {
+    let observed = observation(coordinator, 1, 404, HttpProbeBody::Unrecognized);
+    coordinator.observe(&observed).expect("eligible observation")
+}
+
+// These ownership regressions use the shipped public API rather than private
+// fields or test-only constructors. Moving them here also keeps test helper
+// signatures outside the production-source issuance inventory above.
+#[test]
+fn locally_issued_permit_opens_only_its_own_get() {
+    let mut owner = coordinator();
+    let FallbackDecision::LegacyGetAuthorized(permit) = authorize(&mut owner) else {
+        panic!("eligible probe must authorize a GET");
+    };
+    assert_eq!(permit.target(), LEGACY_SSE_TARGET);
+    assert_eq!(permit.attempt_id(), 1);
+    assert_eq!(owner.open_legacy_get(permit).unwrap(), LEGACY_SSE_TARGET);
+    assert_eq!(owner.state().legacy_gets_authorized, 1);
+    assert_eq!(owner.state().legacy_gets_opened, 1);
+    assert_eq!(owner.selected_era(), None);
+    assert_eq!(owner.advertised_message_post_target(), None);
+}
+
+#[test]
+fn same_bundle_and_attempt_cannot_exchange_permits() {
+    let mut owner = coordinator();
+    let mut other = coordinator();
+    let FallbackDecision::LegacyGetAuthorized(owner_permit) = authorize(&mut owner) else {
+        panic!("owner must authorize a GET");
+    };
+    let FallbackDecision::LegacyGetAuthorized(other_permit) = authorize(&mut other) else {
+        panic!("other must authorize a GET");
+    };
+    assert_ne!(owner_permit, other_permit);
+    let before = owner.state();
+    assert_eq!(
+        owner.open_legacy_get(other_permit),
+        Err(HttpFallbackError::CrossBundleObservation)
+    );
+    assert_eq!(owner.state(), before);
+    assert_eq!(owner.advertised_message_post_target(), None);
+    // A rejected foreign permit does not consume the legitimate authorization.
+    assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), LEGACY_SSE_TARGET);
+}
+
+#[test]
+fn foreign_permit_cannot_override_a_recognized_modern_response() {
+    let mut modern = coordinator();
+    let mut legacy = coordinator();
+    let FallbackDecision::LegacyGetAuthorized(foreign_permit) = authorize(&mut legacy) else {
+        panic!("legacy candidate must authorize a GET");
+    };
+    let observed = observation(&modern, 1, 404, RECOGNIZED_MODERN);
+    assert_eq!(modern.observe(&observed).unwrap(), FallbackDecision::ModernRetained);
+    let before = modern.state();
+    assert_eq!(
+        modern.open_legacy_get(foreign_permit),
+        Err(HttpFallbackError::LegacyGetNotAuthorized)
+    );
+    assert_eq!(modern.state(), before);
+    assert_inert(&modern, "foreign permit cannot override modern evidence");
+}
+
+#[test]
+fn same_target_and_attempt_cannot_cross_security_partitions() {
+    let mut owner = coordinator();
+    let mut other = HttpFallbackCoordinator::new(plan_with(
+        ProtocolPolicy::Auto,
+        MODERN_TARGET,
+        LEGACY_SSE_TARGET,
+        "other-principal",
+        1,
+    ))
+    .unwrap();
+    let FallbackDecision::LegacyGetAuthorized(owner_permit) = authorize(&mut owner) else {
+        panic!("owner must authorize a GET");
+    };
+    let FallbackDecision::LegacyGetAuthorized(other_permit) = authorize(&mut other) else {
+        panic!("other must authorize a GET");
+    };
+    let before = owner.state();
+    assert_eq!(
+        owner.open_legacy_get(other_permit),
+        Err(HttpFallbackError::CrossBundleObservation)
+    );
+    assert_eq!(owner.state(), before);
+    assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), LEGACY_SSE_TARGET);
+}
+
+#[test]
+fn retired_coordinator_permit_cannot_authorize_a_replacement_attempt() {
+    let stale = {
+        let mut retired = coordinator();
+        authorize(&mut retired)
+    };
+    let FallbackDecision::LegacyGetAuthorized(stale_permit) = stale else {
+        panic!("retired coordinator must have authorized a GET");
+    };
+    let mut replacement = coordinator();
+    let FallbackDecision::LegacyGetAuthorized(fresh_permit) = authorize(&mut replacement) else {
+        panic!("replacement must authorize a GET");
+    };
+    let before = replacement.state();
+    assert_eq!(
+        replacement.open_legacy_get(stale_permit),
+        Err(HttpFallbackError::CrossBundleObservation)
+    );
+    assert_eq!(replacement.state(), before);
+    assert_eq!(replacement.open_legacy_get(fresh_permit).unwrap(), LEGACY_SSE_TARGET);
+}
+
+#[test]
+fn endpoint_event_selects_message_post_not_sse_get() {
+    let mut accepted = authorized_and_opened();
+    assert_eq!(accepted.legacy_sse_target(), LEGACY_SSE_TARGET);
+    assert_eq!(accepted.legacy_message_post_target(), LEGACY_MESSAGE_TARGET);
+    assert_eq!(accepted.advertised_message_post_target(), None);
+    assert_eq!(
+        accepted.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
+        Ok(ProtocolEra::Legacy2024)
+    );
+    assert_eq!(accepted.advertised_message_post_target(), Some(LEGACY_MESSAGE_TARGET));
+
+    // Only the event's route changes: advertising the GET route is not proof
+    // that the configured message POST route exists.
+    let mut rejected = authorized_and_opened();
+    let before = rejected.state();
+    assert_eq!(
+        rejected.admit_endpoint_event(LEGACY_SSE_TARGET),
+        Err(HttpFallbackError::EndpointEventTargetMismatch)
+    );
+    assert_eq!(rejected.state(), before);
+    assert_eq!(rejected.advertised_message_post_target(), None);
+}
+
+#[test]
+fn admitted_session_target_is_retained_and_cannot_be_replaced() {
+    let mut coordinator = authorized_and_opened();
+    let first = format!("{LEGACY_MESSAGE_TARGET}?session_id=private-a%2Fb%23c");
+    assert_eq!(coordinator.admit_endpoint_event(&first), Ok(ProtocolEra::Legacy2024));
+    assert_eq!(coordinator.advertised_message_post_target(), Some(first.as_str()));
+    let before = coordinator.state();
+    let second = format!("{LEGACY_MESSAGE_TARGET}?session_id=private-replacement");
+    assert_eq!(
+        coordinator.admit_endpoint_event(&second),
+        Err(HttpFallbackError::DuplicateEndpointEvent)
+    );
+    assert_eq!(coordinator.state(), before);
+    assert_eq!(coordinator.advertised_message_post_target(), Some(first.as_str()));
+    assert!(!format!("{coordinator:?}").contains("private-a"));
+    assert!(!format!("{coordinator:?}").contains("session_id"));
+}
+
+#[test]
+fn malformed_endpoint_queries_never_select_or_retain_a_target() {
+    let malformed = [
+        format!(" {LEGACY_MESSAGE_TARGET}"),
+        format!("{LEGACY_MESSAGE_TARGET} "),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id=abc#fragment"),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id=abc#"),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id=%"),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id=has space"),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id=abc\r\nInjected: yes"),
+        "https://user:password@mcp.example.test/messages".to_owned(),
+        format!("{LEGACY_MESSAGE_TARGET}?session_id={}", "x".repeat(65_537)),
+    ];
+    for advertised in malformed {
+        let mut coordinator = authorized_and_opened();
+        let before = coordinator.state();
+        let error = coordinator.admit_endpoint_event(&advertised).unwrap_err();
+        assert_eq!(error, HttpFallbackError::EndpointEventMalformed);
+        assert_eq!(coordinator.state(), before);
+        assert_eq!(coordinator.advertised_message_post_target(), None);
+        assert!(!error.to_string().contains("session_id"));
+        assert!(!error.to_string().contains("password"));
+        // Refusing bad bytes did not destroy the valid path.
+        assert_eq!(
+            coordinator.admit_endpoint_event(LEGACY_MESSAGE_TARGET),
+            Ok(ProtocolEra::Legacy2024)
+        );
+    }
+}
+
+#[test]
+fn query_free_target_does_not_admit_an_empty_query_or_another_route() {
+    for advertised in [
+        format!("{LEGACY_MESSAGE_TARGET}?"),
+        format!("{LEGACY_SSE_TARGET}?session_id=abc"),
+        "https://other.example.test/messages?session_id=abc".to_owned(),
+        "https://mcp.example.test/messages/extra?session_id=abc".to_owned(),
+    ] {
+        let mut coordinator = authorized_and_opened();
+        let before = coordinator.state();
+        assert_eq!(
+            coordinator.admit_endpoint_event(&advertised),
+            Err(HttpFallbackError::EndpointEventTargetMismatch)
+        );
+        assert_eq!(coordinator.state(), before);
+        assert_eq!(coordinator.advertised_message_post_target(), None);
+    }
+}
+
+#[test]
+fn configured_message_query_is_immutable() {
+    let configured = format!("{LEGACY_MESSAGE_TARGET}?tenant=alice");
+    let plan = ClientProtocolPlan::http(
+        ProtocolPolicy::Auto,
+        Some(url(MODERN_TARGET)),
+        Some(url(LEGACY_SSE_TARGET)),
+        Some(url(&configured)),
+        "credential-partition-leg-neg-01-b".to_owned(),
+        SECURITY_PARTITION.to_owned(),
+        "native-h1-leg-neg-01-b".to_owned(),
+        1,
+        1,
+        0,
+    )
+    .expect("a configured query is part of the immutable bundle");
+    for changed in [
+        LEGACY_MESSAGE_TARGET.to_owned(),
+        format!("{LEGACY_MESSAGE_TARGET}?tenant=bob"),
+        format!("{configured}&session_id=abc"),
+    ] {
+        let mut coordinator = HttpFallbackCoordinator::new(plan.clone()).unwrap();
+        let FallbackDecision::LegacyGetAuthorized(permit) = authorize(&mut coordinator) else {
+            panic!("eligible probe must authorize the candidate GET");
+        };
+        coordinator.open_legacy_get(permit).unwrap();
+        let before = coordinator.state();
+        assert_eq!(
+            coordinator.admit_endpoint_event(&changed),
+            Err(HttpFallbackError::EndpointEventTargetMismatch)
+        );
+        assert_eq!(coordinator.state(), before);
+        assert_eq!(coordinator.advertised_message_post_target(), None);
+        assert_eq!(coordinator.admit_endpoint_event(&configured), Ok(ProtocolEra::Legacy2024));
+        assert_eq!(coordinator.advertised_message_post_target(), Some(configured.as_str()));
+    }
 }

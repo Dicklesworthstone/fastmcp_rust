@@ -27,10 +27,12 @@
 //!
 //! Authorization is not selection. A permitted `GET` still selects nothing: only
 //! the first valid `endpoint` event admitted from that stream moves the era to
-//! [`ProtocolEra::Legacy2024`]. Missing, malformed, duplicate, late, or
+//! [`ProtocolEra::Legacy2024`]. The event names the configured message POST
+//! endpoint, not the SSE GET endpoint. Missing, malformed, duplicate, late, or
 //! wrong-target events are refused with a typed error and leave every observable
 //! field untouched.
 
+use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
 };
@@ -60,6 +62,8 @@ pub enum HttpFallbackError {
     MissingModernPostTarget,
     /// The plan carried no configured legacy SSE GET target.
     MissingLegacySseTarget,
+    /// The plan carried no configured legacy message POST target.
+    MissingLegacyMessagePostTarget,
     /// The classifier refused to start an attempt for this plan.
     Negotiation(ClientHttpNegotiationError),
     /// An observation must name a nonempty modern target and a nonzero attempt.
@@ -98,9 +102,10 @@ pub enum HttpFallbackError {
     LegacyGetAlreadyOpened,
     /// An `endpoint` event arrived without an authorized, opened `GET`.
     EndpointEventWithoutAuthorization,
-    /// The `endpoint` event carried no usable target.
+    /// The `endpoint` event did not carry a bounded canonical HTTP URL without
+    /// userinfo or a fragment.
     EndpointEventMalformed,
-    /// The advertised endpoint is not the configured legacy target.
+    /// The advertised endpoint is not the configured legacy message POST target.
     EndpointEventTargetMismatch,
     /// A second `endpoint` event arrived after the era was already selected.
     DuplicateEndpointEvent,
@@ -120,6 +125,9 @@ impl std::fmt::Display for HttpFallbackError {
             }
             Self::MissingLegacySseTarget => {
                 formatter.write_str("the plan has no configured legacy SSE GET target")
+            }
+            Self::MissingLegacyMessagePostTarget => {
+                formatter.write_str("the plan has no configured legacy message POST target")
             }
             Self::Negotiation(error) => write!(formatter, "probe classification refused: {error}"),
             Self::InvalidObservation => {
@@ -155,7 +163,7 @@ impl std::fmt::Display for HttpFallbackError {
                 formatter.write_str("the endpoint event carried no usable target")
             }
             Self::EndpointEventTargetMismatch => {
-                formatter.write_str("the advertised endpoint is not the configured legacy target")
+                formatter.write_str("the advertised endpoint is not the configured message POST target")
             }
             Self::DuplicateEndpointEvent => {
                 formatter.write_str("the era was already selected by an earlier endpoint event")
@@ -274,14 +282,12 @@ pub enum FallbackDecision {
     LegacyGetAuthorized(LegacyGetPermit),
 }
 
-/// Every externally observable field of one coordinator.
+/// Observable progress counters of one coordinator.
 ///
-/// Tests compare this value before and after a refused path to prove that an
-/// ineligible or invalid input changed nothing. `credential_mutations` and
-/// `era_cache_mutations` are carried explicitly and are always zero: this
-/// coordinator has no authority to acquire a credential or write an era cache
-/// entry, and recording that as an observable rather than an assumption is what
-/// lets the negative tests assert it.
+/// Tests compare this value and the separately exposed admitted POST target
+/// before and after a refusal to prove an invalid input changed nothing.
+/// `credential_mutations` and `era_cache_mutations` are always zero: this
+/// coordinator has no authority to acquire credentials or write an era cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FallbackState {
     /// Observations admitted by this coordinator, at most one.
@@ -304,16 +310,29 @@ pub struct FallbackState {
 ///
 /// One coordinator serves one connection attempt: it admits at most one
 /// observation, issues at most one `GET` authorization, and admits at most one
-/// `endpoint` event.
-#[derive(Debug)]
+/// `endpoint` event. The admitted message POST URL is retained only after its
+/// syntax and immutable route binding pass; callers need not reuse peer bytes.
+/// Debug output omits URLs, including server-generated session query values.
 pub struct HttpFallbackCoordinator {
     plan: ClientProtocolPlan,
     bundle_key: HttpEndpointBundleKey,
     modern_target: String,
     legacy_sse_target: String,
+    legacy_message_post_target: String,
+    admitted_message_post_target: Option<CanonicalHttpUrl>,
     state: FallbackState,
     settled_attempt: Option<u64>,
     permit_owner: Arc<()>,
+}
+
+impl std::fmt::Debug for HttpFallbackCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpFallbackCoordinator")
+            .field("state", &self.state)
+            .field("settled_attempt", &self.settled_attempt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpFallbackCoordinator {
@@ -338,6 +357,10 @@ impl HttpFallbackCoordinator {
             .legacy_sse_target()
             .ok_or(HttpFallbackError::MissingLegacySseTarget)?
             .to_owned();
+        let legacy_message_post_target = plan
+            .legacy_message_post_target()
+            .ok_or(HttpFallbackError::MissingLegacyMessagePostTarget)?
+            .to_owned();
         // Prove the classifier will accept this plan now, so a later refusal
         // cannot be mistaken for an eligibility outcome.
         ClientHttpNegotiation::from_protocol_plan(&plan).map_err(HttpFallbackError::Negotiation)?;
@@ -346,13 +369,15 @@ impl HttpFallbackCoordinator {
             bundle_key,
             modern_target,
             legacy_sse_target,
+            legacy_message_post_target,
+            admitted_message_post_target: None,
             state: FallbackState::default(),
             settled_attempt: None,
             permit_owner: Arc::new(()),
         })
     }
 
-    /// Returns every externally observable field.
+    /// Returns the observable progress counters.
     #[must_use]
     pub const fn state(&self) -> FallbackState {
         self.state
@@ -368,6 +393,24 @@ impl HttpFallbackCoordinator {
     #[must_use]
     pub fn legacy_sse_target(&self) -> &str {
         &self.legacy_sse_target
+    }
+
+    /// Returns the configured legacy message POST target, distinct from GET.
+    #[must_use]
+    pub fn legacy_message_post_target(&self) -> &str {
+        &self.legacy_message_post_target
+    }
+
+    /// Returns the admitted POST target, including any permitted session query.
+    ///
+    /// This is absent until a valid endpoint event selects the legacy era.
+    /// Refused and duplicate events cannot replace it. Treat a session query
+    /// as sensitive routing data rather than a diagnostic or cache identity.
+    #[must_use]
+    pub fn advertised_message_post_target(&self) -> Option<&str> {
+        self.admitted_message_post_target
+            .as_ref()
+            .map(CanonicalHttpUrl::as_str)
     }
 
     /// Returns the endpoint bundle identity this coordinator is bound to.
@@ -469,10 +512,10 @@ impl HttpFallbackCoordinator {
     /// Admits the first valid `endpoint` event from the opened `GET`.
     ///
     /// Only this call may select [`ProtocolEra::Legacy2024`]. The advertised
-    /// target must be the configured one, byte for byte, or the configured
-    /// query-free target extended with a server-generated query — the exact-2024
-    /// lane advertises a session query no client can preconfigure, and scheme,
-    /// authority, and path can never change.
+    /// target must be the configured message POST target, byte for byte, or the
+    /// configured query-free target extended with a server-generated query.
+    /// Scheme, authority and path never change. Admission never trims or
+    /// silently repairs peer bytes, and never accepts userinfo or fragments.
     pub fn admit_endpoint_event(
         &mut self,
         advertised: &str,
@@ -483,26 +526,28 @@ impl HttpFallbackCoordinator {
         if self.state.endpoint_events_admitted > 0 {
             return Err(HttpFallbackError::DuplicateEndpointEvent);
         }
-        let advertised = advertised.trim();
-        if advertised.is_empty() {
+        let target = CanonicalHttpUrl::parse(advertised)
+            .map_err(|_| HttpFallbackError::EndpointEventMalformed)?;
+        if target.as_str() != advertised || target.has_userinfo() || target.fragment().is_some() {
             return Err(HttpFallbackError::EndpointEventMalformed);
         }
-        if !advertised_target_is_admissible(&self.legacy_sse_target, advertised) {
+        if !advertised_target_is_admissible(&self.legacy_message_post_target, target.as_str()) {
             return Err(HttpFallbackError::EndpointEventTargetMismatch);
         }
+        self.admitted_message_post_target = Some(target);
         self.state.endpoint_events_admitted += 1;
         self.state.selected_era = Some(ProtocolEra::Legacy2024);
         Ok(ProtocolEra::Legacy2024)
     }
 }
 
-/// Admits an advertised legacy endpoint against the immutable configured one.
+/// Binds an already syntax-admitted message URL to the configured POST route.
 ///
-/// Byte equality always admits. A configured target with no query component may
-/// additionally be extended by a server-generated query, because the exact
-/// 2024-11-05 lane advertises a session query that no client can preconfigure.
-/// Scheme, authority, and path never change, so the admitted resource, era,
-/// authorization, and cache partition stay pinned to the configured bundle.
+/// Byte equality admits. A configured target with no query component may
+/// additionally be extended by a nonempty server-generated query, because the
+/// exact 2024-11-05 lane advertises a session query no client can preconfigure.
+/// A configured query is immutable; it cannot be replaced or extended by the
+/// peer. Syntax admission precedes this comparison, including the byte bound.
 fn advertised_target_is_admissible(configured: &str, advertised: &str) -> bool {
     if advertised == configured {
         return true;
@@ -510,135 +555,5 @@ fn advertised_target_is_admissible(configured: &str, advertised: &str) -> bool {
     match advertised.split_once('?') {
         Some((base, query)) => !query.is_empty() && base == configured && !configured.contains('?'),
         None => false,
-    }
-}
-
-#[cfg(all(test, feature = "legacy-2024-11-05"))]
-mod permit_tests {
-    use super::*;
-    use crate::CanonicalHttpUrl;
-
-    const MODERN: &str = "https://mcp.example.test/mcp";
-    const SSE: &str = "https://mcp.example.test/sse";
-
-    fn coordinator(security_partition: &str) -> HttpFallbackCoordinator {
-        let parse = |value: &str| CanonicalHttpUrl::parse(value).expect("canonical fixture URL");
-        let plan = ClientProtocolPlan::http(
-            ProtocolPolicy::Auto,
-            Some(parse(MODERN)),
-            Some(parse(SSE)),
-            Some(parse("https://mcp.example.test/messages")),
-            "credential-partition".to_owned(),
-            security_partition.to_owned(),
-            "native-h1".to_owned(),
-            1,
-            1,
-            0,
-        )
-        .expect("valid dual-era plan");
-        HttpFallbackCoordinator::new(plan).expect("Auto coordinator")
-    }
-
-    fn observe(
-        coordinator: &mut HttpFallbackCoordinator,
-        body: HttpProbeBody,
-    ) -> FallbackDecision {
-        let observation = ModernProbeObservation::new(
-            coordinator.bundle_key().clone(),
-            MODERN,
-            1,
-            HttpModernProbe { status: 404, body },
-        )
-        .expect("bound observation");
-        coordinator.observe(&observation).expect("eligible observation")
-    }
-
-    fn authorize(coordinator: &mut HttpFallbackCoordinator) -> LegacyGetPermit {
-        let FallbackDecision::LegacyGetAuthorized(permit) =
-            observe(coordinator, HttpProbeBody::Unrecognized)
-        else {
-            panic!("404 with an unrecognized body must authorize the candidate GET");
-        };
-        permit
-    }
-
-    #[test]
-    fn locally_issued_permit_opens_only_its_own_get() {
-        let mut owner = coordinator("owner");
-        let permit = authorize(&mut owner);
-        assert_eq!(permit.target(), SSE);
-        assert_eq!(permit.attempt_id(), 1);
-        assert_eq!(owner.open_legacy_get(permit).unwrap(), SSE);
-        assert_eq!(owner.state().legacy_gets_authorized, 1);
-        assert_eq!(owner.state().legacy_gets_opened, 1);
-        assert_eq!(owner.selected_era(), None);
-    }
-
-    #[test]
-    fn same_bundle_and_attempt_cannot_exchange_permits() {
-        let mut owner = coordinator("same-partition");
-        let mut other = coordinator("same-partition");
-        let owner_permit = authorize(&mut owner);
-        let other_permit = authorize(&mut other);
-        assert_ne!(owner_permit, other_permit);
-        let before = owner.state();
-        assert_eq!(
-            owner.open_legacy_get(other_permit),
-            Err(HttpFallbackError::CrossBundleObservation)
-        );
-        assert_eq!(owner.state(), before);
-        // Rejecting foreign authority must not consume the local authorization.
-        assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), SSE);
-    }
-
-    #[test]
-    fn foreign_permit_cannot_override_a_recognized_modern_response() {
-        let mut modern = coordinator("same-partition");
-        let mut legacy = coordinator("same-partition");
-        let foreign_permit = authorize(&mut legacy);
-        assert_eq!(
-            observe(&mut modern, HttpProbeBody::RecognizedModernJsonRpc),
-            FallbackDecision::ModernRetained
-        );
-        let before = modern.state();
-        assert_eq!(
-            modern.open_legacy_get(foreign_permit),
-            Err(HttpFallbackError::LegacyGetNotAuthorized)
-        );
-        assert_eq!(modern.state(), before);
-        assert_eq!(modern.state().legacy_gets_authorized, 0);
-        assert_eq!(modern.state().legacy_gets_opened, 0);
-    }
-
-    #[test]
-    fn same_target_and_attempt_cannot_cross_security_partitions() {
-        let mut owner = coordinator("principal-a");
-        let mut other = coordinator("principal-b");
-        let owner_permit = authorize(&mut owner);
-        let other_permit = authorize(&mut other);
-        let before = owner.state();
-        assert_eq!(
-            owner.open_legacy_get(other_permit),
-            Err(HttpFallbackError::CrossBundleObservation)
-        );
-        assert_eq!(owner.state(), before);
-        assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), SSE);
-    }
-
-    #[test]
-    fn retired_coordinator_permit_cannot_authorize_a_replacement_attempt() {
-        let stale_permit = {
-            let mut retired = coordinator("same-partition");
-            authorize(&mut retired)
-        };
-        let mut replacement = coordinator("same-partition");
-        let fresh_permit = authorize(&mut replacement);
-        let before = replacement.state();
-        assert_eq!(
-            replacement.open_legacy_get(stale_permit),
-            Err(HttpFallbackError::CrossBundleObservation)
-        );
-        assert_eq!(replacement.state(), before);
-        assert_eq!(replacement.open_legacy_get(fresh_permit).unwrap(), SSE);
     }
 }
