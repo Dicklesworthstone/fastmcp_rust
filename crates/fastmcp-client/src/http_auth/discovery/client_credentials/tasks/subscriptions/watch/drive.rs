@@ -18,7 +18,7 @@ use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, sha256_bounded};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
-use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
 
 use super::{
     BoundedBody, ClientCredentialsError, ClientCredentialsSnapshot, ClientCredentialsTaskWatch,
@@ -37,6 +37,9 @@ pub use crate::http_auth::discovery::client_credentials::tasks::driver::{
     ClientCredentialsTaskWaitError, ManagedTaskInputAction, ManagedTaskRunOutcome,
 };
 pub use crate::http_auth::managed::tasks::watch::drive::TaskInputUpdateState;
+use crate::http_auth::rpc::interaction::{
+    ManagedInteractionError, admit_embedded_input, normalize_embedded_input_context,
+};
 /// Shared write-ahead codec, persistence contract and protected-file adapter.
 pub use crate::http_auth::managed::tasks::watch::drive::journal;
 use journal::{TaskInputJournal, TaskInputJournalError};
@@ -187,6 +190,8 @@ impl ClientCredentialsTasksClient {
     /// host callback. A resolver may return a nonempty subset of the unresolved
     /// keys, or return control to the caller without an update. Advertised
     /// roots/sampling/elicitation capabilities gate every resolver invocation.
+    /// Unsupported sampling context hints are omitted from resolver copies;
+    /// snapshots and ledger descriptors retain the peer input.
     /// No implicit model, browser, filesystem access or Task creation occurs.
     ///
     /// This convenience runs the same owned driver as `watch_task_inputs`.
@@ -439,9 +444,9 @@ impl ClientCredentialsTaskWatchDriver {
             let pending = ledger.unanswered(input_requests, policy)?;
             if pending.requests.is_empty() { continue; }
             if self.progress.acknowledged >= policy.maximum_updates { return Err(ClientCredentialsTaskWaitError::UpdateLimit.into()); }
-            admit_capabilities(&client.metadata, &pending.requests)?;
+            let callback_inputs = admit_capabilities(&client.metadata, &pending.requests)?;
             self.check(cx, binding)?;
-            let resolution = resolve(pending.requests.clone());
+            let resolution = resolve(callback_inputs);
             self.check(cx, binding)?;
             let action = resolution.await?;
             self.check(cx, binding)?;
@@ -608,28 +613,26 @@ impl InputHistory {
 }
 
 fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests)
-    -> Result<(), ClientCredentialsTaskWaitError>
+    -> Result<TaskInputRequests, ClientCredentialsTaskWaitError>
 {
     let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
     for request in requests.values() {
-        let advertised = match request {
-            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Sampling(_) => {
-                let wire = serde_json::to_value(request).map_err(|_| ClientCredentialsTaskWaitError::UnexpectedResponse)?;
-                let sampling = &capabilities["sampling"];
-                sampling.is_object()
-                    && (wire["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
-                    && (wire["params"].get("includeContext").is_none_or(|context| context == "none")
-                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) =>
-                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) =>
-                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object),
-        };
-        if !advertised { return Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised); }
+        let wire = serde_json::to_value(request)
+            .map_err(|_| ClientCredentialsTaskWaitError::UnexpectedResponse)?;
+        admit_embedded_input(capabilities, wire).map_err(|error| match error {
+            ManagedInteractionError::CapabilityNotAdvertised => ClientCredentialsTaskWaitError::CapabilityNotAdvertised,
+            _ => ClientCredentialsTaskWaitError::UnexpectedResponse,
+        })?;
     }
-    Ok(())
+    let mut callback_inputs = requests.clone();
+    let mut context_ignored = false;
+    for request in callback_inputs.values_mut() {
+        context_ignored |= normalize_embedded_input_context(capabilities, request);
+    }
+    if context_ignored {
+        log::warn!("ignoring unadvertised sampling context hint in Task input");
+    }
+    Ok(callback_inputs)
 }
 
 #[cfg(test)]

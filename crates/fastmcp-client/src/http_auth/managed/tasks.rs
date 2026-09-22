@@ -472,14 +472,39 @@ fn response_source(bytes: &[u8], id: &RequestId, maximum: usize) -> Result<(Json
     Ok((response, source.ok_or(ManagedTasksError::InvalidResponse)?))
 }
 
+/// Checks received Task input shapes before typed optional fields can erase
+/// invalid presence. The caller must select a Task result, after bounded raw
+/// JSON admission and correlation checks. The exact result source remains the
+/// input to the existing Task decoder; no number or descriptor is rewritten.
+/// Capability authority is checked separately before host input resolution.
+pub(crate) fn validate_task_input_shapes(response: &JsonRpcResponse) -> Result<(), ManagedTasksError> {
+    let result = response.result.as_ref().ok_or(ManagedTasksError::InvalidResponse)?;
+    if result.get("status").and_then(Value::as_str) != Some("input_required") {
+        return Ok(());
+    }
+    let requests = result.get("inputRequests").and_then(Value::as_object)
+        .ok_or(ManagedTasksError::InvalidResponse)?;
+    for request in requests.values() {
+        crate::http_auth::rpc::interaction::validate_embedded_input_shape(request)
+            .map_err(|_| ManagedTasksError::InvalidResponse)?;
+    }
+    Ok(())
+}
+
 fn decode_result(decoder: &TaskDecoder, bytes: &[u8], id: &RequestId, maximum: usize) -> Result<ManagedTaskEvent, ManagedTasksError> {
     let (response, source) = response_source(bytes, id, maximum)?;
     match decoder {
         TaskDecoder::Tool(core) => {
+            if response.result.as_ref().and_then(|result| result.get("resultType"))
+                .and_then(Value::as_str) == Some("task")
+            {
+                validate_task_input_shapes(&response)?;
+            }
             let CoreResult::Final(result) = core.decode_response_result(&response, &source).map_err(|_| ManagedTasksError::InvalidResponse)? else { return Err(ManagedTasksError::InvalidResponse) };
             tool_result(result)
         }
         TaskDecoder::Get(expected) => {
+            validate_task_input_shapes(&response)?;
             let result: GetTaskResult = serde_json::from_str(&source).map_err(|_| ManagedTasksError::InvalidResponse)?;
             if &result.task.base().task_id != expected { return Err(ManagedTasksError::TaskIdMismatch); }
             Ok(ManagedTaskEvent::Snapshot(Box::new(result)))
@@ -583,6 +608,79 @@ mod tests {
         assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::Number(2), 4096), Ok(ManagedTaskEvent::Snapshot(_))));
         assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(task), &RequestId::String("2".to_owned()), 4096), Err(ManagedTasksError::ResponseIdMismatch)));
         assert!(matches!(decode_result(&TaskDecoder::Get(TaskId::parse("task-two").unwrap()), &envelope(task), &RequestId::Number(2), 4096), Err(ManagedTasksError::TaskIdMismatch)));
+    }
+
+    #[test]
+    fn raw_task_inputs_reject_erased_shapes_in_get_and_tool_results() {
+        let tool = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2),
+            ManagedTaskRequest::CallTool { name:"echo".to_owned(), arguments:None },
+            ManagedTasksLimits::default()).unwrap();
+        let get = TaskDecoder::Get(task_id());
+        let result = |kind: &str, descriptor: &Value| {
+            let mut result = serde_json::to_value(input_task()).unwrap();
+            result["resultType"] = json!(kind);
+            result["inputRequests"] = json!({"one":descriptor});
+            envelope(&result.to_string())
+        };
+        for descriptor in [
+            json!({"method":"roots/list"}),
+            json!({"method":"roots/list","params":{}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
+                "tools":[{"name":"echo","inputSchema":{"type":"object"}}],"toolChoice":{},"includeContext":"allServers"}}),
+        ] {
+            assert!(matches!(decode_result(&get, &result("complete", &descriptor), &RequestId::Number(2), 4096),
+                Ok(ManagedTaskEvent::Snapshot(_))));
+            assert!(matches!(decode_stream_record(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096, None, &mut None),
+                Ok(ManagedTaskEvent::ToolResult(_))));
+        }
+        for descriptor in [
+            json!({"method":"roots/list","params":[]}),
+            json!({"method":"sampling/createMessage","params":[[],16]}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"tools":null}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":null}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"includeContext":null}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":[]}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":{"auto":null}}}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"includeContext":{"allServers":null}}}),
+            json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,
+                "tools":[["echo",null,null,null,{"type":"object"}]]}}),
+        ] {
+            assert!(matches!(decode_result(&get, &result("complete", &descriptor), &RequestId::Number(2), 4096),
+                Err(ManagedTasksError::InvalidResponse)));
+            assert!(matches!(decode_result(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096),
+                Err(ManagedTasksError::InvalidResponse)));
+            assert!(matches!(decode_stream_record(&tool.decoder, &result("task", &descriptor), &RequestId::Number(2), 4096, None, &mut None),
+                Err(ManagedTasksError::InvalidResponse)));
+        }
+        let ordinary = envelope(r#"{"resultType":"complete","content":[],"status":"input_required","inputRequests":{"opaque":{"params":[]}}}"#);
+        assert!(matches!(decode_result(&tool.decoder, &ordinary, &RequestId::Number(2), 4096),
+            Ok(ManagedTaskEvent::ToolResult(result)) if matches!(*result, FinalCoreResult::ToolsCall { .. })));
+    }
+
+    #[test]
+    fn raw_task_shape_checks_preserve_exact_numbers_and_strict_envelope_precedence() {
+        let source = r#"{"resultType":"complete","taskId":"task-one","status":"input_required","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":18446744073709551617}}}}"#;
+        let bytes = envelope(source);
+        let (response, retained) = response_source(&bytes, &RequestId::Number(2), 4096).unwrap();
+        let before = serde_json::to_value(&response).unwrap();
+        validate_task_input_shapes(&response).unwrap();
+        assert_eq!(retained, source);
+        assert_eq!(serde_json::to_value(&response).unwrap(), before);
+        let ManagedTaskEvent::Snapshot(snapshot) = decode_result(&TaskDecoder::Get(task_id()), &bytes, &RequestId::Number(2), 4096).unwrap()
+            else { panic!("expected admitted task snapshot") };
+        let Task::InputRequired { input_requests, .. } = snapshot.task
+            else { panic!("expected input-required task") };
+        let fastmcp_protocol::FinalEmbeddedInputRequest::Sampling(params) = &input_requests["sample"]
+            else { panic!("expected sampling descriptor") };
+        assert_eq!(params.max_tokens.to_string(), "18446744073709551617");
+
+        let duplicate = r#"{"resultType":"complete","taskId":"task-one","status":"input_required","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"includeContext":"none","includeContext":"allServers"}}}}"#;
+        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(duplicate), &RequestId::Number(2), 4096),
+            Err(ManagedTasksError::InvalidResponse)));
+        let invalid_shape = r#"{"resultType":"complete","taskId":"task-one","status":"input_required","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000,"inputRequests":{"roots":{"method":"roots/list","params":[]}}}"#;
+        assert!(matches!(decode_result(&TaskDecoder::Get(task_id()), &envelope(invalid_shape), &RequestId::Number(3), 4096),
+            Err(ManagedTasksError::ResponseIdMismatch)));
     }
 
     #[test]

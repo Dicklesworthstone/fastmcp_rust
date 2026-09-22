@@ -21,7 +21,11 @@ use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, sha256_bounded};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
-use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
+
+use crate::http_auth::rpc::interaction::{
+    ManagedInteractionError, admit_embedded_input, normalize_embedded_input_context,
+};
 
 use super::{ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient};
 use super::cancellation::{CancellableTaskWatchError, ManagedTaskCancelHandle};
@@ -201,6 +205,8 @@ impl ManagedTasksClient {
     /// host callback. Responses may cover a nonempty subset of unresolved keys;
     /// `ReturnToCaller` pauses without an update. Advertised roots, sampling and
     /// elicitation capabilities gate every resolver invocation.
+    /// The resolver receives copies with unadvertised context hints omitted;
+    /// retained descriptors keep their original representation.
     ///
     /// This convenience uses the same owned driver as `watch_task_inputs`.
     /// Use that constructor to retain update disposition or obtain a separate
@@ -458,9 +464,9 @@ impl ManagedTaskWatchDriver {
             let pending = ledger.unanswered(input_requests, policy)?;
             if pending.requests.is_empty() { continue; }
             if self.progress.acknowledged >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit.into()); }
-            admit_capabilities(&client.metadata, &pending.requests)?;
+            let callback_inputs = admit_capabilities(&client.metadata, &pending.requests)?;
             self.check(cx, credential)?;
-            let resolution = resolve(pending.requests.clone());
+            let resolution = resolve(callback_inputs);
             self.check(cx, credential)?;
             let action = resolution.await?;
             self.check(cx, credential)?;
@@ -620,28 +626,25 @@ impl InputHistory {
 }
 
 fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests)
-    -> Result<(), ManagedTaskDriverError>
+    -> Result<TaskInputRequests, ManagedTaskDriverError>
 {
     let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
     for request in requests.values() {
-        let advertised = match request {
-            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Sampling(_) => {
-                let wire = serde_json::to_value(request).map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?;
-                let sampling = &capabilities["sampling"];
-                sampling.is_object()
-                    && (wire["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
-                    && (wire["params"].get("includeContext").is_none_or(|context| context == "none")
-                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) =>
-                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) =>
-                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object),
-        };
-        if !advertised { return Err(ManagedTaskDriverError::CapabilityNotAdvertised); }
+        let wire = serde_json::to_value(request).map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?;
+        admit_embedded_input(capabilities, wire).map_err(|error| match error {
+            ManagedInteractionError::CapabilityNotAdvertised => ManagedTaskDriverError::CapabilityNotAdvertised,
+            _ => ManagedTaskDriverError::UnexpectedResponse,
+        })?;
     }
-    Ok(())
+    let mut callback_inputs = requests.clone();
+    let mut context_ignored = false;
+    for request in callback_inputs.values_mut() {
+        context_ignored |= normalize_embedded_input_context(capabilities, request);
+    }
+    if context_ignored {
+        log::warn!("ignoring unadvertised sampling context hint in Task input");
+    }
+    Ok(callback_inputs)
 }
 
 #[cfg(test)]
@@ -734,6 +737,67 @@ mod tests {
         let roots = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{}}});
         assert!(matches!(admit_capabilities(&absent, &inputs()), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
         assert!(admit_capabilities(&roots, &inputs()).is_ok());
+    }
+
+    #[test]
+    fn watched_sampling_context_is_advisory_but_tool_choice_requires_tools() {
+        let plain = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{}}});
+        let tools = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"tools":{}}}});
+        for choice in [None, Some(json!({}))] {
+            let mut params = json!({"messages":[],"maxTokens":1,"includeContext":"allServers"});
+            if let Some(choice) = choice { params["toolChoice"] = choice; }
+            let requests = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage","params":params}})).unwrap();
+            let before = serde_json::to_value(&requests).unwrap();
+            if before["sample"]["params"].get("toolChoice").is_some() {
+                assert!(matches!(admit_capabilities(&plain, &requests), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+            } else {
+                assert!(admit_capabilities(&plain, &requests).is_ok());
+            }
+            let callback = serde_json::to_value(admit_capabilities(&tools, &requests).unwrap()).unwrap();
+            assert!(callback["sample"]["params"].get("includeContext").is_none());
+            assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn watched_form_admission_preserves_empty_parent_semantics() {
+        let requests = serde_json::from_value(json!({"form":{"method":"elicitation/create","params":{
+            "mode":"form","message":"Approve","requestedSchema":{"type":"object","properties":{}}
+        }}})).unwrap();
+        let before = serde_json::to_value(&requests).unwrap();
+        for elicitation in [json!({}), json!({"form":{}})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":elicitation}});
+            assert!(admit_capabilities(&metadata, &requests).is_ok());
+        }
+        for elicitation in [json!({"future":{}}), json!({"url":{}}), json!({"form":null}), json!({"form":[]})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":elicitation}});
+            assert!(matches!(admit_capabilities(&metadata, &requests), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        }
+        assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+    }
+
+    #[test]
+    fn watched_context_normalization_changes_only_ungranted_resolver_copies() {
+        let plain = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{},"sampling":{}}});
+        let granted = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{},"sampling":{"context":{}}}});
+        for context in [None, Some("none"), Some("thisServer"), Some("allServers")] {
+            let mut params = json!({"messages":[],"maxTokens":1});
+            if let Some(context) = context { params["includeContext"] = json!(context); }
+            let requests = serde_json::from_value(json!({
+                "roots":{"method":"roots/list"},
+                "sample":{"method":"sampling/createMessage","params":params}
+            })).unwrap();
+            let before = serde_json::to_value(&requests).unwrap();
+            let callback = serde_json::to_value(admit_capabilities(&plain, &requests).unwrap()).unwrap();
+            if context.is_some_and(|context| context != "none") {
+                assert!(callback["sample"]["params"].get("includeContext").is_none());
+                assert_eq!(callback["roots"], before["roots"]);
+            } else {
+                assert_eq!(callback, before);
+            }
+            assert_eq!(serde_json::to_value(admit_capabilities(&granted, &requests).unwrap()).unwrap(), before);
+            assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+        }
     }
 
     #[test]

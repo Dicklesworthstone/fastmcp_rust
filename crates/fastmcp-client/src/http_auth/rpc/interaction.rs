@@ -591,6 +591,26 @@ pub(crate) fn admit_embedded_input(
     Ok(descriptor)
 }
 
+/// Normalizes only a caller-owned effective descriptor. Task ledgers retain
+/// their original wire values. The caller exposes the returned diagnostic
+/// after whole-batch admission and before invoking any host input effects.
+#[cfg(feature = "tasks")]
+pub(crate) fn normalize_embedded_input_context(
+    capabilities: &serde_json::Value,
+    request: &mut FinalEmbeddedInputRequest,
+) -> bool {
+    if capabilities["sampling"]["context"].is_object() {
+        return false;
+    }
+    let FinalEmbeddedInputRequest::Sampling(params) = request else { return false };
+    if params.include_context.is_some_and(|context| context != fastmcp_protocol::IncludeContext::None) {
+        params.include_context = None;
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn admit_challenge(
     original: &CoreRequest,
     input: &InputRequiredResult,
