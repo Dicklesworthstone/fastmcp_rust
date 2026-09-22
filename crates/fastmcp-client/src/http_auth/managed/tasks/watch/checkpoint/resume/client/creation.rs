@@ -4,6 +4,9 @@
 //! existing resume controls and never arguments, input descriptors or results.
 //! A host must supply CURRENT verified ownership and a durable protector.
 
+/// Owned initial submission that persists known Tasks without replaying creation.
+pub mod submission;
+
 use std::fmt;
 use std::time::Duration;
 
