@@ -267,7 +267,9 @@ fn run_resume(case: ResumeCase) {
                 if matches!(case, ResumeCase::DropRead) { drop(reading); }
                 else {
                     match case {
-                        ResumeCase::CancelRead => cancellation.cancel(),
+                        ResumeCase::CancelRead => {
+                            cancellation.cancel();
+                        }
                         ResumeCase::CloseOwner => client.client.close(),
                         ResumeCase::Revoke => client.client.inner.state.try_lock_owned().unwrap()
                             .current.as_ref().unwrap().bearer.revoke(),

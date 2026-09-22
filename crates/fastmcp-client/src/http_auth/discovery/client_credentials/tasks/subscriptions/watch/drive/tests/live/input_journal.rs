@@ -332,8 +332,12 @@ async fn scenario(peer: &Peer, cx: &Cx, case: JournalCase) {
             assert_eq!(peer.seen.lock().unwrap().len(), if generation == 1 { 4 } else { 6 });
             peer.quiet();
             match case {
-                JournalCase::GateIntent | JournalCase::GateAck => store.release.cancel(),
-                JournalCase::LocalIntent => cancellation.cancel(),
+                JournalCase::GateIntent | JournalCase::GateAck => {
+                    store.release.cancel();
+                }
+                JournalCase::LocalIntent => {
+                    cancellation.cancel();
+                }
                 JournalCase::RevokeIntent => machine.client.inner.state.try_lock_owned().unwrap().current.as_ref().unwrap().bearer.revoke(),
                 _ => {},
             }
