@@ -360,4 +360,92 @@ mod tests {
         assert!(!cx.is_cancel_requested());
         assert!(!ctx.request_cancellation().is_cancel_requested());
     }
+
+    /// The checkpoint after the host callback refuses a request cancelled
+    /// *during* that callback, and names this module's own error type.
+    ///
+    /// The three sibling tests above reach the same disposition through
+    /// `interaction_error(..).code == RequestCancelled`. That code cannot
+    /// separate a cancelled interaction from a timed-out one, and it cannot
+    /// separate this module's `Core(Protocol(Cancelled))` from the
+    /// `Interaction(Core(Cancelled))` that `managed_oauth::interaction`
+    /// produces for the same input -- the two conversions land in *different
+    /// outer arms* and collapse onto one wire code. Naming the variant is the
+    /// only assertion that holds them apart.
+    ///
+    /// Attribution: the host ran exactly once and was dropped, so both entry
+    /// guards admitted it and the failure follows the callback; no ID was
+    /// allocated, so it precedes `next_pair`; and `cx` reports no cancellation
+    /// request, which rules out the `check_cx` guard on the next line.
+    /// `Cx::for_testing()` arms no budget, so `checkpoint` can fail here only
+    /// on cancellation -- the attribution holds because nothing else is armed,
+    /// not because the variant could distinguish the two guards.
+    #[test]
+    fn host_cancelled_machine_requests_fail_the_post_callback_checkpoint_by_variant() {
+        let ctx = McpContext::new(Cx::for_testing(), 81);
+        let cx = Cx::for_testing();
+        let ids = AtomicU64::new(7);
+        let host = host(Action::CancelRequest);
+
+        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+
+        assert!(
+            matches!(
+                error,
+                ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
+                    ManagedCoreError::Cancelled,
+                )),
+            ),
+            "the post-callback checkpoint must yield Core(Protocol(Cancelled)), not {error:?}",
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+        assert!(!cx.is_cancel_requested());
+        assert_eq!(ids.load(Ordering::SeqCst), 7);
+    }
+
+    /// Planted negative for the test above. Exactly one input differs -- the
+    /// host's `action` -- and exactly one verdict flips: the named variant.
+    ///
+    /// A declining host stops the same call with the same observable state:
+    /// the callback still ran once and was dropped, `cx` is still uncancelled,
+    /// and no ID was allocated. Every state assertion the positive makes holds
+    /// here unchanged, so an `is_err()` positive would accept this row as
+    /// though it were the cancellation it exists to prove.
+    ///
+    /// It also separates the two outer arms. A decline routes through
+    /// `host_error` into `Interaction(AbortedByHost)`; only the checkpoint
+    /// reaches `Core(Protocol(..))`. A test that matched on the nested
+    /// `ManagedCoreError` alone, or on `interaction_error(..).code`, could not
+    /// tell those two apart.
+    #[test]
+    fn host_cancelled_machine_requests_fail_the_post_callback_checkpoint_planted_negative() {
+        let ctx = McpContext::new(Cx::for_testing(), 81);
+        let cx = Cx::for_testing();
+        let ids = AtomicU64::new(7);
+        // Only `action` differs from the positive above.
+        let host = host(Action::Decline);
+
+        let error = ready(resolve_reply(&host, &ctx, &cx, &ids, challenge())).err().unwrap();
+
+        assert!(
+            matches!(
+                error,
+                ClientCredentialsInteractionError::Interaction(
+                    ManagedInteractionError::AbortedByHost,
+                ),
+            ),
+            "a declining host must be refused as Interaction(AbortedByHost), not {error:?}",
+        );
+        assert!(!matches!(
+            error,
+            ClientCredentialsInteractionError::Core(ClientCredentialsCoreError::Protocol(
+                ManagedCoreError::Cancelled,
+            )),
+        ));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.drops.load(Ordering::SeqCst), 1);
+        assert!(!cx.is_cancel_requested());
+        assert_eq!(ids.load(Ordering::SeqCst), 7);
+    }
 }
