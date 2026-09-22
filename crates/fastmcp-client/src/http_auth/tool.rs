@@ -25,6 +25,9 @@ use serde_json::Value;
 use super::managed::ManagedOAuthSession;
 use super::rpc::{ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 
+/// Explicit multi-round tool operations retaining this same schema contract.
+pub mod interaction;
+
 /// Combined encoded-byte ceiling for one retained input/output schema pair.
 pub const MAX_MANAGED_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
 /// Maximum UTF-8 bytes retained for a tool's exact, case-sensitive name.
@@ -249,15 +252,17 @@ impl ManagedToolClient {
         request_id: RequestId,
         limits: ManagedCoreLimits,
     ) -> Result<ManagedToolCall, ManagedToolError> {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-            return Err(ManagedCoreError::Cancelled.into());
-        }
+        check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
+        check_tool_call(cx, cancellation, &self.contract)?;
         let call = self.session.request_core_with_cancellation(
             cx, cancellation, request, request_id, limits,
         ).await?;
-        self.contract.check()?;
-        Ok(ManagedToolCall { call: Some(call), contract: self.contract.clone(), finished: false })
+        check_tool_call(cx, cancellation, &self.contract)?;
+        Ok(ManagedToolCall {
+            call: Some(call), contract: self.contract.clone(),
+            cancellation: cancellation.clone(), finished: false,
+        })
     }
 }
 
@@ -267,6 +272,7 @@ impl ManagedToolClient {
 pub struct ManagedToolCall {
     call: Option<ManagedCoreCall>,
     contract: Arc<ToolContract>,
+    cancellation: McpRequestCancellation,
     finished: bool,
 }
 
@@ -276,20 +282,32 @@ impl ManagedToolCall {
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedCoreEvent>, ManagedToolError> {
         if self.finished { return Ok(None); }
         let mut call = self.call.take().ok_or(ManagedToolError::Closed)?;
-        self.contract.check()?;
+        check_tool_call(cx, &self.cancellation, &self.contract)?;
         let event = call.next_event(cx).await?.ok_or(ManagedCoreError::MissingTerminal)?;
-        self.contract.check()?;
-        cx.checkpoint().map_err(|_| ManagedCoreError::Cancelled)?;
+        check_tool_call(cx, &self.cancellation, &self.contract)?;
         match &event {
             ManagedCoreEvent::Result(result) => {
                 self.contract.validate_result(result)?;
-                cx.checkpoint().map_err(|_| ManagedCoreError::Cancelled)?;
+                check_tool_call(cx, &self.cancellation, &self.contract)?;
                 self.finished = true;
             }
             ManagedCoreEvent::Notification(_) => self.call = Some(call),
         }
         Ok(Some(event))
     }
+}
+
+// Recheck the retained request-local domain around synchronous schema work,
+// not just the caller Cx. The transport still owns its original time budgets.
+fn check_tool_call(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    contract: &ToolContract,
+) -> Result<(), ManagedToolError> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(ManagedCoreError::Cancelled.into());
+    }
+    contract.check()
 }
 
 #[cfg(test)]
