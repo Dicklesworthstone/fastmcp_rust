@@ -346,5 +346,498 @@ fn check_run(client: &ClientCredentialsTasksClient, cx: &Cx,
         .map_err(ClientCredentialsError::from)
 }
 
+/// Persistence-gated continued observation after explicit checkpoint recovery.
+pub mod lifecycle {
+    use std::future::Future;
+
+    use super::*;
+    use super::super::{
+        ClientCredentialsSnapshot, ClientCredentialsTaskWatch, ClientCredentialsTaskWatchPolicy,
+        ManagedTaskSnapshot, check_watch, copy_binding,
+    };
+    use super::super::cancellation::{
+        CancellableClientCredentialsTaskWatchError, ClientCredentialsTaskCancelHandle,
+    };
+    use super::super::recovery::{
+        ClientCredentialsTaskRecoveryError, ClientCredentialsTaskRecoveryPolicy, RecoveryState,
+    };
+    pub use crate::http_auth::managed::tasks::watch::checkpoint::resume::client::lifecycle::TaskResumePersistenceState;
+
+    /// Provider errors are retained as typed sources, never formatted implicitly.
+    /// Failure after a save starts is not evidence that storage stayed unchanged.
+    pub enum PersistedClientCredentialsTaskWatchError<E> {
+        Resume(TaskResumeError),
+        Watch(ClientCredentialsTaskWatchError),
+        Recovery(ClientCredentialsTaskRecoveryError),
+        Authentication(ClientCredentialsError),
+        Persistence(E),
+        CancellationRequested,
+        TerminalAcknowledgementRequired,
+        NoTerminal,
+        Closed,
+    }
+    impl<E> fmt::Debug for PersistedClientCredentialsTaskWatchError<E> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Resume(error) => f.debug_tuple("Resume").field(error).finish(),
+                Self::Watch(error) => f.debug_tuple("Watch").field(error).finish(),
+                Self::Recovery(error) => f.debug_tuple("Recovery").field(error).finish(),
+                Self::Authentication(error) => f.debug_tuple("Authentication").field(error).finish(),
+                Self::Persistence(_) => f.write_str("Persistence(<host error>)"),
+                Self::CancellationRequested => f.write_str("CancellationRequested"),
+                Self::TerminalAcknowledgementRequired => f.write_str("TerminalAcknowledgementRequired"),
+                Self::NoTerminal => f.write_str("NoTerminal"),
+                Self::Closed => f.write_str("Closed"),
+            }
+        }
+    }
+    impl<E> fmt::Display for PersistedClientCredentialsTaskWatchError<E> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Resume(error) => error.fmt(f),
+                Self::Watch(error) => error.fmt(f),
+                Self::Recovery(error) => error.fmt(f),
+                Self::Authentication(error) => error.fmt(f),
+                Self::Persistence(_) => f.write_str("machine Task checkpoint persistence failed"),
+                Self::CancellationRequested => f.write_str("machine Task cancellation acknowledged; checkpoint retained"),
+                Self::TerminalAcknowledgementRequired => f.write_str("acknowledge handling the terminal Task before checkpoint cleanup"),
+                Self::NoTerminal => f.write_str("no terminal Task has been delivered"),
+                Self::Closed => f.write_str("persisted machine Task watch is closed"),
+            }
+        }
+    }
+    impl<E: std::error::Error + 'static> std::error::Error for PersistedClientCredentialsTaskWatchError<E> {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Resume(error) => Some(error), Self::Watch(error) => Some(error),
+                Self::Recovery(error) => Some(error), Self::Authentication(error) => Some(error),
+                Self::Persistence(error) => Some(error),
+                Self::CancellationRequested | Self::TerminalAcknowledgementRequired
+                | Self::NoTerminal | Self::Closed => None,
+            }
+        }
+    }
+    impl<E> From<TaskResumeError> for PersistedClientCredentialsTaskWatchError<E> {
+        fn from(error: TaskResumeError) -> Self { Self::Resume(error) }
+    }
+    impl<E> From<ClientCredentialsError> for PersistedClientCredentialsTaskWatchError<E> {
+        fn from(error: ClientCredentialsError) -> Self { Self::Authentication(error) }
+    }
+    impl<E> From<ClientCredentialsTaskWatchError> for PersistedClientCredentialsTaskWatchError<E> {
+        fn from(error: ClientCredentialsTaskWatchError) -> Self { Self::Watch(error) }
+    }
+    impl<E> From<ClientCredentialsTaskRecoveryError> for PersistedClientCredentialsTaskWatchError<E> {
+        fn from(error: ClientCredentialsTaskRecoveryError) -> Self {
+            match error { ClientCredentialsTaskRecoveryError::Watch(error) => Self::Watch(error),
+                error => Self::Recovery(error) }
+        }
+    }
+    impl<E> From<CancellableClientCredentialsTaskWatchError> for PersistedClientCredentialsTaskWatchError<E> {
+        fn from(error: CancellableClientCredentialsTaskWatchError) -> Self {
+            match error {
+                CancellableClientCredentialsTaskWatchError::CancellationRequested => Self::CancellationRequested,
+                CancellableClientCredentialsTaskWatchError::Closed => Self::Closed,
+                CancellableClientCredentialsTaskWatchError::Watch(error) => Self::Watch(error),
+                CancellableClientCredentialsTaskWatchError::Recovery(error) => error.into(),
+            }
+        }
+    }
+
+    /// Retained custody of a fresh snapshot and its separate payload-free change.
+    /// Acknowledged means the callback returned success, not that publication won
+    /// a later cancellation/expiry race. No state here authorizes a write retry.
+    pub struct PendingClientCredentialsTaskResumeSnapshot {
+        snapshot: ManagedTaskSnapshot,
+        change: TaskResumeChange,
+        persistence: TaskResumePersistenceState,
+    }
+    impl PendingClientCredentialsTaskResumeSnapshot {
+        pub fn snapshot(&self) -> &ManagedTaskSnapshot { &self.snapshot }
+        pub fn change(&self) -> &TaskResumeChange { &self.change }
+        pub fn persistence(&self) -> TaskResumePersistenceState { self.persistence }
+        pub fn into_parts(self) -> (ManagedTaskSnapshot, TaskResumeChange, TaskResumePersistenceState) {
+            (self.snapshot, self.change, self.persistence)
+        }
+    }
+    impl fmt::Debug for PendingClientCredentialsTaskResumeSnapshot {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PendingClientCredentialsTaskResumeSnapshot")
+                .field("persistence", &self.persistence).finish_non_exhaustive()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Phase { Observing, TerminalPending, Closed, Finished }
+
+    /// One caller-polled, persistence-gated machine Task observation.
+    ///
+    /// Active snapshots are delivered only after an acknowledged conditional
+    /// save. A terminal is delivered BEFORE cleanup; explicitly acknowledge it
+    /// only after handling or durably recording its payload. Drop never deletes
+    /// a checkpoint. This permits terminal redelivery after a crash, not an
+    /// exactly-once or crash-durable result-inbox guarantee.
+    ///
+    /// Failed or abandoned polled reads permanently close this owner. Pending
+    /// snapshots, storage dispositions and reconnection counts stay inspectable.
+    /// No implicit creation, input execution, credential renewal, storage retry,
+    /// runtime or background worker is installed.
+    #[must_use = "retain checkpoint custody until snapshots and terminal handling are acknowledged"]
+    pub struct PersistedClientCredentialsTaskWatch<P> {
+        client: ClientCredentialsTasksClient,
+        current: TaskResumeBinding,
+        record: TaskResumeRecord,
+        cancellation: McpRequestCancellation,
+        deadline: Time,
+        binding: ClientCredentialsSnapshot,
+        watch: Option<ClientCredentialsTaskWatch>,
+        recovery: RecoveryState,
+        remote_cancel: ClientCredentialsTaskCancelHandle,
+        persist: P,
+        pending: Option<PendingClientCredentialsTaskResumeSnapshot>,
+        terminal_cleanup: Option<TaskResumeChange>,
+        cleanup_state: TaskResumePersistenceState,
+        phase: Phase,
+    }
+
+    impl ClientCredentialsTasksClient {
+        /// Resume an already-persisted Task and checkpoint each fresh active
+        /// snapshot before delivering it. Admission negotiates both extensions
+        /// and requires the complete listen ACK, but invokes no storage callback.
+        ///
+        /// The host independently verifies that current identifies this machine
+        /// registration. The checkpoint cannot choose an account or resource.
+        /// persist must compare the entire expected record and acknowledge only
+        /// a durable commit. TaskResumeChange::apply supplies that operation for
+        /// the existing Linux protected store; run blocking I/O in the host's
+        /// owned blocking lane and retain/join its job, never detach a writer.
+        ///
+        /// Recovery is bounded by the supplied policy and original retention,
+        /// record/snapshot budgets and deadline. Observation, explicit cancellation
+        /// and persistence all retain the opening credential; expiry/revocation
+        /// fails closed, not by acquiring new mutation authority.
+        #[allow(clippy::too_many_arguments)]
+        pub async fn resume_task_watch_persisted<P, F, E>(
+            &self, cx: &Cx, current: TaskResumeBinding, record: TaskResumeRecord,
+            id_prefix: String, policy: ClientCredentialsTaskWatchPolicy,
+            recovery: ClientCredentialsTaskRecoveryPolicy, persist: P,
+        ) -> Result<PersistedClientCredentialsTaskWatch<P>, PersistedClientCredentialsTaskWatchError<E>>
+        where P: FnMut(TaskResumeChange) -> F, F: Future<Output = Result<(), E>>,
+        {
+            self.resume_task_watch_persisted_with_cancellation(cx, &McpRequestCancellation::new(),
+                current, record, id_prefix, policy, recovery, persist).await
+        }
+
+        /// Local cancellation releases only this observation. Explicit remote
+        /// cancellation uses the returned one-attempt handle; a valid ACK stops
+        /// pending reads/saves without deleting the checkpoint or claiming rollback.
+        #[allow(clippy::too_many_arguments)]
+        pub async fn resume_task_watch_persisted_with_cancellation<P, F, E>(
+            &self, cx: &Cx, cancellation: &McpRequestCancellation,
+            current: TaskResumeBinding, record: TaskResumeRecord, id_prefix: String,
+            policy: ClientCredentialsTaskWatchPolicy, recovery: ClientCredentialsTaskRecoveryPolicy,
+            persist: P,
+        ) -> Result<PersistedClientCredentialsTaskWatch<P>, PersistedClientCredentialsTaskWatchError<E>>
+        where P: FnMut(TaskResumeChange) -> F, F: Future<Output = Result<(), E>>,
+        {
+            let deadline = discovery_deadline(cx, policy.timeout).map_err(ClientCredentialsError::from)?;
+            check_run(self, cx, cancellation, deadline)?;
+            let deadline = deadline.min(resume_read_deadline(cx, &current, &record, self.client.resource().as_str())?);
+            let connection_policy = recovery.connection_policy(policy)?;
+            let mut remote_cancel = ClientCredentialsTaskCancelHandle::for_observation(
+                self, record.task_id().clone(), &id_prefix, cancellation, deadline,
+            )?;
+            let mut watch = Box::pin(active(cx, deadline, &self.client.inner.closed, cancellation, None, async {
+                Ok(self.watch_tasks_with_cancellation(cx, cancellation, vec![record.task_id().clone()],
+                    id_prefix, connection_policy).await)
+            })).await??;
+            watch.deadline = watch.deadline.min(deadline);
+            let binding = copy_binding(&watch.binding);
+            remote_cancel.pin_binding(copy_binding(&binding), watch.deadline)?;
+            let recovery = RecoveryState::new(&watch, connection_policy, recovery);
+            let result = PersistedClientCredentialsTaskWatch {
+                client: self.clone(), current, record, cancellation: cancellation.clone(),
+                deadline: watch.deadline, binding, watch: Some(watch), recovery, remote_cancel,
+                persist, pending: None, terminal_cleanup: None,
+                cleanup_state: TaskResumePersistenceState::NotAttempted, phase: Phase::Observing,
+            };
+            result.check::<E>(cx)?;
+            Ok(result)
+        }
+    }
+
+    impl<P> PersistedClientCredentialsTaskWatch<P> {
+        /// The last delivered active version, not a claim about current storage.
+        /// A pending acknowledged save may have superseded it without publication.
+        pub fn last_published_record(&self) -> &TaskResumeRecord { &self.record }
+        pub fn pending(&self) -> Option<&PendingClientCredentialsTaskResumeSnapshot> { self.pending.as_ref() }
+        /// End observation before exporting pending custody; never retry its save.
+        pub fn take_pending(&mut self) -> Option<PendingClientCredentialsTaskResumeSnapshot> {
+            self.close(); self.pending.take()
+        }
+        pub fn terminal_cleanup(&self) -> Option<&TaskResumeChange> { self.terminal_cleanup.as_ref() }
+        pub fn cleanup_state(&self) -> TaskResumePersistenceState { self.cleanup_state }
+        pub fn reconnection_attempts(&self) -> usize { self.recovery.reconnection_attempts() }
+        pub fn cancel_handle(&self) -> ClientCredentialsTaskCancelHandle { self.remote_cancel.clone() }
+        pub fn close(&mut self) {
+            self.remote_cancel.close_observation();
+            self.watch = None;
+            if self.phase != Phase::Finished { self.phase = Phase::Closed; }
+        }
+
+        fn check<E>(&self, cx: &Cx) -> Result<(), PersistedClientCredentialsTaskWatchError<E>> {
+            if self.remote_cancel.cancellation_requested() {
+                return Err(PersistedClientCredentialsTaskWatchError::CancellationRequested);
+            }
+            check_watch(cx, self.deadline, &self.client.client.inner.closed, &self.cancellation, &self.binding)?;
+            self.record.admit(cx, &self.current)?;
+            Ok(())
+        }
+
+        pub async fn next_snapshot<F, E>(&mut self, cx: &Cx)
+            -> Result<Option<ManagedTaskSnapshot>, PersistedClientCredentialsTaskWatchError<E>>
+        where P: FnMut(TaskResumeChange) -> F, F: Future<Output = Result<(), E>>,
+        {
+            if self.phase == Phase::Finished { return Ok(None); }
+            if self.remote_cancel.cancellation_requested() {
+                self.close(); return Err(PersistedClientCredentialsTaskWatchError::CancellationRequested);
+            }
+            match self.phase {
+                Phase::Closed => return Err(PersistedClientCredentialsTaskWatchError::Closed),
+                Phase::TerminalPending => return Err(PersistedClientCredentialsTaskWatchError::TerminalAcknowledgementRequired),
+                _ => {},
+            }
+            // Retire admission BEFORE suspension. Errors, panic and future drop
+            // cannot make a partially read stream or a pending write reusable.
+            let mut watch = self.watch.take().ok_or(PersistedClientCredentialsTaskWatchError::Closed)?;
+            self.phase = Phase::Closed;
+            let remote = self.remote_cancel.clone();
+            let mut lease = remote.read_lease();
+            self.check::<E>(cx)?;
+            let client = self.client.clone();
+            let cancellation = self.cancellation.clone();
+            let deadline = self.deadline;
+            let binding = &self.binding;
+            let recovery = &mut self.recovery;
+            let read = Box::pin(active(cx, deadline, &client.client.inner.closed, &cancellation, Some(binding), async {
+                Ok(recovery.next_snapshot(cx, &mut watch, Some(binding)).await)
+            }));
+            let snapshot = remote.until_acknowledged(read).await???
+                .ok_or(TaskResumeError::InvalidRecord)?;
+            let change = TaskResumeChange::from_snapshot(cx, &self.current, &self.record, &snapshot.task)?;
+            if change.replacement().is_none() {
+                self.check::<E>(cx)?;
+                // Only a fully reconciled terminal may win over remote cancel.
+                // No storage command runs until explicit result acknowledgement.
+                remote.select_terminal()?;
+                self.terminal_cleanup = Some(change);
+                self.phase = Phase::TerminalPending;
+                return Ok(Some(snapshot));
+            }
+            self.pending = Some(PendingClientCredentialsTaskResumeSnapshot {
+                snapshot, change, persistence: TaskResumePersistenceState::NotAttempted,
+            });
+            self.check::<E>(cx)?;
+            let pending = self.pending.as_mut().ok_or(TaskResumeError::InvalidRecord)?;
+            let persist = &mut self.persist;
+            let writing = Box::pin(active(cx, deadline, &client.client.inner.closed, &cancellation, Some(&self.binding), async {
+                Ok(persist_change(&mut pending.persistence, persist, pending.change.clone()).await)
+            }));
+            remote.until_acknowledged(writing).await??
+                .map_err(PersistedClientCredentialsTaskWatchError::Persistence)?;
+            self.check::<E>(cx)?;
+            let next = self.pending.as_ref().and_then(|pending| pending.change.replacement())
+                .ok_or(TaskResumeError::InvalidRecord)?.clone();
+            let pending = self.pending.take().ok_or(TaskResumeError::InvalidRecord)?;
+            self.record = next;
+            self.watch = Some(watch);
+            self.phase = Phase::Observing;
+            lease.disarm();
+            Ok(Some(pending.snapshot))
+        }
+
+        /// Acknowledge handling or separately persisting the delivered terminal
+        /// result, then conditionally remove its exact checkpoint. Exactly one
+        /// cleanup attempt is allowed; errors/drop retain its disposition and
+        /// command for explicit provider reconciliation, not an automatic retry.
+        /// Original credential, retention, cancellation and deadline still apply.
+        pub async fn acknowledge_terminal<F, E>(&mut self, cx: &Cx)
+            -> Result<(), PersistedClientCredentialsTaskWatchError<E>>
+        where P: FnMut(TaskResumeChange) -> F, F: Future<Output = Result<(), E>>,
+        {
+            match self.phase {
+                Phase::Finished => return Ok(()),
+                Phase::Closed => return Err(PersistedClientCredentialsTaskWatchError::Closed),
+                Phase::Observing => return Err(PersistedClientCredentialsTaskWatchError::NoTerminal),
+                Phase::TerminalPending => {},
+            }
+            let change = self.terminal_cleanup.clone().ok_or(TaskResumeError::InvalidRecord)?;
+            self.phase = Phase::Closed;
+            self.check::<E>(cx)?;
+            let client = self.client.clone();
+            let cancellation = self.cancellation.clone();
+            let persist = &mut self.persist;
+            let state = &mut self.cleanup_state;
+            Box::pin(active(cx, self.deadline, &client.client.inner.closed, &cancellation, Some(&self.binding), async {
+                Ok(persist_change(state, persist, change).await)
+            })).await?.map_err(PersistedClientCredentialsTaskWatchError::Persistence)?;
+            self.phase = Phase::Finished;
+            Ok(())
+        }
+    }
+    impl<P> Drop for PersistedClientCredentialsTaskWatch<P> {
+        fn drop(&mut self) { self.remote_cancel.close_observation(); }
+    }
+    impl<P> fmt::Debug for PersistedClientCredentialsTaskWatch<P> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PersistedClientCredentialsTaskWatch").field("phase", &self.phase)
+                .field("cleanup_state", &self.cleanup_state)
+                .field("reconnection_attempts", &self.reconnection_attempts()).finish_non_exhaustive()
+        }
+    }
+
+    async fn persist_change<P, F, E>(state: &mut TaskResumePersistenceState, persist: &mut P, change: TaskResumeChange)
+        -> Result<(), E>
+    where P: FnMut(TaskResumeChange) -> F, F: Future<Output = Result<(), E>>,
+    {
+        // Mark before calling host code (which can panic), and retain the receipt
+        // before returning to lifetime guards. They can still withhold delivery.
+        *state = TaskResumePersistenceState::Unconfirmed;
+        let result = persist(change).await;
+        if result.is_ok() { *state = TaskResumePersistenceState::Acknowledged; }
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use super::super::super::tests::{consumer, runtime};
+        use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
+        use serde_json::json;
+        use std::cell::Cell;
+        use std::future::ready;
+        use std::task::{Context, Poll, Waker};
+
+        fn owner(client: &ClientCredentialsTasksClient, subject: &str) -> TaskResumeBinding {
+            let resource = client.client.resource();
+            let facts = PartitionDescriptor::from_verified_facts("fixture", 1, "https://issuer.example",
+                resource.as_str(), "tenant", subject, "client", 1, 1, &[b"bound-resource".as_slice()]).unwrap();
+            TaskResumeBinding::from_verified_owner(resource.clone(), "persisted-machine",
+                &DurableOwnerKey::derive(&facts, 1).unwrap(), [1; 32], [2; 32], [3; 32]).unwrap()
+        }
+        fn saved(cx: &Cx, binding: &TaskResumeBinding) -> TaskResumeRecord {
+            let task = serde_json::from_value(json!({"taskId":"private-task", "status":"working",
+                "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":"2020-01-01T00:00:01Z", "ttlMs":null})).unwrap();
+            TaskResumeRecord::capture(cx, binding, &task, Duration::from_secs(3600)).unwrap()
+        }
+        fn change(cx: &Cx) -> TaskResumeChange {
+            let binding = owner(&consumer(), "one");
+            TaskResumeChange::discard(cx, &binding, &saved(cx, &binding)).unwrap()
+        }
+
+        #[test]
+        fn persisted_machine_admission_refuses_before_grant_or_provider_entry() {
+            runtime().block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = consumer();
+                let current = owner(&client, "one");
+                let record = saved(&cx, &current);
+                let before = record.encode().unwrap();
+                let calls = Cell::new(0);
+                for dimension in 0..5 {
+                    let binding = if dimension == 0 { owner(&client, "other") } else { current.clone() };
+                    let cancellation = McpRequestCancellation::new();
+                    if dimension == 2 { cancellation.cancel(); }
+                    let prefix = if dimension == 1 { "invalid:prefix" } else { "persisted" };
+                    let policy = ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(10), 4,
+                        if dimension == 3 { 2 } else { 32 }).unwrap();
+                    let mut record = record.clone();
+                    if dimension == 4 {
+                        let mut encoded = record.encode().unwrap();
+                        let end = encoded.len();
+                        encoded[end - 16..].copy_from_slice(&1_577_836_802_000_000_000_i128.to_be_bytes());
+                        record = TaskResumeRecord::decode(&encoded).unwrap();
+                    }
+                    let result = Box::pin(client.resume_task_watch_persisted_with_cancellation(&cx, &cancellation,
+                        binding, record, prefix.to_owned(), policy, ClientCredentialsTaskRecoveryPolicy::default(),
+                        |_| { calls.set(calls.get() + 1); ready(Ok::<(), ()>(())) })).await;
+                    match (dimension, result) {
+                        (0 | 4, Err(PersistedClientCredentialsTaskWatchError::Resume(TaskResumeError::Unavailable))) => {},
+                        (1, Err(PersistedClientCredentialsTaskWatchError::Watch(ClientCredentialsTaskWatchError::InvalidIdPrefix))) => {},
+                        (2, Err(PersistedClientCredentialsTaskWatchError::Authentication(
+                            ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)))) => {},
+                        (3, Err(PersistedClientCredentialsTaskWatchError::Recovery(ClientCredentialsTaskRecoveryError::InvalidPolicy))) => {},
+                        (_, value) => panic!("unexpected preflight outcome: {value:?}"),
+                    }
+                }
+                assert_eq!(calls.get(), 0);
+                assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+                assert_eq!(record.encode().unwrap(), before);
+            });
+        }
+
+        #[test]
+        fn persisted_machine_save_receipt_distinguishes_unpolled_failed_and_acknowledged() {
+            let cx = Cx::for_testing();
+            for fail in [false, true] {
+                let mut state = TaskResumePersistenceState::NotAttempted;
+                let calls = Cell::new(0);
+                let mut provider = |_| { calls.set(calls.get() + 1); ready(if fail { Err(7) } else { Ok(()) }) };
+                drop(persist_change(&mut state, &mut provider, change(&cx)));
+                assert_eq!(calls.get(), 0);
+                assert_eq!(state, TaskResumePersistenceState::NotAttempted);
+                let mut future = Box::pin(persist_change(&mut state, &mut provider, change(&cx)));
+                assert_eq!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(if fail { Err(7) } else { Ok(()) }));
+                drop(future);
+                assert_eq!(calls.get(), 1);
+                assert_eq!(state, if fail { TaskResumePersistenceState::Unconfirmed } else { TaskResumePersistenceState::Acknowledged });
+            }
+        }
+
+        #[test]
+        fn persisted_machine_abandoned_save_releases_future_and_keeps_uncertainty() {
+            struct Probe<'a>(&'a Cell<bool>);
+            impl Drop for Probe<'_> { fn drop(&mut self) { self.0.set(true); } }
+            let cx = Cx::for_testing();
+            let dropped = Cell::new(false);
+            let mut state = TaskResumePersistenceState::NotAttempted;
+            let mut provider = |_| {
+                let probe = Probe(&dropped);
+                async move { let _probe = probe; std::future::pending::<Result<(), ()>>().await }
+            };
+            let mut future = Box::pin(persist_change(&mut state, &mut provider, change(&cx)));
+            assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            drop(future);
+            assert!(dropped.get());
+            assert_eq!(state, TaskResumePersistenceState::Unconfirmed);
+        }
+
+        #[test]
+        fn persisted_machine_ready_save_ack_survives_outer_cancellation() {
+            runtime().block_on(async {
+                let cx = Cx::current().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let owner = McpRequestCancellation::new();
+                let mut state = TaskResumePersistenceState::NotAttempted;
+                let mut provider = |_| { cancellation.cancel(); ready(Ok::<(), ()>(())) };
+                let result = active(&cx, cx.now().saturating_add_nanos(1_000_000_000), &owner, &cancellation, None,
+                    async { Ok(persist_change(&mut state, &mut provider, change(&cx)).await) }).await;
+                assert!(result.is_err());
+                assert_eq!(state, TaskResumePersistenceState::Acknowledged);
+                assert!(!owner.is_cancel_requested());
+            });
+        }
+
+        #[test]
+        fn persisted_machine_provider_diagnostics_are_not_implicitly_formatted() {
+            struct Secret;
+            impl fmt::Debug for Secret { fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { panic!("private provider data"); } }
+            let error = PersistedClientCredentialsTaskWatchError::Persistence(Secret);
+            assert_eq!(format!("{error:?}"), "Persistence(<host error>)");
+            assert_eq!(format!("{error}"), "machine Task checkpoint persistence failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
