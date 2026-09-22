@@ -59,7 +59,7 @@ jobs:
           cargo test --locked --workspace --doc --all-features
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3
         with:
           tool: cargo-audit@0.22.2
           checksum: true
