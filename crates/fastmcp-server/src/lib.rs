@@ -48032,8 +48032,13 @@ mod lib_unit_tests {
     // `returning_subscription_*` prefix and its denominator.
     //
     // The first test of each pair pins the CURRENT outcome of a candidate
-    // defect as a mechanism proof, not as a contract: a fix ruled by the
-    // subscription surface's owner inverts that expectation with it.
+    // defect as a mechanism proof, not as a contract: the pump-first test is
+    // bd-gl2we finding F1 (stdio shutdown loses a pending graceful election)
+    // and the under-recv-lock test is F2 (an acknowledgement sent during an
+    // unsplit transport's `recv` fails the connection), both in comment 5412.
+    // A fix ruled by the subscription surface's owner must INVERT that
+    // expectation under a separate RH-3 semantic review; never regenerate
+    // these assertions to green without it.
 
     #[test]
     fn forced_subscription_ack_order_pump_first_loses_graceful_completion() {
