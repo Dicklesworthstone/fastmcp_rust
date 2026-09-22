@@ -148,6 +148,18 @@ def self_test() -> bool:
     if len(_grouped(pre)) != 3:
         print("CONTROL FAILED: grouper miscounted a prose pre-image", file=sys.stderr)
         return False
+    # A TRAILING SECTION must not be absorbed, and its bullets must not become items.
+    sect = ("- [ ] Item one.\n  wrapped clause.\n- [ ] Item two.\n\n"
+            "=== SECTION B: AUTHORITY ===\n- a plain bullet\n")
+    g = _grouped(sect)
+    if len(g) != 2 or "SECTION B" in " ".join(g[-1]):
+        print("CONTROL FAILED: a trailing section was absorbed into the items", file=sys.stderr)
+        return False
+    # A LEADING preamble must be skipped without changing the item count.
+    pre_amble = "AUTHORED BY someone.\nSeparation on the record.\n- [ ] Only item.\n  wrapped.\n"
+    if len(_grouped(pre_amble)) != 1:
+        print("CONTROL FAILED: a leading preamble changed the item count", file=sys.stderr)
+        return False
     # THE INVERSION, encoded as a control so it cannot come back silently.
     mt_pre = "- Emits a parse/\n  invalid-request code."
     mt_good = "- [ ] Emits a parse/invalid-request code."
@@ -217,13 +229,42 @@ def _item_start(line: str) -> str | None:
 
 
 def _grouped(stored: str) -> list[list[str]]:
+    """Group item lines with their INDENTED continuations only.
+
+    Continuation-by-position is wrong for these fields. Two column-0 regions are
+    NOT item text and the first version swallowed both:
+
+      * a LEADING preamble (an authorship or separation statement above the
+        items) -- skipped, because no item has started yet; and
+      * a TRAILING section, e.g. "=== SECTION B: AUTHORITY -- plain bullets,
+        deliberately NOT tickable ===", which several beads carry on purpose.
+
+    Attributing a trailing section to the last item made it report a 1016-char
+    "truncation" on a bead that had none, and -- far worse -- `reflow` would
+    have JOINED the section header into that item and PROMOTED the section's
+    plain bullets into checkbox items. That is field corruption, not a bad
+    report, and it was reachable on two beads under active verification.
+
+    So: a column-0 line that is neither an item start nor indented ENDS the item
+    region, and nothing after it is item text.
+    """
     out: list[list[str]] = []
+    started = False
     for line in stored.split("\n"):
-        head = _item_start(line)
+        indented = line[:1] in (" ", "\t")
+        head = None if indented else _item_start(line)
         if head is not None:
             out.append([head])
-        elif out:
-            out[-1].append(line.strip())
+            started = True
+            continue
+        if not line.strip():
+            continue
+        if indented:
+            if out:
+                out[-1].append(line.strip())
+            continue
+        if started:
+            break  # a column-0 non-item line closes the item region
     return out
 
 
@@ -395,7 +436,7 @@ def main() -> int:
     if not self_test():
         print("REFUSING TO REPORT: controls did not pass in this invocation.", file=sys.stderr)
         return 2
-    print("controls: correct-verifies, corrupt-rejects, mutated-preimage-rejects, advisory pos+neg, wrapped-item-whole, precondition pos+neg, prose-form-grouping, reflow-preserves-words, mid-token pos+neg, guardB-inversion pos+neg  OK")
+    print("controls: correct-verifies, corrupt-rejects, mutated-preimage-rejects, advisory pos+neg, wrapped-item-whole, precondition pos+neg, prose-form-grouping, reflow-preserves-words, mid-token pos+neg, guardB-inversion pos+neg, trailing-section, leading-preamble  OK")
 
     bead, pre_path = sys.argv[1], sys.argv[2]
     preimage = open(pre_path, encoding="utf-8").read()
