@@ -1509,6 +1509,9 @@ pub struct McpContext {
     cache_admission_partition: Arc<Mutex<Option<([u8; 32], u64)>>>,
     /// Cache middleware instances that short-circuited response generation.
     response_cache_hits: Arc<Mutex<Vec<u64>>>,
+    /// Write-once middleware generation admissions shared by request clones.
+    /// Each record is `(instance, fill generation, binding revision)`.
+    response_cache_admissions: Arc<Mutex<Vec<(u64, u64, u64)>>>,
     /// Request-scoped authentication context.
     auth: Arc<Mutex<Option<AuthContext>>>,
     /// Write-once authentication admission state, including committed anonymous
@@ -1738,6 +1741,7 @@ impl McpContext {
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
+            response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1783,6 +1787,7 @@ impl McpContext {
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
+            response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1829,6 +1834,7 @@ impl McpContext {
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
+            response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -1879,6 +1885,7 @@ impl McpContext {
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
             response_cache_hits: Arc::new(Mutex::new(Vec::new())),
+            response_cache_admissions: Arc::new(Mutex::new(Vec::new())),
             auth: Arc::new(Mutex::new(None)),
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
@@ -3161,6 +3168,61 @@ impl McpContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let admitted = admitted?;
         (self.state.as_ref()?.cache_admission_revision() == Some(admitted)).then_some(admitted)
+    }
+
+    /// Records one middleware's generation before it admits a cache lookup or
+    /// lets the request continue to its handler.
+    ///
+    /// The binding revision is opaque to the context; the cache uses it to
+    /// retain any additional request-time key generation. An existing record
+    /// can only be reused unchanged, including through clones, so a late
+    /// response cannot obtain fresh admission after an invalidation. At most
+    /// 64 middleware instances may retain admission in one request.
+    #[doc(hidden)]
+    pub fn begin_response_cache_admission(
+        &self,
+        cache_id: u64,
+        generation: u64,
+        binding_revision: u64,
+    ) -> bool {
+        const MAX_CACHE_MIDDLEWARE_PER_REQUEST: usize = 64;
+        if !self.request_scope_is_active() || cache_id == 0 || generation == 0 {
+            return false;
+        }
+        let mut admissions = self
+            .response_cache_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, admitted_generation, admitted_binding)) = admissions
+            .iter()
+            .find(|(instance, _, _)| *instance == cache_id)
+        {
+            return *admitted_generation == generation && *admitted_binding == binding_revision;
+        }
+        if admissions.len() >= MAX_CACHE_MIDDLEWARE_PER_REQUEST
+            || admissions.try_reserve(1).is_err()
+        {
+            return false;
+        }
+        admissions.push((cache_id, generation, binding_revision));
+        true
+    }
+
+    /// Returns a middleware's original fill generation and binding revision.
+    /// The middleware must compare these under its cache lock before using a
+    /// cached value or publishing a completed handler response.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn response_cache_admission(&self, cache_id: u64) -> Option<(u64, u64)> {
+        if !self.request_scope_is_active() || cache_id == 0 {
+            return None;
+        }
+        self.response_cache_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(instance, _, _)| *instance == cache_id)
+            .map(|(_, generation, binding_revision)| (*generation, *binding_revision))
     }
 
     /// Marks that one middleware instance produced this request's response from
@@ -5480,6 +5542,43 @@ mod tests {
         assert!(ctx.response_was_cache_hit(10));
         assert!(!ctx.response_was_cache_hit(11));
         assert!(!ctx.mark_response_cache_hit(0));
+    }
+
+    #[test]
+    fn response_cache_admissions_are_write_once_clone_shared_and_bounded() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let clone = ctx.clone();
+        assert!(!ctx.begin_response_cache_admission(0, 7, 9));
+        assert!(!ctx.begin_response_cache_admission(1, 0, 9));
+        assert!(ctx.begin_response_cache_admission(1, 7, 9));
+        assert_eq!(clone.response_cache_admission(1), Some((7, 9)));
+        assert!(clone.begin_response_cache_admission(1, 7, 9));
+        assert!(!clone.begin_response_cache_admission(1, 8, 9));
+        assert!(!clone.begin_response_cache_admission(1, 7, 10));
+        assert_eq!(ctx.response_cache_admission(1), Some((7, 9)));
+
+        for instance in 2..=64 {
+            assert!(ctx.begin_response_cache_admission(instance, 11, 0));
+        }
+        assert!(!clone.begin_response_cache_admission(65, 11, 0));
+        assert_eq!(ctx.response_cache_admission(65), None);
+        assert!(clone.begin_response_cache_admission(64, 11, 0));
+        assert_eq!(ctx.response_cache_admission(1), Some((7, 9)));
+        assert_eq!(ctx.response_cache_admission(64), Some((11, 0)));
+    }
+
+    #[test]
+    fn response_cache_admission_is_unavailable_after_request_lease_closes() {
+        let (ctx, lease) = McpContext::new(Cx::for_testing(), 1)
+            .begin_request_scope()
+            .expect("a fresh context can start one request");
+        let clone = ctx.clone();
+        assert!(ctx.begin_response_cache_admission(1, 7, 9));
+        assert_eq!(clone.response_cache_admission(1), Some((7, 9)));
+        drop(lease);
+        assert_eq!(clone.response_cache_admission(1), None);
+        assert!(!ctx.begin_response_cache_admission(1, 7, 9));
+        assert!(!clone.begin_response_cache_admission(2, 7, 9));
     }
 
     #[test]
