@@ -2178,8 +2178,8 @@ def main() -> int:
         note = row.note
         if any(t.location.startswith(prefix) for prefix in notes) and row.outcome != "UNATTEMPTED":
             note = (note + "; " if note else "") + drift_note(w, t)
-        print(f"{t.file.removeprefix(ROOT)} | {t.location} | {t.klass} | {row.declared_bytes}/{row.declared_digest[:16]} | "
-              f"{row.computed_bytes}/{(row.computed_digest or '')[:16]} | {row.outcome} | {note}")
+        print(f"{t.file.removeprefix(ROOT)} | {t.location} | {t.klass} | {row.declared_bytes}/{row.declared_digest} | "
+              f"{row.computed_bytes}/{row.computed_digest or '-'} | {row.outcome} | {note}")
     print("\n== J1 exclusions: every other base field, by (file, shape, category) ==")
     grouped: dict = {}
     for base, category, reason in exclusions:
