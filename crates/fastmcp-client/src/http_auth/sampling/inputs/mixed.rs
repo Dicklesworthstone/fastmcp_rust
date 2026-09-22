@@ -20,7 +20,8 @@ use fastmcp_protocol::{
     FinalEmbeddedElicitationResult, FinalEmbeddedFormElicitationParams,
     FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
     FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams, FinalInputResponses,
-    InputRequiredResult, RequestId, admit_final_schema, exact_json_to_serde,
+    IncludeContext, InputRequiredResult, RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    admit_final_schema, exact_json_to_serde,
 };
 
 use super::{BatchHost, SamplingInputError, SamplingInputLimits};
@@ -42,16 +43,26 @@ pub enum CoreInputHostError { Denied, Failed }
 pub type CoreInputHostFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, CoreInputHostError>> + Send + 'a>>;
 
-/// One immutable, preflighted descriptor, in its received map order.
+/// One immutable, preflighted effective descriptor, in its received map order.
 /// The key is a correlation identity, not authority to access a resource.
+/// Advisory sampling context is normalized before host approval; the original
+/// interaction retains its unmodified wire descriptor and requestState.
 pub struct CoreInputRequest {
     key: String,
     descriptor: FinalEmbeddedInputRequest,
     form_schema: Option<AdmittedSchema>,
+    sampling_context_ignored: bool,
 }
 impl CoreInputRequest {
     pub fn key(&self) -> &str { &self.key }
     pub fn descriptor(&self) -> &FinalEmbeddedInputRequest { &self.descriptor }
+
+    /// Whether a peer requested this-server or all-server sampling context
+    /// without the original request advertising `sampling.context`.
+    /// The effective descriptor omits that hint before approval and sampling.
+    /// Absent hints and an explicit `"none"` do not produce this diagnostic.
+    #[must_use]
+    pub fn sampling_context_ignored(&self) -> bool { self.sampling_context_ignored }
 }
 
 /// The host supplies all disclosure, UI, model and tool authority. Approval is
@@ -150,6 +161,9 @@ impl From<SamplingRunError> for CoreInputError {
 /// retain exact keys and received order. Absence and a present-empty input map
 /// remain distinct and invoke no host. Accepted form data is schema-validated;
 /// declined/dismissed forms have no content. Roots must be structural file URIs.
+/// Sampling context hints without the original request's `sampling.context`
+/// grant are omitted from effective descriptors. Approval can observe each
+/// ignored hint through `CoreInputRequest::sampling_context_ignored`.
 ///
 /// Supply the interaction's original CoreRequest and a fresh request ID. This
 /// helper does not own correlation history or requestState: the returned reply
@@ -232,6 +246,11 @@ async fn resolve_selection<H: CoreInputHost + ?Sized>(
         check(cx, cancellation, end)?;
         return Ok(ManagedInputReply { request_id, input_responses: None });
     };
+    let context_advertised = original.encode_params()
+        .map_err(|_| CoreInputError::InvalidRequest)?
+        .is_some_and(|params| {
+            params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["sampling"]["context"].is_object()
+        });
     let mut requests = Vec::with_capacity(map.members().len());
     let mut input_bytes = 2;
     let mut minimum_reply_bytes = 2;
@@ -252,10 +271,19 @@ async fn resolve_selection<H: CoreInputHost + ?Sized>(
             minimum_reply_bytes = member_bytes(minimum_reply_bytes, key_bytes, 2, !requests.is_empty(), limits.sampling.reply_bytes)
                 .ok_or(CoreInputError::ReplyByteLimit)?;
         }
-        let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
+        let mut descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
             .map_err(|_| CoreInputError::InvalidInput)?;
-        let form_schema = match &descriptor {
+        let mut sampling_context_ignored = false;
+        let form_schema = match &mut descriptor {
             FinalEmbeddedInputRequest::Sampling(request) => {
+                // Normalize this owned descriptor only. The retained challenge
+                // remains the wire evidence used for continuation validation.
+                if !context_advertised
+                    && request.include_context.is_some_and(|context| context != IncludeContext::None)
+                {
+                    request.include_context = None;
+                    sampling_context_ignored = true;
+                }
                 sampling_count += usize::from(selected);
                 SamplingToolLoop::new(request.clone(), limits.sampling.run.conversation)
                     .map_err(SamplingRunError::from)?;
@@ -268,7 +296,9 @@ async fn resolve_selection<H: CoreInputHost + ?Sized>(
             _ => None,
         };
         if selected {
-            requests.push(CoreInputRequest { key: member.name.clone(), descriptor, form_schema });
+            requests.push(CoreInputRequest {
+                key: member.name.clone(), descriptor, form_schema, sampling_context_ignored,
+            });
         }
     }
     if sampling_count > limits.sampling.model_rounds {

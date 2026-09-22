@@ -13,9 +13,13 @@ const MIXED: &str = r#"{"resultType":"input_required","requestState":"opaque+/%"
     "z/root~\n":{"method":"roots/list"},
     "a/form":{"method":"elicitation/create","params":{"mode":"form","message":"Quantity?","requestedSchema":{"type":"object","properties":{"quantity":{"type":"integer","minimum":1}},"required":["quantity"],"additionalProperties":false}}},
     "q/url":{"method":"elicitation/create","params":{"mode":"url","message":"Confirm navigation","url":"https://example.test/action?opaque=%2F"}},
-    "b/sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}
+    "b/sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Summarize the result"}}],"maxTokens":16}}
 }}"#;
 const ROOTS: &str = r#"{"resultType":"input_required","inputRequests":{"root":{"method":"roots/list"}}}"#;
+const CONTEXT: &str = r#"{"resultType":"input_required","requestState":"opaque+/%","inputRequests":{
+    "root":{"method":"roots/list"},
+    "sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Summarize the result"}}],"maxTokens":16,"includeContext":"thisServer"}}
+}}"#;
 
 fn original(caps: Value) -> CoreRequest {
     let mut meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
@@ -39,6 +43,9 @@ impl Drop for PendingDrop { fn drop(&mut self) { self.0.fetch_add(1, Ordering::S
 struct Host {
     calls: Vec<&'static str>,
     approved: Vec<String>,
+    approved_contexts: Vec<Option<IncludeContext>>,
+    ignored_contexts: Vec<bool>,
+    sampled_contexts: Vec<Option<IncludeContext>>,
     roots: FinalEmbeddedRootsListResult,
     form: FinalEmbeddedElicitationResult,
     url: FinalEmbeddedElicitationResult,
@@ -50,6 +57,7 @@ struct Host {
 impl Default for Host {
     fn default() -> Self {
         Self { calls: vec![], approved: vec![],
+            approved_contexts: vec![], ignored_contexts: vec![], sampled_contexts: vec![],
             roots: serde_json::from_value(json!({"roots":[{"uri":"file:///workspace/%2F","name":"Approved"}]})).unwrap(),
             form: serde_json::from_str(r#"{"action":"accept","content":{"quantity":900719925474099312345}}"#).unwrap(),
             url: serde_json::from_value(json!({"action":"accept"})).unwrap(),
@@ -76,10 +84,11 @@ impl Host {
     }
 }
 impl SamplingHost for Host {
-    fn sample<'a>(&'a mut self, _: &'a Cx, _: &'a McpRequestCancellation, _: &'a FinalEmbeddedCreateMessageParams)
+    fn sample<'a>(&'a mut self, _: &'a Cx, _: &'a McpRequestCancellation, request: &'a FinalEmbeddedCreateMessageParams)
         -> SamplingHostFuture<'a, FinalCreateMessageResult>
     {
         self.calls.push("sample");
+        self.sampled_contexts.push(request.include_context);
         Box::pin(std::future::ready(Ok(serde_json::from_value(json!({
             "role":"assistant","model":"test-model","content":{"type":"text","text":"answer"},"stopReason":"endTurn"
         })).unwrap())))
@@ -96,6 +105,11 @@ impl CoreInputHost for Host {
         -> CoreInputHostFuture<'a, ()>
     {
         self.approved = requests.iter().map(|request| request.key().to_owned()).collect();
+        self.approved_contexts = requests.iter().filter_map(|request| match request.descriptor() {
+            FinalEmbeddedInputRequest::Sampling(params) => Some(params.include_context),
+            _ => None,
+        }).collect();
+        self.ignored_contexts = requests.iter().map(CoreInputRequest::sampling_context_ignored).collect();
         self.respond("approve", cancellation, ())
     }
     fn roots<'a>(&'a mut self, _: &'a Cx, cancellation: &'a McpRequestCancellation, _: &'a FinalEmbeddedRootsListParams)
@@ -144,6 +158,182 @@ fn unsupported_later_capability_refuses_before_approval_or_earlier_effects() {
         assert_eq!(resolve(&cx, &request, MIXED, CoreInputLimits::default(), &mut host).await.err(),
             Some(CoreInputError::CapabilityNotAdvertised));
         assert!(host.calls.is_empty());
+    });
+}
+
+#[test]
+fn sampling_context_grant_controls_effective_params_before_approval_without_changing_wire_state() {
+    run(async |cx| {
+        for (hint, requested_context) in [
+            ("thisServer", IncludeContext::ThisServer),
+            ("allServers", IncludeContext::AllServers),
+        ] {
+            let source = CONTEXT.replace("thisServer", hint);
+            for (sampling, advertised) in [
+                (json!({"context":{}}), true),
+                (json!({}), false),
+                (json!({"contextHint":{}}), false),
+            ] {
+                let request = original(json!({"roots":{}, "sampling":sampling}));
+                let request_before = request.encode_params().unwrap();
+                let pending = input(&source);
+                let descriptors_before = pending.input_requests().cloned();
+                let state_before = pending.request_state().map(str::to_owned);
+                let mut host = Host::default();
+                let reply = resolve_core_inputs(
+                    &cx, &McpRequestCancellation::new(), &request, pending.clone(),
+                    RequestId::Number(42), CoreInputLimits::default(), &mut host,
+                ).await.unwrap();
+                let effective = advertised.then_some(requested_context);
+                assert_eq!(host.calls, ["approve", "roots", "sample"]);
+                assert_eq!(host.approved, ["root", "sample"]);
+                assert_eq!(host.approved_contexts, [effective]);
+                assert_eq!(host.sampled_contexts, [effective]);
+                assert_eq!(host.ignored_contexts, [false, !advertised]);
+                assert_eq!(request.encode_params().unwrap(), request_before);
+                assert_eq!(pending.input_requests(), descriptors_before.as_ref());
+                assert_eq!(pending.request_state(), state_before.as_deref());
+                let raw = exact_json_to_serde(pending.input_requests().unwrap().get("sample").unwrap()).unwrap();
+                assert_eq!(raw["params"]["includeContext"], hint);
+                reply.input_responses.unwrap().validate_against_input_required(&pending).unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn absent_and_explicit_none_sampling_context_do_not_emit_ignored_diagnostics() {
+    run(async |cx| {
+        for (source, expected) in [
+            (CONTEXT.replace(",\"includeContext\":\"thisServer\"", ""), None),
+            (CONTEXT.replace("thisServer", "none"), Some(IncludeContext::None)),
+        ] {
+            for sampling in [json!({}), json!({"context":{}})] {
+                let request = original(json!({"roots":{}, "sampling":sampling}));
+                let mut host = Host::default();
+                resolve(&cx, &request, &source, CoreInputLimits::default(), &mut host).await.unwrap();
+                assert_eq!(host.calls, ["approve", "roots", "sample"]);
+                assert_eq!(host.approved_contexts, [expected]);
+                assert_eq!(host.sampled_contexts, [expected]);
+                assert_eq!(host.ignored_contexts, [false, false]);
+            }
+        }
+    });
+}
+
+#[test]
+fn selected_sampling_context_is_normalized_without_resolving_omitted_inputs() {
+    run(async |cx| {
+        let request = original(json!({"roots":{}, "sampling":{}}));
+        let pending = input(CONTEXT);
+        let descriptors_before = pending.input_requests().cloned();
+        for selected in ["root", "sample"] {
+            let mut host = Host::default();
+            let reply = resolve_selected_core_inputs(
+                &cx, &McpRequestCancellation::new(), &request, pending.clone(),
+                RequestId::Number(42), CoreInputLimits::default(), &[selected], &mut host,
+            ).await.unwrap();
+            assert_eq!(host.approved, [selected]);
+            if selected == "sample" {
+                assert_eq!(host.calls, ["approve", "sample"]);
+                assert_eq!(host.approved_contexts, [None]);
+                assert_eq!(host.sampled_contexts, [None]);
+                assert_eq!(host.ignored_contexts, [true]);
+            } else {
+                assert_eq!(host.calls, ["approve", "roots"]);
+                assert!(host.approved_contexts.is_empty());
+                assert!(host.sampled_contexts.is_empty());
+                assert_eq!(host.ignored_contexts, [false]);
+            }
+            validate_partial_responses(&pending, &reply.input_responses.unwrap()).unwrap();
+            assert_eq!(pending.input_requests(), descriptors_before.as_ref());
+            assert_eq!(pending.request_state(), Some("opaque+/%"));
+        }
+    });
+}
+
+#[test]
+fn ignored_sampling_context_is_visible_to_a_host_that_denies_the_batch() {
+    run(async |cx| {
+        let request = original(json!({"roots":{}, "sampling":{}}));
+        let pending = input(CONTEXT);
+        let descriptors_before = pending.input_requests().cloned();
+        let mut host = Host { denied: Some("approve"), ..Host::default() };
+        let result = resolve_core_inputs(
+            &cx, &McpRequestCancellation::new(), &request, pending.clone(),
+            RequestId::Number(42), CoreInputLimits::default(), &mut host,
+        ).await;
+        assert_eq!(result.err(), Some(CoreInputError::Host {
+            stage: CoreInputStage::Approval, reason: CoreInputHostError::Denied,
+        }));
+        assert_eq!(host.calls, ["approve"]);
+        assert_eq!(host.approved_contexts, [None]);
+        assert_eq!(host.ignored_contexts, [false, true]);
+        assert!(host.sampled_contexts.is_empty());
+        assert_eq!(pending.input_requests(), descriptors_before.as_ref());
+        assert_eq!(pending.request_state(), Some("opaque+/%"));
+    });
+}
+
+#[test]
+fn later_tool_choice_requires_tools_grant_before_complete_or_selected_batch_effects() {
+    run(async |cx| {
+        let source = CONTEXT.replace("\"maxTokens\":16", "\"maxTokens\":16,\"toolChoice\":{\"mode\":\"auto\"}");
+        let pending = input(&source);
+        for selected_only in [false, true] {
+            for (sampling, advertised) in [(json!({}), false), (json!({"tools":{}}), true)] {
+                let request = original(json!({"roots":{}, "sampling":sampling}));
+                let mut host = Host::default();
+                let result = if selected_only {
+                    resolve_selected_core_inputs(
+                        &cx, &McpRequestCancellation::new(), &request, pending.clone(),
+                        RequestId::Number(42), CoreInputLimits::default(), &["root"], &mut host,
+                    ).await
+                } else {
+                    resolve_core_inputs(
+                        &cx, &McpRequestCancellation::new(), &request, pending.clone(),
+                        RequestId::Number(42), CoreInputLimits::default(), &mut host,
+                    ).await
+                };
+                if advertised {
+                    let responses = result.unwrap().input_responses.unwrap();
+                    if selected_only {
+                        assert_eq!(host.calls, ["approve", "roots"]);
+                        validate_partial_responses(&pending, &responses).unwrap();
+                    } else {
+                        assert_eq!(host.calls, ["approve", "roots", "sample"]);
+                        assert_eq!(host.approved_contexts, [None]);
+                        assert_eq!(host.ignored_contexts, [false, true]);
+                        responses.validate_against_input_required(&pending).unwrap();
+                    }
+                } else {
+                    assert_eq!(result.err(), Some(CoreInputError::CapabilityNotAdvertised));
+                    assert!(host.calls.is_empty());
+                    assert!(host.approved.is_empty());
+                    assert!(host.sampled_contexts.is_empty());
+                }
+                assert_eq!(pending.request_state(), Some("opaque+/%"));
+            }
+        }
+    });
+}
+
+#[test]
+fn explicit_null_sampling_fields_refuse_before_approval_or_earlier_roots_effects() {
+    run(async |cx| {
+        for field in ["tools", "toolChoice", "includeContext"] {
+            let mut wire: Value = serde_json::from_str(CONTEXT).unwrap();
+            wire["inputRequests"]["sample"]["params"][field] = Value::Null;
+            let source = serde_json::to_string(&wire).unwrap();
+            let mut host = Host::default();
+            assert_eq!(
+                resolve(&cx, &all(), &source, CoreInputLimits::default(), &mut host).await.err(),
+                Some(CoreInputError::InvalidInput),
+            );
+            assert!(host.calls.is_empty());
+            assert!(host.approved.is_empty());
+            assert!(host.sampled_contexts.is_empty());
+        }
     });
 }
 
@@ -319,7 +509,7 @@ fn pending_host_timeout_and_abandonment_drop_the_host_future() {
 #[test]
 fn model_budget_counts_sampling_siblings_before_approval() {
     run(async |cx| {
-        let twice = r#"{"resultType":"input_required","inputRequests":{"a":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}},"b":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}}}"#;
+        let twice = r#"{"resultType":"input_required","inputRequests":{"a":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"First"}}],"maxTokens":16}},"b":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Second"}}],"maxTokens":16}}}}"#;
         let sampling = SamplingInputLimits::new(SamplingRunLimits::default(),8,1,8,4096,4096).unwrap();
         let mut host = Host::default();
         assert_eq!(resolve(&cx,&all(),twice,CoreInputLimits::new(sampling,256,256).unwrap(),&mut host).await.err(),

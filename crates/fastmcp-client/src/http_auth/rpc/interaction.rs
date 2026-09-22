@@ -519,6 +519,78 @@ pub(crate) fn admit_fresh_id(previous: &[RequestId], next: &RequestId) -> Result
     Ok(())
 }
 
+/// Checks embedded parameter and sampling-control wire shapes before derived
+/// struct/enum decoders can accept sequence/tagged representations or erase
+/// explicit nulls. This borrowed check does not grant any client capability.
+pub(crate) fn validate_embedded_input_shape(
+    value: &serde_json::Value,
+) -> Result<(), ManagedInteractionError> {
+    if let Some(params) = value.get("params") {
+        if !params.is_object() {
+            return Err(ManagedCoreError::InvalidResult.into());
+        }
+        if value.get("method").and_then(serde_json::Value::as_str) == Some("sampling/createMessage") {
+            // Derived Rust structs also accept sequences. Wire tool controls
+            // and tool descriptors must retain their required object shape.
+            if let Some(tools) = params.get("tools") {
+                if !tools.as_array().is_some_and(|tools| tools.iter().all(serde_json::Value::is_object)) {
+                    return Err(ManagedCoreError::InvalidResult.into());
+                }
+            }
+            if let Some(choice) = params.get("toolChoice") {
+                if !choice.is_object()
+                    || choice.get("mode").is_some_and(|mode| !mode.is_string())
+                {
+                    return Err(ManagedCoreError::InvalidResult.into());
+                }
+            }
+            if params.get("includeContext").is_some_and(|context| !context.is_string()) {
+                return Err(ManagedCoreError::InvalidResult.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Admits one received descriptor before optional-field deserialization can
+/// erase invalid presence. Only declared object capabilities grant authority;
+/// unknown children do not stand in for the required leaf.
+///
+/// Context is advisory. This admission preserves its received value for
+/// host-driven operations; automatic resolvers must normalize an unsupported
+/// context request and expose that decision before performing host effects.
+pub(crate) fn admit_embedded_input(
+    capabilities: &serde_json::Value,
+    value: serde_json::Value,
+) -> Result<FinalEmbeddedInputRequest, ManagedInteractionError> {
+    validate_embedded_input_shape(&value)?;
+    let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value)
+        .map_err(|_| ManagedCoreError::InvalidResult)?;
+    let advertised = match &descriptor {
+        FinalEmbeddedInputRequest::Roots(_) => {
+            capabilities.get("roots").is_some_and(serde_json::Value::is_object)
+        }
+        FinalEmbeddedInputRequest::Sampling(params) => {
+            let sampling = &capabilities["sampling"];
+            sampling.is_object()
+                && ((params.tools.is_none() && params.tool_choice.is_none())
+                    || sampling.get("tools").is_some_and(serde_json::Value::is_object))
+        }
+        FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
+            capabilities.get("elicitation").and_then(serde_json::Value::as_object)
+                .is_some_and(|elicitation| elicitation.is_empty()
+                    || elicitation.get("form").is_some_and(serde_json::Value::is_object))
+        }
+        FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
+            capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object)
+        }
+    };
+    if !advertised {
+        return Err(ManagedInteractionError::CapabilityNotAdvertised);
+    }
+    Ok(descriptor)
+}
+
 pub(crate) fn admit_challenge(
     original: &CoreRequest,
     input: &InputRequiredResult,
@@ -539,25 +611,7 @@ pub(crate) fn admit_challenge(
     let capabilities = &params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
     for member in requests.members() {
         let value = exact_json_to_serde(&member.value).map_err(|_| ManagedCoreError::InvalidResult)?;
-        let descriptor: FinalEmbeddedInputRequest = serde_json::from_value(value.clone())
-            .map_err(|_| ManagedCoreError::InvalidResult)?;
-        let advertised = match descriptor {
-            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Sampling(_) => {
-                let sampling = &capabilities["sampling"];
-                sampling.is_object()
-                    && (value["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
-                    && (value["params"].get("includeContext").is_none_or(|context| context == "none")
-                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
-                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object)
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
-                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object)
-            }
-        };
-        if !advertised { return Err(ManagedInteractionError::CapabilityNotAdvertised); }
+        admit_embedded_input(capabilities, value)?;
     }
     Ok(())
 }
@@ -736,6 +790,133 @@ mod tests {
         let state_only = input(&original, r#"{"resultType":"input_required","requestState":"state"}"#);
         assert!(admit_challenge(&original, &state_only, limits, 0, 1).is_ok());
         assert!(matches!(admit_challenge(&original, &state_only, limits, 1, 1), Err(ManagedInteractionError::ContinuationLimit)));
+    }
+
+    #[test]
+    fn embedded_capabilities_require_the_exact_hard_leaf() {
+        let roots = json!({"method":"roots/list"});
+        let sampling = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
+        let tools = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"tools":[]}});
+        let choice = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}});
+        let form = json!({"method":"elicitation/create","params":{"mode":"form","message":"details","requestedSchema":{"type":"object","properties":{}}}});
+        let url = json!({"method":"elicitation/create","params":{"mode":"url","message":"continue","url":"https://example.test/consent"}});
+        for (descriptor, granted, denied) in [
+            (roots, json!({"roots":{}}), json!({"extensions":{"roots":{}}})),
+            (sampling, json!({"sampling":{}}), json!({"sampling":null})),
+            (tools, json!({"sampling":{"tools":{}}}), json!({"sampling":{"context":{}}})),
+            (choice, json!({"sampling":{"tools":{}}}), json!({"sampling":{}})),
+            (form.clone(), json!({"elicitation":{}}), json!({"elicitation":{"unknown":{}}})),
+            (form, json!({"elicitation":{"form":{}}}), json!({"elicitation":{"url":{}}})),
+            (url, json!({"elicitation":{"url":{}}}), json!({"elicitation":{}})),
+        ] {
+            assert!(admit_embedded_input(&granted, descriptor.clone()).is_ok());
+            assert!(matches!(admit_embedded_input(&denied, descriptor),
+                Err(ManagedInteractionError::CapabilityNotAdvertised)));
+        }
+        let choice = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}});
+        for grant in [Value::Null, json!(true), json!([]), json!("tools")] {
+            assert!(matches!(admit_embedded_input(&json!({"sampling":{"tools":grant}}), choice.clone()),
+                Err(ManagedInteractionError::CapabilityNotAdvertised)));
+        }
+    }
+
+    #[test]
+    fn advisory_context_does_not_change_the_retained_descriptor() {
+        let descriptor = json!({"method":"sampling/createMessage","params":{
+            "messages":[],"maxTokens":16,"includeContext":"allServers"
+        }});
+        for capabilities in [json!({"sampling":{}}), json!({"sampling":{"context":{}}})] {
+            let admitted = admit_embedded_input(&capabilities, descriptor.clone()).unwrap();
+            assert_eq!(serde_json::to_value(admitted).unwrap(), descriptor);
+        }
+        assert!(matches!(admit_embedded_input(&json!({}), descriptor),
+            Err(ManagedInteractionError::CapabilityNotAdvertised)));
+    }
+
+    #[test]
+    fn embedded_admission_rejects_shape_and_null_before_optional_conversion() {
+        let capabilities = json!({"roots":{},"sampling":{"tools":{},"context":{}}});
+        for params in [Value::Null, json!([]), json!(["sequence"]), json!(true), json!(1)] {
+            for method in ["roots/list", "sampling/createMessage"] {
+                assert!(matches!(admit_embedded_input(&capabilities, json!({"method":method,"params":params.clone()})),
+                    Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+            }
+        }
+        for field in ["tools", "toolChoice", "includeContext"] {
+            let mut descriptor = json!({"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}});
+            descriptor["params"][field] = Value::Null;
+            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+        }
+        assert!(admit_embedded_input(&capabilities, json!({"method":"roots/list"})).is_ok());
+        assert!(admit_embedded_input(&capabilities, json!({"method":"roots/list","params":{}})).is_ok());
+        assert!(admit_embedded_input(&capabilities, json!({"method":"sampling/createMessage","params":{
+            "messages":[],"maxTokens":16,"tools":[],"toolChoice":{"mode":"auto"},"includeContext":"none"
+        }})).is_ok());
+    }
+
+    #[test]
+    fn embedded_sampling_controls_require_their_wire_shapes() {
+        let capabilities = json!({"sampling":{"tools":{}}});
+        for choice in [json!({}), json!({"mode":"auto"})] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"toolChoice":choice
+            }});
+            assert!(admit_embedded_input(&capabilities, descriptor).is_ok());
+        }
+        for choice in [json!([]), json!(["auto"]), json!({"mode":null}), json!({"mode":{"auto":null}})] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"toolChoice":choice
+            }});
+            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+        }
+        for tools in [json!([]), json!([{"name":"tool","inputSchema":{"type":"object"}}])] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"tools":tools
+            }});
+            assert!(admit_embedded_input(&capabilities, descriptor).is_ok());
+        }
+        for tools in [
+            json!({"name":"tool","inputSchema":{"type":"object"}}),
+            json!([["tool",null,null,null,{"type":"object"}]]),
+            json!([null]),
+            json!([true]),
+        ] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"tools":tools
+            }});
+            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+        }
+        for context in [json!("allServers"), json!("thisServer"), json!("none")] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"includeContext":context
+            }});
+            assert!(admit_embedded_input(&capabilities, descriptor).is_ok());
+        }
+        for context in [json!({"allServers":null}), json!({"none":null}), json!([])] {
+            let descriptor = json!({"method":"sampling/createMessage","params":{
+                "messages":[],"maxTokens":16,"includeContext":context
+            }});
+            assert!(matches!(admit_embedded_input(&capabilities, descriptor),
+                Err(ManagedInteractionError::Core(ManagedCoreError::InvalidResult))));
+        }
+    }
+
+    #[test]
+    fn mixed_admission_checks_late_missing_capabilities_without_changing_state() {
+        let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{}}));
+        let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"},"last":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}},"requestState":"same-state"}"#);
+        let before = serde_json::to_value(&challenge).unwrap();
+        let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 2).unwrap();
+        assert!(matches!(admit_challenge(&original, &challenge, limits, 0, 0),
+            Err(ManagedInteractionError::CapabilityNotAdvertised)));
+        assert_eq!(serde_json::to_value(&challenge).unwrap(), before);
+        assert_eq!(challenge.request_state(), Some("same-state"));
+        let capable = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{"tools":{}}}));
+        assert!(admit_challenge(&capable, &challenge, limits, 0, 0).is_ok());
+        assert_eq!(serde_json::to_value(&challenge).unwrap(), before);
     }
 
     #[test]
