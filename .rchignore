@@ -20,3 +20,10 @@ target-*/
 # Tests may emit diagnostic traces on remote workers. They are generated
 # artifacts (already ignored by Git) and must not participate in source sync.
 crates/fastmcp/test_traces/
+
+# Git-ignored host-local symlinks. `--source-content-receipt` refuses any
+# non-regular rsync item, so either one voids every receipt-bound dispatch
+# before it compiles. Neither is a compiler input: rich_rust is a crates.io
+# dependency pinned by checksum in Cargo.lock, not a path dependency.
+/rich_rust
+.doctor/
