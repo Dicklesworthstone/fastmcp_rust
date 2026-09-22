@@ -147,6 +147,19 @@ impl Manifest {
         self.put(record, now, limits)
     }
 
+    // Compare the PHYSICAL version, including expired-but-unpruned controls.
+    // A filtered get() cannot safely implement a conditional deletion: None
+    // conflates expiration with absence and loses the version being removed.
+    fn remove_expected(&self, expected: &TaskResumeRecord) -> Result<Self, TaskResumeError> {
+        let key = expected.key();
+        if self.records.get(&key) != Some(expected) {
+            return Err(TaskResumeError::ConflictingSnapshot);
+        }
+        let mut next = self.clone();
+        next.records.remove(&key);
+        Ok(next)
+    }
+
     fn put(&self, mut record: TaskResumeRecord, now: i128, limits: TaskResumeStoreLimits) -> Result<Self, TaskResumeError> {
         let key = record.key();
         if let Some(previous) = self.records.get(&key) {
@@ -270,6 +283,31 @@ impl<P: TaskResumeProtector> TaskResumeStore<P> {
         next.records.remove(&key);
         self.commit(cx, next)?;
         Ok(true)
+    }
+
+    /// Remove exactly the version whose disposal the host has authorized.
+    /// Unlike remove(key), a stale restart/terminal cannot remove newer controls.
+    /// Missing slots and changed versions fail BEFORE protection or disk writes.
+    /// Comparison includes original retention, not merely Task ID or timestamp.
+    ///
+    /// Expiration prevents remote resumption, not current-owner local cleanup:
+    /// an exact expired-but-unpruned slot remains removable. Current binding,
+    /// process authority, structural validation and uncertain-write quarantine
+    /// still apply. Success synchronizes the replacement manifest; errors never
+    /// claim rollback and must not trigger an automatic retry.
+    ///
+    /// This deliberately discards only local lookup controls. It does not prove
+    /// that the remote Task is terminal, stop remote execution or cancel a Task.
+    /// Perform it in the host's owned blocking lane, never in an async poll.
+    pub fn remove_expected(
+        &mut self, cx: &Cx, current: &TaskResumeBinding, expected: &TaskResumeRecord,
+    ) -> Result<(), TaskResumeStoreError> {
+        self.admit(cx, current)?;
+        // Check authority before exposing whether this owner's slot exists.
+        if expected.binding != current.digest { return Err(TaskResumeError::Unavailable.into()); }
+        expected.validate()?;
+        let next = self.manifest.remove_expected(expected)?;
+        self.commit(cx, next)
     }
 
     pub fn prune_expired(&mut self, cx: &Cx, current: &TaskResumeBinding) -> Result<usize, TaskResumeStoreError> {
@@ -449,5 +487,56 @@ mod tests {
         let size = original.encode(&binding(1), TaskResumeStoreLimits::default()).unwrap().len();
         assert!(original.encode(&binding(1), TaskResumeStoreLimits::new(1, size).unwrap()).is_ok());
         assert!(matches!(original.encode(&binding(1), TaskResumeStoreLimits::new(1, size - 1).unwrap()), Err(TaskResumeError::TooLarge)));
+    }
+
+    #[test]
+    fn conditional_removal_preserves_unrelated_records_and_source_manifest() {
+        let original = populated();
+        let limits = TaskResumeStoreLimits::default();
+        let before = original.encode(&binding(1), limits).unwrap();
+        let removed = original.remove_expected(&record()).unwrap();
+        assert!(removed.records.is_empty());
+        assert_eq!(removed.generation, original.generation, "only commit advances the generation");
+        assert_eq!(original.encode(&binding(1), limits).unwrap(), before);
+        let mut another = record();
+        another.task_id = fastmcp_protocol::tasks_extension::TaskId::parse("unrelated").unwrap();
+        let mut multiple = original.clone();
+        multiple.records.insert(another.key(), another.clone());
+        let removed = multiple.remove_expected(&record()).unwrap();
+        assert_eq!(removed.records.len(), 1);
+        assert_eq!(removed.records.get(&another.key()), Some(&another));
+    }
+
+    #[test]
+    fn missing_or_changed_expected_version_cannot_remove_a_checkpoint() {
+        let original = populated();
+        let limits = TaskResumeStoreLimits::default();
+        let before = original.encode(&binding(1), limits).unwrap();
+        for field in 0..4 {
+            let mut changed = record();
+            match field {
+                0 => changed.retain_until -= 1,
+                1 => changed.poll_interval_ms = Some(1),
+                2 => changed.updated_at = fastmcp_protocol::tasks_extension::TaskTimestamp::parse("2026-09-21T00:00:02Z").unwrap(),
+                _ => changed.status = fastmcp_protocol::tasks_extension::TaskStatus::Working,
+            }
+            assert_eq!(changed.key(), record().key());
+            assert!(matches!(original.remove_expected(&changed), Err(TaskResumeError::ConflictingSnapshot)));
+            assert_eq!(original.encode(&binding(1), limits).unwrap(), before);
+        }
+        assert!(matches!(Manifest::default().remove_expected(&record()), Err(TaskResumeError::ConflictingSnapshot)));
+        assert!(original.remove_expected(&record()).is_ok());
+    }
+
+    #[test]
+    fn expiry_refuses_remote_admission_but_not_exact_local_disposal() {
+        let original = populated();
+        let expected = record();
+        assert_eq!(expected.admit_at(&binding(1), expected.retain_until), Err(TaskResumeError::Unavailable));
+        assert!(original.remove_expected(&expected).unwrap().records.is_empty());
+        let mut changed = expected.clone();
+        changed.retain_until -= 1;
+        assert!(matches!(original.remove_expected(&changed), Err(TaskResumeError::ConflictingSnapshot)));
+        assert_eq!(original.records.get(&expected.key()), Some(&expected));
     }
 }

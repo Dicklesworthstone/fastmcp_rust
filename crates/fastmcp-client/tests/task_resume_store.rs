@@ -302,3 +302,142 @@ mod restart {
         assert!(!directory.bytes().windows(7).any(|part| part == b"PRIVATE"));
     }
 }
+
+mod conditional_cleanup {
+    use super::*;
+
+    #[test]
+    fn exact_removal_survives_reopen_without_erasing_other_tasks() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let first = record(&cx, &owner, "one");
+        let second = record(&cx, &owner, "two");
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        store.insert(&cx, &owner, first.clone()).unwrap();
+        store.insert(&cx, &owner, second.clone()).unwrap();
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        store.remove_expected(&cx, &owner, &first).unwrap();
+        assert_ne!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals + 1);
+        assert_eq!(store.get(&cx, &owner, second.key()).unwrap(), Some(second.clone()));
+        drop(store);
+        let mut reopened = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        assert!(reopened.get(&cx, &owner, first.key()).unwrap().is_none());
+        assert_eq!(reopened.get(&cx, &owner, second.key()).unwrap(), Some(second));
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(reopened.remove_expected(&cx, &owner, &first),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+    }
+
+    #[test]
+    fn stale_or_cross_owner_disposal_cannot_delete_current_controls() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let original = record(&cx, &owner, "one");
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        store.insert(&cx, &owner, original.clone()).unwrap();
+        let task: Task = serde_json::from_value(json!({"taskId":"one", "status":"working",
+            "createdAt":"2020-01-01T00:00:00Z", "lastUpdatedAt":"2020-01-01T00:00:02Z", "ttlMs":null})).unwrap();
+        let newer = TaskResumeRecord::capture(&cx, &owner, &task, Duration::from_secs(3600)).unwrap();
+        store.put(&cx, &owner, newer).unwrap();
+        let current = store.get(&cx, &owner, original.key()).unwrap().unwrap();
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(store.remove_expected(&cx, &owner, &original),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        let mut encoded = current.encode().unwrap();
+        let start = encoded.len() - 16;
+        let expiry = i128::from_be_bytes(encoded[start..].try_into().unwrap());
+        encoded[start..].copy_from_slice(&(expiry - 1).to_be_bytes());
+        let different_retention = TaskResumeRecord::decode(&encoded).unwrap();
+        assert_eq!(current.key(), different_retention.key());
+        assert!(matches!(store.remove_expected(&cx, &owner, &different_retention),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        let other = binding("other", 4);
+        assert!(matches!(store.remove_expected(&cx, &other, &current),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Unavailable))));
+        assert!(matches!(store.remove_expected(&cx, &owner, &record(&cx, &other, "one")),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Unavailable))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+        assert_eq!(store.get(&cx, &owner, current.key()).unwrap(), Some(current.clone()));
+        store.remove_expected(&cx, &owner, &current).unwrap();
+        assert!(store.get(&cx, &owner, current.key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_conditional_delete_preserves_file_record_and_page_generation() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        let first = record(&cx, &owner, "one");
+        store.insert(&cx, &owner, first.clone()).unwrap();
+        store.insert(&cx, &owner, record(&cx, &owner, "two")).unwrap();
+        let page = store.page(&cx, &owner, None, 1).unwrap();
+        let cursor = page.next.unwrap();
+        let baseline_page = store.page(&cx, &owner, Some(&cursor), 1).unwrap().keys;
+        let before = directory.bytes();
+        vault.fail_seal.store(true, Ordering::SeqCst);
+        assert!(matches!(store.remove_expected(&cx, &owner, &first),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Protection))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(store.get(&cx, &owner, first.key()).unwrap(), Some(first.clone()));
+        assert_eq!(store.page(&cx, &owner, Some(&cursor), 1).unwrap().keys, baseline_page);
+        vault.fail_seal.store(false, Ordering::SeqCst);
+        store.remove_expected(&cx, &owner, &first).unwrap();
+        assert!(matches!(store.page(&cx, &owner, Some(&cursor), 1),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::StaleCursor))));
+    }
+
+    #[test]
+    fn protected_historical_slot_can_be_removed_even_when_live_lookup_filters_it() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let mut vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut encoded = record(&cx, &owner, "PRIVATE-expired").encode().unwrap();
+        let end = encoded.len();
+        // Fixed historical record, not a sleep racing filesystem latency.
+        // Its 2020 creation/update precede this finite retention deadline.
+        encoded[end - 16..].copy_from_slice(&1_577_836_802_000_000_000_i128.to_be_bytes());
+        let expired = TaskResumeRecord::decode(&encoded).unwrap();
+        let mut manifest = b"FMTRST01".to_vec();
+        manifest.extend_from_slice(owner.associated_data());
+        manifest.extend_from_slice(&1_u64.to_be_bytes());
+        manifest.extend_from_slice(&1_u16.to_be_bytes());
+        manifest.extend_from_slice(expired.key().as_bytes());
+        manifest.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        manifest.extend_from_slice(&encoded);
+        let protected = vault.seal(&cx, owner.associated_data(), &manifest, 65536).unwrap();
+        let mut file = directory.file(&cx);
+        file.replace(&cx, None, &protected).unwrap();
+        drop(file);
+        // Production file/provider/manifest decoding admits this historical slot.
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        assert_eq!(expired.admit(&cx, &owner), Err(TaskResumeError::Unavailable));
+        assert!(store.get(&cx, &owner, expired.key()).unwrap().is_none());
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        store.remove_expected(&cx, &owner, &expired).unwrap();
+        assert_ne!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals + 1);
+        drop(store);
+        let mut reopened = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        assert!(matches!(reopened.remove_expected(&cx, &owner, &expired),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::ConflictingSnapshot))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+    }
+}
