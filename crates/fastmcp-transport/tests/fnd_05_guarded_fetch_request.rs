@@ -124,16 +124,25 @@ fn private_answer() -> IpAddr {
     "10.0.0.1".parse().expect("ipv4 literal")
 }
 
-/// A root-set fetcher resolving through a counting resolver.
-fn counted_fetcher() -> (GuardedHttpFetcher, Arc<AtomicUsize>) {
+/// A counting resolver and its call counter.
+fn counting_resolver() -> (Arc<CountingResolver>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let resolver = Arc::new(CountingResolver {
         answer: private_answer(),
         calls: Arc::clone(&calls),
     });
-    let roots = GuardedRootSet::new([certificate(LOOPBACK_ROOT_PEM)]).expect("one-CA root set");
-    let fetcher = GuardedHttpFetcher::with_root_set_and_resolver(policy(), &roots, resolver)
-        .expect("root-set fetcher over a caller resolver");
+    (resolver, calls)
+}
+
+/// A fetcher built through ho7of's already-verified `with_resolver` seam.
+///
+/// X4's refusals that do not involve roots (body bound, CR/LF/NUL in a field
+/// value) are proven through this seam, so the proof that nothing reaches DNS
+/// does not depend on code this bead adds (WildMountain's ruling S3).
+fn counted_fetcher() -> (GuardedHttpFetcher, Arc<AtomicUsize>) {
+    let (resolver, calls) = counting_resolver();
+    let fetcher =
+        GuardedHttpFetcher::with_resolver(policy(), resolver).expect("verified resolver seam");
     (fetcher, calls)
 }
 
@@ -408,6 +417,14 @@ fn fnd_05_guarded_request_refusals_planted_negative() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(fetcher_state(&fetcher), before);
 
+    // ROOT-SET refusals, the only arms that involve roots, and so the only
+    // place `with_root_set_and_resolver` is used (ruling S3). Both are refused
+    // by `GuardedRootSet::new`, so no root-set fetcher, and therefore no
+    // resolver, can be reached with them. The unparseable-DER arm is the
+    // planted negative for the pre-admission check (reviewer S2): without that
+    // check the certificate would be dropped silently by the connector while
+    // still being folded into the reported identity.
+    let (root_resolver, root_calls) = counting_resolver();
     assert!(
         matches!(
             GuardedRootSet::new(Vec::new()),
@@ -415,8 +432,46 @@ fn fnd_05_guarded_request_refusals_planted_negative() {
         ),
         "an empty root set is refused at construction"
     );
+    assert!(
+        matches!(
+            GuardedRootSet::new([Certificate::from_der(b"not a certificate".to_vec())]),
+            Err(GuardedHttpFetchError::InvalidPolicy("root certificate"))
+        ),
+        "a certificate the root store rejects is refused, not silently dropped"
+    );
+    assert!(
+        matches!(
+            GuardedRootSet::new([
+                certificate(LOOPBACK_ROOT_PEM),
+                Certificate::from_der(b"not a certificate".to_vec()),
+            ]),
+            Err(GuardedHttpFetchError::InvalidPolicy("root certificate"))
+        ),
+        "one rejected certificate refuses the whole set"
+    );
+    assert_eq!(root_calls.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(fetcher_state(&fetcher), before);
+
+    // Live control for the root-set path: the valid set, over the same
+    // prepared resolver, reaches it exactly once and stops at the fence.
+    let roots = GuardedRootSet::new([certificate(LOOPBACK_ROOT_PEM)]).expect("one-CA root set");
+    let root_fetcher =
+        GuardedHttpFetcher::with_root_set_and_resolver(policy(), &roots, root_resolver)
+            .expect("root-set fetcher over a caller resolver");
+    let root_request =
+        GuardedHttpRequest::new("application/json", b"{}".to_vec()).expect("admissible request");
+    assert_eq!(
+        post(&root_fetcher, &root_request),
+        Err(GuardedHttpFetchError::DisallowedResolvedAddress(
+            private_answer()
+        ))
+    );
+    assert_eq!(
+        root_calls.load(Ordering::SeqCst),
+        1,
+        "the root-set counter is live, so its zero above is a measurement"
+    );
 
     // X8: the fetcher's Debug holds no credential either.
     assert!(!format!("{fetcher:?}").contains(PLANTED_SECRET));

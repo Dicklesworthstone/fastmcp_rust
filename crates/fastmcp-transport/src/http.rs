@@ -7789,11 +7789,17 @@ X/aCEJ5+hA==
             ],
         );
 
-        assert!(
-            matches!(run.results[0], Err(GuardedHttpFetchError::Tls(_))),
-            "a chain outside the root set must be a typed TLS refusal: {:?}",
-            run.results[0]
-        );
+        // A handshake TIMEOUT is also `Tls(_)` ("TLS operation timed out
+        // after ..."). With a 100 ms budget and this attempt running first on a
+        // cold stack, a slow host could green this arm for the wrong reason,
+        // so the refusal must be a verification failure, not a timeout.
+        match &run.results[0] {
+            Err(GuardedHttpFetchError::Tls(message)) => assert!(
+                !message.contains("timed out"),
+                "the non-member refusal must be certificate verification, not a handshake timeout: {message}"
+            ),
+            other => panic!("a chain outside the root set must be a typed TLS refusal: {other:?}"),
+        }
         assert_eq!(
             run.results[1].as_ref().map(|response| response.status),
             Ok(200),
