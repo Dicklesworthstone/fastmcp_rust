@@ -4204,6 +4204,351 @@ fn json_schema_optional_custom_types_reach_registered_modern_tool() {
     }
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct SerdeSchemaLocalState;
+
+fn serde_schema_default_retry_limit() -> u32 {
+    3
+}
+
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SerdeWireArguments {
+    user_name: String,
+    #[serde(rename = "account-id")]
+    account_id: u32,
+    #[serde(default = "serde_schema_default_retry_limit")]
+    retry_limit: u32,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip)]
+    local_only: SerdeSchemaLocalState,
+    r#type: String,
+}
+
+fn serde_schema_valid_arguments() -> serde_json::Value {
+    json!({"userName": "Ada", "account-id": 7, "type": "job"})
+}
+
+fn serde_schema_argument_pairs() -> Vec<(serde_json::Value, serde_json::Value)> {
+    let valid = serde_schema_valid_arguments();
+    vec![
+        (
+            valid.clone(),
+            json!({"user_name": "Ada", "account-id": 7, "type": "job"}),
+        ),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "accountId": 7, "type": "job"}),
+        ),
+        (valid.clone(), json!({"account-id": 7, "type": "job"})),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "account-id": "seven", "type": "job"}),
+        ),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "account-id": 7, "type": "job", "retryLimit": null}),
+        ),
+        (
+            valid,
+            json!({"userName": "Ada", "account-id": 7, "type": "job", "localOnly": {}}),
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_serde_names_defaults_and_skips_match_wire_values() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeWireArguments::json_schema())
+        .expect("Serde field attributes produce an admissible schema");
+    for value in [
+        serde_schema_valid_arguments(),
+        json!({"userName": "Ada", "account-id": 7, "type": "job", "retryLimit": 9,
+            "labels": ["urgent"], "displayName": "Ada L."}),
+    ] {
+        let decoded: SerdeWireArguments = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        schema.validate(&encoded).unwrap();
+        assert!(encoded.get("localOnly").is_none());
+        assert!(encoded.get("local_only").is_none());
+    }
+    let defaults: SerdeWireArguments =
+        serde_json::from_value(serde_schema_valid_arguments()).unwrap();
+    assert_eq!(defaults.retry_limit, 3);
+    assert!(defaults.labels.is_empty());
+    assert_eq!(defaults.local_only, SerdeSchemaLocalState);
+    assert_eq!(
+        schema.schema()["required"],
+        json!(["userName", "account-id", "type"])
+    );
+    assert_eq!(schema.schema()["additionalProperties"], false);
+    assert!(schema.schema()["properties"].get("retryLimit").is_some());
+    assert!(schema.schema()["properties"].get("r#type").is_none());
+}
+
+#[test]
+fn json_schema_serde_names_reject_wrong_fields_and_missing_required() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(SerdeWireArguments::json_schema()).unwrap();
+    for (valid, invalid) in serde_schema_argument_pairs() {
+        schema.validate(&valid).unwrap();
+        serde_json::from_value::<SerdeWireArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<SerdeWireArguments>(invalid).is_err());
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(default = "serde_schema_container_default", rename_all = "kebab-case")]
+struct SerdeDefaultedContainer {
+    retry_limit: u32,
+    queue_name: String,
+}
+
+static SERDE_SCHEMA_DEFAULT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn serde_schema_container_default() -> SerdeDefaultedContainer {
+    SERDE_SCHEMA_DEFAULT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    SerdeDefaultedContainer {
+        retry_limit: 5,
+        queue_name: "general".to_owned(),
+    }
+}
+
+#[test]
+fn json_schema_serde_container_defaults_do_not_run_during_generation() {
+    let before = SERDE_SCHEMA_DEFAULT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeDefaultedContainer::json_schema())
+        .expect("container default only changes omission constraints");
+    assert_eq!(
+        SERDE_SCHEMA_DEFAULT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    for value in [
+        json!({}),
+        json!({"retry-limit": 9}),
+        json!({"queue-name": "urgent"}),
+    ] {
+        schema.validate(&value).unwrap();
+        let decoded: SerdeDefaultedContainer = serde_json::from_value(value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [json!({"retry-limit": null}), json!({"queue-name": false})] {
+        assert!(schema.validate(&value).is_err());
+        assert!(serde_json::from_value::<SerdeDefaultedContainer>(value).is_err());
+    }
+    assert_eq!(schema.schema()["required"], json!([]));
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum SerdeWireEnum {
+    HTTP2Ready,
+    #[serde(rename = "manual-tag")]
+    ManuallyNamed {
+        job_count: u32,
+        #[serde(default)]
+        optional_note: String,
+        #[serde(skip)]
+        local_only: SerdeSchemaLocalState,
+    },
+    #[serde(rename_all = "kebab-case")]
+    FieldOverride {
+        job_count: u32,
+        #[serde(rename = "exactName")]
+        item_id: String,
+    },
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all(serialize = "SCREAMING-KEBAB-CASE", deserialize = "SCREAMING-KEBAB-CASE"))]
+enum SerdeWireUnitEnum {
+    HTTP2Ready,
+    #[serde(rename(serialize = "ready-now", deserialize = "ready-now"))]
+    ReadyNow,
+    #[serde(skip)]
+    Hidden,
+}
+
+#[test]
+fn json_schema_serde_enum_names_and_field_rules_match_wire_values() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeWireEnum::json_schema()).unwrap();
+    for value in [
+        json!("h_t_t_p2_ready"),
+        json!({"manual-tag": {"jobCount": 2}}),
+        json!({"field_override": {"job-count": 2, "exactName": "A"}}),
+    ] {
+        schema.validate(&value).unwrap();
+        let decoded: SerdeWireEnum = serde_json::from_value(value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [
+        json!("http2_ready"),
+        json!("hidden"),
+        json!({"manually_named": {"jobCount": 2}}),
+        json!({"manual-tag": {"job_count": 2}}),
+        json!({"field_override": {"jobCount": 2, "exactName": "A"}}),
+        json!({"field_override": {"job-count": 2, "item-id": "A"}}),
+        json!({"manual-tag": {"jobCount": 2, "localOnly": {}}}),
+    ] {
+        assert!(schema.validate(&value).is_err(), "{value}");
+        assert!(serde_json::from_value::<SerdeWireEnum>(value).is_err());
+    }
+    let units = fastmcp_rust::schema::admit_final_schema(SerdeWireUnitEnum::json_schema()).unwrap();
+    assert_eq!(units.schema()["enum"], json!(["H-T-T-P2-READY", "ready-now"]));
+    for value in [SerdeWireUnitEnum::HTTP2Ready, SerdeWireUnitEnum::ReadyNow] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        units.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SerdeWireUnitEnum>(encoded).unwrap(),
+            value
+        );
+    }
+    assert!(units.validate(&json!("HIDDEN")).is_err());
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct SerdeTupleWire(
+    String,
+    #[serde(skip)] SerdeSchemaLocalState,
+    #[serde(default)] u32,
+);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct SerdeOneRetainedTuple(#[serde(skip)] SerdeSchemaLocalState, String);
+
+#[test]
+fn json_schema_serde_tuple_skips_preserve_array_positions() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeTupleWire::json_schema()).unwrap();
+    for value in [json!(["work"]), json!(["work", 3])] {
+        let decoded: SerdeTupleWire = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [json!([]), json!(["work", null]), json!(["work", {}, 3])] {
+        assert!(schema.validate(&value).is_err());
+        assert!(serde_json::from_value::<SerdeTupleWire>(value).is_err());
+    }
+    let one =
+        fastmcp_rust::schema::admit_final_schema(SerdeOneRetainedTuple::json_schema()).unwrap();
+    let value = SerdeOneRetainedTuple(SerdeSchemaLocalState, "work".to_owned());
+    let encoded = serde_json::to_value(&value).unwrap();
+    assert_eq!(encoded, json!(["work"]));
+    one.validate(&encoded).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SerdeOneRetainedTuple>(encoded).unwrap(),
+        value
+    );
+    assert!(one.validate(&json!("work")).is_err());
+}
+
+#[derive(serde::Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SerdeSchemaOverride {
+    #[serde(rename = "serde-name")]
+    #[json_schema(rename = "schema-name")]
+    field_name: String,
+}
+
+#[test]
+fn json_schema_serde_schema_override_precedence_is_explicit() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(SerdeSchemaOverride::json_schema()).unwrap();
+    assert_eq!(schema.schema()["required"], json!(["schema-name"]));
+    assert!(schema.schema()["properties"].get("schema-name").is_some());
+    assert!(schema.schema()["properties"].get("serde-name").is_none());
+    let encoded = serde_json::to_value(SerdeSchemaOverride {
+        field_name: "work".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(encoded, json!({"serde-name": "work"}));
+    assert!(
+        schema.validate(&encoded).is_err(),
+        "explicit schema override retains responsibility for wire parity"
+    );
+    schema.validate(&json!({"schema-name": "work"})).unwrap();
+}
+
+static SERDE_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_serde_schema(value: SerdeWireArguments) -> McpResult<String> {
+    SERDE_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&value).map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_serde_names_and_defaults_reach_registered_modern_tool() {
+    let server = Server::new("serde-schema", "1.0.0")
+        .tool(DescribeSerdeSchema)
+        .build();
+    let connection = ModernConnection::new();
+    let request = |value| {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "describe_serde_schema",
+                "arguments": {"value": value},
+            })),
+            64_i64,
+        )
+    };
+    for (valid, invalid) in serde_schema_argument_pairs() {
+        let expected: SerdeWireArguments = serde_json::from_value(valid.clone()).unwrap();
+        let before = SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        let actual: SerdeWireArguments =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+            .unwrap();
+        assert!(
+            response.error.is_some()
+                || response
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["isError"] == json!(true))
+        );
+        assert_eq!(
+            SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "invalid neighboring arguments do not invoke the handler"
+        );
+    }
+}
+
 // --- Struct with only description, no fields ---
 
 /// A marker struct.

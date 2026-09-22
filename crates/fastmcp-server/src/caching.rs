@@ -694,6 +694,9 @@ impl ToolCallCacheConfig {
 /// Simple LRU cache with TTL support.
 #[derive(Debug)]
 struct LruCache {
+    /// Request-time admission epoch, advanced under the same lock as removal
+    /// and insertion. Zero permanently disables new fills after exhaustion.
+    fill_generation: u64,
     /// Map of keys to entries.
     entries: HashMap<CacheKey, CacheEntry>,
     /// Order of keys for LRU eviction (most recent at the end).
@@ -711,6 +714,7 @@ struct LruCache {
 impl LruCache {
     fn new(max_entries: usize, max_size_bytes: usize, max_item_size: usize) -> Self {
         Self {
+            fill_generation: 1,
             entries: HashMap::new(),
             order: Vec::new(),
             max_entries,
@@ -882,6 +886,12 @@ impl LruCache {
         self.current_size_bytes = 0;
     }
 
+    fn advance_fill_generation(&mut self) {
+        if self.fill_generation != 0 {
+            self.fill_generation = self.fill_generation.checked_add(1).unwrap_or(0);
+        }
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -932,7 +942,7 @@ impl CacheStats {
 /// default and requires an explicit per-tool allowlist entry via
 /// [`Self::include_tools`].
 pub struct ResponseCachingMiddleware {
-    /// Process-local identity used only for per-request hit bookkeeping.
+    /// Process-local identity for request admission and hit bookkeeping.
     instance_id: u64,
     /// Monotonic final-discovery invalidation generation.
     ///
@@ -1041,6 +1051,7 @@ impl ResponseCachingMiddleware {
             cache.max_item_size
         };
         Self {
+            instance_id: next_cache_instance_id(),
             cache: Mutex::new(LruCache::new(max, max_size, max_item_size)),
             ..self
         }
@@ -1064,6 +1075,7 @@ impl ResponseCachingMiddleware {
             cache.max_item_size
         };
         Self {
+            instance_id: next_cache_instance_id(),
             cache: Mutex::new(LruCache::new(max_entries, max, max_item_size)),
             ..self
         }
@@ -1087,6 +1099,7 @@ impl ResponseCachingMiddleware {
             cache.max_size_bytes
         };
         Self {
+            instance_id: next_cache_instance_id(),
             cache: Mutex::new(LruCache::new(max_entries, max_size, max)),
             ..self
         }
@@ -1230,13 +1243,14 @@ impl ResponseCachingMiddleware {
         }
     }
 
-    /// Clears the entire cache.
+    /// Clears the entire cache and fences every outstanding response fill.
     pub fn clear(&self) {
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.advance_discovery_generation();
+        cache.advance_fill_generation();
         cache.clear();
     }
 
@@ -1249,11 +1263,15 @@ impl ResponseCachingMiddleware {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.advance_discovery_generation();
+        cache.advance_fill_generation();
         cache.remove_discovery_entries();
     }
 
     /// Invalidates every session/auth partition and every cursor page for a
     /// method and semantic-parameter set.
+    ///
+    /// All in-flight fills are conservatively fenced, including unrelated
+    /// methods. Unrelated retained entries remain available to fresh requests.
     pub fn invalidate(&self, method: &str, params: Option<&serde_json::Value>) {
         if method == SERVER_DISCOVER_METHOD {
             self.invalidate_discovery();
@@ -1266,6 +1284,7 @@ impl ResponseCachingMiddleware {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.advance_fill_generation();
         cache.remove_invalidation_digest(invalidation_digest);
     }
 
@@ -1427,17 +1446,39 @@ impl Middleware for ResponseCachingMiddleware {
         ) else {
             return Ok(MiddlewareDecision::Continue);
         };
-        let encoded = {
+        let (encoded, fill_generation) = {
             let mut cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.get_encoded(&key)
+            let binding_revision = match binding {
+                CacheEntryBinding::Ordinary => 0,
+                CacheEntryBinding::Discovery(binding) => binding.generation,
+            };
+            if !self.cache_entry_binding_is_current(binding)
+                || !ctx.begin_response_cache_admission(
+                    self.instance_id,
+                    cache.fill_generation,
+                    binding_revision,
+                )
+            {
+                return Ok(MiddlewareDecision::Continue);
+            }
+            (cache.get_encoded(&key), cache.fill_generation)
         };
 
         if let Some(encoded) = encoded {
             if let Some(value) = decode_cached_json(&encoded) {
-                if !self.cache_entry_binding_is_current(binding) {
+                // Invalidation may win after lookup releases the cache lock
+                // or while the retained bytes are decoded. Admit delivery
+                // under the same lock used to advance the fill epoch.
+                let cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cache.fill_generation != fill_generation
+                    || !self.cache_entry_binding_is_current(binding)
+                {
                     self.record_miss();
                     return Ok(MiddlewareDecision::Continue);
                 }
@@ -1454,6 +1495,7 @@ impl Middleware for ResponseCachingMiddleware {
                     self.record_miss();
                     return Ok(MiddlewareDecision::Continue);
                 }
+                drop(cache);
                 self.record_hit();
                 return Ok(MiddlewareDecision::Respond(value));
             }
@@ -1515,7 +1557,25 @@ impl Middleware for ResponseCachingMiddleware {
         if ctx.response_was_cache_hit(self.instance_id) {
             return Ok(response);
         }
-        let Some(binding) = self.cache_entry_binding(request) else {
+        let Some((fill_generation, binding_revision)) =
+            ctx.response_cache_admission(self.instance_id)
+        else {
+            return Ok(response);
+        };
+        let binding = if request.method == SERVER_DISCOVER_METHOD {
+            let Some(ProtocolEra::Modern2026) = discovery_request_protocol_era(request) else {
+                return Ok(response);
+            };
+            if binding_revision == 0 {
+                return Ok(response);
+            }
+            CacheEntryBinding::Discovery(DiscoveryCacheBinding {
+                era: ProtocolEra::Modern2026,
+                generation: binding_revision,
+            })
+        } else if binding_revision == 0 {
+            CacheEntryBinding::Ordinary
+        } else {
             return Ok(response);
         };
 
@@ -1568,7 +1628,10 @@ impl Middleware for ResponseCachingMiddleware {
         if !context_cache_commit_is_admissible(ctx) {
             return Ok(response);
         }
-        if !self.cache_entry_binding_is_current(binding) {
+        if cache.fill_generation != fill_generation
+            || fill_generation == 0
+            || !self.cache_entry_binding_is_current(binding)
+        {
             return Ok(response);
         }
         cache.insert_encoded(key, encoded, ttl);
@@ -1844,6 +1907,299 @@ mod tests {
     // ========================================
     // ResponseCachingMiddleware tests
     // ========================================
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FillInvalidation {
+        None,
+        Method,
+        Clear,
+        Discovery,
+    }
+
+    fn assert_response_cache_fill_invalidation(invalidation: FillInvalidation) {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+            "resources/read",
+            "prompts/get",
+            "tools/call",
+            SERVER_DISCOVER_METHOD,
+        ] {
+            let middleware = ResponseCachingMiddleware::new()
+                .include_tools(vec!["deterministic".to_owned()]);
+            let request = match method {
+                SERVER_DISCOVER_METHOD => final_discovery_request(FINAL_PROTOCOL_VERSION),
+                "resources/read" => test_request(
+                    method,
+                    Some(serde_json::json!({"uri": "file:///generation-test"})),
+                ),
+                "prompts/get" | "tools/call" => test_request(
+                    method,
+                    Some(serde_json::json!({"name": "deterministic"})),
+                ),
+                _ => test_request(method, Some(serde_json::json!({"cursor": "page-two"}))),
+            };
+            let mut response = if method == SERVER_DISCOVER_METHOD {
+                final_discovery_response(30_000, "private")
+            } else if matches!(method, "prompts/get" | "tools/call") {
+                serde_json::json!({"resultType": "complete"})
+            } else {
+                serde_json::json!({
+                    "resultType": "complete",
+                    "ttlMs": 30_000,
+                    "cacheScope": "private",
+                })
+            };
+            let member = match method {
+                "tools/list" => Some("tools"),
+                "resources/list" => Some("resources"),
+                "resources/templates/list" => Some("resourceTemplates"),
+                "prompts/list" => Some("prompts"),
+                "resources/read" => Some("contents"),
+                "prompts/get" => Some("messages"),
+                "tools/call" => Some("content"),
+                _ => None,
+            };
+            if let Some(member) = member {
+                response[member] = serde_json::json!([]);
+            }
+            response["fixtureRevision"] = serde_json::json!("before-invalidation");
+
+            let request_ctx = test_context();
+            let handler_ctx = request_ctx.clone();
+            assert!(matches!(
+                middleware.on_request(&request_ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            let captured = request_ctx
+                .response_cache_admission(middleware.instance_id)
+                .expect("cacheable request captures its generation before the handler");
+
+            match invalidation {
+                FillInvalidation::None => {}
+                FillInvalidation::Method => {
+                    middleware.invalidate(method, request.params.as_ref());
+                }
+                FillInvalidation::Clear => middleware.clear(),
+                FillInvalidation::Discovery => middleware.invalidate_discovery(),
+            }
+
+            assert_eq!(
+                middleware
+                    .on_response(&handler_ctx, &request, response.clone())
+                    .unwrap(),
+                response,
+                "{method}: cache admission never changes the handler's delivered value"
+            );
+            assert_eq!(
+                handler_ctx.response_cache_admission(middleware.instance_id),
+                Some(captured),
+                "response completion must preserve the captured generation"
+            );
+
+            let lookup = middleware.on_request(&test_context(), &request).unwrap();
+            if invalidation == FillInvalidation::None {
+                assert_eq!(middleware.stats().entries, 1);
+                assert!(matches!(
+                    lookup,
+                    MiddlewareDecision::Respond(value) if value == response
+                ));
+                continue;
+            }
+            assert_eq!(middleware.stats().entries, 0, "{method}: late fill rejected");
+            assert_eq!(middleware.stats().size_bytes, 0);
+            assert!(matches!(lookup, MiddlewareDecision::Continue));
+            assert!(matches!(
+                middleware.on_request(&handler_ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            assert_eq!(
+                handler_ctx.response_cache_admission(middleware.instance_id),
+                Some(captured),
+                "re-entering request middleware cannot refresh an old admission"
+            );
+
+            let successor = test_context();
+            assert!(matches!(
+                middleware.on_request(&successor, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            let mut fresh = response.clone();
+            fresh["fixtureRevision"] = serde_json::json!("after-invalidation");
+            middleware
+                .on_response(&successor, &request, fresh.clone())
+                .unwrap();
+            assert_eq!(middleware.stats().entries, 1);
+            let before_late_retry = middleware.stats();
+            middleware
+                .on_response(&handler_ctx, &request, response)
+                .unwrap();
+            assert_eq!(middleware.stats(), before_late_retry);
+            assert!(matches!(
+                middleware.on_request(&test_context(), &request).unwrap(),
+                MiddlewareDecision::Respond(value) if value == fresh
+            ));
+        }
+    }
+
+    #[test]
+    fn response_cache_unchanged_generation_allows_fill() {
+        assert_response_cache_fill_invalidation(FillInvalidation::None);
+    }
+
+    #[test]
+    fn response_cache_invalidation_rejects_late_fill() {
+        assert_response_cache_fill_invalidation(FillInvalidation::Method);
+    }
+
+    #[test]
+    fn response_cache_clear_rejects_late_fill() {
+        assert_response_cache_fill_invalidation(FillInvalidation::Clear);
+    }
+
+    #[test]
+    fn response_cache_discovery_invalidation_rejects_late_fill() {
+        assert_response_cache_fill_invalidation(FillInvalidation::Discovery);
+    }
+
+    #[test]
+    fn response_cache_invalidation_preserves_unrelated_entries_and_instances() {
+        let first = ResponseCachingMiddleware::new();
+        let second = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let unrelated = test_request("prompts/list", None);
+        let retained = serde_json::json!({"prompts": []});
+        let fill = test_context();
+        assert!(matches!(
+            first.on_request(&fill, &unrelated).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        first
+            .on_response(&fill, &unrelated, retained.clone())
+            .unwrap();
+
+        let shared = test_context();
+        assert!(matches!(
+            first.on_request(&shared, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert!(matches!(
+            second.on_request(&shared, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        first.invalidate("tools/list", None);
+        let response = serde_json::json!({"tools": []});
+        first
+            .on_response(&shared, &request, response.clone())
+            .unwrap();
+        second
+            .on_response(&shared.clone(), &request, response.clone())
+            .unwrap();
+
+        assert_eq!(first.stats().entries, 1);
+        assert_eq!(second.stats().entries, 1);
+        assert!(matches!(
+            first.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert!(matches!(
+            first.on_request(&test_context(), &unrelated).unwrap(),
+            MiddlewareDecision::Respond(value) if value == retained
+        ));
+        assert!(matches!(
+            second.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Respond(value) if value == response
+        ));
+    }
+
+    #[test]
+    fn response_cache_requires_request_admission() {
+        let middleware = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": []});
+        let ctx = test_context();
+        let before = middleware.stats();
+        assert_eq!(
+            middleware
+                .on_response(&ctx, &request, response.clone())
+                .unwrap(),
+            response
+        );
+        assert_eq!(middleware.stats(), before);
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&ctx, &request, response.clone())
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Respond(value) if value == response
+        ));
+    }
+
+    #[test]
+    fn response_cache_generation_exhaustion_stays_disabled() {
+        let middleware = ResponseCachingMiddleware::new();
+        middleware.cache.lock().unwrap().fill_generation = u64::MAX;
+        let request = test_request("tools/list", None);
+        let old = test_context();
+        assert!(matches!(
+            middleware.on_request(&old, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware.clear();
+        assert_eq!(middleware.cache.lock().unwrap().fill_generation, 0);
+        middleware
+            .on_response(&old, &request, serde_json::json!({"tools": []}))
+            .unwrap();
+        for _ in 0..2 {
+            let fresh = test_context();
+            middleware.invalidate("tools/list", None);
+            assert!(matches!(
+                middleware.on_request(&fresh, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            assert_eq!(fresh.response_cache_admission(middleware.instance_id), None);
+            middleware
+                .on_response(&fresh, &request, serde_json::json!({"tools": []}))
+                .unwrap();
+            assert_eq!(middleware.stats().entries, 0);
+            assert_eq!(middleware.cache.lock().unwrap().fill_generation, 0);
+        }
+    }
+
+    #[test]
+    fn response_cache_capacity_reconfiguration_rejects_old_admission() {
+        let middleware = ResponseCachingMiddleware::new();
+        let request = test_request("tools/list", None);
+        let old = test_context();
+        assert!(matches!(
+            middleware.on_request(&old, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let middleware = middleware.max_entries(10);
+        middleware
+            .on_response(&old, &request, serde_json::json!({"tools": ["old"]}))
+            .unwrap();
+        assert_eq!(middleware.stats().entries, 0);
+        let fresh = test_context();
+        assert!(matches!(
+            middleware.on_request(&fresh, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        let response = serde_json::json!({"tools": ["fresh"]});
+        middleware
+            .on_response(&fresh, &request, response.clone())
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(&test_context(), &request).unwrap(),
+            MiddlewareDecision::Respond(value) if value == response
+        ));
+    }
 
     #[test]
     fn test_caching_middleware_caches_tools_list() {
@@ -2143,6 +2499,10 @@ mod tests {
         let private_response = serde_json::json!({"tools": ["private"]});
         assert!(authenticated_ctx.auth().is_some());
 
+        assert!(matches!(
+            middleware.on_request(&anonymous_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&anonymous_ctx, &request, public_response.clone())
             .unwrap();
@@ -2188,6 +2548,10 @@ mod tests {
         let request = test_request("tools/list", None);
         let first_response = serde_json::json!({"tools": ["owner-one"]});
 
+        assert!(matches!(
+            middleware.on_request(&first_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&first_ctx, &request, first_response.clone())
             .unwrap();
@@ -2217,6 +2581,10 @@ mod tests {
         let request = test_request("tools/list", None);
         let ownerless_response = serde_json::json!({"tools": ["ownerless"]});
 
+        assert!(matches!(
+            middleware.on_request(&ownerless_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&ownerless_ctx, &request, ownerless_response.clone())
             .unwrap();
@@ -2243,6 +2611,10 @@ mod tests {
         let public_response = serde_json::json!({"resources": ["public"]});
         assert!(session_ctx.has_session_state());
 
+        assert!(matches!(
+            middleware.on_request(&anonymous_ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&anonymous_ctx, &request, public_response.clone())
             .unwrap();
@@ -2392,9 +2764,14 @@ mod tests {
         let request = test_request("tools/list", None);
         let response = serde_json::json!({"tools": ["request-local"]});
 
+        assert!(matches!(
+            middleware.on_request(&ephemeral, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&ephemeral, &request, response)
             .unwrap();
+        assert_eq!(middleware.stats().entries, 1);
         assert!(matches!(
             middleware.on_request(&durable, &request).unwrap(),
             MiddlewareDecision::Continue
@@ -3343,7 +3720,6 @@ mod tests {
         let middleware = ResponseCachingMiddleware::new()
             .list_ttl_secs(120)
             .call_ttl_secs(900);
-        let ctx = test_context();
         let methods = [
             ("server/discover", None, 120_000_u64),
             ("tools/list", None, 120_000),
@@ -3358,7 +3734,12 @@ mod tests {
         ];
 
         for (method, params, expected_ttl_ms) in methods {
+            let ctx = test_context();
             let request = test_request(method, params);
+            assert!(matches!(
+                middleware.on_request(&ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
             let response = middleware
                 .on_response(
                     &ctx,
@@ -3393,6 +3774,10 @@ mod tests {
             "cacheScope": "private",
         });
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         let delivered = middleware
             .on_response(&ctx, &request, response.clone())
             .expect("a wire-valid but uncacheable final TTL remains deliverable");
@@ -3432,7 +3817,6 @@ mod tests {
     #[test]
     fn every_final_result_with_an_unrepresentable_private_ttl_skips_local_cache_state() {
         let middleware = ResponseCachingMiddleware::new();
-        let ctx = test_context();
         let huge_ttl: serde_json::Value = serde_json::from_str("18446744073709551616000")
             .expect("arbitrary-width JSON integer fixture");
         let methods = [
@@ -3447,6 +3831,7 @@ mod tests {
         ];
 
         for (method, params) in methods {
+            let ctx = test_context();
             let request = test_request(method, params);
             let response = serde_json::json!({
                 "resultType": "complete",
@@ -3454,6 +3839,10 @@ mod tests {
                 "ttlMs": huge_ttl.clone(),
                 "cacheScope": "private",
             });
+            assert!(matches!(
+                middleware.on_request(&ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
             let delivered = middleware
                 .on_response(&ctx, &request, response.clone())
                 .expect("wire-valid final result remains deliverable");
@@ -3472,12 +3861,14 @@ mod tests {
             "ttlMs": huge_ttl.clone(),
             "cacheScope": "private",
         });
+        let ctx = test_context();
+        let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         let delivered = middleware
-            .on_response(
-                &ctx,
-                &final_discovery_request(FINAL_PROTOCOL_VERSION),
-                discovery.clone(),
-            )
+            .on_response(&ctx, &request, discovery.clone())
             .expect("wire-valid discovery result remains deliverable");
         assert_eq!(delivered, discovery);
         assert_eq!(
@@ -3493,6 +3884,10 @@ mod tests {
         let ctx = test_context();
         let request = test_request("tools/list", None);
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         // The sole forbidden dimension differs from the positive case: this
         // is an input-required result, not a cacheable complete result.
         let response = middleware
@@ -3526,11 +3921,15 @@ mod tests {
     #[test]
     fn cache_01_b_positive() {
         let middleware = ResponseCachingMiddleware::new();
-        let ctx = test_context();
         let first_page = test_request("tools/list", Some(serde_json::json!({"cursor": "a"})));
         let second_page = test_request("tools/list", Some(serde_json::json!({"cursor": "b"})));
 
         for (request, tool_name) in [(&first_page, "first"), (&second_page, "second")] {
+            let ctx = test_context();
+            assert!(matches!(
+                middleware.on_request(&ctx, request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
             middleware
                 .on_response(
                     &ctx,
@@ -3545,13 +3944,13 @@ mod tests {
 
         assert!(matches!(
             middleware
-                .on_request(&ctx, &first_page)
+                .on_request(&test_context(), &first_page)
                 .expect("first lookup is safe"),
             MiddlewareDecision::Respond(_)
         ));
         assert!(matches!(
             middleware
-                .on_request(&ctx, &second_page)
+                .on_request(&test_context(), &second_page)
                 .expect("second lookup is safe"),
             MiddlewareDecision::Respond(_)
         ));
@@ -3561,13 +3960,13 @@ mod tests {
         assert_eq!(middleware.stats().entries, 0);
         assert!(matches!(
             middleware
-                .on_request(&ctx, &first_page)
+                .on_request(&test_context(), &first_page)
                 .expect("first post-invalidation lookup is safe"),
             MiddlewareDecision::Continue
         ));
         assert!(matches!(
             middleware
-                .on_request(&ctx, &second_page)
+                .on_request(&test_context(), &second_page)
                 .expect("second post-invalidation lookup is safe"),
             MiddlewareDecision::Continue
         ));
@@ -3622,6 +4021,10 @@ mod tests {
         let ttl = Duration::from_secs(30);
         let response = final_discovery_response(30_000, "private");
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         let delivered = middleware
             .on_response(&ctx, &request, response.clone())
             .expect("final discovery response remains deliverable");
@@ -3657,6 +4060,10 @@ mod tests {
         let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
         let response = final_discovery_response(30_000, "public");
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         // This differs from the cacheable final response only in cacheScope.
         // A public wire claim is delivered faithfully but cannot authorize this
         // private middleware cache.
@@ -3686,6 +4093,10 @@ mod tests {
         let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
         let cached = final_discovery_response(30_000, "private");
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&ctx, &request, cached.clone())
             .expect("baseline final discovery response is cacheable");
@@ -3743,6 +4154,10 @@ mod tests {
         let request = final_discovery_request(FINAL_PROTOCOL_VERSION);
         let response = final_discovery_response(30_000, "private");
 
+        assert!(matches!(
+            middleware.on_request(&ctx, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&ctx, &request, response)
             .expect("initial final discovery response is cacheable");
@@ -3787,6 +4202,10 @@ mod tests {
             serde_json::json!(ProtocolEra::Legacy2024.version().as_str());
         let response = final_discovery_response(30_000, "private");
 
+        assert!(matches!(
+            middleware.on_request(&final_ctx, &final_request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         middleware
             .on_response(&final_ctx, &final_request, response.clone())
             .expect("final discovery response is cacheable");
@@ -3795,6 +4214,10 @@ mod tests {
 
         // The only changed input is the exact protocol era. It must neither
         // reuse the final entry nor add an entry in the final generation.
+        assert!(matches!(
+            middleware.on_request(&legacy_ctx, &legacy_request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
         let delivered = middleware
             .on_response(&legacy_ctx, &legacy_request, response.clone())
             .expect("legacy response remains deliverable without caching");

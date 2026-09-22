@@ -6029,7 +6029,17 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[json_schema(rename = "...")]` - Rename the field in the schema
 /// - `#[json_schema(skip)]` - Skip this field
 /// - `#[json_schema(flatten)]` - Flatten nested object properties
-#[proc_macro_derive(JsonSchema, attributes(json_schema))]
+///
+/// Symmetric Serde `rename`, `rename_all`, `rename_all_fields`, and `skip`
+/// attributes are also honored. Serde field/container defaults permit omitted
+/// fields without running default functions during schema generation.
+/// `deny_unknown_fields` closes named object schemas. An explicit
+/// `json_schema(rename)` takes precedence over Serde names; the caller owns
+/// wire parity when deliberately overriding them. Direction-specific names
+/// or skips that disagree require an explicit `json_schema()` implementation.
+/// Other Serde representations (including tagging, flattening, and custom
+/// serializers) are not inferred by this derive.
+#[proc_macro_derive(JsonSchema, attributes(json_schema, serde))]
 pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
     let serde_json = match serde_json_crate_path() {
@@ -6047,15 +6057,26 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         .as_ref()
         .map_or_else(|| quote! { None::<&str> }, |desc| quote! { Some(#desc) });
 
+    let serde_attrs = match SchemaSerdeAttrs::parse(&input.attrs) {
+        Ok(attrs) => attrs,
+        Err(error) => return error.to_compile_error().into(),
+    };
+
     // Process fields based on data type
     let schema_impl = match &input.data {
-        syn::Data::Struct(data_struct) => generate_struct_schema(data_struct, &type_desc_tokens),
-        syn::Data::Enum(data_enum) => generate_enum_schema(data_enum, &type_desc_tokens),
+        syn::Data::Struct(data_struct) => {
+            generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)
+        }
+        syn::Data::Enum(data_enum) => generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs),
         syn::Data::Union(_) => {
             return syn::Error::new_spanned(input, "JsonSchema cannot be derived for unions")
                 .to_compile_error()
                 .into();
         }
+    };
+    let schema_impl = match schema_impl {
+        Ok(schema) => schema,
+        Err(error) => return error.to_compile_error().into(),
     };
 
     let expanded = quote! {
@@ -6077,36 +6098,264 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Serde applies different case rules to Rust field names and enum variants.
+/// In particular, acronyms are split one capital at a time in enum snake case,
+/// while field snake case retains the original identifier.
+#[derive(Clone, Copy)]
+enum SchemaRenameRule {
+    Lower,
+    Upper,
+    Pascal,
+    Camel,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+    ScreamingKebab,
+}
+
+impl SchemaRenameRule {
+    fn parse(value: &str, span: Span) -> syn::Result<Self> {
+        match value {
+            "lowercase" => Ok(Self::Lower),
+            "UPPERCASE" => Ok(Self::Upper),
+            "PascalCase" => Ok(Self::Pascal),
+            "camelCase" => Ok(Self::Camel),
+            "snake_case" => Ok(Self::Snake),
+            "SCREAMING_SNAKE_CASE" => Ok(Self::ScreamingSnake),
+            "kebab-case" => Ok(Self::Kebab),
+            "SCREAMING-KEBAB-CASE" => Ok(Self::ScreamingKebab),
+            _ => Err(syn::Error::new(span, "unsupported serde rename case")),
+        }
+    }
+
+    fn field_name(self, name: &str) -> String {
+        match self {
+            Self::Lower | Self::Snake => name.to_owned(),
+            Self::Upper | Self::ScreamingSnake => name.to_ascii_uppercase(),
+            Self::Kebab => name.replace('_', "-"),
+            Self::ScreamingKebab => name.to_ascii_uppercase().replace('_', "-"),
+            Self::Pascal | Self::Camel => {
+                let mut result = String::new();
+                let mut capitalize = true;
+                for character in name.chars() {
+                    if character == '_' {
+                        capitalize = true;
+                    } else {
+                        result.push(if capitalize {
+                            character.to_ascii_uppercase()
+                        } else {
+                            character
+                        });
+                        capitalize = false;
+                    }
+                }
+                if matches!(self, Self::Camel) {
+                    lowercase_schema_initial(&result)
+                } else {
+                    result
+                }
+            }
+        }
+    }
+
+    fn variant_name(self, name: &str) -> String {
+        match self {
+            Self::Pascal => name.to_owned(),
+            Self::Lower => name.to_ascii_lowercase(),
+            Self::Upper => name.to_ascii_uppercase(),
+            Self::Camel => lowercase_schema_initial(name),
+            Self::Snake | Self::ScreamingSnake | Self::Kebab | Self::ScreamingKebab => {
+                let separator = if matches!(self, Self::Kebab | Self::ScreamingKebab) {
+                    '-'
+                } else {
+                    '_'
+                };
+                let uppercase = matches!(self, Self::ScreamingSnake | Self::ScreamingKebab);
+                let mut result = String::new();
+                for (index, character) in name.chars().enumerate() {
+                    if index != 0 && character.is_uppercase() {
+                        result.push(separator);
+                    }
+                    result.push(if character == '_' {
+                        separator
+                    } else if uppercase {
+                        character.to_ascii_uppercase()
+                    } else {
+                        character.to_ascii_lowercase()
+                    });
+                }
+                result
+            }
+        }
+    }
+}
+
+fn lowercase_schema_initial(name: &str) -> String {
+    let mut characters = name.chars();
+    characters.next().map_or_else(String::new, |first| {
+        let mut result = String::new();
+        result.push(first.to_ascii_lowercase());
+        result.push_str(characters.as_str());
+        result
+    })
+}
+
+fn unraw_schema_name(name: &Ident) -> String {
+    let name = name.to_string();
+    name.strip_prefix("r#").unwrap_or(&name).to_owned()
+}
+
+#[derive(Default)]
+struct SchemaSerdeAttrs {
+    rename: Option<String>,
+    rename_all: Option<SchemaRenameRule>,
+    rename_all_fields: Option<SchemaRenameRule>,
+    default: bool,
+    skip: bool,
+    skip_serializing_if: bool,
+    deny_unknown_fields: bool,
+}
+
+impl SchemaSerdeAttrs {
+    fn parse(attrs: &[Attribute]) -> syn::Result<Self> {
+        let mut result = Self::default();
+        let mut skip_serializing = false;
+        let mut skip_deserializing = false;
+        for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+            let entries = attr.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated,
+            )?;
+            for entry in entries {
+                if entry.path().is_ident("rename") {
+                    result.rename = Some(symmetric_schema_serde_name(&entry)?);
+                } else if entry.path().is_ident("rename_all") {
+                    result.rename_all = Some(SchemaRenameRule::parse(
+                        &symmetric_schema_serde_name(&entry)?,
+                        entry.span(),
+                    )?);
+                } else if entry.path().is_ident("rename_all_fields") {
+                    result.rename_all_fields = Some(SchemaRenameRule::parse(
+                        &symmetric_schema_serde_name(&entry)?,
+                        entry.span(),
+                    )?);
+                } else if entry.path().is_ident("default") {
+                    result.default = true;
+                } else if entry.path().is_ident("skip") {
+                    result.skip = true;
+                } else if entry.path().is_ident("skip_serializing") {
+                    skip_serializing = true;
+                } else if entry.path().is_ident("skip_deserializing") {
+                    skip_deserializing = true;
+                } else if entry.path().is_ident("skip_serializing_if") {
+                    result.skip_serializing_if = true;
+                } else if entry.path().is_ident("deny_unknown_fields") {
+                    result.deny_unknown_fields = true;
+                }
+            }
+        }
+        if !result.skip && skip_serializing != skip_deserializing {
+            return Err(syn::Error::new_spanned(
+                quote! { #(#attrs)* },
+                "JsonSchema needs the same skipped fields and variants in both directions; use serde(skip) or implement json_schema() explicitly",
+            ));
+        }
+        result.skip |= skip_serializing && skip_deserializing;
+        Ok(result)
+    }
+}
+
+/// One schema is used for both tool inputs and structured outputs. Choosing
+/// either half of an asymmetric rename would reject valid values in the other.
+fn symmetric_schema_serde_name(meta: &Meta) -> syn::Result<String> {
+    if let Meta::NameValue(value) = meta {
+        if let syn::Expr::Lit(value) = &value.value {
+            if let Lit::Str(value) = &value.lit {
+                return Ok(value.value());
+            }
+        }
+    } else if let Meta::List(list) = meta {
+        let entries = list.parse_args_with(
+            syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated,
+        )?;
+        let mut serialize = None;
+        let mut deserialize = None;
+        for entry in entries {
+            if entry.path().is_ident("serialize") {
+                serialize = Some(symmetric_schema_serde_name(&entry)?);
+            } else if entry.path().is_ident("deserialize") {
+                deserialize = Some(symmetric_schema_serde_name(&entry)?);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "expected serialize or deserialize",
+                ));
+            }
+        }
+        if let (Some(serialize), Some(deserialize)) = (serialize, deserialize) {
+            if serialize == deserialize {
+                return Ok(serialize);
+            }
+        }
+        return Err(syn::Error::new_spanned(
+            meta,
+            "JsonSchema needs identical serialize and deserialize names; use a shared serde rename or implement json_schema() explicitly",
+        ));
+    }
+    Err(syn::Error::new_spanned(meta, "expected a serde name string"))
+}
+
 /// Generates JSON Schema for a struct.
-fn generate_struct_schema(data: &syn::DataStruct, type_desc_tokens: &TokenStream2) -> TokenStream2 {
-    generate_fields_schema(&data.fields, type_desc_tokens)
+fn generate_struct_schema(
+    data: &syn::DataStruct,
+    type_desc_tokens: &TokenStream2,
+    serde_attrs: &SchemaSerdeAttrs,
+) -> syn::Result<TokenStream2> {
+    generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs)
 }
 
 /// Shares field constraints between structs and externally tagged enum payloads.
-fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2) -> TokenStream2 {
-    match fields {
+fn generate_fields_schema(
+    fields: &syn::Fields,
+    type_desc_tokens: &TokenStream2,
+    serde_attrs: &SchemaSerdeAttrs,
+) -> syn::Result<TokenStream2> {
+    let schema = match fields {
         syn::Fields::Named(fields) => {
             let mut property_entries = Vec::new();
             let mut required_fields = Vec::new();
 
             for field in &fields.named {
+                let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
                 // Check for skip attribute
-                if has_json_schema_attr(&field.attrs, "skip") {
+                if has_json_schema_attr(&field.attrs, "skip") || field_attrs.skip {
                     continue;
                 }
 
                 let field_name = field.ident.as_ref().unwrap();
 
                 // Check for rename attribute
-                let schema_name =
-                    get_json_schema_rename(&field.attrs).unwrap_or_else(|| field_name.to_string());
+                let schema_name = get_json_schema_rename(&field.attrs).unwrap_or_else(|| {
+                    field_attrs.rename.clone().unwrap_or_else(|| {
+                        serde_attrs.rename_all.map_or_else(
+                            || unraw_schema_name(field_name),
+                            |rule| rule.field_name(&unraw_schema_name(field_name)),
+                        )
+                    })
+                });
 
                 // Get field doc comment
                 let field_doc = extract_doc_comments(&field.attrs);
 
                 // Generate schema for this field's type
                 let field_type = &field.ty;
-                let is_optional = is_option_type(field_type);
+                let is_optional =
+                    is_option_type(field_type) || field_attrs.default || serde_attrs.default;
+                if field_attrs.skip_serializing_if && !is_optional {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "JsonSchema cannot represent skip_serializing_if on a required field; add a matching serde default or implement json_schema() explicitly",
+                    ));
+                }
 
                 // Generate the base schema
                 let field_schema = type_to_json_schema(field_type);
@@ -6136,6 +6385,7 @@ fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2)
                 }
             }
 
+            let deny_unknown_fields = serde_attrs.deny_unknown_fields;
             quote! {
                 {
                     let properties: std::collections::HashMap<String, serde_json::Value> = vec![
@@ -6150,6 +6400,10 @@ fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2)
                         "required": required,
                     });
 
+                    if #deny_unknown_fields {
+                        schema["additionalProperties"] = serde_json::json!(false);
+                    }
+
                     // Add description if available
                     if let Some(desc) = #type_desc_tokens {
                         if let Some(obj) = schema.as_object_mut() {
@@ -6162,22 +6416,40 @@ fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2)
             }
         }
         syn::Fields::Unnamed(fields) => {
-            if fields.unnamed.is_empty() {
+            let mut item_schemas = Vec::new();
+            let mut min_items = 0;
+            for field in &fields.unnamed {
+                let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+                if field_attrs.skip || has_json_schema_attr(&field.attrs, "skip") {
+                    if fields.unnamed.len() == 1 {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "JsonSchema cannot infer a skipped newtype payload; implement json_schema() explicitly",
+                        ));
+                    }
+                    continue;
+                }
+                if field_attrs.skip_serializing_if {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "JsonSchema cannot represent conditional tuple positions; implement json_schema() explicitly",
+                    ));
+                }
+                item_schemas.push(type_to_json_schema(&field.ty));
+                if !field_attrs.default && !serde_attrs.default {
+                    min_items = item_schemas.len();
+                }
+            }
+            if item_schemas.is_empty() {
                 // Draft 2020-12 requires a nonempty prefixItems array when
                 // present; an empty tuple is bounded without that keyword.
                 quote! { serde_json::json!({ "type": "array", "maxItems": 0 }) }
             } else if fields.unnamed.len() == 1 {
                 // Newtype pattern - just use inner type's schema
-                let inner_type = &fields.unnamed.first().unwrap().ty;
-                let inner_schema = type_to_json_schema(inner_type);
+                let inner_schema = &item_schemas[0];
                 quote! { #inner_schema }
             } else {
                 // Multiple fields - tuple represented as array with prefixItems
-                let item_schemas: Vec<_> = fields
-                    .unnamed
-                    .iter()
-                    .map(|f| type_to_json_schema(&f.ty))
-                    .collect();
                 let num_items = item_schemas.len();
                 quote! {
                     {
@@ -6185,7 +6457,7 @@ fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2)
                         serde_json::json!({
                             "type": "array",
                             "prefixItems": items,
-                            "minItems": #num_items,
+                            "minItems": #min_items,
                             "maxItems": #num_items,
                         })
                     }
@@ -6196,21 +6468,49 @@ fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2)
             // Unit struct - null type
             quote! { serde_json::json!({ "type": "null" }) }
         }
-    }
+    };
+    Ok(schema)
 }
 
 /// Generates JSON Schema for an enum.
-fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -> TokenStream2 {
-    // Check if all variants are unit variants (string enum)
-    let all_unit = data
+fn generate_enum_schema(
+    data: &syn::DataEnum,
+    type_desc_tokens: &TokenStream2,
+    serde_attrs: &SchemaSerdeAttrs,
+) -> syn::Result<TokenStream2> {
+    let variants = data
         .variants
         .iter()
-        .all(|v| matches!(v.fields, syn::Fields::Unit));
+        .map(|variant| Ok((variant, SchemaSerdeAttrs::parse(&variant.attrs)?)))
+        .collect::<syn::Result<Vec<_>>>()?;
+    let variants: Vec<_> = variants
+        .into_iter()
+        .filter(|(variant, attrs)| !attrs.skip && !has_json_schema_attr(&variant.attrs, "skip"))
+        .collect();
+    if variants.is_empty() {
+        return Ok(quote! { serde_json::json!({ "not": {} }) });
+    }
+    let variant_name = |variant: &syn::Variant, attrs: &SchemaSerdeAttrs| {
+        get_json_schema_rename(&variant.attrs).unwrap_or_else(|| {
+            attrs.rename.clone().unwrap_or_else(|| {
+                serde_attrs.rename_all.map_or_else(
+                    || unraw_schema_name(&variant.ident),
+                    |rule| rule.variant_name(&unraw_schema_name(&variant.ident)),
+                )
+            })
+        })
+    };
+    // Check if all variants are unit variants (string enum)
+    let all_unit = variants
+        .iter()
+        .all(|(variant, _)| matches!(variant.fields, syn::Fields::Unit));
 
-    if all_unit {
+    let schema = if all_unit {
         // Simple string enum
-        let variant_names: Vec<String> =
-            data.variants.iter().map(|v| v.ident.to_string()).collect();
+        let variant_names: Vec<String> = variants
+            .iter()
+            .map(|(variant, attrs)| variant_name(variant, attrs))
+            .collect();
 
         quote! {
             {
@@ -6231,12 +6531,11 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
     } else {
         // Serde's default external tagging encodes unit variants as strings and
         // payload variants as objects containing exactly one variant key.
-        let variant_schemas: Vec<TokenStream2> = data
-            .variants
+        let variant_schemas = variants
             .iter()
-            .map(|variant| {
-                let variant_name = variant.ident.to_string();
-                match &variant.fields {
+            .map(|(variant, attrs)| {
+                let variant_name = variant_name(variant, attrs);
+                let schema = match &variant.fields {
                     syn::Fields::Unit => {
                         quote! {
                             serde_json::json!({
@@ -6246,8 +6545,16 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
                         }
                     }
                     fields => {
-                        let payload_schema =
-                            generate_fields_schema(fields, &quote! { None::<&str> });
+                        let payload_attrs = SchemaSerdeAttrs {
+                            rename_all: attrs.rename_all.or(serde_attrs.rename_all_fields),
+                            deny_unknown_fields: serde_attrs.deny_unknown_fields,
+                            ..SchemaSerdeAttrs::default()
+                        };
+                        let payload_schema = generate_fields_schema(
+                            fields,
+                            &quote! { None::<&str> },
+                            &payload_attrs,
+                        )?;
                         quote! {
                             serde_json::json!({
                                 "type": "object",
@@ -6259,9 +6566,10 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
                             })
                         }
                     }
-                }
+                };
+                Ok(schema)
             })
-            .collect();
+            .collect::<syn::Result<Vec<_>>>()?;
 
         quote! {
             {
@@ -6278,7 +6586,8 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
                 schema
             }
         }
-    }
+    };
+    Ok(schema)
 }
 
 /// Checks if a field has a specific json_schema attribute.
@@ -6320,4 +6629,64 @@ fn get_json_schema_rename(attrs: &[Attribute]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod serde_schema_tests {
+    use super::{SchemaRenameRule, SchemaSerdeAttrs};
+
+    #[test]
+    fn serde_schema_rename_rules_cover_field_and_variant_cases() {
+        for (rule, field, variant) in [
+            ("lowercase", "my_http2_id", "http2ready"),
+            ("UPPERCASE", "MY_HTTP2_ID", "HTTP2READY"),
+            ("PascalCase", "MyHttp2Id", "HTTP2Ready"),
+            ("camelCase", "myHttp2Id", "hTTP2Ready"),
+            ("snake_case", "my_http2_id", "h_t_t_p2_ready"),
+            ("SCREAMING_SNAKE_CASE", "MY_HTTP2_ID", "H_T_T_P2_READY"),
+            ("kebab-case", "my-http2-id", "h-t-t-p2-ready"),
+            ("SCREAMING-KEBAB-CASE", "MY-HTTP2-ID", "H-T-T-P2-READY"),
+        ] {
+            let parsed = SchemaRenameRule::parse(rule, proc_macro2::Span::call_site()).unwrap();
+            assert_eq!(parsed.field_name("my_http2_id"), field, "{rule}");
+            assert_eq!(parsed.variant_name("HTTP2Ready"), variant, "{rule}");
+        }
+        assert_eq!(SchemaRenameRule::Kebab.variant_name("Foo_Bar"), "foo--bar");
+        assert_eq!(
+            SchemaRenameRule::ScreamingKebab.variant_name("Foo_Bar"),
+            "FOO--BAR"
+        );
+        assert!(SchemaRenameRule::parse("Title Case", proc_macro2::Span::call_site()).is_err());
+    }
+
+    #[test]
+    fn serde_schema_attributes_reject_asymmetric_wire_names() {
+        let same: syn::Attribute = syn::parse_quote! {
+            #[serde(rename(serialize = "wire", deserialize = "wire"))]
+        };
+        assert_eq!(
+            SchemaSerdeAttrs::parse(&[same]).unwrap().rename.as_deref(),
+            Some("wire")
+        );
+        for attr in [
+            syn::parse_quote! { #[serde(rename(serialize = "wire", deserialize = "other"))] },
+            syn::parse_quote! { #[serde(rename(serialize = "wire"))] },
+            syn::parse_quote! { #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))] },
+            syn::parse_quote! { #[serde(skip_serializing)] },
+            syn::parse_quote! { #[serde(skip_deserializing)] },
+        ] {
+            let error = SchemaSerdeAttrs::parse(&[attr])
+                .err()
+                .expect("asymmetric attributes need explicit schema generation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("implement json_schema() explicitly")
+            );
+        }
+        let skipped: syn::Attribute = syn::parse_quote! {
+            #[serde(skip_serializing, skip_deserializing)]
+        };
+        assert!(SchemaSerdeAttrs::parse(&[skipped]).unwrap().skip);
+    }
 }

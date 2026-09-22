@@ -34,6 +34,7 @@
 use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundleKey, HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
 };
+use std::sync::Arc;
 
 use crate::negotiation::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -63,12 +64,13 @@ pub enum HttpFallbackError {
     Negotiation(ClientHttpNegotiationError),
     /// An observation must name a nonempty modern target and a nonzero attempt.
     InvalidObservation,
-    /// The observation belongs to a different configured endpoint bundle.
+    /// The observation or GET permit belongs to a different endpoint bundle or
+    /// coordinator instance.
     ///
     /// Bundle identity covers the complete canonical targets, the credential and
     /// security partitions, the transport profile, and the policy/configuration
-    /// generations, so this also rejects a same-origin different-path endpoint
-    /// and a regenerated configuration.
+    /// generations. Permits additionally bind their exact issuing coordinator:
+    /// two attempts with identical configuration and IDs cannot exchange them.
     CrossBundleObservation,
     /// The observation names a different modern POST target than the plan.
     ModernTargetMismatch,
@@ -89,6 +91,9 @@ pub enum HttpFallbackError {
         /// The observed body classification.
         body: HttpProbeBody,
     },
+    /// This coordinator has not authorized a legacy GET. In particular, a
+    /// recognized modern response must never be bypassed by a foreign permit.
+    LegacyGetNotAuthorized,
     /// The single authorized `GET` was already opened.
     LegacyGetAlreadyOpened,
     /// An `endpoint` event arrived without an authorized, opened `GET`.
@@ -121,7 +126,7 @@ impl std::fmt::Display for HttpFallbackError {
                 formatter.write_str("an observation needs a nonempty target and nonzero attempt")
             }
             Self::CrossBundleObservation => {
-                formatter.write_str("the observation belongs to another endpoint bundle")
+                formatter.write_str("the observation or permit belongs to another coordinator")
             }
             Self::ModernTargetMismatch => {
                 formatter.write_str("the observation names another modern POST target")
@@ -131,15 +136,15 @@ impl std::fmt::Display for HttpFallbackError {
                 "attempt {admitted_attempt} was already admitted by this coordinator"
             ),
             Self::ReplayedObservation { attempt_id } => {
-                write!(
-                    formatter,
-                    "attempt {attempt_id} was replayed after settling"
-                )
+                write!(formatter, "attempt {attempt_id} was replayed after settling")
             }
             Self::IneligibleObservation { status, body } => write!(
                 formatter,
                 "status {status} with {body:?} cannot authorize a legacy GET"
             ),
+            Self::LegacyGetNotAuthorized => {
+                formatter.write_str("this coordinator has not authorized a legacy GET")
+            }
             Self::LegacyGetAlreadyOpened => {
                 formatter.write_str("the one authorized legacy GET was already opened")
             }
@@ -227,14 +232,24 @@ impl ModernProbeObservation {
 /// [`HttpFallbackCoordinator::open_legacy_get`] consumes it by value, so a
 /// second `GET` cannot be opened from one authorization even by mistake.
 /// Holding a permit is not an era selection and never mutates coordinator state.
-///
-/// `PartialEq` is derived so callers can assert on a decision; it deliberately
-/// does not weaken single use, which `Clone`'s absence enforces.
-#[derive(Debug, PartialEq, Eq)]
+/// Its private allocation identity binds it to its exact issuing coordinator,
+/// even when another coordinator uses the same endpoint bundle and attempt ID.
+#[derive(Debug)]
 pub struct LegacyGetPermit {
     target: String,
     attempt_id: u64,
+    owner: Arc<()>,
 }
+
+impl PartialEq for LegacyGetPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+            && self.target == other.target
+            && self.attempt_id == other.attempt_id
+    }
+}
+
+impl Eq for LegacyGetPermit {}
 
 impl LegacyGetPermit {
     /// Returns the configured legacy SSE target this permit authorizes.
@@ -298,6 +313,7 @@ pub struct HttpFallbackCoordinator {
     legacy_sse_target: String,
     state: FallbackState,
     settled_attempt: Option<u64>,
+    permit_owner: Arc<()>,
 }
 
 impl HttpFallbackCoordinator {
@@ -332,6 +348,7 @@ impl HttpFallbackCoordinator {
             legacy_sse_target,
             state: FallbackState::default(),
             settled_attempt: None,
+            permit_owner: Arc::new(()),
         })
     }
 
@@ -418,6 +435,7 @@ impl HttpFallbackCoordinator {
                 Ok(FallbackDecision::LegacyGetAuthorized(LegacyGetPermit {
                     target: self.legacy_sse_target.clone(),
                     attempt_id: observation.attempt_id,
+                    owner: Arc::clone(&self.permit_owner),
                 }))
             }
         }
@@ -426,7 +444,8 @@ impl HttpFallbackCoordinator {
     /// Consumes the single authorization and opens the one permitted `GET`.
     ///
     /// Returns the exact configured target the caller must request. Opening a
-    /// `GET` is still not an era selection.
+    /// `GET` is still not an era selection. A matching attempt number alone is
+    /// not authority: the permit must have been issued by this coordinator.
     pub fn open_legacy_get(
         &mut self,
         permit: LegacyGetPermit,
@@ -434,7 +453,13 @@ impl HttpFallbackCoordinator {
         if self.state.legacy_gets_opened > 0 {
             return Err(HttpFallbackError::LegacyGetAlreadyOpened);
         }
-        if Some(permit.attempt_id) != self.settled_attempt {
+        if self.state.legacy_gets_authorized != 1 {
+            return Err(HttpFallbackError::LegacyGetNotAuthorized);
+        }
+        if !Arc::ptr_eq(&self.permit_owner, &permit.owner)
+            || Some(permit.attempt_id) != self.settled_attempt
+            || permit.target != self.legacy_sse_target
+        {
             return Err(HttpFallbackError::CrossBundleObservation);
         }
         self.state.legacy_gets_opened += 1;
@@ -485,5 +510,135 @@ fn advertised_target_is_admissible(configured: &str, advertised: &str) -> bool {
     match advertised.split_once('?') {
         Some((base, query)) => !query.is_empty() && base == configured && !configured.contains('?'),
         None => false,
+    }
+}
+
+#[cfg(all(test, feature = "legacy-2024-11-05"))]
+mod permit_tests {
+    use super::*;
+    use crate::CanonicalHttpUrl;
+
+    const MODERN: &str = "https://mcp.example.test/mcp";
+    const SSE: &str = "https://mcp.example.test/sse";
+
+    fn coordinator(security_partition: &str) -> HttpFallbackCoordinator {
+        let parse = |value: &str| CanonicalHttpUrl::parse(value).expect("canonical fixture URL");
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::Auto,
+            Some(parse(MODERN)),
+            Some(parse(SSE)),
+            Some(parse("https://mcp.example.test/messages")),
+            "credential-partition".to_owned(),
+            security_partition.to_owned(),
+            "native-h1".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .expect("valid dual-era plan");
+        HttpFallbackCoordinator::new(plan).expect("Auto coordinator")
+    }
+
+    fn observe(
+        coordinator: &mut HttpFallbackCoordinator,
+        body: HttpProbeBody,
+    ) -> FallbackDecision {
+        let observation = ModernProbeObservation::new(
+            coordinator.bundle_key().clone(),
+            MODERN,
+            1,
+            HttpModernProbe { status: 404, body },
+        )
+        .expect("bound observation");
+        coordinator.observe(&observation).expect("eligible observation")
+    }
+
+    fn authorize(coordinator: &mut HttpFallbackCoordinator) -> LegacyGetPermit {
+        let FallbackDecision::LegacyGetAuthorized(permit) =
+            observe(coordinator, HttpProbeBody::Unrecognized)
+        else {
+            panic!("404 with an unrecognized body must authorize the candidate GET");
+        };
+        permit
+    }
+
+    #[test]
+    fn locally_issued_permit_opens_only_its_own_get() {
+        let mut owner = coordinator("owner");
+        let permit = authorize(&mut owner);
+        assert_eq!(permit.target(), SSE);
+        assert_eq!(permit.attempt_id(), 1);
+        assert_eq!(owner.open_legacy_get(permit).unwrap(), SSE);
+        assert_eq!(owner.state().legacy_gets_authorized, 1);
+        assert_eq!(owner.state().legacy_gets_opened, 1);
+        assert_eq!(owner.selected_era(), None);
+    }
+
+    #[test]
+    fn same_bundle_and_attempt_cannot_exchange_permits() {
+        let mut owner = coordinator("same-partition");
+        let mut other = coordinator("same-partition");
+        let owner_permit = authorize(&mut owner);
+        let other_permit = authorize(&mut other);
+        assert_ne!(owner_permit, other_permit);
+        let before = owner.state();
+        assert_eq!(
+            owner.open_legacy_get(other_permit),
+            Err(HttpFallbackError::CrossBundleObservation)
+        );
+        assert_eq!(owner.state(), before);
+        // Rejecting foreign authority must not consume the local authorization.
+        assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), SSE);
+    }
+
+    #[test]
+    fn foreign_permit_cannot_override_a_recognized_modern_response() {
+        let mut modern = coordinator("same-partition");
+        let mut legacy = coordinator("same-partition");
+        let foreign_permit = authorize(&mut legacy);
+        assert_eq!(
+            observe(&mut modern, HttpProbeBody::RecognizedModernJsonRpc),
+            FallbackDecision::ModernRetained
+        );
+        let before = modern.state();
+        assert_eq!(
+            modern.open_legacy_get(foreign_permit),
+            Err(HttpFallbackError::LegacyGetNotAuthorized)
+        );
+        assert_eq!(modern.state(), before);
+        assert_eq!(modern.state().legacy_gets_authorized, 0);
+        assert_eq!(modern.state().legacy_gets_opened, 0);
+    }
+
+    #[test]
+    fn same_target_and_attempt_cannot_cross_security_partitions() {
+        let mut owner = coordinator("principal-a");
+        let mut other = coordinator("principal-b");
+        let owner_permit = authorize(&mut owner);
+        let other_permit = authorize(&mut other);
+        let before = owner.state();
+        assert_eq!(
+            owner.open_legacy_get(other_permit),
+            Err(HttpFallbackError::CrossBundleObservation)
+        );
+        assert_eq!(owner.state(), before);
+        assert_eq!(owner.open_legacy_get(owner_permit).unwrap(), SSE);
+    }
+
+    #[test]
+    fn retired_coordinator_permit_cannot_authorize_a_replacement_attempt() {
+        let stale_permit = {
+            let mut retired = coordinator("same-partition");
+            authorize(&mut retired)
+        };
+        let mut replacement = coordinator("same-partition");
+        let fresh_permit = authorize(&mut replacement);
+        let before = replacement.state();
+        assert_eq!(
+            replacement.open_legacy_get(stale_permit),
+            Err(HttpFallbackError::CrossBundleObservation)
+        );
+        assert_eq!(replacement.state(), before);
+        assert_eq!(replacement.open_legacy_get(fresh_permit).unwrap(), SSE);
     }
 }
