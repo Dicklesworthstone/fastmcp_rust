@@ -194,11 +194,23 @@ def wrapped_clause_precondition(stored: str) -> tuple[bool, str]:
 def parser_truncation(bead: str, stored: str) -> list[str]:
     """LAYER 2: compare what br's parser RETURNS to what the field HOLDS.
 
-    RoseStream found br reads each item as THE FIRST LINE ONLY, so a wrapped
-    bullet's continuation sits in the field and in no item -- with the field
-    intact the whole time, which is why a byte proof cannot see it. The proofs
-    above certify the FIELD; this certifies the READER, one layer past where
-    those proofs' authority ends.
+    ATTRIBUTION, CORRECTED. The mechanism is MagentaSummit's: br reads each item
+    as THE FIRST LINE ONLY, recorded 2026-09-21T17:21Z on bd-reconcile-071-
+    release-9t607, from "I finally read the criterion's full text instead of my
+    own summary of it." RoseStream independently re-derived it AND measured its
+    blast radius across the transcribed beads, which is what made the fleet act;
+    that is a distinct contribution, not a restatement.
+
+    I had MagentaSummit's comment in hand and had quoted it earlier the same
+    hour. `items_of` above credits it correctly. Then a broadcast arrived framing
+    the finding as RoseStream's, and I overwrote my own correct attribution with
+    it -- amplifying a trusted lane over a record I had already read. The tool is
+    the durable artifact, so the correction belongs here and not only in mail.
+
+    A wrapped bullet's continuation sits in the field and in no item, with the
+    field intact the whole time, which is why a byte proof cannot see it. The
+    proofs above certify the FIELD; this certifies the READER, one layer past
+    where those proofs' authority ends.
     """
     raw = subprocess.run(
         ["br", "show", bead, "--json"], capture_output=True, text=True, check=True
