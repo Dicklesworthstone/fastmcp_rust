@@ -109,7 +109,10 @@ export interface WorkingTask extends Task {
  * @category `tasks`
  */
 // TODO: Import from SDK once updated for MRTR
-export type InputRequest = CreateMessageRequest | ListRootsRequest | ElicitRequest;
+export type InputRequest =
+  | CreateMessageRequest
+  | ListRootsRequest
+  | ElicitRequest;
 
 /**
  * A single input response from the client to the server during task execution.
@@ -117,7 +120,10 @@ export type InputRequest = CreateMessageRequest | ListRootsRequest | ElicitReque
  * @category `tasks`
  */
 // TODO: Import from SDK once updated for MRTR
-export type InputResponse = CreateMessageResult | ListRootsResult | ElicitResult;
+export type InputResponse =
+  | CreateMessageResult
+  | ListRootsResult
+  | ElicitResult;
 
 /**
  * Outstanding server-to-client requests that need to be fulfilled during task execution.

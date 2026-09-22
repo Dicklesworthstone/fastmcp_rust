@@ -812,7 +812,8 @@ export interface McpUiToolMeta {
  * ```
  */
 export const OPEN_LINK_METHOD: McpUiOpenLinkRequest["method"] = "ui/open-link";
-export const DOWNLOAD_FILE_METHOD: McpUiDownloadFileRequest["method"] = "ui/download-file";
+export const DOWNLOAD_FILE_METHOD: McpUiDownloadFileRequest["method"] =
+  "ui/download-file";
 export const MESSAGE_METHOD: McpUiMessageRequest["method"] = "ui/message";
 export const SANDBOX_PROXY_READY_METHOD: McpUiSandboxProxyReadyNotification["method"] =
   "ui/notifications/sandbox-proxy-ready";
@@ -834,7 +835,8 @@ export const REQUEST_TEARDOWN_METHOD: McpUiRequestTeardownNotification["method"]
   "ui/notifications/request-teardown";
 export const RESOURCE_TEARDOWN_METHOD: McpUiResourceTeardownRequest["method"] =
   "ui/resource-teardown";
-export const INITIALIZE_METHOD: McpUiInitializeRequest["method"] = "ui/initialize";
+export const INITIALIZE_METHOD: McpUiInitializeRequest["method"] =
+  "ui/initialize";
 export const INITIALIZED_METHOD: McpUiInitializedNotification["method"] =
   "ui/notifications/initialized";
 export const REQUEST_DISPLAY_MODE_METHOD: McpUiRequestDisplayModeRequest["method"] =

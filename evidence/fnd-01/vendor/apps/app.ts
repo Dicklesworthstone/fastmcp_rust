@@ -1,95 +1,94 @@
 import {
-  mergeCapabilities,
-  type ProtocolOptions,
   type RequestOptions,
+  mergeCapabilities,
+  ProtocolOptions,
 } from "@modelcontextprotocol/sdk/shared/protocol.js";
 
 import {
-  type CallToolRequest,
+  CallToolRequest,
   CallToolRequestSchema,
-  type CallToolResult,
+  CallToolResult,
   CallToolResultSchema,
-  type CreateMessageRequest,
-  type CreateMessageResult,
+  CreateMessageRequest,
+  CreateMessageResult,
   CreateMessageResultSchema,
-  type CreateMessageResultWithTools,
+  CreateMessageResultWithTools,
   CreateMessageResultWithToolsSchema,
   EmptyResultSchema,
-  type Implementation,
-  type ListResourcesRequest,
-  type ListResourcesResult,
+  Implementation,
+  ListResourcesRequest,
+  ListResourcesResult,
   ListResourcesResultSchema,
-  type ListToolsRequest,
+  ListToolsRequest,
   ListToolsRequestSchema,
-  type ListToolsResult,
-  type LoggingMessageNotification,
+  ListToolsResult,
+  LoggingMessageNotification,
   PingRequestSchema,
-  type ReadResourceRequest,
-  type ReadResourceResult,
+  ReadResourceRequest,
+  ReadResourceResult,
   ReadResourceResultSchema,
-  type Tool,
-  type ToolAnnotations,
-  type ToolListChangedNotification,
+  Tool,
+  ToolAnnotations,
+  ToolListChangedNotification,
 } from "@modelcontextprotocol/sdk/types.js";
+import { AppNotification, AppRequest, AppResult } from "./types";
 import { ProtocolWithEvents } from "./events";
-import type { AppNotification, AppRequest, AppResult } from "./types";
-
 export { ProtocolWithEvents };
-
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { z } from "zod/v4";
 import { PostMessageTransport } from "./message-transport";
 import {
-  type StandardSchemaV1,
+  LATEST_PROTOCOL_VERSION,
+  McpUiAppCapabilities,
+  McpUiUpdateModelContextRequest,
+  McpUiHostCapabilities,
+  McpUiHostContext,
+  McpUiHostContextChangedNotification,
+  McpUiHostContextChangedNotificationSchema,
+  McpUiInitializedNotification,
+  McpUiInitializeRequest,
+  McpUiInitializeResultSchema,
+  McpUiMessageRequest,
+  McpUiMessageResultSchema,
+  McpUiOpenLinkRequest,
+  McpUiOpenLinkResultSchema,
+  McpUiDownloadFileRequest,
+  McpUiDownloadFileResultSchema,
+  McpUiResourceTeardownRequest,
+  McpUiResourceTeardownRequestSchema,
+  McpUiResourceTeardownResult,
+  McpUiRequestTeardownNotification,
+  McpUiSizeChangedNotification,
+  McpUiToolCancelledNotification,
+  McpUiToolCancelledNotificationSchema,
+  McpUiToolInputNotification,
+  McpUiToolInputNotificationSchema,
+  McpUiToolInputPartialNotification,
+  McpUiToolInputPartialNotificationSchema,
+  McpUiToolResultNotification,
+  McpUiToolResultNotificationSchema,
+  McpUiRequestDisplayModeRequest,
+  McpUiRequestDisplayModeResultSchema,
+} from "./types";
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  StandardSchemaV1,
   standardSchemaToJsonSchema,
   validateStandardSchema,
 } from "./standard-schema";
-import {
-  LATEST_PROTOCOL_VERSION,
-  type McpUiAppCapabilities,
-  type McpUiDownloadFileRequest,
-  McpUiDownloadFileResultSchema,
-  type McpUiHostCapabilities,
-  type McpUiHostContext,
-  type McpUiHostContextChangedNotification,
-  McpUiHostContextChangedNotificationSchema,
-  type McpUiInitializedNotification,
-  type McpUiInitializeRequest,
-  McpUiInitializeResultSchema,
-  type McpUiMessageRequest,
-  McpUiMessageResultSchema,
-  type McpUiOpenLinkRequest,
-  McpUiOpenLinkResultSchema,
-  type McpUiRequestDisplayModeRequest,
-  McpUiRequestDisplayModeResultSchema,
-  type McpUiRequestTeardownNotification,
-  type McpUiResourceTeardownRequest,
-  McpUiResourceTeardownRequestSchema,
-  type McpUiResourceTeardownResult,
-  type McpUiSizeChangedNotification,
-  type McpUiToolCancelledNotification,
-  McpUiToolCancelledNotificationSchema,
-  type McpUiToolInputNotification,
-  McpUiToolInputNotificationSchema,
-  type McpUiToolInputPartialNotification,
-  McpUiToolInputPartialNotificationSchema,
-  type McpUiToolResultNotification,
-  McpUiToolResultNotificationSchema,
-  type McpUiUpdateModelContextRequest,
-} from "./types";
+import { z } from "zod/v4";
 
-export { PostMessageTransport } from "./message-transport";
 export type {
   StandardSchemaV1,
   StandardSchemaWithJSON,
 } from "./standard-schema";
-export {
-  applyDocumentTheme,
-  applyHostFonts,
-  applyHostStyleVariables,
-  getDocumentTheme,
-} from "./styles";
+
+export { PostMessageTransport } from "./message-transport";
 export * from "./types";
+export {
+  applyHostStyleVariables,
+  applyHostFonts,
+  getDocumentTheme,
+  applyDocumentTheme,
+} from "./styles";
 
 /**
  * Metadata key for associating a UI resource URI with a tool.
@@ -205,21 +204,24 @@ export type AppOptions = ProtocolOptions & {
   allowUnsafeEval?: boolean;
 };
 
-type RequestHandlerExtra = Parameters<Parameters<App["setRequestHandler"]>[1]>[1];
+type RequestHandlerExtra = Parameters<
+  Parameters<App["setRequestHandler"]>[1]
+>[1];
 
 /**
  * Result of an app-registered tool callback. When `Out` is provided,
  * `structuredContent` is required and typed (unless `isError: true`).
  */
-export type AppToolResult<Out extends StandardSchemaV1 | undefined = undefined> =
-  Out extends StandardSchemaV1
-    ?
-        | (CallToolResult & {
-            structuredContent: StandardSchemaV1.InferOutput<Out>;
-            isError?: false;
-          })
-        | (CallToolResult & { isError: true })
-    : CallToolResult;
+export type AppToolResult<
+  Out extends StandardSchemaV1 | undefined = undefined,
+> = Out extends StandardSchemaV1
+  ?
+      | (CallToolResult & {
+          structuredContent: StandardSchemaV1.InferOutput<Out>;
+          isError?: false;
+        })
+      | (CallToolResult & { isError: true })
+  : CallToolResult;
 
 /**
  * Callback for an app-registered tool. When `In` is provided, `args` is the
@@ -238,7 +240,9 @@ export type AppToolCallback<
       args: StandardSchemaV1.InferOutput<In>,
       extra: RequestHandlerExtra,
     ) => AppToolResult<Out> | Promise<AppToolResult<Out>>
-  : (extra: RequestHandlerExtra) => AppToolResult<Out> | Promise<AppToolResult<Out>>;
+  : (
+      extra: RequestHandlerExtra,
+    ) => AppToolResult<Out> | Promise<AppToolResult<Out>>;
 
 /**
  * Handle returned by {@link App.registerTool}. Mirrors `RegisteredTool` from
@@ -258,7 +262,10 @@ export type RegisteredAppTool = {
   remove(): void;
   update(updates: Partial<Omit<RegisteredAppTool, "update">>): void;
   /** @internal */
-  handler: (args: unknown, extra: RequestHandlerExtra) => Promise<CallToolResult>;
+  handler: (
+    args: unknown,
+    extra: RequestHandlerExtra,
+  ) => Promise<CallToolResult>;
 };
 
 /**
@@ -335,7 +342,12 @@ export type AppEventMap = {
  * await app.connect();
  * ```
  */
-export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResult, AppEventMap> {
+export class App extends ProtocolWithEvents<
+  AppRequest,
+  AppNotification,
+  AppResult,
+  AppEventMap
+> {
   private _hostCapabilities?: McpUiHostCapabilities;
   private _hostInfo?: Implementation;
   private _hostContext?: McpUiHostContext;
@@ -379,12 +391,8 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * Registering a handler for one of these *after* {@link connect `connect`}
    * resolves risks missing the notification entirely.
    */
-  private static readonly ONE_SHOT_EVENTS: ReadonlySet<keyof AppEventMap> = new Set([
-    "toolinput",
-    "toolinputpartial",
-    "toolresult",
-    "toolcancelled",
-  ]);
+  private static readonly ONE_SHOT_EVENTS: ReadonlySet<keyof AppEventMap> =
+    new Set(["toolinput", "toolinputpartial", "toolresult", "toolcancelled"]);
 
   /**
    * One-shot events that have had at least one handler registered (via `on*`
@@ -484,7 +492,9 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
 
   private registerCapabilities(capabilities: McpUiAppCapabilities): void {
     if (this.transport) {
-      throw new Error("Cannot register capabilities after transport is established");
+      throw new Error(
+        "Cannot register capabilities after transport is established",
+      );
     }
     this._capabilities = mergeCapabilities(this._capabilities, capabilities);
   }
@@ -555,12 +565,13 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
                 `Invalid input for tool ${name}: `,
               )
             : (rawArgs ?? {});
-          result = await (cb as AppToolCallback<StandardSchemaV1, StandardSchemaV1>)(
-            parsedArgs,
+          result = await (
+            cb as AppToolCallback<StandardSchemaV1, StandardSchemaV1>
+          )(parsedArgs, extra);
+        } else {
+          result = await (cb as AppToolCallback<undefined, StandardSchemaV1>)(
             extra,
           );
-        } else {
-          result = await (cb as AppToolCallback<undefined, StandardSchemaV1>)(extra);
         }
         if (registeredTool.outputSchema && !result.isError) {
           result.structuredContent = (await validateStandardSchema(
@@ -640,7 +651,9 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
     };
   }
 
-  async sendToolListChanged(params: ToolListChangedNotification["params"] = {}): Promise<void> {
+  async sendToolListChanged(
+    params: ToolListChangedNotification["params"] = {},
+  ): Promise<void> {
     this._assertInitialized("sendToolListChanged");
     await this.notification(<ToolListChangedNotification>{
       method: "notifications/tools/list_changed",
@@ -752,10 +765,16 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @deprecated Use {@link addEventListener `addEventListener("toolinput", handler)`} instead — it composes with other listeners and supports cleanup via {@link removeEventListener `removeEventListener`}.
    * @see {@link McpUiToolInputNotification `McpUiToolInputNotification`} for the notification structure
    */
-  get ontoolinput(): ((params: McpUiToolInputNotification["params"]) => void) | undefined {
+  get ontoolinput():
+    | ((params: McpUiToolInputNotification["params"]) => void)
+    | undefined {
     return this.getEventHandler("toolinput");
   }
-  set ontoolinput(callback: ((params: McpUiToolInputNotification["params"]) => void) | undefined,) {
+  set ontoolinput(
+    callback:
+      | ((params: McpUiToolInputNotification["params"]) => void)
+      | undefined,
+  ) {
     this.setEventHandler("toolinput", callback);
   }
 
@@ -804,9 +823,11 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
     | undefined {
     return this.getEventHandler("toolinputpartial");
   }
-  set ontoolinputpartial(callback:
-    | ((params: McpUiToolInputPartialNotification["params"]) => void)
-    | undefined,) {
+  set ontoolinputpartial(
+    callback:
+      | ((params: McpUiToolInputPartialNotification["params"]) => void)
+      | undefined,
+  ) {
     this.setEventHandler("toolinputpartial", callback);
   }
 
@@ -838,12 +859,16 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @see {@link McpUiToolResultNotification `McpUiToolResultNotification`} for the notification structure
    * @see {@link ontoolinput `ontoolinput`} for the initial tool input handler
    */
-  get ontoolresult(): ((params: McpUiToolResultNotification["params"]) => void) | undefined {
+  get ontoolresult():
+    | ((params: McpUiToolResultNotification["params"]) => void)
+    | undefined {
     return this.getEventHandler("toolresult");
   }
-  set ontoolresult(callback:
-    | ((params: McpUiToolResultNotification["params"]) => void)
-    | undefined,) {
+  set ontoolresult(
+    callback:
+      | ((params: McpUiToolResultNotification["params"]) => void)
+      | undefined,
+  ) {
     this.setEventHandler("toolresult", callback);
   }
 
@@ -873,12 +898,16 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @see {@link McpUiToolCancelledNotification `McpUiToolCancelledNotification`} for the notification structure
    * @see {@link ontoolresult `ontoolresult`} for successful tool completion
    */
-  get ontoolcancelled(): ((params: McpUiToolCancelledNotification["params"]) => void) | undefined {
+  get ontoolcancelled():
+    | ((params: McpUiToolCancelledNotification["params"]) => void)
+    | undefined {
     return this.getEventHandler("toolcancelled");
   }
-  set ontoolcancelled(callback:
-    | ((params: McpUiToolCancelledNotification["params"]) => void)
-    | undefined,) {
+  set ontoolcancelled(
+    callback:
+      | ((params: McpUiToolCancelledNotification["params"]) => void)
+      | undefined,
+  ) {
     this.setEventHandler("toolcancelled", callback);
   }
 
@@ -921,9 +950,11 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
     | undefined {
     return this.getEventHandler("hostcontextchanged");
   }
-  set onhostcontextchanged(callback:
-    | ((params: McpUiHostContextChangedNotification["params"]) => void)
-    | undefined,) {
+  set onhostcontextchanged(
+    callback:
+      | ((params: McpUiHostContextChangedNotification["params"]) => void)
+      | undefined,
+  ) {
     this.setEventHandler("hostcontextchanged", callback);
   }
 
@@ -963,18 +994,23 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
   get onteardown() {
     return this._onteardown;
   }
-  set onteardown(callback:
-    | ((
-        params: McpUiResourceTeardownRequest["params"],
-        extra: RequestHandlerExtra,
-      ) => McpUiResourceTeardownResult | Promise<McpUiResourceTeardownResult>)
-    | undefined,) {
+  set onteardown(
+    callback:
+      | ((
+          params: McpUiResourceTeardownRequest["params"],
+          extra: RequestHandlerExtra,
+        ) => McpUiResourceTeardownResult | Promise<McpUiResourceTeardownResult>)
+      | undefined,
+  ) {
     this.warnIfRequestHandlerReplaced("onteardown", this._onteardown, callback);
     this._onteardown = callback;
-    this.replaceRequestHandler(McpUiResourceTeardownRequestSchema, (request, extra) => {
-      if (!this._onteardown) throw new Error("No onteardown handler set");
-      return this._onteardown(request.params, extra);
-    });
+    this.replaceRequestHandler(
+      McpUiResourceTeardownRequestSchema,
+      (request, extra) => {
+        if (!this._onteardown) throw new Error("No onteardown handler set");
+        return this._onteardown(request.params, extra);
+      },
+    );
   }
 
   /**
@@ -1012,9 +1048,14 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
   get oncalltool() {
     return this._oncalltool;
   }
-  set oncalltool(callback:
-    | ((params: CallToolRequest["params"], extra: RequestHandlerExtra) => Promise<CallToolResult>)
-    | undefined,) {
+  set oncalltool(
+    callback:
+      | ((
+          params: CallToolRequest["params"],
+          extra: RequestHandlerExtra,
+        ) => Promise<CallToolResult>)
+      | undefined,
+  ) {
     this.warnIfRequestHandlerReplaced("oncalltool", this._oncalltool, callback);
     this._oncalltool = callback;
     this.replaceRequestHandler(CallToolRequestSchema, (request, extra) => {
@@ -1074,10 +1115,19 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
   get onlisttools() {
     return this._onlisttools;
   }
-  set onlisttools(callback:
-    | ((params: ListToolsRequest["params"], extra: RequestHandlerExtra) => Promise<ListToolsResult>)
-    | undefined,) {
-    this.warnIfRequestHandlerReplaced("onlisttools", this._onlisttools, callback);
+  set onlisttools(
+    callback:
+      | ((
+          params: ListToolsRequest["params"],
+          extra: RequestHandlerExtra,
+        ) => Promise<ListToolsResult>)
+      | undefined,
+  ) {
+    this.warnIfRequestHandlerReplaced(
+      "onlisttools",
+      this._onlisttools,
+      callback,
+    );
     this._onlisttools = callback;
     this.replaceRequestHandler(ListToolsRequestSchema, (request, extra) => {
       if (!this._onlisttools) throw new Error("No onlisttools handler set");
@@ -1093,7 +1143,9 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
     switch (method) {
       case "sampling/createMessage":
         if (!this._hostCapabilities?.sampling) {
-          throw new Error(`Host does not support sampling (required for ${method})`);
+          throw new Error(
+            `Host does not support sampling (required for ${method})`,
+          );
         }
         break;
     }
@@ -1108,7 +1160,9 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
       case "tools/call":
       case "tools/list":
         if (!this._capabilities.tools) {
-          throw new Error(`Client does not support tool capability (required for ${method})`);
+          throw new Error(
+            `Client does not support tool capability (required for ${method})`,
+          );
         }
         return;
       case "ping":
@@ -1189,14 +1243,18 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
           `Did you mean: callServerTool({ name: "${params}", arguments: { ... } })?`,
       );
     }
-    return await this.request({ method: "tools/call", params }, CallToolResultSchema, {
-      // Hosts may interpose long-running or user-interactive steps before the
-      // tool result arrives. Opting in here lets a host heartbeat keep the
-      // request alive past the default timeout; callers can still override.
-      onprogress: () => {},
-      resetTimeoutOnProgress: true,
-      ...options,
-    });
+    return await this.request(
+      { method: "tools/call", params },
+      CallToolResultSchema,
+      {
+        // Hosts may interpose long-running or user-interactive steps before the
+        // tool result arrives. Opting in here lets a host heartbeat keep the
+        // request alive past the default timeout; callers can still override.
+        onprogress: () => {},
+        resetTimeoutOnProgress: true,
+        ...options,
+      },
+    );
   }
 
   /**
@@ -1376,7 +1434,11 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
     const resultSchema = params.tools
       ? CreateMessageResultWithToolsSchema
       : CreateMessageResultSchema;
-    return await this.request({ method: "sampling/createMessage", params }, resultSchema, options);
+    return await this.request(
+      { method: "sampling/createMessage", params },
+      resultSchema,
+      options,
+    );
   }
 
   /**
@@ -1520,7 +1582,10 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    *
    * @returns Promise that resolves when the context update is acknowledged
    */
-  updateModelContext(params: McpUiUpdateModelContextRequest["params"], options?: RequestOptions) {
+  updateModelContext(
+    params: McpUiUpdateModelContextRequest["params"],
+    options?: RequestOptions,
+  ) {
     this._assertInitialized("updateModelContext");
     return this.request(
       <McpUiUpdateModelContextRequest>{
@@ -1635,7 +1700,10 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @see {@link McpUiDownloadFileRequest `McpUiDownloadFileRequest`} for request structure
    * @see {@link McpUiDownloadFileResult `McpUiDownloadFileResult`} for result structure
    */
-  downloadFile(params: McpUiDownloadFileRequest["params"], options?: RequestOptions) {
+  downloadFile(
+    params: McpUiDownloadFileRequest["params"],
+    options?: RequestOptions,
+  ) {
     this._assertInitialized("downloadFile");
     return this.request(
       <McpUiDownloadFileRequest>{
@@ -1717,7 +1785,10 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @see {@link McpUiRequestDisplayModeRequest `McpUiRequestDisplayModeRequest`} for request structure
    * @see {@link McpUiHostContext `McpUiHostContext`} for checking availableDisplayModes
    */
-  requestDisplayMode(params: McpUiRequestDisplayModeRequest["params"], options?: RequestOptions) {
+  requestDisplayMode(
+    params: McpUiRequestDisplayModeRequest["params"],
+    options?: RequestOptions,
+  ) {
     this._assertInitialized("requestDisplayMode");
     return this.request(
       <McpUiRequestDisplayModeRequest>{
@@ -1870,11 +1941,16 @@ export class App extends ProtocolWithEvents<AppRequest, AppNotification, AppResu
    * @see {@link PostMessageTransport `PostMessageTransport`} for the typical transport implementation
    */
   override async connect(
-    transport: Transport = new PostMessageTransport(window.parent, window.parent),
+    transport: Transport = new PostMessageTransport(
+      window.parent,
+      window.parent,
+    ),
     options?: RequestOptions,
   ): Promise<void> {
     if (this.transport) {
-      throw new Error("App is already connected. Call close() before connecting again.");
+      throw new Error(
+        "App is already connected. Call close() before connecting again.",
+      );
     }
     this._initializedSent = false;
     await super.connect(transport);
