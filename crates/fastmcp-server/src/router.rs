@@ -3902,6 +3902,10 @@ impl Router {
     }
 
     /// Handles one exact MCP 2024-11-05 completion request.
+    ///
+    /// Completion providers retain the legacy freedom to resolve references
+    /// and arguments outside the local catalog. Session-disabled and
+    /// final-only targets remain inaccessible through this discovery surface.
     pub fn handle_completion_legacy(
         &self,
         request_ctx: &McpContext,
@@ -3923,9 +3927,25 @@ impl Router {
 
         let target_handler = match &params.reference {
             fastmcp_protocol::LegacyCompletionReference::Prompt { name } => {
+                if !request_ctx.is_prompt_enabled(name) || self.final_only_prompts.contains(name) {
+                    return Err(McpError::invalid_params(
+                        "completion prompt reference is not available",
+                    ));
+                }
                 self.legacy_prompt_completion_handlers.get(name)
             }
             fastmcp_protocol::LegacyCompletionReference::Resource { uri } => {
+                if !request_ctx.is_resource_enabled(uri)
+                    || self.final_only_resources.contains(uri)
+                    || self
+                        .resource_templates
+                        .get(uri)
+                        .is_some_and(|entry| !entry.legacy_enabled)
+                {
+                    return Err(McpError::invalid_params(
+                        "completion resource reference is not available",
+                    ));
+                }
                 self.legacy_resource_template_completion_handlers.get(uri)
             }
         };
@@ -3953,7 +3973,14 @@ impl Router {
         .await?;
 
         let completion = match outcome {
-            Outcome::Ok(completion) => completion,
+            Outcome::Ok(completion) => {
+                if completion.values.len() > fastmcp_protocol::MAX_COMPLETION_VALUES {
+                    return Err(McpError::internal_error(
+                        "completion handler returned more than 100 values",
+                    ));
+                }
+                completion
+            }
             Outcome::Err(error) => {
                 return Err(sanitize_handler_error(
                     request_ctx.cx(),
@@ -11716,6 +11743,39 @@ mod router_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LegacyCompletionProbe {
+        calls: Arc<AtomicUsize>,
+        value_count: Arc<AtomicUsize>,
+    }
+
+    impl CompletionHandler for LegacyCompletionProbe {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            _params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionValues {
+                values: (0..self.value_count.load(Ordering::SeqCst))
+                    .rev()
+                    .map(|index| format!("legacy-completion-{index}"))
+                    .collect(),
+                // The exact legacy schema has no minimum on total.
+                total: Some(-1),
+                has_more: None,
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            _params: FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            panic!("legacy completion must not invoke a final provider")
+        }
+    }
+
     struct CountingCompletion {
         final_calls: Arc<AtomicUsize>,
     }
@@ -17490,6 +17550,254 @@ mod router_tests {
             Some(&serde_json::json!("complete"))
         );
         assert_eq!(modern.get("completion"), legacy.get("completion"));
+    }
+
+    #[test]
+    fn legacy_completion_visibility_blocks_fallback_and_targeted_providers() {
+        const PROMPT: &str = "legacy-completion-prompt";
+        const TEMPLATE: &str = "resource://legacy-completion/{id}";
+        for targeted in [false, true] {
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let target_calls = Arc::new(AtomicUsize::new(0));
+            let value_count = Arc::new(AtomicUsize::new(2));
+            let mut router = Router::new();
+            router.add_legacy_prompt(NamedPrompt::new(PROMPT));
+            router.add_legacy_resource_template(marked_template(TEMPLATE, "legacy-completion"));
+            router.add_legacy_completion_handler(LegacyCompletionProbe {
+                calls: Arc::clone(&fallback_calls),
+                value_count: Arc::clone(&value_count),
+            });
+            if targeted {
+                let provider = LegacyCompletionProbe {
+                    calls: Arc::clone(&target_calls),
+                    value_count: Arc::clone(&value_count),
+                };
+                router.add_legacy_prompt_completion_handler(PROMPT, provider.clone());
+                router.add_legacy_resource_template_completion_handler(TEMPLATE, provider);
+            }
+            let catalogs_before = (
+                serde_json::to_value(router.prompts()).unwrap(),
+                serde_json::to_value(router.resource_templates()).unwrap(),
+            );
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let context = request_context(&cx, 187, Budget::INFINITE, &state);
+            let sibling_state = SessionState::new();
+            let sibling = request_context(&cx, 188, Budget::INFINITE, &sibling_state);
+
+            for (is_prompt, target) in [
+                (true, PROMPT),
+                (false, TEMPLATE),
+                (true, "provider-owned-prompt"),
+                (false, "resource://provider-owned/{id}"),
+            ] {
+                let reference = if is_prompt {
+                    serde_json::json!({"type": "ref/prompt", "name": target})
+                } else {
+                    serde_json::json!({"type": "ref/resource", "uri": target})
+                };
+                let params: LegacyCompletionParams = serde_json::from_value(serde_json::json!({
+                    "ref": reference,
+                    "argument": {"name": "provider-owned-argument", "value": "sta"},
+                }))
+                .unwrap();
+                let params_before = serde_json::to_vec(&params).unwrap();
+                let accepted = router
+                    .handle_completion_legacy(&context, params.clone())
+                    .expect("visible legacy targets retain provider-owned argument admission");
+                let accepted = serde_json::to_value(accepted).unwrap();
+                assert_eq!(
+                    accepted["completion"]["values"],
+                    serde_json::json!(["legacy-completion-1", "legacy-completion-0"])
+                );
+                assert_eq!(accepted["completion"]["total"], -1);
+                assert!(accepted["completion"].get("hasMore").is_none());
+                assert!(accepted.get("resultType").is_none());
+
+                assert!(if is_prompt {
+                    context.disable_prompt(target)
+                } else {
+                    context.disable_resource(target)
+                });
+                let visibility_before = (context.disabled_prompts(), context.disabled_resources());
+                let calls_before = (
+                    fallback_calls.load(Ordering::SeqCst),
+                    target_calls.load(Ordering::SeqCst),
+                );
+                let denied = router
+                    .handle_completion_legacy(&context, params.clone())
+                    .expect_err("session-hidden completion cannot consult any provider");
+                assert_eq!(denied.code, McpErrorCode::InvalidParams);
+                assert_eq!(
+                    denied.message,
+                    if is_prompt {
+                        "completion prompt reference is not available"
+                    } else {
+                        "completion resource reference is not available"
+                    }
+                );
+                assert_eq!(
+                    (
+                        fallback_calls.load(Ordering::SeqCst),
+                        target_calls.load(Ordering::SeqCst),
+                    ),
+                    calls_before,
+                    "refusal must not invoke either provider"
+                );
+                assert_eq!(
+                    (context.disabled_prompts(), context.disabled_resources()),
+                    visibility_before
+                );
+                assert_eq!(serde_json::to_vec(&params).unwrap(), params_before);
+                assert_eq!(
+                    serde_json::to_value(
+                        router
+                            .handle_completion_legacy(&sibling, params.clone())
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    accepted,
+                    "one session's visibility cannot affect another session"
+                );
+                assert!(if is_prompt {
+                    context.enable_prompt(target)
+                } else {
+                    context.enable_resource(target)
+                });
+                assert_eq!(
+                    serde_json::to_value(router.handle_completion_legacy(&context, params).unwrap())
+                        .unwrap(),
+                    accepted,
+                    "a re-enabled reference must remain usable after refusal"
+                );
+            }
+            assert_eq!(
+                (
+                    serde_json::to_value(router.prompts()).unwrap(),
+                    serde_json::to_value(router.resource_templates()).unwrap(),
+                ),
+                catalogs_before
+            );
+            assert_eq!(
+                target_calls.load(Ordering::SeqCst),
+                if targeted { 6 } else { 0 }
+            );
+            assert_eq!(
+                fallback_calls.load(Ordering::SeqCst),
+                if targeted { 6 } else { 12 }
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_completion_cannot_expose_final_only_targets() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_legacy_completion_handler(LegacyCompletionProbe {
+            calls: Arc::clone(&calls),
+            value_count: Arc::new(AtomicUsize::new(2)),
+        });
+        router.add_prompt(NamedPrompt::new("final-only-completion"));
+        router.add_resource(LegacyTemplateResource {
+            read_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        router.add_resource(NamedResource::new("resource://final-only-completion"));
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let context = request_context(&cx, 189, Budget::INFINITE, &state);
+        let params: [LegacyCompletionParams; 3] = [
+            serde_json::json!({"type": "ref/prompt", "name": "final-only-completion"}),
+            serde_json::json!({
+                "type": "ref/resource",
+                "uri": "mcp://resource/{collection}/manifest?revision={revision}",
+            }),
+            serde_json::json!({"type": "ref/resource", "uri": "resource://final-only-completion"}),
+        ]
+        .map(|reference| {
+            serde_json::from_value(serde_json::json!({
+                "ref": reference,
+                "argument": {"name": "collection", "value": "bo"},
+            }))
+            .unwrap()
+        });
+        for request in &params {
+            let result = router
+                .handle_completion_legacy(&context, request.clone())
+                .expect("legacy-visible registrations can reach the completion provider");
+            assert_eq!(result.completion.values.len(), 2);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Change only each registration's era visibility. Keep the requests,
+        // provider, session, and catalog identities exactly the same.
+        router
+            .add_final_prompt_with_behavior(
+                NamedPrompt::new("final-only-completion"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .unwrap();
+        router
+            .add_final_resource_with_behavior(
+                LegacyTemplateResource {
+                    read_calls: Arc::new(AtomicUsize::new(0)),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .unwrap();
+        router
+            .add_final_resource_with_behavior(
+                NamedResource::new("resource://final-only-completion"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .unwrap();
+        for request in params {
+            let denied = router
+                .handle_completion_legacy(&context, request)
+                .expect_err("final-only catalog entries cannot leak through legacy completion");
+            assert_eq!(denied.code, McpErrorCode::InvalidParams);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn legacy_completion_enforces_value_limit_before_returning_handler_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let value_count = Arc::new(AtomicUsize::new(99));
+        let mut router = Router::new();
+        router.add_legacy_completion_handler(LegacyCompletionProbe {
+            calls: Arc::clone(&calls),
+            value_count: Arc::clone(&value_count),
+        });
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let context = request_context(&cx, 190, Budget::INFINITE, &state);
+        let params: LegacyCompletionParams = serde_json::from_value(serde_json::json!({
+            "ref": {"type": "ref/prompt", "name": "provider-owned-prompt"},
+            "argument": {"name": "topic", "value": "sta"},
+        }))
+        .unwrap();
+        for count in [99, 100, 101, 100] {
+            value_count.store(count, Ordering::SeqCst);
+            let result = router.handle_completion_legacy(&context, params.clone());
+            if count > fastmcp_protocol::MAX_COMPLETION_VALUES {
+                let error = result.expect_err("a public handler result cannot contain 101 values");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(
+                    error.message,
+                    "completion handler returned more than 100 values"
+                );
+            } else {
+                let result = result.expect("a bounded legacy result remains accepted after refusal");
+                assert_eq!(result.completion.values.len(), count);
+                assert_eq!(
+                    result.completion.values[0],
+                    format!("legacy-completion-{}", count - 1)
+                );
+                assert_eq!(result.completion.total, Some(-1));
+                assert!(result.completion.has_more.is_none());
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]
