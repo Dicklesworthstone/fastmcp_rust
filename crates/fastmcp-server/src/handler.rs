@@ -1671,9 +1671,11 @@ pub trait ToolHandler: Send + Sync {
 
     /// Calls the tool synchronously with the given arguments.
     ///
-    /// This is the default implementation point. Override this for simple
-    /// synchronous tools. Returns `McpResult` which is converted to `McpOutcome`
-    /// by the async wrapper.
+    /// This is the default implementation point. Override it for simple
+    /// synchronous tools -- meaning tools that need nothing from the context
+    /// that reaches the peer. If the tool samples, elicits, or reads roots,
+    /// this is the wrong hook and the section below says why. Returns
+    /// `McpResult` which is converted to `McpOutcome` by the async wrapper.
     ///
     /// # Do not bridge an async context capability from here (bd-6rfrg)
     ///
@@ -2059,9 +2061,28 @@ pub trait ResourceHandler: Send + Sync {
 
     /// Reads the resource content synchronously.
     ///
-    /// This is the default implementation point. Override this for simple
-    /// synchronous resources. Returns `McpResult` which is converted to `McpOutcome`
-    /// by the async wrapper.
+    /// This is the default implementation point. Override it for simple
+    /// synchronous resources -- meaning ones that need nothing from the
+    /// context that reaches the peer. Returns `McpResult` which is converted
+    /// to `McpOutcome` by the async wrapper.
+    ///
+    /// # Do not bridge an async context capability from here (bd-6rfrg)
+    ///
+    /// This method is synchronous and the context capabilities that reach the
+    /// peer -- sampling, elicitation, roots -- are not, so the obvious way to
+    /// use one from a simple resource is to wrap the await in
+    /// `fastmcp_core::block_on`. Do not. On a thread that is driving the
+    /// runtime, that bridge blocks the only thread able to deliver the
+    /// client's response and the request can never complete.
+    ///
+    /// A resource that needs such a capability belongs on an async hook
+    /// ([`Self::read_async`] or [`Self::read_final_outcome_async`]). Supplying
+    /// one is what changes the behaviour: [`Self::read_async`]'s default
+    /// delegates straight back to this method, so a resource that overrides
+    /// only the synchronous hook still runs synchronously wherever it is
+    /// polled. This is the same hazard documented on [`ToolHandler::call`];
+    /// it is recorded here because the trap is reachable identically from this
+    /// trait and a reader of this method alone would not find it there.
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>>;
 
     /// Reads the resource content synchronously with the matched URI and parameters.
@@ -2389,9 +2410,28 @@ pub trait PromptHandler: Send + Sync {
 
     /// Gets the prompt messages synchronously with the given arguments.
     ///
-    /// This is the default implementation point. Override this for simple
-    /// synchronous prompts. Returns `McpResult` which is converted to `McpOutcome`
-    /// by the async wrapper.
+    /// This is the default implementation point. Override it for simple
+    /// synchronous prompts -- meaning ones that need nothing from the context
+    /// that reaches the peer. Returns `McpResult` which is converted to
+    /// `McpOutcome` by the async wrapper.
+    ///
+    /// # Do not bridge an async context capability from here (bd-6rfrg)
+    ///
+    /// This method is synchronous and the context capabilities that reach the
+    /// peer -- sampling, elicitation, roots -- are not, so the obvious way to
+    /// use one from a simple prompt is to wrap the await in
+    /// `fastmcp_core::block_on`. Do not. On a thread that is driving the
+    /// runtime, that bridge blocks the only thread able to deliver the
+    /// client's response and the request can never complete.
+    ///
+    /// A prompt that needs such a capability belongs on an async hook
+    /// ([`Self::get_async`] or [`Self::get_final_outcome_async`]). Supplying
+    /// one is what changes the behaviour: [`Self::get_async`]'s default
+    /// delegates straight back to this method, so a prompt that overrides only
+    /// the synchronous hook still runs synchronously wherever it is polled.
+    /// This is the same hazard documented on [`ToolHandler::call`]; it is
+    /// recorded here because the trap is reachable identically from this trait
+    /// and a reader of this method alone would not find it there.
     fn get(
         &self,
         ctx: &McpContext,
