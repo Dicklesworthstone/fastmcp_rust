@@ -3,9 +3,15 @@
 # consumer will accept.
 #
 # WHY THIS EXISTS.  crates/fastmcp/tests/fnd_01_dependency_evidence.rs reads
-# FASTMCP_FND01_PUBLIC_HARNESS_BIN (see `ordinary_public_harness_*`; cited by
-# symbol because that file moves), and six lines later derives the only legal
-# value itself:
+# THREE variables, all required, all cited by symbol because that file moves:
+#
+#     FASTMCP_FND01_PUBLIC_HARNESS_BIN     the artifact path
+#     FASTMCP_FND01_PUBLIC_HARNESS_BYTES   canonical positive decimal, 1..=256 MiB
+#     FASTMCP_FND01_PUBLIC_HARNESS_SHA256  64 lowercase hex characters
+#
+# BYTES and SHA256 are read by `ordinary_public_harness_receipt_binding`; BIN is
+# read by the path-equality guard.  For BIN the reader derives the only legal
+# value itself, six lines after reading it:
 #
 #     expected = ${CARGO_TARGET_DIR:-<repo>/target}/debug/examples/fnd_01_evidence_harness
 #     must be absolute, and must EQUAL that path
@@ -37,13 +43,14 @@ while [ "$#" -gt 0 ]; do
       cat <<'USAGE'
 usage: scripts/fnd01_harness_provision.sh [--features <list>|--no-features] [--print-export]
 
-Builds the `fnd_01_evidence_harness` Cargo example and prints the absolute path
-that FASTMCP_FND01_PUBLIC_HARNESS_BIN must be set to, with the artifact's byte
-length and SHA-256.
+Builds the `fnd_01_evidence_harness` Cargo example and prints the artifact's
+path, byte length and SHA-256 -- the three values the consumer requires as
+FASTMCP_FND01_PUBLIC_HARNESS_BIN / _BYTES / _SHA256.  --print-export emits all
+three as eval-ready export lines.
 
   --features <list>   feature list for the build (default: testing-lab)
   --no-features       build with default features only
-  --print-export      emit a ready-to-eval `export FASTMCP_FND01_PUBLIC_HARNESS_BIN=...` line
+  --print-export      emit all THREE export lines, ready to eval
 
 FEATURE DEFAULT IS A HYPOTHESIS, NOT A MEASUREMENT.  The example declares no
 `required-features`, while the test target that includes the same source
@@ -98,9 +105,49 @@ else
 fi
 harness_bytes=$(wc -c < "$harness" | tr -d ' ')
 
+# The consumer reads THREE variables, not one, and validates each before use
+# (`ordinary_public_harness_receipt_binding` for BYTES/SHA256; the path equality
+# for BIN). Validate here too, so a refusal names its cause at the point the
+# value is produced rather than several layers away as `pending!`.
+#
+# BYTES must be canonical positive decimal: non-empty, no leading zero, digits
+# only. SHA256 must be exactly 64 lowercase hex characters.
+case "$harness_bytes" in
+  ''|0|0*) printf 'byte length is not canonical positive decimal: %s\n' "$harness_bytes" >&2; exit 1 ;;
+  *[!0-9]*) printf 'byte length is not all digits: %s\n' "$harness_bytes" >&2; exit 1 ;;
+esac
+case "$harness_sha" in
+  *[!0-9a-f]*|'') printf 'sha256 is not lowercase hex: %s\n' "$harness_sha" >&2; exit 1 ;;
+esac
+[ "${#harness_sha}" -eq 64 ] || { printf 'sha256 is %s characters, expected 64\n' "${#harness_sha}" >&2; exit 1; }
+
+# MAX_GATE_EXECUTABLE_BYTES is 256 MiB and the consumer refuses a longer artifact
+# BEFORE it looks at any digest. Report it here, by name, because a provisioned
+# harness over the bound does not fix the five ordinary_* cases -- it exchanges
+# E_ORDINARY_HANDOFF_PENDING for a receipt-length refusal, which is the separate
+# blocker bd-fnd-01-harness-exceeds-gate-bound-2ayqy.
+max_gate_executable_bytes=268435456
+over_bound=0
+if [ "$harness_bytes" -gt "$max_gate_executable_bytes" ]; then
+  over_bound=1
+fi
+
 printf 'harness   %s\n' "$harness"
 printf 'bytes     %s\n' "$harness_bytes"
 printf 'sha256    %s\n' "$harness_sha"
+if [ "$over_bound" -eq 1 ]; then
+  printf 'WARNING: %s bytes exceeds MAX_GATE_EXECUTABLE_BYTES (%s).\n' \
+    "$harness_bytes" "$max_gate_executable_bytes" >&2
+  printf 'The consumer will refuse this artifact on length before reading its digest, so the\n' >&2
+  printf 'ordinary_* cases will report a receipt-length refusal rather than succeeding. That is\n' >&2
+  printf 'bd-fnd-01-harness-exceeds-gate-bound-2ayqy, not a fault in this provisioning step.\n' >&2
+fi
+
 if [ "$emit_export" -eq 1 ]; then
-  printf 'export FASTMCP_FND01_PUBLIC_HARNESS_BIN=%s\n' "$harness"
+  # All THREE, eval-ready. %q quotes the path so a directory containing spaces
+  # survives the round trip; the other two are constrained above to characters
+  # that need no quoting.
+  printf 'export FASTMCP_FND01_PUBLIC_HARNESS_BIN=%q\n' "$harness"
+  printf 'export FASTMCP_FND01_PUBLIC_HARNESS_BYTES=%s\n' "$harness_bytes"
+  printf 'export FASTMCP_FND01_PUBLIC_HARNESS_SHA256=%s\n' "$harness_sha"
 fi
