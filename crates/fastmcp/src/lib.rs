@@ -10362,6 +10362,7 @@ pub mod legacy_2024 {
 pub mod evidence_binding;
 pub mod release_quarantine;
 pub mod release_quarantine_reachability;
+pub mod release_quarantine_integration;
 
 // Testing helpers are opt-in and do not widen the production facade.
 #[cfg(any(feature = "testing", feature = "testing-lab"))]
