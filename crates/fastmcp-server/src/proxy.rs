@@ -21232,6 +21232,7 @@ expect_request notifications/initialized ''
         assert_eq!(messages[6]["id"], serde_json::json!(3));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn proxy_legacy_http_contains_panicking_sampling_handler_without_losing_follow_up() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
