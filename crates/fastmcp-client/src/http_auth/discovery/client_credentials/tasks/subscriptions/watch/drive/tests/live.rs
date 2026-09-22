@@ -319,3 +319,4 @@ fn tls_multiple_tasks_use_one_credential_and_ignore_late_terminals() { isolated(
 fn tls_abandoned_watch_read_releases_socket() { isolated("tls_abandoned_watch_read_releases_socket",Case::Abandon); }
 
 mod recovery;
+mod cancellation;
