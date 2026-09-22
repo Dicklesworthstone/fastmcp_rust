@@ -10,6 +10,7 @@
 //! cannot be preempted: its reservation remains charged until the closure really
 //! returns. The caller's runtime region retains ownership of that worker.
 
+mod bridge;
 mod completion;
 mod prompt;
 mod resource;
@@ -138,8 +139,14 @@ impl BlockingHandlerLane {
             // release it while the synchronous closure remains on the stack.
             let _charge = worker_charge;
             _charge.0.process.verify().map_err(|_| unavailable("blocking handler process changed"))?;
+            // Pool presence was checked before spawn, so this closure cannot
+            // use asupersync's inline fallback. Its caller keeps driving the
+            // runtime while this worker may wait for a reverse request. Mark
+            // only this synchronous scope, never the async admission/join path.
+            let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
             let context = worker_context.with_request_cx(worker_cx);
             let _current = Cx::set_current(Some(context.cx().clone()));
+            let _worker_scope = bridge::WorkerScope::enter(Arc::clone(&_charge.0), context.clone());
             context.checkpoint().map_err(|_| McpError::request_cancelled())?;
             let result = catch_unwind(AssertUnwindSafe(|| work(&context)))
                 .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
@@ -345,6 +352,7 @@ impl<H: ToolHandler + 'static> ToolHandler for BlockingTool<H> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use fastmcp_core::{SamplingRequest, SamplingResponse, SamplingSender};
     use serde_json::json;
 
     struct Echo { calls: Arc<AtomicUsize>, poller: std::thread::ThreadId }
@@ -366,6 +374,182 @@ mod tests {
         let builder = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap());
         if pool { builder.blocking_threads(0, 2).build().unwrap() } else { builder.build().unwrap() }
+    }
+
+    struct DrivenSampler {
+        cx: Cx,
+        requests: Mutex<Option<oneshot::Sender<SamplingRequest>>>,
+        replies: Mutex<Option<oneshot::Receiver<SamplingResponse>>>,
+        calls: AtomicUsize,
+    }
+
+    impl SamplingSender for DrivenSampler {
+        fn create_message(
+            &self,
+            request: SamplingRequest,
+        ) -> BoxFuture<'_, McpResult<SamplingResponse>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let requests = self.requests.lock().unwrap().take().unwrap();
+            let mut replies = self.replies.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                requests.send_blocking(request)
+                    .map_err(|_| unavailable("test sampling request receiver closed"))?;
+                replies.recv(&self.cx).await
+                    .map_err(|_| unavailable("test sampling reply sender closed"))
+            })
+        }
+    }
+
+    fn sampling_peer(cx: &Cx) -> (
+        Arc<DrivenSampler>,
+        oneshot::Receiver<SamplingRequest>,
+        oneshot::Sender<SamplingResponse>,
+    ) {
+        let (requests, received) = oneshot::channel();
+        let (reply, replies) = oneshot::channel();
+        (
+            Arc::new(DrivenSampler {
+                cx: cx.clone(),
+                requests: Mutex::new(Some(requests)),
+                replies: Mutex::new(Some(replies)),
+                calls: AtomicUsize::new(0),
+            }),
+            received,
+            reply,
+        )
+    }
+
+    struct SamplingTool {
+        poller: std::thread::ThreadId,
+        lane: Option<BlockingHandlerLane>,
+    }
+
+    impl ToolHandler for SamplingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "blocking_sampling".into(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
+            assert_ne!(std::thread::current().id(), self.poller);
+            assert_eq!(ctx.request_id(), 7);
+            let request = ctx.sample("complete from peer", 17);
+            let response = match &self.lane {
+                Some(lane) => lane.wait_for(request),
+                None => fastmcp_core::block_on(request),
+            }?;
+            Ok(vec![Content::Text { text: response.text }])
+        }
+    }
+
+    #[test]
+    fn blocking_tool_sampling_completes_while_the_caller_drives_the_reply() {
+        run_sampling_exchange(false);
+    }
+
+    #[test]
+    fn caller_owned_blocking_wait_supports_sampling_without_a_private_runtime() {
+        run_sampling_exchange(true);
+    }
+
+    fn run_sampling_exchange(caller_owned: bool) {
+        runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let (sampler, mut received, reply) = sampling_peer(&cx);
+            let context = McpContext::new(cx.clone(), 7).with_sampling(sampler.clone());
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let tool = BlockingTool::new(
+                SamplingTool {
+                    poller: std::thread::current().id(),
+                    lane: caller_owned.then(|| lane.clone()),
+                },
+                lane.clone(),
+            ).unwrap();
+            let mut call = Box::pin(tool.call_async(&context, json!({})));
+            let mut requested = std::pin::pin!(received.recv(&cx));
+            let mut reply = Some(reply);
+            let mut deadline = std::pin::pin!(Sleep::new(
+                cx.now().saturating_add_nanos(5_000_000_000),
+            ));
+            let result = poll_fn(|task| {
+                if let Poll::Ready(result) = call.as_mut().poll(task) {
+                    assert!(reply.is_none(), "sampling returned before its peer replied: {result:?}");
+                    return Poll::Ready(result);
+                }
+                if reply.is_some() {
+                    if let Poll::Ready(request) = requested.as_mut().poll(task) {
+                        let request = request.unwrap();
+                        assert_eq!(request.messages[0].text, "complete from peer");
+                        assert_eq!(request.max_tokens, 17);
+                        reply.take().unwrap()
+                            .send_blocking(SamplingResponse::new("peer completion", "test-model"))
+                            .unwrap();
+                    }
+                }
+                assert!(deadline.as_mut().poll(task).is_pending(), "sampling exchange timed out");
+                Poll::Pending
+            }).await;
+            let Outcome::Ok(content) = result else { panic!("sampling must complete"); };
+            assert!(matches!(&content[0], Content::Text { text } if text == "peer completion"));
+            assert_eq!(sampler.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lane.in_flight().unwrap(), 0);
+            assert!(context.ensure_live().is_ok());
+        });
+    }
+
+    #[test]
+    fn sampling_bridge_on_the_async_driver_still_refuses_before_sending() {
+        runtime(true).block_on(async {
+            let cx = Cx::current().unwrap();
+            let (sampler, _received, _reply) = sampling_peer(&cx);
+            let context = McpContext::new(cx, 7).with_sampling(sampler.clone());
+            let error = fastmcp_core::block_on(context.sample("complete from peer", 17))
+                .unwrap_err();
+            assert!(error.to_string().contains("Sampling cannot complete from here"));
+            assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+            assert!(context.ensure_live().is_ok());
+        });
+    }
+
+    #[test]
+    fn worker_lane_declaration_is_restored_after_success_and_panic() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(1, 1)
+            .build().unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let context = McpContext::new(cx.clone(), 7);
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            for panics in [false, true] {
+                let result = lane.execute(&context, &cx, move |_| {
+                    assert!(!fastmcp_core::block_on(async {
+                        fastmcp_core::runtime::bridge_would_starve_its_driver()
+                    }));
+                    if panics { panic!("test blocking lane unwind"); }
+                    Ok(())
+                }).await;
+                assert_eq!(result.is_err(), panics);
+                // The same one-thread pool now runs unrelated work. A leaked
+                // lane declaration would wrongly authorize a later bridge.
+                let mut probe = cx.spawn_blocking(|worker_cx| {
+                    let _current = Cx::set_current(Some(worker_cx));
+                    fastmcp_core::block_on(async {
+                        fastmcp_core::runtime::bridge_would_starve_its_driver()
+                    })
+                }).unwrap();
+                assert!(probe.join(&cx).await.unwrap());
+                assert_eq!(lane.in_flight().unwrap(), 0);
+            }
+        });
     }
 
     #[test]

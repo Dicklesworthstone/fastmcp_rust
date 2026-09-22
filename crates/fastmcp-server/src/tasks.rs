@@ -2164,6 +2164,18 @@ pub const MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS: usize = 1_024;
 /// The independent key-count bound also bounds collection overhead.
 pub const MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES: usize = 64 * 1_024;
 
+const MAX_FINAL_TASK_DESCRIPTOR_BYTES: usize = 256 * 1_024;
+const MAX_FINAL_TASK_INPUT_BYTES: usize = 1_024 * 1_024;
+const MAX_FINAL_TASK_RESULT_BYTES: usize = 8 * 1_024 * 1_024;
+const MAX_FINAL_TASK_METADATA_BYTES: usize = 1_024 * 1_024;
+const MAX_FINAL_TASK_APPLICATION_BYTES: usize = 10 * 1_024 * 1_024;
+// A final timestamp has 20..=35 ASCII bytes. Cancelling `working` adds two
+// status bytes and may grow lastUpdatedAt by fifteen; reserve both task and
+// notification copies so mandatory cancellation never competes with new work.
+const FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES: usize = 2 + 15;
+const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
+    2 * FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES;
+
 /// Bounded process-local [`FinalTaskStore`] for embeddings and development.
 ///
 /// This store retains the current task, its latest typed status notification,
@@ -2175,6 +2187,20 @@ pub const MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES: usize = 64 * 1_024;
 /// [`MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS`] and
 /// [`MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES`]. A new input round exceeding
 /// either bound is rejected without changing that task.
+///
+/// Retained compact-JSON payload bytes are admitted atomically, including the
+/// separate task and notification copies, initial-work duplicate, permanent
+/// descriptor, accepted inputs, and input-key history. The default aggregate
+/// capacity is 64 MiB and may be configured up to 512 MiB. Individual tasks
+/// admit at most 256 KiB of descriptor, 1 MiB of combined outstanding and
+/// accepted input, 8 MiB of result/error, and 1 MiB of task metadata; the task,
+/// permanent descriptor, and accepted input together must fit 10 MiB.
+/// Each live task also reserves 34 bytes within that capacity for mandatory
+/// cancellation retirement; unrelated writes cannot consume this reserve.
+/// Live task metadata leaves 17 bytes unused within its 1 MiB member ceiling
+/// for the same status/timestamp transition.
+/// These are encoded payload bounds, not decoded heap, active application
+/// memory, framework-wide memory, or persistent-storage guarantees.
 pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -2196,6 +2222,255 @@ struct InMemoryFinalTaskState {
     cancellation_requests: BTreeSet<FinalTaskId>,
     latest_notifications: BTreeMap<FinalTaskId, FinalTaskStatusNotification>,
     expires_at: BTreeMap<FinalTaskId, Instant>,
+    payload_accounting: InMemoryFinalTaskPayloadAccounting,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct InMemoryFinalTaskPayloadCharge {
+    total: usize,
+    initial_work: usize,
+    accepted_inputs: usize,
+    cancellation_reserve: usize,
+}
+
+struct InMemoryFinalTaskPayloadAdmission {
+    total: usize,
+    reserved: usize,
+}
+
+struct InMemoryFinalTaskPayloadAccounting {
+    limit: usize,
+    total: usize,
+    reserved: usize,
+    records: BTreeMap<FinalTaskId, InMemoryFinalTaskPayloadCharge>,
+}
+
+impl Default for InMemoryFinalTaskPayloadAccounting {
+    fn default() -> Self {
+        Self {
+            limit: InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+            total: 0,
+            reserved: 0,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
+impl InMemoryFinalTaskPayloadAccounting {
+    fn admit(
+        &self,
+        task_id: &FinalTaskId,
+        replacement: InMemoryFinalTaskPayloadCharge,
+    ) -> McpResult<InMemoryFinalTaskPayloadAdmission> {
+        let previous = self.records.get(task_id);
+        let total = self
+            .total
+            .checked_sub(previous.map_or(0, |charge| charge.total))
+            .and_then(|total| total.checked_add(replacement.total));
+        let reserved = self
+            .reserved
+            .checked_sub(previous.map_or(0, |charge| charge.cancellation_reserve))
+            .and_then(|reserved| reserved.checked_add(replacement.cancellation_reserve));
+        match total.zip(reserved) {
+            Some((total, reserved))
+                if total
+                    .checked_add(reserved)
+                    .is_some_and(|bytes| bytes <= self.limit) =>
+            {
+                Ok(InMemoryFinalTaskPayloadAdmission { total, reserved })
+            }
+            _ => Err(McpError::invalid_params(
+                "In-memory final task payload byte capacity reached",
+            )),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        task_id: FinalTaskId,
+        replacement: InMemoryFinalTaskPayloadCharge,
+        admission: InMemoryFinalTaskPayloadAdmission,
+    ) {
+        self.records.insert(task_id, replacement);
+        self.total = admission.total;
+        self.reserved = admission.reserved;
+    }
+
+    fn release_handoff(&mut self, task_id: &FinalTaskId, initial: bool, accepted: bool) {
+        if let Some(charge) = self.records.get_mut(task_id) {
+            let mut released = 0;
+            if initial {
+                released += charge.initial_work;
+                charge.initial_work = 0;
+            }
+            if accepted {
+                released += charge.accepted_inputs;
+                charge.accepted_inputs = 0;
+            }
+            charge.total -= released;
+            self.total -= released;
+        }
+    }
+
+    fn release_task(&mut self, task_id: &FinalTaskId) {
+        if let Some(charge) = self.records.remove(task_id) {
+            self.total -= charge.total;
+            self.reserved -= charge.cancellation_reserve;
+        }
+    }
+}
+
+struct FinalTaskPayloadByteCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::io::Write for FinalTaskPayloadByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| std::io::Error::other("Final task payload byte limit exceeded"))?;
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn final_task_payload_bytes(
+    value: &(impl serde::Serialize + ?Sized),
+    limit: usize,
+    member: &str,
+) -> McpResult<usize> {
+    let mut counter = FinalTaskPayloadByteCounter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        McpError::invalid_params(format!("Final task {member} exceeds its encoded payload limit"))
+    })?;
+    Ok(counter.bytes)
+}
+
+/// Borrows both maps and serializes their prospective union without cloning
+/// retained input values. Replacement keys have the same semantics as extend.
+struct FinalTaskProspectiveInputs<'a> {
+    current: Option<&'a FinalTaskInputResponses>,
+    appended: &'a FinalTaskInputResponses,
+}
+
+impl serde::Serialize for FinalTaskProspectiveInputs<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(current) = self.current {
+            for (key, value) in current {
+                if !self.appended.contains_key(key) {
+                    map.serialize_entry(key, value)?;
+                }
+            }
+        }
+        for (key, value) in self.appended {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+fn prepare_in_memory_final_task_payload_charge(
+    task: &FinalTask,
+    notification: &FinalTaskStatusNotification,
+    descriptor: Option<&FinalTaskWorkDescriptor>,
+    initial_work_retained: bool,
+    accepted_input_bytes: usize,
+    input_key_history: Option<&InMemoryFinalTaskInputKeyHistory>,
+) -> McpResult<InMemoryFinalTaskPayloadCharge> {
+    let live = matches!(task, FinalTask::Working(_) | FinalTask::InputRequired { .. });
+    let metadata_limit = if live {
+        MAX_FINAL_TASK_METADATA_BYTES - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES
+    } else {
+        MAX_FINAL_TASK_METADATA_BYTES
+    };
+    final_task_payload_bytes(task.base(), metadata_limit, "metadata")?;
+    let outstanding_bytes = match task {
+        FinalTask::InputRequired { input_requests, .. } => {
+            final_task_payload_bytes(input_requests, MAX_FINAL_TASK_INPUT_BYTES, "input requests")?
+        }
+        FinalTask::Completed { result, .. } => {
+            final_task_payload_bytes(result, MAX_FINAL_TASK_RESULT_BYTES, "terminal result")?;
+            0
+        }
+        FinalTask::Failed { error, .. } => {
+            final_task_payload_bytes(error, MAX_FINAL_TASK_RESULT_BYTES, "terminal error")?;
+            0
+        }
+        FinalTask::Working(_) | FinalTask::Cancelled(_) => 0,
+    };
+    outstanding_bytes
+        .checked_add(accepted_input_bytes)
+        .filter(|bytes| *bytes <= MAX_FINAL_TASK_INPUT_BYTES)
+        .ok_or_else(|| {
+            McpError::invalid_params("Final task combined input payload limit exceeded")
+        })?;
+    let descriptor_bytes = descriptor
+        .map(|descriptor| {
+            final_task_payload_bytes(
+                descriptor.as_value(),
+                MAX_FINAL_TASK_DESCRIPTOR_BYTES,
+                "work descriptor",
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let task_bytes = final_task_payload_bytes(task, MAX_FINAL_TASK_APPLICATION_BYTES, "task")?;
+    let application_bytes = task_bytes
+        .checked_add(descriptor_bytes)
+        .and_then(|bytes| bytes.checked_add(accepted_input_bytes))
+        .filter(|bytes| *bytes <= MAX_FINAL_TASK_APPLICATION_BYTES)
+        .ok_or_else(|| {
+            McpError::invalid_params("Final task aggregate application payload limit exceeded")
+        })?;
+    let notification_limit = MAX_FINAL_TASK_APPLICATION_BYTES + MAX_FINAL_TASK_METADATA_BYTES
+        - if live {
+            FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES
+        } else {
+            0
+        };
+    let notification_bytes =
+        final_task_payload_bytes(notification, notification_limit, "notification")?;
+    let history_bytes = input_key_history
+        .map(|history| {
+            final_task_payload_bytes(
+                &history.keys,
+                MAX_FINAL_TASK_METADATA_BYTES,
+                "input key history",
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let initial_work_bytes = if initial_work_retained {
+        descriptor_bytes
+    } else {
+        0
+    };
+    let total = application_bytes
+        .checked_add(notification_bytes)
+        .and_then(|bytes| bytes.checked_add(initial_work_bytes))
+        .and_then(|bytes| bytes.checked_add(history_bytes))
+        .ok_or_else(|| {
+            McpError::invalid_params("Final task retained payload byte count overflow")
+        })?;
+    Ok(InMemoryFinalTaskPayloadCharge {
+        total,
+        initial_work: initial_work_bytes,
+        accepted_inputs: accepted_input_bytes,
+        cancellation_reserve: if live {
+            FINAL_TASK_CANCELLATION_RESERVE_BYTES
+        } else {
+            0
+        },
+    })
 }
 
 #[derive(Clone, Default)]
@@ -2287,9 +2562,22 @@ const IN_MEMORY_FINAL_TASK_HANDOFF_LEASE: StdDuration = StdDuration::from_secs(3
 const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
 
 impl InMemoryFinalTaskStore {
+    /// Default aggregate compact-JSON payload capacity: 64 MiB.
+    pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1_024 * 1_024;
+    /// Maximum configurable aggregate compact-JSON payload capacity: 512 MiB.
+    pub const HARD_MAX_PAYLOAD_BYTES: usize = 512 * 1_024 * 1_024;
+
     /// Creates a store with the system monotonic clock and bounded retention.
     pub fn new(max_tasks: usize) -> McpResult<Self> {
         Self::with_clock(max_tasks, Arc::new(Instant::now))
+    }
+
+    /// Creates a store with explicit task-count and encoded-payload capacities.
+    /// Payload capacity must be positive and at most 512 MiB. A smaller value
+    /// does not evict retained tasks; it rejects expanding writes atomically.
+    /// The capacity includes 34 bytes of cancellation headroom per live task.
+    pub fn with_payload_capacity(max_tasks: usize, max_payload_bytes: usize) -> McpResult<Self> {
+        Self::with_clock_and_payload_capacity(max_tasks, max_payload_bytes, Arc::new(Instant::now))
     }
 
     /// Creates a store with an application-supplied monotonic retention clock.
@@ -2299,16 +2587,60 @@ impl InMemoryFinalTaskStore {
         max_tasks: usize,
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> McpResult<Self> {
+        Self::with_clock_and_payload_capacity(max_tasks, Self::DEFAULT_MAX_PAYLOAD_BYTES, clock)
+    }
+
+    /// Creates a byte-bounded store with an application-supplied monotonic clock.
+    /// The clock has the same bounded, non-reentrant contract as [`Self::with_clock`].
+    pub fn with_clock_and_payload_capacity(
+        max_tasks: usize,
+        max_payload_bytes: usize,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> McpResult<Self> {
         if max_tasks == 0 {
             return Err(McpError::invalid_params(
                 "In-memory final task store capacity must be positive",
             ));
         }
+        if max_payload_bytes == 0 || max_payload_bytes > Self::HARD_MAX_PAYLOAD_BYTES {
+            return Err(McpError::invalid_params(
+                "In-memory final task payload capacity must be between 1 byte and 512 MiB",
+            ));
+        }
         Ok(Self {
             max_tasks,
             clock,
-            state: Mutex::new(InMemoryFinalTaskState::default()),
+            state: Mutex::new(InMemoryFinalTaskState {
+                payload_accounting: InMemoryFinalTaskPayloadAccounting {
+                    limit: max_payload_bytes,
+                    ..InMemoryFinalTaskPayloadAccounting::default()
+                },
+                ..InMemoryFinalTaskState::default()
+            }),
         })
+    }
+
+    /// Returns the configured compact-JSON payload capacity.
+    #[must_use]
+    pub fn max_payload_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .payload_accounting
+            .limit
+    }
+
+    /// Returns retained compact-JSON payload bytes after expiry reclamation.
+    /// Terminal tasks remain charged through their original retention deadline.
+    /// This reports payload bytes, excluding unused cancellation reservations.
+    #[must_use]
+    pub fn retained_payload_bytes(&self) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reclaim_expired_in_memory_final_tasks(&mut state, (self.clock)());
+        state.payload_accounting.total
     }
 
     /// Returns the configured maximum number of retained tasks.
@@ -2375,7 +2707,19 @@ impl InMemoryFinalTaskStore {
                 "In-memory final task store capacity reached",
             ));
         }
+        let payload_charge = prepare_in_memory_final_task_payload_charge(
+            &task,
+            &notification,
+            Some(&work_descriptor),
+            true,
+            0,
+            None,
+        )?;
+        let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
+        state
+            .payload_accounting
+            .commit(task_id.clone(), payload_charge, retained_payload_bytes);
         state
             .latest_notifications
             .insert(task_id.clone(), notification);
@@ -2430,7 +2774,19 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         let input_key_history = prepare_in_memory_final_task_input_key_history(None, None, &task)?;
+        let payload_charge = prepare_in_memory_final_task_payload_charge(
+            &task,
+            &notification,
+            None,
+            false,
+            0,
+            input_key_history.as_ref(),
+        )?;
+        let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
+        state
+            .payload_accounting
+            .commit(task_id.clone(), payload_charge, retained_payload_bytes);
         if let Some(history) = input_key_history {
             state.input_key_history.insert(task_id.clone(), history);
         }
@@ -3217,9 +3573,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             match kind {
                 InMemoryFinalTaskHandoffKind::Initial => {
                     state.initial_work.remove(task_id);
+                    state.payload_accounting.release_handoff(task_id, true, false);
                 }
                 InMemoryFinalTaskHandoffKind::Resumed => {
                     state.accepted_inputs.remove(task_id);
+                    state.payload_accounting.release_handoff(task_id, false, true);
                 }
             }
         }
@@ -3618,6 +3976,7 @@ fn record_in_memory_final_task_cancellation(
 
     state.accepted_inputs.remove(task_id);
     state.initial_work.remove(task_id);
+    state.payload_accounting.release_handoff(task_id, true, true);
     if !dispatch_elected {
         state.handoff_leases.remove(task_id);
     }
@@ -3651,11 +4010,43 @@ fn replace_in_memory_final_task(
         Some(current),
         &task,
     )?;
+    let accepted_input_bytes = match &input_mutation {
+        InMemoryFinalTaskInputMutation::Clear => 0,
+        InMemoryFinalTaskInputMutation::Append(input_responses) => {
+            let current_inputs = state.accepted_inputs.get(&task_id);
+            if input_responses.is_empty() && current_inputs.is_none() {
+                0
+            } else {
+                final_task_payload_bytes(
+                    &FinalTaskProspectiveInputs {
+                        current: current_inputs,
+                        appended: input_responses,
+                    },
+                    MAX_FINAL_TASK_INPUT_BYTES,
+                    "accepted input",
+                )?
+            }
+        }
+    };
+    let working = matches!(&task, FinalTask::Working(_));
+    let payload_charge = prepare_in_memory_final_task_payload_charge(
+        &task,
+        &notification,
+        state.work_descriptors.get(&task_id),
+        working && state.initial_work.contains_key(&task_id),
+        accepted_input_bytes,
+        input_key_history
+            .as_ref()
+            .or_else(|| state.input_key_history.get(&task_id)),
+    )?;
+    let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
     let generation = next_in_memory_final_task_generation(state)?;
+    state
+        .payload_accounting
+        .commit(task_id.clone(), payload_charge, retained_payload_bytes);
     if let Some(history) = input_key_history {
         state.input_key_history.insert(task_id.clone(), history);
     }
-    let working = matches!(&task, FinalTask::Working(_));
     let terminal = matches!(
         &task,
         FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
@@ -3750,6 +4141,7 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_task_ids {
+        state.payload_accounting.release_task(&task_id);
         state.expires_at.remove(&task_id);
         state.tasks.remove(&task_id);
         state.authenticated_principals.remove(&task_id);
@@ -8716,6 +9108,10 @@ mod tests {
                 "generation": state.generations.get(task_id),
                 "nextGeneration": state.next_generation,
                 "nextDispatchFence": state.next_dispatch_fence,
+                "payloadTotal": state.payload_accounting.total,
+                "payloadReserved": state.payload_accounting.reserved,
+                "payloadLimit": state.payload_accounting.limit,
+                "payloadCharges": state.payload_accounting.records,
                 "workDescriptor": state.work_descriptors.get(task_id).map(FinalTaskWorkDescriptor::as_value),
                 "initialWork": state.initial_work.get(task_id).map(FinalTaskWorkDescriptor::as_value),
                 "acceptedInputs": state.accepted_inputs.get(task_id),
@@ -8735,6 +9131,75 @@ mod tests {
             state.expires_at.get(task_id).copied(),
             lease.and_then(|lease| lease.recovery_expires_at),
         )
+    }
+
+    fn encoded_final_task_test_bytes(value: &impl serde::Serialize) -> usize {
+        serde_json::to_vec(value)
+            .expect("test payload serializes")
+            .len()
+    }
+
+    fn assert_final_task_payload_accounting(store: &InMemoryFinalTaskStore) {
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total = 0;
+        let mut reserved = 0;
+        for (task_id, task) in &state.tasks {
+            let mut actual = encoded_final_task_test_bytes(task)
+                + encoded_final_task_test_bytes(
+                    state
+                        .latest_notifications
+                        .get(task_id)
+                        .expect("retained notification"),
+                );
+            for descriptor in [
+                state.work_descriptors.get(task_id),
+                state.initial_work.get(task_id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                actual += encoded_final_task_test_bytes(descriptor.as_value());
+            }
+            if let Some(inputs) = state.accepted_inputs.get(task_id) {
+                actual += encoded_final_task_test_bytes(inputs);
+            }
+            if let Some(history) = state.input_key_history.get(task_id) {
+                actual += encoded_final_task_test_bytes(&history.keys);
+            }
+            assert_eq!(state.payload_accounting.records[task_id].total, actual);
+            let expected_reserve = if matches!(
+                task,
+                FinalTask::Working(_) | FinalTask::InputRequired { .. }
+            ) {
+                FINAL_TASK_CANCELLATION_RESERVE_BYTES
+            } else {
+                0
+            };
+            assert_eq!(
+                state.payload_accounting.records[task_id].cancellation_reserve,
+                expected_reserve,
+            );
+            reserved += expected_reserve;
+            total += actual;
+        }
+        assert_eq!(state.payload_accounting.records.len(), state.tasks.len());
+        assert_eq!(state.payload_accounting.total, total);
+        assert_eq!(state.payload_accounting.reserved, reserved);
+        assert!(total + reserved <= state.payload_accounting.limit);
+    }
+
+    fn final_roots_input_with_encoded_bytes(key: &str, bytes: usize) -> FinalTaskInputResponses {
+        let mut wire = serde_json::json!({
+            (key): {"roots": [{"uri": "file:///task-input", "name": ""}]}
+        });
+        let overhead = encoded_final_task_test_bytes(&wire);
+        wire[key]["roots"][0]["name"] = serde_json::Value::String("x".repeat(bytes - overhead));
+        let inputs = serde_json::from_value(wire).expect("typed roots input fixture");
+        assert_eq!(encoded_final_task_test_bytes(&inputs), bytes);
+        inputs
     }
 
     fn final_update_precommit_fixture(
@@ -9657,6 +10122,522 @@ mod tests {
                 .task,
             FinalTask::Working(_)
         ));
+    }
+
+    #[test]
+    fn task_02_final_payload_counter_counts_escaping_and_rejects_overflow() {
+        let value = serde_json::json!({"text": "quoted \"line\"\n雪", "items": [null, true, 1]});
+        let bytes = encoded_final_task_test_bytes(&value);
+        assert_eq!(final_task_payload_bytes(&value, bytes, "fixture").unwrap(), bytes);
+        assert!(final_task_payload_bytes(&value, bytes - 1, "fixture").is_err());
+        let mut counter = FinalTaskPayloadByteCounter { bytes: usize::MAX, limit: usize::MAX };
+        assert!(std::io::Write::write(&mut counter, b"x").is_err());
+        assert_eq!(counter.bytes, usize::MAX);
+        assert!(InMemoryFinalTaskStore::with_payload_capacity(1, 0).is_err());
+        assert!(InMemoryFinalTaskStore::with_payload_capacity(
+            1,
+            InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES + 1,
+        ).is_err());
+        assert_eq!(
+            InMemoryFinalTaskStore::with_payload_capacity(
+                1,
+                InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES,
+            ).unwrap().max_payload_bytes(),
+            InMemoryFinalTaskStore::HARD_MAX_PAYLOAD_BYTES,
+        );
+    }
+
+    #[test]
+    fn task_02_final_descriptor_payload_boundary_preserves_create_state() {
+        for authenticated in [false, true] {
+            let store = InMemoryFinalTaskStore::new(2).unwrap();
+            let task = final_working_task_with_ttl("task-descriptor-byte-boundary", 60_000);
+            let task_id = task.base().task_id.clone();
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            for excess in [1, 0] {
+                let descriptor = FinalTaskWorkDescriptor::new(serde_json::Value::String(
+                    "x".repeat(MAX_FINAL_TASK_DESCRIPTOR_BYTES - 2 + excess),
+                )).unwrap();
+                let result = if authenticated {
+                    store.create_task_with_authenticated_work(
+                        task.clone(), final_task_notification(&task), descriptor,
+                        Sha256Digest::from_bytes([11; 32]),
+                    )
+                } else {
+                    store.create_task_with_work(
+                        task.clone(),
+                        final_task_notification(&task),
+                        descriptor,
+                    )
+                };
+                if excess == 1 {
+                    assert!(result.is_err());
+                    assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                    assert_eq!(store.retained_payload_bytes(), 0);
+                } else {
+                    result.expect("an exactly bounded descriptor is accepted after rejection");
+                    assert!(store.get_task(&task_id).unwrap().is_some());
+                    assert_final_task_payload_accounting(&store);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_02_final_metadata_payload_boundary_preserves_create_state() {
+        let store = InMemoryFinalTaskStore::new(1).unwrap();
+        let FinalTask::Working(mut base) = final_working_task_without_ttl("task-metadata-boundary")
+        else {
+            unreachable!();
+        };
+        base.status_message = Some(String::new());
+        base.last_updated_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+        let overhead = encoded_final_task_test_bytes(&base);
+        let metadata_limit = MAX_FINAL_TASK_METADATA_BYTES
+            - FINAL_TASK_CANCELLATION_METADATA_RESERVE_BYTES;
+        let before = final_task_restoration_snapshot(&store, &base.task_id);
+        for excess in [1, 0] {
+            base.status_message = Some("x".repeat(metadata_limit - overhead + excess));
+            let task = FinalTask::Working(base.clone());
+            let result = store.create_task(task.clone(), final_task_notification(&task));
+            if excess == 1 {
+                assert!(result.is_err());
+                assert_eq!(final_task_restoration_snapshot(&store, &base.task_id), before);
+            } else {
+                result.expect("exactly bounded metadata creates through the bare store path");
+                assert_final_task_payload_accounting(&store);
+            }
+        }
+        let snapshot = store.get_task_snapshot(&base.task_id).unwrap().unwrap();
+        base.status = FinalTaskStatus::Cancelled;
+        base.last_updated_at = FinalTaskTimestamp::parse(
+            "2026-07-28T12:00:00.123456789+00:00",
+        ).unwrap();
+        assert_eq!(
+            encoded_final_task_test_bytes(&base),
+            MAX_FINAL_TASK_METADATA_BYTES,
+        );
+        let cancelled = FinalTask::Cancelled(base);
+        assert!(store.request_cancellation_and_clear_input_if_current(
+            &snapshot, cancelled.clone(), final_task_notification(&cancelled),
+        ).unwrap().is_some());
+        assert_final_task_payload_accounting(&store);
+    }
+
+    #[test]
+    fn task_02_final_partial_input_payload_aggregate_is_atomic() {
+        let (store, _now) = in_memory_store_with_test_clock(1);
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None).task.base().task_id.clone();
+        let requests: FinalTaskInputRequests = serde_json::from_value(serde_json::json!({
+            "left": {"method": "roots/list"}, "right": {"method": "roots/list"}
+        })).unwrap();
+        runtime.require_input(&task_id, requests, None).unwrap();
+        let right_requests: FinalTaskInputRequests = serde_json::from_value(serde_json::json!({
+            "right": {"method": "roots/list"}
+        })).unwrap();
+        let combined_overflow = final_roots_input_with_encoded_bytes(
+            "left",
+            MAX_FINAL_TASK_INPUT_BYTES - encoded_final_task_test_bytes(&right_requests) + 1,
+        );
+        let before_partial = final_task_restoration_snapshot(&store, &task_id);
+        assert!(runtime.update_task(&task_id, &combined_overflow).is_err());
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before_partial);
+        let left = final_roots_input_with_encoded_bytes("left", MAX_FINAL_TASK_INPUT_BYTES - 512);
+        runtime.update_task(&task_id, &left).expect("partial input is retained");
+        assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::InputRequired { .. })));
+        assert_final_task_payload_accounting(&store);
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        // Two single-entry object encodings combine by removing two braces
+        // and adding one comma, so the exact second-member budget is 513.
+        let oversized = final_roots_input_with_encoded_bytes("right", 514);
+        assert!(runtime.update_task(&task_id, &oversized).is_err());
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+        let right = final_roots_input_with_encoded_bytes("right", 513);
+        runtime.update_task(&task_id, &right).expect("exactly bounded merged input resumes work");
+        assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Working(_))));
+        assert_final_task_payload_accounting(&store);
+        let retained = store.state.lock().unwrap().accepted_inputs[&task_id].clone();
+        assert_eq!(encoded_final_task_test_bytes(&retained), MAX_FINAL_TASK_INPUT_BYTES);
+    }
+
+    #[test]
+    fn task_02_final_outstanding_input_payload_boundary_preserves_work() {
+        let (store, _now) = in_memory_store_with_test_clock(1);
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task.base().task_id.clone();
+        let mut wire = serde_json::json!({
+            "sample": {
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 16, "systemPrompt": ""}
+            }
+        });
+        let empty: FinalTaskInputRequests = serde_json::from_value(wire.clone()).unwrap();
+        let overhead = encoded_final_task_test_bytes(&empty);
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        for excess in [1, 0] {
+            wire["sample"]["params"]["systemPrompt"] = serde_json::Value::String(
+                "x".repeat(MAX_FINAL_TASK_INPUT_BYTES - overhead + excess),
+            );
+            let requests: FinalTaskInputRequests = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(
+                encoded_final_task_test_bytes(&requests),
+                MAX_FINAL_TASK_INPUT_BYTES + excess,
+            );
+            let result = runtime.require_input(&task_id, requests, None);
+            if excess == 1 {
+                assert!(result.is_err());
+                assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+            } else {
+                assert!(matches!(result.unwrap(), FinalTask::InputRequired { .. }));
+                assert_final_task_payload_accounting(&store);
+            }
+        }
+    }
+
+    #[test]
+    fn task_02_final_terminal_payload_boundaries_preserve_fenced_state() {
+        for failed in [false, true] {
+            let (store, _now) = in_memory_store_with_test_clock(1);
+            let task = final_working_task_with_ttl("task-result-byte-boundary", 60_000);
+            let task_id = task.base().task_id.clone();
+            store
+                .create_task_with_work(
+                    task.clone(),
+                    final_task_notification(&task),
+                    final_test_work_descriptor(),
+                )
+                .unwrap();
+            let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "result-owner")
+                .unwrap()
+                .unwrap();
+            let fence = store
+                .begin_handoff_dispatch_for_owner_if_current(
+                    &task_id,
+                    snapshot.generation(),
+                    "result-owner",
+                )
+                .unwrap()
+                .unwrap();
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            let empty = if failed {
+                serde_json::json!({"code": -32000, "message": ""})
+            } else {
+                serde_json::json!({"content": [{"type": "text", "text": ""}]})
+            };
+            let overhead = encoded_final_task_test_bytes(&empty);
+            for excess in [1, 0] {
+                let mut wire = empty.clone();
+                let padding = serde_json::Value::String(
+                    "x".repeat(MAX_FINAL_TASK_RESULT_BYTES - overhead + excess),
+                );
+                let replacement = if failed {
+                    wire["message"] = padding;
+                    FinalTask::Failed {
+                        base: transition_terminal_final_task_base(
+                            task.base().clone(),
+                            FinalTaskStatus::Failed,
+                            None,
+                        )
+                        .unwrap(),
+                        error: serde_json::from_value(wire).unwrap(),
+                    }
+                } else {
+                    wire["content"][0]["text"] = padding;
+                    FinalTask::Completed {
+                        base: transition_terminal_final_task_base(
+                            task.base().clone(),
+                            FinalTaskStatus::Completed,
+                            None,
+                        )
+                        .unwrap(),
+                        result: serde_json::from_value(wire).unwrap(),
+                    }
+                };
+                let result = store.replace_task_and_clear_input_for_handoff_if_current(
+                    &snapshot, "result-owner", fence, false,
+                    replacement.clone(), final_task_notification(&replacement),
+                );
+                if excess == 1 {
+                    assert!(result.is_err());
+                    assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+                } else {
+                    assert!(
+                        result.expect("exact terminal member is committed by its fenced owner")
+                    );
+                    assert!(store.retained_payload_bytes() >= 2 * MAX_FINAL_TASK_RESULT_BYTES);
+                    assert_final_task_payload_accounting(&store);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_02_final_payload_capacity_charges_notifications_deltas_and_terminal_retention() {
+        let task = final_working_task_with_ttl("task-payload-capacity", 1_000);
+        let task_id = task.base().task_id.clone();
+        let descriptor = final_test_work_descriptor();
+        let descriptor_bytes = encoded_final_task_test_bytes(descriptor.as_value());
+        let FinalTask::Working(mut grown_base) = task.clone() else { unreachable!() };
+        grown_base.status_message = Some("x".repeat(2_048));
+        let grown = FinalTask::Working(grown_base.clone());
+        let limit = encoded_final_task_test_bytes(&grown)
+            + encoded_final_task_test_bytes(&final_task_notification(&grown))
+            + 2 * descriptor_bytes
+            + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
+        let insufficient = InMemoryFinalTaskStore::with_payload_capacity(2, limit - 1).unwrap();
+        let before = final_task_restoration_snapshot(&insufficient, &task_id);
+        assert!(insufficient.create_task_with_work(
+            grown.clone(), final_task_notification(&grown), descriptor.clone(),
+        ).is_err());
+        assert_eq!(final_task_restoration_snapshot(&insufficient, &task_id), before);
+
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock = Arc::clone(&now);
+        let store = InMemoryFinalTaskStore::with_clock_and_payload_capacity(
+            2, limit, Arc::new(move || *clock.lock().unwrap()),
+        ).unwrap();
+        store
+            .create_task_with_work(task.clone(), final_task_notification(&task), descriptor.clone())
+            .unwrap();
+        let initial = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        assert!(
+            store
+                .replace_task_if_current(&initial, grown.clone(), final_task_notification(&grown))
+                .unwrap()
+        );
+        assert_eq!(store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES, limit);
+        assert_final_task_payload_accounting(&store);
+        let current = store.get_task_snapshot(&task_id).unwrap().unwrap();
+        let before = final_task_restoration_snapshot(&store, &task_id);
+        grown_base.status_message.as_mut().unwrap().push('x');
+        let oversized = FinalTask::Working(grown_base);
+        assert!(
+            store
+                .replace_task_if_current(
+                    &current,
+                    oversized.clone(),
+                    final_task_notification(&oversized),
+                )
+                .is_err()
+        );
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+
+        let other = final_working_task_with_ttl("task-payload-sibling", 1_000);
+        assert!(store.create_task(other.clone(), final_task_notification(&other)).is_err());
+        assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+        let completed = FinalTask::Completed {
+            base: transition_terminal_final_task_base(
+                task.base().clone(),
+                FinalTaskStatus::Completed,
+                None,
+            )
+            .unwrap(),
+            result: serde_json::from_value(serde_json::json!({"content": []})).unwrap(),
+        };
+        assert!(
+            store
+                .replace_task_if_current(
+                    &current,
+                    completed.clone(),
+                    final_task_notification(&completed),
+                )
+                .unwrap()
+        );
+        let terminal_bytes = encoded_final_task_test_bytes(&completed)
+            + encoded_final_task_test_bytes(&final_task_notification(&completed))
+            + descriptor_bytes;
+        assert_eq!(store.retained_payload_bytes(), terminal_bytes);
+        store.create_task(other.clone(), final_task_notification(&other))
+            .expect("shrinking a replacement releases aggregate capacity");
+        assert_final_task_payload_accounting(&store);
+        assert!(store.retained_payload_bytes() > terminal_bytes);
+
+        *now.lock().unwrap() += StdDuration::from_millis(1_000);
+        assert_eq!(store.retained_payload_bytes(), 0);
+        assert_eq!(store.retained_payload_bytes(), 0, "expiry releases each charge once");
+        assert_eq!(store.task_count(), 0);
+        assert_final_task_payload_accounting(&store);
+        store.create_task_with_work(grown.clone(), final_task_notification(&grown), descriptor)
+            .expect("expiry allows the full encoded capacity to be reused");
+        assert_eq!(store.retained_payload_bytes() + FINAL_TASK_CANCELLATION_RESERVE_BYTES, limit);
+        assert_final_task_payload_accounting(&store);
+    }
+
+    #[test]
+    fn task_02_final_handoff_completion_and_cancellation_release_only_consumed_payload() {
+        for resumed in [false, true] {
+            for cancel in [false, true] {
+                let (store, _now) = in_memory_store_with_test_clock(1);
+                let runtime =
+                    final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+                let (task_id, released) = if resumed {
+                    let inputs = final_roots_input_with_encoded_bytes("roots", 512);
+                    (create_accepted_final_input(&runtime, inputs), 512)
+                } else {
+                    let created = create_final_task_state_fixture(&runtime, None);
+                    (
+                        created.task.base().task_id.clone(),
+                        encoded_final_task_test_bytes(final_test_work_descriptor().as_value()),
+                    )
+                };
+                let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                if resumed {
+                    store
+                        .take_input_handoff_for_owner_if_current(&snapshot, "payload-owner")
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&snapshot, "payload-owner")
+                        .unwrap()
+                        .unwrap();
+                }
+                let fence = store.begin_handoff_dispatch_for_owner_if_current(
+                    &task_id, snapshot.generation(), "payload-owner",
+                ).unwrap().unwrap();
+                let before = store.retained_payload_bytes();
+                if cancel {
+                    assert!(store.request_cancellation_if_current(&snapshot).unwrap());
+                    assert!(store.request_cancellation_if_current(&snapshot).unwrap());
+                } else {
+                    assert!(store.finish_handoff_dispatch_for_owner_if_current(
+                        &task_id, snapshot.generation(), "payload-owner", fence,
+                    ).unwrap());
+                    assert!(!store.finish_handoff_dispatch_for_owner_if_current(
+                        &task_id, snapshot.generation(), "payload-owner", fence,
+                    ).unwrap());
+                }
+                assert_eq!(store.retained_payload_bytes(), before - released);
+                assert!(store.get_task(&task_id).unwrap().is_some());
+                assert!(store.state.lock().unwrap().work_descriptors.contains_key(&task_id));
+                assert_final_task_payload_accounting(&store);
+            }
+        }
+    }
+
+    #[test]
+    fn task_02_final_full_payload_capacity_preserves_cancellation_retirement() {
+        let mut task = final_working_task_with_ttl("task-full-cancel", 60_000);
+        if let FinalTask::Working(base) = &mut task {
+            base.last_updated_at = FinalTaskTimestamp::parse("2026-07-28T12:00:00Z").unwrap();
+        }
+        let task_id = task.base().task_id.clone();
+        let initial_bytes = encoded_final_task_test_bytes(&task)
+            + encoded_final_task_test_bytes(&final_task_notification(&task));
+        for maximum_timestamp in [false, true] {
+            let store = Arc::new(InMemoryFinalTaskStore::with_payload_capacity(
+                1,
+                initial_bytes + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+            ).unwrap());
+            store.create_task(task.clone(), final_task_notification(&task)).unwrap();
+            if maximum_timestamp {
+                let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+                let mut base = task.base().clone();
+                base.status = FinalTaskStatus::Cancelled;
+                base.last_updated_at = FinalTaskTimestamp::parse(
+                    "2026-07-28T12:00:00.123456789+00:00",
+                ).unwrap();
+                let cancelled = FinalTask::Cancelled(base);
+                assert!(store.request_cancellation_and_clear_input_if_current(
+                    &snapshot, cancelled.clone(), final_task_notification(&cancelled),
+                ).unwrap().is_some());
+                assert_eq!(store.retained_payload_bytes(), initial_bytes + 34);
+            } else {
+                let runtime =
+                    final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+                runtime
+                    .cancel_task(&task_id)
+                    .expect("cancellation can grow its control fields at capacity");
+                assert!(store.retained_payload_bytes() > initial_bytes);
+            }
+            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Cancelled(_))));
+            assert_final_task_payload_accounting(&store);
+        }
+
+        for expiry_retirement in [false, true] {
+            let mut sibling = final_working_task_with_ttl("task-full-cancel-sibling", 60_000);
+            if let FinalTask::Working(base) = &mut sibling {
+                base.status_message = Some("x".repeat(256));
+            }
+            let sibling_id = sibling.base().task_id.clone();
+            let sibling_charge = encoded_final_task_test_bytes(&sibling)
+                + encoded_final_task_test_bytes(&final_task_notification(&sibling))
+                + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
+            let descriptor = FinalTaskWorkDescriptor::new(serde_json::Value::String(
+                "x".repeat(sibling_charge - 2),
+            )).unwrap();
+            let capacity =
+                initial_bytes + 2 * sibling_charge + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = Arc::clone(&now);
+            let store = Arc::new(InMemoryFinalTaskStore::with_clock_and_payload_capacity(
+                2, capacity, Arc::new(move || *clock.lock().unwrap()),
+            ).unwrap());
+            store
+                .create_task_with_work(task.clone(), final_task_notification(&task), descriptor)
+                .unwrap();
+            let snapshot = store.get_task_snapshot(&task_id).unwrap().unwrap();
+            store
+                .take_initial_work_handoff_for_owner_if_current(&snapshot, "cancel-owner")
+                .unwrap()
+                .unwrap();
+            let fence = store.begin_handoff_dispatch_for_owner_if_current(
+                &task_id, snapshot.generation(), "cancel-owner",
+            ).unwrap().unwrap();
+            let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+            runtime.cancel_task(&task_id).unwrap();
+            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Working(_))));
+            store.create_task(sibling.clone(), final_task_notification(&sibling))
+                .expect("the sibling may use the released initial descriptor bytes");
+            assert_eq!(
+                store.retained_payload_bytes() + 2 * FINAL_TASK_CANCELLATION_RESERVE_BYTES,
+                capacity,
+            );
+            let sibling_before = store.get_task_snapshot(&sibling_id).unwrap().unwrap();
+            let sibling_notification =
+                serde_json::to_value(store.latest_notification(&sibling_id)).unwrap();
+            let mut pressure = sibling.clone();
+            if let FinalTask::Working(base) = &mut pressure {
+                base.status_message.as_mut().unwrap().push('x');
+            }
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &sibling_before,
+                        pressure.clone(),
+                        final_task_notification(&pressure),
+                    )
+                    .is_err(),
+                "a sibling cannot consume even two bytes of reserved cancellation capacity",
+            );
+            if expiry_retirement {
+                *now.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+            } else {
+                let cancelled = FinalTask::Cancelled(transition_terminal_final_task_base(
+                    task.base().clone(), FinalTaskStatus::Cancelled, None,
+                ).unwrap());
+                assert!(store.replace_task_and_clear_input_for_handoff_if_current(
+                    &snapshot, "cancel-owner", fence, true,
+                    cancelled.clone(), final_task_notification(&cancelled),
+                ).unwrap());
+            }
+            assert!(matches!(store.get_task(&task_id).unwrap(), Some(FinalTask::Cancelled(_))));
+            let sibling_after = store.get_task_snapshot(&sibling_id).unwrap().unwrap();
+            assert_eq!(sibling_before.generation(), sibling_after.generation());
+            assert_eq!(
+                serde_json::to_value(sibling_before.task()).unwrap(),
+                serde_json::to_value(sibling_after.task()).unwrap(),
+            );
+            assert_eq!(
+                serde_json::to_value(store.latest_notification(&sibling_id)).unwrap(),
+                sibling_notification,
+            );
+            assert_final_task_payload_accounting(&store);
+        }
     }
 
     #[test]

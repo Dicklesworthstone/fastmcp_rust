@@ -107,10 +107,7 @@ impl ManagedTasksClient {
         ids: ManagedTaskRequestIds,
     ) -> Result<TaskResumeReconciliation, TaskResumeReconciliationError> {
         self.session.check(cx, cancellation).map_err(ManagedTasksError::from)?;
-        let now = wall_now();
-        admit_record(record, current, self.session.resource().as_str(), now)?;
-        let remaining = record.retain_until.checked_sub(now).ok_or(TaskResumeError::Unavailable)?;
-        let retention_deadline = cx.now().saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
+        let retention_deadline = resume_read_deadline(cx, current, record, self.session.resource().as_str())?;
         let deadline = retention_deadline.min(deadline_after(cx, self.limits.timeout).map_err(ManagedTasksError::from)?);
         let observed = self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(async {
@@ -144,6 +141,22 @@ impl ManagedTasksClient {
         record.admit(cx, current)?;
         Ok(outcome)
     }
+}
+
+// Authentication-independent retention admission shared by managed and machine
+// restart. Return a monotonic bound once; later wall-clock rollback cannot
+// extend the read. Stored records never choose the configured endpoint.
+pub(crate) fn resume_read_deadline(
+    cx: &Cx,
+    current: &TaskResumeBinding,
+    record: &TaskResumeRecord,
+    resource: &str,
+) -> Result<asupersync::types::Time, TaskResumeError> {
+    super::checkpoint(cx)?;
+    let now = wall_now();
+    admit_record(record, current, resource, now)?;
+    let remaining = record.retain_until.checked_sub(now).ok_or(TaskResumeError::Unavailable)?;
+    Ok(cx.now().saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX)))
 }
 
 fn admit_record(

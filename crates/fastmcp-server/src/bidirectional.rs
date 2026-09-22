@@ -1243,6 +1243,40 @@ impl MrtrInputRequest {
         self.kind
     }
 
+    /// Checks accepted final elicitation data against the exact descriptor
+    /// retained at issuance. A client-side form resolver is not a trust
+    /// boundary for server handlers receiving an arbitrary peer's retry.
+    fn validate_response(&self, response: &MrtrInputResponse) -> McpResult<()> {
+        let Some(MrtrInputParams::FinalElicitation(params)) = &self.params else {
+            return Ok(());
+        };
+        if response.value.get("action").and_then(serde_json::Value::as_str) != Some("accept") {
+            // Decline/cancel content is a schema-valid peer SHOULD deviation.
+            // It is not accepted form data and must not be checked against the
+            // requested schema.
+            return Ok(());
+        }
+        match params {
+            fastmcp_protocol::FinalEmbeddedElicitationParams::Form(params) => {
+                let content = response
+                    .value
+                    .get("content")
+                    .filter(|content| content.is_object())
+                    .ok_or_else(|| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?;
+                params
+                    .requested_schema
+                    .validate(content)
+                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))
+            }
+            fastmcp_protocol::FinalEmbeddedElicitationParams::Url(_) => {
+                if response.value.get("content").is_some() {
+                    return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Decodes one handler-declared embedded input descriptor.
     ///
     /// Only the three final MRTR methods are admitted. In particular, a
@@ -1414,6 +1448,13 @@ impl MrtrInputResponse {
     }
 
     fn from_wire(kind: MrtrInputKind, value: serde_json::Value) -> McpResult<Self> {
+        if kind == MrtrInputKind::Elicitation
+            && value.get("content").is_some_and(|content| !content.is_object())
+        {
+            // Preserve absent versus explicitly null before the legacy-shaped
+            // handler value's Option decoder can collapse those wire states.
+            return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
+        }
         let response = match kind {
             MrtrInputKind::Elicitation => Self::elicitation(
                 serde_json::from_value(value)
@@ -1809,8 +1850,9 @@ struct MrtrExchangeState {
 /// Process-local, one-use final MRTR request-state storage.
 ///
 /// A record owns the exact key-to-response-kind ledger for the inputs it
-/// emitted. The opaque state is random, expires, cannot be replayed after a
-/// successful retry, and is invalidated when its owning request is cancelled.
+/// emitted, including each final elicitation's mode and admitted form schema.
+/// The opaque state is random, expires, cannot be replayed after a successful
+/// retry, and is invalidated when its owning request is cancelled.
 pub struct MrtrExchangeRegistry {
     state: Mutex<MrtrExchangeState>,
     max_states: usize,
@@ -1915,8 +1957,10 @@ impl MrtrExchangeRegistry {
     ///
     /// Unknown keys are inert and ignored after bounded structural admission.
     /// Every recognized key must carry the exact response kind recorded when
-    /// it was issued. Partial maps are accepted and yield a fresh state with
-    /// only unsatisfied descriptors.
+    /// it was issued. Accepted final elicitation content must also satisfy its
+    /// retained mode and form schema before any response in the map is stored.
+    /// Partial maps are accepted and yield a fresh state with only unsatisfied
+    /// descriptors.
     ///
     /// # Errors
     ///
@@ -2264,6 +2308,11 @@ impl MrtrExchangeRegistry {
                 if expected_kind != response.kind() {
                     return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
                 }
+                let request = exchange
+                    .requests
+                    .get(key)
+                    .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_ERROR))?;
+                request.validate_response(response)?;
                 if accepted_responses.append_accepted_if_absent(key, response) {
                     made_progress = true;
                 }
@@ -2658,6 +2707,228 @@ mod tests {
             "model": "test-model",
         }))
         .expect("final sampling result with tool use must admit")
+    }
+
+    #[test]
+    fn mrtr_form_content_rejection_preserves_the_entire_pending_batch() {
+        let registry = MrtrExchangeRegistry::new();
+        let required = registry
+            .issue(
+                McpRequestCancellation::new(),
+                MrtrInputRequests::new([
+                    (
+                        "form".to_owned(),
+                        MrtrInputRequest::final_elicitation(final_form_elicitation_params())
+                            .expect("form request admits"),
+                    ),
+                    ("roots".to_owned(), MrtrInputRequest::roots()),
+                ])
+                .expect("two input requests admit"),
+            )
+            .expect("form and roots exchange issues");
+        let state = mrtr_state_from_wire(&required);
+        for invalid in [
+            serde_json::json!({"action": "accept"}),
+            serde_json::json!({"action": "accept", "content": {}}),
+            serde_json::json!({"action": "accept", "content": {"displayName": true}}),
+            serde_json::json!({"action": "accept", "content": {"displayName": ""}}),
+            serde_json::json!({"action": "accept", "content": null}),
+            serde_json::json!({"action": "accept", "content": "private-invalid-answer"}),
+        ] {
+            let invalid = MrtrInputResponses::new([
+                // This earlier sibling must not be committed when the form
+                // later in the same typed batch fails admission.
+                ("roots".to_owned(), mrtr_roots_response()),
+                (
+                    "form".to_owned(),
+                    MrtrInputResponse {
+                        kind: MrtrInputKind::Elicitation,
+                        value: invalid,
+                    },
+                ),
+            ])
+            .expect("typed map preserves response order");
+            let error = registry
+                .accept(&state, invalid)
+                .expect_err("unaccepted form content cannot consume an exchange");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, MRTR_RESPONSE_KIND_ERROR);
+            assert_eq!(registry.active_len(), 1);
+        }
+
+        let accepted = MrtrInputResponse::elicitation(fastmcp_protocol::ElicitResult::accept(
+            HashMap::from([(
+                "displayName".to_owned(),
+                fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
+            )]),
+        ))
+        .expect("valid form response encodes");
+        let partial = registry
+            .accept(
+                &state,
+                MrtrInputResponses::new([("form".to_owned(), accepted)])
+                    .expect("one valid form response"),
+            )
+            .expect("original state accepts a corrected form");
+        let MrtrRetry::InputRequired(partial) = partial else {
+            panic!("the roots sibling from rejected batches must still be pending");
+        };
+        assert_eq!(partial.input_requests().expect("roots remain").len(), 1);
+        assert!(
+            partial
+                .input_requests()
+                .expect("roots remain")
+                .get("roots")
+                .is_some()
+        );
+        let successor = mrtr_state_from_wire(&partial);
+        let complete = registry
+            .accept_wire(
+                &successor,
+                &BTreeMap::from([
+                    // The previously accepted key is now inert. Its original
+                    // accepted value must survive a later changed duplicate.
+                    (
+                        "form".to_owned(),
+                        serde_json::json!({"action": "accept", "content": {}}),
+                    ),
+                    ("roots".to_owned(), serde_json::json!({"roots": []})),
+                ]),
+            )
+            .expect("the outstanding roots response completes the successor");
+        let MrtrRetry::Complete(complete) = complete else {
+            panic!("all requested inputs are now answered");
+        };
+        let form = complete
+            .elicitation("form")
+            .expect("typed form response")
+            .expect("form exists");
+        assert_eq!(
+            form.content.expect("accepted form content")["displayName"],
+            fastmcp_protocol::ElicitContentValue::String("Ada".to_owned())
+        );
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_url_acceptance_rejects_content_without_consuming_retry_state() {
+        let registry = MrtrExchangeRegistry::new();
+        let required = registry
+            .issue(
+                McpRequestCancellation::new(),
+                MrtrInputRequests::new([(
+                    "url".to_owned(),
+                    MrtrInputRequest::final_elicitation(final_url_elicitation_params())
+                        .expect("URL request admits"),
+                )])
+                .expect("one URL input"),
+            )
+            .expect("URL exchange issues");
+        let state = mrtr_state_from_wire(&required);
+        for content in [
+            serde_json::json!({}),
+            serde_json::json!({"private": "do-not-echo"}),
+            serde_json::Value::Null,
+        ] {
+            let error = registry
+                .accept_wire(
+                    &state,
+                    &BTreeMap::from([(
+                        "url".to_owned(),
+                        serde_json::json!({"action": "accept", "content": content}),
+                    )]),
+                )
+                .expect_err("accepted URL responses cannot carry form content");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, MRTR_RESPONSE_KIND_ERROR);
+            assert_eq!(registry.active_len(), 1);
+        }
+        let completed = registry
+            .accept_wire(
+                &state,
+                &BTreeMap::from([(
+                    "url".to_owned(),
+                    serde_json::json!({"action": "accept"}),
+                )]),
+            )
+            .expect("content-free URL acceptance uses the original state");
+        let MrtrRetry::Complete(completed) = completed else {
+            panic!("URL acceptance completes the single-input exchange");
+        };
+        let response = completed
+            .elicitation("url")
+            .expect("URL response decodes")
+            .expect("URL response exists");
+        assert_eq!(response.action, fastmcp_protocol::ElicitAction::Accept);
+        assert!(response.content.is_none());
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_decline_and_cancel_do_not_apply_accepted_form_schema_rules() {
+        for params in [
+            final_form_elicitation_params(),
+            final_url_elicitation_params(),
+        ] {
+            for action in ["decline", "cancel"] {
+                let registry = MrtrExchangeRegistry::new();
+                let required = registry
+                    .issue(
+                        McpRequestCancellation::new(),
+                        MrtrInputRequests::new([(
+                            "input".to_owned(),
+                            MrtrInputRequest::final_elicitation(params.clone())
+                                .expect("request admits"),
+                        )])
+                        .expect("one elicitation input"),
+                    )
+                    .expect("elicitation exchange issues");
+                let state = mrtr_state_from_wire(&required);
+                for invalid_content in [serde_json::Value::Null, serde_json::json!([])] {
+                    assert!(
+                        registry
+                            .accept_wire(
+                                &state,
+                                &BTreeMap::from([(
+                                    "input".to_owned(),
+                                    serde_json::json!({"action": action, "content": invalid_content}),
+                                )]),
+                            )
+                            .is_err(),
+                        "present content must still be an object"
+                    );
+                    assert_eq!(registry.active_len(), 1);
+                }
+                let complete = registry
+                    .accept_wire(
+                        &state,
+                        &BTreeMap::from([(
+                            "input".to_owned(),
+                            // Structurally valid content, deliberately invalid
+                            // for the form contract, remains an accepted peer
+                            // SHOULD deviation for a non-accept action.
+                            serde_json::json!({"action": action, "content": {"displayName": false}}),
+                        )]),
+                    )
+                    .expect("decline/cancel need no accepted form content");
+                let MrtrRetry::Complete(complete) = complete else {
+                    panic!("decline/cancel answers the single input");
+                };
+                let response = complete
+                    .elicitation("input")
+                    .expect("response decodes")
+                    .expect("response exists");
+                assert_eq!(
+                    response.action,
+                    if action == "decline" {
+                        fastmcp_protocol::ElicitAction::Decline
+                    } else {
+                        fastmcp_protocol::ElicitAction::Cancel
+                    }
+                );
+                assert_eq!(registry.active_len(), 0);
+            }
+        }
     }
 
     #[test]

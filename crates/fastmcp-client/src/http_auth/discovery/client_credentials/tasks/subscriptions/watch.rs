@@ -13,6 +13,8 @@ pub mod cancellation;
 pub mod drive;
 /// Opt-in bounded observation recovery and natural credential renewal.
 pub mod recovery;
+/// Read-only reconciliation and bounded restart of protected Task checkpoints.
+pub mod resume;
 
 use std::collections::VecDeque;
 use std::fmt;
