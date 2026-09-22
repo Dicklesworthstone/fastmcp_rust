@@ -3755,6 +3755,131 @@ fn json_schema_enum_description() {
     assert_eq!(schema["description"], "Status with mixed variants.");
 }
 
+/// Every default Serde enum representation must survive schema admission.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum WireEnum {
+    Idle,
+    Message(String),
+    Pair(String, u32),
+    Record {
+        /// Required work count.
+        count: u32,
+        label: Option<String>,
+    },
+    EmptyTuple(),
+    EmptyRecord {},
+}
+
+#[test]
+fn json_schema_external_enum_accepts_actual_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(WireEnum::json_schema())
+        .expect("derived enum is a valid final-dialect schema");
+    for value in [
+        WireEnum::Idle,
+        WireEnum::Message("hello".to_owned()),
+        WireEnum::Pair("work".to_owned(), 3),
+        WireEnum::Record {
+            count: 3,
+            label: None,
+        },
+        WireEnum::Record {
+            count: 3,
+            label: Some("work".to_owned()),
+        },
+        WireEnum::EmptyTuple(),
+        WireEnum::EmptyRecord {},
+    ] {
+        let encoded = serde_json::to_value(&value).expect("enum serializes");
+        schema
+            .validate(&encoded)
+            .expect("actual Serde payload must be admitted");
+        assert_eq!(
+            serde_json::from_str::<WireEnum>(&serde_json::to_string(&value).unwrap()).unwrap(),
+            value
+        );
+    }
+    schema
+        .validate(&json!({"Record": {"count": 3}}))
+        .expect("omitted Option field stays optional inside a variant");
+    assert!(schema.schema()["oneOf"][4]["properties"]["EmptyTuple"]
+        .get("prefixItems")
+        .is_none());
+    assert_eq!(
+        schema.schema()["oneOf"][3]["properties"]["Record"]["properties"]["count"]["description"],
+        "Required work count."
+    );
+}
+
+#[test]
+fn json_schema_external_enum_rejects_wrong_tags_and_payload_shapes() {
+    let schema = fastmcp_rust::schema::admit_final_schema(WireEnum::json_schema()).unwrap();
+    // Serde accepts this alternate unit representation on input, but emits a
+    // string. The generated schema describes its canonical serialized form.
+    assert!(schema.validate(&json!({"Idle": null})).is_err());
+    for invalid in [
+        json!("Unknown"),
+        json!({"Message": 3}),
+        json!({"Message": "hello", "extra": true}),
+        json!({"Message": "hello", "Pair": ["work", 3]}),
+        json!({"Pair": {}}),
+        json!({"Pair": ["work"]}),
+        json!({"Pair": ["work", 3, 4]}),
+        json!({"Pair": [3, "work"]}),
+        json!({"Record": {}}),
+        json!({"Record": {"count": "three"}}),
+        json!({"Record": {"count": 3, "label": false}}),
+        json!({"EmptyTuple": {}}),
+        json!({"EmptyTuple": [1]}),
+        json!({"EmptyRecord": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<WireEnum>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[tool]
+fn describe_wire_enum(value: WireEnum) -> String {
+    format!("{value:?}")
+}
+
+#[test]
+fn json_schema_external_enum_reaches_registered_modern_tool() {
+    let server = Server::new("enum-schema", "1.0.0")
+        .tool(DescribeWireEnum)
+        .build();
+    let connection = ModernConnection::new();
+    for value in [
+        json!("Idle"),
+        json!({"Pair": ["work", 3]}),
+        json!({"Record": {"count": 3}}),
+    ] {
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "describe_wire_enum",
+                "arguments": {"value": value},
+            })),
+            64_i64,
+        );
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request)
+            .expect("registered enum tool produces a response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.expect("enum tool produced a result");
+        assert_eq!(result["resultType"], "complete");
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()));
+    }
+}
+
 // --- Struct with only description, no fields ---
 
 /// A marker struct.

@@ -6041,7 +6041,12 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
 
 /// Generates JSON Schema for a struct.
 fn generate_struct_schema(data: &syn::DataStruct, type_desc_tokens: &TokenStream2) -> TokenStream2 {
-    match &data.fields {
+    generate_fields_schema(&data.fields, type_desc_tokens)
+}
+
+/// Shares field constraints between structs and externally tagged enum payloads.
+fn generate_fields_schema(fields: &syn::Fields, type_desc_tokens: &TokenStream2) -> TokenStream2 {
+    match fields {
         syn::Fields::Named(fields) => {
             let mut property_entries = Vec::new();
             let mut required_fields = Vec::new();
@@ -6119,8 +6124,11 @@ fn generate_struct_schema(data: &syn::DataStruct, type_desc_tokens: &TokenStream
             }
         }
         syn::Fields::Unnamed(fields) => {
-            // Tuple struct - generate as array
-            if fields.unnamed.len() == 1 {
+            if fields.unnamed.is_empty() {
+                // Draft 2020-12 requires a nonempty prefixItems array when
+                // present; an empty tuple is bounded without that keyword.
+                quote! { serde_json::json!({ "type": "array", "maxItems": 0 }) }
+            } else if fields.unnamed.len() == 1 {
                 // Newtype pattern - just use inner type's schema
                 let inner_type = &fields.unnamed.first().unwrap().ty;
                 let inner_schema = type_to_json_schema(inner_type);
@@ -6183,7 +6191,8 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
             }
         }
     } else {
-        // Tagged union - use oneOf
+        // Serde's default external tagging encodes unit variants as strings and
+        // payload variants as objects containing exactly one variant key.
         let variant_schemas: Vec<TokenStream2> = data
             .variants
             .iter()
@@ -6193,36 +6202,22 @@ fn generate_enum_schema(data: &syn::DataEnum, type_desc_tokens: &TokenStream2) -
                     syn::Fields::Unit => {
                         quote! {
                             serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    #variant_name: { "type": "null" }
-                                },
-                                "required": [#variant_name]
+                                "type": "string",
+                                "const": #variant_name
                             })
                         }
                     }
-                    syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                        let inner_type = &fields.unnamed.first().unwrap().ty;
-                        let inner_schema = type_to_json_schema(inner_type);
+                    fields => {
+                        let payload_schema =
+                            generate_fields_schema(fields, &quote! { None::<&str> });
                         quote! {
                             serde_json::json!({
                                 "type": "object",
                                 "properties": {
-                                    #variant_name: #inner_schema
+                                    #variant_name: #payload_schema
                                 },
-                                "required": [#variant_name]
-                            })
-                        }
-                    }
-                    _ => {
-                        // Complex variant - just mark as object
-                        quote! {
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    #variant_name: { "type": "object" }
-                                },
-                                "required": [#variant_name]
+                                "required": [#variant_name],
+                                "additionalProperties": false
                             })
                         }
                     }
