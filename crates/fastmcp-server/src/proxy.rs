@@ -2594,6 +2594,23 @@ pub const MAX_PROXY_CATALOG_ENTRIES: usize = 100_000;
 /// families before registering any downstream handler.
 pub const MAX_PROXY_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
+/// The catalog byte counter measures the encoded size of a cache hint, so it
+/// needs `CacheScope` in an encodable form. `CacheScope` deliberately has no
+/// freestanding `Serialize`: `fastmcp-protocol` spells it at the FIELD level,
+/// at five sites, through the private `serialize_cache_scope`, as lowercase
+/// `"public"` / `"private"` (messages.rs:2568). Deriving `Serialize` on the
+/// enum to satisfy this counter would add a sixth spelling to a protocol type
+/// — `"Public"` / `"Private"`, the variant names — that contradicts the five
+/// and would be what any caller gets by default. This measurement is local
+/// accounting whose bytes are discarded by `ProxyCatalogByteCounter`, so it
+/// borrows the canonical spelling instead of adding a wire form to carry it.
+fn catalog_cache_scope_token(scope: CacheScope) -> &'static str {
+    match scope {
+        CacheScope::Public => "public",
+        CacheScope::Private => "private",
+    }
+}
+
 /// Admission is committed only after the complete candidate page fits. A
 /// refused page cannot consume capacity or expose a partially extended catalog.
 #[derive(Default)]
@@ -2616,7 +2633,10 @@ impl ProxyCatalogAdmission {
                 serde_json::to_writer(&mut *counter, cursor)?;
             }
             if let Some(hint) = cache_hint {
-                serde_json::to_writer(counter, &(&hint.ttl_ms, hint.cache_scope))?;
+                serde_json::to_writer(
+                    counter,
+                    &(&hint.ttl_ms, catalog_cache_scope_token(hint.cache_scope)),
+                )?;
             }
             Ok(())
         })
@@ -2635,7 +2655,10 @@ impl ProxyCatalogAdmission {
         Self::default().admit_encoded(method, entries.len(), |counter| {
             serde_json::to_writer(&mut *counter, entries)?;
             for hint in cache_hints {
-                serde_json::to_writer(&mut *counter, &(&hint.ttl_ms, hint.cache_scope))?;
+                serde_json::to_writer(
+                    &mut *counter,
+                    &(&hint.ttl_ms, catalog_cache_scope_token(hint.cache_scope)),
+                )?;
             }
             Ok(())
         })
@@ -19413,7 +19436,11 @@ IFS= read -r end
         );
         let prefix = vec!["first".to_owned()];
         let cursor = "opaque-\"cursor";
-        let hint_bytes = serde_json::to_vec(&(&hint.ttl_ms, hint.cache_scope))
+        // The expected size is recomputed from the LITERAL canonical spelling, not
+        // from `catalog_cache_scope_token`, so this stays an independent oracle: a
+        // regression in that helper makes production and this expectation disagree
+        // instead of moving them together. This hint is `CacheScope::Private`.
+        let hint_bytes = serde_json::to_vec(&(&hint.ttl_ms, "private"))
             .unwrap()
             .len();
         let fixed_bytes = serde_json::to_vec(&prefix).unwrap().len()
@@ -19515,7 +19542,10 @@ IFS= read -r end
         assert_eq!(admission.entries, 0);
         let expected = serde_json::to_vec(&Vec::<u8>::new()).unwrap().len()
             + serde_json::to_vec("first-cursor").unwrap().len()
-            + serde_json::to_vec(&(&hint.ttl_ms, hint.cache_scope))
+            // Literal canonical spelling, per the note on the sibling test above;
+            // this hint is `CacheScope::Public`, so the two tests between them pin
+            // both variants independently of the helper.
+            + serde_json::to_vec(&(&hint.ttl_ms, "public"))
                 .unwrap()
                 .len();
         assert_eq!(admission.encoded_bytes, expected);
