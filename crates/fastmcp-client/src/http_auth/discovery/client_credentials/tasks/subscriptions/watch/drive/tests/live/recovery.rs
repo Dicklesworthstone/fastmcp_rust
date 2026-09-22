@@ -624,3 +624,686 @@ mod input_driver {
     #[test]
     fn tls_input_recovery_cannot_extend_the_original_deadline() { isolated_input("tls_input_recovery_cannot_extend_the_original_deadline", InputCase::Deadline); }
 }
+
+// Exercise the shipped input driver, not a second recovery implementation.
+// The original observation-only cases above remain unchanged.
+mod input {
+    use super::*;
+    use std::cell::Cell;
+    use fastmcp_protocol::RequestId;
+    use fastmcp_protocol::tasks_extension::TaskInputRequests;
+    use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::cancellation::{
+        ClientCredentialsTaskCancellationError, TaskCancellationState,
+    };
+    use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::drive::{
+        ClientCredentialsTaskWatchDriveError as DriveError, TaskInputUpdateState,
+    };
+
+    const PREFIX: &str = "input-recovery";
+
+    #[derive(Clone, Copy)]
+    enum InputCase {
+        Reconcile, ObservationGap, ChangedAnswered, ChangedUnanswered,
+        LostUpdate, RejectedUpdate, UpdateLimit, SnapshotLimit, Exhausted,
+        PartialAck, Refused, CancelBackoff, DropBackoff, RevokeBackoff,
+        RemoteCancel, RefusedCancel, Deadline,
+    }
+    impl InputCase {
+        fn controlled(self) -> bool {
+            matches!(self, Self::CancelBackoff | Self::DropBackoff | Self::RevokeBackoff
+                | Self::RemoteCancel | Self::RefusedCancel)
+        }
+        fn cancel_attempt(self) -> bool { matches!(self, Self::RemoteCancel | Self::RefusedCancel) }
+        fn numeric_requests(self) -> usize {
+            match self {
+                Self::Reconcile | Self::RefusedCancel => 16,
+                Self::ObservationGap | Self::ChangedAnswered | Self::ChangedUnanswered
+                    | Self::UpdateLimit | Self::Exhausted => 12,
+                Self::PartialAck | Self::Refused => 10,
+                Self::LostUpdate | Self::RejectedUpdate => 6,
+                _ => 8,
+            }
+        }
+        fn successful(self) -> bool {
+            matches!(self, Self::Reconcile | Self::ObservationGap | Self::RefusedCancel)
+        }
+        fn acknowledged_updates(self) -> usize {
+            match self {
+                Self::LostUpdate | Self::RejectedUpdate => 0,
+                Self::Reconcile | Self::RefusedCancel => 2,
+                _ => 1,
+            }
+        }
+    }
+
+    fn isolated_input(name: &str, case: InputCase) {
+        isolated_run(&format!("recovery::input::{name}"), || run_input(case));
+    }
+
+    async fn missing_terminal(mut socket: TlsStream<TcpStream>) {
+        // HTTP completes cleanly, but the operation has no admitted JSON-RPC
+        // terminal. The same defect is recoverable for a get, NEVER an update.
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n")
+            .await.unwrap();
+        socket.shutdown().await.unwrap();
+        closed(&mut socket).await;
+    }
+
+    async fn get_head(peer: &Peer) -> (TlsStream<TcpStream>, serde_json::Value) {
+        peer.discover().await;
+        let (socket, request) = peer.rpc("tasks/get").await;
+        assert_eq!(request["params"]["taskId"], "one");
+        (socket, request)
+    }
+
+    async fn changed_inputs(peer: &Peer, case: InputCase) {
+        let (mut socket, request) = get_head(peer).await;
+        let mut snapshot = task("one", "input_required");
+        snapshot["resultType"] = json!("complete");
+        let key = if matches!(case, InputCase::ChangedAnswered) { Some("one") }
+            else if matches!(case, InputCase::ChangedUnanswered) { Some("two") }
+            else { None };
+        if let Some(key) = key {
+            snapshot["inputRequests"][key] = json!({"method":"sampling/createMessage",
+                "params":{"messages":[],"maxTokens":16}});
+        }
+        reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":snapshot})).await;
+    }
+
+    async fn first_update(peer: &Peer, case: InputCase) {
+        if !matches!(case, InputCase::LostUpdate) {
+            peer.update("one", matches!(case, InputCase::RejectedUpdate)).await;
+            return;
+        }
+        peer.discover().await;
+        let (socket, request) = peer.rpc("tasks/update").await;
+        assert_eq!(request["params"]["taskId"], "one");
+        assert_eq!(request["params"]["inputResponses"], json!({"one":{"roots":[]}}));
+        peer.updates.fetch_add(1, Ordering::SeqCst);
+        missing_terminal(socket).await;
+    }
+
+    async fn replacement(peer: &Peer, case: InputCase) -> Option<TlsStream<TcpStream>> {
+        if !matches!(case, InputCase::PartialAck | InputCase::Refused) {
+            return Some(peer.listen(json!(["one"]), false).await.0);
+        }
+        peer.discover().await;
+        let (mut socket, request) = peer.rpc("subscriptions/listen").await;
+        assert_eq!(request["params"]["notifications"], json!({"taskIds":["one"]}));
+        if matches!(case, InputCase::Refused) {
+            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await.unwrap();
+            socket.shutdown().await.unwrap();
+        } else {
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await.unwrap();
+            event(&mut socket, json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
+                "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):request["id"]},
+                    "notifications":{"taskIds":[]}}})).await;
+        }
+        closed(&mut socket).await;
+        None
+    }
+
+    async fn remote_cancel(peer: &Peer, refused: bool) {
+        peer.discover().await;
+        let (mut socket, request) = peer.rpc("tasks/cancel").await;
+        assert_eq!(request["id"], format!("{PREFIX}:cancel:operation"));
+        assert_eq!(request["params"]["taskId"], "one");
+        if refused {
+            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await.unwrap();
+            socket.shutdown().await.unwrap();
+        } else {
+            reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})).await;
+        }
+    }
+
+    fn no_resolver(_: TaskInputRequests) -> std::future::Ready<Result<ManagedTaskInputAction, DriveError>> {
+        panic!("a completed or interrupted driver must not resolve another input");
+    }
+    fn no_observer(_: &Task) -> Result<(), DriveError> {
+        panic!("a completed or interrupted driver must not publish another snapshot");
+    }
+
+    fn run_input(case: InputCase) {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let mut client = peer.client();
+                Arc::get_mut(&mut client.client.inner).unwrap().timeout = Duration::from_secs(12);
+                let cancellation = McpRequestCancellation::new();
+                let backoff = McpRequestCancellation::new();
+                let snapshots = if matches!(case, InputCase::SnapshotLimit) { 2 } else { 16 };
+                let maximum_updates = if matches!(case, InputCase::UpdateLimit) { 1 } else { 2 };
+                let delay = if case.controlled() { Duration::from_secs(2) }
+                    else if matches!(case, InputCase::Deadline) { Duration::from_secs(11) }
+                    else { Duration::from_millis(20) };
+                let policy = ClientCredentialsTaskWatchDrivePolicy::new(
+                    ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(10), snapshots, 32).unwrap(),
+                    maximum_updates, 8, 4096,
+                ).unwrap().with_recovery(RecoveryPolicy::new(1, delay, delay).unwrap()).unwrap();
+
+                let server = async {
+                    let (mut stream, _) = peer.listen(json!(["one"]), false).await;
+                    if matches!(case, InputCase::ObservationGap) {
+                        peer.get("one", "working").await;
+                        end_listen(&mut stream).await;
+                    } else {
+                        peer.get("one", "input_required").await;
+                        first_update(&peer, case).await;
+                        if matches!(case, InputCase::LostUpdate | InputCase::RejectedUpdate) {
+                            closed(&mut stream).await;
+                            return;
+                        }
+                        let (socket, _) = get_head(&peer).await;
+                        missing_terminal(socket).await;
+                        // Release of the old listen proves the driver actually
+                        // entered recovery after retaining the update receipt.
+                        closed(&mut stream).await;
+                        backoff.cancel();
+                        if case.cancel_attempt() {
+                            remote_cancel(&peer, matches!(case, InputCase::RefusedCancel)).await;
+                        }
+                        if matches!(case, InputCase::SnapshotLimit | InputCase::CancelBackoff
+                            | InputCase::DropBackoff | InputCase::RevokeBackoff
+                            | InputCase::RemoteCancel | InputCase::Deadline)
+                        { return; }
+                    }
+                    let Some(mut stream) = replacement(&peer, case).await else { return; };
+                    if matches!(case, InputCase::Exhausted) {
+                        let (socket, _) = get_head(&peer).await;
+                        missing_terminal(socket).await;
+                    } else {
+                        changed_inputs(&peer, case).await;
+                        if case.successful() {
+                            peer.update(if matches!(case, InputCase::ObservationGap) { "one" } else { "two" }, false).await;
+                            peer.get("one", "cancelled").await;
+                        }
+                    }
+                    closed(&mut stream).await;
+                };
+
+                let application = async {
+                    let mut driver = Box::pin(client.watch_task_inputs_with_cancellation(
+                        &cx, &cancellation, TaskId::parse("one").unwrap(), PREFIX.to_owned(), policy,
+                    )).await.unwrap();
+                    let handle = driver.cancel_handle();
+                    // Every replacement would try a grant if it used ordinary
+                    // acquisition. The issuer is deliberately not a TLS peer in
+                    // this fixture: only reusing the original authority succeeds.
+                    client.client.inner.state.try_lock_owned().unwrap().current.as_mut().unwrap().renew_after = Instant::now();
+                    let resolutions = Cell::new(0);
+                    let observations = Cell::new(0);
+                    let mut driving = Box::pin(driver.drive(&cx, |pending: TaskInputRequests| {
+                        let index = resolutions.get();
+                        resolutions.set(index + 1);
+                        if index == 0 {
+                            assert_eq!(pending.keys().map(String::as_str).collect::<Vec<_>>(), ["one", "two"]);
+                        } else {
+                            assert_eq!(pending.keys().map(String::as_str).collect::<Vec<_>>(), ["two"],
+                                "reconnection must not answer the acknowledged first key twice");
+                        }
+                        let key = if index == 0 { "one" } else { "two" };
+                        std::future::ready(Ok(ManagedTaskInputAction::Respond(answers(json!({key:{"roots":[]}})))))
+                    }, |_| { observations.set(observations.get() + 1); Ok(()) }));
+
+                    let result = if case.controlled() {
+                        poll_fn(|task| {
+                            assert!(driving.as_mut().poll(task).is_pending());
+                            if backoff.is_cancel_requested() { Poll::Ready(()) }
+                            else { task.waker().wake_by_ref(); Poll::Pending }
+                        }).await;
+                        match case {
+                            InputCase::DropBackoff => { drop(driving); None }
+                            InputCase::CancelBackoff => { cancellation.cancel(); Some(driving.await) }
+                            InputCase::RevokeBackoff => {
+                                client.client.inner.state.try_lock_owned().unwrap().current.as_ref().unwrap().bearer.revoke();
+                                Some(driving.await)
+                            }
+                            InputCase::RemoteCancel | InputCase::RefusedCancel => {
+                                // Retain the pending drive but pause its polling
+                                // while the same caller performs the explicit
+                                // cancel. A due timer cannot reorder peer POSTs.
+                                let cancel = handle.request_cancel(&cx).await;
+                                if matches!(case, InputCase::RemoteCancel) {
+                                    cancel.unwrap();
+                                    assert_eq!(handle.state(), TaskCancellationState::Acknowledged);
+                                } else {
+                                    assert!(matches!(cancel, Err(ClientCredentialsTaskCancellationError::Unconfirmed(_))));
+                                    assert_eq!(handle.state(), TaskCancellationState::Unconfirmed);
+                                }
+                                Some(driving.await)
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else { Some(driving.await) };
+
+                    match case {
+                        InputCase::Reconcile | InputCase::ObservationGap | InputCase::RefusedCancel => {
+                            assert!(matches!(result, Some(Ok(ManagedTaskRunOutcome::Terminal(task)))
+                                if matches!(*task, Task::Cancelled(_))));
+                            assert_eq!(observations.get(), 3);
+                        }
+                        InputCase::ChangedAnswered | InputCase::ChangedUnanswered => assert!(matches!(result,
+                            Some(Err(DriveError::Input(ClientCredentialsTaskWaitError::InputKeyReused))))),
+                        InputCase::UpdateLimit => assert!(matches!(result,
+                            Some(Err(DriveError::Input(ClientCredentialsTaskWaitError::UpdateLimit))))),
+                        InputCase::SnapshotLimit => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::SnapshotLimit))))),
+                        InputCase::Exhausted => {
+                            let Some(Err(DriveError::Recovery(RecoveryError::RecoveryLimit { last_error }))) = result
+                                else { panic!("the single recovery budget must not reset after successful admission"); };
+                            assert!(is_interruption(&last_error));
+                        }
+                        InputCase::PartialAck => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::IncompleteAcknowledgement))))),
+                        InputCase::Refused => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Protocol(ManagedTasksError::HttpStatus { status: 403 })
+                            )))))),
+                        InputCase::LostUpdate => {
+                            let Some(Err(DriveError::Watch(error))) = result else { panic!("an uncertain update cannot be recovered"); };
+                            assert!(is_interruption(&error));
+                        }
+                        InputCase::RejectedUpdate => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Protocol(ManagedTasksError::Remote { .. })
+                            )))))),
+                        InputCase::CancelBackoff => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled))
+                            )))))),
+                        InputCase::RevokeBackoff => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired)
+                            )))))),
+                        InputCase::Deadline => assert!(matches!(result,
+                            Some(Err(DriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(OAuthDiscoveryError::TimedOut))
+                            )))))),
+                        InputCase::RemoteCancel => assert!(matches!(result, Some(Err(DriveError::CancellationRequested)))),
+                        InputCase::DropBackoff => assert!(result.is_none()),
+                    }
+                    let acknowledged = case.acknowledged_updates();
+                    assert_eq!(driver.acknowledged_updates(), acknowledged);
+                    let update_state = if acknowledged == 0 { TaskInputUpdateState::Unconfirmed }
+                        else { TaskInputUpdateState::Acknowledged };
+                    assert_eq!(driver.update_state(), update_state);
+                    let last_id = if acknowledged == 2 { 13 }
+                        else if matches!(case, InputCase::ObservationGap) { 9 } else { 5 };
+                    assert_eq!(driver.last_update_request_id(), Some(&RequestId::String(format!("{PREFIX}:{last_id}"))));
+                    assert_eq!(resolutions.get(), if acknowledged == 2 { 2 } else { 1 });
+                    assert_eq!(driver.reconnection_attempts(), if matches!(case,
+                        InputCase::LostUpdate | InputCase::RejectedUpdate | InputCase::SnapshotLimit) { 0 } else { 1 });
+                    assert!(!format!("{driver:?}").contains("watched-access"));
+                    assert!(driver.drive(&cx, no_resolver, no_observer).await.is_err());
+                    assert_eq!(driver.update_state(), update_state);
+                    assert_eq!(driver.acknowledged_updates(), acknowledged);
+                    assert!(handle.request_cancel(&cx).await.is_err(), "closed owners cannot admit another remote mutation");
+                    assert_eq!(cancellation.is_cancel_requested(), matches!(case, InputCase::CancelBackoff));
+                };
+                Box::pin(pair(server, application)).await;
+                let mut expected: BTreeSet<_> = (0..case.numeric_requests()).map(|n| format!("{PREFIX}:{n}")).collect();
+                if case.cancel_attempt() {
+                    expected.insert(format!("{PREFIX}:cancel:discovery"));
+                    expected.insert(format!("{PREFIX}:cancel:operation"));
+                }
+                assert_eq!(*peer.seen.lock().unwrap(), expected, "no ID reuse, hidden grant, extra get or mutation replay");
+                assert_eq!(peer.updates.load(Ordering::SeqCst), if case.acknowledged_updates() == 2 { 2 } else { 1 });
+                peer.quiet();
+            };
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(15_000_000_000), Box::pin(scenario)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn tls_input_recovery_reconciles_after_ack_without_replaying_partial_answers() {
+        isolated_input("tls_input_recovery_reconciles_after_ack_without_replaying_partial_answers", InputCase::Reconcile);
+    }
+    #[test]
+    fn tls_input_recovery_can_resolve_new_inputs_after_an_observation_gap() {
+        isolated_input("tls_input_recovery_can_resolve_new_inputs_after_an_observation_gap", InputCase::ObservationGap);
+    }
+    #[test]
+    fn tls_input_recovery_rejects_changed_acknowledged_descriptors() {
+        isolated_input("tls_input_recovery_rejects_changed_acknowledged_descriptors", InputCase::ChangedAnswered);
+    }
+    #[test]
+    fn tls_input_recovery_rejects_changed_unanswered_descriptors() {
+        isolated_input("tls_input_recovery_rejects_changed_unanswered_descriptors", InputCase::ChangedUnanswered);
+    }
+    #[test]
+    fn tls_input_recovery_never_replays_an_update_with_a_lost_reply() {
+        isolated_input("tls_input_recovery_never_replays_an_update_with_a_lost_reply", InputCase::LostUpdate);
+    }
+    #[test]
+    fn tls_input_recovery_never_replays_a_rejected_update() {
+        isolated_input("tls_input_recovery_never_replays_a_rejected_update", InputCase::RejectedUpdate);
+    }
+    #[test]
+    fn tls_input_recovery_does_not_reset_the_update_budget() {
+        isolated_input("tls_input_recovery_does_not_reset_the_update_budget", InputCase::UpdateLimit);
+    }
+    #[test]
+    fn tls_input_recovery_does_not_refund_failed_reconciliation_capacity() {
+        isolated_input("tls_input_recovery_does_not_refund_failed_reconciliation_capacity", InputCase::SnapshotLimit);
+    }
+    #[test]
+    fn tls_input_recovery_exhaustion_retains_acknowledged_updates() {
+        isolated_input("tls_input_recovery_exhaustion_retains_acknowledged_updates", InputCase::Exhausted);
+    }
+    #[test]
+    fn tls_input_recovery_requires_complete_replacement_ack_before_get_or_input() {
+        isolated_input("tls_input_recovery_requires_complete_replacement_ack_before_get_or_input", InputCase::PartialAck);
+    }
+    #[test]
+    fn tls_input_recovery_refuses_authorization_failure_without_more_callbacks() {
+        isolated_input("tls_input_recovery_refuses_authorization_failure_without_more_callbacks", InputCase::Refused);
+    }
+    #[test]
+    fn tls_input_recovery_local_cancel_interrupts_backoff_without_remote_cancel() {
+        isolated_input("tls_input_recovery_local_cancel_interrupts_backoff_without_remote_cancel", InputCase::CancelBackoff);
+    }
+    #[test]
+    fn tls_input_recovery_abandonment_closes_custody_and_retains_update_receipt() {
+        isolated_input("tls_input_recovery_abandonment_closes_custody_and_retains_update_receipt", InputCase::DropBackoff);
+    }
+    #[test]
+    fn tls_input_recovery_revocation_during_backoff_cannot_renew_authority() {
+        isolated_input("tls_input_recovery_revocation_during_backoff_cannot_renew_authority", InputCase::RevokeBackoff);
+    }
+    #[test]
+    fn tls_input_recovery_remote_cancel_ack_interrupts_backoff() {
+        isolated_input("tls_input_recovery_remote_cancel_ack_interrupts_backoff", InputCase::RemoteCancel);
+    }
+    #[test]
+    fn tls_input_recovery_failed_cancel_does_not_prevent_successful_reconciliation() {
+        isolated_input("tls_input_recovery_failed_cancel_does_not_prevent_successful_reconciliation", InputCase::RefusedCancel);
+    }
+    #[test]
+    fn tls_input_recovery_cannot_extend_the_original_deadline() {
+        isolated_input("tls_input_recovery_cannot_extend_the_original_deadline", InputCase::Deadline);
+    }
+}
+
+// Cancellable observation has no input resolver or update authority. Exercise
+// its public recovery constructor separately from the input-driver composition.
+mod observation_control {
+    use super::*;
+    use asupersync::time::Sleep;
+    use crate::http_auth::discovery::client_credentials::tasks::subscriptions::watch::cancellation::{
+        CancellableClientCredentialsTaskWatchError as ObserveError,
+        ClientCredentialsTaskCancellationError, TaskCancellationState,
+    };
+
+    const PREFIX: &str = "cancel-recovery";
+    #[derive(Clone, Copy)]
+    enum Case {
+        Resume, PlainStops, AckBackoff, RefusedBackoff, DropBackoff, LocalCancel,
+        RevokeBackoff, PartialAck, AckReplacement, DropReplacement, Deadline, ExpiredPin,
+    }
+    impl Case {
+        fn controlled_backoff(self) -> bool {
+            matches!(self, Self::AckBackoff | Self::RefusedBackoff | Self::DropBackoff
+                | Self::LocalCancel | Self::RevokeBackoff)
+        }
+        fn replacement_wait(self) -> bool { matches!(self, Self::AckReplacement | Self::DropReplacement) }
+        fn cancel_attempt(self) -> bool { matches!(self, Self::AckBackoff | Self::RefusedBackoff | Self::AckReplacement) }
+        fn numeric_requests(self) -> usize {
+            match self {
+                Self::Resume | Self::RefusedBackoff => 8,
+                Self::PartialAck | Self::AckReplacement | Self::DropReplacement => 6,
+                Self::ExpiredPin => 2,
+                _ => 4,
+            }
+        }
+    }
+    fn isolated_control(name: &str, case: Case) {
+        isolated_run(&format!("recovery::observation_control::{name}"), || run_control(case));
+    }
+
+    async fn cancel_reply(peer: &Peer, refused: bool) {
+        peer.discover().await;
+        let (mut socket, request) = peer.rpc("tasks/cancel").await;
+        assert_eq!(request["id"], format!("{PREFIX}:cancel:operation"));
+        assert_eq!(request["params"]["taskId"], "one");
+        if refused {
+            socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await.unwrap();
+            socket.shutdown().await.unwrap();
+        } else {
+            reply(&mut socket, json!({"jsonrpc":"2.0","id":request["id"],"result":{"resultType":"complete"}})).await;
+        }
+    }
+
+    fn run_control(case: Case) {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let scenario = async {
+                let peer = Peer::new().await;
+                let mut client = peer.client();
+                Arc::get_mut(&mut client.client.inner).unwrap().timeout = Duration::from_secs(12);
+                let expires_at = Instant::now() + Duration::from_secs(5);
+                if matches!(case, Case::ExpiredPin) {
+                    let mut state = client.client.inner.state.try_lock_owned().unwrap();
+                    let token = state.current.as_mut().unwrap();
+                    token.expires_at = expires_at;
+                    token.renew_after = expires_at;
+                }
+                let cancellation = McpRequestCancellation::new();
+                let backoff = McpRequestCancellation::new();
+                let replacement_entered = McpRequestCancellation::new();
+                let watch_policy = ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(10), 8, 32).unwrap();
+                let delay = if case.controlled_backoff() { Duration::from_secs(2) }
+                    else if matches!(case, Case::Deadline) { Duration::from_secs(11) }
+                    else { Duration::from_millis(20) };
+                let recovery = RecoveryPolicy::new(1, delay, delay).unwrap();
+
+                let server = async {
+                    let (mut stream, _) = peer.listen(json!(["one"]), false).await;
+                    if matches!(case, Case::ExpiredPin) { closed(&mut stream).await; return; }
+                    // Deliver an actual input challenge in the success case.
+                    // Observation must not answer it or submit any input update.
+                    peer.get("one", if matches!(case, Case::Resume) { "input_required" } else { "working" }).await;
+                    end_listen(&mut stream).await;
+                    backoff.cancel();
+                    if matches!(case, Case::AckBackoff | Case::RefusedBackoff) {
+                        cancel_reply(&peer, matches!(case, Case::RefusedBackoff)).await;
+                    }
+                    if matches!(case, Case::PlainStops | Case::AckBackoff | Case::DropBackoff
+                        | Case::LocalCancel | Case::RevokeBackoff | Case::Deadline)
+                    { return; }
+                    if matches!(case, Case::PartialAck) || case.replacement_wait() {
+                        peer.discover().await;
+                        let (mut socket, request) = peer.rpc("subscriptions/listen").await;
+                        assert_eq!(request["params"]["notifications"], json!({"taskIds":["one"]}));
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                            .await.unwrap();
+                        socket.flush().await.unwrap();
+                        if matches!(case, Case::PartialAck) {
+                            event(&mut socket, json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",
+                                "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):request["id"]},
+                                    "notifications":{"taskIds":[]}}})).await;
+                        } else {
+                            // The real replacement socket is now waiting for
+                            // its first ACK. No initial get may precede it.
+                            replacement_entered.cancel();
+                            if matches!(case, Case::AckReplacement) { cancel_reply(&peer, false).await; }
+                        }
+                        closed(&mut socket).await;
+                        return;
+                    }
+                    let (mut replacement, _) = peer.listen(json!(["one"]), false).await;
+                    peer.get("one", "cancelled").await;
+                    closed(&mut replacement).await;
+                };
+
+                let application = async {
+                    let mut watch = if matches!(case, Case::PlainStops) {
+                        Box::pin(client.watch_task_cancellable_with_cancellation(
+                            &cx, &cancellation, TaskId::parse("one").unwrap(), PREFIX.to_owned(), watch_policy,
+                        )).await.unwrap()
+                    } else {
+                        Box::pin(client.watch_task_cancellable_recovering_with_cancellation(
+                            &cx, &cancellation, TaskId::parse("one").unwrap(), PREFIX.to_owned(), watch_policy, recovery,
+                        )).await.unwrap()
+                    };
+                    let handle = watch.cancel_handle();
+                    // A replacement that silently used normal acquisition
+                    // would attempt a grant at the non-fixture issuer URL.
+                    client.client.inner.state.try_lock_owned().unwrap().current.as_mut().unwrap().renew_after = Instant::now();
+                    drop(watch.next_snapshot(&cx));
+                    assert_eq!(watch.reconnection_attempts(), 0, "an unpolled read cannot consume recovery");
+                    assert_eq!(handle.state(), TaskCancellationState::Ready);
+                    if matches!(case, Case::ExpiredPin) {
+                        let delay = expires_at.saturating_duration_since(Instant::now()) + Duration::from_millis(20);
+                        Sleep::new(cx.now().saturating_add_nanos(u64::try_from(delay.as_nanos()).unwrap())).await;
+                        assert!(matches!(handle.request_cancel(&cx).await,
+                            Err(ClientCredentialsTaskCancellationError::NotAttempted(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired)
+                            )))));
+                        assert_eq!(handle.state(), TaskCancellationState::Ready);
+                        assert!(matches!(watch.next_snapshot(&cx).await,
+                            Err(ObserveError::Watch(ClientCredentialsTaskWatchError::Task(
+                                ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired)
+                            )))));
+                        assert_eq!(watch.reconnection_attempts(), 0);
+                        assert!(matches!(handle.request_cancel(&cx).await, Err(ClientCredentialsTaskCancellationError::Closed)));
+                        return;
+                    }
+                    let first = watch.next_snapshot(&cx).await.unwrap().unwrap();
+                    assert_eq!(first.cause, ManagedTaskSnapshotCause::Initial);
+                    if matches!(case, Case::Resume) { assert!(matches!(*first.task, Task::InputRequired { .. })); }
+                    else { assert!(matches!(*first.task, Task::Working(_))); }
+                    let mut reading = Box::pin(watch.next_snapshot(&cx));
+                    let result = if case.controlled_backoff() || case.replacement_wait() {
+                        let entered = if case.replacement_wait() { &replacement_entered } else { &backoff };
+                        poll_fn(|task| {
+                            assert!(reading.as_mut().poll(task).is_pending());
+                            if entered.is_cancel_requested() { Poll::Ready(()) }
+                            else { task.waker().wake_by_ref(); Poll::Pending }
+                        }).await;
+                        match case {
+                            Case::DropBackoff | Case::DropReplacement => { drop(reading); None }
+                            Case::LocalCancel => { cancellation.cancel(); Some(reading.await) }
+                            Case::RevokeBackoff => {
+                                client.client.inner.state.try_lock_owned().unwrap().current.as_ref().unwrap().bearer.revoke();
+                                Some(reading.await)
+                            }
+                            Case::AckBackoff | Case::RefusedBackoff | Case::AckReplacement => {
+                                let cancelled = handle.request_cancel(&cx).await;
+                                if matches!(case, Case::RefusedBackoff) {
+                                    assert!(matches!(cancelled, Err(ClientCredentialsTaskCancellationError::Unconfirmed(_))));
+                                    assert_eq!(handle.state(), TaskCancellationState::Unconfirmed);
+                                } else {
+                                    cancelled.unwrap();
+                                    assert_eq!(handle.state(), TaskCancellationState::Acknowledged);
+                                }
+                                Some(reading.await)
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else { Some(reading.await) };
+
+                    match case {
+                        Case::Resume | Case::RefusedBackoff => {
+                            let terminal = result.unwrap().unwrap().unwrap();
+                            assert_eq!(terminal.cause, ManagedTaskSnapshotCause::Reconnected);
+                            assert!(matches!(*terminal.task, Task::Cancelled(_)));
+                            client.client.close();
+                            assert!(watch.next_snapshot(&cx).await.unwrap().is_none(),
+                                "delivered terminal completion cannot become failure after login close");
+                        }
+                        Case::PlainStops => {
+                            let Some(Err(ObserveError::Watch(error))) = result else { panic!("plain watch cannot reconnect"); };
+                            assert!(is_interruption(&error));
+                        }
+                        Case::AckBackoff | Case::AckReplacement => assert!(matches!(result, Some(Err(ObserveError::CancellationRequested)))),
+                        Case::DropBackoff | Case::DropReplacement => assert!(result.is_none()),
+                        Case::PartialAck => assert!(matches!(result, Some(Err(ObserveError::Watch(
+                            ClientCredentialsTaskWatchError::IncompleteAcknowledgement
+                        ))))),
+                        Case::LocalCancel => assert!(matches!(result, Some(Err(ObserveError::Watch(ClientCredentialsTaskWatchError::Task(
+                            ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled))
+                        )))))),
+                        Case::RevokeBackoff => assert!(matches!(result, Some(Err(ObserveError::Watch(ClientCredentialsTaskWatchError::Task(
+                            ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired)
+                        )))))),
+                        Case::Deadline => assert!(matches!(result, Some(Err(ObserveError::Watch(ClientCredentialsTaskWatchError::Task(
+                            ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(OAuthDiscoveryError::TimedOut))
+                        )))))),
+                        Case::ExpiredPin => unreachable!(),
+                    }
+                    assert_eq!(watch.reconnection_attempts(), usize::from(!matches!(case, Case::PlainStops)));
+                    assert!(!format!("{watch:?}").contains("watched-access"));
+                    if !matches!(case, Case::Resume | Case::RefusedBackoff) {
+                        assert!(watch.next_snapshot(&cx).await.is_err(), "an abandoned or failed owner stays closed");
+                    }
+                    assert!(handle.request_cancel(&cx).await.is_err(), "recovery cannot reset remote mutation admission");
+                    assert_eq!(cancellation.is_cancel_requested(), matches!(case, Case::LocalCancel));
+                };
+                Box::pin(pair(server, application)).await;
+                let mut expected: BTreeSet<_> = (0..case.numeric_requests()).map(|n| format!("{PREFIX}:{n}")).collect();
+                if case.cancel_attempt() {
+                    expected.insert(format!("{PREFIX}:cancel:discovery"));
+                    expected.insert(format!("{PREFIX}:cancel:operation"));
+                }
+                assert_eq!(*peer.seen.lock().unwrap(), expected);
+                assert_eq!(peer.updates.load(Ordering::SeqCst), 0, "observation never answers Task input");
+                peer.quiet();
+            };
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(15_000_000_000), Box::pin(scenario)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn tls_cancellable_recovery_observes_inputs_without_answering_or_renewing() {
+        isolated_control("tls_cancellable_recovery_observes_inputs_without_answering_or_renewing", Case::Resume);
+    }
+    #[test]
+    fn tls_plain_cancellable_watch_does_not_implicitly_reconnect() {
+        isolated_control("tls_plain_cancellable_watch_does_not_implicitly_reconnect", Case::PlainStops);
+    }
+    #[test]
+    fn tls_cancellable_recovery_ack_interrupts_backoff_without_terminal_fabrication() {
+        isolated_control("tls_cancellable_recovery_ack_interrupts_backoff_without_terminal_fabrication", Case::AckBackoff);
+    }
+    #[test]
+    fn tls_cancellable_recovery_refused_cancel_preserves_observation() {
+        isolated_control("tls_cancellable_recovery_refused_cancel_preserves_observation", Case::RefusedBackoff);
+    }
+    #[test]
+    fn tls_cancellable_recovery_abandoned_backoff_retires_cancel_admission() {
+        isolated_control("tls_cancellable_recovery_abandoned_backoff_retires_cancel_admission", Case::DropBackoff);
+    }
+    #[test]
+    fn tls_cancellable_recovery_local_stop_does_not_cancel_the_remote_task() {
+        isolated_control("tls_cancellable_recovery_local_stop_does_not_cancel_the_remote_task", Case::LocalCancel);
+    }
+    #[test]
+    fn tls_cancellable_recovery_revocation_never_acquires_replacement_authority() {
+        isolated_control("tls_cancellable_recovery_revocation_never_acquires_replacement_authority", Case::RevokeBackoff);
+    }
+    #[test]
+    fn tls_cancellable_recovery_requires_complete_selection_before_get() {
+        isolated_control("tls_cancellable_recovery_requires_complete_selection_before_get", Case::PartialAck);
+    }
+    #[test]
+    fn tls_cancellable_recovery_ack_closes_a_replacement_waiting_for_admission() {
+        isolated_control("tls_cancellable_recovery_ack_closes_a_replacement_waiting_for_admission", Case::AckReplacement);
+    }
+    #[test]
+    fn tls_cancellable_recovery_abandoned_replacement_releases_its_socket() {
+        isolated_control("tls_cancellable_recovery_abandoned_replacement_releases_its_socket", Case::DropReplacement);
+    }
+    #[test]
+    fn tls_cancellable_recovery_does_not_extend_deadline_to_fit_backoff() {
+        isolated_control("tls_cancellable_recovery_does_not_extend_deadline_to_fit_backoff", Case::Deadline);
+    }
+    #[test]
+    fn tls_cancellable_recovery_original_expiry_blocks_both_reads_and_cancel_without_renewal() {
+        isolated_control("tls_cancellable_recovery_original_expiry_blocks_both_reads_and_cancel_without_renewal", Case::ExpiredPin);
+    }
+}
