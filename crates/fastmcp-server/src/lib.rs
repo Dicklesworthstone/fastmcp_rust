@@ -7032,9 +7032,13 @@ impl BoundHttpServer {
                         // never evaluated -- a different failure from it returning Ok.
                         #[cfg(test)]
                         lib_unit_tests::record_f2ndd_reaper_stage(42);
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_park(reaper_cx.is_cancel_requested());
                         asupersync::time::sleep(reaper_cx.now(), REAP_PARK_CHUNK).await;
                         #[cfg(test)]
                         lib_unit_tests::record_f2ndd_reaper_stage(43);
+                        #[cfg(test)]
+                        lib_unit_tests::record_f2ndd_reaper_sleep_return();
                         if reaper_cx.checkpoint().is_err() {
                             #[cfg(test)]
                             lib_unit_tests::record_f2ndd_reaper_stage(44);
@@ -23593,6 +23597,29 @@ mod lib_unit_tests {
 
     pub(super) fn record_f2ndd_reaper_stage(stage: usize) {
         F2NDD_REAPER_STAGE.fetch_max(stage, Ordering::SeqCst);
+    }
+
+    /// DIAGNOSTIC (bd-f2ndd). How many REAP_PARK_CHUNK sleeps have RETURNED.
+    /// Zero at a stage-42 stall means the timer never fired once in this
+    /// process; a positive count means sleeps did wake until one did not.
+    /// Like every f2ndd counter this is process-global and never reset, so it
+    /// is only attributable to one probe when that probe runs alone in its
+    /// own test process (`--exact`, one name per invocation).
+    pub(super) static F2NDD_REAPER_SLEEP_RETURNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// DIAGNOSTIC (bd-f2ndd). Whether cancellation had already been requested
+    /// on the reaper's cx when its MOST RECENT sleep began: 0 never recorded,
+    /// 1 not yet requested, 2 already requested. A stage-42 stall with 1 is a
+    /// sleep that began before the abort and was never polled again after it.
+    pub(super) static F2NDD_REAPER_CANCEL_AT_LAST_PARK: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn record_f2ndd_reaper_sleep_return() {
+        F2NDD_REAPER_SLEEP_RETURNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn record_f2ndd_reaper_park(cancel_requested: bool) {
+        let state = if cancel_requested { 2 } else { 1 };
+        F2NDD_REAPER_CANCEL_AT_LAST_PARK.store(state, Ordering::SeqCst);
     }
 
     pub(super) fn record_f2ndd_serve_stage(stage: usize) {
@@ -43375,6 +43402,8 @@ mod lib_unit_tests {
                     "DIAGNOSTIC (bd-f2ndd): `bound.serve(cx)` was still pending at its bound. \
                      serve completes only when the client cancels caller_cx, so this alone does \
                      not localise the stall. {client_state}. SERVE SHUTDOWN STAGE {}: {}.{}{} \
+                     REAPER SLEEP RETURNS {}; CANCEL AT LAST PARK {} (0 unrecorded, 1 not yet \
+                     requested, 2 already requested). \
                      The stall is NOT fixed; do not raise this bound.",
                     F2NDD_SERVE_STAGE.load(Ordering::SeqCst),
                     match F2NDD_SERVE_STAGE.load(Ordering::SeqCst) {
@@ -43401,7 +43430,9 @@ mod lib_unit_tests {
                         0 => " (children-at-join NOT RECORDED)",
                         1 => " (ZERO live connection children in connection_scope at the reaper join, so a live sibling is NOT what it waits on)",
                         _ => " (LIVE connection children in connection_scope at the reaper join -- the reaper and every connection share that scope and the children are not drained until later in this same shutdown)",
-                    }
+                    },
+                    F2NDD_REAPER_SLEEP_RETURNS.load(Ordering::SeqCst),
+                    F2NDD_REAPER_CANCEL_AT_LAST_PARK.load(Ordering::SeqCst),
                 )
             })?;
         let join_deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
