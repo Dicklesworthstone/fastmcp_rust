@@ -5770,7 +5770,7 @@ mod ctx_read_resource_tests {
 
     /// Renders a caught panic payload as text, naming the shapes it does not
     /// recognise rather than collapsing them into an empty string.
-    fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    pub(super) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
         if let Some(text) = payload.downcast_ref::<&'static str>() {
             (*text).to_string()
         } else if let Some(text) = payload.downcast_ref::<String>() {
@@ -6288,6 +6288,106 @@ mod ctx_call_tool_tests {
         let result = fastmcp_core::block_on(ctx.call_tool("nested_auth", serde_json::json!({})))
             .expect("nested tool call should succeed");
         assert_eq!(result.first_text(), Some("tool-auth"));
+    }
+
+    // ========================================================================
+    // bd-v9ev3 area (d), SECOND SHAPE: the call_tool column.
+    //
+    // STRENGTHENING, NOT REQUIRED BY A1 AS WRITTEN. A1 is satisfied by an
+    // explanation that predicts each area's observed failure text, and the
+    // mechanism named on the read_resource column already does that for all
+    // four (d) tests. This test exists because the mechanism is shared while
+    // the SHAPE is not: `ToolHandler::call` dispatched through a tool caller is
+    // a different path from `ResourceHandler::read` through a resource reader,
+    // and a true fact about one caller is not a fact about a different one.
+    // It buys the difference between predicted and observed on that column.
+    // ========================================================================
+
+    /// The `BridgeProbeResource` seam on the tool dispatch path: bridge a
+    /// nested call, catch the unwind, and report the payload as the tool's own
+    /// output instead of letting the redaction swallow it.
+    struct BridgeProbeTool;
+
+    impl ToolHandler for BridgeProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "bridge_probe".to_string(),
+                description: Some("Reports the payload of its own nested bridge".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let observed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fastmcp_core::block_on(ctx.call_tool("current_auth", serde_json::json!({})))
+            })) {
+                Ok(Ok(inner)) => format!(
+                    "NO PANIC: inner call returned {}",
+                    inner.first_text().unwrap_or("(no content)")
+                ),
+                Ok(Err(error)) => format!("NO PANIC: inner call returned Err {error}"),
+                Err(payload) => {
+                    super::ctx_read_resource_tests::panic_payload_text(payload.as_ref())
+                }
+            };
+
+            Ok(vec![Content::Text { text: observed }])
+        }
+    }
+
+    /// POSITIVE, second shape. Moves the call_tool column from PREDICTED to
+    /// OBSERVED.
+    ///
+    /// No separate negative accompanies this one, and that is a judgement I am
+    /// recording rather than an omission: the RH-5 control for the varied
+    /// dimension -- whether a bridge is already active -- is owned by
+    /// `the_same_handler_completes_when_no_bridge_is_already_active`, and the
+    /// reentrancy flag it exercises is one process-global thread-local shared
+    /// by both shapes. The alternative this shape could otherwise admit -- that
+    /// the tool path panics for some unrelated reason -- is excluded by the
+    /// assertion being an EQUALITY on the payload rather than a check that
+    /// something panicked.
+    #[test]
+    fn a_nested_bridge_from_a_sync_tool_handler_panics_with_the_reentrancy_rejection() {
+        let mut router = Router::new();
+        router
+            .add_tool(CurrentAuthTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(BridgeProbeTool)
+            .expect("tool registration succeeds");
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, session_state.clone()));
+
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, session_state)
+            .with_tool_caller(caller)
+            .with_auth(AuthContext::with_subject("probe-auth"));
+
+        // The outer bridge. The tool it dispatches to enters a second one.
+        let observed = fastmcp_core::block_on(ctx.call_tool("bridge_probe", serde_json::json!({})))
+            .expect("the probe catches its own unwind, so the outer call must succeed")
+            .first_text()
+            .expect("the probe reports its observation as text")
+            .to_string();
+
+        assert_eq!(
+            observed, "nested fastmcp_core::runtime::block_on is not supported",
+            "the tool dispatch path does not reach the same reentrancy rejection as the \
+             resource path, so the call_tool column is NOT the same defect and (d) is two \
+             defects rather than one"
+        );
     }
 }
 
