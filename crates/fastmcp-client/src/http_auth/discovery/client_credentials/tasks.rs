@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
 use crate::http_executor::{
-    ModernHttpExecutor, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseStream,
     ModernHttpSseResponseStream,
 };
 use crate::sse::SseLimits;
@@ -252,6 +252,9 @@ impl ClientCredentialsTaskCall {
     /// permanently removes the parser; partially consumed bytes are not reused.
     /// EOF without a correlated final result fails. A final result is delivered
     /// once, and only then do later reads return `None`.
+    /// For `tasks/get` only, a native body-read failure retains MissingTerminal
+    /// so an explicitly recovering observer can reconcile through fresh
+    /// discovery. Complete invalid JSON is never classified as interruption.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<ManagedTaskEvent>, ClientCredentialsTasksError> {
         if self.finished { return Ok(None); }
         let body = self.body.take().ok_or(ManagedTasksError::Closed)?;
@@ -262,7 +265,7 @@ impl ClientCredentialsTaskCall {
                 match *body {
                     Body::Json(response) => {
                         let bytes = response.read_to_end_with_cancellation(cx, &self.cancellation, self.limits.frame_bytes).await
-                            .map_err(|_| ManagedTasksError::InvalidResponse)?;
+                            .map_err(|error| json_body_error(&self.decoder, error))?;
                         Ok((decode_result(&self.decoder, &bytes, &self.request_id, self.limits.frame_bytes)?, None))
                     }
                     Body::Sse(mut stream) => {
@@ -282,6 +285,22 @@ impl ClientCredentialsTaskCall {
         if matches!(&event, ManagedTaskEvent::Notification(_)) { self.body = remaining; }
         else { self.finished = true; }
         Ok(Some(event))
+    }
+}
+
+fn json_body_error(decoder: &Decoder, error: ModernHttpExecutorError) -> ManagedTasksError {
+    // The response head has already been admitted. This is the native body's
+    // read/framing failure, not a JSON validation failure or an authorization
+    // refusal. Preserve it only for a read-only Get. Updates, cancellation and
+    // task-creating calls must not acquire retry authority from a lost reply.
+    // Limits, timeouts, credential reflection and opaque transport errors keep
+    // their existing terminal classification; do not expand this to all errors.
+    if matches!(decoder, Decoder::Get(_))
+        && matches!(error, ModernHttpExecutorError::ResponseBodyReadFailed)
+    {
+        ManagedTasksError::MissingTerminal
+    } else {
+        ManagedTasksError::InvalidResponse
     }
 }
 
@@ -538,5 +557,42 @@ mod tests {
         for bytes in [br#"[{"jsonrpc":"2.0","id":2,"result":{}}]"#.as_slice(), br#"{"jsonrpc":"2.0","id":2,"id":2,"result":{}}"#.as_slice()] {
             assert!(response_source(bytes, &RequestId::Number(2), 4096).is_err());
         }
+    }
+
+    #[test]
+    fn only_get_body_read_failure_retains_observation_interruption() {
+        assert!(matches!(json_body_error(&Decoder::Get(id()), ModernHttpExecutorError::ResponseBodyReadFailed),
+            ManagedTasksError::MissingTerminal));
+        let tool = prepared(ManagedTaskRequest::CallTool { name:"effect".to_owned(), arguments:None });
+        for decoder in [&Decoder::Update, &Decoder::Cancel, &tool.decoder] {
+            assert!(matches!(json_body_error(decoder, ModernHttpExecutorError::ResponseBodyReadFailed),
+                ManagedTasksError::InvalidResponse));
+        }
+        for error in [ModernHttpExecutorError::Cancelled,
+            ModernHttpExecutorError::InvalidTimeoutPolicy,
+            ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes: 1 },
+            ModernHttpExecutorError::CredentialInPeerError,
+            ModernHttpExecutorError::UnsupportedContentEncoding,
+            ModernHttpExecutorError::Redirect { status: 307 }]
+        {
+            assert!(matches!(json_body_error(&Decoder::Get(id()), error), ManagedTasksError::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn complete_bad_json_cannot_become_a_recoverable_get_interruption() {
+        let mut result = serde_json::to_value(task()).unwrap();
+        result["resultType"] = json!("complete");
+        let bytes = envelope(result);
+        assert!(matches!(decode_result(&Decoder::Get(id()), &bytes, &RequestId::Number(2), 65536),
+            Ok(ManagedTaskEvent::Snapshot(_))));
+        for invalid in [b"{\"jsonrpc\":".as_slice(), b"not-json".as_slice(),
+            br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#.as_slice()]
+        {
+            assert!(matches!(decode_result(&Decoder::Get(id()), invalid, &RequestId::Number(2), 65536),
+                Err(ManagedTasksError::InvalidResponse)));
+        }
+        assert!(matches!(decode_result(&Decoder::Get(id()), &bytes, &RequestId::Number(3), 65536),
+            Err(ManagedTasksError::ResponseIdMismatch)));
     }
 }
