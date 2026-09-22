@@ -10,6 +10,7 @@
 //! cannot be preempted: its reservation remains charged until the closure really
 //! returns. The caller's runtime region retains ownership of that worker.
 
+mod bridge;
 mod completion;
 mod prompt;
 mod resource;
@@ -145,6 +146,7 @@ impl BlockingHandlerLane {
             let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
             let context = worker_context.with_request_cx(worker_cx);
             let _current = Cx::set_current(Some(context.cx().clone()));
+            let _worker_scope = bridge::WorkerScope::enter(Arc::clone(&_charge.0), context.clone());
             context.checkpoint().map_err(|_| McpError::request_cancelled())?;
             let result = catch_unwind(AssertUnwindSafe(|| work(&context)))
                 .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
@@ -419,6 +421,7 @@ mod tests {
 
     struct SamplingTool {
         poller: std::thread::ThreadId,
+        lane: Option<BlockingHandlerLane>,
     }
 
     impl ToolHandler for SamplingTool {
@@ -438,20 +441,36 @@ mod tests {
         fn call(&self, ctx: &McpContext, _arguments: Value) -> McpResult<Vec<Content>> {
             assert_ne!(std::thread::current().id(), self.poller);
             assert_eq!(ctx.request_id(), 7);
-            let response = fastmcp_core::block_on(ctx.sample("complete from peer", 17))?;
+            let request = ctx.sample("complete from peer", 17);
+            let response = match &self.lane {
+                Some(lane) => lane.wait_for(request),
+                None => fastmcp_core::block_on(request),
+            }?;
             Ok(vec![Content::Text { text: response.text }])
         }
     }
 
     #[test]
     fn blocking_tool_sampling_completes_while_the_caller_drives_the_reply() {
+        run_sampling_exchange(false);
+    }
+
+    #[test]
+    fn caller_owned_blocking_wait_supports_sampling_without_a_private_runtime() {
+        run_sampling_exchange(true);
+    }
+
+    fn run_sampling_exchange(caller_owned: bool) {
         runtime(true).block_on(async {
             let cx = Cx::current().unwrap();
             let (sampler, mut received, reply) = sampling_peer(&cx);
             let context = McpContext::new(cx.clone(), 7).with_sampling(sampler.clone());
             let lane = BlockingHandlerLane::new(1).unwrap();
             let tool = BlockingTool::new(
-                SamplingTool { poller: std::thread::current().id() },
+                SamplingTool {
+                    poller: std::thread::current().id(),
+                    lane: caller_owned.then(|| lane.clone()),
+                },
                 lane.clone(),
             ).unwrap();
             let mut call = Box::pin(tool.call_async(&context, json!({})));
