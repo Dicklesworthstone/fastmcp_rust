@@ -288,6 +288,22 @@ and verification when applicable:
 - **PL-5 Structured proof:** live/effect proofs record machine-checkable
   frame, seed, runtime-selected subject, lineage, clocks, and digests; prose
   claims are insufficient.
+- **PL-6 Control-drift attribution:** a control whose value IMPROVES between two
+  runs of the same instrument is not evidence of a better instrument until the
+  delta is attributed to a named cause. The tree is live and other lanes repair,
+  regenerate and revert artifacts mid-measurement, so a moving control usually
+  means the SUBJECT changed. Establish which run saw which state
+  (`git merge-base --is-ancestor <cause> <earlier-anchor>`), report BOTH values
+  with their anchors and blob hashes, and never silently adopt the better one.
+  A control that moved because its subject was repaired is evidence about the
+  subject, and discarding the earlier reading destroys it. Bind claims to BLOB
+  hashes rather than a tree hash: a blob survives unrelated edits to the tree,
+  and a rebased commit sha still resolves under `git show` while no longer being
+  in HEAD's history. Recorded 2026-09-22 after a hasher-agreement control read
+  6-of-22 and then 22-of-22 twenty minutes later; the delta was `0acbe367`
+  restoring 16 byte-frozen artifacts that `dccc3384` had reformatted, which made
+  the earlier reading an independent detection of the bd-tj434 drift rather than
+  a stale number to overwrite.
 
 Every tracker mutation uses an explicit `--actor`. Only the batch orchestrator
 may report the `batch_verify` gate. The campaign has one structure owner and
