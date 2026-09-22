@@ -140,6 +140,7 @@ impl From<CancellableClientCredentialsTaskWatchError> for ClientCredentialsTaskW
             CancellableClientCredentialsTaskWatchError::CancellationRequested => Self::CancellationRequested,
             CancellableClientCredentialsTaskWatchError::Closed => ClientCredentialsTaskWatchError::Closed.into(),
             CancellableClientCredentialsTaskWatchError::Watch(error) => error.into(),
+            CancellableClientCredentialsTaskWatchError::Recovery(error) => error.into(),
         }
     }
 }

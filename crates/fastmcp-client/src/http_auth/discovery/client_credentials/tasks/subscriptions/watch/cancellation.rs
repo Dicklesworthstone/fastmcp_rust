@@ -24,6 +24,9 @@ use super::{
     ManagedTaskSnapshot, WatchIds, WatchState, active, check_watch, copy_binding,
     discovery_deadline, prepare_pinned, request_pinned,
 };
+use super::recovery::{
+    ClientCredentialsTaskRecoveryError, ClientCredentialsTaskRecoveryPolicy, RecoveryState,
+};
 
 pub use crate::http_auth::managed::tasks::watch::cancellation::TaskCancellationState;
 
@@ -62,6 +65,7 @@ pub enum CancellableClientCredentialsTaskWatchError {
     CancellationRequested,
     Closed,
     Watch(ClientCredentialsTaskWatchError),
+    Recovery(ClientCredentialsTaskRecoveryError),
 }
 impl fmt::Display for CancellableClientCredentialsTaskWatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -69,15 +73,32 @@ impl fmt::Display for CancellableClientCredentialsTaskWatchError {
             Self::CancellationRequested => f.write_str("machine Task cancellation acknowledged; observation stopped"),
             Self::Closed => f.write_str("cancellable machine Task watch is closed"),
             Self::Watch(error) => error.fmt(f),
+            Self::Recovery(error) => error.fmt(f),
         }
     }
 }
-impl std::error::Error for CancellableClientCredentialsTaskWatchError {}
+impl std::error::Error for CancellableClientCredentialsTaskWatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Watch(error) => Some(error),
+            Self::Recovery(error) => Some(error),
+            Self::CancellationRequested | Self::Closed => None,
+        }
+    }
+}
 impl From<ClientCredentialsTaskWatchError> for CancellableClientCredentialsTaskWatchError {
     fn from(error: ClientCredentialsTaskWatchError) -> Self { Self::Watch(error) }
 }
 impl From<ClientCredentialsError> for CancellableClientCredentialsTaskWatchError {
     fn from(error: ClientCredentialsError) -> Self { Self::Watch(error.into()) }
+}
+impl From<ClientCredentialsTaskRecoveryError> for CancellableClientCredentialsTaskWatchError {
+    fn from(error: ClientCredentialsTaskRecoveryError) -> Self {
+        match error {
+            ClientCredentialsTaskRecoveryError::Watch(error) => Self::Watch(error),
+            error => Self::Recovery(error),
+        }
+    }
 }
 
 struct Control {
@@ -255,14 +276,21 @@ impl ClientCredentialsTaskCancelHandle {
 /// handle. Terminal delivery and acknowledged cancellation elect one outcome.
 /// CancellationRequested is never successful EOF or a fabricated Cancelled Task.
 /// Abandoning a polled read releases observation and permanently closes cancel
-/// admission; an unpolled future has no effect. This owner does not reconnect.
+/// admission; an unpolled future has no effect. Reconnection is opt-in at
+/// admission, and retains the original credential and one-attempt cancel scope.
 #[must_use = "retain observation custody and poll snapshots or explicitly close"]
 pub struct CancellableClientCredentialsTaskWatch {
     remote_cancel: ClientCredentialsTaskCancelHandle,
     observation: Option<ClientCredentialsTaskWatch>,
+    recovery: Option<RecoveryState>,
 }
 impl CancellableClientCredentialsTaskWatch {
     pub fn cancel_handle(&self) -> ClientCredentialsTaskCancelHandle { self.remote_cancel.clone() }
+    /// Includes failed replacement admissions, without resetting on success,
+    /// cancellation, close or abandonment. Plain watches always return zero.
+    pub fn reconnection_attempts(&self) -> usize {
+        self.recovery.as_ref().map_or(0, RecoveryState::reconnection_attempts)
+    }
     pub fn close(&mut self) {
         self.remote_cancel.close_observation();
         self.observation = None;
@@ -285,7 +313,14 @@ impl CancellableClientCredentialsTaskWatch {
         let scope = Arc::clone(&handle.scope);
         let binding = scope.binding.as_deref().ok_or(CancellableClientCredentialsTaskWatchError::Closed)?;
         let read = Box::pin(active(cx, scope.deadline, &scope.client.client.inner.closed,
-            &scope.cancellation, Some(binding), async { Ok(observation.next_snapshot(cx).await) }));
+            &scope.cancellation, Some(binding), async {
+                Ok(match self.recovery.as_mut() {
+                    Some(recovery) => Box::pin(recovery.next_snapshot(cx, &mut observation, Some(binding)))
+                        .await.map_err(CancellableClientCredentialsTaskWatchError::from),
+                    None => observation.next_snapshot(cx).await
+                        .map_err(CancellableClientCredentialsTaskWatchError::from),
+                })
+            }));
         let snapshot = handle.until_acknowledged(read).await???;
         if handle.cancellation_requested() {
             return Err(CancellableClientCredentialsTaskWatchError::CancellationRequested);
@@ -306,7 +341,8 @@ impl Drop for CancellableClientCredentialsTaskWatch {
 impl fmt::Debug for CancellableClientCredentialsTaskWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CancellableClientCredentialsTaskWatch")
-            .field("cancellation", &self.remote_cancel.state()).finish_non_exhaustive()
+            .field("cancellation", &self.remote_cancel.state())
+            .field("reconnection_attempts", &self.reconnection_attempts()).finish_non_exhaustive()
     }
 }
 
@@ -353,6 +389,52 @@ impl ClientCredentialsTasksClient {
         &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
         id_prefix: String, policy: ClientCredentialsTaskWatchPolicy,
     ) -> Result<CancellableClientCredentialsTaskWatch, CancellableClientCredentialsTaskWatchError> {
+        self.open_cancellable_watch(cx, cancellation, task_id, id_prefix, policy, None).await
+    }
+
+    /// Observe one existing Task across bounded disconnects while retaining an
+    /// independent one-attempt cancellation handle. Each replacement freshly
+    /// negotiates Tasks and acknowledges the exact selection before a new get.
+    /// No host resolver, input update, creating call or automatic cancel runs.
+    ///
+    /// Unlike an observation-only recovering watch, the opening credential is
+    /// never renewed: the same authority owns reads AND remote cancellation.
+    /// Expiry, revocation, HTTP refusals and malformed responses stay terminal.
+    /// Record/snapshot budgets, request IDs and the original absolute deadline
+    /// survive every reconnect. A failed cancellation does not prevent recovery;
+    /// only its validated ACK stops observation, including during backoff.
+    pub async fn watch_task_cancellable_recovering(
+        &self, cx: &Cx, task_id: TaskId, id_prefix: String,
+        policy: ClientCredentialsTaskWatchPolicy,
+        recovery: ClientCredentialsTaskRecoveryPolicy,
+    ) -> Result<CancellableClientCredentialsTaskWatch, CancellableClientCredentialsTaskWatchError> {
+        self.watch_task_cancellable_recovering_with_cancellation(
+            cx, &McpRequestCancellation::new(), task_id, id_prefix, policy, recovery,
+        ).await
+    }
+
+    /// Caller-local cancellation bounds admission, idle reads, backoff and
+    /// replacement ACKs without cancelling the remote Task or sibling owners.
+    /// Recovery record reservations are validated before credentials or sockets.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn watch_task_cancellable_recovering_with_cancellation(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
+        id_prefix: String, policy: ClientCredentialsTaskWatchPolicy,
+        recovery: ClientCredentialsTaskRecoveryPolicy,
+    ) -> Result<CancellableClientCredentialsTaskWatch, CancellableClientCredentialsTaskWatchError> {
+        self.open_cancellable_watch(cx, cancellation, task_id, id_prefix, policy, Some(recovery)).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_cancellable_watch(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
+        id_prefix: String, policy: ClientCredentialsTaskWatchPolicy,
+        recovery: Option<ClientCredentialsTaskRecoveryPolicy>,
+    ) -> Result<CancellableClientCredentialsTaskWatch, CancellableClientCredentialsTaskWatchError> {
+        let connection_policy = match recovery {
+            Some(recovery) => recovery.connection_policy(policy)?,
+            None => policy,
+        };
         let _ = WatchState::new(vec![task_id.clone()], policy.maximum_snapshots)?;
         let deadline = discovery_deadline(cx, policy.timeout).map_err(ClientCredentialsError::from)?;
         let mut handle = ClientCredentialsTaskCancelHandle::for_observation(
@@ -361,14 +443,78 @@ impl ClientCredentialsTasksClient {
         let owner = &self.client.inner.closed;
         let mut observation = Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(self.watch_tasks_with_cancellation(cx, cancellation,
-                vec![task_id], id_prefix, policy).await)
+                vec![task_id], id_prefix, connection_policy).await)
         })).await??;
         observation.deadline = observation.deadline.min(deadline);
         check_watch(cx, observation.deadline, owner, cancellation, &observation.binding)?;
         handle.pin_binding(copy_binding(&observation.binding), observation.deadline)?;
-        Ok(CancellableClientCredentialsTaskWatch { remote_cancel: handle, observation: Some(observation) })
+        let recovery = recovery.map(|policy| RecoveryState::new(&observation, connection_policy, policy));
+        Ok(CancellableClientCredentialsTaskWatch {
+            remote_cancel: handle, observation: Some(observation), recovery,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::time::Duration;
+    use super::super::tests::{consumer, runtime};
+    use super::super::{ClientCredentialsTasksError, OAuthDiscoveryError};
+
+    #[test]
+    fn cancellable_recovery_reserves_records_before_credentials_or_listen() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = consumer();
+            let policy = ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(1), 1, 2).unwrap();
+            let result = Box::pin(client.watch_task_cancellable_recovering(
+                &cx, TaskId::parse("one").unwrap(), "bounded".to_owned(), policy,
+                ClientCredentialsTaskRecoveryPolicy::default(),
+            )).await;
+            assert!(matches!(result, Err(CancellableClientCredentialsTaskWatchError::Recovery(
+                ClientCredentialsTaskRecoveryError::InvalidPolicy
+            ))));
+            assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+        });
+    }
+
+    #[test]
+    fn cancellable_recovery_local_cancellation_and_closed_owner_never_acquire() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for closed in [false, true] {
+                let client = consumer();
+                let cancellation = McpRequestCancellation::new();
+                if closed { client.client.close(); } else { cancellation.cancel(); }
+                let result = Box::pin(client.watch_task_cancellable_recovering_with_cancellation(
+                    &cx, &cancellation, TaskId::parse("one").unwrap(), "bounded".to_owned(),
+                    ClientCredentialsTaskWatchPolicy::default(), ClientCredentialsTaskRecoveryPolicy::default(),
+                )).await;
+                let Err(CancellableClientCredentialsTaskWatchError::Watch(ClientCredentialsTaskWatchError::Task(
+                    ClientCredentialsTasksError::Authentication(error)
+                ))) = result else { panic!("cancelled or closed recovery must stop before admission"); };
+                if closed { assert!(matches!(error, ClientCredentialsError::Closed)); }
+                else { assert!(matches!(error, ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled))); }
+                assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn cancellable_recovery_preserves_exhaustion_causes_across_input_error_conversion() {
+        let error = CancellableClientCredentialsTaskWatchError::from(
+            ClientCredentialsTaskRecoveryError::RecoveryLimit { last_error: ClientCredentialsTaskWatchError::Interrupted });
+        assert!(std::error::Error::source(&error).is_some());
+        let error = super::super::drive::ClientCredentialsTaskWatchDriveError::from(error);
+        assert!(matches!(error, super::super::drive::ClientCredentialsTaskWatchDriveError::Recovery(
+            ClientCredentialsTaskRecoveryError::RecoveryLimit { last_error: ClientCredentialsTaskWatchError::Interrupted }
+        )));
+        let error = CancellableClientCredentialsTaskWatchError::from(
+            ClientCredentialsTaskRecoveryError::Watch(ClientCredentialsTaskWatchError::SnapshotLimit));
+        assert!(matches!(error, CancellableClientCredentialsTaskWatchError::Watch(ClientCredentialsTaskWatchError::SnapshotLimit)));
+    }
+}
