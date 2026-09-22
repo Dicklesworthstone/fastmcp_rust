@@ -2066,3 +2066,56 @@ fn bd_6rfrg_the_required_sync_call_cannot_complete_the_same_sampling_body() {
          remedied. Outcome: {outcome:?}"
     );
 }
+
+/// Is `outcome` the bd-6rfrg diagnosis -- an error naming both the bridge and
+/// the way out of it? Two substrings rather than one because an error that
+/// names the problem without naming the remedy leaves the user exactly as stuck
+/// as the hang did, and G3 asks for something actionable, not merely audible.
+fn names_the_sampling_bridge(outcome: &SamplingOutcome) -> bool {
+    match outcome {
+        SamplingOutcome::Errored(message) => {
+            message.contains("block_on") && message.contains("ToolExecutionMode::Async")
+        }
+        _ => false,
+    }
+}
+
+/// bd-6rfrg G5. The decided behaviour of remedy (c1): the sync bridge is
+/// DIAGNOSED rather than silent.
+///
+/// ORDER OF EVIDENCE MATTERS AND THIS TEST CANNOT ESTABLISH IT ALONE. Remedy
+/// (c1) converts the hang into this error, so a green run here is consistent
+/// with two different worlds: the hazard existed and was remedied, or this
+/// fixture's dispatch path was never trapped and the error is a false
+/// rejection. Only
+/// `bd_6rfrg_the_required_sync_call_cannot_complete_the_same_sampling_body`,
+/// RUN AT 911707e5 -- the commit before the remedy -- separates them. If that
+/// run reports `Completed`, this test is asserting a false rejection and the
+/// remedy must be reverted rather than this test kept.
+#[test]
+fn bd_6rfrg_the_sync_sampling_bridge_is_diagnosed_not_silent() {
+    let subject = run_sampling_arm(SamplingArm::RequiredSyncCall);
+    let negative = run_sampling_arm(SamplingArm::DeclaredAsync);
+    println!("bd-6rfrg G5 subject: {subject:?}");
+    println!("bd-6rfrg G5 negative: {negative:?}");
+
+    assert!(
+        !matches!(subject, SamplingOutcome::NoOutcomeWithinBound { .. }),
+        "G3: the detection did not fire and the request went silent again, which is the \
+         one outcome no remedy may leave in place: {subject:?}"
+    );
+    assert!(
+        names_the_sampling_bridge(&subject),
+        "G5: the sync bridge must be diagnosed by an error naming both block_on and the \
+         async hook that replaces it: {subject:?}"
+    );
+    // PLANTED NEGATIVE, RH-5. The SAME predicate, one trait method over. The
+    // async hook completes, so it must NOT be diagnosed: an assertion that held
+    // for both arms would be measuring the predicate's appetite rather than the
+    // difference between the two positions.
+    assert!(
+        !names_the_sampling_bridge(&negative),
+        "G5 NEGATIVE FAILED: the async arm was diagnosed as a starved bridge too, so the \
+         predicate does not discriminate and the assertion above is worthless: {negative:?}"
+    );
+}
