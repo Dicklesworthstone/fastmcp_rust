@@ -148,6 +148,22 @@ def self_test() -> bool:
     if len(_grouped(pre)) != 3:
         print("CONTROL FAILED: grouper miscounted a prose pre-image", file=sys.stderr)
         return False
+    # THE INVERSION, encoded as a control so it cannot come back silently.
+    mt_pre = "- Emits a parse/\n  invalid-request code."
+    mt_good = "- [ ] Emits a parse/invalid-request code."
+    mt_bad = "- [ ] Emits a parse/ invalid-request code."
+    if mid_token_integrity(mt_pre, mt_good):
+        print("CONTROL FAILED: guard E rejected a CORRECT mid-token join", file=sys.stderr)
+        return False
+    if not mid_token_integrity(mt_pre, mt_bad):
+        print("CONTROL FAILED: guard E accepted a CORRUPTED token", file=sys.stderr)
+        return False
+    if norm(strip_back(mt_good)) != norm(strip_back(reflow(mt_pre))):
+        print("CONTROL FAILED: like-to-like guard B rejected a correct repair", file=sys.stderr)
+        return False
+    if norm(strip_back(mt_bad)) == norm(strip_back(reflow(mt_pre))):
+        print("CONTROL FAILED: like-to-like guard B accepted a corruption", file=sys.stderr)
+        return False
     # Re-flow must preserve the author's word sequence exactly. NOTE: this is a
     # norm() equality, so it is BLIND to a space inserted at a mid-token break --
     # both sides normalise identically. The two controls below cover that, and
@@ -260,6 +276,39 @@ def mid_token_breaks(stored: str) -> list[tuple[str, str]]:
     return out
 
 
+def mid_token_integrity(preimage: str, stored: str) -> list[str]:
+    """Joiner-INDEPENDENT oracle for the one class re-flow can corrupt.
+
+    For each place the AUTHOR broke a token across lines, the joined form must
+    appear in the stored text and the SPACED form must not. It derives the
+    expected token from the pre-image alone and never asks the joiner what it
+    would have produced, so it remains an oracle even when the joiner is wrong
+    -- which is exactly the state this tool shipped in between 175bec41 and
+    8b6a92df.
+
+    This is the check guard B cannot be. Guard B is a norm() equality, and
+    norm() collapses the newline the corruption replaces: the author's
+    "no-common-\nmodern" and the corrupt "no-common- modern" normalise to the
+    same string, so guard B PASSED the corruption and, once the joiner was
+    fixed, FAILED the repair. A proof that normalises away the thing it is
+    testing cannot test it.
+    """
+    findings: list[str] = []
+    lines = preimage.split("\n")
+    for i in range(len(lines) - 1):
+        left, nxt = lines[i].rstrip(), lines[i + 1]
+        right = nxt.strip()
+        if not right or _item_start(nxt) is not None or not MID_TOKEN.search(left):
+            continue
+        tail, head = left.split()[-1], right.split()[0]
+        joined, spaced = tail + head, tail + " " + head
+        if spaced in stored:
+            findings.append(f"GUARD E FAIL: space inserted inside a token -- '{spaced}'")
+        elif joined not in stored:
+            findings.append(f"GUARD E FAIL: joined token absent -- expected '{joined}'")
+    return findings
+
+
 def wrapped_clause_precondition(stored: str) -> tuple[bool, str]:
     """Re-flow is mechanical ONLY if every continuation is a wrapped clause.
 
@@ -346,7 +395,7 @@ def main() -> int:
     if not self_test():
         print("REFUSING TO REPORT: controls did not pass in this invocation.", file=sys.stderr)
         return 2
-    print("controls: correct-verifies, corrupt-rejects, mutated-preimage-rejects, advisory pos+neg, wrapped-item-whole, precondition pos+neg, prose-form-grouping, reflow-preserves-words  OK")
+    print("controls: correct-verifies, corrupt-rejects, mutated-preimage-rejects, advisory pos+neg, wrapped-item-whole, precondition pos+neg, prose-form-grouping, reflow-preserves-words, mid-token pos+neg, guardB-inversion pos+neg  OK")
 
     bead, pre_path = sys.argv[1], sys.argv[2]
     preimage = open(pre_path, encoding="utf-8").read()
@@ -361,7 +410,13 @@ def main() -> int:
     if not ok and reflowed:
         pre_ok, detail = wrapped_clause_precondition(preimage)
         gA = norm(reflow(preimage)) == norm(stored)
-        gB = norm(strip_back(stored)) == norm(preimage)
+        # LIKE TO LIKE. The old form compared against norm() of the RAW
+        # pre-image, which re-introduces the space at a mid-token break and so
+        # inverted on exactly the beads that matter. It now compares against the
+        # pre-image put through the SAME joiner. That makes it joiner-dependent
+        # and therefore no longer an oracle for the token class -- guard E is.
+        gB = norm(strip_back(stored)) == norm(strip_back(reflow(preimage)))
+        gE_findings = mid_token_integrity(preimage, stored)
         gC = len(_grouped(stored)) == len(_grouped(preimage))
         gD = "- [x]" not in stored
         findings = [f"RE-FLOWED FORM: P2/P3 do not apply; guards used instead ({detail})"]
@@ -370,10 +425,12 @@ def main() -> int:
             ("B re-derives the author's words", gB),
             ("C item count unchanged", gC),
             ("D zero ticked", gD),
+            ("E mid-token integrity (joiner-independent)", not gE_findings),
             ("precondition wrapped-clauses-only", pre_ok),
         ):
             findings.append(f"  GUARD {label}: {'PASS' if val else 'FAIL'}")
-        ok = gA and gB and gC and gD and pre_ok
+        findings.extend("  " + f for f in gE_findings)
+        ok = gA and gB and gC and gD and pre_ok and not gE_findings
         n = len(_grouped(stored))
     print(f"\n{bead}")
     print(f"  bullets {n}   bytes {len(preimage.encode())} -> {len(stored.encode())}"
