@@ -79,7 +79,10 @@ esac
 
 harness="$target_dir/debug/examples/fnd_01_evidence_harness"
 
-build_args=(build -p fastmcp-rust --example fnd_01_evidence_harness)
+# --locked: a fresh checkout must build against the TRACKED Cargo.lock, the same
+# lockfile the consumer's `cargo test --locked` resolves.  Without it a stale lock
+# is silently rewritten and the artifact is built from a graph nobody tracked.
+build_args=(build --locked -p fastmcp-rust --example fnd_01_evidence_harness)
 if [ -n "$features" ]; then
   build_args+=(--features "$features")
 fi
