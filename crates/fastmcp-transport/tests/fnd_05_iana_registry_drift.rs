@@ -173,6 +173,12 @@ fn fnd_05_iana_snapshot_matches_its_pin() {
 /// function through the public surface for 22 addresses; this mirror exists so
 /// the whole registry can be swept offline. If the two ever disagree, that
 /// file is the authority and this mirror is the bug.
+///
+/// The registry-wide proof against the SHIPPED classifier now lives in
+/// `fnd_05_iana_fence_sweep.rs`, which drives every global=False prefix
+/// through the public fetch path. That retires #2647's objection that this
+/// mirror and the declared gap list were the only registry-wide check, and
+/// both were written by the same author.
 fn mirror_denies(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(a) => {
@@ -195,6 +201,17 @@ fn mirror_denies(address: IpAddr) -> bool {
                 return true;
             }
             let s = a.segments();
+            // The four arms bd-fnd-05-implementation-b-ysez adds, in the same
+            // separate-block form as the shipped classifier.
+            if matches!(
+                s,
+                [0x0100, 0, 0, 1, ..]
+                    | [0x2001, 0x0000..=0x01FF, ..]
+                    | [0x3FFF, 0x0000..=0x0FFF, ..]
+                    | [0x5F00, ..]
+            ) {
+                return true;
+            }
             matches!(s,
                 [0x0000 | 0x2002 | 0xFC00..=0xFDFF | 0xFE80..=0xFEBF, ..]
                 | [0x0064, 0xFF9B, 0, 0, 0, 0, ..]
@@ -205,9 +222,17 @@ fn mirror_denies(address: IpAddr) -> bool {
     }
 }
 
-/// Every prefix the vendored registries mark globally UNREACHABLE, with one
-/// probe address each.
+/// Every prefix the vendored registries mark globally UNREACHABLE, probed at
+/// its FIRST and LAST address.
+///
+/// The flag is read by its LEADING TOKEN, the text before any child element,
+/// so a footnoted `False <xref .../>` counts. An exact match on the whole
+/// element skipped 127.0.0.0/8, 2001::/23 and fc00::/7, and an unparsed
+/// `<xref>` after 192.0.0.0/24 dropped that prefix too (#5559, #5562). A prefix
+/// that cannot be parsed now panics rather than being skipped, and the caller
+/// asserts the exact count.
 fn globally_unreachable_probes() -> Vec<(String, IpAddr)> {
+    let leading_token = |raw: &str| raw.split('<').next().unwrap_or("").trim().to_owned();
     let mut out = Vec::new();
     for (relative, v6) in [
         ("evidence/fnd-05/iana/iana-ipv4-special-registry.xml", false),
@@ -223,42 +248,45 @@ fn globally_unreachable_probes() -> Vec<(String, IpAddr)> {
                 let end = record[start..].find(&close)? + start;
                 Some(record[start..end].trim().to_owned())
             };
-            if element("global").as_deref() != Some("False") {
+            if element("global").map(|raw| leading_token(&raw)).as_deref() != Some("False") {
                 continue;
             }
-            let Some(addresses) = element("address") else {
-                continue;
-            };
-            for part in addresses.split(',') {
+            let addresses = element("address")
+                .unwrap_or_else(|| panic!("{relative}: a global=False record has no <address>"));
+            for part in leading_token(&addresses).split(',') {
                 let part = part.trim();
-                let Some((network, bits)) = part.split_once('/') else {
-                    continue;
-                };
-                let Ok(bits) = bits.trim().parse::<u32>() else {
-                    continue;
-                };
-                // Probe the first address after the network address, which for
-                // every prefix in these registries lies inside the prefix.
-                let probe = if v6 {
-                    let Ok(base) = network.parse::<std::net::Ipv6Addr>() else {
-                        continue;
-                    };
-                    let mut octets = base.octets();
-                    if bits < 128 {
-                        octets[15] |= 1;
-                    }
-                    IpAddr::V6(std::net::Ipv6Addr::from(octets))
+                let (network, bits) = part
+                    .split_once('/')
+                    .unwrap_or_else(|| panic!("{relative}: {part} is not a CIDR prefix"));
+                let bits: u32 = bits
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{relative}: {part} has no integer length"));
+                let (first, last) = if v6 {
+                    let base = u128::from(
+                        network
+                            .parse::<std::net::Ipv6Addr>()
+                            .unwrap_or_else(|_| panic!("{relative}: {part} network")),
+                    );
+                    let host = u128::MAX.checked_shr(bits).unwrap_or(0);
+                    (
+                        IpAddr::V6(std::net::Ipv6Addr::from(base)),
+                        IpAddr::V6(std::net::Ipv6Addr::from(base | host)),
+                    )
                 } else {
-                    let Ok(base) = network.parse::<std::net::Ipv4Addr>() else {
-                        continue;
-                    };
-                    let mut octets = base.octets();
-                    if bits < 32 {
-                        octets[3] |= 1;
-                    }
-                    IpAddr::V4(std::net::Ipv4Addr::from(octets))
+                    let base = u32::from(
+                        network
+                            .parse::<std::net::Ipv4Addr>()
+                            .unwrap_or_else(|_| panic!("{relative}: {part} network")),
+                    );
+                    let host = u32::MAX.checked_shr(bits).unwrap_or(0);
+                    (
+                        IpAddr::V4(std::net::Ipv4Addr::from(base)),
+                        IpAddr::V4(std::net::Ipv4Addr::from(base | host)),
+                    )
                 };
-                out.push((part.to_owned(), probe));
+                out.push((part.to_owned(), first));
+                out.push((part.to_owned(), last));
             }
         }
     }
@@ -292,11 +320,16 @@ fn declared_gaps() -> BTreeSet<String> {
 #[test]
 fn fnd_05_iana_classifier_gap_set_is_exactly_as_declared() {
     let probes = globally_unreachable_probes();
-    assert!(
-        probes.len() >= 10,
-        "only {} globally-unreachable prefixes were parsed from the vendored registries; a \
-         parse that finds almost nothing would let this gate pass while examining nothing",
-        probes.len()
+    // EXACT, not a floor: a floor passed while 4 of 33 prefixes were silently
+    // skipped (#5559, #5562). Bound to registry blobs eda3cd1f (ipv4) and
+    // 08da69b6 (ipv6); a reviewed refresh re-freezes these numbers.
+    let prefixes: BTreeSet<&String> = probes.iter().map(|(prefix, _)| prefix).collect();
+    assert_eq!(
+        (prefixes.len(), probes.len()),
+        (33, 66),
+        "the vendored registries hold 20 ipv4 + 13 ipv6 = 33 global=False prefixes, each probed \
+         at its first and last address; a different count means a partial parse or a changed \
+         registry, and either must be reviewed rather than accepted"
     );
 
     let observed: BTreeSet<String> = probes

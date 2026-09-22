@@ -2604,6 +2604,21 @@ fn is_public_guarded_ipv6(address: Ipv6Addr) -> bool {
         return false;
     }
     let segments = address.segments();
+    // IANA special-purpose prefixes marked globally UNREACHABLE in the pinned
+    // 2025-10-09 registry (evidence/fnd-05/iana/) that the arms below admit.
+    // 2001::/23 is denied whole, which also denies its seven global=True
+    // anycast/service sub-allocations. That fail-closed over-denial is ruled
+    // and declared in provenance.toml (bd-fnd-05-implementation-b-ysez). Kept
+    // as a separate block so every existing arm below stays unchanged.
+    if matches!(
+        segments,
+        [0x0100, 0, 0, 1, ..]
+            | [0x2001, 0x0000..=0x01FF, ..]
+            | [0x3FFF, 0x0000..=0x0FFF, ..]
+            | [0x5F00, ..]
+    ) {
+        return false;
+    }
     !matches!(
         segments,
         [0x0000 | 0x2002 | 0xFC00..=0xFDFF | 0xFE80..=0xFEBF, ..]
