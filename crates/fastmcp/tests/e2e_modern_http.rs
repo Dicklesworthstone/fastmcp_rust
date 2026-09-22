@@ -28837,6 +28837,9 @@ fn e2e_public_http_legacy_filesystem_provider_lists_and_reads_live_file() {
 
 const PUBLIC_HTTP_SAMPLE_TOOL_NAME: &str = "public-http-e2e-sample";
 const PUBLIC_HTTP_SAMPLED_TEXT: &str = "sampled-legacy-http";
+/// bd-6rfrg. The sibling tool that reaches the SAME sampling body through the
+/// REQUIRED synchronous `call` instead of the async hook.
+const PUBLIC_HTTP_SYNC_SAMPLE_TOOL_NAME: &str = "public-http-e2e-sync-sample";
 
 /// Live exact-2024 HTTP tool that issues one reverse `sampling/createMessage`.
 struct PublicHttpSampleTool;
@@ -28879,6 +28882,41 @@ impl ToolHandler for PublicHttpSampleTool {
     }
 }
 
+/// bd-6rfrg: the obvious sync tool that samples.
+///
+/// Identical to [`PublicHttpSampleTool`] except for WHICH TRAIT METHOD carries
+/// the body. That one implements the async hook and declares
+/// `ToolExecutionMode::Async`; this one implements only the REQUIRED sync
+/// `call` (handler.rs:1666), whose own doc calls it "the default implementation
+/// point", and bridges the async `ctx.sample` with the `block_on` this
+/// workspace exports. It overrides nothing else, which is the user's position:
+/// they picked no execution mode and implemented the one method the trait
+/// requires.
+///
+/// Registered on the SAME server as its async twin, so the only difference
+/// between the two arms is the tool name in the call.
+struct PublicHttpSyncSampleTool;
+
+impl ToolHandler for PublicHttpSyncSampleTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_SYNC_SAMPLE_TOOL_NAME.to_owned(),
+            description: Some("bd-6rfrg: samples from the REQUIRED synchronous call".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let response = fastmcp_core::block_on(ctx.sample("echo", 16))?;
+        Ok(vec![Content::text(response.text)])
+    }
+}
+
 fn spawn_legacy_sample_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -28897,6 +28935,7 @@ fn spawn_legacy_sample_http_server() -> HttpServerFixture {
                 .protocol_policy(ProtocolPolicy::LegacyOnly)
                 .expect("LegacyOnly is available")
                 .tool(PublicHttpSampleTool)
+                .tool(PublicHttpSyncSampleTool)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -29341,6 +29380,101 @@ fn e2e_public_http_legacy_sampling_callback_reaches_context() {
         callback_calls.load(Ordering::Relaxed),
         1,
         "the tool's context authority issues exactly one sampling/createMessage callback"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+/// bd-6rfrg G1 and G5, on the harness that PROVES the round trip.
+///
+/// THE LADDER COLLAPSES TO ONE TEST HERE, because this file already supplies
+/// the rungs beneath it as passing tests:
+///   rung 0, the harness answers a tools/call --
+///     `e2e_public_http_legacy_filesystem_provider_lists_and_reads_live_file`
+///   rung 1, sampling is LIVE through this exact fixture --
+///     `e2e_public_http_legacy_sampling_callback_reaches_context`, which asserts
+///     the async twin returns PUBLIC_HTTP_SAMPLED_TEXT and that the client's
+///     callback fired exactly once.
+/// Three hand-built fixtures failed to reach a live sample before this; the
+/// defect each time was building a harness instead of borrowing a proven one.
+///
+/// `callback_calls` is the discriminator this harness gives away for free:
+///   0 -> the reverse request NEVER WENT OUT; the bridge failed before the peer.
+///   1 -> it went out and was answered, and the bridge did not deliver it.
+#[test]
+fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_sample_http_server();
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let mut client = runtime_block_on_bounded_named(
+        &cx,
+        "bd-6rfrg sync sampling HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+        )
+        .expect("the bd-6rfrg sync sampling HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-bd-6rfrg-sync-sample", "1.0.0")
+        .capabilities(ClientCapabilities {
+            sampling: Some(Default::default()),
+            elicitation: None,
+            roots: None,
+            ..Default::default()
+        })
+        .reverse_request_handlers(
+            legacy_2024::LegacyReverseRequestHandlers::new().with_sampling_create_message({
+                let callback_calls = Arc::clone(&callback_calls);
+                move |_cx, _cancel, _params| {
+                    callback_calls.fetch_add(1, Ordering::Relaxed);
+                    Box::pin(async {
+                        Ok(legacy_2024::LegacyCreateMessageResult::text(
+                            PUBLIC_HTTP_SAMPLED_TEXT,
+                            "e2e-bd-6rfrg-sync-model",
+                        ))
+                    })
+                }
+            }),
+        )
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the bd-6rfrg sampling callback is configured before exact-2024 HTTP initialization");
+
+    let outcome = runtime_block_on_bounded_named(
+        &cx,
+        "bd-6rfrg sync sampling tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_SYNC_SAMPLE_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the sync-sampling tool must return a typed exact-2024 tool result within the bound");
+    let text = legacy_http_tool_text(&outcome).unwrap_or_default();
+    let callbacks = callback_calls.load(Ordering::Relaxed);
+    println!(
+        "bd-6rfrg sync arm: is_error={} callbacks={callbacks} text={text:?}",
+        outcome.is_error
+    );
+
+    assert_ne!(
+        text.as_str(),
+        PUBLIC_HTTP_SAMPLED_TEXT,
+        "PREMISE NOT REPRODUCED: the obvious sync tool completed a REAL sampling round trip \
+         through the required `call` method. Report this as a finding about bd-6rfrg's premise; \
+         do not adjust the fixture until it fails, and treat the bead's disposition as the \
+         orchestrator's call rather than this test's. callbacks={callbacks}"
+    );
+    assert!(
+        outcome.is_error && text.contains("block_on") && text.contains("ToolExecutionMode::Async"),
+        "G3/G5: the sync bridge must be DIAGNOSED by an error naming both block_on and the async \
+         hook that replaces it, not left silent. callbacks={callbacks} (0 = the reverse request \
+         never went out; 1 = it was answered and the bridge did not deliver it). is_error={} \
+         text={text:?}",
+        outcome.is_error
     );
 
     drop(client);
