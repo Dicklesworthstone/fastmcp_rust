@@ -1958,6 +1958,17 @@ impl ModernHttpSseResponseStream {
         self.pending_event_bytes = 0;
     }
 
+    /// Whether a refusal, a cancellation, a timeout or a release has closed this
+    /// stream: its parser is gone and it never reached a clean end.
+    ///
+    /// Every read checks this BEFORE the caller's context. Otherwise a stream
+    /// closed by an expired or cancelled budget would re-read that same budget
+    /// and report the timeout or cancellation again on every later read, when
+    /// the contract is one typed timeout and then a closed stream.
+    fn is_closed(&self) -> bool {
+        self.parser.is_none() && self.end_of_stream.is_none()
+    }
+
     /// A released stream used when a JSON Task body already supplied the terminal.
     fn released() -> Self {
         Self {
@@ -2047,6 +2058,9 @@ impl ModernHttpSseResponseStream {
     /// The returned payload is not JSON-RPC-admitted. Its caller must decode
     /// it through the protocol's strict response/notification admission path.
     pub async fn next_event(&mut self, cx: &Cx) -> Result<Option<String>, ModernHttpExecutorError> {
+        if self.is_closed() {
+            return Err(ModernHttpExecutorError::SseStreamClosed);
+        }
         if let Err(error) = check_modern_http_context(cx) {
             self.close();
             return Err(error);
@@ -2146,6 +2160,9 @@ impl ModernHttpSseResponseStream {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
     ) -> Result<Option<String>, ModernHttpExecutorError> {
+        if self.is_closed() {
+            return Err(ModernHttpExecutorError::SseStreamClosed);
+        }
         let result = {
             let mut next = std::pin::pin!(self.next_event(cx));
             let mut cancelled = std::pin::pin!(cancellation.cancelled());
@@ -2209,6 +2226,9 @@ impl ModernHttpSseResponseStream {
         &mut self,
         cx: &Cx,
     ) -> Result<Poll<Option<String>>, ModernHttpExecutorError> {
+        if self.is_closed() {
+            return Err(ModernHttpExecutorError::SseStreamClosed);
+        }
         if let Err(error) = check_modern_http_context(cx) {
             self.close();
             return Err(error);
