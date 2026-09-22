@@ -3880,6 +3880,330 @@ fn json_schema_external_enum_reaches_registered_modern_tool() {
     }
 }
 
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum OptionalUnitChoice {
+    First,
+    Second,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ConstChoice {
+    Allowed,
+}
+
+impl ConstChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({"type": "string", "const": "Allowed"})
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct ConjunctionChoice(ConstChoice);
+
+impl ConjunctionChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "allOf": [{"type": "string"}, {"enum": ["Allowed"]}],
+            "not": {"const": "Denied"}
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum AlreadyNullableChoice {
+    Empty(()),
+    Choice(ConstChoice),
+}
+
+impl AlreadyNullableChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({"oneOf": [{"type": "null"}, ConstChoice::json_schema()]})
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct DialectChoice(ConstChoice);
+
+impl DialectChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "const": "Allowed"
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalDialectChoice(Option<DialectChoice>);
+
+#[test]
+fn json_schema_optional_newtype_keeps_custom_root_dialect_admissible() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalDialectChoice::json_schema())
+        .expect("the optional newtype retains a valid document-root dialect");
+    for value in [
+        OptionalDialectChoice(None),
+        OptionalDialectChoice(Some(DialectChoice(ConstChoice::Allowed))),
+    ] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        schema
+            .validate(&encoded)
+            .expect("nullable dialect preserves accepted values");
+        assert_eq!(
+            serde_json::from_value::<OptionalDialectChoice>(encoded).unwrap(),
+            value
+        );
+    }
+    assert!(schema.validate(&json!("Denied")).is_err());
+    assert!(serde_json::from_value::<OptionalDialectChoice>(json!("Denied")).is_err());
+    assert_eq!(
+        schema.schema()["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct IdentifiedChoice(ConstChoice);
+
+impl IdentifiedChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://schemas.example.test/nullable-choice",
+            "$defs": {"choice": ConstChoice::json_schema()},
+            "$ref": "#/$defs/choice"
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalIdentifiedChoice {
+    choice: Option<IdentifiedChoice>,
+}
+
+#[test]
+fn json_schema_optional_identified_resource_keeps_its_reference_scope() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalIdentifiedChoice::json_schema())
+        .expect("an explicitly identified custom resource remains admissible when nullable");
+    for encoded in [
+        json!({}),
+        json!({"choice": null}),
+        json!({"choice": "Allowed"}),
+    ] {
+        schema
+            .validate(&encoded)
+            .expect("the resource-local ref resolves within its original id");
+        serde_json::from_value::<OptionalIdentifiedChoice>(encoded).unwrap();
+    }
+    assert!(schema.validate(&json!({"choice": "Denied"})).is_err());
+    assert!(
+        serde_json::from_value::<OptionalIdentifiedChoice>(json!({"choice": "Denied"})).is_err()
+    );
+    assert_eq!(
+        schema.schema()["properties"]["choice"]["anyOf"][0],
+        IdentifiedChoice::json_schema()
+    );
+}
+
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalSchemaArguments {
+    unit: Option<OptionalUnitChoice>,
+    mixed: Option<WireEnum>,
+    constant: Option<ConstChoice>,
+    conjunction: Option<ConjunctionChoice>,
+    already_nullable: Option<AlreadyNullableChoice>,
+}
+
+fn optional_schema_argument_pairs() -> [(serde_json::Value, serde_json::Value); 7] {
+    [
+        (json!({"unit": "First"}), json!({"unit": "Unknown"})),
+        (json!({"mixed": "Idle"}), json!({"mixed": "Unknown"})),
+        (
+            json!({"mixed": {"Pair": ["work", 3]}}),
+            json!({"mixed": {"Pair": ["work"]}}),
+        ),
+        (json!({"constant": "Allowed"}), json!({"constant": "Denied"})),
+        (
+            json!({"conjunction": "Allowed"}),
+            json!({"conjunction": "Denied"}),
+        ),
+        (
+            json!({"already_nullable": "Allowed"}),
+            json!({"already_nullable": "Denied"}),
+        ),
+        (
+            json!({"already_nullable": null}),
+            json!({"already_nullable": []}),
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_optional_custom_types_accept_null_and_actual_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalSchemaArguments::json_schema())
+        .expect("nullable custom schemas pass final-dialect admission");
+    for value in [
+        OptionalSchemaArguments::default(),
+        OptionalSchemaArguments {
+            unit: Some(OptionalUnitChoice::First),
+            mixed: Some(WireEnum::Pair("work".to_owned(), 3)),
+            constant: Some(ConstChoice::Allowed),
+            conjunction: Some(ConjunctionChoice(ConstChoice::Allowed)),
+            already_nullable: Some(AlreadyNullableChoice::Choice(ConstChoice::Allowed)),
+        },
+        OptionalSchemaArguments {
+            unit: Some(OptionalUnitChoice::Second),
+            mixed: Some(WireEnum::Idle),
+            ..OptionalSchemaArguments::default()
+        },
+    ] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        schema
+            .validate(&encoded)
+            .expect("Some and None preserve their Serde wire form");
+        assert_eq!(
+            serde_json::from_value::<OptionalSchemaArguments>(encoded).unwrap(),
+            value
+        );
+    }
+    schema
+        .validate(&json!({}))
+        .expect("all optional fields may be absent");
+    assert_eq!(
+        serde_json::from_value::<OptionalSchemaArguments>(json!({})).unwrap(),
+        OptionalSchemaArguments::default()
+    );
+    // The inner oneOf already matches null. Adding null must use anyOf so the
+    // two matching nullable branches cannot cancel each other out.
+    assert_eq!(
+        serde_json::from_value::<AlreadyNullableChoice>(json!(null)).unwrap(),
+        AlreadyNullableChoice::Empty(())
+    );
+    schema.validate(&json!({"already_nullable": null})).unwrap();
+}
+
+#[test]
+fn json_schema_optional_custom_types_preserve_non_null_constraints() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalSchemaArguments::json_schema())
+        .expect("optional argument schema is admitted");
+    for (valid, invalid) in optional_schema_argument_pairs() {
+        schema
+            .validate(&valid)
+            .expect("the matched valid control is admitted");
+        serde_json::from_value::<OptionalSchemaArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(
+            serde_json::from_value::<OptionalSchemaArguments>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+static OPTIONAL_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_optional_schema(
+    unit: Option<OptionalUnitChoice>,
+    mixed: Option<WireEnum>,
+    constant: Option<ConstChoice>,
+    conjunction: Option<ConjunctionChoice>,
+    already_nullable: Option<AlreadyNullableChoice>,
+) -> McpResult<String> {
+    OPTIONAL_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&OptionalSchemaArguments {
+        unit,
+        mixed,
+        constant,
+        conjunction,
+        already_nullable,
+    })
+    .map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_optional_custom_types_reach_registered_modern_tool() {
+    let server = Server::new("optional-schema", "1.0.0")
+        .tool(DescribeOptionalSchema)
+        .build();
+    let connection = ModernConnection::new();
+    let request = |arguments| {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "describe_optional_schema",
+                "arguments": arguments,
+            })),
+            64_i64,
+        )
+    };
+    for arguments in [
+        json!({}),
+        json!({"unit": null, "mixed": null, "constant": null, "conjunction": null,
+            "already_nullable": null}),
+        json!({"unit": "First", "mixed": {"Pair": ["work", 3]}, "constant": "Allowed",
+            "conjunction": "Allowed", "already_nullable": "Allowed"}),
+    ] {
+        let expected: OptionalSchemaArguments =
+            serde_json::from_value(arguments.clone()).unwrap();
+        let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(arguments))
+            .expect("the registered optional tool returns a response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response
+            .result
+            .expect("tool returned its actual decoded arguments");
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        let actual: OptionalSchemaArguments = serde_json::from_str(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("serialized handler arguments"),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+    }
+    for (valid, invalid) in optional_schema_argument_pairs() {
+        let positive = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+            .expect("the matched optional argument reaches the tool");
+        assert!(positive.error.is_none());
+        let result = positive
+            .result
+            .expect("the matched positive returns application content");
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+            .expect("invalid optional values receive a protocol response");
+        assert!(
+            response.error.is_some()
+                || response
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["isError"] == json!(true))
+        );
+        assert_eq!(
+            OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "invalid non-null values must not reach application code"
+        );
+    }
+}
+
 // --- Struct with only description, no fields ---
 
 /// A marker struct.

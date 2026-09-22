@@ -3658,6 +3658,23 @@ mod async_handler_expansion_tests {
     }
 }
 
+/// Only macro-owned primitive/container schemas can become nullable by widening
+/// `type`: their remaining constraints apply solely to non-null instances.
+/// Custom schemas can contain `enum`, `const`, or combinators that still reject
+/// null even when `type` admits it, or when `type` is absent altogether.
+fn uses_compact_nullable_schema(ty: &Type) -> bool {
+    let Some(segment) = type_last_segment(ty) else {
+        return false;
+    };
+    match segment.ident.to_string().as_str() {
+        "String" | "str" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
+        | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "Vec"
+        | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap" | "Value" => true,
+        "Option" => option_inner_type(ty).is_some_and(uses_compact_nullable_schema),
+        _ => false,
+    }
+}
+
 /// Generates a JSON schema type for a Rust type.
 fn type_to_json_schema(ty: &Type) -> TokenStream2 {
     let Type::Path(type_path) = ty else {
@@ -3682,15 +3699,34 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             serde_json::json!({ "type": "boolean" })
         },
         "Option" => {
-            // For Option<T>, emit T's schema widened to admit JSON null, so
-            // callers may spell "omitted" as an explicit null (serde maps both
-            // to None). Schemas without a "type" keyword (empty or custom
-            // object schemas) are left untouched: an absent "type" already
-            // admits null, and custom json_schema() output is not ours to
-            // rewrite.
+            // Preserve compact built-in schemas used by parameter headers.
+            // For custom types preserve every original constraint inside an
+            // inclusive union. `oneOf` would reject null when T already admits
+            // it. Keep any resource `$id` with the original schema so scoped
+            // references retain their base; unscoped reference rebasing is a
+            // separate reusable-schema concern.
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
                     let inner_schema = type_to_json_schema(inner_ty);
+                    if !uses_compact_nullable_schema(inner_ty) {
+                        return quote! {{
+                            let mut inner_schema = #inner_schema;
+                            // A dialect belongs to its schema resource. A
+                            // custom root without an id keeps its declaration
+                            // on the new root; an identified resource retains
+                            // both its id and dialect inside the original arm.
+                            let dialect = inner_schema.as_object_mut()
+                                .filter(|schema| !schema.contains_key("$id"))
+                                .and_then(|schema| schema.remove("$schema"));
+                            let mut schema = serde_json::json!({
+                                "anyOf": [inner_schema, { "type": "null" }]
+                            });
+                            if let Some(dialect) = dialect {
+                                schema["$schema"] = dialect;
+                            }
+                            schema
+                        }};
+                    }
                     return quote! {{
                         let mut schema = #inner_schema;
                         if let Some(obj) = schema.as_object_mut() {
@@ -5981,7 +6017,9 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `i8`..`i128`, `u8`..`u128`, `isize`, `usize` → `"integer"`
 /// - `f32`, `f64` → `"number"`
 /// - `bool` → `"boolean"`
-/// - `Option<T>` → schema for T widened with `"null"` (e.g. `["integer", "null"]`), field not required; explicit JSON `null` is treated as omitted
+/// - `Option<T>` → nullable schema; built-ins keep compact type unions while
+///   custom schemas retain their constraints inside `anyOf`; field not required
+///   and explicit JSON `null` is treated as omitted
 /// - `Vec<T>` → `"array"` with items schema
 /// - `HashMap<String, T>` → `"object"` with additionalProperties
 /// - Other types → `"object"` (custom types should derive JsonSchema)
