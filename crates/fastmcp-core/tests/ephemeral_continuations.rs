@@ -405,3 +405,68 @@ fn f2ndd_join_is_woken_on_a_cancelled_cx_when_the_task_completes_while_it_waits(
         }
     });
 }
+
+/// The last provable difference: serve's scope has HOSTED AND REAPED other
+/// children before the reaper join. `lib.rs:7011` creates one `connection_scope`;
+/// `:7015` spawns the reaper into it and `:7100` spawns every connection into the
+/// SAME scope. By the time the reaper is joined those connections have run and
+/// been reaped -- stage 32 recorded ZERO live children, so this is about a scope
+/// that has hosted them, not one still holding them.
+///
+/// Every earlier revision joined in a scope that had only ever held one task.
+#[test]
+fn f2ndd_join_is_woken_in_a_scope_that_has_hosted_and_reaped_children() {
+    f2ndd_runtime().block_on(async {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
+        let scope = cx.scope();
+
+        // Host and reap three children first, so the scope is not pristine.
+        for index in 0..3 {
+            let mut prior = cx
+                .spawn_in(&scope, move |_child| async move {
+                    asupersync::runtime::yield_now().await;
+                    index
+                })
+                .expect("bd-f2ndd repro prior child must be admitted");
+            let mut settled = false;
+            for _ in 0..10_000 {
+                if !matches!(prior.try_join(), Ok(None)) {
+                    settled = true;
+                    break;
+                }
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(
+                settled,
+                "bd-f2ndd repro SETUP FAILED: prior child {index} never settled, so the scope was \
+                 not left in the hosted-and-reaped state this test exists to model"
+            );
+        }
+
+        // Now the same shape the other tests use, in a scope that has history.
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_release = std::sync::Arc::clone(&release);
+        let mut handle = cx
+            .spawn_in(&scope, move |child| async move {
+                while !child_release.load(SeqCst) {
+                    asupersync::runtime::yield_now().await;
+                }
+                let _ = child.checkpoint();
+            })
+            .expect("bd-f2ndd repro spawn_in must be admitted");
+
+        handle.abort();
+        match f2ndd_bounded_join(&mut handle, release).await {
+            F2nddJoin::WokenBeforeWatchdog(_) => {}
+            F2nddJoin::NeverParked(_) => {
+                panic!("bd-f2ndd repro VACUOUS: the joiner never parked, so no wakeup was tested")
+            }
+            F2nddJoin::OnlyWatchdog => panic!(
+                "bd-f2ndd: in a scope that has HOSTED AND REAPED children, the joiner was released \
+                 only by the watchdog -- while the identical shape in a pristine scope is woken. \
+                 The scope's history is the differing variable"
+            ),
+        }
+    });
+}
