@@ -56390,7 +56390,29 @@ original = "value"
             // this violation is invisible to every non-Linux analysis -- it can only
             // ever be caught by a Linux run, which is why it survived from 09-18.
             | "crates/fastmcp-client/src/http_auth/secure_file.rs"
+            // The encrypted one-use continuation custody draws its custody-record
+            // discriminator THROUGH the sealed API and contains ZERO `getrandom`
+            // references -- the same stated test that admitted private_key_jwt and
+            // secure_file above. Added by 000d5f58 (2026-09-19). Narrow single-API
+            // form: it needs one draw, and an entry wider than its use is a
+            // permission nobody is checking.
+            | "crates/fastmcp-core/src/runtime/envelope/continuations.rs"
             | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
+            // The bounded authenticated envelope draws its key material, its nonce
+            // domain separator and its record discriminator THROUGH the sealed API,
+            // and contains ZERO `getrandom` references. Added by 0df68bfe
+            // (2026-09-19). THREE APIs rather than one because it genuinely draws
+            // three, and the entry is still exactly as wide as its use: the two
+            // remaining sealed APIs are refused for this path.
+            //
+            // THIRD REGRESSION OF THIS CHECK IN FIVE DAYS (fa5539f8 09-18, then
+            // 0df68bfe and 000d5f58 09-19). Nothing couples "add a file that
+            // references draw_*" to "extend this allowlist", so a fourth is a
+            // matter of time. A fourth entry is not a fix for that; the coupling is
+            // a separate decision with its own owner. Recorded on bd-9l1dz.
+            "crates/fastmcp-core/src/runtime/envelope.rs" => {
+                matches!(api, "draw_ephemeral_key_material" | "draw_nonce_domain_material" | "draw_security_identifier")
+            }
             "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
             _ => false,
         }
@@ -56496,6 +56518,119 @@ original = "value"
                 "the neighbouring http_auth path must not inherit permission for {api}"
             );
         }
+    }
+
+    /// bd-9l1dz item 2: the bounded authenticated envelope's admission is exactly
+    /// three APIs wide.
+    ///
+    /// It draws three where the prior admissions draw one, so the "narrow" test
+    /// here is not "one API" but "exactly the three it uses": the remaining two
+    /// sealed APIs must still be refused for this path, or the entry would be a
+    /// permission nobody is checking.
+    #[test]
+    fn fnd_01_state_partition_rng_envelope_sealed_api_allowlist_exact() {
+        let envelope_path = "crates/fastmcp-core/src/runtime/envelope.rs";
+        // A REAL file on disk, nested inside the admitted path's own directory tree
+        // and carrying no entry of its own. A fabricated neighbour would prove only
+        // that an invented string is refused; this proves the admission does not
+        // reach a sibling the disk walk actually visits.
+        let neighboring_path = "crates/fastmcp-core/src/runtime/envelope/tests.rs";
+        for api in ["draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_security_identifier"] {
+            assert!(
+                state_partition_rng_sealed_api_is_allowlisted(envelope_path, api),
+                "the bounded authenticated envelope must admit {api}"
+            );
+        }
+        // `draw_unknown` is the fabricated control: a name the sealed set does not
+        // contain must be refused even for an admitted path, so a `true`-returning
+        // arm cannot pass this test.
+        for api in ["draw_hmac_sha256_key", "draw_websocket_mask", "draw_unknown"] {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(envelope_path, api),
+                "the bounded authenticated envelope must reject {api}"
+            );
+        }
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api),
+                "the neighbouring runtime path must not inherit permission for {api}"
+            );
+        }
+    }
+
+    /// bd-9l1dz item 3: the continuation custody's admission is exactly one API
+    /// wide, and does not leak to its own parent directory.
+    ///
+    /// The neighbour checked here is `envelope.rs`'s sibling rather than an
+    /// unrelated file, because the hazard this entry creates is specifically that
+    /// a nested path under an admitted directory inherits the parent's permission.
+    /// The allowlist matches whole paths, and this proves it.
+    #[test]
+    fn fnd_01_state_partition_rng_continuations_sealed_api_allowlist_exact() {
+        let continuations_path = "crates/fastmcp-core/src/runtime/envelope/continuations.rs";
+        // Its real directory sibling, which exists on disk and is not admitted.
+        let neighboring_path = "crates/fastmcp-core/src/runtime/envelope/tests.rs";
+        assert!(
+            state_partition_rng_sealed_api_is_allowlisted(continuations_path, "draw_security_identifier"),
+            "the encrypted one-use continuation custody must admit draw_security_identifier"
+        );
+        for api in ["draw_hmac_sha256_key", "draw_ephemeral_key_material", "draw_nonce_domain_material", "draw_websocket_mask", "draw_unknown"] {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(continuations_path, api),
+                "the encrypted one-use continuation custody must reject {api}"
+            );
+        }
+        for api in STATE_PARTITION_RNG_SEALED_APIS {
+            assert!(
+                !state_partition_rng_sealed_api_is_allowlisted(neighboring_path, api),
+                "a sibling under the envelope directory must not inherit permission for {api}"
+            );
+        }
+    }
+
+    /// bd-9l1dz item 4: the RH-1 planted-mutation review for this relaxation.
+    ///
+    /// Two entries were added to a validator's admission set. The hazard RH-1 names
+    /// is that widening disables the gate rather than narrowly admitting an approved
+    /// caller, and the assertions above cannot see that: they only ask about the two
+    /// new paths. This asks the complementary question — does the allowlist still
+    /// REFUSE, for the population it is supposed to refuse?
+    ///
+    /// The `_ => false` arm is the whole gate. If any edit ever turns it into a
+    /// permissive default, every assertion in the three tests above still passes
+    /// and this one fails.
+    #[test]
+    fn fnd_01_state_partition_rng_sealed_api_default_is_still_refusal() {
+        // Paths chosen to sit next to, inside, and above the two new entries, so a
+        // directory-prefix or `starts_with` implementation is caught rather than a
+        // merely unrelated name.
+        let unadmitted = [
+            "crates/fastmcp-core/src/runtime/envelope/mod.rs",
+            "crates/fastmcp-core/src/runtime/envelope.rs.bak",
+            "crates/fastmcp-core/src/runtime/",
+            "crates/fastmcp-core/src/",
+            "crates/fastmcp-core/src/runtime/envelope/continuations/inner.rs",
+            "",
+        ];
+        for path in unadmitted {
+            for api in STATE_PARTITION_RNG_SEALED_APIS {
+                assert!(
+                    !state_partition_rng_sealed_api_is_allowlisted(path, api),
+                    "{path:?} has no allowlist entry and must be refused for {api}"
+                );
+            }
+        }
+        // Control proving this test can distinguish: the two admitted paths DO
+        // answer true for their own APIs, so a universally-false stub would fail
+        // here rather than pass everything above.
+        assert!(
+            state_partition_rng_sealed_api_is_allowlisted("crates/fastmcp-core/src/runtime/envelope.rs", "draw_security_identifier"),
+            "control: the admitted envelope path must still be allowlisted, or this test proves nothing"
+        );
+        assert!(
+            state_partition_rng_sealed_api_is_allowlisted("crates/fastmcp-core/src/runtime/envelope/continuations.rs", "draw_security_identifier"),
+            "control: the admitted continuations path must still be allowlisted"
+        );
     }
 
     fn state_partition_rng_source<'a>(inventory: &'a StatePartitionRngInventory, path: &str) -> VResult<&'a StatePartitionRngRustSource> {
