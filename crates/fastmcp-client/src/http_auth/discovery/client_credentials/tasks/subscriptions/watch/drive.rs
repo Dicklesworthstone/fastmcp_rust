@@ -7,6 +7,8 @@
 //! after errors, cancellation, close or abandonment of a polled drive future.
 //! Opt-in bounded observation recovery retains input history and the original
 //! credential. It never retries an update whose acknowledgement was not read.
+//! An optional shared input journal persists intent before mutation and the
+//! admitted ACK before reconciliation. Unresolved intents block restart replay.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -35,6 +37,9 @@ pub use crate::http_auth::discovery::client_credentials::tasks::driver::{
     ClientCredentialsTaskWaitError, ManagedTaskInputAction, ManagedTaskRunOutcome,
 };
 pub use crate::http_auth::managed::tasks::watch::drive::TaskInputUpdateState;
+/// Shared write-ahead codec, persistence contract and protected-file adapter.
+pub use crate::http_auth::managed::tasks::watch::drive::journal;
+use journal::{TaskInputJournal, TaskInputJournalError};
 
 /// Explicit input authority in addition to the watch's finite lifetime and
 /// snapshot/record budgets. Zero updates selects observation only. Input bytes
@@ -98,6 +103,7 @@ pub enum ClientCredentialsTaskWatchDriveError {
     Watch(ClientCredentialsTaskWatchError),
     Input(ClientCredentialsTaskWaitError),
     Recovery(ClientCredentialsTaskRecoveryError),
+    Journal(TaskInputJournalError),
     CancellationRequested,
 }
 impl fmt::Display for ClientCredentialsTaskWatchDriveError {
@@ -106,11 +112,15 @@ impl fmt::Display for ClientCredentialsTaskWatchDriveError {
             Self::Watch(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
             Self::Recovery(error) => error.fmt(f),
+            Self::Journal(error) => error.fmt(f),
             Self::CancellationRequested => f.write_str("machine Task cancellation acknowledged; input driver stopped"),
         }
     }
 }
 impl std::error::Error for ClientCredentialsTaskWatchDriveError {}
+impl From<TaskInputJournalError> for ClientCredentialsTaskWatchDriveError {
+    fn from(error: TaskInputJournalError) -> Self { Self::Journal(error) }
+}
 impl From<ClientCredentialsTaskWatchError> for ClientCredentialsTaskWatchDriveError {
     fn from(error: ClientCredentialsTaskWatchError) -> Self { Self::Watch(error) }
 }
@@ -259,7 +269,7 @@ impl ClientCredentialsTasksClient {
         Ok(ClientCredentialsTaskWatchDriver {
             client: self.clone(), cancellation: cancellation.clone(), deadline: watch.deadline,
             policy, binding: Some(binding), watch: Some(watch), remote_cancel,
-            progress: UpdateProgress::default(), recovery,
+            progress: UpdateProgress::default(), recovery, journal: None,
         })
     }
 }
@@ -275,7 +285,8 @@ impl ClientCredentialsTasksClient {
 /// CancellationRequested means a cancel ACK was validated, not that an update
 /// rolled back or a Task is terminal. Inspect update_state after interruption:
 /// the last update can be Unconfirmed even when cancellation is Acknowledged.
-/// This is process-local evidence, not durable mutation recovery.
+/// Without with_input_journal this evidence is process-local. An attached
+/// journal additionally gates updates on saved intents and retains their ACKs.
 #[must_use = "retain the input driver to control cancellation and inspect update disposition"]
 pub struct ClientCredentialsTaskWatchDriver {
     client: ClientCredentialsTasksClient,
@@ -287,8 +298,47 @@ pub struct ClientCredentialsTaskWatchDriver {
     remote_cancel: ClientCredentialsTaskCancelHandle,
     progress: UpdateProgress,
     recovery: Option<RecoveryState>,
+    journal: Option<TaskInputJournal>,
 }
 impl ClientCredentialsTaskWatchDriver {
+    /// Attach an exclusive, authenticated journal before drive is polled.
+    /// The host must derive its CURRENT verified binding from this machine
+    /// registration, resource and policy, not from the restored record. Use a
+    /// separate authentication profile/namespace from browser-managed logins.
+    /// Storage custody and rollback prevention remain the host's obligations.
+    ///
+    /// A fresh authenticated snapshot always precedes input resolution. Restore
+    /// acknowledged keys, descriptor identities and the lifetime update budget;
+    /// an unresolved intent permits observation but never another input update.
+    /// Use a new request prefix after restart: saved update IDs cannot be reused.
+    ///
+    /// Persistence runs inside the original token, deadline and cancellation
+    /// scope, including explicit remote cancellation. Blocking file work belongs
+    /// in the host's owned lane. No credential renewal, background worker, host
+    /// resolver-side-effect journal or remote-cancellation journal is installed.
+    pub fn with_input_journal(mut self, journal: TaskInputJournal)
+        -> Result<Self, ClientCredentialsTaskWatchDriveError>
+    {
+        if self.journal.is_some() || self.watch.is_none() || self.binding.is_none() {
+            return Err(ClientCredentialsTaskWatchError::Closed.into());
+        }
+        let watch = self.watch.as_ref().ok_or(ClientCredentialsTaskWatchError::Closed)?;
+        let (_, progress) = restore_journal(&self.client, &watch.state.task_ids[0], self.policy, &journal)?;
+        self.progress = progress;
+        self.journal = Some(journal);
+        Ok(self)
+    }
+
+    /// Saved controls and any uncertain conditional write survive close/error.
+    pub fn input_journal(&self) -> Option<&TaskInputJournal> { self.journal.as_ref() }
+
+    /// Retire observation and cancellation admission before releasing custody.
+    /// A pending save remains quarantined; this never grants a reset or replay.
+    pub fn into_input_journal(mut self) -> Option<TaskInputJournal> {
+        self.close();
+        self.journal.take()
+    }
+
     pub fn cancel_handle(&self) -> ClientCredentialsTaskCancelHandle { self.remote_cancel.clone() }
     pub fn update_state(&self) -> TaskInputUpdateState { self.progress.state }
     pub fn acknowledged_updates(&self) -> usize { self.progress.acknowledged }
@@ -358,7 +408,10 @@ impl ClientCredentialsTaskWatchDriver {
         let deadline = self.deadline;
         let policy = self.policy;
         let task_id = watch.state.task_ids[0].clone();
-        let mut ledger = InputHistory::default();
+        let mut ledger = match self.journal.as_ref() {
+            Some(journal) => restore_journal(&client, &task_id, policy, journal)?.0,
+            None => InputHistory::default(),
+        };
         let mut reconciled = None;
         loop {
             self.check(cx, binding)?;
@@ -373,6 +426,7 @@ impl ClientCredentialsTaskWatchDriver {
                 }
             };
             self.check(cx, binding)?;
+            if let Some(journal) = &self.journal { journal.check_task(&task)?; }
             observe(&task)?;
             self.check(cx, binding)?;
             if matches!(&*task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
@@ -381,6 +435,7 @@ impl ClientCredentialsTaskWatchDriver {
             }
             let Task::InputRequired { input_requests, .. } = &*task else { continue; };
             if policy.maximum_updates == 0 { return Ok(ManagedTaskRunOutcome::InputRequired(task)); }
+            if let Some(journal) = &self.journal { journal.can_update()?; }
             let pending = ledger.unanswered(input_requests, policy)?;
             if pending.requests.is_empty() { continue; }
             if self.progress.acknowledged >= policy.maximum_updates { return Err(ClientCredentialsTaskWaitError::UpdateLimit.into()); }
@@ -407,7 +462,19 @@ impl ClientCredentialsTaskWatchDriver {
             let _ = prepare_pinned(&client, &get_ids, ManagedTaskRequest::Get(task_id.clone()))?;
             let _ = prepare_pinned(&client, &update_ids,
                 ManagedTaskRequest::Update { task: task.clone(), input_responses: responses.clone() })?;
+            let intent = self.journal.as_ref().map(|journal|
+                journal.intent_from_history(&task, &ledger.entries, ledger.bytes,
+                    responses.keys().cloned(), &update_ids.1)
+            ).transpose()?;
             self.check(cx, binding)?;
+            // Do not begin a mutation round until the exact conditional intent
+            // is saved. Failure or abandonment quarantines the journal; neither
+            // the update nor observation recovery can bypass this boundary.
+            if let Some(intent) = intent {
+                self.journal.as_mut().ok_or(TaskInputJournalError::InvalidRecord)?
+                    .persist(cx, &cancellation, deadline, intent).await?;
+                self.check(cx, binding)?;
+            }
             self.progress.begin(update_ids.1.clone(), policy.maximum_updates)?;
             let mut call = request_pinned(&client, cx, &cancellation, binding, deadline, update_ids,
                 ManagedTaskRequest::Update { task, input_responses: responses }).await?;
@@ -420,6 +487,15 @@ impl ClientCredentialsTaskWatchDriver {
             ledger = next_ledger;
             drop(call);
             self.check(cx, binding)?;
+            if let Some(journal) = self.journal.as_mut() {
+                let receipt = journal.acknowledgement()?;
+                // In-memory wire evidence was admitted above and survives a
+                // failed save. Do not get, resolve more input, or reconnect on
+                // a persistence failure; only the subsequent observation may
+                // enter the existing recovery engine.
+                journal.persist(cx, &cancellation, deadline, receipt).await?;
+                self.check(cx, binding)?;
+            }
             // A partial answer need not change status or cause a notification.
             // Only observation AFTER this admitted ACK can recover. The update
             // itself and its response read above never enter the recovery loop.
@@ -460,6 +536,17 @@ impl fmt::Debug for ClientCredentialsTaskWatchDriver {
             .field("reconnection_attempts", &self.reconnection_attempts())
             .finish_non_exhaustive()
     }
+}
+
+fn restore_journal(
+    client: &ClientCredentialsTasksClient, task: &TaskId,
+    policy: ClientCredentialsTaskWatchDrivePolicy, journal: &TaskInputJournal,
+) -> Result<(InputHistory, UpdateProgress), TaskInputJournalError> {
+    let state = journal.admit_driver(client.client.resource(), task,
+        policy.maximum_updates, policy.maximum_input_keys, policy.maximum_input_bytes)?;
+    Ok((InputHistory { entries: state.entries, bytes: state.bytes },
+        UpdateProgress { state: state.state, acknowledged: state.acknowledged,
+            request_id: state.request_id }))
 }
 
 #[derive(Clone, Default)]
@@ -547,3 +634,177 @@ fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use fastmcp_core::CanonicalHttpUrl;
+    use fastmcp_core::partition::{DurableOwnerKey, PartitionDescriptor};
+    use crate::http_auth::managed::tasks::watch::checkpoint::resume::TaskResumeBinding;
+    use journal::{TaskInputJournalChange, TaskInputJournalRecord};
+    use std::task::{Context, Poll, Waker};
+    use serde_json::json;
+
+    fn consumer() -> ClientCredentialsTasksClient { super::super::tests::consumer() }
+    fn binding(resource: CanonicalHttpUrl, profile: u8) -> TaskResumeBinding {
+        let facts = PartitionDescriptor::from_verified_facts("fixture", 1, "https://issuer.example",
+            resource.as_str(), "tenant", "machine-subject", "machine-client", 1, 1,
+            &[b"bound-resource".as_slice()]).unwrap();
+        let owner = DurableOwnerKey::derive(&facts, 1).unwrap();
+        TaskResumeBinding::from_verified_owner(resource, "machine-input-journal", &owner,
+            [profile; 32], [3; 32], [4; 32]).unwrap()
+    }
+    fn task() -> Task {
+        serde_json::from_value(json!({"taskId":"one", "status":"input_required",
+            "createdAt":"2026-09-22T00:00:00Z", "lastUpdatedAt":"2026-09-22T00:00:01Z",
+            "ttlMs":null, "inputRequests":{"one":{"method":"roots/list"},"two":{"method":"roots/list"}}})).unwrap()
+    }
+    fn requests() -> TaskInputRequests {
+        let Task::InputRequired { input_requests, .. } = task() else { unreachable!() };
+        input_requests
+    }
+    // Unit-only conditional-save receipt. Real persistence belongs to the
+    // shared protected-file adapter; this helper makes no durability claim.
+    fn save(_: Cx, _: McpRequestCancellation, _: Time, change: TaskInputJournalChange)
+        -> std::future::Ready<Result<TaskInputJournalRecord, TaskInputJournalError>>
+    { std::future::ready(Ok(change.proposed().clone())) }
+    fn fresh(client: &ClientCredentialsTasksClient) -> TaskInputJournal {
+        let owner = binding(client.client.resource().clone(), 11);
+        let record = TaskInputJournalRecord::empty(&owner, task().base().task_id.clone()).unwrap();
+        TaskInputJournal::new(owner, record, save).unwrap()
+    }
+    fn reopen(client: &ClientCredentialsTasksClient, journal: &TaskInputJournal) -> TaskInputJournal {
+        let record = TaskInputJournalRecord::decode(&journal.record().unwrap().encode().unwrap()).unwrap();
+        TaskInputJournal::new(binding(client.client.resource().clone(), 11), record, save).unwrap()
+    }
+    fn restore(client: &ClientCredentialsTasksClient, journal: &TaskInputJournal) -> (InputHistory, UpdateProgress) {
+        restore_journal(client, &task().base().task_id, ClientCredentialsTaskWatchDrivePolicy::default(), journal).unwrap()
+    }
+    fn intent(client: &ClientCredentialsTasksClient, journal: &TaskInputJournal, key: &str, id: &str)
+        -> TaskInputJournalChange
+    {
+        let (mut history, _) = restore(client, journal);
+        history.unanswered(&requests(), ClientCredentialsTaskWatchDrivePolicy::default()).unwrap();
+        journal.intent_from_history(&task(), &history.entries, history.bytes,
+            std::iter::once(key.to_owned()), &RequestId::String(id.to_owned())).unwrap()
+    }
+    fn persist(journal: &mut TaskInputJournal, change: TaskInputJournalChange) {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let mut work = Box::pin(journal.persist(&cx, &cancellation,
+            cx.now().saturating_add_nanos(1_000_000_000), change));
+        assert!(matches!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Ok(()))));
+    }
+    fn acknowledge(journal: &mut TaskInputJournal) {
+        let receipt = journal.acknowledgement().unwrap();
+        persist(journal, receipt);
+    }
+
+    #[test]
+    fn machine_journal_restores_intent_uncertainty_and_only_acknowledged_keys() {
+        let client = consumer();
+        let mut journal = fresh(&client);
+        let change = intent(&client, &journal, "one", "first:5");
+        persist(&mut journal, change);
+        let pending = reopen(&client, &journal);
+        let (_, progress) = restore(&client, &pending);
+        assert_eq!(progress.state, TaskInputUpdateState::Unconfirmed);
+        assert_eq!(progress.acknowledged, 0);
+        assert_eq!(progress.request_id, Some(RequestId::String("first:5".to_owned())));
+        assert_eq!(pending.can_update(), Err(TaskInputJournalError::ReconciliationRequired));
+        acknowledge(&mut journal);
+        let restored = reopen(&client, &journal);
+        let (mut history, progress) = restore(&client, &restored);
+        assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+        assert_eq!(progress.acknowledged, 1);
+        assert_eq!(restored.record().unwrap().generation(), 2);
+        let pending = history.unanswered(&requests(), ClientCredentialsTaskWatchDrivePolicy::default()).unwrap();
+        assert_eq!(pending.requests.keys().map(String::as_str).collect::<Vec<_>>(), ["two"]);
+        assert_eq!(restored.record().unwrap().encode().unwrap(), journal.record().unwrap().encode().unwrap());
+    }
+
+    #[test]
+    fn machine_journal_restored_budgets_cannot_be_reset_by_a_new_driver() {
+        let client = consumer();
+        let mut journal = fresh(&client);
+        let change = intent(&client, &journal, "one", "first:5");
+        persist(&mut journal, change); acknowledge(&mut journal);
+        let before = journal.record().unwrap().encode().unwrap();
+        for dimension in 0..3 {
+            let mut policy = ClientCredentialsTaskWatchDrivePolicy::default();
+            match dimension { 0 => policy.maximum_updates = 0, 1 => policy.maximum_input_keys = 1,
+                _ => policy.maximum_input_bytes = 1 }
+            assert!(matches!(restore_journal(&client, &task().base().task_id, policy, &journal),
+                Err(TaskInputJournalError::Capacity)));
+        }
+        assert_eq!(journal.record().unwrap().encode().unwrap(), before);
+        let (_, mut progress) = restore(&client, &journal);
+        assert!(matches!(progress.begin(RequestId::String("restart:5".to_owned()), 1),
+            Err(ClientCredentialsTaskWaitError::UpdateLimit)));
+        assert_eq!(progress.acknowledged, 1);
+        assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+    }
+
+    #[test]
+    fn machine_journal_rejects_identity_descriptor_and_request_id_reuse() {
+        let client = consumer();
+        let mut journal = fresh(&client);
+        let change = intent(&client, &journal, "one", "first:5");
+        persist(&mut journal, change); acknowledge(&mut journal);
+        let before = journal.record().unwrap().encode().unwrap();
+        let (history, _) = restore(&client, &journal);
+        assert!(matches!(journal.intent_from_history(&task(), &history.entries, history.bytes,
+            std::iter::once("two".to_owned()), &RequestId::String("first:5".to_owned())),
+            Err(TaskInputJournalError::IdentityReused)));
+        for key in ["one", "two"] {
+            let mut history = history.clone();
+            let changed = serde_json::from_value(json!({key:{"method":"sampling/createMessage",
+                "params":{"messages":[],"maxTokens":1}}})).unwrap();
+            assert!(matches!(history.unanswered(&changed, ClientCredentialsTaskWatchDrivePolicy::default()),
+                Err(ClientCredentialsTaskWaitError::InputKeyReused)));
+        }
+        let mut changed = serde_json::to_value(task()).unwrap();
+        changed["createdAt"] = json!("2026-09-21T00:00:00Z");
+        assert_eq!(journal.check_task(&serde_json::from_value(changed).unwrap()), Err(TaskInputJournalError::TaskChanged));
+        assert_eq!(journal.record().unwrap().encode().unwrap(), before);
+    }
+
+    #[test]
+    fn machine_journal_requires_current_resource_task_and_authentication_profile() {
+        let client = consumer();
+        let journal = fresh(&client);
+        assert!(matches!(restore_journal(&client, &TaskId::parse("foreign").unwrap(),
+            ClientCredentialsTaskWatchDrivePolicy::default(), &journal), Err(TaskInputJournalError::BindingMismatch)));
+        let wrong = binding(CanonicalHttpUrl::parse("https://other.example/mcp").unwrap(), 11);
+        let other = TaskInputJournal::new(wrong.clone(), TaskInputJournalRecord::empty(&wrong,
+            task().base().task_id.clone()).unwrap(), save).unwrap();
+        assert!(matches!(restore_journal(&client, &task().base().task_id,
+            ClientCredentialsTaskWatchDrivePolicy::default(), &other), Err(TaskInputJournalError::BindingMismatch)));
+        assert!(matches!(TaskInputJournal::new(binding(client.client.resource().clone(), 12),
+            journal.record().unwrap().clone(), save), Err(TaskInputJournalError::BindingMismatch)));
+        assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+    }
+
+    #[test]
+    fn machine_journal_abandoned_save_cannot_restore_the_cached_predecessor() {
+        let client = consumer();
+        let original = fresh(&client);
+        let mut journal = TaskInputJournal::new(binding(client.client.resource().clone(), 11),
+            original.record().unwrap().clone(), |_: Cx, _: McpRequestCancellation, _: Time, _: TaskInputJournalChange|
+                std::future::pending::<Result<TaskInputJournalRecord, TaskInputJournalError>>()).unwrap();
+        let change = intent(&client, &journal, "one", "first:5");
+        let proposed = change.proposed().clone();
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let mut work = Box::pin(journal.persist(&cx, &cancellation,
+            cx.now().saturating_add_nanos(1_000_000_000), change));
+        assert!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        drop(work);
+        assert_eq!(journal.pending_change().unwrap().proposed(), &proposed);
+        assert!(matches!(restore_journal(&client, &task().base().task_id,
+            ClientCredentialsTaskWatchDrivePolicy::default(), &journal), Err(TaskInputJournalError::ReconciliationRequired)));
+        assert!(matches!(ClientCredentialsTaskWatchDriveError::from(TaskInputJournalError::InvalidReceipt),
+            ClientCredentialsTaskWatchDriveError::Journal(TaskInputJournalError::InvalidReceipt)));
+        assert!(!cancellation.is_cancel_requested());
+    }
+}
