@@ -4549,6 +4549,339 @@ fn json_schema_serde_names_and_defaults_reach_registered_modern_tool() {
     }
 }
 
+const SHAPED_SCHEMA_ARRAY_WIDTH: usize = 2;
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaInferredArray([u8; !0 >> (usize::BITS - 1)]);
+
+#[allow(non_upper_case_globals)]
+const __fastmcp_array_length: usize = 2;
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaHygienicArray([[u8; __fastmcp_array_length]; 1]);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaArguments {
+    pair: (String, u16),
+    singleton: (bool,),
+    fixed: [i16; SHAPED_SCHEMA_ARRAY_WIDTH + 1],
+    empty: [bool; 0],
+    nested: Vec<(u8, [String; 2])>,
+    glyph: char,
+    optional_glyph: Option<char>,
+    unit: (),
+    tiny: i8,
+}
+
+fn shaped_schema_valid_arguments() -> serde_json::Value {
+    json!({
+        "pair": ["work", 65535],
+        "singleton": [true],
+        "fixed": [-32768, 0, 32767],
+        "empty": [],
+        "nested": [[255, ["A", "B"]]],
+        "glyph": "🦀",
+        "unit": null,
+        "tiny": 127,
+    })
+}
+
+fn shaped_schema_argument_pairs() -> Vec<(serde_json::Value, serde_json::Value)> {
+    let valid = shaped_schema_valid_arguments();
+    [
+        ("pair", json!(["work"])),
+        ("pair", json!(["work", 65535, true])),
+        ("pair", json!(["work", 65536])),
+        ("pair", json!(["work", -1])),
+        ("singleton", json!(true)),
+        ("fixed", json!([-32768, 0])),
+        ("fixed", json!([-32768, 0, 32767, 1])),
+        ("fixed", json!([-32769, 0, 32767])),
+        ("empty", json!([true])),
+        ("nested", json!([[256, ["A", "B"]]])),
+        ("nested", json!([[255, ["A"]]])),
+        ("glyph", json!("")),
+        ("glyph", json!("🦀🦀")),
+        ("optional_glyph", json!("AB")),
+        ("unit", json!([])),
+        ("tiny", json!(128)),
+    ]
+    .into_iter()
+    .map(|(field, value)| {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        (valid.clone(), invalid)
+    })
+    .collect()
+}
+
+#[test]
+fn json_schema_tuple_and_array_shapes_match_serde() {
+    let schema = fastmcp_rust::schema::admit_final_schema(ShapedSchemaArguments::json_schema())
+        .expect("tuples, arrays, unit, and char produce an admissible schema");
+    let mut alternate = shaped_schema_valid_arguments();
+    alternate["nested"] = json!([]);
+    alternate["glyph"] = json!("é");
+    alternate["optional_glyph"] = json!("A");
+    alternate["tiny"] = json!(-128);
+    for value in [shaped_schema_valid_arguments(), alternate] {
+        let decoded: ShapedSchemaArguments = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        schema.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ShapedSchemaArguments>(encoded).unwrap(),
+            decoded
+        );
+    }
+    let properties = &schema.schema()["properties"];
+    assert_eq!(properties["pair"]["minItems"], 2);
+    assert_eq!(properties["pair"]["maxItems"], 2);
+    assert_eq!(properties["singleton"]["type"], "array");
+    assert_eq!(properties["singleton"]["minItems"], 1);
+    assert_eq!(properties["fixed"]["minItems"], 3);
+    assert_eq!(properties["fixed"]["maxItems"], 3);
+    assert_eq!(properties["empty"]["maxItems"], 0);
+    assert!(properties["empty"].get("prefixItems").is_none());
+    assert_eq!(properties["unit"]["type"], "null");
+    assert!(properties["unit"].get("prefixItems").is_none());
+    assert_eq!(
+        properties["optional_glyph"]["type"],
+        json!(["string", "null"])
+    );
+    {
+        // The array type gives these unsuffixed literals a usize context.
+        // Losing that context produces a negative bound or overflows an i32 shift.
+        let inferred = fastmcp_rust::schema::admit_final_schema(
+            ShapedSchemaInferredArray::json_schema(),
+        )
+        .unwrap();
+        let value = ShapedSchemaInferredArray([7]);
+        let encoded = serde_json::to_value(&value).unwrap();
+        inferred.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ShapedSchemaInferredArray>(encoded).unwrap(),
+            value
+        );
+        assert_eq!(inferred.schema()["minItems"], 1);
+        assert_eq!(inferred.schema()["maxItems"], 1);
+        assert!(inferred.validate(&json!([7, 8])).is_err());
+    }
+    let hygienic = fastmcp_rust::schema::admit_final_schema(
+        ShapedSchemaHygienicArray::json_schema(),
+    )
+    .unwrap();
+    let value = ShapedSchemaHygienicArray([[7, 8]]);
+    let encoded = serde_json::to_value(&value).unwrap();
+    hygienic.validate(&encoded).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ShapedSchemaHygienicArray>(encoded).unwrap(),
+        value
+    );
+    assert_eq!(hygienic.schema()["items"]["minItems"], 2);
+    assert_eq!(hygienic.schema()["maxItems"], 1);
+    assert!(hygienic.validate(&json!([[7]])).is_err());
+}
+
+#[test]
+fn json_schema_tuple_and_array_shapes_reject_near_neighbors() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(ShapedSchemaArguments::json_schema()).unwrap();
+    for (valid, invalid) in shaped_schema_argument_pairs() {
+        schema.validate(&valid).unwrap();
+        serde_json::from_value::<ShapedSchemaArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<ShapedSchemaArguments>(invalid).is_err());
+    }
+}
+
+#[derive(JsonSchema)]
+struct NativeIntegerSchemas {
+    i8_value: i8,
+    i16_value: i16,
+    i32_value: i32,
+    i64_value: i64,
+    i128_value: i128,
+    isize_value: isize,
+    u8_value: u8,
+    u16_value: u16,
+    u32_value: u32,
+    u64_value: u64,
+    u128_value: u128,
+    usize_value: usize,
+}
+
+struct NativeIntegerSchemaCase {
+    name: &'static str,
+    minimum: serde_json::Value,
+    maximum: serde_json::Value,
+    below: serde_json::Value,
+    above: serde_json::Value,
+    accepts: fn(serde_json::Value) -> bool,
+}
+
+fn native_integer_schema_cases() -> Vec<NativeIntegerSchemaCase> {
+    macro_rules! case {
+        ($name:literal, $ty:ty, $below:expr, $above:expr) => {
+            NativeIntegerSchemaCase {
+                name: $name,
+                minimum: json!(<$ty>::MIN),
+                maximum: json!(<$ty>::MAX),
+                below: serde_json::from_str($below).unwrap(),
+                above: serde_json::from_str($above).unwrap(),
+                accepts: |value| serde_json::from_value::<$ty>(value).is_ok(),
+            }
+        };
+    }
+    vec![
+        case!("i8_value", i8, "-129", "128"),
+        case!("i16_value", i16, "-32769", "32768"),
+        case!("i32_value", i32, "-2147483649", "2147483648"),
+        case!(
+            "i64_value",
+            i64,
+            "-9223372036854775809",
+            "9223372036854775808"
+        ),
+        case!(
+            "i128_value",
+            i128,
+            "-170141183460469231731687303715884105729",
+            "170141183460469231731687303715884105728"
+        ),
+        case!(
+            "isize_value",
+            isize,
+            &(isize::MIN as i128 - 1).to_string(),
+            &(isize::MAX as i128 + 1).to_string()
+        ),
+        case!("u8_value", u8, "-1", "256"),
+        case!("u16_value", u16, "-1", "65536"),
+        case!("u32_value", u32, "-1", "4294967296"),
+        case!("u64_value", u64, "-1", "18446744073709551616"),
+        case!(
+            "u128_value",
+            u128,
+            "-1",
+            "340282366920938463463374607431768211456"
+        ),
+        case!(
+            "usize_value",
+            usize,
+            "-1",
+            &(usize::MAX as u128 + 1).to_string()
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_native_integer_bounds_are_exact() {
+    let schema = NativeIntegerSchemas::json_schema();
+    for case in native_integer_schema_cases() {
+        let admitted =
+            fastmcp_rust::schema::admit_final_schema(schema["properties"][case.name].clone())
+                .unwrap();
+        assert_eq!(admitted.schema()["minimum"], case.minimum);
+        assert_eq!(admitted.schema()["maximum"], case.maximum);
+        for value in [case.minimum, case.maximum] {
+            admitted.validate(&value).unwrap();
+            assert!((case.accepts)(value));
+        }
+    }
+    assert_eq!(
+        schema["properties"]["i128_value"]["minimum"].to_string(),
+        "-170141183460469231731687303715884105728"
+    );
+    assert_eq!(
+        schema["properties"]["u128_value"]["maximum"].to_string(),
+        "340282366920938463463374607431768211455"
+    );
+}
+
+#[test]
+fn json_schema_native_integer_bounds_reject_neighboring_values() {
+    let schema = NativeIntegerSchemas::json_schema();
+    for case in native_integer_schema_cases() {
+        let admitted =
+            fastmcp_rust::schema::admit_final_schema(schema["properties"][case.name].clone())
+                .unwrap();
+        admitted.validate(&case.minimum).unwrap();
+        admitted.validate(&case.maximum).unwrap();
+        for value in [case.below, case.above] {
+            assert!(
+                admitted.validate(&value).is_err(),
+                "{} accepts {value}",
+                case.name
+            );
+            assert!(!(case.accepts)(value));
+        }
+    }
+}
+
+static SHAPED_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_shaped_schema(value: ShapedSchemaArguments) -> McpResult<String> {
+    SHAPED_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&value).map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_shaped_arguments_reach_registered_modern_tool() {
+    let server = Server::new("shaped-schema", "1.0.0")
+        .tool(DescribeShapedSchema)
+        .build();
+    let connection = ModernConnection::new();
+    let request = |value| {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "describe_shaped_schema",
+                "arguments": {"value": value},
+            })),
+            64_i64,
+        )
+    };
+    for (valid, invalid) in shaped_schema_argument_pairs() {
+        let expected: ShapedSchemaArguments = serde_json::from_value(valid.clone()).unwrap();
+        let before = SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+            .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        let actual: ShapedSchemaArguments =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+            .unwrap();
+        assert!(
+            response.error.is_some()
+                || response
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result["isError"] == json!(true))
+        );
+        assert_eq!(
+            SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "invalid shape or out-of-range integer must not reach the handler"
+        );
+    }
+}
+
 // --- Struct with only description, no fields ---
 
 /// A marker struct.

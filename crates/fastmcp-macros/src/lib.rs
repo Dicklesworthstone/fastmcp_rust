@@ -3667,7 +3667,7 @@ fn uses_compact_nullable_schema(ty: &Type) -> bool {
         return false;
     };
     match segment.ident.to_string().as_str() {
-        "String" | "str" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
+        "String" | "str" | "char" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
         | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "Vec"
         | "HashSet" | "BTreeSet" | "HashMap" | "BTreeMap" | "Value" => true,
         "Option" => option_inner_type(ty).is_some_and(uses_compact_nullable_schema),
@@ -3677,6 +3677,42 @@ fn uses_compact_nullable_schema(ty: &Type) -> bool {
 
 /// Generates a JSON schema type for a Rust type.
 fn type_to_json_schema(ty: &Type) -> TokenStream2 {
+    match ty {
+        Type::Tuple(tuple) if tuple.elems.is_empty() => {
+            return quote! { serde_json::json!({ "type": "null" }) };
+        }
+        Type::Tuple(tuple) => {
+            let items: Vec<_> = tuple.elems.iter().map(type_to_json_schema).collect();
+            let length = items.len();
+            return quote! {
+                serde_json::json!({
+                    "type": "array",
+                    "prefixItems": [#(#items),*],
+                    "minItems": #length,
+                    "maxItems": #length,
+                })
+            };
+        }
+        Type::Array(array) => {
+            let items = type_to_json_schema(&array.elem);
+            let length = &array.len;
+            let length_binding = Ident::new("__fastmcp_array_length", Span::mixed_site());
+            return quote! {{
+                // Array lengths have a usize expected type in Rust. Preserve
+                // that context for unsuffixed literals and const expressions.
+                let #length_binding: usize = #length;
+                serde_json::json!({
+                    "type": "array",
+                    "items": #items,
+                    "minItems": #length_binding,
+                    "maxItems": #length_binding,
+                })
+            }};
+        }
+        Type::Paren(paren) => return type_to_json_schema(&paren.elem),
+        Type::Group(group) => return type_to_json_schema(&group.elem),
+        _ => {}
+    }
     let Type::Path(type_path) = ty else {
         return quote! { serde_json::json!({}) };
     };
@@ -3688,9 +3724,16 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
         "String" | "str" => quote! {
             serde_json::json!({ "type": "string" })
         },
+        "char" => quote! {
+            serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 1 })
+        },
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
         | "usize" => quote! {
-            serde_json::json!({ "type": "integer" })
+            serde_json::json!({
+                "type": "integer",
+                "minimum": <#ty>::MIN,
+                "maximum": <#ty>::MAX,
+            })
         },
         "f32" | "f64" => quote! {
             serde_json::json!({ "type": "number" })
@@ -6004,7 +6047,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// //   "type": "object",
 /// //   "properties": {
 /// //     "name": { "type": "string", "description": "The name of the person" },
-/// //     "age": { "type": ["integer", "null"], "description": "Optional age" },
+/// //     "age": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295, "description": "Optional age" },
 /// //     "tags": { "type": "array", "items": { "type": "string" }, "description": "List of tags" }
 /// //   },
 /// //   "required": ["name", "tags"]
@@ -6013,16 +6056,18 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Supported Types
 ///
-/// - `String`, `&str` → `"string"`
-/// - `i8`..`i128`, `u8`..`u128`, `isize`, `usize` → `"integer"`
+/// - `String` → `"string"`; `char` → a string of exactly one codepoint
+/// - `i8`..`i128`, `u8`..`u128`, `isize`, `usize` → `"integer"` with native bounds
 /// - `f32`, `f64` → `"number"`
 /// - `bool` → `"boolean"`
 /// - `Option<T>` → nullable schema; built-ins keep compact type unions while
 ///   custom schemas retain their constraints inside `anyOf`; field not required
 ///   and explicit JSON `null` is treated as omitted
 /// - `Vec<T>` → `"array"` with items schema
+/// - `[T; N]` → `"array"` with exactly `N` items
+/// - Nonempty tuples → positional arrays; `()` → `"null"`
 /// - `HashMap<String, T>` → `"object"` with additionalProperties
-/// - Other types → `"object"` (custom types should derive JsonSchema)
+/// - Custom types call their derived or manually implemented `json_schema()`
 ///
 /// # Attributes
 ///
