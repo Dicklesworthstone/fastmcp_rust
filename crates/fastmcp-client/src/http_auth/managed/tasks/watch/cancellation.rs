@@ -11,6 +11,7 @@ use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::Poll;
+use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::types::Time;
@@ -21,7 +22,7 @@ use fastmcp_protocol::tasks_extension::{Task, TaskId};
 use super::{
     ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTaskSnapshot,
     ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient,
-    ManagedTasksError, OAuthSessionError, WatchIds, deadline_after, prepare,
+    ManagedTasksError, OAuthCredentialSnapshot, OAuthSessionError, WatchIds, deadline_after, prepare,
 };
 use super::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
@@ -172,6 +173,9 @@ struct CancelScope {
     ids: ManagedTaskRequestIds,
     cancellation: McpRequestCancellation,
     deadline: Time,
+    // Input-driving owners share their one admitted credential, not a freshly
+    // renewed mutation authority. Ordinary observers retain on-demand auth.
+    pinned_credential: Option<Arc<OAuthCredentialSnapshot>>,
 }
 
 /// Cloneable authority for one explicit remote-cancel attempt. Clones share
@@ -203,8 +207,18 @@ impl ManagedTaskCancelHandle {
         let _ = client.prepare_round(ids.clone(), prepared)?;
         Ok(Self { scope: Arc::new(CancelScope {
             control: Arc::new(Control::new()), client: client.clone(), task_id,
-            ids, cancellation: cancellation.clone(), deadline,
+            ids, cancellation: cancellation.clone(), deadline, pinned_credential: None,
         }) })
+    }
+
+    // Install only during admission, before the scope is shared or usable. No
+    // public method can swap credentials beneath a pending cancellation.
+    pub(super) fn pin_credential(
+        &mut self, credential: Arc<OAuthCredentialSnapshot>,
+    ) -> Result<(), CancellableTaskWatchError> {
+        let scope = Arc::get_mut(&mut self.scope).ok_or(CancellableTaskWatchError::Closed)?;
+        scope.pinned_credential = Some(credential);
+        Ok(())
     }
 
     pub(super) fn cancellation_requested(&self) -> bool {
@@ -244,6 +258,11 @@ impl ManagedTaskCancelHandle {
     /// abandoned future leaves Unconfirmed rather than enabling a hidden retry.
     /// Observation continues unless an actual acknowledgement was admitted.
     ///
+    /// Input-driving owners also pin the original credential for cancellation:
+    /// expiry/revocation cannot renew or change that run's mutation authority,
+    /// even while the driver is unpolled. Other watch owners acquire credentials
+    /// on demand as before. Both paths perform fresh Tasks discovery.
+    ///
     /// Closing/dropping the observation owner wakes an outstanding cancellation
     /// wait. A socket/provider operation already committed cannot be undone.
     /// An ACK admitted before that wake is returned as acknowledged even if a
@@ -261,16 +280,31 @@ impl ManagedTaskCancelHandle {
         let deadline = (|| {
             scope.client.session.check(cx, &scope.cancellation)?;
             scope.client.session.check(cx, cancellation)?;
+            if let Some(credential) = &scope.pinned_credential {
+                if Instant::now() >= credential.expires_at || credential.credential().is_revoked() {
+                    return Err(OAuthSessionError::LoginRequired);
+                }
+            }
             let deadline = scope.deadline.min(deadline_after(cx, scope.client.limits.timeout)?);
             if cx.now() >= deadline { return Err(OAuthSessionError::TimedOut); }
             Ok(deadline)
         })().map_err(|error| TaskCancellationError::NotAttempted(error.into()))?;
         scope.control.claim()?;
-        let attempted = Box::pin(scope.client.session.await_active(cx, &scope.cancellation, deadline, None, async {
+        let expiry = scope.pinned_credential.as_ref().map(|credential| credential.expires_at);
+        let attempted = Box::pin(scope.client.session.await_active(cx, &scope.cancellation, deadline, expiry, async {
             Ok(async {
-                let mut call = scope.client.request_with_cancellation(
-                    cx, cancellation, scope.ids.clone(), ManagedTaskRequest::Cancel(scope.task_id.clone()),
-                ).await?;
+                let mut call = match scope.pinned_credential.as_deref() {
+                    Some(credential) => {
+                        let prepared = prepare(scope.client.session.resource().as_str(), &scope.client.metadata,
+                            &scope.ids.operation, ManagedTaskRequest::Cancel(scope.task_id.clone()), scope.client.limits)?;
+                        let round = scope.client.prepare_round(scope.ids.clone(), prepared)?;
+                        scope.client.execute_round(cx, cancellation, round, credential,
+                            deadline, scope.client.limits.records).await?
+                    }
+                    None => scope.client.request_with_cancellation(
+                        cx, cancellation, scope.ids.clone(), ManagedTaskRequest::Cancel(scope.task_id.clone()),
+                    ).await?,
+                };
                 if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Cancelled(_))) {
                     return Err(ManagedTasksError::InvalidResponse);
                 }

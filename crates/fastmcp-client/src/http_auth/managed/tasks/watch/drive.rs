@@ -4,20 +4,23 @@
 //! triggers one reconciliation get, since a partial answer need not emit a
 //! notification. Optional observation recovery retains the input ledger across
 //! reconnects and interrupted reconciliation reads. Mutations are never retried;
-//! no timer polling or background worker is used.
+//! no timer polling or background worker is used. The owned driver exposes the
+//! shared remote-cancel handle and retains update disposition after interruption.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, sha256_bounded};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
-use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, RequestId, FINAL_CLIENT_CAPABILITIES_META_KEY};
 
-use super::{ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient};
+use super::{ManagedTaskWatch, ManagedTaskWatchError, ManagedTaskWatchPolicy, ManagedTasksClient};
+use super::cancellation::{CancellableTaskWatchError, ManagedTaskCancelHandle};
 use super::recovery::{ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveryState};
 use super::super::{
     BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError,
@@ -89,6 +92,9 @@ pub enum ManagedTaskWatchDriveError {
     Watch(ManagedTaskWatchError),
     Input(ManagedTaskDriverError),
     Recovery(ManagedTaskRecoveryError),
+    /// A validated remote cancellation ACK stopped this driver. This is not a
+    /// terminal Task or proof that an in-flight input update did not commit.
+    CancellationRequested,
     /// A concurrent renewal changed the credential during listen admission.
     /// No subsequent host callback or input update has run under that credential.
     CredentialChanged,
@@ -100,6 +106,7 @@ impl fmt::Display for ManagedTaskWatchDriveError {
             Self::Watch(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
             Self::Recovery(error) => error.fmt(f),
+            Self::CancellationRequested => f.write_str("Task cancellation acknowledged; input driver stopped"),
             Self::CredentialChanged => f.write_str("Task watch credential changed during admission"),
         }
     }
@@ -126,6 +133,59 @@ impl From<ManagedTaskRecoveryError> for ManagedTaskWatchDriveError {
         }
     }
 }
+impl From<CancellableTaskWatchError> for ManagedTaskWatchDriveError {
+    fn from(error: CancellableTaskWatchError) -> Self {
+        match error {
+            CancellableTaskWatchError::CancellationRequested => Self::CancellationRequested,
+            CancellableTaskWatchError::Closed => ManagedTaskWatchError::Closed.into(),
+            CancellableTaskWatchError::Watch(error) => error.into(),
+            CancellableTaskWatchError::Recovery(error) => error.into(),
+            CancellableTaskWatchError::Session(error) => error.into(),
+        }
+    }
+}
+
+/// Local evidence about the most recent input update, not remote Task status.
+/// Cancellation, close and future abandonment never clear this disposition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TaskInputUpdateState {
+    #[default]
+    NotAttempted,
+    /// The update round started, but its acknowledgement has not been admitted.
+    /// Even a failed discovery is conservatively included. Do not replay it.
+    Unconfirmed,
+    /// A complete typed update acknowledgement was admitted. Reconciliation or
+    /// result delivery can still fail afterwards without erasing this receipt.
+    Acknowledged,
+}
+
+#[derive(Default)]
+struct UpdateProgress {
+    state: TaskInputUpdateState,
+    acknowledged: usize,
+    request_id: Option<RequestId>,
+}
+impl UpdateProgress {
+    fn begin(&mut self, id: RequestId, maximum: usize) -> Result<(), ManagedTaskDriverError> {
+        if self.state == TaskInputUpdateState::Unconfirmed {
+            return Err(ManagedTaskDriverError::UnexpectedResponse);
+        }
+        if self.acknowledged >= maximum { return Err(ManagedTaskDriverError::UpdateLimit); }
+        self.request_id = Some(id);
+        self.state = TaskInputUpdateState::Unconfirmed;
+        Ok(())
+    }
+
+    fn acknowledge(&mut self) -> Result<(), ManagedTaskDriverError> {
+        if self.state != TaskInputUpdateState::Unconfirmed {
+            return Err(ManagedTaskDriverError::UnexpectedResponse);
+        }
+        // begin is bounded by the validated policy (at most 128 updates).
+        self.acknowledged += 1;
+        self.state = TaskInputUpdateState::Acknowledged;
+        Ok(())
+    }
+}
 
 impl ManagedTasksClient {
     /// Observes one existing Task and resolves input only through the supplied
@@ -133,15 +193,14 @@ impl ManagedTasksClient {
     /// `ReturnToCaller` pauses without an update. Advertised roots, sampling and
     /// elicitation capabilities gate every resolver invocation.
     ///
-    /// One identity sequence covers listen, all gets and every update. A local
-    /// update is reconciled immediately even without a notification. Answered
-    /// keys are not answered again, and changing any previously observed input
-    /// descriptor is rejected, including an as-yet-unanswered key.
-    ///
-    /// This operation never creates/cancels a remote Task or retries a failed
-    /// mutation. Observation reconnect is opt-in through `with_recovery` and
-    /// keeps the same input ledger. The ledger is process-local; restarting is
-    /// not authority to replay an update whose acknowledgement was lost.
+    /// This convenience uses the same owned driver as `watch_task_inputs`.
+    /// Use that constructor to retain update disposition or obtain a separate
+    /// remote-cancel handle while host input is pending. Without using that
+    /// handle, this operation never issues a remote cancellation.
+    /// One identity sequence covers all reads and updates. Acknowledged keys
+    /// are not answered again during recovery; changed descriptors are refused.
+    /// No creating call or failed mutation is retried. The ledger is volatile:
+    /// restarting is not permission to replay an update with a lost reply.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task_watching<R, F, O>(
         &self, cx: &Cx, task_id: TaskId, id_prefix: String,
@@ -156,139 +215,276 @@ impl ManagedTasksClient {
             task_id, id_prefix, policy, resolve, observe).await
     }
 
-    /// Pins the original subscription credential through snapshots, callbacks,
-    /// discovery, reconnects and updates. Renewal cannot extend this run or
-    /// change its authorization. The deadline includes credential acquisition,
-    /// initial admission and every recovery delay. Cancelling/dropping releases
-    /// owned work without cancelling the ambient Cx, siblings or the remote Task.
-    /// Synchronous host callbacks must return promptly and cooperate.
+    /// Local cancellation releases owned work without cancelling the ambient
+    /// Cx, siblings or the remote Task. Synchronous callbacks must cooperate.
     #[allow(clippy::too_many_arguments)]
     pub async fn drive_task_watching_with_cancellation<R, F, O>(
         &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
-        id_prefix: String, policy: ManagedTaskWatchDrivePolicy, mut resolve: R, mut observe: O,
+        id_prefix: String, policy: ManagedTaskWatchDrivePolicy, resolve: R, observe: O,
     ) -> Result<ManagedTaskRunOutcome, ManagedTaskWatchDriveError>
     where
         R: FnMut(TaskInputRequests) -> F,
         F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskWatchDriveError>>,
         O: FnMut(&Task) -> Result<(), ManagedTaskWatchDriveError>,
     {
+        let mut driver = self.watch_task_inputs_with_cancellation(
+            cx, cancellation, task_id, id_prefix, policy,
+        ).await?;
+        Box::pin(driver.drive(cx, resolve, observe)).await
+    }
+
+    /// Admit a single Task's input driver without reading a snapshot, invoking
+    /// host code, or updating the Task. The returned owner exposes cancel_handle
+    /// before drive is polled, so remote cancellation can interrupt a pending
+    /// resolver, read, update reply or recovery backoff.
+    ///
+    /// The complete selection must be acknowledged first. All input work AND
+    /// remote cancellation use the opening credential, never an implicitly
+    /// renewed input authority. Initial admission, caller pauses and all later
+    /// work share one finite deadline. The driver creates no runtime or worker.
+    pub async fn watch_task_inputs(
+        &self, cx: &Cx, task_id: TaskId, id_prefix: String,
+        policy: ManagedTaskWatchDrivePolicy,
+    ) -> Result<ManagedTaskWatchDriver, ManagedTaskWatchDriveError> {
+        self.watch_task_inputs_with_cancellation(
+            cx, &McpRequestCancellation::new(), task_id, id_prefix, policy,
+        ).await
+    }
+
+    /// Retains the supplied request-local cancellation domain without taking
+    /// permission to cancel that shared token. Invalid IDs, policy, and cancel
+    /// encodings are refused before credential acquisition or network effects.
+    pub async fn watch_task_inputs_with_cancellation(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
+        id_prefix: String, policy: ManagedTaskWatchDrivePolicy,
+    ) -> Result<ManagedTaskWatchDriver, ManagedTaskWatchDriveError> {
         self.session.check(cx, cancellation)?;
-        // Validate selection, identity and the combined connection reservation
-        // before acquiring/renewing a token or making a network request.
         let _ = super::WatchState::new(vec![task_id.clone()], policy.watch.maximum_snapshots)?;
         let _ = super::WatchIds::new(id_prefix.clone())?;
         let connection_policy = policy.connection_policy()?;
         let deadline = deadline_after(cx, policy.watch.timeout)?;
-        let credential = self.session.await_active(cx, cancellation, deadline, None, async {
+        let mut remote_cancel = ManagedTaskCancelHandle::for_observation(
+            self, task_id.clone(), &id_prefix, cancellation, deadline,
+        )?;
+        let credential = Arc::new(self.session.await_active(cx, cancellation, deadline, None, async {
             self.session.credential_with_cancellation(cx, cancellation).await
-        }).await?;
-        self.session.await_active(cx, cancellation, deadline, Some(credential.expires_at), async {
-            Ok(async {
-                let mut watch = Box::pin(self.watch_tasks_with_cancellation(cx, cancellation,
-                    vec![task_id.clone()], id_prefix, connection_policy)).await?;
-                let generation = watch.subscription.as_ref()
-                    .ok_or(ManagedTaskWatchError::Closed)?.credential_generation();
-                if generation != credential.generation {
-                    return Err(ManagedTaskWatchDriveError::CredentialChanged);
-                }
-                watch.deadline = watch.deadline.min(deadline);
-                let mut recovery = policy.recovery.map(|recovery|
-                    RecoveryState::new(&watch, connection_policy, recovery));
-                let mut ledger = InputHistory::default();
-                let mut updates = 0;
-                let mut reconciled = None;
-                loop {
-                    let task = match reconciled.take() {
-                        Some(task) => task,
-                        None => {
-                            let snapshot = match recovery.as_mut() {
-                                Some(recovery) => Box::pin(recovery.next_snapshot(cx, &mut watch, Some(&credential))).await?,
-                                None => Box::pin(watch.next_snapshot_with_credential(cx, Some(&credential))).await?,
-                            };
-                            snapshot.ok_or(ManagedTaskWatchError::UnexpectedEvent)?.task
-                        }
+        }).await?);
+        remote_cancel.pin_credential(Arc::clone(&credential))?;
+        let mut watch = Box::pin(self.session.await_active(
+            cx, cancellation, deadline, Some(credential.expires_at), async {
+                Ok(self.watch_tasks_with_cancellation(
+                    cx, cancellation, vec![task_id], id_prefix, connection_policy,
+                ).await)
+            },
+        )).await??;
+        let generation = watch.subscription.as_ref()
+            .ok_or(ManagedTaskWatchError::Closed)?.credential_generation();
+        if generation != credential.generation { return Err(ManagedTaskWatchDriveError::CredentialChanged); }
+        check_drive(self, cx, cancellation, deadline, &credential)?;
+        watch.deadline = watch.deadline.min(deadline);
+        Ok(ManagedTaskWatchDriver {
+            client: self.clone(), cancellation: cancellation.clone(), deadline, policy,
+            credential: Some(credential), watch: Some(watch), remote_cancel,
+            progress: UpdateProgress::default(),
+        })
+    }
+}
+
+/// Owned, one-shot input execution over the existing authenticated Task watch.
+///
+/// drive transfers its socket and credential before suspension. Dropping a
+/// POLLED drive closes observation and future cancel admission permanently,
+/// including while a resolver or update is pending. Unpolled futures do nothing.
+/// ReturnToCaller also ends this run; it does not restore an old input challenge
+/// as retry authority. No implicit remote cancellation occurs on drop/close.
+///
+/// A successful remote cancellation produces CancellationRequested, not a
+/// fabricated terminal. Inspect update_state afterwards: an interrupted update
+/// may have committed. The actual last acknowledgement and correlation ID stay
+/// available on this owner after any return, error, close or abandoned future.
+/// This evidence is process-local, not a durable mutation-recovery journal.
+#[must_use = "retain the input driver to control cancellation and inspect update disposition"]
+pub struct ManagedTaskWatchDriver {
+    client: ManagedTasksClient,
+    cancellation: McpRequestCancellation,
+    deadline: Time,
+    policy: ManagedTaskWatchDrivePolicy,
+    credential: Option<Arc<OAuthCredentialSnapshot>>,
+    watch: Option<ManagedTaskWatch>,
+    remote_cancel: ManagedTaskCancelHandle,
+    progress: UpdateProgress,
+}
+
+impl ManagedTaskWatchDriver {
+    /// All clones share the existing controller's one-attempt reservation.
+    pub fn cancel_handle(&self) -> ManagedTaskCancelHandle { self.remote_cancel.clone() }
+    pub fn update_state(&self) -> TaskInputUpdateState { self.progress.state }
+    pub fn acknowledged_updates(&self) -> usize { self.progress.acknowledged }
+    /// Correlation only, never an idempotency key or proof of remote rollback.
+    pub fn last_update_request_id(&self) -> Option<&RequestId> { self.progress.request_id.as_ref() }
+
+    pub fn close(&mut self) {
+        self.remote_cancel.close_observation();
+        self.watch = None;
+        self.credential = None;
+    }
+
+    /// Run once through current snapshots and explicit host input. A validated
+    /// cancel ACK wakes pending work; a failed cancel attempt does not. All host
+    /// callbacks and update effects are checked against the same stop decision.
+    /// A terminal is elected only after validation and the observer callback.
+    /// Synchronous callbacks must return promptly; completed host side effects
+    /// cannot be recalled by a racing cancellation.
+    pub async fn drive<R, F, O>(
+        &mut self, cx: &Cx, mut resolve: R, mut observe: O,
+    ) -> Result<ManagedTaskRunOutcome, ManagedTaskWatchDriveError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskWatchDriveError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskWatchDriveError>,
+    {
+        if self.remote_cancel.cancellation_requested() {
+            self.close();
+            return Err(ManagedTaskWatchDriveError::CancellationRequested);
+        }
+        let mut watch = self.watch.take().ok_or(ManagedTaskWatchError::Closed)?;
+        let remote = self.remote_cancel.clone();
+        // This lease is intentionally never disarmed: drive is one-shot on
+        // success, error, panic or abandonment, not just on a remote cancel.
+        let _lease = remote.read_lease();
+        let credential = self.credential.take().ok_or(ManagedTaskWatchError::Closed)?;
+        let client = self.client.clone();
+        let cancellation = self.cancellation.clone();
+        let deadline = self.deadline;
+        let running = Box::pin(client.session.await_active(
+            cx, &cancellation, deadline, Some(credential.expires_at), async {
+                Ok(self.drive_active(cx, &mut watch, &credential, &mut resolve, &mut observe).await)
+            },
+        ));
+        remote.until_acknowledged(running).await??
+    }
+
+    fn check(&self, cx: &Cx, credential: &OAuthCredentialSnapshot) -> Result<(), ManagedTaskWatchDriveError> {
+        if self.remote_cancel.cancellation_requested() { return Err(ManagedTaskWatchDriveError::CancellationRequested); }
+        check_drive(&self.client, cx, &self.cancellation, self.deadline, credential)
+    }
+
+    async fn drive_active<R, F, O>(
+        &mut self, cx: &Cx, watch: &mut ManagedTaskWatch, credential: &OAuthCredentialSnapshot,
+        resolve: &mut R, observe: &mut O,
+    ) -> Result<ManagedTaskRunOutcome, ManagedTaskWatchDriveError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskWatchDriveError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskWatchDriveError>,
+    {
+        let client = self.client.clone();
+        let cancellation = self.cancellation.clone();
+        let deadline = self.deadline;
+        let policy = self.policy;
+        let mut recovery = policy.recovery.map(|recovery|
+            RecoveryState::new(watch, policy.connection_policy().expect("policy admitted before opening"), recovery));
+        let mut ledger = InputHistory::default();
+        let mut reconciled = None;
+        loop {
+            self.check(cx, credential)?;
+            let task = match reconciled.take() {
+                Some(task) => task,
+                None => {
+                    let snapshot = match recovery.as_mut() {
+                        Some(recovery) => Box::pin(recovery.next_snapshot(cx, watch, Some(credential))).await?,
+                        None => Box::pin(watch.next_snapshot_with_credential(cx, Some(credential))).await?,
                     };
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    observe(&task)?;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    if matches!(&*task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
-                        return Ok(ManagedTaskRunOutcome::Terminal(task));
-                    }
-                    let Task::InputRequired { input_requests, .. } = &*task else { continue; };
-                    if policy.maximum_updates == 0 { return Ok(ManagedTaskRunOutcome::InputRequired(task)); }
-                    let pending = ledger.unanswered(input_requests, policy)?;
-                    if pending.requests.is_empty() { continue; }
-                    if updates >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit.into()); }
-                    admit_capabilities(&self.metadata, &pending.requests)?;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let resolution = resolve(pending.requests.clone());
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let action = resolution.await?;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let ManagedTaskInputAction::Respond(responses) = action else {
-                        return Ok(ManagedTaskRunOutcome::InputRequired(task));
-                    };
-                    // All local reservations and BOTH complete request encodings
-                    // precede the mutation. A partial answer must not consume the
-                    // last slot and leave its required reconciliation impossible.
-                    let next_ledger = ledger.with_answers(&pending, &responses)?;
-                    watch.state.reserve_snapshot()?;
-                    let update_ids = watch.ids.next_pair()?;
-                    let get_ids = watch.ids.next_pair()?;
-                    let update = prepare(self.session.resource().as_str(), &self.metadata,
-                        &update_ids.operation, ManagedTaskRequest::Update { task, input_responses: responses }, self.limits)?;
-                    let update_round = self.prepare_round(update_ids, update)?;
-                    let get = prepare(self.session.resource().as_str(), &self.metadata,
-                        &get_ids.operation, ManagedTaskRequest::Get(task_id.clone()), self.limits)?;
-                    let get_round = self.prepare_round(get_ids, get)?;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let call_deadline = deadline.min(deadline_after(cx, self.limits.timeout)?);
-                    // Deliberately outside observation recovery. Even an I/O
-                    // error here may mean the peer already accepted the update.
-                    let mut call = self.execute_round(cx, cancellation, update_round,
-                        &credential, call_deadline, self.limits.records).await?;
-                    if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Updated(_))) {
-                        return Err(ManagedTaskWatchError::UnexpectedEvent.into());
-                    }
-                    drop(call);
-                    // Retain acknowledgement BEFORE the observation can fail.
-                    // A replacement snapshot may still contain these input keys;
-                    // neither resolver work nor their answers may be repeated.
-                    ledger = next_ledger;
-                    updates += 1;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    let observed = async {
-                        let call_deadline = deadline.min(deadline_after(cx, self.limits.timeout)?);
-                        let mut call = self.execute_round(cx, cancellation, get_round,
-                            &credential, call_deadline, self.limits.records).await?;
-                        let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
-                            return Err(ManagedTaskWatchError::UnexpectedEvent);
-                        };
-                        Ok::<_, ManagedTaskWatchError>(snapshot.task)
-                    }.await;
-                    check_drive(self, cx, cancellation, deadline, &credential)?;
-                    match observed {
-                        Ok(task) => {
-                            watch.finished = watch.state.record_snapshot(&task)?;
-                            if let Some(recovery) = recovery.as_mut() {
-                                recovery.record_snapshot(&watch, &task)?;
-                            }
-                            if watch.finished { watch.close(); }
-                            reconciled = Some(Box::new(task));
-                        }
-                        Err(error) => match recovery.as_mut() {
-                            Some(recovery) => {
-                                // Only a get after a validated ACK enters here.
-                                // The next loop obtains a fresh authoritative
-                                // snapshot, without rebuilding ledger or limits.
-                                Box::pin(recovery.reconnect_after(cx, &mut watch, Some(&credential), error)).await?;
-                            }
-                            None => return Err(error.into()),
-                        },
-                    }
+                    snapshot.ok_or(ManagedTaskWatchError::UnexpectedEvent)?.task
                 }
-            }.await)
-        }).await?
+            };
+            self.check(cx, credential)?;
+            observe(&task)?;
+            self.check(cx, credential)?;
+            if matches!(&*task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+                self.remote_cancel.select_terminal()?;
+                return Ok(ManagedTaskRunOutcome::Terminal(task));
+            }
+            let Task::InputRequired { input_requests, .. } = &*task else { continue; };
+            if policy.maximum_updates == 0 { return Ok(ManagedTaskRunOutcome::InputRequired(task)); }
+            let pending = ledger.unanswered(input_requests, policy)?;
+            if pending.requests.is_empty() { continue; }
+            if self.progress.acknowledged >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit.into()); }
+            admit_capabilities(&client.metadata, &pending.requests)?;
+            self.check(cx, credential)?;
+            let resolution = resolve(pending.requests.clone());
+            self.check(cx, credential)?;
+            let action = resolution.await?;
+            self.check(cx, credential)?;
+            let ManagedTaskInputAction::Respond(responses) = action else {
+                return Ok(ManagedTaskRunOutcome::InputRequired(task));
+            };
+            // Reserve capacity and encode BOTH requests before dispatching the
+            // update, so its mandatory reconciliation always has a local slot.
+            let next_ledger = ledger.with_answers(&pending, &responses)?;
+            watch.state.reserve_snapshot()?;
+            let update_ids = watch.ids.next_pair()?;
+            let get_ids = watch.ids.next_pair()?;
+            let update = prepare(client.session.resource().as_str(), &client.metadata,
+                &update_ids.operation, ManagedTaskRequest::Update { task, input_responses: responses }, client.limits)?;
+            let update_id = update_ids.operation.clone();
+            let update_round = client.prepare_round(update_ids, update)?;
+            let task_id = watch.state.task_ids[0].clone();
+            let get = prepare(client.session.resource().as_str(), &client.metadata,
+                &get_ids.operation, ManagedTaskRequest::Get(task_id), client.limits)?;
+            let get_round = client.prepare_round(get_ids, get)?;
+            self.check(cx, credential)?;
+            let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
+            // Retain uncertainty before the first await of a mutation round.
+            // Observation recovery deliberately cannot retry anything here.
+            self.progress.begin(update_id, policy.maximum_updates)?;
+            let mut call = client.execute_round(cx, &cancellation, update_round,
+                credential, call_deadline, client.limits.records).await?;
+            if !matches!(call.next_event(cx).await?, Some(ManagedTaskEvent::Updated(_))) {
+                return Err(ManagedTaskWatchError::UnexpectedEvent.into());
+            }
+            self.progress.acknowledge()?;
+            ledger = next_ledger;
+            drop(call);
+            self.check(cx, credential)?;
+            let observed = async {
+                let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
+                let mut call = client.execute_round(cx, &cancellation, get_round,
+                    credential, call_deadline, client.limits.records).await?;
+                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
+                    return Err(ManagedTaskWatchError::UnexpectedEvent);
+                };
+                Ok::<_, ManagedTaskWatchError>(snapshot.task)
+            }.await;
+            self.check(cx, credential)?;
+            match observed {
+                Ok(task) => {
+                    watch.finished = watch.state.record_snapshot(&task)?;
+                    if let Some(recovery) = recovery.as_mut() { recovery.record_snapshot(watch, &task)?; }
+                    if watch.finished { watch.close(); }
+                    reconciled = Some(Box::new(task));
+                }
+                Err(error) => match recovery.as_mut() {
+                    Some(recovery) => {
+                        // Only observation after an admitted ACK can recover;
+                        // input history, update receipt and all budgets survive.
+                        Box::pin(recovery.reconnect_after(cx, watch, Some(credential), error)).await?;
+                    }
+                    None => return Err(error.into()),
+                },
+            }
+        }
+    }
+}
+impl Drop for ManagedTaskWatchDriver {
+    fn drop(&mut self) { self.remote_cancel.close_observation(); }
+}
+impl fmt::Debug for ManagedTaskWatchDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedTaskWatchDriver")
+            .field("update_state", &self.progress.state)
+            .field("acknowledged_updates", &self.progress.acknowledged)
+            .finish_non_exhaustive()
     }
 }
 
@@ -502,5 +698,50 @@ mod tests {
             ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::SnapshotLimit)));
         assert!(matches!(ManagedTaskWatchDriveError::from(ManagedTaskRecoveryError::RecoveryLimit),
             ManagedTaskWatchDriveError::Recovery(ManagedTaskRecoveryError::RecoveryLimit)));
+    }
+
+    #[test]
+    fn pending_update_cannot_be_replaced_by_another_attempt_or_false_ack() {
+        let mut progress = UpdateProgress::default();
+        assert!(progress.acknowledge().is_err());
+        assert_eq!(progress.state, TaskInputUpdateState::NotAttempted);
+        progress.begin(RequestId::Number(7), 2).unwrap();
+        assert!(progress.begin(RequestId::Number(9), 2).is_err());
+        assert_eq!(progress.request_id, Some(RequestId::Number(7)));
+        assert_eq!(progress.state, TaskInputUpdateState::Unconfirmed);
+        assert_eq!(progress.acknowledged, 0);
+        progress.acknowledge().unwrap();
+        assert!(progress.acknowledge().is_err());
+        assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+        assert_eq!(progress.acknowledged, 1);
+    }
+
+    #[test]
+    fn next_input_update_retains_previous_count_and_cannot_reset_the_limit() {
+        let mut progress = UpdateProgress::default();
+        assert!(progress.begin(RequestId::Number(1), 0).is_err());
+        assert!(progress.request_id.is_none());
+        progress.begin(RequestId::Number(1), 2).unwrap();
+        progress.acknowledge().unwrap();
+        progress.begin(RequestId::Number(3), 2).unwrap();
+        assert_eq!(progress.acknowledged, 1);
+        assert_eq!(progress.state, TaskInputUpdateState::Unconfirmed);
+        progress.acknowledge().unwrap();
+        assert!(matches!(progress.begin(RequestId::Number(5), 2), Err(ManagedTaskDriverError::UpdateLimit)));
+        assert_eq!(progress.acknowledged, 2);
+        assert_eq!(progress.state, TaskInputUpdateState::Acknowledged);
+        assert_eq!(progress.request_id, Some(RequestId::Number(3)));
+    }
+
+    #[test]
+    fn remote_cancel_is_distinct_from_local_cancellation_and_preserves_typed_errors() {
+        assert!(matches!(ManagedTaskWatchDriveError::from(CancellableTaskWatchError::CancellationRequested),
+            ManagedTaskWatchDriveError::CancellationRequested));
+        assert!(matches!(ManagedTaskWatchDriveError::from(CancellableTaskWatchError::Closed),
+            ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Closed)));
+        assert!(matches!(ManagedTaskWatchDriveError::from(CancellableTaskWatchError::Session(OAuthSessionError::Cancelled)),
+            ManagedTaskWatchDriveError::Watch(ManagedTaskWatchError::Session(OAuthSessionError::Cancelled))));
+        assert!(matches!(ManagedTaskWatchDriveError::from(CancellableTaskWatchError::Recovery(ManagedTaskRecoveryError::CredentialChanged)),
+            ManagedTaskWatchDriveError::CredentialChanged));
     }
 }
