@@ -190,6 +190,48 @@ impl fmt::Debug for ManagedTaskCancelHandle {
 impl ManagedTaskCancelHandle {
     pub fn state(&self) -> TaskCancellationState { self.scope.control.state() }
 
+    // Shared by plain/recovering and persistence-gated owners. This is local
+    // preparation only: callers publish the handle AFTER successful admission.
+    // The owner must close this scope on drop and arm a lease for each read.
+    pub(super) fn for_observation(
+        client: &ManagedTasksClient, task_id: TaskId, prefix: &str,
+        cancellation: &McpRequestCancellation, deadline: Time,
+    ) -> Result<Self, CancellableTaskWatchError> {
+        let ids = cancellation_ids(prefix)?;
+        let prepared = prepare(client.session.resource().as_str(), &client.metadata, &ids.operation,
+            ManagedTaskRequest::Cancel(task_id.clone()), client.limits)?;
+        let _ = client.prepare_round(ids.clone(), prepared)?;
+        Ok(Self { scope: Arc::new(CancelScope {
+            control: Arc::new(Control::new()), client: client.clone(), task_id,
+            ids, cancellation: cancellation.clone(), deadline,
+        }) })
+    }
+
+    pub(super) fn cancellation_requested(&self) -> bool {
+        self.scope.control.completion.load(Ordering::Acquire) == CANCEL_REQUESTED
+    }
+
+    pub(super) fn close_observation(&self) { self.scope.control.close(); }
+
+    // Select only after the enclosing owner's complete snapshot admission.
+    // Persisted owners validate saved controls BEFORE electing the terminal.
+    pub(super) fn select_terminal(&self) -> Result<(), CancellableTaskWatchError> {
+        self.scope.control.terminal()
+    }
+
+    pub(super) fn read_lease(&self) -> ReadLease {
+        ReadLease { control: Arc::clone(&self.scope.control), armed: true }
+    }
+
+    // Also wraps persistence, not just network reads. A dropped/failed save is
+    // not a rollback receipt; the enclosing owner retains its pending change.
+    pub(super) async fn until_acknowledged<T>(
+        &self, work: impl Future<Output = T>,
+    ) -> Result<T, CancellableTaskWatchError> {
+        until_signal(&self.scope.control.acknowledged, work).await
+            .map_err(|()| CancellableTaskWatchError::CancellationRequested)
+    }
+
     /// Request remote cancellation while another caller polls next_snapshot.
     /// Success records an ACK only. No remote terminal or rollback is implied.
     pub async fn request_cancel(&self, cx: &Cx) -> Result<(), TaskCancellationError> {
@@ -301,25 +343,25 @@ impl CancellableManagedTaskWatch {
         let mut observation = self.observation.take().ok_or(CancellableTaskWatchError::Closed)?;
         // Before the first await, the read owns ALL transport custody and its
         // abandonment closes cancellation admission too. No detached cleanup.
-        let mut lease = ReadLease { control: Arc::clone(&self.scope.control), armed: true };
+        let handle = self.cancel_handle();
+        let mut lease = handle.read_lease();
         let scope = Arc::clone(&self.scope);
         let read = Box::pin(scope.client.session.await_active(cx, &scope.cancellation, scope.deadline, None, async {
             Ok(observation.next(cx).await)
         }));
-        let result = until_signal(&scope.control.acknowledged, read).await
-            .map_err(|()| CancellableTaskWatchError::CancellationRequested)??;
+        let result = handle.until_acknowledged(read).await??;
         let snapshot = result?;
-        if scope.control.completion.load(Ordering::Acquire) == CANCEL_REQUESTED {
+        if handle.cancellation_requested() {
             return Err(CancellableTaskWatchError::CancellationRequested);
         }
         let Some(snapshot) = snapshot else {
             return Err(ManagedTaskWatchError::UnexpectedEvent.into());
         };
         if matches!(&*snapshot.task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
-            scope.control.terminal()?;
+            handle.select_terminal()?;
         } else {
             self.observation = Some(observation);
-            lease.armed = false;
+            lease.disarm();
         }
         Ok(Some(snapshot))
     }
@@ -334,7 +376,10 @@ impl fmt::Debug for CancellableManagedTaskWatch {
     }
 }
 
-struct ReadLease { control: Arc<Control>, armed: bool }
+pub(super) struct ReadLease { control: Arc<Control>, armed: bool }
+impl ReadLease {
+    pub(super) fn disarm(&mut self) { self.armed = false; }
+}
 impl Drop for ReadLease {
     fn drop(&mut self) { if self.armed { self.control.close(); } }
 }
@@ -392,14 +437,13 @@ impl ManagedTasksClient {
         recovery: Option<ManagedTaskRecoveryPolicy>,
     ) -> Result<CancellableManagedTaskWatch, CancellableTaskWatchError> {
         self.session.check(cx, cancellation)?;
-        let ids = cancellation_ids(&id_prefix)?;
         if let Some(recovery) = recovery { recovery.connection_policy(policy)?; }
         // Complete cancellation encoding and limits are checked BEFORE opening
         // observation. No half-admitted owner can later discover invalid IDs.
-        let prepared = prepare(self.session.resource().as_str(), &self.metadata, &ids.operation,
-            ManagedTaskRequest::Cancel(task_id.clone()), self.limits)?;
-        let _ = self.prepare_round(ids.clone(), prepared)?;
         let deadline = deadline_after(cx, policy.timeout)?;
+        let handle = ManagedTaskCancelHandle::for_observation(
+            self, task_id.clone(), &id_prefix, cancellation, deadline,
+        )?;
         let observation = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(match recovery {
                 Some(recovery) => self.watch_tasks_recovering_with_cancellation(
@@ -415,10 +459,7 @@ impl ManagedTasksClient {
         self.session.check(cx, cancellation)?;
         if cx.now() >= deadline { return Err(OAuthSessionError::TimedOut.into()); }
         Ok(CancellableManagedTaskWatch {
-            scope: Arc::new(CancelScope {
-                control: Arc::new(Control::new()), client: self.clone(), task_id,
-                ids, cancellation: cancellation.clone(), deadline,
-            }),
+            scope: handle.scope,
             observation: Some(observation),
         })
     }

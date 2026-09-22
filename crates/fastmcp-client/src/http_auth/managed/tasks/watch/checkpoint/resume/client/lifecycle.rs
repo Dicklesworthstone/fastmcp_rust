@@ -7,6 +7,8 @@
 //! The callback receives only a conditional control-record change,
 //! never the application Task, inputs, results, credentials or request state.
 //! No creating call or input answer is replayed. This is not durable execution.
+//! Explicit remote cancellation also stops pending persistence, retaining its
+//! disposition and pending snapshot rather than pretending a write rolled back.
 
 use std::fmt;
 use std::future::Future;
@@ -19,6 +21,9 @@ use fastmcp_protocol::tasks_extension::Task;
 use crate::http_auth::managed::{OAuthSessionError, deadline_after};
 use crate::http_auth::managed::tasks::ManagedTasksClient;
 use crate::http_auth::managed::tasks::watch::{ManagedTaskSnapshot, ManagedTaskWatchPolicy};
+use crate::http_auth::managed::tasks::watch::cancellation::{
+    CancellableTaskWatchError, ManagedTaskCancelHandle,
+};
 use crate::http_auth::managed::tasks::watch::recovery::{
     ManagedTaskRecoveryError, ManagedTaskRecoveryPolicy, RecoveringManagedTaskWatch,
 };
@@ -152,6 +157,9 @@ pub enum PersistedTaskWatchError<E> {
     Recovery(ManagedTaskRecoveryError),
     Session(OAuthSessionError),
     Persistence(E),
+    /// A validated remote cancel acknowledgement stopped this observer. It is
+    /// not a terminal Task, a storage rollback receipt or permission to delete.
+    CancellationRequested,
     TerminalAcknowledgementRequired,
     NoTerminal,
     Closed,
@@ -163,6 +171,7 @@ impl<E> fmt::Debug for PersistedTaskWatchError<E> {
             Self::Recovery(error) => f.debug_tuple("Recovery").field(error).finish(),
             Self::Session(error) => f.debug_tuple("Session").field(error).finish(),
             Self::Persistence(_) => f.write_str("Persistence(<host error>)"),
+            Self::CancellationRequested => f.write_str("CancellationRequested"),
             Self::TerminalAcknowledgementRequired => f.write_str("TerminalAcknowledgementRequired"),
             Self::NoTerminal => f.write_str("NoTerminal"),
             Self::Closed => f.write_str("Closed"),
@@ -176,6 +185,7 @@ impl<E> fmt::Display for PersistedTaskWatchError<E> {
             Self::Recovery(error) => error.fmt(f),
             Self::Session(error) => error.fmt(f),
             Self::Persistence(_) => f.write_str("Task observation persistence was not acknowledged"),
+            Self::CancellationRequested => f.write_str("Task cancellation acknowledged; persisted observation stopped"),
             Self::TerminalAcknowledgementRequired => f.write_str("acknowledge the delivered terminal before completing observation"),
             Self::NoTerminal => f.write_str("no terminal Task snapshot has been delivered"),
             Self::Closed => f.write_str("persisted Task watch is closed"),
@@ -189,7 +199,8 @@ impl<E: std::error::Error + 'static> std::error::Error for PersistedTaskWatchErr
             Self::Recovery(error) => Some(error),
             Self::Session(error) => Some(error),
             Self::Persistence(error) => Some(error),
-            Self::TerminalAcknowledgementRequired | Self::NoTerminal | Self::Closed => None,
+            Self::CancellationRequested | Self::TerminalAcknowledgementRequired
+            | Self::NoTerminal | Self::Closed => None,
         }
     }
 }
@@ -201,6 +212,17 @@ impl<E> From<ManagedTaskRecoveryError> for PersistedTaskWatchError<E> {
 }
 impl<E> From<OAuthSessionError> for PersistedTaskWatchError<E> {
     fn from(error: OAuthSessionError) -> Self { Self::Session(error) }
+}
+impl<E> From<CancellableTaskWatchError> for PersistedTaskWatchError<E> {
+    fn from(error: CancellableTaskWatchError) -> Self {
+        match error {
+            CancellableTaskWatchError::CancellationRequested => Self::CancellationRequested,
+            CancellableTaskWatchError::Closed => Self::Closed,
+            CancellableTaskWatchError::Watch(error) => Self::Recovery(ManagedTaskRecoveryError::Watch(error)),
+            CancellableTaskWatchError::Recovery(error) => Self::Recovery(error),
+            CancellableTaskWatchError::Session(error) => Self::Session(error),
+        }
+    }
 }
 
 impl ManagedTasksClient {
@@ -221,6 +243,11 @@ impl ManagedTasksClient {
     /// Tasks and authorization failures keep the saved record unchanged; only a
     /// freshly validated terminal snapshot permits conditional removal, and
     /// only AFTER the caller explicitly acknowledges handling its result.
+    ///
+    /// The returned owner's cancel_handle permits one explicit authenticated
+    /// remote cancel request. A validated ACK stops reads, recovery and pending
+    /// persistence without deleting the checkpoint. Merely obtaining or dropping
+    /// the handle performs no request. Failed attempts do not stop observation.
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_task_watch_persisted<P, F, E>(
         &self, cx: &Cx, current: TaskResumeBinding, record: TaskResumeRecord,
@@ -252,11 +279,15 @@ impl ManagedTasksClient {
         F: Future<Output = Result<(), E>>,
     {
         self.session.check(cx, cancellation)?;
+        let anchor = cx.now();
         let now = wall_now();
         admit_record(&record, &current, self.session.resource().as_str(), now)?;
         let remaining = record.retain_until.checked_sub(now).ok_or(TaskResumeError::Unavailable)?;
-        let retention_deadline = cx.now().saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
+        let retention_deadline = anchor.saturating_add_nanos(u64::try_from(remaining).unwrap_or(u64::MAX));
         let deadline = retention_deadline.min(deadline_after(cx, policy.timeout)?);
+        let remote_cancel = ManagedTaskCancelHandle::for_observation(
+            self, record.task_id().clone(), &id_prefix, cancellation, deadline,
+        )?;
         let watch = Box::pin(self.session.await_active(cx, cancellation, deadline, None, async {
             Ok(self.watch_tasks_recovering_with_cancellation(
                 cx, cancellation, vec![record.task_id().clone()], id_prefix, policy, recovery,
@@ -264,7 +295,7 @@ impl ManagedTasksClient {
         })).await??;
         let result = PersistedManagedTaskWatch {
             client: self.clone(), current, record, cancellation: cancellation.clone(),
-            deadline, watch: Some(watch), persist, pending: None, terminal_cleanup: None,
+            deadline, watch: Some(watch), remote_cancel, persist, pending: None, terminal_cleanup: None,
             cleanup_state: TaskResumePersistenceState::NotAttempted, closed: false, finished: false,
         };
         result.check::<E>(cx)?;
@@ -282,6 +313,9 @@ impl ManagedTasksClient {
 /// An abandoned POLLED read closes observation permanently. During persistence
 /// its pending snapshot/change remains inspectable on this owner, but a failed
 /// owner never performs another read or write. An unpolled future has no effect.
+/// Remote cancellation retains that same pending custody and cannot be mistaken
+/// for terminal cleanup. An independently running storage job can still commit;
+/// the host must retain its job handle and reconcile its actual outcome.
 #[must_use = "poll snapshots, close explicitly, or drop the observation owner"]
 pub struct PersistedManagedTaskWatch<P> {
     client: ManagedTasksClient,
@@ -290,6 +324,7 @@ pub struct PersistedManagedTaskWatch<P> {
     cancellation: McpRequestCancellation,
     deadline: Time,
     watch: Option<RecoveringManagedTaskWatch>,
+    remote_cancel: ManagedTaskCancelHandle,
     persist: P,
     pending: Option<PendingTaskResumeSnapshot>,
     terminal_cleanup: Option<TaskResumeChange>,
@@ -308,7 +343,18 @@ impl<P> PersistedManagedTaskWatch<P> {
     /// Exposed for diagnostics, never replayed by a failed/abandoned owner.
     pub fn terminal_cleanup(&self) -> Option<&TaskResumeChange> { self.terminal_cleanup.as_ref() }
     pub fn cleanup_state(&self) -> TaskResumePersistenceState { self.cleanup_state }
-    pub fn close(&mut self) { self.watch = None; self.closed = true; }
+
+    /// A separate, cloneable caller-driven handle sharing one cancel attempt.
+    /// ACK means CancellationRequested, not Task::Cancelled or record deletion.
+    /// It is bound to this owner's original retention/deadline and login; close,
+    /// drop, failed observation or terminal delivery retires further admission.
+    pub fn cancel_handle(&self) -> ManagedTaskCancelHandle { self.remote_cancel.clone() }
+
+    pub fn close(&mut self) {
+        self.remote_cancel.close_observation();
+        self.watch = None;
+        self.closed = true;
+    }
 
     /// Call only AFTER consuming or durably recording the terminal payload.
     /// Success means conditional removal was acknowledged; next_snapshot then
@@ -344,6 +390,9 @@ impl<P> PersistedManagedTaskWatch<P> {
     }
 
     fn check<E>(&self, cx: &Cx) -> Result<(), PersistedTaskWatchError<E>> {
+        if self.remote_cancel.cancellation_requested() {
+            return Err(PersistedTaskWatchError::CancellationRequested);
+        }
         self.client.session.check(cx, &self.cancellation)?;
         self.record.admit(cx, &self.current)?;
         if cx.now() >= self.deadline { return Err(OAuthSessionError::TimedOut.into()); }
@@ -358,23 +407,35 @@ impl<P> PersistedManagedTaskWatch<P> {
         F: Future<Output = Result<(), E>>,
     {
         if self.finished { return Ok(None); }
+        if self.remote_cancel.cancellation_requested() {
+            self.close();
+            return Err(PersistedTaskWatchError::CancellationRequested);
+        }
         if self.closed { return Err(PersistedTaskWatchError::Closed); }
         if self.terminal_cleanup.is_some() {
             return Err(PersistedTaskWatchError::TerminalAcknowledgementRequired);
         }
-        // Custody moves before suspension. Neither failure nor future-drop can
-        // leave a socket/recovery opportunity available to another read.
+        // One lease spans the read AND persistence. Error/drop also closes a
+        // concurrent cancel attempt, while retaining pending storage custody.
         let mut watch = self.watch.take().ok_or(PersistedTaskWatchError::Closed)?;
+        let remote_cancel = self.remote_cancel.clone();
+        let mut lease = remote_cancel.read_lease();
         self.check::<E>(cx)?;
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let snapshot = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
+        let read = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
             Ok(watch.next_snapshot(cx).await)
-        })).await??.ok_or(TaskResumeError::InvalidRecord)?;
+        }));
+        let snapshot = remote_cancel.until_acknowledged(read).await???
+            .ok_or(TaskResumeError::InvalidRecord)?;
         let change = TaskResumeChange::from_snapshot(cx, &self.current, &self.record, &snapshot.task)?;
         if change.replacement.is_none() {
             self.check::<E>(cx)?;
+            // Elect only after validating against the saved controls. A stale
+            // or conflicting terminal must not disable live cancel authority
+            // as though it had been delivered. Failure still retires the owner.
+            remote_cancel.select_terminal()?;
             self.terminal_cleanup = Some(change);
             // The remote watch/socket is released, but the protected record
             // remains until the caller acknowledges the delivered result.
@@ -386,17 +447,24 @@ impl<P> PersistedManagedTaskWatch<P> {
         self.check::<E>(cx)?;
         let pending = self.pending.as_mut().ok_or(TaskResumeError::InvalidRecord)?;
         let persist = &mut self.persist;
-        // Invoke INSIDE the lifetime guard. Keep pending in self so dropping
-        // this future during a host-owned write cannot silently discard it.
-        Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
+        // Invoke INSIDE both guards. Keep pending in self so cancellation or
+        // abandonment cannot discard a committed-but-unacknowledged write.
+        let writing = Box::pin(client.session.await_active(cx, &cancellation, deadline, None, async {
             Ok(persist_change(&mut pending.persistence, persist, pending.change.clone()).await)
-        })).await?.map_err(PersistedTaskWatchError::Persistence)?;
+        }));
+        remote_cancel.until_acknowledged(writing).await??
+            .map_err(PersistedTaskWatchError::Persistence)?;
         self.check::<E>(cx)?;
         let pending = self.pending.take().ok_or(TaskResumeError::InvalidRecord)?;
         self.record = pending.change.replacement.ok_or(TaskResumeError::InvalidRecord)?;
         self.watch = Some(watch);
+        lease.disarm();
         Ok(Some(pending.snapshot))
     }
+}
+
+impl<P> Drop for PersistedManagedTaskWatch<P> {
+    fn drop(&mut self) { self.remote_cancel.close_observation(); }
 }
 
 // Shared by active-record publication and explicit terminal cleanup. Mark the
