@@ -12,6 +12,16 @@ WHAT IT PROVES, and the proofs are the whole point:
   P2  stored_bytes - preimage_bytes == 4 * N   (exactly the prefixes, nothing else)
   P3  stripping the prefixes reproduces the pre-image BYTE FOR BYTE
 
+RE-FLOW, AND THE ONE PLACE IT IS NOT MECHANICAL. Joining a wrapped clause moves only
+whitespace, EXCEPT where the author broke a token across lines (`parse/` +
+`invalid-request`, `no-common-` + `modern`). There the right amount of whitespace is
+none, and every whitespace-NORMALISING guard passes on the corruption by construction,
+because it collapses the very newline it is replacing. `MID_TOKEN` detects those
+boundaries, `reflow` joins them without a space, and the precondition reports the count
+as `mid_token=`. The shipped joiner used an unconditional space and corrupted
+`pre-classification` and `discovery/connection` on ahet.37; the controls in `self_test`
+are substring checks, not `norm()` equalities, so they actually fail against it.
+
 WHAT IT CANNOT PROVE, stated because the delta proof is blind to it BY CONSTRUCTION:
 that the bullets were ever REQUIREMENTS. P1-P3 prove bytes were preserved, never that
 they were criteria. WildMountain's sharpened rule is per-bullet grammatical mood -- is
@@ -36,6 +46,14 @@ NOTE_MARKERS = re.compile(
     r"^\s*(note|n\.b\.|see |e\.g\.|for example|todo|fixme|aside|context:|background:)",
     re.IGNORECASE,
 )
+# A line ending in a word character followed by `-` or `/` is a token BROKEN
+# ACROSS LINES: `parse/` + `invalid-request`, `no-common-` + `modern`. Joining
+# those with a space corrupts the word. The leading `\w` is load-bearing: it
+# excludes `--` and `//`, where the trailing run is a dash separator or a path
+# and a space IS correct. Measured over all 815 beads carrying criteria at
+# 114759fd: 40 beads match a naive `[-/]$`, 39 match this, and the one it drops
+# (bd-55ola, "NOT A NUMBER --" + "corrected ...") wants the space.
+MID_TOKEN = re.compile(r"\w[-/]$")
 
 
 def transcribe(preimage: str) -> tuple[str, int]:
@@ -130,9 +148,36 @@ def self_test() -> bool:
     if len(_grouped(pre)) != 3:
         print("CONTROL FAILED: grouper miscounted a prose pre-image", file=sys.stderr)
         return False
-    # Re-flow must preserve the author's word sequence exactly.
+    # Re-flow must preserve the author's word sequence exactly. NOTE: this is a
+    # norm() equality, so it is BLIND to a space inserted at a mid-token break --
+    # both sides normalise identically. The two controls below cover that, and
+    # they are substring checks for exactly that reason.
     if norm(strip_back(reflow(good))) != norm(pre):
         print("CONTROL FAILED: re-flow did not preserve the author's words", file=sys.stderr)
+        return False
+    # A mid-token break must gain NO space. Fails against a reflow() that joins
+    # unconditionally, which is the defect this pair exists to catch: it shipped,
+    # and it corrupted `pre-classification` and `discovery/connection` on ahet.37.
+    mt = "- [ ] emits a parse/\n  invalid-request response.\n- [ ] a no-common-\n  modern error."
+    got = reflow(mt)
+    if "parse/invalid-request" not in got or "parse/ invalid-request" in got:
+        print("CONTROL FAILED: re-flow put a space at a '/' mid-token break", file=sys.stderr)
+        return False
+    if "no-common-modern" not in got or "no-common- modern" in got:
+        print("CONTROL FAILED: re-flow put a space at a '-' mid-token break", file=sys.stderr)
+        return False
+    if len(mid_token_breaks(mt)) != 2:
+        print("CONTROL FAILED: mid-token detector miscounted", file=sys.stderr)
+        return False
+    # NEGATIVE HALF: a `--` dash separator is not a broken token and the space
+    # there is correct. Without this, the fix above would over-fire and silently
+    # weld two clauses together -- a different corruption in the other direction.
+    ds = "- [ ] A DERIVATION, NOT A NUMBER --\n  corrected later."
+    if "NUMBER -- corrected" not in reflow(ds):
+        print("CONTROL FAILED: re-flow welded a '--' dash separator", file=sys.stderr)
+        return False
+    if mid_token_breaks(ds):
+        print("CONTROL FAILED: mid-token detector fired on a '--' separator", file=sys.stderr)
         return False
     return True
 
@@ -167,8 +212,52 @@ def _grouped(stored: str) -> list[list[str]]:
 
 
 def reflow(stored: str) -> str:
-    """Join each item's continuation lines. Only whitespace moves."""
-    return "\n".join(PREFIX + " ".join(p for p in parts if p) for parts in _grouped(stored))
+    """Join each item's continuation lines.
+
+    Only whitespace moves -- EXCEPT at a mid-token break, where the correct
+    amount of whitespace to insert is NONE. An author wrapping
+    `parse/invalid-request` or `no-common-modern` leaves the line ending in
+    `/` or `-` with the token resuming on the next line; joining there with a
+    space silently changes the word.
+
+    A whitespace-NORMALISING comparison cannot catch that, because it collapses
+    the newline+indent being replaced, so the corrupted join and the author's
+    original normalise to the identical string. That is why the control for
+    this lives in `self_test` as a literal substring check and not as another
+    `norm()` equality.
+    """
+    out = []
+    for parts in _grouped(stored):
+        body = ""
+        for part in (p for p in parts if p):
+            if not body:
+                body = part.rstrip()
+            elif MID_TOKEN.search(body):
+                body += part
+            else:
+                body += " " + part
+        out.append(PREFIX + body)
+    return "\n".join(out)
+
+
+def mid_token_breaks(stored: str) -> list[tuple[str, str]]:
+    """Continuation boundaries where the author broke a token across lines.
+
+    Reported so a human sees them, because joining one is the single place
+    re-flow stops being purely mechanical: it has to decide whether a trailing
+    hyphen belongs to the word or ends it. `reflow` takes the word-break
+    reading, which is right for every instance measured in this tracker, but
+    the count belongs in the output rather than buried in the joiner.
+    """
+    out: list[tuple[str, str]] = []
+    lines = stored.split("\n")
+    for i in range(len(lines) - 1):
+        nxt = lines[i + 1]
+        if _item_start(nxt) is not None or not nxt.strip():
+            continue
+        if MID_TOKEN.search(lines[i].rstrip()):
+            out.append((lines[i].rstrip()[-30:], nxt.strip()[:30]))
+    return out
 
 
 def wrapped_clause_precondition(stored: str) -> tuple[bool, str]:
@@ -188,7 +277,11 @@ def wrapped_clause_precondition(stored: str) -> tuple[bool, str]:
         cont += 1
         if re.match(r"^\s*[-*+]\s", line) or re.match(r"^\s*\d+[.)]\s", line):
             nested += 1
-    return (nested == 0 and blank == 0), f"continuations={cont} nested={nested} blank={blank}"
+    mid = len(mid_token_breaks(stored))
+    return (
+        nested == 0 and blank == 0,
+        f"continuations={cont} nested={nested} blank={blank} mid_token={mid}",
+    )
 
 
 def parser_truncation(bead: str, stored: str) -> list[str]:
