@@ -1644,19 +1644,24 @@ class Mutation:
     dependents: tuple = ()  # other targets whose outcome must move too, each with its reason
 
 
+# Files a non-OBS builder parses; a planted edit to their parsed form could move another target.
+PARSED_BY_OTHER_BUILDERS = {DV, SV, AUTH, SDK, SER, TA, TC}
+
+
 def first_isolated_probe_assertion(w: World) -> int:
-    """The first TOML assertion on a probe manifest whose selection is a string no other
-    assertion on the same source can see (neither selector is a prefix of the other), reached
-    by a plain path: an identity component (<key>=<literal>) is excluded, because mutating the
-    identity key's own value would unresolve the selector instead of changing the value
-    (run 1 of 040d9619 planted against /package/name=sha1_smol/name and failed that way)."""
+    """The first TOML assertion whose selection is a string that no other assertion on the same
+    source can see (neither selector is a prefix of the other), on a source no non-OBS builder
+    parses, reached by a plain path. An identity component (<key>=<literal>) is excluded, because
+    mutating the identity key's own value unresolves the selector instead of changing the value:
+    run 1 of 040d9619 planted against /package/name=sha1_smol/name and failed that way, and run 2
+    of 7e641f68 found no plain-path candidate while the search was still limited to probes/."""
     rows = w.doc(DV)["semantic_assertion"]
 
     def parts(selector: str) -> list:
         return selector.split("/")
 
     for index, row in enumerate(rows):
-        if row["observation_mode"] != "canonical_selected_toml" or "/probes/" not in row["source_path"]:
+        if row["observation_mode"] != "canonical_selected_toml" or row["source_path"] in PARSED_BY_OTHER_BUILDERS:
             continue
         if "=" in row["selector"]:
             continue
