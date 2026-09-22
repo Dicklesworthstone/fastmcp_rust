@@ -856,6 +856,7 @@ impl<T> ProxyFinalCatalog<T> {
         }
     }
 
+    #[cfg(test)]
     fn single_page(entries: Vec<T>, ttl_ms: CacheTtl, cache_scope: CacheScope) -> Self {
         Self {
             entries,
@@ -2974,10 +2975,19 @@ impl ProxyBackend for Client {
         match era {
             ProtocolEra::Legacy2024 => {
                 if self.server_capabilities().tools.is_none() {
-                    Ok(ProxyToolCatalog::Legacy(Vec::new()))
-                } else {
-                    Client::list_tools(self).map(ProxyToolCatalog::Legacy)
+                    return Ok(ProxyToolCatalog::Legacy(Vec::new()));
                 }
+                collect_proxy_catalog_pages(
+                    "legacy",
+                    fastmcp_protocol::methods::TOOLS_LIST,
+                    |cursor| match Client::list_tools_typed(self, cursor)? {
+                        CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                            Ok((result.tools, result.next_cursor, None))
+                        }
+                        _ => Err(unexpected_proxy_result("tools/list")),
+                    },
+                )
+                .map(|catalog| ProxyToolCatalog::Legacy(catalog.entries))
             }
             ProtocolEra::Modern2026 => {
                 let advertised = self
@@ -3032,20 +3042,17 @@ impl ProxyBackend for Client {
                 if self.server_capabilities().resources.is_none() {
                     return Ok(ProxyResourceCatalog::Legacy(Vec::new()));
                 }
-                match Client::list_resources_typed(self, None)? {
-                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
-                        Ok(ProxyResourceCatalog::Legacy(result.resources))
-                    }
-                    CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::single_page(
-                            payload.resources,
-                            payload.ttl_ms,
-                            payload.cache_scope,
-                        )))
-                    }
-                    _ => Err(unexpected_proxy_result("resources/list")),
-                }
+                collect_proxy_catalog_pages(
+                    "legacy",
+                    fastmcp_protocol::methods::RESOURCES_LIST,
+                    |cursor| match Client::list_resources_typed(self, cursor)? {
+                        CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                            Ok((result.resources, result.next_cursor, None))
+                        }
+                        _ => Err(unexpected_proxy_result("resources/list")),
+                    },
+                )
+                .map(|catalog| ProxyResourceCatalog::Legacy(catalog.entries))
             }
             ProtocolEra::Modern2026 => {
                 let advertised = self
@@ -3102,24 +3109,17 @@ impl ProxyBackend for Client {
                 if self.server_capabilities().resources.is_none() {
                     return Ok(ProxyResourceTemplateCatalog::Legacy(Vec::new()));
                 }
-                match Client::list_resource_templates_typed(self, None)? {
-                    CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
-                        ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
-                    ),
-                    CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
-                        result, ..
-                    }) => {
-                        let payload = result.payload;
-                        Ok(ProxyResourceTemplateCatalog::Final(
-                            ProxyFinalCatalog::single_page(
-                                payload.resource_templates,
-                                payload.ttl_ms,
-                                payload.cache_scope,
-                            ),
-                        ))
-                    }
-                    _ => Err(unexpected_proxy_result("resources/templates/list")),
-                }
+                collect_proxy_catalog_pages(
+                    "legacy",
+                    fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                    |cursor| match Client::list_resource_templates_typed(self, cursor)? {
+                        CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => {
+                            Ok((result.resource_templates, result.next_cursor, None))
+                        }
+                        _ => Err(unexpected_proxy_result("resources/templates/list")),
+                    },
+                )
+                .map(|catalog| ProxyResourceTemplateCatalog::Legacy(catalog.entries))
             }
             ProtocolEra::Modern2026 => {
                 let advertised = self
@@ -3176,20 +3176,17 @@ impl ProxyBackend for Client {
                 if self.server_capabilities().prompts.is_none() {
                     return Ok(ProxyPromptCatalog::Legacy(Vec::new()));
                 }
-                match Client::list_prompts_typed(self, None)? {
-                    CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
-                        Ok(ProxyPromptCatalog::Legacy(result.prompts))
-                    }
-                    CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok(ProxyPromptCatalog::Final(ProxyFinalCatalog::single_page(
-                            payload.prompts,
-                            payload.ttl_ms,
-                            payload.cache_scope,
-                        )))
-                    }
-                    _ => Err(unexpected_proxy_result("prompts/list")),
-                }
+                collect_proxy_catalog_pages(
+                    "legacy",
+                    fastmcp_protocol::methods::PROMPTS_LIST,
+                    |cursor| match Client::list_prompts_typed(self, cursor)? {
+                        CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                            Ok((result.prompts, result.next_cursor, None))
+                        }
+                        _ => Err(unexpected_proxy_result("prompts/list")),
+                    },
+                )
+                .map(|catalog| ProxyPromptCatalog::Legacy(catalog.entries))
             }
             ProtocolEra::Modern2026 => {
                 let advertised = self
@@ -5952,24 +5949,20 @@ impl ProxyBackend for ProxyHttpClient {
 
     fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
         match self.binding.era() {
-            ProtocolEra::Legacy2024 => {
-                match self
-                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))?
-                {
+            ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
+                "legacy",
+                fastmcp_protocol::methods::TOOLS_LIST,
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::TOOLS_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
                     CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
-                        Ok(ProxyToolCatalog::Legacy(result.tools))
-                    }
-                    CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::single_page(
-                            payload.tools,
-                            payload.ttl_ms,
-                            payload.cache_scope,
-                        )))
+                        Ok((result.tools, result.next_cursor, None))
                     }
                     _ => Err(unexpected_proxy_result("tools/list")),
-                }
-            }
+                },
+            )
+            .map(|catalog| ProxyToolCatalog::Legacy(catalog.entries)),
             ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
                 fastmcp_protocol::methods::TOOLS_LIST,
                 |cursor| match self.request_result(
@@ -6007,23 +6000,20 @@ impl ProxyBackend for ProxyHttpClient {
 
     fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
         match self.binding.era() {
-            ProtocolEra::Legacy2024 => match self.request_result(
+            ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
+                "legacy",
                 fastmcp_protocol::methods::RESOURCES_LIST,
-                serde_json::json!({}),
-            )? {
-                CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
-                    Ok(ProxyResourceCatalog::Legacy(result.resources))
-                }
-                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                    let payload = result.payload;
-                    Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::single_page(
-                        payload.resources,
-                        payload.ttl_ms,
-                        payload.cache_scope,
-                    )))
-                }
-                _ => Err(unexpected_proxy_result("resources/list")),
-            },
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::RESOURCES_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                        Ok((result.resources, result.next_cursor, None))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/list")),
+                },
+            )
+            .map(|catalog| ProxyResourceCatalog::Legacy(catalog.entries)),
             ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
                 fastmcp_protocol::methods::RESOURCES_LIST,
                 |cursor| match self.request_result(
@@ -6061,25 +6051,20 @@ impl ProxyBackend for ProxyHttpClient {
 
     fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
         match self.binding.era() {
-            ProtocolEra::Legacy2024 => match self.request_result(
+            ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
+                "legacy",
                 fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
-                serde_json::json!({}),
-            )? {
-                CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
-                    ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
-                ),
-                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => {
-                    let payload = result.payload;
-                    Ok(ProxyResourceTemplateCatalog::Final(
-                        ProxyFinalCatalog::single_page(
-                            payload.resource_templates,
-                            payload.ttl_ms,
-                            payload.cache_scope,
-                        ),
-                    ))
-                }
-                _ => Err(unexpected_proxy_result("resources/templates/list")),
-            },
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => {
+                        Ok((result.resource_templates, result.next_cursor, None))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/templates/list")),
+                },
+            )
+            .map(|catalog| ProxyResourceTemplateCatalog::Legacy(catalog.entries)),
             ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
                 fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
                 |cursor| match self.request_result(
@@ -6119,23 +6104,20 @@ impl ProxyBackend for ProxyHttpClient {
 
     fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
         match self.binding.era() {
-            ProtocolEra::Legacy2024 => match self.request_result(
+            ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
+                "legacy",
                 fastmcp_protocol::methods::PROMPTS_LIST,
-                serde_json::json!({}),
-            )? {
-                CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
-                    Ok(ProxyPromptCatalog::Legacy(result.prompts))
-                }
-                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                    let payload = result.payload;
-                    Ok(ProxyPromptCatalog::Final(ProxyFinalCatalog::single_page(
-                        payload.prompts,
-                        payload.ttl_ms,
-                        payload.cache_scope,
-                    )))
-                }
-                _ => Err(unexpected_proxy_result("prompts/list")),
-            },
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::PROMPTS_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                        Ok((result.prompts, result.next_cursor, None))
+                    }
+                    _ => Err(unexpected_proxy_result("prompts/list")),
+                },
+            )
+            .map(|catalog| ProxyPromptCatalog::Legacy(catalog.entries)),
             ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
                 fastmcp_protocol::methods::PROMPTS_LIST,
                 |cursor| match self.request_result(
@@ -20204,6 +20186,385 @@ exec sleep 2
             panic!("exact legacy proxy request must retain a legacy tools/list result");
         };
         result.tools.into_iter().map(|tool| tool.name).collect()
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[derive(Clone, Copy)]
+    enum LegacyCatalogPageFailure {
+        RepeatedCursor,
+        UpstreamError,
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    struct LegacyCatalogPageReply {
+        method: &'static str,
+        cursor: Option<&'static str>,
+        response: serde_json::Value,
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_catalog_page_replies(
+        failure: Option<LegacyCatalogPageFailure>,
+    ) -> Vec<LegacyCatalogPageReply> {
+        let mut replies = Vec::new();
+        let mut attempts = vec![None];
+        if let Some(failure) = failure {
+            attempts.extend([Some(failure), None]);
+        }
+        for attempt in attempts {
+            'catalog: for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                for page in 1..=2 {
+                    let mut result = match method {
+                        "tools/list" => serde_json::json!({"tools":[{
+                            "name": format!("tool-{page}"),
+                            "description": format!("Tool from page {page}"),
+                            "inputSchema": {"type":"object","properties":{"city":{"type":"string"}}}
+                        }]}),
+                        "resources/list" => serde_json::json!({"resources":[{
+                            "uri": format!("https://example.test/resource/{page}"),
+                            "name": format!("resource-{page}"),
+                            "description": format!("Resource from page {page}"),
+                            "mimeType":"text/plain"
+                        }]}),
+                        "resources/templates/list" => serde_json::json!({"resourceTemplates":[{
+                            "uriTemplate": format!("https://example.test/template/{page}/{{id}}"),
+                            "name": format!("template-{page}"),
+                            "mimeType":"text/plain"
+                        }]}),
+                        "prompts/list" => serde_json::json!({"prompts":[{
+                            "name": format!("prompt-{page}"),
+                            "description": format!("Prompt from page {page}"),
+                            "arguments":[{"name":"city","description":"City name","required":true}]
+                        }]}),
+                        _ => unreachable!(),
+                    };
+                    // Reuse the same opaque token across families. Each list
+                    // operation must retain its own cursor history.
+                    if page == 1 {
+                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                    }
+                    let failing_page =
+                        attempt.is_some() && method == "resources/list" && page == 2;
+                    if failing_page
+                        && matches!(attempt, Some(LegacyCatalogPageFailure::RepeatedCursor))
+                    {
+                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                    }
+                    let response = if failing_page
+                        && matches!(attempt, Some(LegacyCatalogPageFailure::UpstreamError))
+                    {
+                        serde_json::json!({"error":{
+                            "code":-32602,"message":"catalog page unavailable"
+                        }})
+                    } else {
+                        serde_json::json!({"result":result})
+                    };
+                    replies.push(LegacyCatalogPageReply {
+                        method,
+                        cursor: (page == 2).then_some("catalog-page-two"),
+                        response,
+                    });
+                    if failing_page {
+                        // The next attempt must restart tools/list without a
+                        // cursor, never request page three or later families.
+                        break 'catalog;
+                    }
+                }
+            }
+        }
+        replies
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_catalog_snapshot(catalog: &ProxyCatalog) -> Vec<u8> {
+        serde_json::to_vec(&(
+            &catalog.tools,
+            &catalog.resources,
+            &catalog.resource_templates,
+            &catalog.prompts,
+        ))
+        .expect("legacy catalog definitions serialize")
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn assert_legacy_catalog_pagination(
+        proxy: &ProxyClient,
+        failure: Option<LegacyCatalogPageFailure>,
+    ) {
+        let catalog = proxy.catalog().expect("every exact-2024 page is collected");
+        assert_eq!(catalog.era().unwrap(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            catalog
+                .tools
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tool-1", "tool-2"]
+        );
+        assert_eq!(
+            catalog
+                .resources
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["resource-1", "resource-2"]
+        );
+        assert_eq!(
+            catalog
+                .resource_templates
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["template-1", "template-2"]
+        );
+        assert_eq!(
+            catalog
+                .prompts
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["prompt-1", "prompt-2"]
+        );
+        assert_eq!(
+            catalog.tools[1].description.as_deref(),
+            Some("Tool from page 2")
+        );
+        assert_eq!(
+            catalog.tools[1].input_schema["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(catalog.resources[1].mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            catalog.resource_templates[1].uri_template,
+            "https://example.test/template/2/{id}"
+        );
+        assert_eq!(catalog.prompts[1].arguments[0].name, "city");
+        assert!(catalog.prompts[1].arguments[0].required);
+        let snapshot = legacy_catalog_snapshot(&catalog);
+        let era = proxy.observed_protocol_era().unwrap();
+        let binding = proxy.upstream_binding();
+        assert_eq!(era, Some(ProtocolEra::Legacy2024));
+        if let Some(failure) = failure {
+            let error = proxy
+                .catalog()
+                .expect_err("a failed page cannot become a shorter catalog");
+            match failure {
+                LegacyCatalogPageFailure::RepeatedCursor => {
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert!(error.message.contains("non-advancing cursor"));
+                }
+                LegacyCatalogPageFailure::UpstreamError => {
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert!(error.message.contains("catalog page unavailable"));
+                }
+            }
+            assert_eq!(legacy_catalog_snapshot(&catalog), snapshot);
+            assert_eq!(proxy.observed_protocol_era().unwrap(), era);
+            assert_eq!(proxy.upstream_binding(), binding);
+            let recovered = proxy
+                .catalog()
+                .expect("the same upstream accepts a fresh listing");
+            assert_eq!(legacy_catalog_snapshot(&recovered), snapshot);
+            assert_eq!(recovered.era().unwrap(), ProtocolEra::Legacy2024);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn proxy_legacy_stdio_catalog_pagination_probe(failure: Option<LegacyCatalogPageFailure>) {
+        let initialize = scripted_response_line(
+            1,
+            serde_json::json!({
+                "protocolVersion":"2024-11-05",
+                "capabilities":{"tools":{},"resources":{},"prompts":{}},
+                "serverInfo":{"name":"legacy-pagination-peer","version":"1"}
+            }),
+        );
+        let mut script = format!(
+            r#"
+peer_pid=$$
+(sleep 12; kill -TERM "$peer_pid" 2>/dev/null) >/dev/null 2>&1 &
+watchdog_pid=$!
+trap 'kill "$watchdog_pid" 2>/dev/null || true' EXIT
+trap 'exit 99' HUP INT TERM
+expect_request() {{
+    IFS= read -r request || exit 90
+    case "$request" in *"\"method\":\"$1\""*) ;; *) exit 91 ;; esac
+    if [ -n "$2" ]; then
+        case "$request" in *"\"cursor\":\"$2\""*) ;; *) exit 92 ;; esac
+    else
+        case "$request" in *'"cursor":'*) exit 93 ;; esac
+    fi
+}}
+expect_request initialize ''
+printf '%s\n' '{initialize}'
+expect_request notifications/initialized ''
+"#
+        );
+        for (index, reply) in legacy_catalog_page_replies(failure).into_iter().enumerate() {
+            let mut response = reply.response;
+            response["jsonrpc"] = serde_json::json!("2.0");
+            response["id"] = serde_json::json!(index + 2);
+            let response = serde_json::to_string(&response).unwrap();
+            assert!(
+                !response.contains('\''),
+                "shell fixture response must be quote-safe"
+            );
+            script.push_str(&format!(
+                "expect_request '{}' '{}'\nprintf '%s\\n' '{response}'\n",
+                reply.method,
+                reply.cursor.unwrap_or_default(),
+            ));
+        }
+        script.push_str("while IFS= read -r remaining; do :; done\n");
+        let cx = Cx::for_testing();
+        let client = block_on(
+            fastmcp_client::ClientBuilder::new()
+                .auto_initialize(true)
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .request_timeout_policy(scripted_peer_timeout_policy())
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+        )
+        .expect("spawn exact-2024 paginated stdio peer");
+        let proxy = ProxyClient::from_backend(client);
+        assert_legacy_catalog_pagination(&proxy, failure);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_legacy_stdio_catalog_pagination_positive() {
+        proxy_legacy_stdio_catalog_pagination_probe(None);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn proxy_legacy_stdio_catalog_pagination_planted_negative() {
+        for failure in [
+            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::UpstreamError,
+        ] {
+            proxy_legacy_stdio_catalog_pagination_probe(Some(failure));
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn proxy_legacy_http_catalog_pagination_probe(failure: Option<LegacyCatalogPageFailure>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind exact-2024 HTTP peer");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message?session=catalog");
+        let advertised_target = message_target.clone();
+        let peer = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(8)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(8)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "catalog peer accept deadline");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("catalog peer accept failed: {error}"),
+                    }
+                }
+            };
+            let mut sse = accept();
+            assert!(
+                read_http_request(&mut sse)
+                    .head
+                    .starts_with("GET /legacy-sse HTTP/1.1")
+            );
+            write!(sse, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            write_chunked_sse_event(
+                &mut sse,
+                format!("event: endpoint\ndata: {advertised_target}\n\n").as_bytes(),
+            );
+            for method in ["initialize", "notifications/initialized"] {
+                let mut post = accept();
+                let request = read_http_request(&mut post);
+                let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(message["method"], method);
+                write_http_response(&mut post, 202, "application/json", b"");
+                if method == "initialize" {
+                    let response = serde_json::json!({
+                        "jsonrpc":"2.0","id":message["id"],"result":{
+                            "protocolVersion":"2024-11-05",
+                            "capabilities":{"tools":{},"resources":{},"prompts":{}},
+                            "serverInfo":{"name":"legacy-pagination-peer","version":"1"}
+                        }
+                    });
+                    write_chunked_sse_event(
+                        &mut sse,
+                        format!("event: message\ndata: {response}\n\n").as_bytes(),
+                    );
+                }
+            }
+            let mut received = 0;
+            for reply in legacy_catalog_page_replies(failure) {
+                let mut post = accept();
+                let request = read_http_request(&mut post);
+                assert!(
+                    request
+                        .head
+                        .starts_with("POST /legacy-message?session=catalog HTTP/1.1")
+                );
+                let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(message["method"], reply.method);
+                assert_eq!(
+                    message["params"].get("cursor"),
+                    reply.cursor.map(serde_json::Value::from).as_ref(),
+                    "every family and every retry starts without a cursor"
+                );
+                write_http_response(&mut post, 202, "application/json", b"");
+                let mut response = reply.response;
+                response["jsonrpc"] = serde_json::json!("2.0");
+                response["id"] = message["id"].clone();
+                write_chunked_sse_event(
+                    &mut sse,
+                    format!("event: message\ndata: {response}\n\n").as_bytes(),
+                );
+                received += 1;
+            }
+            sse.write_all(b"0\r\n\r\n").unwrap();
+            received
+        });
+        let proxy = ProxyClient::from_backend(legacy_http_proxy_client(
+            &sse_target,
+            &message_target,
+            ClientCapabilities::default(),
+        ));
+        assert_legacy_catalog_pagination(&proxy, failure);
+        assert_eq!(peer.join().unwrap(), if failure.is_some() { 20 } else { 8 });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn proxy_legacy_http_catalog_pagination_positive() {
+        proxy_legacy_http_catalog_pagination_probe(None);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn proxy_legacy_http_catalog_pagination_planted_negative() {
+        for failure in [
+            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::UpstreamError,
+        ] {
+            proxy_legacy_http_catalog_pagination_probe(Some(failure));
+        }
     }
 
     #[derive(Clone, Copy)]
