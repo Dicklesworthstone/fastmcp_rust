@@ -140,6 +140,13 @@ impl Manifest {
         Ok(Self { generation, records })
     }
 
+    // Absence means no physical manifest slot, not get()'s filtered view.
+    // Expired records must not turn a repeated initial write into an upsert.
+    fn insert(&self, record: TaskResumeRecord, now: i128, limits: TaskResumeStoreLimits) -> Result<Self, TaskResumeError> {
+        if self.records.contains_key(&record.key()) { return Err(TaskResumeError::ConflictingSnapshot); }
+        self.put(record, now, limits)
+    }
+
     fn put(&self, mut record: TaskResumeRecord, now: i128, limits: TaskResumeStoreLimits) -> Result<Self, TaskResumeError> {
         let key = record.key();
         if let Some(previous) = self.records.get(&key) {
@@ -217,6 +224,24 @@ impl<P: TaskResumeProtector> TaskResumeStore<P> {
     {
         self.admit(cx, current)?;
         Ok(self.manifest.records.get(&key).filter(|record| wall_now() < record.retain_until).cloned())
+    }
+
+    /// Insert a newly accepted Task only when its manifest slot is absent.
+    /// Even an identical or expired-but-unpruned record is a conflict, before
+    /// protection or filesystem mutation. This is NOT an idempotent retry API.
+    /// Quotas, process authority and uncertain-commit quarantine are unchanged.
+    /// A successful return follows the same synchronized write as put().
+    pub fn insert(&mut self, cx: &Cx, current: &TaskResumeBinding, record: TaskResumeRecord)
+        -> Result<TaskResumeKey, TaskResumeStoreError>
+    {
+        self.admit(cx, current)?;
+        let now = wall_now();
+        record.validate()?;
+        record.admit_at(current, now)?;
+        let key = record.key();
+        let next = self.manifest.insert(record, now, self.limits)?;
+        self.commit(cx, next)?;
+        Ok(key)
     }
 
     /// Atomically persists the complete protected manifest. A returned key is
@@ -344,6 +369,19 @@ mod tests {
     fn populated() -> Manifest {
         let record = record();
         Manifest { generation: 1, records: BTreeMap::from([(record.key(), record)]) }
+    }
+
+    #[test]
+    fn initial_insert_cannot_overwrite_even_identical_or_expired_slots() {
+        let original = populated();
+        let limits = TaskResumeStoreLimits::default();
+        let before = original.encode(&binding(1), limits).unwrap();
+        for instant in [now(), record().retain_until, record().retain_until + 1] {
+            assert!(matches!(original.insert(record(), instant, limits), Err(TaskResumeError::ConflictingSnapshot)));
+        }
+        assert_eq!(original.encode(&binding(1), limits).unwrap(), before);
+        let inserted = Manifest::default().insert(record(), now(), limits).unwrap();
+        assert_eq!(inserted.records.get(&record().key()), Some(&record()));
     }
 
     #[test]

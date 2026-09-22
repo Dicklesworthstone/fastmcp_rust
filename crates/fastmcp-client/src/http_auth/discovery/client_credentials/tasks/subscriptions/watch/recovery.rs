@@ -442,7 +442,7 @@ mod tests {
             ClientCredentialsError::from(OAuthDiscoveryError::Cancelled).into(),
             ManagedTasksError::HttpStatus { status: 401 }.into(),
             ManagedTasksError::HttpStatus { status: 503 }.into(),
-            ManagedTasksError::Remote { code: -32603 }.into(),
+            ManagedTasksError::Remote { code: serde_json::from_str("-32603").unwrap() }.into(),
             ManagedTasksError::InvalidResponse.into(),
             ClientCredentialsTaskWatchError::IncompleteAcknowledgement,
             ClientCredentialsTaskWatchError::SnapshotLimit,
