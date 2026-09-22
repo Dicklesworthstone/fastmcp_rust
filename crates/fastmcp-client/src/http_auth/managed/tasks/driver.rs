@@ -16,8 +16,12 @@ use asupersync::Cx;
 use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::{McpRequestCancellation, Sha256Digest, sha256_bounded};
-use fastmcp_protocol::{CorrelationKey, FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY};
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses};
+
+use crate::http_auth::rpc::interaction::{
+    ManagedInteractionError, admit_embedded_input, normalize_embedded_input_context,
+};
 
 use super::{
     BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
@@ -156,8 +160,10 @@ impl ManagedTasksClient {
     /// new input. Descriptor fingerprints are representation-sensitive.
     ///
     /// Observers run once per admitted snapshot, including unchanged snapshots.
-    /// Automatic roots, sampling/tools/context and form/URL elicitation require
+    /// Roots, sampling, sampling tools/toolChoice and form/URL elicitation require
     /// the corresponding capability in this client's immutable metadata.
+    /// The resolver receives copies with unadvertised context hints omitted;
+    /// retained descriptors keep their original representation.
     /// Neither observer nor resolver errors are retried. After an uncertain
     /// update, the driver returns an error and performs no further get/update.
     /// Starting another driver is an explicit new operation with no exactly-once
@@ -247,9 +253,9 @@ impl ManagedTasksClient {
                     let (pending, fingerprints) = state.unanswered(input_requests, policy)?;
                     if pending.is_empty() { continue; }
                     if updates >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit); }
-                    admit_capabilities(&self.metadata, &pending)?;
+                    let callback_inputs = admit_capabilities(&self.metadata, &pending)?;
                     self.check_driver(cx, cancellation, deadline)?;
-                    let resolution = resolve(pending.clone());
+                    let resolution = resolve(callback_inputs);
                     self.check_driver(cx, cancellation, deadline)?;
                     let action = resolution.await?;
                     self.check_driver(cx, cancellation, deadline)?;
@@ -394,29 +400,24 @@ fn validate_answers(requests: &TaskInputRequests, responses: &TaskInputResponses
         .map_err(|_| ManagedTaskDriverError::InvalidInputResponse)
 }
 
-fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests) -> Result<(), ManagedTaskDriverError> {
+fn admit_capabilities(metadata: &serde_json::Value, requests: &TaskInputRequests) -> Result<TaskInputRequests, ManagedTaskDriverError> {
     let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
     for request in requests.values() {
-        let advertised = match request {
-            FinalEmbeddedInputRequest::Roots(_) => capabilities.get("roots").is_some_and(serde_json::Value::is_object),
-            FinalEmbeddedInputRequest::Sampling(_) => {
-                let wire = serde_json::to_value(request).map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?;
-                let sampling = &capabilities["sampling"];
-                sampling.is_object()
-                    && (wire["params"].get("tools").is_none() || sampling.get("tools").is_some_and(serde_json::Value::is_object))
-                    && (wire["params"].get("includeContext").is_none_or(|context| context == "none")
-                        || sampling.get("context").is_some_and(serde_json::Value::is_object))
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Form(_)) => {
-                capabilities["elicitation"].get("form").is_some_and(serde_json::Value::is_object)
-            }
-            FinalEmbeddedInputRequest::Elicitation(FinalEmbeddedElicitationParams::Url(_)) => {
-                capabilities["elicitation"].get("url").is_some_and(serde_json::Value::is_object)
-            }
-        };
-        if !advertised { return Err(ManagedTaskDriverError::CapabilityNotAdvertised); }
+        let wire = serde_json::to_value(request).map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?;
+        admit_embedded_input(capabilities, wire).map_err(|error| match error {
+            ManagedInteractionError::CapabilityNotAdvertised => ManagedTaskDriverError::CapabilityNotAdvertised,
+            _ => ManagedTaskDriverError::UnexpectedResponse,
+        })?;
     }
-    Ok(())
+    let mut callback_inputs = requests.clone();
+    let mut context_ignored = false;
+    for request in callback_inputs.values_mut() {
+        context_ignored |= normalize_embedded_input_context(capabilities, request);
+    }
+    if context_ignored {
+        log::warn!("ignoring unadvertised sampling context hint in Task input");
+    }
+    Ok(callback_inputs)
 }
 
 #[cfg(test)]
@@ -531,10 +532,72 @@ mod tests {
         assert!(matches!(admit_capabilities(&absent, &inputs()), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
         assert!(admit_capabilities(&roots, &inputs()).is_ok());
         let sampling = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":1,"includeContext":"allServers"}}})).unwrap();
+        let before = serde_json::to_value(&sampling).unwrap();
         let plain = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{}}});
         let context = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"context":{}}}});
-        assert!(matches!(admit_capabilities(&plain, &sampling), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        assert!(matches!(admit_capabilities(&absent, &sampling), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        assert!(admit_capabilities(&plain, &sampling).is_ok());
         assert!(admit_capabilities(&context, &sampling).is_ok());
+        assert_eq!(serde_json::to_value(&sampling).unwrap(), before);
+    }
+
+    #[test]
+    fn sampling_tools_and_tool_choice_require_the_tools_capability() {
+        for (field, value) in [("tools", json!([])), ("toolChoice", json!({}))] {
+            let mut params = json!({"messages":[],"maxTokens":1,"includeContext":"allServers"});
+            params[field] = value;
+            let requests = serde_json::from_value(json!({"sample":{"method":"sampling/createMessage","params":params}})).unwrap();
+            let before = serde_json::to_value(&requests).unwrap();
+            for sampling in [json!({}), json!({"context":{}}), json!({"tools":null}), json!({"tools":[]})] {
+                let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":sampling}});
+                assert!(matches!(admit_capabilities(&metadata, &requests), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+            }
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"sampling":{"tools":{}}}});
+            let callback = serde_json::to_value(admit_capabilities(&metadata, &requests).unwrap()).unwrap();
+            assert!(callback["sample"]["params"].get("includeContext").is_none());
+            assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn literal_empty_elicitation_grants_forms_but_unknown_children_do_not() {
+        let requests = serde_json::from_value(json!({"form":{"method":"elicitation/create","params":{
+            "mode":"form","message":"Approve","requestedSchema":{"type":"object","properties":{}}
+        }}})).unwrap();
+        let before = serde_json::to_value(&requests).unwrap();
+        for elicitation in [json!({}), json!({"form":{}})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":elicitation}});
+            assert!(admit_capabilities(&metadata, &requests).is_ok());
+        }
+        for elicitation in [json!({"future":{}}), json!({"url":{}}), json!({"form":null}), json!({"form":[]})] {
+            let metadata = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"elicitation":elicitation}});
+            assert!(matches!(admit_capabilities(&metadata, &requests), Err(ManagedTaskDriverError::CapabilityNotAdvertised)));
+        }
+        assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+    }
+
+    #[test]
+    fn context_normalization_changes_only_ungranted_resolver_copies() {
+        let plain = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{},"sampling":{}}});
+        let granted = json!({FINAL_CLIENT_CAPABILITIES_META_KEY:{"roots":{},"sampling":{"context":{}}}});
+        for context in [None, Some("none"), Some("thisServer"), Some("allServers")] {
+            let mut params = json!({"messages":[],"maxTokens":1});
+            if let Some(context) = context { params["includeContext"] = json!(context); }
+            let requests = serde_json::from_value(json!({
+                "roots":{"method":"roots/list"},
+                "sample":{"method":"sampling/createMessage","params":params}
+            })).unwrap();
+            let before = serde_json::to_value(&requests).unwrap();
+            let callback = serde_json::to_value(admit_capabilities(&plain, &requests).unwrap()).unwrap();
+            if context.is_some_and(|context| context != "none") {
+                assert!(callback["sample"]["params"].get("includeContext").is_none());
+                assert_eq!(callback["roots"], before["roots"]);
+            } else {
+                assert_eq!(callback, before);
+            }
+            assert_eq!(serde_json::to_value(admit_capabilities(&granted, &requests).unwrap()).unwrap(), before);
+            assert_eq!(serde_json::to_value(&requests).unwrap(), before);
+        }
     }
 
     #[test]

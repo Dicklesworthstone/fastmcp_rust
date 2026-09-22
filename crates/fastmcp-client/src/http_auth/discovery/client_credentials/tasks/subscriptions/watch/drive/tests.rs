@@ -80,15 +80,79 @@ fn watched_task_capability_gate_does_not_grant_roots_or_elicitation_implicitly()
     assert!(admit_capabilities(&only_form,&form).is_ok());
     assert!(admit_capabilities(&only_form,&url).is_err());
     assert!(admit_capabilities(&metadata(json!({"elicitation":{"url":{}}})),&url).is_ok());
+    let empty=metadata(json!({"elicitation":{}}));
+    assert!(admit_capabilities(&empty,&form).is_ok());
+    assert!(admit_capabilities(&empty,&url).is_err());
+    for capability in [json!({"unknown":{}}),json!({"url":{}}),json!({"form":null}),json!({"form":[]})] {
+        assert!(matches!(admit_capabilities(&metadata(json!({"elicitation":capability})),&form),
+            Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+    }
 }
 #[test]
-fn watched_task_sampling_requires_its_tools_and_context_subcapabilities() {
+fn watched_task_sampling_requires_tools_and_treats_context_as_advisory() {
     let sample=requests(json!({"sample":{"method":"sampling/createMessage","params":{
         "messages":[],"maxTokens":16,"tools":[],"includeContext":"allServers"}}}));
-    for caps in [json!({}),json!({"sampling":{}}),json!({"sampling":{"tools":{}}}),json!({"sampling":{"context":{}}})] {
+    for caps in [json!({}),json!({"sampling":{}}),json!({"sampling":{"context":{}}})] {
         assert!(matches!(admit_capabilities(&metadata(caps),&sample),Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
     }
-    assert!(admit_capabilities(&metadata(json!({"sampling":{"tools":{},"context":{}}})),&sample).is_ok());
+    let before=serde_json::to_value(&sample).unwrap();
+    let callback_inputs=admit_capabilities(&metadata(json!({"sampling":{"tools":{}}})),&sample).unwrap();
+    assert!(serde_json::to_value(callback_inputs).unwrap()["sample"]["params"].get("includeContext").is_none());
+    let granted=admit_capabilities(&metadata(json!({"sampling":{"tools":{},"context":{}}})),&sample).unwrap();
+    assert_eq!(serde_json::to_value(granted).unwrap(),before);
+    assert_eq!(serde_json::to_value(&sample).unwrap(),before);
+}
+#[test]
+fn watched_task_tool_choice_without_tools_requires_the_tools_grant() {
+    let sample=requests(json!({"sample":{"method":"sampling/createMessage","params":{
+        "messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}}));
+    for capability in [json!({}),json!({"context":{}}),json!({"tools":null}),json!({"tools":[]})] {
+        assert!(matches!(admit_capabilities(&metadata(json!({"sampling":capability})),&sample),
+            Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+    }
+    assert!(admit_capabilities(&metadata(json!({"sampling":{"tools":{}}})),&sample).is_ok());
+}
+#[test]
+fn watched_task_context_normalization_preserves_observed_descriptors_and_history() {
+    for hint in [None,Some("none"),Some("thisServer"),Some("allServers")] {
+        let mut wire=json!({"sample":{"method":"sampling/createMessage","params":{
+            "messages":[],"maxTokens":16}}});
+        if let Some(hint)=hint { wire["sample"]["params"]["includeContext"]=json!(hint); }
+        let inputs=requests(wire.clone());
+        let policy=ClientCredentialsTaskWatchDrivePolicy::default();
+        let mut history=InputHistory::default();
+        let pending=history.unanswered(&inputs,policy).unwrap();
+        let before=history.entries.clone();
+        let bytes=history.bytes;
+        let admitted=admit_capabilities(&metadata(json!({"sampling":{}})),&pending.requests).unwrap();
+        let mut expected=wire.clone();
+        if hint.is_some_and(|hint| hint!="none") {
+            expected["sample"]["params"].as_object_mut().unwrap().remove("includeContext");
+        }
+        assert_eq!(serde_json::to_value(admitted).unwrap(),expected);
+        assert_eq!(serde_json::to_value(&inputs).unwrap(),wire);
+        assert_eq!(serde_json::to_value(&pending.requests).unwrap(),wire);
+        assert_eq!(history.entries,before);
+        assert_eq!(history.bytes,bytes);
+        let granted=admit_capabilities(&metadata(json!({"sampling":{"context":{}}})),&pending.requests).unwrap();
+        assert_eq!(serde_json::to_value(granted).unwrap(),wire);
+        assert_eq!(history.unanswered(&inputs,policy).unwrap().fingerprints,pending.fingerprints);
+    }
+}
+#[test]
+fn watched_task_rejects_a_late_missing_capability_without_rewriting_earlier_input() {
+    let inputs=requests(json!({
+        "a":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"includeContext":"allServers"}},
+        "z":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}
+    }));
+    let before=serde_json::to_value(&inputs).unwrap();
+    assert!(matches!(admit_capabilities(&metadata(json!({"sampling":{}})),&inputs),
+        Err(ClientCredentialsTaskWaitError::CapabilityNotAdvertised)));
+    assert_eq!(serde_json::to_value(&inputs).unwrap(),before);
+    let admitted=admit_capabilities(&metadata(json!({"sampling":{"tools":{}}})),&inputs).unwrap();
+    assert_eq!(admitted.len(),2);
+    assert!(serde_json::to_value(admitted).unwrap()["a"]["params"].get("includeContext").is_none());
+    assert_eq!(serde_json::to_value(&inputs).unwrap(),before);
 }
 #[test]
 fn watched_task_drive_policy_is_bounded_and_can_select_observation_only() {
