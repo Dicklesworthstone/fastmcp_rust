@@ -50518,6 +50518,16 @@ activate = 1\n";
     // Cargo.lock 99_964 -> 100_009, rust-toolchain.toml unchanged at 239 and
     // matching, which is the control proving the sweep discriminates.
     //
+    // ATTESTATION IS TWO HALVES AND THE FIRST LANDING MOVED ONLY ONE. 8282ab3a
+    // updated the lengths and digests above and left
+    // TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE anchored at a7109f65, whose blobs are
+    // the PRE-repair 7_224/99_964 — so properties 2 and 3 of that table both
+    // failed, which is precisely the state it exists to make visible. The
+    // anchors now name b5b1cc91, the latest mover of both paths, whose blobs
+    // equal these attested bytes exactly. rust-toolchain.toml's anchor was
+    // already its latest mover and stayed put; it is the control on both halves.
+    // Whoever re-attests these next: move the anchor in the same commit.
+    //
     // THE FINDING THIS REPAIR DOES NOT ADDRESS, recorded so the third rot is
     // not a surprise: these two rows measure PROJECT-AUTHORED MUTABLE files
     // that ordinary dependency work edits on its own schedule. Re-attesting
@@ -50561,8 +50571,8 @@ activate = 1\n";
     /// ruling. This mechanism must not become the route by which a pin move is
     /// sanctioned.
     const TOOLCHAIN_WORKSPACE_INPUT_PROVENANCE: [(&str, &str); 3] = [
-        ("Cargo.toml", "a7109f655a3c10a661c76cddce6727ca339863c1"),
-        ("Cargo.lock", "a7109f655a3c10a661c76cddce6727ca339863c1"),
+        ("Cargo.toml", "b5b1cc91c3ff562fbee50e63d8181366a9af4108"),
+        ("Cargo.lock", "b5b1cc91c3ff562fbee50e63d8181366a9af4108"),
         ("rust-toolchain.toml", "6a7e856662ce8607fb35b9f5670cef9ffbecc203"),
     ];
 
