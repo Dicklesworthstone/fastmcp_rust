@@ -116,6 +116,26 @@ impl ClientCredentialsTasksClient {
         filter: SubscriptionFilter,
         limits: ClientCredentialsSubscriptionLimits,
     ) -> Result<ClientCredentialsTaskSubscription, ClientCredentialsTasksError> {
+        self.subscribe_with_binding(
+            cx, cancellation, discovery_id, request_id, filter, limits, None,
+        ).await
+    }
+
+    // A recovering input driver must never acquire new input authority. Both
+    // modes share preparation, discovery and the exact same listen decoder;
+    // the pinned mode differs ONLY in how the opening snapshot is obtained.
+    // Kept private so a caller cannot import arbitrary credential custody.
+    #[allow(clippy::too_many_arguments)]
+    async fn subscribe_with_binding(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        discovery_id: RequestId,
+        request_id: RequestId,
+        filter: SubscriptionFilter,
+        limits: ClientCredentialsSubscriptionLimits,
+        binding: Option<&ClientCredentialsSnapshot>,
+    ) -> Result<ClientCredentialsTaskSubscription, ClientCredentialsTasksError> {
         let prepared = prepare_subscription(
             self.client.resource().as_str(), &self.metadata, &discovery_id,
             &request_id, filter, limits,
@@ -123,9 +143,15 @@ impl ClientCredentialsTasksClient {
         let deadline = discovery_deadline(cx, limits.timeout.min(self.client.inner.timeout))
             .map_err(ClientCredentialsError::from)?;
         let owner = &self.client.inner.closed;
-        active(cx, deadline, owner, cancellation, None, async {
+        active(cx, deadline, owner, cancellation, binding, async {
             Ok(async {
-                let snapshot = self.client.credential_with_cancellation(cx, cancellation).await?;
+                let snapshot = match binding {
+                    Some(binding) => ClientCredentialsSnapshot {
+                        bearer: binding.bearer.clone(), scopes: binding.scopes.clone(),
+                        expires_at: binding.expires_at, generation: binding.generation,
+                    },
+                    None => self.client.credential_with_cancellation(cx, cancellation).await?,
+                };
                 let executor = ModernHttpExecutor::new();
                 let discovery_wire = authorize(&snapshot, prepared.discovery_wire)?;
                 let response = active(cx, deadline, owner, cancellation, Some(&snapshot), async {

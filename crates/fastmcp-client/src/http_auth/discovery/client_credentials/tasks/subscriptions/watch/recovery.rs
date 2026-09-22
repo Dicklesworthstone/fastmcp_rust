@@ -5,6 +5,8 @@
 //! natural credential expiry are recoverable. Revocation, failed grants, HTTP
 //! refusals, malformed responses and opaque transport failures stay terminal.
 //! No creating call, input answer or cancellation can enter this owner.
+//! Input drivers reuse this observation engine with their original credential
+//! pinned: natural expiry then stops the run instead of authorizing renewal.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -61,7 +63,7 @@ impl ClientCredentialsTaskRecoveryPolicy {
         Ok(Self { maximum_reconnections, minimum_delay, maximum_delay })
     }
 
-    fn connection_policy(
+    pub(super) fn connection_policy(
         self,
         mut watch: ClientCredentialsTaskWatchPolicy,
     ) -> Result<ClientCredentialsTaskWatchPolicy, ClientCredentialsTaskRecoveryError> {
@@ -154,10 +156,9 @@ impl ClientCredentialsTasksClient {
         let watch = self.watch_tasks_with_cancellation(
             cx, cancellation, task_ids, id_prefix, connection_policy,
         ).await?;
-        let intervals = vec![recovery_policy.minimum_delay; watch.state.task_ids.len()];
+        let recovery = RecoveryState::new(&watch, connection_policy, recovery_policy);
         Ok(RecoveringClientCredentialsTaskWatch {
-            watch: Some(watch), connection_policy, policy: recovery_policy,
-            intervals, reconnections: 0, finished: false,
+            watch: Some(watch), recovery, finished: false,
         })
     }
 }
@@ -173,15 +174,12 @@ impl ClientCredentialsTasksClient {
 #[must_use = "poll snapshots, close explicitly, or drop the observation owner"]
 pub struct RecoveringClientCredentialsTaskWatch {
     watch: Option<ClientCredentialsTaskWatch>,
-    connection_policy: ClientCredentialsTaskWatchPolicy,
-    policy: ClientCredentialsTaskRecoveryPolicy,
-    intervals: Vec<Duration>,
-    reconnections: usize,
+    recovery: RecoveryState,
     finished: bool,
 }
 
 impl RecoveringClientCredentialsTaskWatch {
-    pub fn reconnection_attempts(&self) -> usize { self.reconnections }
+    pub fn reconnection_attempts(&self) -> usize { self.recovery.reconnection_attempts() }
 
     /// Releases local observation only, without changing the machine client,
     /// the caller's cancellation domain or any remote Task.
@@ -199,17 +197,58 @@ impl RecoveringClientCredentialsTaskWatch {
         let cancellation = watch.cancellation.clone();
         let deadline = watch.deadline;
         let snapshot = Box::pin(active(cx, deadline, &owner, &cancellation, None, async {
-            Ok(self.next_inner(cx, &mut watch).await)
+            Ok(self.recovery.next_snapshot(cx, &mut watch, None).await)
         })).await??;
         self.finished = watch.finished;
         if !self.finished { self.watch = Some(watch); }
         Ok(snapshot)
     }
+}
 
-    async fn next_inner(
+// Shared observation state, deliberately separate from socket/input custody.
+// Counters are retained on the caller-owned driver even if a polled operation
+// is abandoned. Neither this state nor reconnect accepts a mutation command.
+pub(super) struct RecoveryState {
+    connection_policy: ClientCredentialsTaskWatchPolicy,
+    policy: ClientCredentialsTaskRecoveryPolicy,
+    intervals: Vec<Duration>,
+    reconnections: usize,
+}
+
+impl RecoveryState {
+    pub(super) fn new(
+        watch: &ClientCredentialsTaskWatch,
+        connection_policy: ClientCredentialsTaskWatchPolicy,
+        policy: ClientCredentialsTaskRecoveryPolicy,
+    ) -> Self {
+        Self {
+            connection_policy, policy,
+            intervals: vec![policy.minimum_delay; watch.state.task_ids.len()],
+            reconnections: 0,
+        }
+    }
+
+    pub(super) fn reconnection_attempts(&self) -> usize { self.reconnections }
+
+    pub(super) fn record_snapshot(
+        &mut self,
+        watch: &ClientCredentialsTaskWatch,
+        task: &Task,
+    ) -> Result<(), ClientCredentialsTaskWatchError> {
+        let index = watch.state.task_ids.iter()
+            .position(|id| id == &task.base().task_id)
+            .ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?;
+        if !watch.state.terminal[index] {
+            self.intervals[index] = read_interval(task, self.policy.minimum_delay)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn next_snapshot(
         &mut self,
         cx: &Cx,
         watch: &mut ClientCredentialsTaskWatch,
+        pinned: Option<&ClientCredentialsSnapshot>,
     ) -> Result<Option<ManagedTaskSnapshot>, ClientCredentialsTaskRecoveryError> {
         loop {
             match watch.next_snapshot(cx).await {
@@ -218,24 +257,37 @@ impl RecoveringClientCredentialsTaskWatch {
                         if self.reconnections > 0 && snapshot.cause == ManagedTaskSnapshotCause::Initial {
                             snapshot.cause = ManagedTaskSnapshotCause::Reconnected;
                         }
-                        let index = watch.state.task_ids.iter()
-                            .position(|id| id == &snapshot.task.base().task_id)
-                            .ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?;
-                        if !watch.state.terminal[index] {
-                            self.intervals[index] = read_interval(&snapshot.task, self.policy.minimum_delay)?;
-                        }
+                        self.record_snapshot(watch, &snapshot.task)?;
                     }
                     return Ok(snapshot);
                 }
-                Err(error) => self.reconnect_after(cx, watch, error).await?,
+                Err(error) => self.reconnect_after(cx, watch, pinned, error).await?,
             }
         }
     }
 
-    async fn reconnect_after(
+    pub(super) async fn reconnect_after(
         &mut self,
         cx: &Cx,
         watch: &mut ClientCredentialsTaskWatch,
+        pinned: Option<&ClientCredentialsSnapshot>,
+        error: ClientCredentialsTaskWatchError,
+    ) -> Result<(), ClientCredentialsTaskRecoveryError> {
+        let owner = watch.client.client.inner.closed.clone();
+        let cancellation = watch.cancellation.clone();
+        let deadline = watch.deadline;
+        // This bound includes backoff, discovery, ACK and caller cancellation.
+        // A pin also makes credential expiry/revocation wake pending recovery.
+        Box::pin(active(cx, deadline, &owner, &cancellation, pinned, async {
+            Ok(self.reconnect_inner(cx, watch, pinned, error).await)
+        })).await?
+    }
+
+    async fn reconnect_inner(
+        &mut self,
+        cx: &Cx,
+        watch: &mut ClientCredentialsTaskWatch,
+        pinned: Option<&ClientCredentialsSnapshot>,
         mut error: ClientCredentialsTaskWatchError,
     ) -> Result<(), ClientCredentialsTaskRecoveryError> {
         if !recoverable(&error, &watch.binding, Instant::now()) {
@@ -263,7 +315,7 @@ impl RecoveringClientCredentialsTaskWatch {
                 return Err(ClientCredentialsError::from(OAuthDiscoveryError::TimedOut).into());
             }
             Sleep::new(due).await;
-            match reconnect(watch, cx, &pending, self.connection_policy).await {
+            match reconnect(watch, cx, &pending, self.connection_policy, pinned).await {
                 Ok(()) => return Ok(()),
                 // An ended replacement before ACK may consume another reserved
                 // connection. Never loop on grant, expiry, security or opaque
@@ -322,6 +374,7 @@ async fn reconnect(
     cx: &Cx,
     pending: &[usize],
     policy: ClientCredentialsTaskWatchPolicy,
+    pinned: Option<&ClientCredentialsSnapshot>,
 ) -> Result<(), ClientCredentialsTaskWatchError> {
     if watch.binding.bearer.is_revoked() { return Err(ClientCredentialsError::Expired.into()); }
     let selected: Vec<_> = pending.iter().map(|index| watch.state.task_ids[*index].clone()).collect();
@@ -332,8 +385,8 @@ async fn reconnect(
         watch.client.limits.frame_bytes.min(MAX_SELECTION_BYTES),
         policy.maximum_records, policy.timeout,
     )?;
-    let mut subscription = watch.client.subscribe_with_cancellation(
-        cx, &watch.cancellation, discovery_id, request_id, selection.filter()?, limits,
+    let mut subscription = watch.client.subscribe_with_binding(
+        cx, &watch.cancellation, discovery_id, request_id, selection.filter()?, limits, pinned,
     ).await?;
     let Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) =
         subscription.next_event(cx).await?
@@ -493,6 +546,146 @@ mod tests {
                 }
                 assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
             }
+            assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+        });
+    }
+
+    fn local_watch(cx: &Cx) -> ClientCredentialsTaskWatch {
+        ClientCredentialsTaskWatch {
+            client: consumer(), cancellation: McpRequestCancellation::new(),
+            binding: binding(Instant::now()), subscription: None,
+            state: WatchState::new(vec![id("one")], 8).unwrap(),
+            ids: super::super::WatchIds::new("input".to_owned()).unwrap(),
+            deadline: cx.now().saturating_add_nanos(5_000_000_000), finished: false,
+        }
+    }
+
+    fn state(watch: &ClientCredentialsTaskWatch) -> RecoveryState {
+        let policy = ClientCredentialsTaskRecoveryPolicy::default();
+        RecoveryState::new(watch,
+            policy.connection_policy(ClientCredentialsTaskWatchPolicy::default()).unwrap(), policy)
+    }
+
+    #[test]
+    fn pinned_recovery_cannot_spend_a_reconnect_or_renew_after_expiry_or_revocation() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for revoked in [false, true] {
+                let mut watch = local_watch(&cx);
+                if revoked { watch.binding.bearer.revoke(); }
+                else { watch.binding.expires_at = Instant::now(); }
+                let pinned = copy_binding(&watch.binding);
+                let mut recovery = state(&watch);
+                // The ordinary observer may renew natural expiry; a driver's
+                // pin is checked before backoff, IDs or grant acquisition.
+                assert_eq!(recoverable(&ClientCredentialsTaskWatchError::Interrupted,
+                    &watch.binding, Instant::now()), !revoked);
+                assert!(matches!(Box::pin(recovery.reconnect_after(&cx, &mut watch, Some(&pinned),
+                    ClientCredentialsTaskWatchError::Interrupted)).await,
+                    Err(ClientCredentialsTaskRecoveryError::Watch(ClientCredentialsTaskWatchError::Task(
+                        ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired))))));
+                assert_eq!(recovery.reconnection_attempts(), 0);
+                assert_eq!(watch.ids.next, 0);
+                assert_eq!(watch.state.snapshots, 0);
+                assert!(watch.client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn pinned_subscription_preflight_never_falls_back_to_grant_acquisition() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            for revoked in [false, true] {
+                let client = consumer();
+                let mut pinned = binding(Instant::now());
+                if revoked { pinned.bearer.revoke(); }
+                else { pinned.expires_at = Instant::now(); }
+                let selected = WatchState::new(vec![id("one")], 2).unwrap().filter().unwrap();
+                let result = Box::pin(client.subscribe_with_binding(
+                    &cx, &McpRequestCancellation::new(), super::super::RequestId::Number(1),
+                    super::super::RequestId::Number(2), selected,
+                    ClientCredentialsSubscriptionLimits::default(), Some(&pinned),
+                )).await;
+                assert!(matches!(result, Err(ClientCredentialsTasksError::Authentication(ClientCredentialsError::Expired))));
+                assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+                assert_eq!(pinned.generation, 1);
+            }
+        });
+    }
+
+    #[test]
+    fn pinned_recovery_keeps_refusals_terminal_and_exhaustion_does_not_reset_counters() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut watch = local_watch(&cx);
+            watch.state.snapshots = 2;
+            let pinned = copy_binding(&watch.binding);
+            let mut recovery = state(&watch);
+            assert!(matches!(Box::pin(recovery.reconnect_after(&cx, &mut watch, Some(&pinned),
+                ManagedTasksError::HttpStatus { status: 401 }.into())).await,
+                Err(ClientCredentialsTaskRecoveryError::Watch(ClientCredentialsTaskWatchError::Task(
+                    ClientCredentialsTasksError::Protocol(ManagedTasksError::HttpStatus { status: 401 }))))));
+            assert_eq!(recovery.reconnection_attempts(), 0);
+            recovery.reconnections = recovery.policy.maximum_reconnections;
+            let before = recovery.reconnection_attempts();
+            assert!(matches!(Box::pin(recovery.reconnect_after(&cx, &mut watch, Some(&pinned),
+                ManagedTasksError::MissingTerminal.into())).await,
+                Err(ClientCredentialsTaskRecoveryError::RecoveryLimit { last_error:
+                    ClientCredentialsTaskWatchError::Task(ClientCredentialsTasksError::Protocol(ManagedTasksError::MissingTerminal)) })));
+            assert_eq!(recovery.reconnection_attempts(), before);
+            assert_eq!(watch.ids.next, 0);
+            assert_eq!(watch.state.snapshots, 2);
+            assert_eq!(watch.state.terminal, [false]);
+            assert!(watch.client.client.inner.state.try_lock_owned().unwrap().current.is_none());
+        });
+    }
+
+    #[test]
+    fn post_update_snapshots_update_backoff_without_refunding_snapshots_or_reconnects() {
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut watch = local_watch(&cx);
+            let mut recovery = state(&watch);
+            watch.state.snapshots = 3;
+            recovery.reconnections = 2;
+            let snapshot = |task_id| serde_json::from_value::<Task>(serde_json::json!({
+                "taskId": task_id, "status":"working", "ttlMs":60000,
+                "createdAt":"2026-09-22T00:00:00Z", "lastUpdatedAt":"2026-09-22T00:00:00Z",
+                "pollIntervalMs": 5000
+            })).unwrap();
+            recovery.record_snapshot(&watch, &snapshot("one")).unwrap();
+            assert_eq!(recovery.intervals, [Duration::from_secs(5)]);
+            assert!(recovery.record_snapshot(&watch, &snapshot("other")).is_err());
+            assert_eq!(recovery.intervals, [Duration::from_secs(5)]);
+            assert_eq!(recovery.reconnection_attempts(), 2);
+            assert_eq!(watch.state.snapshots, 3);
+            assert_eq!(watch.state.terminal, [false]);
+        });
+    }
+
+    #[test]
+    fn input_recovery_policy_reserves_records_before_admission_and_preserves_typed_failures() {
+        use super::super::drive::{ClientCredentialsTaskWatchDriveError, ClientCredentialsTaskWatchDrivePolicy};
+        let policy = ClientCredentialsTaskRecoveryPolicy::default();
+        let drive_policy = |records| ClientCredentialsTaskWatchDrivePolicy::new(
+            ClientCredentialsTaskWatchPolicy::new(Duration::from_secs(5), 8, records).unwrap(), 2, 2, 4096,
+        ).unwrap().with_recovery(policy);
+        assert!(drive_policy(10).is_ok());
+        assert!(matches!(drive_policy(9), Err(ClientCredentialsTaskWatchDriveError::Recovery(
+            ClientCredentialsTaskRecoveryError::InvalidPolicy))));
+        assert!(matches!(ClientCredentialsTaskWatchDriveError::from(ClientCredentialsTaskRecoveryError::Watch(
+            ClientCredentialsTaskWatchError::Interrupted)),
+            ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Interrupted)));
+        runtime().block_on(async {
+            let cx = Cx::current().unwrap();
+            let client = consumer();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert!(matches!(Box::pin(client.watch_task_inputs_with_cancellation(&cx, &cancelled,
+                id("one"), "input".to_owned(), drive_policy(10).unwrap())).await,
+                Err(ClientCredentialsTaskWatchDriveError::Watch(ClientCredentialsTaskWatchError::Task(
+                    ClientCredentialsTasksError::Authentication(ClientCredentialsError::Discovery(OAuthDiscoveryError::Cancelled)))))));
             assert!(client.client.inner.state.try_lock_owned().unwrap().current.is_none());
         });
     }

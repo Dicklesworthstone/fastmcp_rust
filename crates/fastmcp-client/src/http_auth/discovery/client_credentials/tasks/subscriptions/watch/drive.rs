@@ -5,6 +5,8 @@
 //! change Task status or cause a notification. No failed POST is ever retried.
 //! The owned driver exposes explicit cancellation and retains update receipts
 //! after errors, cancellation, close or abandonment of a polled drive future.
+//! Opt-in bounded observation recovery retains input history and the original
+//! credential. It never retries an update whose acknowledgement was not read.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,6 +28,9 @@ use super::{
 use super::cancellation::{
     CancellableClientCredentialsTaskWatchError, ClientCredentialsTaskCancelHandle,
 };
+use super::recovery::{
+    ClientCredentialsTaskRecoveryError, ClientCredentialsTaskRecoveryPolicy, RecoveryState,
+};
 pub use crate::http_auth::discovery::client_credentials::tasks::driver::{
     ClientCredentialsTaskWaitError, ManagedTaskInputAction, ManagedTaskRunOutcome,
 };
@@ -41,11 +46,12 @@ pub struct ClientCredentialsTaskWatchDrivePolicy {
     maximum_updates: usize,
     maximum_input_keys: usize,
     maximum_input_bytes: usize,
+    recovery: Option<ClientCredentialsTaskRecoveryPolicy>,
 }
 impl Default for ClientCredentialsTaskWatchDrivePolicy {
     fn default() -> Self {
         Self { watch: ClientCredentialsTaskWatchPolicy::default(), maximum_updates: 32,
-            maximum_input_keys: 256, maximum_input_bytes: 1024 * 1024 }
+            maximum_input_keys: 256, maximum_input_bytes: 1024 * 1024, recovery: None }
     }
 }
 impl ClientCredentialsTaskWatchDrivePolicy {
@@ -56,7 +62,32 @@ impl ClientCredentialsTaskWatchDrivePolicy {
         if maximum_updates > 128 || maximum_input_keys > 4096
             || !(1..=4 * 1024 * 1024).contains(&maximum_input_bytes)
         { return Err(ClientCredentialsTaskWaitError::InvalidPolicy.into()); }
-        Ok(Self { watch, maximum_updates, maximum_input_keys, maximum_input_bytes })
+        Ok(Self { watch, maximum_updates, maximum_input_keys, maximum_input_bytes, recovery: None })
+    }
+
+    /// Recover ended observation streams, including a reconciliation read after
+    /// an admitted update ACK. Retain the same input history, update receipts,
+    /// request identity sequence, snapshot budget and absolute deadline.
+    ///
+    /// The listen record budget is divided across the initial connection and
+    /// every allowed reconnect, with at least two records per connection.
+    /// Unlike observation-only recovery, input execution NEVER renews its
+    /// credential. Expiry, revocation, failed mutations, malformed responses,
+    /// HTTP refusals and ambiguous transport errors remain terminal.
+    pub fn with_recovery(
+        mut self,
+        recovery: ClientCredentialsTaskRecoveryPolicy,
+    ) -> Result<Self, ClientCredentialsTaskWatchDriveError> {
+        self.recovery = Some(recovery);
+        self.connection_policy()?;
+        Ok(self)
+    }
+
+    fn connection_policy(self) -> Result<ClientCredentialsTaskWatchPolicy, ClientCredentialsTaskWatchDriveError> {
+        match self.recovery {
+            Some(recovery) => Ok(recovery.connection_policy(self.watch)?),
+            None => Ok(self.watch),
+        }
     }
 }
 
@@ -66,6 +97,7 @@ impl ClientCredentialsTaskWatchDrivePolicy {
 pub enum ClientCredentialsTaskWatchDriveError {
     Watch(ClientCredentialsTaskWatchError),
     Input(ClientCredentialsTaskWaitError),
+    Recovery(ClientCredentialsTaskRecoveryError),
     CancellationRequested,
 }
 impl fmt::Display for ClientCredentialsTaskWatchDriveError {
@@ -73,6 +105,7 @@ impl fmt::Display for ClientCredentialsTaskWatchDriveError {
         match self {
             Self::Watch(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
+            Self::Recovery(error) => error.fmt(f),
             Self::CancellationRequested => f.write_str("machine Task cancellation acknowledged; input driver stopped"),
         }
     }
@@ -92,6 +125,14 @@ impl From<ClientCredentialsError> for ClientCredentialsTaskWatchDriveError {
 }
 impl From<ManagedTasksError> for ClientCredentialsTaskWatchDriveError {
     fn from(error: ManagedTasksError) -> Self { Self::Watch(error.into()) }
+}
+impl From<ClientCredentialsTaskRecoveryError> for ClientCredentialsTaskWatchDriveError {
+    fn from(error: ClientCredentialsTaskRecoveryError) -> Self {
+        match error {
+            ClientCredentialsTaskRecoveryError::Watch(error) => Self::Watch(error),
+            error => Self::Recovery(error),
+        }
+    }
 }
 impl From<CancellableClientCredentialsTaskWatchError> for ClientCredentialsTaskWatchDriveError {
     fn from(error: CancellableClientCredentialsTaskWatchError) -> Self {
@@ -181,7 +222,8 @@ impl ClientCredentialsTasksClient {
     /// code. Its cancel handle can interrupt a pending resolver, get or update
     /// response. Admission, caller pauses and execution share one finite
     /// deadline and the exact credential that acknowledged the subscription.
-    /// No implicit renewal, reconnection, Task creation or mutation replay occurs.
+    /// Reconnection is opt-in through the drive policy; credential renewal,
+    /// Task creation and mutation replay are never implicit.
     pub async fn watch_task_inputs(
         &self, cx: &Cx, task_id: TaskId, id_prefix: String,
         policy: ClientCredentialsTaskWatchDrivePolicy,
@@ -197,6 +239,7 @@ impl ClientCredentialsTasksClient {
         &self, cx: &Cx, cancellation: &McpRequestCancellation, task_id: TaskId,
         id_prefix: String, policy: ClientCredentialsTaskWatchDrivePolicy,
     ) -> Result<ClientCredentialsTaskWatchDriver, ClientCredentialsTaskWatchDriveError> {
+        let connection_policy = policy.connection_policy()?;
         let _ = WatchState::new(vec![task_id.clone()], policy.watch.maximum_snapshots)?;
         let deadline = discovery_deadline(cx, policy.watch.timeout).map_err(ClientCredentialsError::from)?;
         let mut remote_cancel = ClientCredentialsTaskCancelHandle::for_observation(
@@ -205,16 +248,17 @@ impl ClientCredentialsTasksClient {
         let owner = &self.client.inner.closed;
         let mut watch = Box::pin(active(cx, deadline, owner, cancellation, None, async {
             Ok(self.watch_tasks_with_cancellation(cx, cancellation,
-                vec![task_id], id_prefix, policy.watch).await)
+                vec![task_id], id_prefix, connection_policy).await)
         })).await??;
         watch.deadline = watch.deadline.min(deadline);
         check_watch(cx, watch.deadline, owner, cancellation, &watch.binding)?;
         let binding = copy_binding(&watch.binding);
         remote_cancel.pin_binding(copy_binding(&binding), watch.deadline)?;
+        let recovery = policy.recovery.map(|policy| RecoveryState::new(&watch, connection_policy, policy));
         Ok(ClientCredentialsTaskWatchDriver {
             client: self.clone(), cancellation: cancellation.clone(), deadline: watch.deadline,
             policy, binding: Some(binding), watch: Some(watch), remote_cancel,
-            progress: UpdateProgress::default(),
+            progress: UpdateProgress::default(), recovery,
         })
     }
 }
@@ -241,11 +285,17 @@ pub struct ClientCredentialsTaskWatchDriver {
     watch: Option<ClientCredentialsTaskWatch>,
     remote_cancel: ClientCredentialsTaskCancelHandle,
     progress: UpdateProgress,
+    recovery: Option<RecoveryState>,
 }
 impl ClientCredentialsTaskWatchDriver {
     pub fn cancel_handle(&self) -> ClientCredentialsTaskCancelHandle { self.remote_cancel.clone() }
     pub fn update_state(&self) -> TaskInputUpdateState { self.progress.state }
     pub fn acknowledged_updates(&self) -> usize { self.progress.acknowledged }
+    /// Includes failed replacement admissions and remains available after
+    /// cancellation, close or abandonment. An unpolled drive spends nothing.
+    pub fn reconnection_attempts(&self) -> usize {
+        self.recovery.as_ref().map_or(0, RecoveryState::reconnection_attempts)
+    }
     /// Correlation only, never an idempotency key or remote rollback evidence.
     pub fn last_update_request_id(&self) -> Option<&RequestId> { self.progress.request_id.as_ref() }
     pub fn close(&mut self) {
@@ -313,8 +363,13 @@ impl ClientCredentialsTaskWatchDriver {
             self.check(cx, binding)?;
             let task = match reconciled.take() {
                 Some(task) => task,
-                None => watch.next_snapshot(cx).await?
-                    .ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?.task,
+                None => {
+                    let snapshot = match self.recovery.as_mut() {
+                        Some(recovery) => Box::pin(recovery.next_snapshot(cx, watch, Some(binding))).await?,
+                        None => watch.next_snapshot(cx).await?,
+                    };
+                    snapshot.ok_or(ClientCredentialsTaskWatchError::UnexpectedEvent)?.task
+                }
             };
             self.check(cx, binding)?;
             observe(&task)?;
@@ -365,17 +420,31 @@ impl ClientCredentialsTaskWatchDriver {
             drop(call);
             self.check(cx, binding)?;
             // A partial answer need not change status or cause a notification.
-            // Reconcile this admitted write once, never replay the update.
-            let mut call = request_pinned(&client, cx, &cancellation, binding, deadline, get_ids,
-                ManagedTaskRequest::Get(task_id.clone())).await?;
-            let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
-                return Err(ClientCredentialsTaskWatchError::UnexpectedEvent.into());
-            };
-            drop(call);
+            // Only observation AFTER this admitted ACK can recover. The update
+            // itself and its response read above never enter the recovery loop.
+            let observed = async {
+                let mut call = request_pinned(&client, cx, &cancellation, binding, deadline, get_ids,
+                    ManagedTaskRequest::Get(task_id.clone())).await?;
+                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
+                    return Err(ClientCredentialsTaskWatchError::UnexpectedEvent);
+                };
+                Ok::<_, ClientCredentialsTaskWatchError>(snapshot.task)
+            }.await;
             self.check(cx, binding)?;
-            watch.finished = watch.state.record_snapshot(&snapshot.task)?;
-            if watch.finished { watch.close(); }
-            reconciled = Some(Box::new(snapshot.task));
+            match observed {
+                Ok(task) => {
+                    watch.finished = watch.state.record_snapshot(&task)?;
+                    if let Some(recovery) = self.recovery.as_mut() { recovery.record_snapshot(watch, &task)?; }
+                    if watch.finished { watch.close(); }
+                    reconciled = Some(Box::new(task));
+                }
+                Err(error) => match self.recovery.as_mut() {
+                    Some(recovery) => {
+                        Box::pin(recovery.reconnect_after(cx, watch, Some(binding), error)).await?;
+                    }
+                    None => return Err(error.into()),
+                },
+            }
         }
     }
 }
@@ -387,6 +456,7 @@ impl fmt::Debug for ClientCredentialsTaskWatchDriver {
         f.debug_struct("ClientCredentialsTaskWatchDriver")
             .field("update_state", &self.progress.state)
             .field("acknowledged_updates", &self.progress.acknowledged)
+            .field("reconnection_attempts", &self.reconnection_attempts())
             .finish_non_exhaustive()
     }
 }
