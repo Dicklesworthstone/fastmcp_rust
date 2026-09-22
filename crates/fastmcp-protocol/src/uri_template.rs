@@ -1962,7 +1962,11 @@ fn reverse_match_named(
         }
     } else if let Some(after_equals) = after_name.strip_prefix('=') {
         (after_equals, 1)
-    } else if after_name.is_empty() || after_name.starts_with(';') {
+    } else if after_name.is_empty()
+        || after_name.starts_with(';')
+        || next_boundary.is_some_and(|boundary| after_name.starts_with(boundary.as_str()))
+    {
+        // Empty matrix values omit '=', even immediately before the next part.
         (after_name, 0)
     } else {
         return Some((None, 0));
@@ -2009,11 +2013,22 @@ fn reverse_match_named_expression(
         };
 
         let (after_equals, equals_len) = if requires_equals {
-            let after_equals = after_name.strip_prefix('=')?;
+            let Some(after_equals) = after_name.strip_prefix('=') else {
+                // A shared name prefix does not bind this variable. For example,
+                // absent `id` must not prevent `identifier` from being matched.
+                continue;
+            };
             (after_equals, 1)
         } else if let Some(after_equals) = after_name.strip_prefix('=') {
             (after_equals, 1)
-        } else if after_name.is_empty() || after_name.starts_with(properties.separator) {
+        } else if after_name.is_empty()
+            || after_name.starts_with(properties.separator)
+            || expression
+                .next_boundary
+                .as_ref()
+                .is_some_and(|boundary| after_name.starts_with(boundary.as_str()))
+        {
+            // Leave the following literal or expression marker unconsumed.
             (after_name, 0)
         } else {
             continue;
@@ -2099,6 +2114,171 @@ fn contains_pct_encoded_triplet(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversible_named_expressions_round_trip_optional_prefix_names() {
+        let samples = [None, Some(""), Some("42"), Some("café/a"), Some("%2F")];
+        for source in [
+            "mcp://items{?id,identifier,id.tag}",
+            "mcp://items?fixed=1{&id,identifier,id.tag}",
+            "mcp://items{;id,identifier,id.tag}",
+        ] {
+            let matcher = ReversibleResourceTemplate::compile(
+                UriTemplate::parse(source).expect("named template parses"),
+            )
+            .expect("named scalar expressions are reversible");
+            for id in samples {
+                for identifier in samples {
+                    for tag in samples {
+                        let values: TemplateValues = [
+                            ("id", id),
+                            ("identifier", identifier),
+                            ("id.tag", tag),
+                        ]
+                        .into_iter()
+                        .filter_map(|(name, value)| {
+                            value.map(|value| (name.to_owned(), TemplateValue::scalar(value)))
+                        })
+                        .collect();
+                        let uri = matcher.expand(&values).expect("scalar values expand");
+                        assert_eq!(
+                            matcher.match_uri(&uri).expect("matching stays within bounds"),
+                            Some(values),
+                            "optional bindings must survive round-trip: {source} -> {uri}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reversible_empty_matrix_parameters_before_literal_boundaries() {
+        for names in ["flag", "unused,flag", "flag,unused"] {
+            for suffix in ["/tail", "?fixed=1", "#view"] {
+                let source = format!("mcp://items{{;{names}}}{suffix}");
+                let matcher = ReversibleResourceTemplate::compile(
+                    UriTemplate::parse(&source).expect("matrix template parses"),
+                )
+                .expect("the suffix supplies a reversible boundary");
+                let values = TemplateValues::from([(
+                    "flag".to_owned(),
+                    TemplateValue::scalar(""),
+                )]);
+                let uri = format!("mcp://items;flag{suffix}");
+                assert_eq!(matcher.expand(&values).expect("empty scalar expands"), uri);
+                assert_eq!(
+                    matcher.match_uri(&uri).expect("matching stays within bounds"),
+                    Some(values),
+                    "an empty matrix parameter must survive before {suffix}",
+                );
+                let absent = TemplateValues::new();
+                let absent_uri = format!("mcp://items{suffix}");
+                assert_eq!(
+                    matcher.expand(&absent).expect("undefined value expands"),
+                    absent_uri,
+                );
+                assert_eq!(
+                    matcher.match_uri(&absent_uri).expect("undefined value matches"),
+                    Some(absent),
+                    "omitting the parameter must not manufacture an empty binding",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reversible_empty_matrix_parameters_before_optional_query_expressions() {
+        for names in ["flag", "unused,flag", "flag,unused"] {
+            let source = format!("mcp://items{{;{names}}}{{?page}}");
+            let matcher = ReversibleResourceTemplate::compile(
+                UriTemplate::parse(&source).expect("adjacent named expressions parse"),
+            )
+            .expect("distinct expression markers are reversible");
+            for page in [None, Some("2")] {
+                let mut values = TemplateValues::from([(
+                    "flag".to_owned(),
+                    TemplateValue::scalar(""),
+                )]);
+                let uri = if let Some(page) = page {
+                    values.insert("page".to_owned(), TemplateValue::scalar(page));
+                    format!("mcp://items;flag?page={page}")
+                } else {
+                    "mcp://items;flag".to_owned()
+                };
+                assert_eq!(matcher.expand(&values).expect("named values expand"), uri);
+                assert_eq!(
+                    matcher.match_uri(&uri).expect("matching stays within bounds"),
+                    Some(values),
+                    "the following query must remain optional: {source} -> {uri}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reversible_query_prefix_matching_keeps_invalid_candidates_rejected() {
+        let matcher = ReversibleResourceTemplate::compile(
+            UriTemplate::parse("mcp://items{?id,identifier}").expect("query template parses"),
+        )
+        .expect("named query variables are reversible");
+        let values = TemplateValues::from([(
+            "identifier".to_owned(),
+            TemplateValue::scalar("42"),
+        )]);
+        assert_eq!(
+            matcher
+                .match_uri("mcp://items?identifier=42")
+                .expect("valid URI matches"),
+            Some(values),
+        );
+        for uri in [
+            "mcp://items?identifierExtra=42",
+            "mcp://items?identifier",
+            "mcp://items?identifier=42&id=1",
+            "mcp://items?identifier=%Q0",
+            "mcp://items?identifier=%FF",
+            "mcp://items?identifier=%34%32",
+        ] {
+            assert_eq!(
+                matcher.match_uri(uri).expect("invalid URI is a bounded non-match"),
+                None,
+                "unknown names, malformed values, and noncanonical order remain rejected: {uri}",
+            );
+        }
+    }
+
+    #[test]
+    fn reversible_matrix_boundary_matching_keeps_invalid_candidates_rejected() {
+        let matcher = ReversibleResourceTemplate::compile(
+            UriTemplate::parse("mcp://items{;flag}/tail").expect("matrix template parses"),
+        )
+        .expect("literal suffix supplies a reversible boundary");
+        let values = TemplateValues::from([(
+            "flag".to_owned(),
+            TemplateValue::scalar(""),
+        )]);
+        assert_eq!(
+            matcher
+                .match_uri("mcp://items;flag/tail")
+                .expect("valid URI matches"),
+            Some(values),
+        );
+        for uri in [
+            "mcp://items;flag=/tail",
+            "mcp://items;flagship/tail",
+            "mcp://items;flag/other",
+            "mcp://items;flag/tail/trailing",
+            "mcp://items;flag=%FF/tail",
+            "mcp://items;flag=%/tail",
+        ] {
+            assert_eq!(
+                matcher.match_uri(uri).expect("invalid URI is a bounded non-match"),
+                None,
+                "wrong names, malformed values, and changed suffixes remain rejected: {uri}",
+            );
+        }
+    }
 
     fn values() -> TemplateValues {
         let mut values = TemplateValues::new();
