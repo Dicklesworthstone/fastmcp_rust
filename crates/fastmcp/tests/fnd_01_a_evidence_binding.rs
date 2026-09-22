@@ -1922,17 +1922,30 @@ impl SdkBatchRun {
         format!("fnd_01_sdk_batch {:?}", self.argv)
     }
 
-    /// The `code` field of a no-credit record, when there is one. Used to tell
-    /// an upstream precondition failure apart from a defect in the surface.
-    fn no_credit_code(&self) -> Option<String> {
+    /// A string member of the emitted record, when stdout parsed and carried
+    /// one. Deliberately non-panicking: this is used inside failure messages,
+    /// where a second panic would replace the diagnosis with its own.
+    fn member(&self, name: &str) -> Option<String> {
         serde_json::from_str::<serde_json::Value>(&self.stdout)
             .ok()
             .and_then(|value| {
                 value
-                    .get("code")
+                    .get(name)
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             })
+    }
+
+    /// The `code` field of a no-credit record, when there is one. Used to tell
+    /// an upstream precondition failure apart from a defect in the surface.
+    fn no_credit_code(&self) -> Option<String> {
+        self.member("code")
+    }
+
+    /// The `detail` field, which carries the runner's stable pipe-delimited
+    /// diagnostic — the part that names WHICH precondition refused.
+    fn no_credit_detail(&self) -> Option<String> {
+        self.member("detail")
     }
 }
 
@@ -1960,6 +1973,65 @@ fn sdk_batch_binary() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Why this host cannot evaluate a case that needs a repository, or `None`
+/// when it can.
+///
+/// The shipped runner observes the repository through `sdk_git_output`, which
+/// collapses every non-zero git exit **and any stderr at all** into one
+/// diagnostic, `…|SDK repository runtime|git observation`. That code is
+/// therefore not by itself evidence of an absent repository — treating it as
+/// such would file a genuine git failure as environmental. So this probes the
+/// precondition directly instead of reading the runner's bucket, using the same
+/// `not a git repository` test as [`blob_at_revision`] above.
+fn repository_observation_void_reason() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(workspace_root())
+        .output();
+    match output {
+        Err(error) => Some(format!("`git` could not be spawned on this host: {error}")),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not a git repository") {
+                Some(format!("no git repository on this host: {}", stderr.trim()))
+            } else if output.status.success() {
+                None
+            } else {
+                Some(format!(
+                    "`git rev-parse --git-dir` failed on this host: {}",
+                    stderr.trim()
+                ))
+            }
+        }
+    }
+}
+
+/// Refuses loudly, and in words that survive being pasted into a receipt, when
+/// a red is caused by the host rather than by the surface under test.
+///
+/// Without this the two repository-backed cases fail with a bare
+/// `assertion `left == right` failed: Some(1)`, which a reader — or a runner's
+/// void-detecting grep — cannot tell apart from a real defect in the example.
+/// The sibling git helpers in this file already carry the `VOID, NOT A FINDING`
+/// marker; these cases reach the identical wall by a different route and must
+/// say so in the identical words.
+fn refuse_if_environmentally_void(run: &SdkBatchRun) {
+    if run.exit_code == Some(0) {
+        return;
+    }
+    if let Some(reason) = repository_observation_void_reason() {
+        panic!(
+            "VOID, NOT A FINDING - {}: {reason}. RCH syncs source files and never `.git` \
+             (.rchignore), so the shipped runner's own repository observation cannot evaluate \
+             on a worker, and its refusal says nothing about the property under test. Run it \
+             where the repository is authoritative. Runner record: code {:?}, detail {:?}",
+            run.describe(),
+            run.no_credit_code(),
+            run.no_credit_detail(),
+        );
+    }
 }
 
 fn run_sdk_batch(arguments: &[&str]) -> SdkBatchRun {
