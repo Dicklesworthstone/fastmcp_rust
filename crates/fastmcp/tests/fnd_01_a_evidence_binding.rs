@@ -2152,15 +2152,23 @@ fn fnd_01_b_sdk_batch_mode_dispatch_planted_negative() {
 /// Predicate: the shipped runner admits a batch and grants no credit while
 /// doing so. Minimum count: 1.
 ///
-/// PRECONDITION, stated so a red here is attributable: `sdk-batch-run-json`
-/// calls `sdk_prepare_batch`, which refuses a dirty checkout
-/// (`E_SDK_RUNNER_DIRTY`), and `sdk_admit_batch`, which runs the full FND-01
-/// verifier and refuses on any error (`E_SDK_RUNNER_VERIFIER`). This case
-/// therefore cannot pass while the verifier has failures, and the assertion
-/// message below names which of the two fired.
+/// PRECONDITIONS, stated so a red here is attributable. `sdk-batch-run-json`
+/// calls `sdk_prepare_batch`, which
+///
+/// 1. observes the repository through `sdk_git_output` and refuses with
+///    `…|SDK repository runtime|git observation` when git cannot be run
+///    cleanly — which on an RCH worker means the absent `.git`, not a defect;
+/// 2. refuses a dirty checkout with `E_SDK_RUNNER_DIRTY`;
+///
+/// and then `sdk_admit_batch`, which runs the full FND-01 verifier and refuses
+/// on any error with `E_SDK_RUNNER_VERIFIER`. This case therefore cannot pass
+/// while the verifier has failures, and cannot evaluate at all without a
+/// repository. `refuse_if_environmentally_void` separates the third case from
+/// the first two before the ordinary assertion runs.
 #[test]
 fn fnd_01_b_sdk_batch_run_positive() {
     let run = run_sdk_batch(&["sdk-batch-run-json"]);
+    refuse_if_environmentally_void(&run);
     assert_eq!(
         run.exit_code,
         Some(0),
@@ -2215,10 +2223,13 @@ fn fnd_01_b_sdk_batch_run_positive() {
 ///
 /// Evaluator: the example process. Observed field: the planted-negative record.
 /// Predicate: typed refusal reached, one field changed, no mutable state moved.
-/// Minimum count: 1. Same precondition as the positive.
+/// Minimum count: 1. Same preconditions as the positive, including the
+/// repository observation — this case is not the cheap half, because it calls
+/// `sdk_prepare_batch` first too.
 #[test]
 fn fnd_01_b_sdk_batch_run_planted_negative() {
     let run = run_sdk_batch(&["sdk-batch-run-planted-negative-json"]);
+    refuse_if_environmentally_void(&run);
     assert_eq!(
         run.exit_code,
         Some(0),
