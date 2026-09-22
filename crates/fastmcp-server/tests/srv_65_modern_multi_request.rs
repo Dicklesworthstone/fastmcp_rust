@@ -1712,12 +1712,22 @@ const SAMPLING_RECV_GRACE: Duration = Duration::from_secs(5);
 /// bound that is too short.
 const SAMPLING_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Which trait method carries the handler body. The only variable.
+/// Which position the fixture exercises.
+///
+/// These form a LADDER, and a rung means nothing unless the rung below it
+/// passed in the same run: `PlainEcho` establishes that the harness answers a
+/// `tools/call` at all, `DeclaredAsync` that sampling is live through it, and
+/// only then does `RequiredSyncCall` say anything about the trait positions.
+/// The first version of this fixture had no `PlainEcho`, and all three of its
+/// positions returned the same `NoCorrelatedResponse` -- a harness failure
+/// wearing the costume of a sampling result.
 #[derive(Clone, Copy, Debug)]
 enum SamplingArm {
+    /// `echo`, which samples nothing. Proves the harness round-trips a call.
+    PlainEcho,
     /// The required sync `call`, bridging `ctx.sample` with `block_on`.
     RequiredSyncCall,
-    /// The async final hook, awaiting `ctx.sample` directly. The control.
+    /// The async final hook, awaiting `ctx.sample` directly.
     DeclaredAsync,
 }
 
@@ -1902,38 +1912,70 @@ impl ToolHandler for AsyncSamplingTool {
     }
 }
 
-/// The ordinary handshake a sampling-capable client performs, then one
-/// `tools/call`. Sampling is advertised in `initialize` capabilities AND in the
-/// modern `_meta` envelope, because both are legitimate client behaviour and
-/// the fixture must not depend on which one this dispatcher reads.
-fn sampling_request_script(tool: &str) -> Vec<JsonRpcRequest> {
+/// The modern `_meta` envelope with sampling advertised.
+///
+/// `modern_meta` advertises only `tools`, and a client that does not advertise
+/// sampling gets no sampling sender, so `ctx.sample` would fail for a reason
+/// that has nothing to do with the trait position under test.
+fn sampling_meta() -> serde_json::Value {
     let mut meta = modern_meta();
     meta["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
         "sampling": {},
         "tools": {"listChanged": true},
     });
+    meta
+}
+
+/// The request sequence, in THIS FILE'S PROVEN SHAPE.
+///
+/// `server/discover` -> `tools/list` -> `tools/call` with the modern `_meta`
+/// envelope on every frame, which is exactly what
+/// `srv_65_one_process_answers_a_modern_request_sequence` already demonstrates
+/// this dispatcher answering on one connection.
+///
+/// THE FIRST VERSION OF THIS SCRIPT SENT `initialize` AND AN `initialized`
+/// NOTIFICATION INSTEAD, and the run answered request id 1 and nothing after
+/// it -- every arm alike. Admission on this path is strict (see
+/// `srv_65_second_request_without_modern_metadata_is_refused`), so a handshake
+/// this file never exercises is a second untested variable sitting underneath
+/// the one variable the fixture exists to isolate. Deviating from the proven
+/// frame shape cost a whole build-lane arm.
+fn sampling_request_script(tool: &str) -> Vec<JsonRpcRequest> {
     vec![
-        JsonRpcRequest::new(
-            "initialize",
-            Some(serde_json::json!({
-                "protocolVersion": MODERN_PROTOCOL_VERSION,
-                "capabilities": {"sampling": {}},
-                "clientInfo": {"name": "bd-6rfrg-sampling-probe", "version": "0.0.1"},
-                "_meta": meta.clone(),
-            })),
-            1_i64,
+        modern_request(
+            "server/discover",
+            1,
+            Some(serde_json::json!({"_meta": sampling_meta()})),
         ),
-        JsonRpcRequest::notification("notifications/initialized", None),
-        JsonRpcRequest::new(
+        modern_request(
+            "tools/list",
+            2,
+            Some(serde_json::json!({"_meta": sampling_meta()})),
+        ),
+        modern_request(
             "tools/call",
+            3,
             Some(serde_json::json!({
                 "name": tool,
                 "arguments": {"value": "unused"},
-                "_meta": meta,
+                "_meta": sampling_meta(),
             })),
-            3_i64,
         ),
     ]
+}
+
+/// Refuses to let an arm be read as a sampling result when the harness never
+/// answered the call.
+fn require_the_harness_answered(outcome: &SamplingOutcome, arm: &str) {
+    if let SamplingOutcome::NoCorrelatedResponse { observed } = outcome {
+        panic!(
+            "[{arm}] THE HARNESS DID NOT ANSWER THE CALL AT ALL, so this arm measures nothing \
+             about the trait positions. Run \
+             bd_6rfrg_the_harness_answers_a_plain_tool_call first: if that fails too, the \
+             fixture is broken and NO conclusion about sampling is available from this run. \
+             Response ids observed: {observed:?}"
+        );
+    }
 }
 
 /// Drives one arm under an external bound and RECORDS what happened.
@@ -1945,6 +1987,9 @@ fn sampling_request_script(tool: &str) -> Vec<JsonRpcRequest> {
 /// would move the hang into the assertion.
 fn run_sampling_arm(arm: SamplingArm) -> SamplingOutcome {
     let tool_name = match arm {
+        // Same server as the sync arm; the ONLY difference is which tool the
+        // call names, so a PlainEcho failure cannot be blamed on registration.
+        SamplingArm::PlainEcho => "echo",
         SamplingArm::RequiredSyncCall => "sync_sample",
         SamplingArm::DeclaredAsync => "async_sample",
     };
@@ -1967,7 +2012,7 @@ fn run_sampling_arm(arm: SamplingArm) -> SamplingOutcome {
             block_on(async move {
                 let cx = Cx::current().expect("the asupersync runtime installs a current Cx");
                 let server = match arm {
-                    SamplingArm::RequiredSyncCall => {
+                    SamplingArm::PlainEcho | SamplingArm::RequiredSyncCall => {
                         Server::new("bd-6rfrg", "1.0.0").tool(SyncSamplingTool)
                     }
                     SamplingArm::DeclaredAsync => {
@@ -2019,6 +2064,32 @@ fn run_sampling_arm(arm: SamplingArm) -> SamplingOutcome {
     }
 }
 
+/// bd-6rfrg, rung zero. The harness answers a `tools/call` at all.
+///
+/// Nothing above this rung is interpretable without it. The first run of this
+/// fixture returned `NoCorrelatedResponse { observed: [Some(Number(1))] }` for
+/// ALL THREE positions -- control, subject and negative alike -- which is a
+/// transport-correlation failure occurring before any handler runs, not a
+/// result about sampling. This test exists so that failure reports itself here
+/// instead of being read one rung up.
+#[test]
+fn bd_6rfrg_the_harness_answers_a_plain_tool_call() {
+    let outcome = run_sampling_arm(SamplingArm::PlainEcho);
+    println!("bd-6rfrg rung 0: {outcome:?}");
+    match &outcome {
+        SamplingOutcome::Completed(text) => assert_eq!(
+            text, "unused",
+            "the harness must round-trip the argument it sent, so a later arm's \
+             `Completed` can be trusted to mean the handler ran"
+        ),
+        other => panic!(
+            "THE FIXTURE IS BROKEN, NOT THE SUBJECT: a tool that samples nothing did not \
+             complete, so no bd-6rfrg arm in this run says anything about the trait \
+             positions: {other:?}"
+        ),
+    }
+}
+
 /// bd-6rfrg G1, the control. Sampling must be LIVE in this fixture, or the
 /// sync arm's outcome is uninterpretable in either direction.
 ///
@@ -2028,6 +2099,7 @@ fn run_sampling_arm(arm: SamplingArm) -> SamplingOutcome {
 #[test]
 fn bd_6rfrg_sampling_is_live_when_the_handler_awaits_it_directly() {
     let outcome = run_sampling_arm(SamplingArm::DeclaredAsync);
+    require_the_harness_answered(&outcome, "control");
     match &outcome {
         SamplingOutcome::Completed(text) => assert_eq!(
             text, SAMPLED_TEXT,
@@ -2058,6 +2130,10 @@ fn bd_6rfrg_sampling_is_live_when_the_handler_awaits_it_directly() {
 fn bd_6rfrg_the_required_sync_call_cannot_complete_the_same_sampling_body() {
     let outcome = run_sampling_arm(SamplingArm::RequiredSyncCall);
     println!("bd-6rfrg G1 sync arm: {outcome:?}");
+    // WITHOUT THIS GUARD THE ASSERTION BELOW IS UNSOUND: `NoCorrelatedResponse`
+    // is not `Completed`, so a harness that answered nothing would have read as
+    // the hazard CONFIRMED. The negative arm of the G5 test is what exposed it.
+    require_the_harness_answered(&outcome, "G1 subject");
     assert!(
         !matches!(outcome, SamplingOutcome::Completed(_)),
         "REFUTATION, NOT A FIXTURE BUG: the obvious sync tool that samples \
@@ -2098,6 +2174,8 @@ fn bd_6rfrg_the_sync_sampling_bridge_is_diagnosed_not_silent() {
     let negative = run_sampling_arm(SamplingArm::DeclaredAsync);
     println!("bd-6rfrg G5 subject: {subject:?}");
     println!("bd-6rfrg G5 negative: {negative:?}");
+    require_the_harness_answered(&subject, "G5 subject");
+    require_the_harness_answered(&negative, "G5 negative");
 
     assert!(
         !matches!(subject, SamplingOutcome::NoOutcomeWithinBound { .. }),
