@@ -67641,6 +67641,94 @@ fn fallible(value: Option<u8>) {
         })
     }
 
+    // bd-8dzq6 A15: the rule [apps.sdk_1_29_0.standard_reuse_closure] declares for the 21 per-row
+    // canonical_closure_sha256 values and the global digest, recomputed from the committed manifest.
+    // The rule text is pinned so the prose cannot move without this code. Every digest divergence is
+    // collected rather than short-circuited, so a refusal names exactly the subject that moved; shape
+    // defects fail closed. This recompute is not wired into validate_tasks_apps_sources (a frozen
+    // instrument). It establishes self-consistency of one commit's rule, values and global digest,
+    // not that any closure array is the true transitive closure of the SDK schema source.
+    const TA_CLOSURE_SUBJECT: &str = "apps.sdk_1_29_0.standard_reuse_closure";
+    const TA_CLOSURE_CODE: &str = "E_TASKS_APPS_CLOSURE_RECOMPUTE";
+    const TA_CLOSURE_RULES: [(&str, &str); 4] = [
+        ("canonical_root_payload", "UTF-8 and LF only: fastmcp-sdk-schema-closure-v1\\n, schema_source_sha256=<lowercase hex>\\n, root=<sdk schema export>\\n, then node=<schema name>\\n for every closure member in schema_name_order; the final LF is required"),
+        ("canonical_root_hash", "SHA-256 of canonical_root_payload bytes"),
+        ("schema_name_order", "ascending UTF-8 byte order with duplicate names removed"),
+        ("canonical_global_payload", "UTF-8 and LF only: fastmcp-apps-sdk-1.29.0-standard-reuse-closures-v1\\n, schema_source_sha256=<lowercase hex>\\n, then root=<sdk schema export><TAB>sha256=<canonical root hash>\\n in the literal standard_reuse_imports order; the final LF is required"),
+    ];
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TaClosureReport {
+        rows_hashed: usize,
+        reproduced: Vec<String>,
+        global_byte_length: usize,
+        refusals: Vec<Diagnostic>,
+    }
+
+    fn ta_recompute_standard_reuse_closures(manifest: &toml::Value) -> VResult<TaClosureReport> {
+        let (subject, code) = (TA_CLOSURE_SUBJECT, TA_CLOSURE_CODE);
+        let root = ta_tbl(manifest, "manifest")?;
+        let apps = ta_tbl(ta_fld(root, "apps", "manifest")?, "apps")?;
+        let sdk = ta_tbl(ta_fld(apps, "sdk_1_29_0", "apps")?, "apps.sdk_1_29_0")?;
+        let closure = ta_tbl(ta_fld(sdk, "standard_reuse_closure", "apps.sdk_1_29_0")?, subject)?;
+        let mut report = TaClosureReport { rows_hashed: 0, reproduced: Vec::new(), global_byte_length: 0, refusals: Vec::new() };
+        // A moved rule is refused before any row is hashed: a digest recomputed under a rule that no
+        // longer says what this code does would be evidence about nothing.
+        for (field, pinned) in TA_CLOSURE_RULES {
+            if ta_str(closure, field, subject)? != pinned {
+                report.refusals.push(ta_err(code, subject, field));
+            }
+        }
+        if !report.refusals.is_empty() {
+            return Ok(report);
+        }
+        let source = ta_str(closure, "schema_source_sha256", subject)?;
+        ta_require!(source.len() == 64 && source.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)), code, subject, "schema_source_sha256");
+        ta_require!(ta_bool(closure, "schema_closure_includes_root", subject)?, code, subject, "schema_closure_includes_root");
+        let rows = ta_arr(apps, "standard_reuse", code, "apps")?;
+        let imports = ta_arr(sdk, "standard_reuse_imports", code, "apps.sdk_1_29_0")?;
+        let import_count = ta_usize(sdk, "standard_reuse_import_count", "apps.sdk_1_29_0")?;
+        // The row count is read from the rows, never a literal, so a 22nd row is recomputed rather
+        // than skipped; the declared counts must agree with it.
+        ta_require!(rows.len() == ta_usize(closure, "root_count", subject)? && rows.len() == import_count && imports.len() == import_count, code, subject, "root_count");
+        let mut declared = BTreeMap::new();
+        for (index, row) in rows.iter().enumerate() {
+            let at = format!("apps.standard_reuse/{index}");
+            let row = ta_tbl(row, &at)?;
+            let (symbol, export, digest) = (ta_str(row, "symbol", &at)?, ta_str(row, "sdk_schema_export", &at)?, ta_str(row, "canonical_closure_sha256", &at)?);
+            let mut names = ta_arr(row, "schema_closure", code, &at)?.iter().map(|name| name.as_str().ok_or_else(|| ta_err(code, &at, "schema_closure"))).collect::<VResult<Vec<&str>>>()?;
+            ta_require!(names.contains(&export), code, &at, "schema_closure_includes_root");
+            // schema_name_order: `str` ordering is byte ordering, and dedup removes duplicate names.
+            names.sort_unstable();
+            names.dedup();
+            let mut payload = format!("fastmcp-sdk-schema-closure-v1\nschema_source_sha256={source}\nroot={export}\n").into_bytes();
+            for name in names {
+                payload.extend_from_slice(format!("node={name}\n").as_bytes());
+            }
+            report.rows_hashed += 1;
+            if lower_hex(&sha256(&payload)) == digest {
+                report.reproduced.push(symbol.to_owned());
+            } else {
+                report.refusals.push(ta_err(code, symbol, &format!("{at}/canonical_closure_sha256")));
+            }
+            ta_require!(declared.insert(symbol, (export, digest)).is_none(), code, &at, "symbol");
+        }
+        // The global payload is built from the DECLARED row values, so it ties those values to the
+        // pinned global digest independently of whether each row's own recompute matched.
+        let mut global = format!("fastmcp-apps-sdk-1.29.0-standard-reuse-closures-v1\nschema_source_sha256={source}\n").into_bytes();
+        for (index, import) in imports.iter().enumerate() {
+            let (export, digest) = import.as_str().and_then(|symbol| declared.get(symbol)).copied().ok_or_else(|| ta_err(code, "apps.sdk_1_29_0", &format!("standard_reuse_imports/{index}")))?;
+            global.extend_from_slice(format!("root={export}\tsha256={digest}\n").as_bytes());
+        }
+        report.global_byte_length = global.len();
+        if global.len() != ta_usize(closure, "canonical_global_byte_length", subject)? {
+            report.refusals.push(ta_err(code, subject, "canonical_global_byte_length"));
+        } else if lower_hex(&sha256(&global)) != ta_str(closure, "canonical_global_sha256", subject)? {
+            report.refusals.push(ta_err(code, subject, "canonical_global_sha256"));
+        }
+        Ok(report)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -67991,6 +68079,91 @@ fn fallible(value: Option<u8>) {
                 "fresh baseline reaccepts with the same typed observable state"
             );
             assert_eq!(ta_vendor_digest(&baseline.vendor).expect("baseline digest"), baseline_digest);
+        }
+
+        /// The committed tasks-apps manifest, parsed directly. The closure recompute depends only on
+        /// this file's bytes, so it does not ride on the frozen source-tree digest's admission path.
+        fn committed_tasks_apps_manifest() -> toml::Value {
+            let path = repository_root().join(TA_MPATH);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        }
+
+        /// Changes exactly one byte of an ASCII string: the last byte becomes '0', or '1' if it was '0'.
+        /// Hex stays hex, and every other ASCII string stays valid UTF-8.
+        fn ta_change_last_byte(text: &str) -> String {
+            let mut bytes = text.as_bytes().to_vec();
+            let last = bytes.len() - 1;
+            bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+            String::from_utf8(bytes).expect("an ASCII string with one ASCII byte changed is UTF-8")
+        }
+
+        #[test]
+        fn fnd_01_tasks_apps_standard_reuse_closure_recompute_positive() {
+            let manifest = committed_tasks_apps_manifest();
+            let report = ta_recompute_standard_reuse_closures(&manifest).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert_eq!(report.refusals, Vec::<Diagnostic>::new(), "every row digest and the global digest reproduce from the declared rule");
+            assert_eq!(report.rows_hashed, 21, "every row is recomputed");
+            assert_eq!(report.reproduced.len(), 21, "21 of 21 rows reproduce");
+            assert_eq!(report.global_byte_length, 2329, "the global payload has the declared canonical_global_byte_length");
+        }
+
+        #[test]
+        fn fnd_01_tasks_apps_standard_reuse_closure_recompute_planted_negative() {
+            // The accepted baseline: without it, a recompute that refused everything would pass every arm.
+            let committed = committed_tasks_apps_manifest();
+            let baseline = ta_recompute_standard_reuse_closures(&committed).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert!(baseline.refusals.is_empty(), "the committed manifest must reproduce, or the arms below prove nothing: {:?}", baseline.refusals);
+            let row = committed.get("apps").and_then(|apps| apps.get("standard_reuse")).and_then(|rows| rows.get(0)).expect("row 0");
+            let row_symbol = row.get("symbol").and_then(toml::Value::as_str).expect("row 0 symbol").to_owned();
+            let row_export = row.get("sdk_schema_export").and_then(toml::Value::as_str).expect("row 0 export").to_owned();
+            let row_refusal = ta_err(TA_CLOSURE_CODE, &row_symbol, "apps.standard_reuse/0/canonical_closure_sha256");
+            let other_rows: Vec<String> = baseline.reproduced.iter().filter(|symbol| **symbol != row_symbol).cloned().collect();
+            assert_eq!(other_rows.len(), 20, "the arms below leave twenty rows untouched");
+
+            // ARM (a): one byte of one schema_closure member in row 0, a member that is not the row's
+            // own export. Only row 0 refuses; the other 20 still reproduce; D2 still matches, because it
+            // is built from the declared values and not from the recomputed ones.
+            let mut arm_a = committed.clone();
+            let member = arm_a.get_mut("apps").and_then(|apps| apps.get_mut("standard_reuse")).and_then(|rows| rows.get_mut(0)).and_then(|row| row.get_mut("schema_closure")).and_then(|names| names.get_mut(0)).expect("row 0, closure member 0");
+            let original_member = member.as_str().expect("a closure member is a string").to_owned();
+            assert_ne!(original_member, row_export, "arm (a) must not mutate the row's own export");
+            *member = toml::Value::String(ta_change_last_byte(&original_member));
+            assert_ne!(arm_a, committed, "arm (a) must actually change the manifest");
+            let refused_a = ta_recompute_standard_reuse_closures(&arm_a).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert_eq!(refused_a.refusals, vec![row_refusal.clone()], "only the mutated row refuses, and the global digest still matches");
+            assert_eq!(refused_a.reproduced, other_rows, "the other 20 rows still reproduce");
+            assert_eq!(refused_a.rows_hashed, 21, "every row is still recomputed");
+
+            // ARM (b): one byte of row 0's declared canonical_closure_sha256. Row 0's D1 refuses AND D2
+            // refuses, because the global payload carries that declared value.
+            let mut arm_b = committed.clone();
+            let digest = arm_b.get_mut("apps").and_then(|apps| apps.get_mut("standard_reuse")).and_then(|rows| rows.get_mut(0)).and_then(|row| row.get_mut("canonical_closure_sha256")).expect("row 0 declared digest");
+            let original_digest = digest.as_str().expect("a declared digest is a string").to_owned();
+            *digest = toml::Value::String(ta_change_last_byte(&original_digest));
+            assert_ne!(arm_b, committed, "arm (b) must actually change the manifest");
+            let refused_b = ta_recompute_standard_reuse_closures(&arm_b).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert_eq!(refused_b.refusals, vec![row_refusal, ta_err(TA_CLOSURE_CODE, TA_CLOSURE_SUBJECT, "canonical_global_sha256")], "the mutated row's D1 and the global D2 both refuse");
+            assert_eq!(refused_b.reproduced, other_rows, "the other 20 rows still reproduce");
+            assert_eq!(refused_b.global_byte_length, 2329, "a one-byte digest change keeps the declared length, so D2 refuses on the hash");
+
+            // ARM (c): one byte of the pinned canonical_root_payload rule text. Refused before any row
+            // is hashed.
+            let mut arm_c = committed.clone();
+            let rule = arm_c.get_mut("apps").and_then(|apps| apps.get_mut("sdk_1_29_0")).and_then(|sdk| sdk.get_mut("standard_reuse_closure")).and_then(|closure| closure.get_mut("canonical_root_payload")).expect("declared canonical_root_payload");
+            let original_rule = rule.as_str().expect("the declared rule is a string").to_owned();
+            *rule = toml::Value::String(ta_change_last_byte(&original_rule));
+            assert_ne!(arm_c, committed, "arm (c) must actually change the manifest");
+            let refused_c = ta_recompute_standard_reuse_closures(&arm_c).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
+            assert_eq!(refused_c.refusals, vec![ta_err(TA_CLOSURE_CODE, TA_CLOSURE_SUBJECT, "canonical_root_payload")], "the moved rule is refused by name");
+            assert_eq!(refused_c.rows_hashed, 0, "a moved rule is refused before any row is hashed");
+            assert!(refused_c.reproduced.is_empty(), "nothing reproduces under a moved rule");
+
+            assert_eq!(
+                ta_recompute_standard_reuse_closures(&committed).unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable())),
+                baseline,
+                "the committed manifest reproduces unchanged after the planted arms"
+            );
         }
     }
 } // mod ordinary
