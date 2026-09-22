@@ -24,7 +24,7 @@ use fastmcp_rust::release_quarantine::{
     ORDERED_CONTEXTS, ORDERED_SINKS, ProviderObservation, SinkReachability,
 };
 use fastmcp_rust::release_quarantine_reachability::{
-    RESTORATION_RECEIPT_IDENTIFIER, Rel02ReceiptState, canonical_cell_bytes,
+    RESTORATION_RECEIPT_IDENTIFIER, Rel02ReceiptState, RefInputProvenance, canonical_cell_bytes,
     frozen_mutation_reachability, rel_quar_00_b_reachability_denial,
 };
 
@@ -161,6 +161,29 @@ fn rel_quar_00_b_planted_negative() {
         .expect_err("B must refuse to record provider verification");
     assert_eq!(refusal.code, "E_PROVIDER_INFERENCE");
 
+    // (7) One cell removed. The count guard runs before the per-cell loop, so
+    // a short vector must be refused on its length rather than on whatever the
+    // surviving cells happen to contain.
+    let mut planted = pristine.clone();
+    planted.cells.pop().expect("the record carries cells to remove");
+    let refusal = rel_quar_00_b_reachability_denial(&planted)
+        .expect_err("a short cell vector must be refused");
+    assert_eq!(refusal.code, "E_CELL_COUNT");
+    assert_eq!(refusal.field, "cells.len");
+
+    // (8) One cell's ref/input provenance flipped to the other variant, with
+    // its terminal result left inert so the earlier reachability guard cannot
+    // fire first and mask this one. Flipping rather than assigning a constant
+    // keeps the mutation a mismatch whichever context cell zero carries.
+    let mut planted = pristine.clone();
+    planted.cells[0].ref_input_provenance = match planted.cells[0].ref_input_provenance {
+        RefInputProvenance::NotApplicable => RefInputProvenance::ProviderSupplied,
+        RefInputProvenance::ProviderSupplied => RefInputProvenance::NotApplicable,
+    };
+    let refusal = rel_quar_00_b_reachability_denial(&planted)
+        .expect_err("a ref/input provenance that disagrees with its context must be refused");
+    assert_eq!(refusal.code, "E_REF_PROVENANCE");
+
     // Every refusal above borrowed the record. The pristine value must be
     // unchanged and still acceptable, with the identical receipt.
     let reaccepted =
@@ -169,6 +192,6 @@ fn rel_quar_00_b_planted_negative() {
     assert_eq!(
         canonical_cell_bytes(&pristine.cells[0]),
         baseline_cell_zero_bytes,
-        "the baseline cell bytes are unchanged after six refusals"
+        "the baseline cell bytes are unchanged after eight refusals"
     );
 }
