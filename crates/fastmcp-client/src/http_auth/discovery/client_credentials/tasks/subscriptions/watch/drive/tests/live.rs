@@ -320,3 +320,5 @@ fn tls_abandoned_watch_read_releases_socket() { isolated("tls_abandoned_watch_re
 
 mod recovery;
 mod cancellation;
+
+mod input_journal;
