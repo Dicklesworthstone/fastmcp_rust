@@ -12640,7 +12640,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":{id},"result":{result}}}'
                                  rather than claim a flush it never performed: {error}"
                             );
                             if inspect {
-                                assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                                assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled, "{error}");
                             } else {
                                 assert!(error.message.contains("Some tests failed"), "{error}");
                             }
