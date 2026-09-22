@@ -4458,6 +4458,7 @@ impl ClientHttpConnection {
                                 reverse_request_handlers,
                                 &server_request,
                             )
+                            .await
                             .ok_or_else(|| {
                                 ClientHttpConnectionError::LegacyUnexpectedMessage {
                                     request_id: request_id.clone(),
@@ -5408,7 +5409,7 @@ fn legacy_cancelled_request_id(notification: &JsonRpcRequest) -> Option<RequestI
 /// The configured callback must match the capability retained for legacy
 /// initialization. Sampling and roots are never serviced merely because a
 /// handler exists; elicitation remains unavailable in exact MCP 2024-11-05.
-fn legacy_http_server_request_response(
+async fn legacy_http_server_request_response(
     cx: &Cx,
     client_capabilities: &ClientCapabilities,
     handlers: &ReverseRequestHandlers,
@@ -5430,28 +5431,38 @@ fn legacy_http_server_request_response(
             let Some(handler) = handlers.sampling_create_message.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_shared_reverse_request_handler(
-                    cx,
-                    handler,
-                    ReverseRequestCancellation::new(),
-                    params,
-                )
-            });
+            // This loop already runs on the caller's runtime; awaiting the
+            // handler avoids a nested `block_on` (bd-84om4).
+            let result = match crate::decode_reverse_request_params(request) {
+                Ok(params) => {
+                    crate::invoke_reverse_request_handler_async(
+                        cx,
+                        handler.as_ref(),
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             Some(crate::reverse_request_response(request_id, result))
         }
         "roots/list" if client_capabilities.roots.is_some() => {
             let Some(handler) = handlers.roots_list.as_ref() else {
                 return crate::method_not_found_response(request);
             };
-            let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_shared_reverse_request_handler(
-                    cx,
-                    handler,
-                    ReverseRequestCancellation::new(),
-                    params,
-                )
-            });
+            let result = match crate::decode_reverse_request_params(request) {
+                Ok(params) => {
+                    crate::invoke_reverse_request_handler_async(
+                        cx,
+                        handler.as_ref(),
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             Some(crate::reverse_request_response(request_id, result))
         }
         // Exact 2024-11-05 never admitted elicitation. In particular, do not

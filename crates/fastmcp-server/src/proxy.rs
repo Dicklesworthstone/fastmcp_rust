@@ -21233,6 +21233,146 @@ expect_request notifications/initialized ''
     }
 
     #[test]
+    fn proxy_legacy_http_contains_panicking_sampling_handler_without_losing_follow_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message?session=reverse");
+        let expected_message_target = legacy_message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_http_request(&mut sse);
+            // Only the endpoint line interpolates; the literal JSON events
+            // stay outside format! so their braces need no escaping.
+            let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
+                + concat!(
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[],\"maxTokens\":1}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"roots/list\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"elicitation/create\",\"params\":{}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}\n\n",
+                );
+            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+            let mut posts = Vec::new();
+            for _ in 0..7 {
+                let (mut post, _) = listener.accept().expect("accept legacy proxy POST");
+                let request = read_http_request(&mut post);
+                write_http_response(&mut post, 202, "application/json", b"");
+                posts.push(request);
+            }
+            (sse_request, posts)
+        });
+        let mut proxy = legacy_http_proxy_client(
+            &legacy_sse_target,
+            &legacy_message_target,
+            ClientCapabilities {
+                sampling: Some(fastmcp_protocol::SamplingCapability {}),
+                elicitation: None,
+                roots: Some(fastmcp_protocol::RootsCapability {
+                    list_changed: false,
+                }),
+                ..Default::default()
+            },
+        );
+        proxy
+            .ensure_legacy_initialized()
+            .expect("exact legacy initialization precedes the handler substitution");
+        proxy
+            .connection
+            .set_legacy_reverse_request_handlers(
+                fastmcp_client::ReverseRequestHandlers::new()
+                    .with_sampling_create_message(|_cx, _cancellation, _params| {
+                        Box::pin(async move {
+                            panic!("bd-84om4 planted handler panic sentinel");
+                            #[allow(unreachable_code)]
+                            Ok(fastmcp_protocol::CreateMessageResult::text(
+                                "unreachable",
+                                "panic",
+                            ))
+                        })
+                    })
+                    .with_roots_list(|_cx, _cancellation, _params| {
+                        Box::pin(async move {
+                            Err::<fastmcp_protocol::ListRootsResult, _>(
+                                fastmcp_core::McpError::invalid_request(
+                                    "Proxy HTTP legacy roots callback is unavailable",
+                                ),
+                            )
+                        })
+                    }),
+            )
+            .expect("the substitute handlers match the retained legacy capabilities");
+
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("authorized reverse requests retain their upstream result"),
+            )
+            .is_empty()
+        );
+        assert!(
+            legacy_tools_list_names(
+                proxy
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))
+                    .expect("the following request remains aligned after reverse replies"),
+            )
+            .is_empty()
+        );
+
+        let (sse, posts) = server
+            .join()
+            .expect("legacy reverse-request server must join");
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        let messages: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|post| {
+                serde_json::from_slice(&post.body).expect("legacy proxy POST remains JSON-RPC")
+            })
+            .collect();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("initialize"),
+                Some("notifications/initialized"),
+                Some("tools/list"),
+                None,
+                None,
+                None,
+                Some("tools/list"),
+            ],
+        );
+        assert_eq!(
+            messages[0]["params"]["capabilities"]["sampling"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            messages[0]["params"]["capabilities"]["roots"],
+            serde_json::json!({})
+        );
+        assert_eq!(messages[3]["id"], serde_json::json!(80));
+        assert_eq!(
+            messages[3]["error"],
+            serde_json::json!({
+                "code": -32603,
+                "message": "Client reverse request handler failed",
+            })
+        );
+        assert_eq!(messages[4]["id"], serde_json::json!(81));
+        assert_eq!(messages[4]["error"]["code"], serde_json::json!(-32600));
+        assert_eq!(messages[5]["id"], serde_json::json!(82));
+        assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
+        assert_eq!(messages[6]["id"], serde_json::json!(3));
+    }
+
+    #[test]
     fn proxy_legacy_http_cancellation_matches_only_the_active_request() {
         for (name, cancellation_request_id, first_is_cancelled) in
             [("matching", "2e0", true), ("unrelated", "99", false)]

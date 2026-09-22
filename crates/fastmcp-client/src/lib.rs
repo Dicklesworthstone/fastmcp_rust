@@ -3105,6 +3105,35 @@ fn invoke_shared_reverse_request_handler<P, R>(
     invoke_reverse_request_handler(cx, handler.as_ref(), cancellation, params)
 }
 
+/// Async counterpart of [`invoke_reverse_request_handler`] for callers already
+/// on an asupersync runtime, such as the exact-2024 inline SSE request loop.
+/// Driving the handler with a nested `block_on` there re-enters the runtime,
+/// which `fastmcp_core::runtime::block_on` rejects with a panic (bd-84om4).
+///
+/// The handler call and every poll of its future stay behind the redacting
+/// panic boundary, and the error mapping is the synchronous helper's.
+async fn invoke_reverse_request_handler_async<P, R>(
+    cx: &Cx,
+    handler: &(
+         dyn for<'callback> Fn(
+        &'callback Cx,
+        ReverseRequestCancellation,
+        P,
+    ) -> ReverseRequestFuture<'callback, R>
+             + Send
+             + Sync
+     ),
+    cancellation: ReverseRequestCancellation,
+    params: P,
+) -> McpResult<R> {
+    cancellation.checkpoint()?;
+    let future = catch_client_callback_unwind(|| handler(cx, cancellation, params))
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?;
+    catch_client_callback_unwind_async(future, ClientCallbackPanicRedaction::Redacted)
+        .await
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
+}
+
 const MAX_REVERSE_CALLBACK_WORKERS: usize = 4;
 const MAX_QUEUED_REVERSE_CALLBACKS: usize = 16;
 const REVERSE_CALLBACK_POLL_SLICE: Duration = Duration::from_millis(10);
@@ -4900,27 +4929,6 @@ struct WebSocketReverseCallbackTerminal {
     error: Mutex<Option<McpError>>,
 }
 
-/// Polls a callback future behind a panic boundary. The boundary is applied
-/// to every poll, so a panic after an await is published just as promptly as a
-/// panic on the first poll; no reader-side reap is required to wake ingress.
-#[cfg(feature = "websocket-experimental")]
-async fn websocket_callback_catch_unwind<F>(future: F) -> std::thread::Result<F::Output>
-where
-    F: Future,
-{
-    let mut future = std::pin::pin!(future);
-    std::future::poll_fn(move |context| {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            future.as_mut().poll(context)
-        })) {
-            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
-            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
-            Err(payload) => std::task::Poll::Ready(Err(payload)),
-        }
-    })
-    .await
-}
-
 #[cfg(feature = "websocket-experimental")]
 struct WebSocketReverseCallbackCompletionGuard {
     terminal: Arc<WebSocketReverseCallbackTerminal>,
@@ -5054,11 +5062,10 @@ where
                 callback_id.clone(),
                 terminal_cx.clone(),
             );
-            let result = match websocket_callback_catch_unwind(handler(
-                &callback_cx,
-                invoke_cancellation,
-                params,
-            ))
+            let result = match catch_client_callback_unwind_async(
+                handler(&callback_cx, invoke_cancellation, params),
+                ClientCallbackPanicRedaction::Unredacted,
+            )
             .await
             {
                 Ok(result) => result,
@@ -10231,6 +10238,49 @@ fn catch_client_callback_unwind<R>(callback: impl FnOnce() -> R) -> Result<R, Bo
     install_client_callback_panic_hook();
     let _redaction = ClientCallbackPanicRedactionGuard::enter();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+}
+
+/// Whether an async callback panic boundary redacts the panic payload.
+///
+/// Each caller chooses explicitly: the exact-2024 inline reverse dispatch
+/// redacts, as its synchronous predecessor did, while the WebSocket callback
+/// path keeps its unredacted panic output (bd-84om4, owner ruling 5578).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientCallbackPanicRedaction {
+    Redacted,
+    Unredacted,
+}
+
+/// Polls a callback future behind a panic boundary. The boundary is applied
+/// to every poll, so a panic after an await is published just as promptly as a
+/// panic on the first poll; no reader-side reap is required to wake ingress.
+///
+/// This is the async counterpart of [`catch_client_callback_unwind`] for
+/// callers already on an asupersync runtime, where a nested `block_on` would
+/// re-enter the runtime.
+async fn catch_client_callback_unwind_async<F>(
+    future: F,
+    redaction: ClientCallbackPanicRedaction,
+) -> std::thread::Result<F::Output>
+where
+    F: Future,
+{
+    let redacted = redaction == ClientCallbackPanicRedaction::Redacted;
+    if redacted {
+        install_client_callback_panic_hook();
+    }
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(move |context| {
+        let _redaction = redacted.then(ClientCallbackPanicRedactionGuard::enter);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.as_mut().poll(context)
+        })) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
 }
 
 #[derive(Debug, Clone, Copy)]
