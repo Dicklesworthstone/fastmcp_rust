@@ -132,9 +132,18 @@ if [ "$harness_bytes" -gt "$max_gate_executable_bytes" ]; then
   over_bound=1
 fi
 
-printf 'harness   %s\n' "$harness"
-printf 'bytes     %s\n' "$harness_bytes"
-printf 'sha256    %s\n' "$harness_sha"
+# With --print-export, stdout must be EVAL-SAFE and nothing else: an adopter runs
+# `eval "$(scripts/fnd01_harness_provision.sh --print-export)"`, and a human
+# summary on stdout makes that emit `harness: command not found` (measured) while
+# `eval` still reports success, because eval returns only its LAST command's
+# status. Noise that survives set -e is worse than noise that fails it.
+summary_fd=1
+if [ "$emit_export" -eq 1 ]; then
+  summary_fd=2
+fi
+printf 'harness   %s\n' "$harness" >&"$summary_fd"
+printf 'bytes     %s\n' "$harness_bytes" >&"$summary_fd"
+printf 'sha256    %s\n' "$harness_sha" >&"$summary_fd"
 if [ "$over_bound" -eq 1 ]; then
   printf 'WARNING: %s bytes exceeds MAX_GATE_EXECUTABLE_BYTES (%s).\n' \
     "$harness_bytes" "$max_gate_executable_bytes" >&2
