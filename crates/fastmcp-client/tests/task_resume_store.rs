@@ -221,3 +221,84 @@ fn changed_ciphertext_is_not_reinterpreted_as_an_empty_store() {
 
 #[path = "task_resume_store/lifecycle.rs"]
 mod lifecycle;
+
+mod restart {
+    use super::*;
+    use fastmcp_client::http_auth::managed::tasks::watch::checkpoint::resume::client::restart::{
+        TaskResumeRestartPlan, TaskResumeRestartPolicy,
+    };
+
+    #[test]
+    fn every_page_is_staged_before_our_own_mutations_invalidate_cursors() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        for id in ["one", "two", "three", "four"] {
+            store.insert(&cx, &owner, record(&cx, &owner, id)).unwrap();
+        }
+        let first = store.page(&cx, &owner, None, 1).unwrap();
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        let plan = TaskResumeRestartPlan::load_store(&cx, &owner, &store, 1, TaskResumeRestartPolicy::default()).unwrap();
+        assert_eq!(plan.len(), 4);
+        assert_eq!(plan.charged_records(), 4);
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals, "loading must not write");
+        let staged: Vec<_> = plan.records().map(|value| value.encode().unwrap()).collect();
+        assert_eq!(plan.charged_bytes(), staged.iter().map(Vec::len).sum::<usize>());
+        store.remove(&cx, &owner, first.keys[0]).unwrap();
+        assert!(matches!(store.page(&cx, &owner, first.next.as_ref(), 1),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::StaleCursor))));
+        assert_eq!(plan.records().map(|value| value.encode().unwrap()).collect::<Vec<_>>(), staged);
+        assert_eq!(plan.len(), 4, "selection is independent of later host persistence");
+    }
+
+    #[test]
+    fn incomplete_or_foreign_restart_load_never_escapes_as_a_partial_plan() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        for id in ["one", "two", "three"] {
+            store.insert(&cx, &owner, record(&cx, &owner, id)).unwrap();
+        }
+        let baseline = TaskResumeRestartPlan::load_store(&cx, &owner, &store, 1, TaskResumeRestartPolicy::default()).unwrap();
+        let before = directory.bytes();
+        let seals = vault.seals.load(Ordering::SeqCst);
+        let too_few = TaskResumeRestartPolicy::new(2, 65536, Duration::from_secs(60)).unwrap();
+        assert!(matches!(TaskResumeRestartPlan::load_store(&cx, &owner, &store, 1, too_few),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Capacity))));
+        let too_small = TaskResumeRestartPolicy::new(3, baseline.charged_bytes() - 1, Duration::from_secs(60)).unwrap();
+        assert!(matches!(TaskResumeRestartPlan::load_store(&cx, &owner, &store, 1, too_small),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::TooLarge))));
+        assert!(matches!(TaskResumeRestartPlan::load_store(&cx, &binding("other", 4), &store, 1, TaskResumeRestartPolicy::default()),
+            Err(TaskResumeStoreError::Resume(TaskResumeError::Unavailable))));
+        assert_eq!(directory.bytes(), before);
+        assert_eq!(vault.seals.load(Ordering::SeqCst), seals);
+        assert_eq!(TaskResumeRestartPlan::load_store(&cx, &owner, &store, 2, TaskResumeRestartPolicy::default()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reopened_manifest_produces_the_same_complete_restart_selection() {
+        let cx = Cx::for_testing();
+        let directory = Directory::new();
+        let vault = TestVault::default();
+        let owner = binding("one", 4);
+        let mut store = open(&cx, &directory, vault.clone(), owner.clone(), 8);
+        for id in ["PRIVATE-TASK-é", "PRIVATE-TASK-e\u{301}"] {
+            store.insert(&cx, &owner, record(&cx, &owner, id)).unwrap();
+        }
+        let first = TaskResumeRestartPlan::load_store(&cx, &owner, &store, 1, TaskResumeRestartPolicy::default()).unwrap();
+        let encoded: Vec<_> = first.records().map(|value| value.encode().unwrap()).collect();
+        assert_eq!(encoded.len(), 2);
+        drop(store);
+        let reopened = open(&cx, &directory, vault, owner.clone(), 8);
+        let second = TaskResumeRestartPlan::load_store(&cx, &owner, &reopened, 2, TaskResumeRestartPolicy::default()).unwrap();
+        assert_eq!(second.records().map(|value| value.encode().unwrap()).collect::<Vec<_>>(), encoded);
+        assert!(!format!("{second:?}").contains("PRIVATE"));
+        assert!(!directory.bytes().windows(7).any(|part| part == b"PRIVATE"));
+    }
+}

@@ -10,6 +10,8 @@
 pub mod creation;
 /// Persistence-gated Task observation and explicit terminal acknowledgement.
 pub mod lifecycle;
+/// Bounded restart enumeration and sequential authenticated reconciliation.
+pub mod restart;
 
 use std::fmt;
 
