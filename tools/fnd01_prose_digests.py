@@ -2076,6 +2076,53 @@ def bullet_one_population(w: World) -> tuple[set, int]:
     return distinct, occurrences
 
 
+def encoding_keys(w: World, files: list[str], predicate: Callable[[str], bool]) -> list[tuple[str, str, str]]:
+    """Every (file, table location, key) whose key satisfies the predicate, over parsed TOML."""
+    found = []
+
+    def walk(file: str, node, location: str):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if predicate(key):
+                    found.append((file, location or "<root>", key))
+                walk(file, value, f"{location}.{key}" if location else key)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(file, value, f"{location}[{index}]")
+
+    for file in files:
+        walk(file, w.doc(file), "")
+    return found
+
+
+def j1_key_screen_report(w: World, files: list[str], fields: list[BaseField]) -> list[str]:
+    """J1: the two key-name counts, their itemised difference, and every declared encoding key whose
+    table stores no 64-hex digest (a construction with nothing to reproduce; J8 lists them)."""
+    predicate_a = encoding_keys(w, files, lambda key: key == "encoding" or key.endswith("_encoding"))
+    predicate_b = encoding_keys(w, files, lambda key: "encoding" in key)
+    lines = [
+        f"predicate A (key == 'encoding' or key ends with '_encoding'): {len(predicate_a)} keys in "
+        f"{len({(f, t) for f, t, _ in predicate_a})} tables  [the bar author's 108 / 81]",
+        f"candidate predicate B (key contains 'encoding'): {len(predicate_b)} keys in "
+        f"{len({(f, t) for f, t, _ in predicate_b})} tables",
+        "comment 5312 states 109 keys / 83 tables, but its own per-file breakdown (55+48+3+2+1+3) sums to 112; its "
+        "predicate was not recorded, so the itemised set below is B minus A, not a reconstruction of 5312:",
+    ]
+    for file, table, key in sorted(set(predicate_b) - set(predicate_a)):
+        lines.append(f"  B-A  {file.removeprefix(ROOT)} | {table} | {key}")
+    tables_with_digest = {(base.file, re.sub(r"\.[^.\[\]]+(\[\d+\])?$", "", base.location) or "<root>") for base in fields}
+    governs = {
+        (DV, "archive_parser_contract"): "governs the archive_contract[].member_tree_sha256 targets",
+        (TA, "tasks.fixture_corpus_contract"): "governs the tasks.path_fixture literal-record targets",
+    }
+    lines.append("declared *_encoding keys whose own table stores no 64-hex digest (unless marked, nothing to reproduce):")
+    for file, table, key in predicate_a:
+        if (file, table) not in tables_with_digest and key != "encoding":
+            mark = governs.get((file, table), "no stored digest")
+            lines.append(f"  NO-DIGEST  {file.removeprefix(ROOT)} | {table} | {key} | {mark}")
+    return lines
+
+
 def j2_report(w: World, rows: list[Row], fields: list[BaseField]) -> list[str]:
     lines = []
     population_values = {row.declared_digest for row in rows}
@@ -2149,6 +2196,9 @@ def main() -> int:
         transitive = len(w.doc(DV)["mutation_fixture"])
     print(f"\n== J4 TRANSITIVE (never added to MATCH): {transitive} FND01FIXv1 per-value digests confirmed only through "
           "fixture_contract.canonical_sha256's preimage ==")
+    print("\n== J1 key-name screen (shown INSUFFICIENT: the population above is read, not name-matched) ==")
+    for line in j1_key_screen_report(w, files, fields):
+        print(line)
     print("\n== J2 ==")
     for line in j2_report(w, rows, fields):
         print(line)
