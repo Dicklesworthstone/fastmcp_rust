@@ -29440,7 +29440,13 @@ fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
     )
     .expect("the bd-6rfrg sampling callback is configured before exact-2024 HTTP initialization");
 
-    let outcome = runtime_block_on_bounded_named(
+    // NOT `.expect(..)`. The reverse-request COUNTER is this arm's discriminator
+    // and an unwrap here fires before it can be read -- which is exactly what
+    // happened on the first run: the arm failed with a generic "Internal server
+    // error" and the one number that separates its causes was never printed.
+    // A discriminator downstream of the failure it discriminates is not a
+    // discriminator.
+    let called = runtime_block_on_bounded_named(
         &cx,
         "bd-6rfrg sync sampling tools/call",
         client.call_tool(
@@ -29451,10 +29457,31 @@ fn e2e_public_http_bd_6rfrg_sync_call_cannot_complete_the_sampling_body() {
                 meta: None,
             },
         ),
-    )
-    .expect("the sync-sampling tool must return a typed exact-2024 tool result within the bound");
-    let text = legacy_http_tool_text(&outcome).unwrap_or_default();
+    );
     let callbacks = callback_calls.load(Ordering::Relaxed);
+    println!("bd-6rfrg sync arm: callbacks={callbacks} raw={called:?}");
+    // callbacks is read BEFORE any assertion, and it separates the two causes a
+    // sanitized error cannot:
+    //   0 -> the reverse request NEVER WENT OUT. `fastmcp_core::block_on`
+    //        aborted before polling `ctx.sample` -- its nested-bridge assert
+    //        (runtime.rs `BridgeEntry::enter`) fires BEFORE the future is
+    //        polled, so the typed diagnosis in `sample_with_request` is
+    //        unreachable on that path and the panic is redacted to
+    //        SANITIZED_HANDLER_PANIC_MESSAGE, which is literally
+    //        "Internal server error" (router.rs:1726).
+    //   1 -> it went out and was answered, and the failure is downstream of the
+    //        peer rather than in the bridge.
+    let outcome = match called {
+        Ok(outcome) => outcome,
+        Err(error) => panic!(
+            "the sync-sampling tool returned a JSON-RPC ERROR rather than a typed tool result. \
+             callbacks={callbacks}. Note that \"Internal server error\" has TWO producers -- a \
+             handler panic and a handler-returned InternalError both sanitize to it \
+             (router.rs:1932 and :1944) -- so the code alone does not name the cause; the \
+             counter above does. error={error:?}"
+        ),
+    };
+    let text = legacy_http_tool_text(&outcome).unwrap_or_default();
     println!(
         "bd-6rfrg sync arm: is_error={} callbacks={callbacks} text={text:?}",
         outcome.is_error
