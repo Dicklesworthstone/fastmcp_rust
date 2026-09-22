@@ -6,6 +6,9 @@
 //! replay the creating call or any old input answer. The caller explicitly
 //! persists an updated control record or removes the terminal/unavailable one.
 
+/// Persistence-gated Task observation and explicit terminal acknowledgement.
+pub mod lifecycle;
+
 use std::fmt;
 
 use asupersync::Cx;
