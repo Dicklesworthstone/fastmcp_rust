@@ -356,3 +356,52 @@ fn f2ndd_abort_wakes_the_joiner_of_a_task_parked_in_sleep() {
         }
     });
 }
+
+/// The SERVER's actual shape: the joiner's OWN cx is cancelled before it joins.
+///
+/// `serve` reaches the reaper join only by breaking its accept loop at
+/// `lib.rs:7063` -- `if cx.checkpoint().is_err() { break Ok(()); }` -- so its cx
+/// is provably cancelled at that point. The two tests above join on a LIVE cx,
+/// which is the one dimension separating them from the failing path.
+///
+/// Ordering is deterministic and mirrors serve: the cx is cancelled first, the
+/// child stays alive on the release flag, the joiner parks, the release fires,
+/// and only then does the child observe cancellation and complete. So the
+/// joiner is parked on a cancelled cx while the task it waits for finishes.
+#[test]
+fn f2ndd_join_is_woken_on_a_cancelled_cx_when_the_task_completes_while_it_waits() {
+    f2ndd_runtime().block_on(async {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cx = Cx::current().expect("bd-f2ndd repro ambient Cx");
+        let scope = cx.scope();
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_release = std::sync::Arc::clone(&release);
+        let mut handle = cx
+            .spawn_in(&scope, move |child| async move {
+                while !child_release.load(SeqCst) {
+                    asupersync::runtime::yield_now().await;
+                }
+                let _ = child.checkpoint();
+            })
+            .expect("bd-f2ndd repro spawn_in must be admitted");
+
+        // Cancel the JOINER's own cx, as serve's break condition proves happened.
+        cx.cancel_with(
+            asupersync::CancelKind::User,
+            Some("bd-f2ndd repro: cancel the joiner's cx, as serve's accept-loop break implies"),
+        );
+        handle.abort();
+
+        match f2ndd_bounded_join(&mut handle, release).await {
+            F2nddJoin::WokenBeforeWatchdog(_) => {}
+            F2nddJoin::NeverParked(_) => panic!(
+                "bd-f2ndd repro VACUOUS: the joiner never parked -- cancelling the cx settled the \
+                 child before the join, so this shape did not reproduce and must be restructured"
+            ),
+            F2nddJoin::OnlyWatchdog => panic!(
+                "bd-f2ndd: a joiner on a CANCELLED cx was released only by the watchdog, while the \
+                 same shape on a live cx is woken -- the cancelled cx is the differing variable"
+            ),
+        }
+    });
+}
