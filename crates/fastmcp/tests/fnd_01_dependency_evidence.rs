@@ -50498,9 +50498,35 @@ activate = 1\n";
     // WHAT THIS RE-ATTEST DOES NOT DO: it re-binds a LENGTH AND DIGEST. It does
     // not re-verify the CONTENT those values measure. Nothing here asserts that
     // the dependency set is correct, only that it is the one now on disk.
+    //
+    // ---- RE-ATTEST 2, 2026-09-22, bound to abb29ae1 --------------------------
+    // EVERYTHING ABOVE DESCRIBES RE-ATTEST 1 (8ce0e858, 2026-09-17) AND ITS
+    // RANGES END AT THAT COMMIT. It does not justify the values now below it;
+    // this paragraph does. Kept rather than rewritten because it is the record
+    // of the first repair, and a reader who stops at it would otherwise be
+    // reading a stale justification sitting above fresh constants.
+    //
+    // These constants rotted a SECOND time, five days after being repaired.
+    // Exactly two commits moved either file since 8ce0e858, and both are
+    // ordinary accounted work:
+    //   - b5b1cc91 deps(rust): rustix =1.1.4 -> =1.1.5, syn 3.0.6;
+    //   - 0df68bfe feat(core): adds chacha20poly1305 =0.11.0, which is the
+    //     envelope candidate this very policy already enumerates, so the new
+    //     direct dependency is one FND-01 had qualified rather than an
+    //     unaccounted arrival.
+    // Measured at abb29ae1 on a clean tree: Cargo.toml 7_224 -> 7_475,
+    // Cargo.lock 99_964 -> 100_009, rust-toolchain.toml unchanged at 239 and
+    // matching, which is the control proving the sweep discriminates.
+    //
+    // THE FINDING THIS REPAIR DOES NOT ADDRESS, recorded so the third rot is
+    // not a surprise: these two rows measure PROJECT-AUTHORED MUTABLE files
+    // that ordinary dependency work edits on its own schedule. Re-attesting
+    // clears the instance and leaves the generator. Twice in five days is the
+    // evidence; a derived binding or a coupling to the pin-refresh task is the
+    // fix, and neither is in scope here. Tracked on bd-wo55t.
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_224, "e1b1ed5da8fe800f2f0f60ca351d0636a94653cb4fe98ff96a4f15ccd0a5ef80"),
-        ("Cargo.lock", 99_964, "6b1c351b9e1647396957c7bffb023cc9e488226cbdbb8a13ae52984fa7d0e82f"),
+        ("Cargo.toml", 7_475, "a261ab74fe196608a43d48dfc2c9aca51e8c0ce83eccff574bd57956553dd201"),
+        ("Cargo.lock", 100_009, "3baf2693e4b84e1ba0f7d31e597c0499f50cc04be6f783e24663d8125c10a2fb"),
         ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
     /// bd-veqqv: MACHINE-CHECKED PROVENANCE for `TOOLCHAIN_WORKSPACE_INPUTS`.
