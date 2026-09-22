@@ -7,6 +7,10 @@
 //! no timer polling or background worker is used. The owned driver exposes the
 //! shared remote-cancel handle and retains update disposition after interruption.
 
+/// Opt-in write-ahead controls for restart-safe input-update non-replay.
+pub mod journal;
+use journal::{TaskInputJournal, TaskInputJournalError};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -92,6 +96,7 @@ pub enum ManagedTaskWatchDriveError {
     Watch(ManagedTaskWatchError),
     Input(ManagedTaskDriverError),
     Recovery(ManagedTaskRecoveryError),
+    Journal(TaskInputJournalError),
     /// A validated remote cancellation ACK stopped this driver. This is not a
     /// terminal Task or proof that an in-flight input update did not commit.
     CancellationRequested,
@@ -106,12 +111,16 @@ impl fmt::Display for ManagedTaskWatchDriveError {
             Self::Watch(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
             Self::Recovery(error) => error.fmt(f),
+            Self::Journal(error) => error.fmt(f),
             Self::CancellationRequested => f.write_str("Task cancellation acknowledged; input driver stopped"),
             Self::CredentialChanged => f.write_str("Task watch credential changed during admission"),
         }
     }
 }
 impl std::error::Error for ManagedTaskWatchDriveError {}
+impl From<TaskInputJournalError> for ManagedTaskWatchDriveError {
+    fn from(error: TaskInputJournalError) -> Self { Self::Journal(error) }
+}
 impl From<ManagedTaskWatchError> for ManagedTaskWatchDriveError {
     fn from(error: ManagedTaskWatchError) -> Self { Self::Watch(error) }
 }
@@ -286,6 +295,7 @@ impl ManagedTasksClient {
             client: self.clone(), cancellation: cancellation.clone(), deadline, policy,
             credential: Some(credential), watch: Some(watch), remote_cancel,
             progress: UpdateProgress::default(),
+            journal: None,
         })
     }
 }
@@ -298,11 +308,12 @@ impl ManagedTasksClient {
 /// ReturnToCaller also ends this run; it does not restore an old input challenge
 /// as retry authority. No implicit remote cancellation occurs on drop/close.
 ///
-/// A successful remote cancellation produces CancellationRequested, not a
+/// A successful remote cancellation producesCancellationRequested, not a
 /// fabricated terminal. Inspect update_state afterwards: an interrupted update
 /// may have committed. The actual last acknowledgement and correlation ID stay
 /// available on this owner after any return, error, close or abandoned future.
-/// This evidence is process-local, not a durable mutation-recovery journal.
+/// Without with_input_journal this evidence is process-local. An attached
+/// journal additionally gates each update on a durable intent and records ACKs.
 #[must_use = "retain the input driver to control cancellation and inspect update disposition"]
 pub struct ManagedTaskWatchDriver {
     client: ManagedTasksClient,
@@ -313,9 +324,41 @@ pub struct ManagedTaskWatchDriver {
     watch: Option<ManagedTaskWatch>,
     remote_cancel: ManagedTaskCancelHandle,
     progress: UpdateProgress,
+    journal: Option<TaskInputJournal>,
 }
 
 impl ManagedTaskWatchDriver {
+    /// Attach an exclusive, authenticated restart journal before drive is polled.
+    /// The host binding must identify this login and resource. Stored controls
+    /// never replace fresh discovery/get authorization. Restored acknowledged
+    /// keys and update counts retain their lifetime limits; unresolved intents
+    /// permit observation but stop input resolution and mutation.
+    ///
+    /// The persistence future runs inside the original credential/cancellation/
+    /// deadline scope. Host blocking I/O must use its owned blocking lane. Use a
+    /// fresh request prefix on restart: previously recorded update IDs cannot be
+    /// reused. This does not journal host resolver side effects or remote cancel.
+    pub fn with_input_journal(mut self, journal: TaskInputJournal) -> Result<Self, ManagedTaskWatchDriveError> {
+        if self.journal.is_some() || self.watch.is_none() || self.credential.is_none() {
+            return Err(ManagedTaskWatchError::Closed.into());
+        }
+        let watch = self.watch.as_ref().ok_or(ManagedTaskWatchError::Closed)?;
+        journal.admit(self.client.session.resource(), &watch.state.task_ids[0], self.policy)?;
+        self.progress = journal.restore_progress();
+        self.journal = Some(journal);
+        Ok(self)
+    }
+
+    /// Durable state and any unconfirmed storage change survive close/errors.
+    pub fn input_journal(&self) -> Option<&TaskInputJournal> { self.journal.as_ref() }
+
+    /// End observation before releasing journal custody. A quarantined journal
+    /// remains quarantined; consuming the driver never grants a replay/reset.
+    pub fn into_input_journal(mut self) -> Option<TaskInputJournal> {
+        self.close();
+        self.journal.take()
+    }
+
     /// All clones share the existing controller's one-attempt reservation.
     pub fn cancel_handle(&self) -> ManagedTaskCancelHandle { self.remote_cancel.clone() }
     pub fn update_state(&self) -> TaskInputUpdateState { self.progress.state }
@@ -384,7 +427,10 @@ impl ManagedTaskWatchDriver {
         let policy = self.policy;
         let mut recovery = policy.recovery.map(|recovery|
             RecoveryState::new(watch, policy.connection_policy().expect("policy admitted before opening"), recovery));
-        let mut ledger = InputHistory::default();
+        let mut ledger = match self.journal.as_ref() {
+            Some(journal) => journal.admit(client.session.resource(), &watch.state.task_ids[0], policy)?,
+            None => InputHistory::default(),
+        };
         let mut reconciled = None;
         loop {
             self.check(cx, credential)?;
@@ -399,6 +445,7 @@ impl ManagedTaskWatchDriver {
                 }
             };
             self.check(cx, credential)?;
+            if let Some(journal) = &self.journal { journal.check_task(&task)?; }
             observe(&task)?;
             self.check(cx, credential)?;
             if matches!(&*task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
@@ -407,6 +454,7 @@ impl ManagedTaskWatchDriver {
             }
             let Task::InputRequired { input_requests, .. } = &*task else { continue; };
             if policy.maximum_updates == 0 { return Ok(ManagedTaskRunOutcome::InputRequired(task)); }
+            if let Some(journal) = &self.journal { journal.can_update()?; }
             let pending = ledger.unanswered(input_requests, policy)?;
             if pending.requests.is_empty() { continue; }
             if self.progress.acknowledged >= policy.maximum_updates { return Err(ManagedTaskDriverError::UpdateLimit.into()); }
@@ -425,6 +473,9 @@ impl ManagedTaskWatchDriver {
             watch.state.reserve_snapshot()?;
             let update_ids = watch.ids.next_pair()?;
             let get_ids = watch.ids.next_pair()?;
+            let intent = self.journal.as_ref().map(|journal|
+                journal.intent(&task, &ledger, responses.keys().cloned(), &update_ids.operation)
+            ).transpose()?;
             let update = prepare(client.session.resource().as_str(), &client.metadata,
                 &update_ids.operation, ManagedTaskRequest::Update { task, input_responses: responses }, client.limits)?;
             let update_id = update_ids.operation.clone();
@@ -434,6 +485,13 @@ impl ManagedTaskWatchDriver {
                 &get_ids.operation, ManagedTaskRequest::Get(task_id), client.limits)?;
             let get_round = client.prepare_round(get_ids, get)?;
             self.check(cx, credential)?;
+            // Both wire documents and all local reservations have been admitted.
+            // A failed, cancelled or abandoned durable intent cannot reach POST.
+            if let Some(intent) = intent {
+                self.journal.as_mut().ok_or(TaskInputJournalError::InvalidRecord)?
+                    .persist(cx, &cancellation, deadline, intent).await?;
+                self.check(cx, credential)?;
+            }
             let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
             // Retain uncertainty before the first await of a mutation round.
             // Observation recovery deliberately cannot retry anything here.
@@ -446,6 +504,12 @@ impl ManagedTaskWatchDriver {
             self.progress.acknowledge()?;
             ledger = next_ledger;
             drop(call);
+            if let Some(journal) = self.journal.as_mut() {
+                let receipt = journal.acknowledgement()?;
+                // The remote receipt above survives even when this save fails.
+                // No reconciliation/get or subsequent update overtakes the save.
+                journal.persist(cx, &cancellation, deadline, receipt).await?;
+            }
             self.check(cx, credential)?;
             let observed = async {
                 let call_deadline = deadline.min(deadline_after(cx, client.limits.timeout)?);
