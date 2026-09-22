@@ -4,8 +4,11 @@
 //! authenticated snapshots; their embedded Task is never published as current
 //! state. The opening credential owns every discovery/get for this watch, even
 //! if another caller renews the machine client's token. Expiry ends observation.
-//! There is no polling, reconnect, task creation or remote cancellation here.
+//! Ordinary watches never cancel remote Tasks. The explicit cancellation
+//! wrapper coordinates one remote attempt with the observation owner's lifetime.
 
+/// Explicit one-attempt remote cancellation for a single Task observation.
+pub mod cancellation;
 /// Host-authorized input resolution driven by Task notifications.
 pub mod drive;
 /// Opt-in bounded observation recovery and natural credential renewal.
@@ -240,12 +243,13 @@ impl ClientCredentialsTaskWatch {
 
 // This private composition reuses the ordinary Tasks preparation, discovery
 // admission and incremental result decoder. Unlike standalone requests, a watch
-// must NOT acquire a replacement credential before a get or explicit update.
-// It accepts only those two commands, never creation or remote cancellation.
+// must NOT acquire a replacement credential before a get or explicit mutation.
+// Cancel is used only by the explicitly constructed one-attempt controller;
+// ordinary observation never constructs that command. Task creation is refused.
 fn prepare_pinned(
     client: &ClientCredentialsTasksClient, ids: &(RequestId, RequestId), request: ManagedTaskRequest,
 ) -> Result<(Prepared, CoreRequest, ModernHttpRequest), ClientCredentialsTaskWatchError> {
-    if !matches!(&request, ManagedTaskRequest::Get(_) | ManagedTaskRequest::Update { .. }) {
+    if !matches!(&request, ManagedTaskRequest::Get(_) | ManagedTaskRequest::Update { .. } | ManagedTaskRequest::Cancel(_)) {
         return Err(ManagedTasksError::InvalidRequest.into());
     }
     ids.0.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
