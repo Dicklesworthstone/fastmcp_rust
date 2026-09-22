@@ -43,8 +43,27 @@ def distinct_ids(text: str) -> list[str]:
 
 
 def count_clause(text: str) -> int | None:
-    found = COUNT.findall(text)
-    return int(found[0]) if found else None
+    """The MOST PERMISSIVE bound in the field.
+
+    A field carries several count clauses -- on the corpus here, every single hit
+    has more than one -- so picking the first is arbitrary and an arbitrary pick
+    is not a measurement. Taking the max means a bead fires only when even the
+    loosest clause in its own text is exceeded, which makes a hit conservative:
+    no reading of the field admits the IDs it names.
+    """
+    found = [int(n) for n in COUNT.findall(text)]
+    return max(found) if found else None
+
+
+def stems(ids: list[str]) -> set[str]:
+    """The naming schemes behind a set of frozen IDs.
+
+    The dominant defect shape pairs a SHORT scheme with a LONG one (x_i_* beside
+    x_integration_*, x_v_* beside x_verification_*): two schemes, four IDs, and a
+    count clause written for one scheme. Reporting the stems is what distinguishes
+    that template defect from a bead that merely names several tests.
+    """
+    return {re.sub(r"_(?:positive|planted_negative)$", "", i) for i in ids}
 
 
 def self_test() -> bool:
@@ -61,6 +80,15 @@ def self_test() -> bool:
     if count_clause(none) is not None:
         print("CONTROL FAILED: a missing clause was invented", file=sys.stderr)
         return False
+    if count_clause("required count = 2 ... passed count = 4") != 4:
+        print("CONTROL FAILED: did not take the most permissive clause", file=sys.stderr)
+        return False
+    if stems(["x_i_positive", "x_i_planted_negative", "x_integration_positive"]) != {
+        "x_i",
+        "x_integration",
+    }:
+        print("CONTROL FAILED: stem grouping wrong", file=sys.stderr)
+        return False
     return True
 
 
@@ -68,7 +96,7 @@ def main() -> int:
     if not self_test():
         print("REFUSING TO REPORT: controls did not pass.", file=sys.stderr)
         return 2
-    print("controls: over-named parsed, exact parsed, absent-clause not invented  OK\n")
+    print("controls: over-named, exact, absent-clause, most-permissive, stems  5/5 OK\n")
 
     raw = subprocess.run(
         ["br", "list", "--json"], capture_output=True, text=True, check=True
@@ -92,9 +120,12 @@ def main() -> int:
     print(f"non-closed beads with acceptance text : {scanned}")
     print(f"naming MORE ids than their own clause : {len(hits)}\n")
     for bid, found, bound, owner, ids in sorted(hits, key=lambda row: -row[1]):
-        print(f"  {bid:<46} ids={found:<3} count={bound:<3} {owner}")
-        print(f"      {', '.join(ids)}")
-    print("\n  A hit is a contradiction inside ONE field. No run can resolve it.")
+        sch = sorted(stems(ids), key=len)
+        print(f"  {bid:<46} ids={found:<3} count={bound:<3} schemes={len(sch)}  {owner}")
+        print(f"      {' + '.join(sch)}")
+    two = sum(1 for h in hits if len(stems(h[4])) == 2)
+    print(f"\n  of which TWO NAMING SCHEMES over one count clause: {two}")
+    print("  A hit is a contradiction inside ONE field. No run can resolve it.")
     return 0
 
 
