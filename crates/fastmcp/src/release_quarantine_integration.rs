@@ -28,6 +28,30 @@
 //! inferred, exactly as A and B carry theirs. No function here reads the
 //! network, and none may.
 //!
+//! WHICH GUARDS ARE THIS ROLE'S OWN, AND WHICH ARE SHADOWED. Established by
+//! running the planted negatives, not by reading:
+//!
+//!   OWN, and reachable -- neither slice can make these, because each is a
+//!   relation BETWEEN the two:
+//!     E_SLICE_BINDING   the B record is bound to the A digest A's replay
+//!                       actually produced. B STORES `a_digest` and encodes it
+//!                       but never validates it, so a record bound to a foreign
+//!                       inventory passes both slices individually.
+//!
+//!   DEFENCE IN DEPTH, and UNREACHABLE through the shipped replays -- the B
+//!   evaluator refuses each of these first, so the checks below cannot fire and
+//!   no planted negative can target them:
+//!     E_REL_02_PRESENT    shadowed by B's `E_RESTORATION_BOUNDARY`
+//!     E_COUNTER_NON_ZERO  shadowed by B's own zero-counter check
+//!     E_PROVIDER_STATE    shadowed by B's `E_PROVIDER_INFERENCE`
+//!
+//! They are kept rather than deleted because they state this closure's own
+//! requirements in one place, and because they would become load-bearing if the
+//! B replay were ever removed from the entrypoint. They are documented as
+//! shadowed so a reader does not mistake them for live protection, and the
+//! contract test asserts the PRECEDENCE -- a change that made one of them fire
+//! first, or that dropped B's, fails that arm and names which.
+//!
 //! NO-CLAIM BOUNDARY. This role alone does not establish parent completion,
 //! aggregate MCP 2026-07-28 support, MCP 2024-11-05 preservation, automatic
 //! negotiation, profile maturity, conformance, publication, or release
