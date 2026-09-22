@@ -181,6 +181,11 @@ impl AdmittedFinalFormSchema {
     pub const fn schema(&self) -> &Value {
         self.schema.schema()
     }
+
+    /// Validates submitted form content against the admitted form contract.
+    pub fn validate(&self, value: &Value) -> ValidationResult {
+        self.schema.validate(value)
+    }
 }
 
 impl serde::Serialize for AdmittedFinalFormSchema {

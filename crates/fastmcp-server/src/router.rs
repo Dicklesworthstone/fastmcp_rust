@@ -21031,6 +21031,95 @@ mod router_tests {
     }
 
     #[test]
+    fn final_context_elicitation_rejects_invalid_answers_before_consuming_handler_state() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ContextElicitationTool {
+                initial_calls: Arc::clone(&initial_calls),
+                resumed_calls: Arc::clone(&resumed_calls),
+            })
+            .expect("context elicitation tool registers");
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let context_for = |id| {
+            InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                id,
+                InboundRequestTransport::Memory,
+                &connection,
+            )
+            .request_context()
+            .with_client_capabilities(ClientCapabilityInfo::new().with_elicitation(true, false))
+        };
+        let mut initial_request =
+            final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 950_i64);
+        initial_request.params.as_mut().expect("initial params")["_meta"]
+            ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+            "elicitation": {"form": {}},
+        });
+        let initial = router
+            .dispatch_stateless(&context_for(950), &initial_request)
+            .expect("initial form request issues continuation state");
+        let state = initial["requestState"]
+            .as_str()
+            .expect("opaque state")
+            .to_owned();
+        assert_eq!(
+            initial["inputRequests"]["approval"]["params"]["requestedSchema"]["required"],
+            serde_json::json!(["approved"])
+        );
+        for (id, answer) in (951_u64..).zip([
+            serde_json::json!({"action": "accept"}),
+            serde_json::json!({"action": "accept", "content": {}}),
+            serde_json::json!({"action": "accept", "content": {"approved": "private-invalid-answer"}}),
+            serde_json::json!({"action": "accept", "content": null}),
+        ]) {
+            let mut retry = final_tools_call_request(
+                "context-elicitation-tool",
+                serde_json::json!({}),
+                i64::try_from(id).expect("test request ID fits"),
+            );
+            let params = retry.params.as_mut().expect("retry params");
+            params["_meta"] =
+                initial_request.params.as_ref().expect("initial params")["_meta"].clone();
+            params["requestState"] = serde_json::json!(state);
+            params["inputResponses"] = serde_json::json!({"approval": answer});
+            let raw = serde_json::to_string(params).expect("retry params encode");
+            let error = router
+                .dispatch_stateless_with_raw_params(&context_for(id), &retry, Some(&raw))
+                .expect_err("invalid answers fail before a handler continuation can consume state");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert!(!error.message.contains("private-invalid-answer"));
+            assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(router.mrtr_exchanges.active_len(), 1);
+        }
+        let mut valid = final_tools_call_request(
+            "context-elicitation-tool",
+            serde_json::json!({}),
+            955_i64,
+        );
+        let params = valid.params.as_mut().expect("valid retry params");
+        params["_meta"] =
+            initial_request.params.as_ref().expect("initial params")["_meta"].clone();
+        params["requestState"] = serde_json::json!(state);
+        params["inputResponses"] = serde_json::json!({
+            "approval": {"action": "accept", "content": {"approved": true}},
+        });
+        let raw = serde_json::to_string(params).expect("valid retry params encode");
+        let completed = router
+            .dispatch_stateless_with_raw_params(&context_for(955), &valid, Some(&raw))
+            .expect("the original continuation state remains usable for a corrected answer");
+        assert_eq!(completed["resultType"], "complete");
+        assert_eq!(completed["content"][0]["text"], "approved");
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+    }
+
+    #[test]
     fn final_context_elicitation_without_capability_rejects_before_mrtr_state_mutation() {
         let initial_calls = Arc::new(AtomicUsize::new(0));
         let resumed_calls = Arc::new(AtomicUsize::new(0));

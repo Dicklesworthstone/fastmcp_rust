@@ -2367,8 +2367,21 @@ pub struct FinalEmbeddedElicitationResult {
     /// User action.
     pub action: ElicitAction,
     /// Optional submitted form data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_elicitation_content"
+    )]
     pub content: Option<BTreeMap<String, ElicitContentValue>>,
+}
+
+fn deserialize_optional_elicitation_content<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, ElicitContentValue>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BTreeMap::deserialize(deserializer).map(Some)
 }
 
 impl FinalEmbeddedElicitationResult {
@@ -11209,6 +11222,44 @@ mod tests {
         let url = ElicitRequestParams::url("Auth required", "https://example.com", "id-1");
         assert_eq!(url.mode(), ElicitMode::Url);
         assert_eq!(url.message(), "Auth required");
+    }
+
+    #[test]
+    fn final_embedded_elicitation_content_preserves_absence_and_rejects_explicit_null() {
+        for action in ["accept", "decline", "cancel"] {
+            let absent = serde_json::json!({"action": action});
+            let decoded: FinalEmbeddedElicitationResult = serde_json::from_value(absent.clone())
+                .expect("absent content remains structurally valid for every action");
+            assert!(decoded.content.is_none());
+            assert_eq!(serde_json::to_value(decoded).unwrap(), absent);
+
+            let empty = serde_json::json!({"action": action, "content": {}});
+            let decoded: FinalEmbeddedElicitationResult = serde_json::from_value(empty.clone())
+                .expect("an explicitly empty content object preserves its presence");
+            assert_eq!(decoded.content, Some(BTreeMap::new()));
+            assert_eq!(serde_json::to_value(decoded).unwrap(), empty);
+
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!("private-content"),
+                serde_json::json!(false),
+                serde_json::json!(1),
+            ] {
+                let invalid = serde_json::json!({"action": action, "content": invalid});
+                assert!(
+                    serde_json::from_value::<FinalEmbeddedElicitationResult>(invalid.clone())
+                        .is_err()
+                );
+                assert!(
+                    serde_json::from_value::<FinalInputResponses>(serde_json::json!({
+                        "answer": invalid,
+                    }))
+                    .is_err(),
+                    "the enclosing retry map must retain the same content-presence boundary"
+                );
+            }
+        }
     }
 
     #[test]
