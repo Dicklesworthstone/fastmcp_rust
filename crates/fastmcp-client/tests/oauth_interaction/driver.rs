@@ -27,6 +27,10 @@ mod task_submission;
 #[path = "task_resume.rs"]
 mod task_resume;
 
+#[cfg(feature = "tasks")]
+#[path = "task_creation_persistence.rs"]
+mod task_creation_persistence;
+
 #[path = "catalogs.rs"]
 mod catalogs;
 
