@@ -1,82 +1,122 @@
 diff --git a/crates/fastmcp-client/src/http_executor.rs b/crates/fastmcp-client/src/http_executor.rs
 --- a/crates/fastmcp-client/src/http_executor.rs
 +++ b/crates/fastmcp-client/src/http_executor.rs
-@@ -3,6 +3,9 @@
- //! This module owns modern MCP POST execution, disposable first-probe
+@@ -4,4 +4,7 @@
  //! negotiation, and the public response stream surface. It neither retries an
  //! MCP request nor follows redirects.
-+
-+/// Explicitly reviewed schema-derived tool parameter headers.
-+pub mod parameter_headers;
  
++/// Explicitly reviewed, resource-bound tool parameter headers.
++pub mod parameter_headers;
++
  use std::collections::{BTreeMap, HashMap, VecDeque};
- use std::fmt;
-@@ -353,6 +356,7 @@
+@@ -351,6 +354,8 @@
+     protocol_version: String,
      method: String,
      name: Option<String>,
++    name_header: Option<String>,
      authorization: Option<String>,
 +    parameter_headers: Option<Vec<(String, String)>>,
      include_method_header: bool,
  }
- 
-@@ -365,6 +369,7 @@
+@@ -364,4 +369,5 @@
              .field("method", &self.method)
              .field("name", &self.name)
              .field("body_bytes", &self.body.len())
 +            .field("parameter_header_count", &self.parameter_headers.as_ref().map_or(0, Vec::len))
              .field("include_method_header", &self.include_method_header)
-             .field(
-                 "authorization",
-@@ -403,6 +408,7 @@
+@@ -390,16 +396,27 @@
+         if [target.as_str(), protocol_version.as_str(), method.as_str()]
+             .into_iter()
+-            .chain(name.as_deref())
+             .any(contains_header_control)
++            || name.as_deref().is_some_and(|name| {
++                name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
++            })
+         {
+             return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+         }
++        // Preserve the logical name for body/header identity checks, but retain
++        // its admitted wire spelling so infallible serialization cannot emit
++        // Unicode, OWS-sensitive or sentinel-looking names as ambiguous fields.
++        let name_header = name.as_deref()
++            .map(fastmcp_protocol::http_headers::encode_mcp_header_value)
++            .transpose()
++            .map_err(|_| ModernHttpExecutorError::InvalidRequestMetadata)?;
+         Ok(Self {
+             target,
+             body,
+             protocol_version,
              method,
              name,
++            name_header,
              authorization: None,
 +            parameter_headers: None,
              include_method_header: true,
          })
-     }
-@@ -434,6 +440,7 @@
+@@ -434,4 +451,6 @@
              method: String::new(),
              name: None,
++            name_header: None,
              authorization: None,
 +            parameter_headers: None,
              include_method_header: false,
-         })
-     }
-@@ -506,6 +513,9 @@
-         if let Some(name) = &self.name {
+@@ -475,3 +494,3 @@
+-    /// Builds the fixed, uncoded MCP request headers.
++    /// Builds the admitted MCP request headers, including opted-in mirrors.
+     ///
+     /// `Accept-Encoding` explicitly requests the canonical identity coding;
+@@ -507,7 +526,10 @@
+         if self.include_method_header {
+             headers.push(("Mcp-Method".to_owned(), self.method.clone()));
+         }
+-        if let Some(name) = &self.name {
++        if let Some(name) = &self.name_header {
              headers.push(("Mcp-Name".to_owned(), name.clone()));
          }
 +        if let Some(parameters) = &self.parameter_headers {
 +            headers.extend(parameters.iter().cloned());
 +        }
          let authorization = match credential {
-             Some(credential) => self.bound_authorization(credential),
-             None => self.authorization.clone(),
+diff --git a/crates/fastmcp-client/src/http_auth/rpc.rs b/crates/fastmcp-client/src/http_auth/rpc.rs
+--- a/crates/fastmcp-client/src/http_auth/rpc.rs
++++ b/crates/fastmcp-client/src/http_auth/rpc.rs
+@@ -8,4 +8,4 @@
+ //! This explicit modern-only core-call API does not negotiate extensions,
+-//! project schema-derived custom headers, cache results, or automatically
+-//! retry an input-required result. Use the returned typed
+-//! `input_required` branch to implement an explicit host continuation policy.
++//! cache results, or automatically retry an input-required result. Reviewed
++//! schema-derived parameter headers are an explicit opt-in in [`tool_headers`].
++//! Use the returned typed `input_required` branch for host continuation policy.
+@@ -46,4 +46,6 @@
+ pub mod resource;
+ /// Request-owned, bounded core subscription streams over managed OAuth.
+ pub mod subscription;
++/// Explicit parameter-header disclosure with ordinary managed call ownership.
++pub mod tool_headers;
+ 
 diff --git a/crates/fastmcp-client/src/http_executor/parameter_headers.rs b/crates/fastmcp-client/src/http_executor/parameter_headers.rs
 new file mode 100644
 --- /dev/null
 +++ b/crates/fastmcp-client/src/http_executor/parameter_headers.rs
-@@ -0,0 +1,236 @@
-+//! Caller-reviewed, resource-bound MCP tool parameter headers.
+@@ -0,0 +1,192 @@
++//! Explicitly reviewed, resource-bound tool parameter-header dispatch.
 +//!
-+//! Schema annotations describe projection, not permission to disclose arguments
-+//! to an intermediary. A host must review every binding before retaining one of
-+//! these plans. Projection reads the actual immutable JSON-RPC body, never a
-+//! separately supplied copy of the arguments. The native executor's ordinary
-+//! header serializer emits the resulting fields on its existing POST path.
++//! A schema describes projection, never permission to disclose arguments. The
++//! host must approve every compiled binding before this module will retain a
++//! plan. Projection reads the immutable outgoing JSON-RPC bytes, not a separate
++//! argument map. No schema lookup, credential acquisition, retry or I/O occurs.
 +//!
-+//! This is client-side disclosure policy, not server authorization, catalog
-+//! freshness, extension negotiation, or automatic discovery. A host replacing
-+//! a catalog/schema or its disclosure policy must review a new plan. No HTTP
-+//! retry, credential acquisition, schema-reference fetch or cache is introduced.
++//! The host owns catalog freshness and disclosure policy. A changed definition
++//! or policy requires a new review; retaining a plan does not make it current.
++//! This module does not authorize execution or validate the entire invocation.
 +
 +use std::fmt;
 +
 +use fastmcp_core::CanonicalHttpUrl;
 +use fastmcp_protocol::http_headers::{
-+    AdmittedToolHeaderSchema, McpHeaderError, ParameterHeaderBinding,
-+    MAX_MCP_HEADER_VALUE_BYTES,
++    AdmittedToolHeaderSchema, MAX_MCP_HEADER_VALUE_BYTES, McpHeaderError,
++    ParameterHeaderBinding,
 +};
 +use fastmcp_protocol::protocol_policy::ProtocolEra;
 +use fastmcp_protocol::{
@@ -87,11 +127,10 @@ new file mode 100644
 +
 +use super::ModernHttpRequest;
 +
-+/// Hard admission ceiling for the exact source body inspected for projection.
-+/// An embedding's request/transport limits can be tighter, never relaxed here.
++/// Hard ceiling for duplicate-aware admission of the exact outgoing body.
 +pub const MAX_TOOL_HEADER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 +
-+/// Fixed errors never contain a schema, property path, argument or resource.
++/// Diagnostics never retain a resource, schema, binding, or argument value.
 +#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 +pub enum ToolHeaderDispatchError {
 +    InvalidBinding,
@@ -106,16 +145,16 @@ new file mode 100644
 +
 +impl fmt::Display for ToolHeaderDispatchError {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+        match self {
-+            Self::InvalidBinding => f.write_str("invalid tool-header resource or name binding"),
-+            Self::DisclosureDenied => f.write_str("tool parameter-header disclosure was not approved"),
-+            Self::TargetMismatch => f.write_str("tool-header plan belongs to a different HTTPS resource"),
-+            Self::OperationMismatch => f.write_str("tool-header plan does not match the request operation"),
-+            Self::AlreadyProjected => f.write_str("tool parameter headers were already installed"),
-+            Self::InvalidRequest => f.write_str("tool-header projection requires an admitted modern tool request"),
-+            Self::RequestTooLarge => f.write_str("tool-header request exceeds the source-byte bound"),
-+            Self::Projection(error) => fmt::Display::fmt(error, f),
-+        }
++        f.write_str(match self {
++            Self::InvalidBinding => "invalid tool-header resource or name binding",
++            Self::DisclosureDenied => "tool parameter-header disclosure was not approved",
++            Self::TargetMismatch => "tool-header plan belongs to a different HTTPS resource",
++            Self::OperationMismatch => "tool-header plan does not match the request operation",
++            Self::AlreadyProjected => "tool parameter headers were already installed",
++            Self::InvalidRequest => "tool-header projection requires an admitted final tool request",
++            Self::RequestTooLarge => "tool-header request exceeds the source-byte limit",
++            Self::Projection(error) => return fmt::Display::fmt(error, f),
++        })
 +    }
 +}
 +
@@ -125,16 +164,13 @@ new file mode 100644
 +    fn from(error: McpHeaderError) -> Self { Self::Projection(error) }
 +}
 +
-+/// Immutable approval of one tool schema at one exact canonical HTTPS resource.
++/// Immutable approval of one exact tool schema at one canonical HTTPS resource.
 +///
-+/// There is no constructor accepting an arbitrary list of outgoing headers.
-+/// All bindings must be approved together: denying one rejects the complete
-+/// plan, including previously approved siblings. Unknown/unannotated arguments
-+/// are never promoted to headers. The retained schema is not mutated.
-+///
-+/// This value is intentionally not Clone or serializable. It may be borrowed
-+/// for multiple calls while its host's original disclosure decision is valid.
-+/// Sharing a reviewed plan does not share any argument, token, or request state.
++/// No arbitrary header map can be installed. The complete source is admitted
++/// before the first review callback. Rejecting any binding rejects the plan,
++/// including previously approved siblings. Unannotated arguments remain body
++/// data. This value is deliberately neither Clone nor serializable; an owner
++/// may explicitly share it through an Arc without sharing invocation data.
 +pub struct ReviewedToolHeaders {
 +    resource: CanonicalHttpUrl,
 +    tool_name: String,
@@ -142,13 +178,9 @@ new file mode 100644
 +}
 +
 +impl ReviewedToolHeaders {
-+    /// Admits syntax first, then asks the host to approve each exact property
-+    /// path, header name and primitive type through `review`.
-+    ///
-+    /// The callback receives schema bindings, never invocation arguments. It
-+    /// must make a local disclosure decision, not blindly echo a peer's claim
-+    /// that a field is non-sensitive. Its own external effects remain the
-+    /// host's responsibility. No callback runs for a malformed schema/binding.
++    /// The callback reviews an exact property path, field name and primitive
++    /// type. It receives no invocation values and must apply the host's local
++    /// disclosure policy rather than trusting server annotations as consent.
 +    pub fn new(
 +        resource: CanonicalHttpUrl,
 +        tool_name: impl Into<String>,
@@ -162,13 +194,18 @@ new file mode 100644
 +            || resource.as_str().len() > MAX_MCP_HEADER_VALUE_BYTES
 +            || tool_name.is_empty()
 +            || tool_name.len() > MAX_MCP_HEADER_VALUE_BYTES
-+            || super::contains_header_control(&tool_name)
++            || tool_name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
 +        {
 +            return Err(ToolHeaderDispatchError::InvalidBinding);
 +        }
++        if schema.get("type").and_then(Value::as_str) != Some("object") {
++            return Err(McpHeaderError::InvalidSchema.into());
++        }
 +        let schema = AdmittedToolHeaderSchema::admit(schema)?;
 +        for binding in schema.header_plan().bindings() {
-+            if !review(binding) { return Err(ToolHeaderDispatchError::DisclosureDenied); }
++            if !review(binding) {
++                return Err(ToolHeaderDispatchError::DisclosureDenied);
++            }
 +        }
 +        Ok(Self { resource, tool_name, schema })
 +    }
@@ -187,7 +224,9 @@ new file mode 100644
 +        }
 +        let target = CanonicalHttpUrl::parse(request.target())
 +            .map_err(|_| ToolHeaderDispatchError::TargetMismatch)?;
-+        if target != self.resource { return Err(ToolHeaderDispatchError::TargetMismatch); }
++        if target != self.resource {
++            return Err(ToolHeaderDispatchError::TargetMismatch);
++        }
 +        if !request.include_method_header
 +            || request.protocol_version != FINAL_PROTOCOL_VERSION
 +            || request.method != "tools/call"
@@ -216,15 +255,11 @@ new file mode 100644
 +        {
 +            return Err(ToolHeaderDispatchError::InvalidRequest);
 +        }
-+        // Use the shipped typed admission in addition to raw duplicate/batch
-+        // admission. This never rewrites or reserializes the owning wire body.
++        // Raw duplicate/batch admission precedes typed method/metadata admission.
++        // Neither decoder rewrites the immutable body which the executor sends.
 +        let _ = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", envelope.params.as_ref())
 +            .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
-+        // This is deliberately only mirror projection, not schema validation
-+        // of the entire invocation. Absent/null annotated values omit a field;
-+        // the server retains responsibility for its full argument contract.
-+        let projected = self.schema.header_plan().project(params.get("arguments"))?;
-+        Ok(projected.into_fields())
++        Ok(self.schema.header_plan().project(params.get("arguments"))?.into_fields())
 +    }
 +}
 +
@@ -237,19 +272,14 @@ new file mode 100644
 +}
 +
 +impl ModernHttpRequest {
-+    /// Installs all approved `Mcp-Param-*` fields from this request's exact body.
++    /// Atomically installs reviewed fields from this request's exact body.
++    /// An empty projection also seals the request against replacing its plan.
++    /// Body bytes, credentials and routing identity are not replaced.
 +    ///
-+    /// This consumes the request, applies the resource/name/version checks and
-+    /// projects atomically. Neither a caller-supplied argument mirror nor an
-+    /// arbitrary header map can enter the serializer. Even an empty projection
-+    /// seals the request against replacement with another schema. Body bytes,
-+    /// existing credentials and routing metadata remain unchanged.
-+    ///
-+    /// The returned value is sent with the existing `ModernHttpExecutor` or
-+    /// `ManagedOAuthSession::execute_with_cancellation` APIs. Authentication,
-+    /// TLS, response deadlines and request ownership are unchanged. The host
-+    /// must not log the explicit `headers()` output, which now includes these
-+    /// reviewed values just as it already includes an attached credential.
++    /// Execute the returned request through the existing native/managed APIs.
++    /// Their authentication, TLS, cancellation and response bounds remain in
++    /// force. Explicit `headers()` output contains disclosed values, just as
++    /// it can already contain a credential, and must not be logged casually.
 +    pub fn with_reviewed_tool_headers(
 +        mut self,
 +        reviewed: &ReviewedToolHeaders,
@@ -261,65 +291,25 @@ new file mode 100644
 +}
 +
 +#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use crate::http_auth::BoundBearerCredential;
-+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
-+    use serde_json::json;
-+
-+    #[test]
-+    fn native_fresh_credential_serialization_retains_projection_without_reusing_old_authorization() {
-+        let target = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
-+        let review = ReviewedToolHeaders::new(target.clone(), "lookup", json!({
-+            "type":"object", "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
-+        }), |_| true).unwrap();
-+        let body = serde_json::to_vec(&json!({
-+            "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
-+                "name":"lookup", "arguments":{"region":"eu"},
-+                "_meta":serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap(),
-+            },
-+        })).unwrap();
-+        let old = BoundBearerCredential::bind(target.clone(), "test-only-old").unwrap();
-+        let fresh = BoundBearerCredential::bind(target, "test-only-fresh").unwrap();
-+        let wire = ModernHttpRequest::new("https://tools.example/mcp", body, FINAL_PROTOCOL_VERSION,
-+            "tools/call", Some("lookup".to_owned())).unwrap()
-+            .with_authorization(&old).with_reviewed_tool_headers(&review).unwrap();
-+        let headers = wire.headers_with_credential(Some(&fresh));
-+        assert!(headers.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
-+        assert!(headers.iter().any(|(name, value)| name == "Authorization" && value == "Bearer test-only-fresh"));
-+        assert!(!headers.iter().any(|(_, value)| value.contains("test-only-old")));
-+        fresh.revoke();
-+        let withheld = wire.headers_with_credential(Some(&fresh));
-+        assert!(!withheld.iter().any(|(name, _)| name == "Authorization"));
-+        assert!(withheld.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
-+    }
-+}
-diff --git a/crates/fastmcp-client/tests/http_parameter_headers.rs b/crates/fastmcp-client/tests/http_parameter_headers.rs
++mod tests;
+diff --git a/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs b/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs
 new file mode 100644
 --- /dev/null
-+++ b/crates/fastmcp-client/tests/http_parameter_headers.rs
-@@ -0,0 +1,243 @@
-+//! Public client construction and native header-serialization regressions.
-+//! These tests do not claim live TLS, server authorization or HDR-01 closure.
-+#![forbid(unsafe_code)]
++++ b/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs
+@@ -0,0 +1,246 @@
++use super::*;
 +
-+use fastmcp_client::http_auth::BoundBearerCredential;
-+use fastmcp_client::http_executor::ModernHttpRequest;
-+use fastmcp_client::http_executor::parameter_headers::{
-+    ReviewedToolHeaders, ToolHeaderDispatchError, MAX_TOOL_HEADER_REQUEST_BYTES,
-+};
-+use fastmcp_core::CanonicalHttpUrl;
++use crate::http_auth::BoundBearerCredential;
 +use fastmcp_protocol::http_headers::{
-+    McpHeaderError, MAX_MCP_HEADER_VALUE_BYTES, decode_mcp_header_value,
++    MAX_PARAMETER_HEADER_INTEGER, ParameterHeaderType, decode_mcp_header_value,
 +};
-+use fastmcp_protocol::{ClientCapabilities, FINAL_PROTOCOL_VERSION, FinalRequestMeta};
-+use serde_json::{Value, json};
++use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
++use serde_json::json;
 +
 +const TARGET: &str = "https://tools.example/mcp";
-+const TOOL: &str = "lookup";
 +
 +fn schema() -> Value {
-+    json!({"type":"object","properties":{
++    json!({"type":"object", "properties":{
 +        "region":{"type":"string","x-mcp-header":"Region"},
 +        "count":{"type":"integer","x-mcp-header":"Count"},
 +        "verbose":{"type":"boolean","x-mcp-header":"Verbose"},
@@ -329,216 +319,401 @@ new file mode 100644
 +    }})
 +}
 +
-+fn reviewed() -> ReviewedToolHeaders {
-+    ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), TOOL, schema(), |binding| {
-+        // This fixture is the locally authored disclosure policy, not a claim
-+        // that an arbitrary peer-provided schema is trusted.
-+        match binding.header_name() {
-+            "Mcp-Param-Region" => binding.property_path().iter().map(String::as_str).eq(["region"]),
-+            "Mcp-Param-Count" => binding.property_path().iter().map(String::as_str).eq(["count"]),
-+            "Mcp-Param-Verbose" => binding.property_path().iter().map(String::as_str).eq(["verbose"]),
-+            "Mcp-Param-Nested" => binding.property_path().iter().map(String::as_str).eq(["options", "a/b~.0"]),
-+            _ => false,
-+        }
-+    }).unwrap()
++fn plan() -> ReviewedToolHeaders {
++    ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", schema(), |_| true).unwrap()
 +}
 +
-+fn document(arguments: Option<Value>) -> Value {
++fn body(arguments: Option<Value>) -> Vec<u8> {
 +    let mut params = json!({
-+        "name":TOOL,
-+        "_meta":serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap(),
++        "name":"lookup", "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
 +    });
 +    if let Some(arguments) = arguments { params["arguments"] = arguments; }
-+    json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":params})
++    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":params})).unwrap()
 +}
 +
-+fn from_document(target: &str, document: &Value, version: &str, method: &str, name: Option<&str>) -> ModernHttpRequest {
-+    ModernHttpRequest::new(target, serde_json::to_vec(document).unwrap(), version, method, name.map(str::to_owned)).unwrap()
++fn wire(target: &str, body: Vec<u8>) -> ModernHttpRequest {
++    ModernHttpRequest::new(target, body, FINAL_PROTOCOL_VERSION, "tools/call", Some("lookup".to_owned())).unwrap()
 +}
 +
-+fn request(arguments: Option<Value>) -> ModernHttpRequest {
-+    from_document(TARGET, &document(arguments), FINAL_PROTOCOL_VERSION, "tools/call", Some(TOOL))
-+}
-+
-+fn fields(request: &ModernHttpRequest) -> Vec<(String, String)> {
-+    let mut fields: Vec<_> = request.headers().into_iter().filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
-+    fields.sort_by(|left, right| left.0.cmp(&right.0));
++fn parameters(request: &ModernHttpRequest) -> Vec<(String, String)> {
++    let mut fields: Vec<_> = request.headers().into_iter()
++        .filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
++    fields.sort();
 +    fields
 +}
 +
 +#[test]
-+fn reviewed_projection_enters_the_existing_wire_serializer_without_rewriting_the_body() {
-+    let request = request(Some(json!({
-+        "region":"eu-west", "count":42, "verbose":false,
-+        "options":{"a/b~.0":"nested"}, "private":"body-only-canary",
-+    })));
-+    let body = request.body().to_vec();
-+    let wire = request.with_reviewed_tool_headers(&reviewed()).unwrap();
-+    assert_eq!(wire.body(), body);
-+    assert_eq!(fields(&wire), vec![
-+        ("Mcp-Param-Count".to_owned(), "42".to_owned()),
++fn native_projection_uses_exact_paths_and_leaves_the_actual_body_unchanged() {
++    let review = plan();
++    let before = body(Some(json!({"region":"eu", "count":2, "verbose":false,
++        "options":{"a/b~.0":"nested"}, "private":"body-only-canary"})));
++    let before = [b" \n".as_slice(), before.as_slice(), b"\n ".as_slice()].concat();
++    let request = wire(TARGET, before.clone()).with_reviewed_tool_headers(&review).unwrap();
++    assert_eq!(request.body(), before);
++    assert_eq!(parameters(&request), vec![
++        ("Mcp-Param-Count".to_owned(), "2".to_owned()),
 +        ("Mcp-Param-Nested".to_owned(), "nested".to_owned()),
-+        ("Mcp-Param-Region".to_owned(), "eu-west".to_owned()),
++        ("Mcp-Param-Region".to_owned(), "eu".to_owned()),
 +        ("Mcp-Param-Verbose".to_owned(), "false".to_owned()),
 +    ]);
-+    assert!(!wire.headers().iter().any(|(_, value)| value.contains("body-only-canary")));
-+    assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Method" && value == "tools/call"));
-+    assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Name" && value == TOOL));
++    assert_eq!(review.schema(), &schema());
++    assert!(!format!("{request:?} {review:?}").contains("body-only-canary"));
++    assert!(!request.headers().iter().any(|(_, value)| value.contains("body-only-canary")));
 +}
 +
 +#[test]
-+fn private_arguments_stay_private_and_each_schema_binding_requires_local_review() {
-+    let mut visits = 0;
-+    let result = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), TOOL, schema(), |binding| {
-+        visits += 1;
++fn review_is_explicit_and_partial_approval_does_not_install_a_plan() {
++    let mut visited = Vec::new();
++    let result = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", schema(), |binding| {
++        visited.push((binding.property_path().to_vec(), binding.parameter_type()));
 +        binding.header_name() != "Mcp-Param-Region"
 +    });
-+    assert_eq!(result.unwrap_err(), ToolHeaderDispatchError::DisclosureDenied);
-+    assert!(visits > 0);
-+    assert!(fields(&request(Some(json!({"region":"private"})))).is_empty());
++    assert!(matches!(result, Err(ToolHeaderDispatchError::DisclosureDenied)));
++    assert!(!visited.is_empty());
++    assert!(visited.iter().any(|(path, kind)| path == &["region".to_owned()] && *kind == ParameterHeaderType::String));
++    assert!(parameters(&wire(TARGET, body(Some(json!({"region":"eu"}))))).is_empty());
 +}
 +
 +#[test]
-+fn malformed_schema_rejects_before_any_disclosure_callback() {
-+    let mut visits = 0;
-+    let result = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), TOOL, json!({
-+        "type":"object", "properties":{
-+            "a":{"type":"string","x-mcp-header":"Region"},
-+            "b":{"type":"string","x-mcp-header":"rEGION"},
-+        },
-+    }), |_| { visits += 1; true });
-+    assert!(matches!(result, Err(ToolHeaderDispatchError::Projection(McpHeaderError::DuplicateAnnotation))));
-+    assert_eq!(visits, 0);
-+}
-+
-+#[test]
-+fn binding_is_https_only_and_cannot_move_between_paths_or_queries() {
-+    let mut visits = 0;
-+    assert!(matches!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse("http://localhost/mcp").unwrap(), TOOL, schema(), |_| {
-+        visits += 1; true
-+    }), Err(ToolHeaderDispatchError::InvalidBinding)));
-+    assert_eq!(visits, 0);
-+    let document = document(Some(json!({"region":"eu"})));
-+    for target in ["https://other.example/mcp", "https://tools.example/other", "https://tools.example/mcp?other=1", "http://tools.example/mcp"] {
-+        let wire = from_document(target, &document, FINAL_PROTOCOL_VERSION, "tools/call", Some(TOOL));
-+        assert_eq!(wire.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::TargetMismatch);
-+    }
-+    // The same canonical resource remains usable; refusal has no shared state.
-+    assert!(request(Some(json!({"region":"eu"}))).with_reviewed_tool_headers(&reviewed()).is_ok());
-+}
-+
-+#[test]
-+fn both_wire_routing_metadata_and_exact_body_operation_must_match() {
-+    let original = document(Some(json!({"region":"eu"})));
-+    for (version, method, name) in [
-+        ("2024-11-05", "tools/call", Some(TOOL)),
-+        (FINAL_PROTOCOL_VERSION, "prompts/get", Some(TOOL)),
-+        (FINAL_PROTOCOL_VERSION, "tools/call", Some("other")),
-+        (FINAL_PROTOCOL_VERSION, "tools/call", None),
++fn malformed_schema_is_rejected_before_any_review_callback() {
++    for source in [
++        json!({"type":"string"}),
++        json!({"type":"object","properties":{"x":{"type":"object","x-mcp-header":"X"}}}),
++        json!({"type":"object","properties":{
++            "x":{"type":"string","x-mcp-header":"Same"},
++            "y":{"type":"string","x-mcp-header":"same"}
++        }}),
++        json!({"type":"object","properties":{"x":{"type":"string","x-mcp-header":"X\r\nBad"}}}),
 +    ] {
-+        let wire = from_document(TARGET, &original, version, method, name);
-+        assert_eq!(wire.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::OperationMismatch);
-+    }
-+    for pointer in ["/method", "/params/name", "/params/_meta/io.modelcontextprotocol~1protocolVersion"] {
-+        let mut altered = original.clone();
-+        *altered.pointer_mut(pointer).unwrap() = json!("different");
-+        assert!(from_document(TARGET, &altered, FINAL_PROTOCOL_VERSION, "tools/call", Some(TOOL))
-+            .with_reviewed_tool_headers(&reviewed()).is_err());
-+    }
-+    let response = ModernHttpRequest::for_jsonrpc_response(TARGET, FINAL_PROTOCOL_VERSION, br#"{"jsonrpc":"2.0","id":17,"result":{}}"#.to_vec()).unwrap();
-+    assert_eq!(response.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::OperationMismatch);
-+}
-+
-+#[test]
-+fn duplicate_members_batches_notifications_and_unversioned_bodies_cannot_project() {
-+    let source = serde_json::to_string(&document(Some(json!({"region":"eu"})))).unwrap();
-+    let duplicate = source.replacen("\"region\":\"eu\"", "\"region\":\"eu\",\"region\":\"other\"", 1);
-+    let mut notification = document(None);
-+    notification.as_object_mut().unwrap().remove("id");
-+    let mut unversioned = document(None);
-+    unversioned["params"].as_object_mut().unwrap().remove("_meta");
-+    for source in [format!("[{source}]"), duplicate, notification.to_string(), unversioned.to_string()] {
-+        let wire = ModernHttpRequest::new(TARGET, source.into_bytes(), FINAL_PROTOCOL_VERSION, "tools/call", Some(TOOL.to_owned())).unwrap();
-+        assert!(wire.with_reviewed_tool_headers(&reviewed()).is_err());
++        let mut calls = 0;
++        assert!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", source, |_| {
++            calls += 1;
++            true
++        }).is_err());
++        assert_eq!(calls, 0);
 +    }
 +}
 +
 +#[test]
-+fn absent_and_null_fields_are_omitted_without_general_argument_validation() {
-+    for arguments in [None, Some(json!({})), Some(json!({"region":null,"count":null,"verbose":null,"options":null}))] {
-+        let wire = request(arguments).with_reviewed_tool_headers(&reviewed()).unwrap();
-+        assert!(fields(&wire).is_empty());
-+        // An empty projection must not permit replacement by a different plan.
-+        assert_eq!(wire.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::AlreadyProjected);
++fn approved_values_with_unicode_controls_or_sentinels_remain_one_safe_field() {
++    for value in ["雪", " a ", "\t", "a\r\nInjected: yes", "\0", "=?base64?YWJj?=", "=?base64?="] {
++        let request = wire(TARGET, body(Some(json!({"region":value}))))
++            .with_reviewed_tool_headers(&plan()).unwrap();
++        let fields = parameters(&request);
++        assert_eq!(fields.len(), 1);
++        assert!(!fields[0].1.contains(['\r', '\n', '\0']));
++        assert_eq!(decode_mcp_header_value(fields[0].1.as_bytes()).unwrap(), value);
 +    }
 +}
 +
 +#[test]
-+fn unicode_controls_whitespace_and_sentinel_literals_use_single_decoding() {
-+    for value in ["Hello, 世界", " padded ", "\t", "line\r\ninjection: no", "\0", "=?base64?bGl0ZXJhbA==?=", ""] {
-+        let wire = request(Some(json!({"region":value}))).with_reviewed_tool_headers(&reviewed()).unwrap();
-+        let projected = fields(&wire);
-+        assert_eq!(projected.len(), 1);
-+        assert_eq!(decode_mcp_header_value(projected[0].1.as_bytes()).unwrap(), value);
-+        assert!(projected[0].1.bytes().all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte)));
++fn null_and_absent_fields_are_omitted_without_rewriting_arguments() {
++    for arguments in [None, Some(json!({})), Some(json!({"region":null,"options":null}))] {
++        let before = body(arguments);
++        let request = wire(TARGET, before.clone()).with_reviewed_tool_headers(&plan()).unwrap();
++        assert!(parameters(&request).is_empty());
++        assert_eq!(request.body(), before);
++        assert!(matches!(request.with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::AlreadyProjected)));
 +    }
 +}
 +
 +#[test]
-+fn exact_safe_integer_projection_never_rounds_a_fraction_into_a_header() {
-+    for (lexeme, expected) in [("42.0", "42"), ("4.2e1", "42"), ("-0", "0"), ("9007199254740991", "9007199254740991")] {
-+        let arguments: Value = serde_json::from_str(&format!("{{\"count\":{lexeme}}}")).unwrap();
-+        let wire = request(Some(arguments)).with_reviewed_tool_headers(&reviewed()).unwrap();
-+        assert_eq!(fields(&wire)[0].1, expected);
-+    }
-+    for lexeme in ["42.00000000000000001", "9007199254740992", "9007199254740990.5"] {
-+        let arguments: Value = serde_json::from_str(&format!("{{\"region\":\"valid sibling\",\"count\":{lexeme}}}")).unwrap();
-+        assert!(matches!(request(Some(arguments)).with_reviewed_tool_headers(&reviewed()),
-+            Err(ToolHeaderDispatchError::Projection(McpHeaderError::InvalidParameter))));
++fn one_invalid_sibling_refuses_the_complete_projection() {
++    for arguments in [
++        json!({"region":"valid","count":"2"}),
++        json!({"region":"valid","count":MAX_PARAMETER_HEADER_INTEGER + 1}),
++        json!({"region":"valid","verbose":1}),
++        json!({"region":"valid","options":{"a/b~.0":42}}),
++    ] {
++        let original = wire(TARGET, body(Some(arguments)));
++        assert!(original.clone().with_reviewed_tool_headers(&plan()).is_err());
++        assert!(parameters(&original).is_empty());
 +    }
 +}
 +
 +#[test]
-+fn projection_is_atomic_on_wrong_primitive_and_over_limit_values() {
-+    for invalid in [json!(42), json!(true), json!([]), json!({})] {
-+        let wire = request(Some(json!({"count":1,"region":invalid})));
-+        let original = wire.clone();
-+        assert!(wire.with_reviewed_tool_headers(&reviewed()).is_err());
-+        assert!(fields(&original).is_empty());
-+        assert!(!original.body().is_empty());
++fn binding_refuses_cleartext_userinfo_fragments_and_hostile_tool_names() {
++    for target in ["http://tools.example/mcp", "http://localhost/mcp", "https://user@tools.example/mcp", "https://tools.example/mcp#"] {
++        assert!(matches!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(target).unwrap(), "lookup", schema(), |_| true),
++            Err(ToolHeaderDispatchError::InvalidBinding)));
 +    }
-+    let exact = "x".repeat(MAX_MCP_HEADER_VALUE_BYTES);
-+    assert!(request(Some(json!({"region":exact}))).with_reviewed_tool_headers(&reviewed()).is_ok());
-+    let over = "x".repeat(MAX_MCP_HEADER_VALUE_BYTES + 1);
-+    assert!(matches!(request(Some(json!({"region":over}))).with_reviewed_tool_headers(&reviewed()),
-+        Err(ToolHeaderDispatchError::Projection(McpHeaderError::LimitExceeded))));
-+    let oversized = ModernHttpRequest::new(TARGET, vec![b' '; MAX_TOOL_HEADER_REQUEST_BYTES + 1], FINAL_PROTOCOL_VERSION,
-+        "tools/call", Some(TOOL.to_owned())).unwrap();
-+    assert_eq!(oversized.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::RequestTooLarge);
++    for name in ["", "bad\r\nname"] {
++        assert!(matches!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), name, schema(), |_| true),
++            Err(ToolHeaderDispatchError::InvalidBinding)));
++    }
 +}
 +
 +#[test]
-+fn credentials_and_parameter_headers_survive_either_attachment_order_and_cloning() {
-+    let credential = BoundBearerCredential::bind(CanonicalHttpUrl::parse(TARGET).unwrap(), "test-only-credential").unwrap();
-+    let input = request(Some(json!({"region":"eu"})));
-+    let first = input.clone().with_authorization(&credential).with_reviewed_tool_headers(&reviewed()).unwrap();
-+    let second = input.with_reviewed_tool_headers(&reviewed()).unwrap().with_authorization(&credential);
-+    assert_eq!(first.headers(), second.headers());
-+    assert_eq!(first.clone().headers(), first.headers());
-+    assert!(first.headers().iter().any(|(name, value)| name == "Authorization" && value == "Bearer test-only-credential"));
-+    assert_eq!(first.with_reviewed_tool_headers(&reviewed()).unwrap_err(), ToolHeaderDispatchError::AlreadyProjected);
++fn a_plan_cannot_cross_an_endpoint_path_query_authority_or_scheme() {
++    let review = plan();
++    for target in ["https://other.example/mcp", "https://tools.example/other", "https://tools.example/mcp?q=1", "http://tools.example/mcp"] {
++        assert!(matches!(wire(target, body(None)).with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::TargetMismatch)));
++    }
++    assert!(wire("https://TOOLS.EXAMPLE:443/mcp", body(None)).with_reviewed_tool_headers(&review).is_ok());
 +}
 +
 +#[test]
-+fn source_schema_and_projected_values_are_not_disclosed_by_debug_or_errors() {
-+    let review = reviewed();
-+    assert_eq!(review.schema(), &schema());
-+    let wire = request(Some(json!({"region":"argument-canary"}))).with_reviewed_tool_headers(&review).unwrap();
-+    let debug = format!("{review:?} {wire:?}");
-+    assert!(!debug.contains("argument-canary"));
-+    assert!(!format!("{review:?}").contains("Region"));
-+    for error in [ToolHeaderDispatchError::DisclosureDenied, ToolHeaderDispatchError::TargetMismatch,
-+        ToolHeaderDispatchError::Projection(McpHeaderError::InvalidParameter)] {
-+        assert!(!format!("{error:?} {error}").contains("argument-canary"));
++fn wrong_operation_name_version_and_reverse_response_cannot_project() {
++    let review = plan();
++    for request in [
++        ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "prompts/get", Some("lookup".to_owned())).unwrap(),
++        ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "tools/call", Some("other".to_owned())).unwrap(),
++        ModernHttpRequest::new(TARGET, body(None), "2024-11-05", "tools/call", Some("lookup".to_owned())).unwrap(),
++        ModernHttpRequest::for_jsonrpc_response(TARGET, FINAL_PROTOCOL_VERSION, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec()).unwrap(),
++    ] {
++        assert!(matches!(request.with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::OperationMismatch)));
++    }
++}
++
++#[test]
++fn inconsistent_raw_body_and_metadata_cannot_be_hidden_by_valid_routing_headers() {
++    let original: Value = serde_json::from_slice(&body(Some(json!({"region":"eu"})))).unwrap();
++    let mut variants = Vec::new();
++    let mut value = original.clone();
++    value["method"] = json!("prompts/get");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"]["name"] = json!("other");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"]["_meta"][FINAL_PROTOCOL_VERSION_META_KEY] = json!("2024-11-05");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"].as_object_mut().unwrap().remove("_meta");
++    variants.push(value);
++    let mut value = original;
++    value.as_object_mut().unwrap().remove("id");
++    variants.push(value);
++    for value in variants {
++        assert!(wire(TARGET, serde_json::to_vec(&value).unwrap()).with_reviewed_tool_headers(&plan()).is_err());
++    }
++}
++
++#[test]
++fn raw_duplicate_members_batches_and_trailing_documents_are_rejected() {
++    let valid = String::from_utf8(body(Some(json!({"region":"eu"})))).unwrap();
++    let duplicate_id = valid.replacen("\"id\":17", "\"id\":17,\"id\":17", 1);
++    let duplicate_argument = valid.replacen("\"region\":\"eu\"", "\"region\":\"eu\",\"region\":\"us\"", 1);
++    assert_ne!(duplicate_id, valid);
++    assert_ne!(duplicate_argument, valid);
++    for invalid in [duplicate_id, duplicate_argument, format!("[{valid}]"), format!("{valid}{valid}")] {
++        assert!(matches!(wire(TARGET, invalid.into_bytes()).with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::InvalidRequest)));
++    }
++}
++
++#[test]
++fn source_size_is_bounded_before_decoding_or_projection() {
++    let mut source = body(None);
++    source.resize(MAX_TOOL_HEADER_REQUEST_BYTES, b' ');
++    assert!(wire(TARGET, source.clone()).with_reviewed_tool_headers(&plan()).is_ok());
++    source.push(b' ');
++    assert!(matches!(wire(TARGET, source).with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::RequestTooLarge)));
++}
++
++#[test]
++fn fresh_credential_serialization_retains_headers_without_reusing_old_authorization() {
++    let resource = CanonicalHttpUrl::parse(TARGET).unwrap();
++    let old = BoundBearerCredential::bind(resource.clone(), "old-test-credential").unwrap();
++    let fresh = BoundBearerCredential::bind(resource, "fresh-test-credential").unwrap();
++    let request = wire(TARGET, body(Some(json!({"region":"eu"}))))
++        .with_authorization(&old).with_reviewed_tool_headers(&plan()).unwrap();
++    let fields = request.headers_with_credential(Some(&fresh));
++    assert!(fields.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++    assert!(fields.iter().any(|(name, value)| name == "Authorization" && value == "Bearer fresh-test-credential"));
++    assert!(!fields.iter().any(|(_, value)| value.contains("old-test-credential")));
++    fresh.revoke();
++    let fields = request.headers_with_credential(Some(&fresh));
++    assert!(!fields.iter().any(|(name, _)| name == "Authorization"));
++    assert!(fields.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++}
++
++#[test]
++fn mcp_name_encoding_preserves_logical_identity_and_keeps_wire_fields_safe() {
++    for name in ["lookup", "雪", " lookup ", "=?base64?YWJj?="] {
++        let mut document: Value = serde_json::from_slice(&body(None)).unwrap();
++        document["params"]["name"] = json!(name);
++        let source = serde_json::to_vec(&document).unwrap();
++        let review = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), name, schema(), |_| true).unwrap();
++        let request = ModernHttpRequest::new(TARGET, source.clone(), FINAL_PROTOCOL_VERSION, "tools/call", Some(name.to_owned()))
++            .unwrap().with_reviewed_tool_headers(&review).unwrap();
++        let headers = request.headers();
++        let encoded = &headers.iter().find(|(key, _)| key == "Mcp-Name").unwrap().1;
++        assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), name);
++        assert_eq!(request.name.as_deref(), Some(name));
++        assert_eq!(request.body(), source);
++    }
++}
+diff --git a/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
+@@ -0,0 +1,169 @@
++//! Explicit parameter-header disclosure through the managed OAuth call owner.
++//!
++//! Reuses the normal core codec, managed credential lifecycle, one-POST dispatch,
++//! incremental notifications and request-local cancellation. An annotation in a
++//! catalog is never sufficient to enable this API: the host supplies a reviewed
++//! plan bound to this resource and tool. Ordinary calls remain header-free.
++
++use std::fmt;
++
++use asupersync::Cx;
++use fastmcp_core::McpRequestCancellation;
++use fastmcp_protocol::{CoreRequest, RequestId};
++
++use super::{
++    CoreDecoder, ManagedCoreCall, ManagedCoreError, ManagedCoreLimits,
++    ManagedOAuthSession, bounded_wait, call_deadline, prepare,
++};
++use crate::http_executor::ModernHttpRequest;
++use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
++
++/// Header admission and core transport errors contain no disclosed values.
++#[derive(Debug)]
++pub enum ManagedToolHeaderError {
++    Headers(ToolHeaderDispatchError),
++    Core(ManagedCoreError),
++}
++
++impl fmt::Display for ManagedToolHeaderError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Headers(error) => fmt::Display::fmt(error, f),
++            Self::Core(error) => fmt::Display::fmt(error, f),
++        }
++    }
++}
++
++impl std::error::Error for ManagedToolHeaderError {}
++impl From<ToolHeaderDispatchError> for ManagedToolHeaderError {
++    fn from(error: ToolHeaderDispatchError) -> Self { Self::Headers(error) }
++}
++impl From<ManagedCoreError> for ManagedToolHeaderError {
++    fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
++}
++
++// One preparation path is shared by initial calls and explicit continuations.
++// It must run before credential acquisition and before consuming retry state.
++pub(crate) fn prepare_optional(
++    target: &str,
++    request: CoreRequest,
++    request_id: RequestId,
++    limits: ManagedCoreLimits,
++    reviewed: Option<&ReviewedToolHeaders>,
++) -> Result<(ModernHttpRequest, CoreDecoder), ManagedToolHeaderError> {
++    let (wire, decoder) = prepare(target, request, request_id, limits)?;
++    let wire = match reviewed {
++        Some(reviewed) => wire.with_reviewed_tool_headers(reviewed)?,
++        None => wire,
++    };
++    Ok((wire, decoder))
++}
++
++impl ManagedOAuthSession {
++    /// Sends one tools/call with explicitly reviewed schema-derived headers.
++    /// All binding, body, field-type and byte checks run before renewal or I/O.
++    /// This returns the ordinary incremental core call; an input-required result
++    /// does not automatically trigger a continuation or an input resolver.
++    pub async fn request_tool_with_headers(
++        &self,
++        cx: &Cx,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: &ReviewedToolHeaders,
++        limits: ManagedCoreLimits,
++    ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
++        self.request_tool_with_headers_and_cancellation(
++            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
++        ).await
++    }
++
++    /// Retains one cancellation domain and absolute deadline through preparation,
++    /// credential renewal and every response read. No sibling is cancelled and
++    /// no side-effecting operation is replayed by this method.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn request_tool_with_headers_and_cancellation(
++        &self,
++        cx: &Cx,
++        cancellation: &McpRequestCancellation,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: &ReviewedToolHeaders,
++        limits: ManagedCoreLimits,
++    ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
++        let deadline = call_deadline(cx, cancellation, limits.timeout)?;
++        let (wire, decoder) = prepare_optional(
++            self.resource().as_str(), request, request_id, limits, Some(reviewed),
++        )?;
++        let response = bounded_wait(cx, cancellation, deadline, async {
++            self.execute_with_cancellation(cx, cancellation, &wire)
++                .await.map_err(ManagedCoreError::from)
++        }).await?;
++        ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
++            .map_err(ManagedToolHeaderError::from)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use fastmcp_core::CanonicalHttpUrl;
++    use fastmcp_protocol::protocol_policy::ProtocolEra;
++    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
++    use serde_json::{Value, json};
++
++    const TARGET: &str = "https://tools.example/mcp";
++
++    fn review() -> ReviewedToolHeaders {
++        ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", json!({
++            "type":"object", "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
++        }), |binding| binding.property_path() == ["region".to_owned()]
++            && binding.header_name() == "Mcp-Param-Region").unwrap()
++    }
++
++    fn request(method: &str, mut params: Value) -> CoreRequest {
++        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
++        CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
++    }
++
++    #[test]
++    fn managed_preparation_retains_the_core_decoder_and_exact_parameters() {
++        let request = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu","private":"body-only"}}));
++        let before = request.encode_params().unwrap().unwrap();
++        let (wire, decoder) = prepare_optional(TARGET, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())).unwrap();
++        let body: Value = serde_json::from_slice(wire.body()).unwrap();
++        assert_eq!(body["params"], before);
++        assert_eq!(body["id"], 17);
++        assert_eq!(decoder.request_id, RequestId::Number(17));
++        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++        assert!(!wire.headers().iter().any(|(_, value)| value.contains("body-only")));
++        assert!(!wire.headers().iter().any(|(name, _)| name == "Authorization"));
++    }
++
++    #[test]
++    fn invalid_binding_type_or_size_fails_during_local_preparation() {
++        let review = review();
++        for (target, request) in [
++            ("https://tools.example/other", request("tools/call", json!({"name":"lookup"}))),
++            (TARGET, request("tools/call", json!({"name":"other"}))),
++            (TARGET, request("tools/call", json!({"name":"lookup","arguments":{"region":42}}))),
++            (TARGET, request("tools/list", json!({}))),
++        ] {
++            assert!(prepare_optional(target, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review)).is_err());
++        }
++        let tiny = ManagedCoreLimits::new(1, 1024, 1024, 1, std::time::Duration::from_secs(1)).unwrap();
++        assert!(matches!(prepare_optional(TARGET, request("tools/call", json!({"name":"lookup"})), RequestId::Number(17), tiny, Some(&review)),
++            Err(ManagedToolHeaderError::Core(ManagedCoreError::RequestTooLarge))));
++    }
++
++    #[test]
++    fn header_opt_in_does_not_activate_extensions_or_change_ordinary_calls() {
++        let core = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu"}}));
++        let (ordinary, _) = prepare_optional(TARGET, core.clone(), RequestId::Number(17), ManagedCoreLimits::default(), None).unwrap();
++        assert!(!ordinary.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
++        let mut params = core.encode_params().unwrap().unwrap();
++        params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] = json!({"io.modelcontextprotocol/tasks":{}});
++        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
++        assert!(matches!(prepare_optional(TARGET, core, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())),
++            Err(ManagedToolHeaderError::Core(ManagedCoreError::UnsupportedRequest))));
 +    }
 +}
