@@ -125,7 +125,7 @@ pub use handler::{
     FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
     FinalRoots, FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler, ResourceHandler,
-    ToolErrorKind, ToolExecutionMode, ToolHandler, create_context_with_progress,
+    ToolErrorKind, ToolExecutionMode, ToolHandler, UriParams, create_context_with_progress,
     create_context_with_progress_and_senders, promote_legacy_prompt_messages,
     promote_legacy_resource_contents, promote_legacy_tool_content,
 };

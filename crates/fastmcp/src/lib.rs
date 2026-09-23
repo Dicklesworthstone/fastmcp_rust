@@ -402,8 +402,9 @@ pub mod server {
         ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
         StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
         ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-        TransportRootsProvider, TransportSamplingSender, caching, create_context_with_progress,
-        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
+        TransportRootsProvider, TransportSamplingSender, UriParams, caching,
+        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
+        providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -789,7 +790,7 @@ pub use fastmcp_server::{
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
     StaticTokenVerifier, StatsSnapshot, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
     TokenVerifier, ToolErrorKind, ToolExecutionMode, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, UriParams,
     create_context_with_progress, create_context_with_progress_and_senders,
 };
 #[cfg(feature = "websocket-experimental")]
@@ -2779,7 +2780,7 @@ pub mod modern {
         ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
         ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
         ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-        TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
+        TransportRootsProvider, TransportSamplingSender, UriParams, create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -7135,7 +7136,7 @@ pub mod legacy_2024 {
         AuthProvider, BannerStyle, CompletionHandler, ConsoleConfig, DuplicateBehavior,
         HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, Middleware,
         PromptHandler, ResourceHandler, ServerLaunchPolicyError, ToolErrorKind, ToolExecutionMode,
-        ToolHandler, TrafficVerbosity,
+        ToolHandler, TrafficVerbosity, UriParams,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -10630,7 +10631,7 @@ pub mod prelude {
         SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
         StdioRequestExecution, StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem,
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, decode_strict_jsonrpc_message,
+        TransportSamplingSender, UriParams, decode_strict_jsonrpc_message,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{
@@ -10708,6 +10709,71 @@ mod tests {
             prompt.definition().name,
             "facade_private_core_generated_prompt"
         );
+    }
+
+    /// A templated resource written only against the facade: overriding
+    /// `ResourceHandler::read_with_uri` requires naming its `UriParams`
+    /// parameter type through the public surface (GitHub #75).
+    struct FacadeTemplatedResource;
+
+    impl ResourceHandler for FacadeTemplatedResource {
+        fn definition(&self) -> fastmcp_protocol::Resource {
+            fastmcp_protocol::Resource {
+                uri: "test://facade/items/{id}".to_owned(),
+                name: "facade-templated".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            params: &super::prelude::UriParams,
+        ) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: params.get("id").cloned(),
+                blob: None,
+            }])
+        }
+    }
+
+    #[test]
+    fn uri_params_is_reexported_on_every_resource_handler_surface() {
+        // Every facade path that exports `ResourceHandler` also names the
+        // parameter type of its `read_with_uri` hook, and they are one type.
+        let from_prelude: super::prelude::UriParams =
+            super::prelude::UriParams::from([("id".to_owned(), "42".to_owned())]);
+        let from_root: &super::UriParams = &from_prelude;
+        let from_modern: &super::modern::UriParams = from_root;
+        let from_server: &super::server::UriParams = from_modern;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let from_server: &super::legacy_2024::UriParams = from_server;
+        let _: &fastmcp_server::UriParams = from_server;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller-owned runtime must build");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must provide Cx");
+            let context = McpContext::new(cx, 7);
+            let contents = FacadeTemplatedResource
+                .read_with_uri(&context, "test://facade/items/42", from_server)
+                .expect("templated read succeeds");
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].uri, "test://facade/items/42");
+            assert_eq!(contents[0].text.as_deref(), Some("42"));
+        });
     }
 
     #[test]
