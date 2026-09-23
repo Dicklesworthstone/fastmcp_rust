@@ -24,6 +24,7 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -129,31 +130,53 @@ impl BlockingHandlerLane {
         if !capabilities.spawn || !capabilities.time || request_cx.timer_driver().is_none() {
             return Err(unavailable("blocking handlers require caller-owned spawn and timers"));
         }
-        if request_cx.blocking_pool_handle().is_none() {
-            return Err(unavailable("blocking handlers require an installed caller-owned blocking pool"));
-        }
+        let pool = request_cx.blocking_pool_handle().ok_or_else(|| {
+            unavailable("blocking handlers require an installed caller-owned blocking pool")
+        })?;
         let charge = self.reserve()?;
         let worker_charge = Arc::clone(&charge);
         let worker_context = context.clone();
-        let worker = request_cx.spawn_blocking(move |worker_cx| {
-            // This reservation outlives user work, unwinding, and disposal of a
-            // result that can no longer be delivered. Aborting the wait cannot
-            // release it while the synchronous closure remains on the stack.
-            let _charge = worker_charge;
-            _charge.0.process.verify().map_err(|_| unavailable("blocking handler process changed"))?;
-            // Pool presence was checked before spawn, so this closure cannot
-            // use asupersync's inline fallback. Its caller keeps driving the
-            // runtime while this worker may wait for a reverse request. Mark
-            // only this synchronous scope, never the async admission/join path.
-            let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
+        let worker = request_cx.spawn(move |worker_cx| async move {
+            let _child_charge = Arc::clone(&worker_charge);
             let context = worker_context.with_request_cx(worker_cx);
-            let _current = Cx::set_current(Some(context.cx().clone()));
-            let _worker_scope = bridge::WorkerScope::enter(Arc::clone(&_charge.0), context.clone());
-            context.checkpoint().map_err(|_| McpError::request_cancelled())?;
-            let result = catch_unwind(AssertUnwindSafe(|| work(&context)))
-                .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
             context.ensure_live().map_err(|_| McpError::request_cancelled())?;
-            result
+            let (sender, mut receiver) = oneshot::channel();
+            let completion = Arc::new(PoolCompletion::default());
+            let job = PoolWork {
+                work: Some(work),
+                context: context.clone(),
+                charge: worker_charge,
+                _completion: PoolCompletionGuard(Arc::clone(&completion)),
+            };
+            // Cx::spawn_blocking runs its closure inline if a present pool
+            // rejects submission or loses its last worker. Submit only through
+            // the raw pool, which drops rejected work without invoking it. Keep
+            // the enclosing Cx task for child identity and region cancellation.
+            let pool_task = pool.spawn(move || job.run(sender));
+            let pool_task = crate::BlockingTaskGuard(pool_task);
+            let received = receiver.recv(context.cx()).await;
+            if matches!(&received, Err(oneshot::RecvError::Cancelled))
+                || context.ensure_live().is_err()
+            {
+                pool_task.0.cancel();
+            }
+            // A cancelled Sleep is immediately ready. Use a completion wake
+            // that ignores cancellation so draining a non-preemptible syscall
+            // neither spins nor declares its region quiescent prematurely.
+            completion.changed.wait_until(|| completion.done.load(Ordering::Acquire)).await;
+            // Cancellation dominates a simultaneous sender-close or result.
+            // Pool rejection alone has its own stable, redacted error.
+            context.ensure_live().map_err(|_| McpError::request_cancelled())?;
+            match received {
+                Ok(result) => result,
+                Err(oneshot::RecvError::Cancelled) => Err(McpError::request_cancelled()),
+                Err(oneshot::RecvError::Closed) => {
+                    Err(unavailable("blocking handler admission to caller blocking pool failed"))
+                }
+                Err(oneshot::RecvError::PolledAfterCompletion) => {
+                    Err(unavailable("blocking handler worker did not complete"))
+                }
+            }
         }).map_err(|_| unavailable("blocking handler admission to caller runtime failed"))?;
         let mut owner = WorkerOwner { worker: Some(worker), _charge: charge };
         let result = wait(&context, async {
@@ -197,6 +220,56 @@ impl<T: Send + 'static> Drop for WorkerOwner<T> {
         if self._charge.0.process.verify().is_ok() {
             if let Some(worker) = &self.worker { worker.abort(); }
         }
+    }
+}
+
+#[derive(Default)]
+struct PoolCompletion {
+    done: AtomicBool,
+    changed: Notify,
+}
+
+struct PoolCompletionGuard(Arc<PoolCompletion>);
+
+impl Drop for PoolCompletionGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        let _ = catch_unwind(AssertUnwindSafe(|| self.0.changed.notify_waiters()));
+    }
+}
+
+// Struct fields drop in declaration order, including when a rejected or
+// cancelled queued pool closure is never invoked. Publish completion only
+// after releasing the callback, its context, and the worker's reservation.
+struct PoolWork<F> {
+    work: Option<F>,
+    context: McpContext,
+    charge: Arc<Charge>,
+    _completion: PoolCompletionGuard,
+}
+
+impl<F> PoolWork<F> {
+    fn run<T>(mut self, sender: oneshot::Sender<McpResult<T>>)
+    where F: FnOnce(&McpContext) -> McpResult<T>,
+    {
+        let result = (|| {
+            self.charge.0.process.verify()
+                .map_err(|_| unavailable("blocking handler process changed"))?;
+            let _blocking_lane = fastmcp_core::runtime::enter_blocking_lane();
+            let _current = Cx::set_current(Some(self.context.cx().clone()));
+            let _worker_scope = bridge::WorkerScope::enter(
+                Arc::clone(&self.charge.0), self.context.clone(),
+            );
+            self.context.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            let work = self.work.take().expect("pool work is invoked once");
+            let result = catch_unwind(AssertUnwindSafe(|| work(&self.context)))
+                .map_err(|_| unavailable("blocking handler panicked; payload redacted"))?;
+            self.context.ensure_live().map_err(|_| McpError::request_cancelled())?;
+            result
+        })();
+        // Self retains the reservation through publication and through the
+        // destruction of a result whose receiver has disappeared.
+        let _ = sender.send_blocking(result);
     }
 }
 
@@ -651,6 +724,122 @@ mod tests {
                 assert_eq!(lane.in_flight().unwrap(), 0);
             });
         }
+    }
+
+    #[test]
+    fn caller_owned_pool_admission_preserves_child_context_and_wait_bridge() {
+        pool_admission_probe(false);
+    }
+
+    #[test]
+    fn rejected_pool_never_executes_handler_or_installs_driver_markers() {
+        pool_admission_probe(true);
+    }
+
+    fn pool_admission_probe(rejected: bool) {
+        let pool = asupersync::runtime::BlockingPool::new(0, 1);
+        if rejected { pool.shutdown(); }
+        runtime(false).block_on(async {
+            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let (sampler, _received, _reply) = sampling_peer(&cx);
+            let context = McpContext::new(cx.clone(), 7).with_sampling(sampler.clone());
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let admitted = lane.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let poller = std::thread::current().id();
+            let parent_task = cx.task_id();
+            let result = lane.execute(&context, &cx, move |worker_ctx| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_ne!(std::thread::current().id(), poller);
+                assert_ne!(worker_ctx.task_id(), parent_task);
+                assert_eq!(worker_ctx.request_id(), 7);
+                admitted.wait_for(async {
+                    assert_eq!(Cx::current().unwrap().task_id(), worker_ctx.task_id());
+                    Ok(81)
+                })
+            }).await;
+            if rejected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+                assert!(error.to_string().contains(
+                    "blocking handler admission to caller blocking pool failed",
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(result.unwrap(), 81);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(lane.in_flight().unwrap(), 0);
+            // Neither outcome grants the driver a worker-only wait bridge or
+            // permission to block a sampling request's own response pump.
+            let polls = AtomicUsize::new(0);
+            assert!(lane.wait_for(async { polls.fetch_add(1, Ordering::SeqCst); Ok(()) }).is_err());
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            let error = fastmcp_core::block_on(context.sample("must not send", 17)).unwrap_err();
+            assert!(error.to_string().contains("Sampling cannot complete from here"));
+            assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+            assert!(context.ensure_live().is_ok());
+        });
+        assert!(pool.shutdown_and_wait(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn cancelled_queued_call_never_invokes_handler_or_releases_capacity_early() {
+        let pool = asupersync::runtime::BlockingPool::new(0, 1);
+        let (started, entered) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, blocked) = std::sync::mpsc::sync_channel::<()>(1);
+        let occupying = pool.spawn(move || {
+            started.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(5)).expect("test releases its occupying worker");
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime(false).block_on(async {
+            let cx = Cx::current().unwrap().with_blocking_pool_handle(Some(pool.handle()));
+            let context = McpContext::new(cx.clone(), 7);
+            let sibling = McpContext::new(cx.clone(), 8).with_operation_deadline(Some(
+                cx.now().saturating_add_nanos(5_000_000_000),
+            ));
+            let lane = BlockingHandlerLane::new(1).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let mut call = Box::pin(lane.execute(&context, &cx, move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(21)
+            }));
+            let mut deadline = std::pin::pin!(Sleep::new(
+                cx.now().saturating_add_nanos(5_000_000_000),
+            ));
+            let mut admission_tick = Box::pin(Sleep::new(
+                cx.now().saturating_add_nanos(1_000_000),
+            ));
+            poll_fn(|task| {
+                assert!(call.as_mut().poll(task).is_pending());
+                assert!(deadline.as_mut().poll(task).is_pending(), "pool admission timed out");
+                if pool.pending_count() == 1 { return Poll::Ready(()); }
+                if admission_tick.as_mut().poll(task).is_ready() {
+                    admission_tick = Box::pin(Sleep::new(
+                        cx.now().saturating_add_nanos(1_000_000),
+                    ));
+                    let _ = admission_tick.as_mut().poll(task);
+                }
+                Poll::Pending
+            }).await;
+            context.request_cancellation().cancel();
+            let error = call.await.unwrap_err();
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+            assert_eq!(lane.in_flight().unwrap(), 1, "queued work still owns its reservation");
+            assert!(lane.execute(&sibling, &cx, |_| Ok(22)).await.is_err());
+            assert!(cx.checkpoint().is_ok(), "cancelling the child must not cancel its caller");
+            release.send(()).unwrap();
+            lane.wait_idle(&sibling).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(lane.in_flight().unwrap(), 0);
+            assert_eq!(lane.execute(&sibling, &cx, |_| Ok(23)).await.unwrap(), 23);
+            assert!(sibling.ensure_live().is_ok());
+        });
+        assert!(occupying.wait_timeout(Duration::from_secs(5)));
+        assert!(pool.shutdown_and_wait(Duration::from_secs(5)));
     }
 
     #[test]
