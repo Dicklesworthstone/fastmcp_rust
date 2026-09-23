@@ -86,6 +86,7 @@
 //! THREE DIFFERENT QUANTITIES, ALL TRUE OF THIS FILE AT ONCE. Only one is
 //! measured against the bead's bar, which is stated in GROUPS:
 //!
+//! ```text
 //!     distinct bNN group prefixes   <- THE GROUP FIGURE, vs the AC's 23
 //!         grep -oE '^fn (b[0-9]+)_' file | sort -u | wc -l
 //!     fn bNN_* definitions          <- larger; a group may hold two tests
@@ -93,6 +94,7 @@
 //!     #[test] attributes            <- larger still; adds the guard, the
 //!                                      two frozen IDs, and any second test
 //!         grep -cE '^[[:space:]]*#\[test\]' file
+//! ```
 //!
 //! DO NOT count `#[test]` unanchored. This prose mentions the token, so
 //! `grep -c '#\[test\]'` scores three higher than the truth -- and one of the
