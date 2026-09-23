@@ -31,6 +31,9 @@ pub mod interaction;
 /// Caller-driven catalog watches publishing invalidation-bound tool clients.
 pub mod catalog;
 
+mod validity;
+use validity::await_validity;
+
 /// Combined encoded-byte ceiling for one retained input/output schema pair.
 pub const MAX_MANAGED_TOOL_SCHEMA_BYTES: usize = 512 * 1024;
 /// Maximum UTF-8 bytes retained for a tool's exact, case-sensitive name.
@@ -85,6 +88,7 @@ struct ToolContract {
     input: AdmittedToolHeaderSchema,
     output: Option<AdmittedSchema>,
     invalidated: AtomicBool,
+    invalidation: McpRequestCancellation,
     catalog_invalidated: Option<Arc<AtomicBool>>,
 }
 
@@ -121,7 +125,13 @@ impl ToolContract {
             serde_json::to_writer(&mut bytes, output.schema())
                 .map_err(|_| ManagedToolError::SchemaTooLarge)?;
         }
-        Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false), catalog_invalidated: None })
+        Ok(Self { name: tool.name, input, output, invalidated: AtomicBool::new(false),
+            invalidation: McpRequestCancellation::new(), catalog_invalidated: None })
+    }
+
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+        self.invalidation.cancel();
     }
 
     fn is_invalidated(&self) -> bool {
@@ -233,9 +243,13 @@ impl ManagedToolClient {
     /// Refuses newly started calls and later publication through every clone.
     /// Calls admitted before invalidation may already be dispatching.
     /// Already-delivered events and server side effects cannot be recalled.
-    /// This does not wake an idle HTTP read: use the request's cancellation
-    /// handle for prompt abort. A new definition requires a new client.
-    pub fn invalidate(&self) { self.contract.invalidated.store(true, Ordering::Release); }
+    /// Wakes pending requests, reads and continuations through every clone.
+    /// Their owners must poll or drop them to release resources; no background
+    /// worker is created. The caller's cancellation handle and shared session
+    /// are not cancelled. Abandoning an in-flight OAuth renewal still retains
+    /// the session's existing fail-closed refresh-lineage policy and may require
+    /// a new login. A new definition requires a new client.
+    pub fn invalidate(&self) { self.contract.invalidate(); }
 
     pub fn is_invalidated(&self) -> bool { self.contract.is_invalidated() }
 
@@ -268,9 +282,11 @@ impl ManagedToolClient {
         check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
-        let call = self.session.request_core_with_cancellation(
-            cx, cancellation, request, request_id, limits,
-        ).await?;
+        let call = await_validity(cx, cancellation, &self.contract,
+            self.session.request_core_with_cancellation(
+                cx, cancellation, request, request_id, limits,
+            ),
+        ).await??;
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolCall {
             call: Some(call), contract: self.contract.clone(),
@@ -296,7 +312,8 @@ impl ManagedToolCall {
         if self.finished { return Ok(None); }
         let mut call = self.call.take().ok_or(ManagedToolError::Closed)?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
-        let event = call.next_event(cx).await?.ok_or(ManagedCoreError::MissingTerminal)?;
+        let event = await_validity(cx, &self.cancellation, &self.contract, call.next_event(cx))
+            .await??.ok_or(ManagedCoreError::MissingTerminal)?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         match &event {
             ManagedCoreEvent::Result(result) => {

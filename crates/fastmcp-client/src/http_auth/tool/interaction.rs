@@ -12,7 +12,7 @@ use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{CoreRequest, FinalInputResponses, InputRequiredResult, RequestId};
 
-use super::{ManagedToolClient, ManagedToolError, ToolContract, check_tool_call};
+use super::{ManagedToolClient, ManagedToolError, ToolContract, await_validity, check_tool_call};
 use crate::http_auth::rpc::{ManagedCoreError, interaction::{
     ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent,
     ManagedInteractionLimits,
@@ -75,9 +75,11 @@ impl ManagedToolClient {
         check_tool_call(cx, cancellation, &self.contract)?;
         self.contract.validate_request(&request)?;
         check_tool_call(cx, cancellation, &self.contract)?;
-        let operation = self.session.start_core_interaction_with_cancellation(
-            cx, cancellation, request, request_id, limits,
-        ).await?;
+        let operation = await_validity(cx, cancellation, &self.contract,
+            self.session.start_core_interaction_with_cancellation(
+                cx, cancellation, request, request_id, limits,
+            ),
+        ).await??;
         check_tool_call(cx, cancellation, &self.contract)?;
         Ok(ManagedToolInteraction {
             operation: Some(operation), contract: self.contract.clone(),
@@ -90,10 +92,11 @@ impl ManagedToolClient {
 /// the operation rather than making a possibly dispatched attempt reusable.
 /// A locally rejected answer retains the current challenge for correction.
 ///
-/// Contract invalidation prevents later entry/publication but cannot recall an
-/// already-admitted dispatch or wake an idle socket. Use the request's retained
-/// cancellation handle to interrupt waiting work. No resolver, replay, external
-/// action, detached worker, or new lifetime budget is introduced here.
+/// Contract invalidation wakes pending reads/resumes and prevents later
+/// entry/publication, but cannot recall an already-admitted dispatch. Cleanup
+/// occurs in the caller's next poll or Drop, without cancelling sibling tools
+/// or the shared session. No resolver, replay, external action, detached worker,
+/// or new lifetime budget is introduced here.
 pub struct ManagedToolInteraction {
     operation: Option<ManagedInteraction>,
     contract: Arc<ToolContract>,
@@ -132,7 +135,7 @@ impl ManagedToolInteraction {
     ) -> Result<Option<ManagedInteractionEvent>, ManagedToolInteractionError> {
         if self.finished { return Ok(None); }
         let mut operation = self.take_checked(cx)?;
-        let next = operation.next_event(cx).await;
+        let next = await_validity(cx, &self.cancellation, &self.contract, operation.next_event(cx)).await?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         let event = match next {
             Ok(Some(event)) => event,
@@ -194,13 +197,15 @@ impl ManagedToolInteraction {
             self.operation = Some(operation);
             return Err(ManagedInteractionError::NotAwaitingInput.into());
         }
-        let outcome = if partial {
-            // Only resume_partial supplies this mode, always with a map.
-            let responses = responses.ok_or(ManagedInteractionError::InvalidInputResponses)?;
-            operation.resume_partial(cx, request_id, responses).await
-        } else {
-            operation.resume(cx, request_id, responses).await
-        };
+        let outcome = await_validity(cx, &self.cancellation, &self.contract, async {
+            if partial {
+                // Only resume_partial supplies this mode, always with a map.
+                let responses = responses.ok_or(ManagedInteractionError::InvalidInputResponses)?;
+                operation.resume_partial(cx, request_id, responses).await
+            } else {
+                operation.resume(cx, request_id, responses).await
+            }
+        }).await?;
         check_tool_call(cx, &self.cancellation, &self.contract)?;
         // Before dispatch, the core owner retains a challenge on local refusal.
         // After dispatch, failures erase it. Never infer retry permission from
