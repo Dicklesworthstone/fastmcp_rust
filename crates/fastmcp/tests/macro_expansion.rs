@@ -3881,6 +3881,231 @@ fn json_schema_external_enum_reaches_registered_modern_tool() {
 }
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RecursiveSchemaNode {
+    value: i32,
+    children: Vec<Self>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum RecursiveSchemaExpression {
+    Literal(i64),
+    Negate(Box<Self>),
+    Add(Box<Self>, Box<Self>),
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct RecursiveSchemaBranch {
+    label: String,
+    edge: Option<Box<RecursiveSchemaEdge>>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum RecursiveSchemaEdge {
+    Finish,
+    Visit(RecursiveSchemaBranch),
+}
+
+#[test]
+fn json_schema_recursive_struct_preserves_constraints_at_every_level() {
+    let generated = RecursiveSchemaNode::try_json_schema()
+        .expect("finite local definitions represent a recursive Vec");
+    assert_eq!(generated, RecursiveSchemaNode::json_schema());
+    assert_eq!(generated["type"], "object");
+    assert_eq!(generated["$defs"].as_object().unwrap().len(), 1);
+    let schema = fastmcp_rust::schema::admit_final_schema(generated)
+        .expect("every recursive reference resolves inside the standalone document");
+    let valid = json!({
+        "value": 1,
+        "children": [{"value": 2, "children": [{"value": 3, "children": []}]}]
+    });
+    schema.validate(&valid).expect("nested tree is admitted");
+    let tree: RecursiveSchemaNode = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(tree).unwrap(), valid);
+    for invalid in [
+        json!({"value": 1, "children": [{"value": "two", "children": []}]}),
+        json!({"value": 1, "children": [{"value": 2, "children": [], "extra": true}]}),
+        json!({"value": 1, "children": [{"value": 2}]}),
+    ] {
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<RecursiveSchemaNode>(invalid).is_err());
+    }
+}
+
+#[test]
+fn json_schema_recursive_enum_and_mutual_recursion_follow_serde() {
+    let expression_schema =
+        fastmcp_rust::schema::admit_final_schema(RecursiveSchemaExpression::json_schema())
+            .expect("recursive enum emits a closed local reference graph");
+    let expression = RecursiveSchemaExpression::Add(
+        Box::new(RecursiveSchemaExpression::Literal(4)),
+        Box::new(RecursiveSchemaExpression::Negate(Box::new(
+            RecursiveSchemaExpression::Literal(2),
+        ))),
+    );
+    let valid = serde_json::to_value(&expression).unwrap();
+    expression_schema.validate(&valid).unwrap();
+    assert_eq!(
+        serde_json::from_value::<RecursiveSchemaExpression>(valid.clone()).unwrap(),
+        expression
+    );
+    let mut invalid = valid;
+    invalid["Add"][1]["Negate"]["Literal"] = json!("two");
+    assert!(expression_schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<RecursiveSchemaExpression>(invalid).is_err());
+
+    let branch_schema =
+        fastmcp_rust::schema::admit_final_schema(RecursiveSchemaBranch::json_schema())
+            .expect("mutually recursive types resolve in one generation context");
+    let valid = json!({
+        "label": "root",
+        "edge": {"Visit": {"label": "child", "edge": "Finish"}}
+    });
+    branch_schema.validate(&valid).unwrap();
+    serde_json::from_value::<RecursiveSchemaBranch>(valid.clone()).unwrap();
+    let mut invalid = valid;
+    invalid["edge"]["Visit"]["label"] = json!(false);
+    assert!(branch_schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<RecursiveSchemaBranch>(invalid).is_err());
+}
+
+#[derive(JsonSchema)]
+struct RecursiveSchemaArray<const N: usize> {
+    bytes: [u8; N],
+    next: Option<Box<Self>>,
+}
+
+#[derive(JsonSchema)]
+struct DistinctRecursiveSchemaArrays {
+    two: RecursiveSchemaArray<2>,
+    three: RecursiveSchemaArray<3>,
+}
+
+#[derive(JsonSchema)]
+struct RecursiveSchemaPointers {
+    boxed: Box<RecursiveSchemaNode>,
+    shared: std::sync::Arc<RecursiveSchemaNode>,
+    local: std::rc::Rc<RecursiveSchemaNode>,
+    slice: Box<[RecursiveSchemaNode]>,
+}
+
+#[derive(JsonSchema)]
+struct BorrowedRecursiveSchema<'a> {
+    label: &'a str,
+    child: Option<Box<Self>>,
+}
+
+#[test]
+fn json_schema_borrowed_recursive_type_uses_static_schema_instantiation() {
+    let generated = BorrowedRecursiveSchema::<'static>::try_json_schema()
+        .expect("schema generation needs a type identity without constructing a value");
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    let valid = json!({"label": "parent", "child": {"label": "child", "child": null}});
+    schema.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["child"]["label"] = json!(false);
+    assert!(schema.validate(&invalid).is_err());
+}
+
+#[test]
+fn json_schema_recursive_generic_instances_and_shared_pointers_do_not_alias() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(DistinctRecursiveSchemaArrays::json_schema())
+            .expect("different const-generic instantiations retain separate definitions");
+    assert_eq!(schema.schema()["$defs"].as_object().unwrap().len(), 2);
+    let valid = json!({
+        "two": {"bytes": [1, 2], "next": {"bytes": [3, 4]}},
+        "three": {"bytes": [1, 2, 3], "next": {"bytes": [4, 5, 6]}}
+    });
+    schema.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["three"]["next"]["bytes"] = json!([4, 5]);
+    assert!(schema.validate(&invalid).is_err());
+
+    let pointers = fastmcp_rust::schema::admit_final_schema(RecursiveSchemaPointers::json_schema())
+        .expect("transparent pointers and slices preserve the recursive payload");
+    let leaf = json!({"value": 1, "children": []});
+    let valid = json!({
+        "boxed": leaf.clone(), "shared": leaf.clone(), "local": leaf.clone(),
+        "slice": [leaf]
+    });
+    pointers.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["shared"]["value"] = json!(false);
+    assert!(pointers.validate(&invalid).is_err());
+}
+
+static RECURSIVE_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn compare_recursive_schema_trees(left: RecursiveSchemaNode, right: RecursiveSchemaNode) -> String {
+    RECURSIVE_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("{}:{}", left.value, right.value)
+}
+
+#[test]
+fn json_schema_recursive_arguments_share_definitions_in_registered_modern_tool() {
+    let definition = CompareRecursiveSchemaTrees.definition();
+    assert_eq!(definition.input_schema["type"], "object");
+    assert_eq!(
+        definition.input_schema["$defs"].as_object().unwrap().len(),
+        1
+    );
+    fastmcp_rust::schema::admit_final_schema(definition.input_schema)
+        .expect("multiple recursive arguments form one standalone input schema");
+    let server = Server::new("recursive-schema", "1.0.0")
+        .tool(CompareRecursiveSchemaTrees)
+        .build();
+    let connection = ModernConnection::new();
+    let request = |arguments| {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "compare_recursive_schema_trees",
+                "arguments": arguments,
+            })),
+            64_i64,
+        )
+    };
+    let valid = json!({
+        "left": {"value": 1, "children": [{"value": 2, "children": []}]},
+        "right": {"value": 3, "children": [{"value": 4, "children": []}]}
+    });
+    let before = RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let response = server
+        .dispatch_stateless(&facade_final_inbound(&connection), &request(valid.clone()))
+        .expect("registered recursive input tool produces a response");
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_ne!(result["isError"], json!(true));
+    assert_eq!(result["content"][0]["text"], "1:3");
+    assert_eq!(
+        RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1
+    );
+    let mut invalid = valid;
+    invalid["right"]["children"][0]["value"] = json!("four");
+    let response = server
+        .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+        .expect("nested invalid input produces a tool execution error");
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], json!(true));
+    assert_eq!(
+        RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1,
+        "recursive input validation must finish before the handler runs"
+    );
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 enum OptionalUnitChoice {
     First,
     Second,
@@ -3977,6 +4202,46 @@ impl IdentifiedChoice {
             "$ref": "#/$defs/choice"
         })
     }
+}
+
+#[derive(JsonSchema)]
+struct DescribedIdentifiedSchema {
+    /// The annotation must not change the handwritten resource's scope.
+    choice: IdentifiedChoice,
+}
+
+struct UnscopedManualSchema;
+
+impl UnscopedManualSchema {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$defs": {"type_1": {"type": "boolean"}},
+            "$ref": "#/$defs/type_1"
+        })
+    }
+}
+
+#[derive(JsonSchema)]
+struct DescribedUnscopedSchema {
+    recursive: RecursiveSchemaNode,
+    /// Adding a description must not bypass handwritten reference admission.
+    manual: UnscopedManualSchema,
+}
+
+#[test]
+fn json_schema_custom_provider_annotations_preserve_resource_boundaries() {
+    let schema = fastmcp_rust::schema::admit_final_schema(
+        DescribedIdentifiedSchema::try_json_schema()
+            .expect("a described handwritten resource keeps its own identity"),
+    )
+    .unwrap();
+    schema.validate(&json!({"choice": "Allowed"})).unwrap();
+    assert!(schema.validate(&json!({"choice": "Denied"})).is_err());
+    assert_eq!(
+        DescribedUnscopedSchema::try_json_schema(),
+        Err(fastmcp_rust::schema::SchemaGenerationError::ReferenceResourceBoundary),
+        "a described manual local ref cannot capture the generated recursive definition"
+    );
 }
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]

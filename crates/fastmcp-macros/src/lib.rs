@@ -148,6 +148,15 @@ fn serde_json_crate_path() -> syn::Result<TokenStream2> {
     }
 }
 
+fn schema_protocol_crate_path() -> syn::Result<TokenStream2> {
+    if let Ok(found) = crate_name("fastmcp-rust") {
+        let facade = found_crate_path(found, "fastmcp-rust");
+        Ok(quote!(#facade::__private::protocol))
+    } else {
+        direct_crate_path("fastmcp-protocol")
+    }
+}
+
 /// Extracts documentation from attributes.
 fn extract_doc_comments(attrs: &[Attribute]) -> Option<String> {
     let docs: Vec<String> = attrs
@@ -3708,8 +3717,15 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                 })
             };
         }
+        Type::Slice(slice) => {
+            let items = type_to_json_schema(&slice.elem);
+            return quote! {
+                serde_json::json!({ "type": "array", "items": #items })
+            };
+        }
         Type::Paren(paren) => return type_to_json_schema(&paren.elem),
         Type::Group(group) => return type_to_json_schema(&group.elem),
+        Type::Reference(reference) => return type_to_json_schema(&reference.elem),
         _ => {}
     }
     let Type::Path(type_path) = ty else {
@@ -3740,6 +3756,19 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
         "bool" => quote! {
             serde_json::json!({ "type": "boolean" })
         },
+        "Box" | "Rc" | "Arc" | "Cow" => {
+            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                if let Some(inner_ty) = args.args.iter().find_map(|argument| match argument {
+                    syn::GenericArgument::Type(ty) => Some(ty),
+                    _ => None,
+                }) {
+                    return type_to_json_schema(inner_ty);
+                }
+            }
+            quote! {
+                compile_error!("JSON Schema requires a payload type for this transparent wrapper")
+            }
+        }
         "Option" => {
             // Preserve compact built-in schemas used by parameter headers.
             // For custom types preserve every original constraint inside an
@@ -3856,9 +3885,17 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             quote! { serde_json::json!({}) }
         }
         _ => {
-            // For other types, assume they implement a json_schema() method
-            // (e.g. via #[derive(JsonSchema)] or manual implementation)
-            quote! { <#ty>::json_schema() }
+            // Derived types share this document's explicit context, so a
+            // repeated or recursive occurrence can use one local definition.
+            // Autoref dispatch retains manually authored inherent providers:
+            // those types need not implement the generated context hook.
+            quote! {{
+                use fastmcp_protocol::schema::DispatchSchema as _;
+                (&fastmcp_protocol::schema::SchemaTypeDispatch::<#ty>::new()).schema(
+                    __fastmcp_schema_context,
+                    || <#ty>::json_schema(),
+                )
+            }}
         }
     }
 }
@@ -5066,21 +5103,24 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             impl fastmcp_server::ToolHandler for #handler_name {
                 fn definition(&self) -> fastmcp_protocol::Tool {
-                    let properties: std::collections::HashMap<String, serde_json::Value> = vec![
-                        #(#property_entries),*
-                    ].into_iter().collect();
+                    let mut schema_context = fastmcp_protocol::schema::SchemaGenerator::new();
+                    let properties: std::collections::BTreeMap<String, serde_json::Value> = {
+                        let __fastmcp_schema_context = &mut schema_context;
+                        vec![#(#property_entries),*].into_iter().collect()
+                    };
 
                     let required: Vec<String> = vec![#(#required_params.to_string()),*];
+                    let input_schema = schema_context.finish(serde_json::json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                    })).expect("FastMCP tool input schema exceeds generation limits");
 
                     fastmcp_protocol::Tool {
                         name: #tool_name.to_string(),
                         description: #description_tokens,
-                        input_schema: serde_json::json!({
-                            "$schema": "https://json-schema.org/draft/2020-12/schema",
-                            "type": "object",
-                            "properties": properties,
-                            "required": required,
-                        }),
+                        input_schema,
                         output_schema: #output_schema_field,
                         icon: #icon_tokens,
                         version: #version_tokens,
@@ -6083,6 +6123,15 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// or skips that disagree require an explicit `json_schema()` implementation.
 /// Other Serde representations (including tagging, flattening, and custom
 /// serializers) are not inferred by this derive.
+///
+/// Recursive and repeated derived types share bounded local `$defs` in each
+/// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
+/// schema. Generation uses an explicit context and never global state.
+/// `try_json_schema()` reports generation limits without panicking; the
+/// convenience `json_schema()` method panics if those limits are exceeded.
+/// Schema generation requires a `'static` type instantiation so distinct Rust
+/// types are tracked by exact `TypeId`. A type with borrowed fields can use
+/// `Borrowed::<'static>::json_schema()` without constructing a borrowed value.
 #[proc_macro_derive(JsonSchema, attributes(json_schema, serde))]
 pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
@@ -6090,10 +6139,20 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         Ok(path) => path,
         Err(error) => return error.to_compile_error().into(),
     };
+    let protocol = match schema_protocol_crate_path() {
+        Ok(path) => path,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let name = &input.ident;
     let impl_module = format_ident!("__fastmcp_json_schema_{}", name);
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let mut schema_generics = input.generics.clone();
+    schema_generics
+        .make_where_clause()
+        .predicates
+        .push(syn::parse_quote!(Self: 'static));
+    let (schema_impl_generics, _, schema_where_clause) = schema_generics.split_for_impl();
 
     // Extract type-level doc comments for schema description
     let type_description = extract_doc_comments(&input.attrs);
@@ -6129,11 +6188,44 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         mod #impl_module {
             use super::*;
             use #serde_json as serde_json;
+            use #protocol as fastmcp_protocol;
+
+            impl #schema_impl_generics fastmcp_protocol::schema::JsonSchemaType
+                for #name #ty_generics #schema_where_clause
+            {
+                fn schema_body(
+                    __fastmcp_schema_context: &mut fastmcp_protocol::schema::SchemaGenerator,
+                ) -> serde_json::Value {
+                    #schema_impl
+                }
+            }
 
             impl #impl_generics #name #ty_generics #where_clause {
                 /// Returns the JSON Schema for this type.
-                pub fn json_schema() -> serde_json::Value {
-                    #schema_impl
+                ///
+                /// # Panics
+                ///
+                /// Panics if generation exceeds the bounded schema limits.
+                /// Use `try_json_schema()` to handle those errors explicitly.
+                pub fn json_schema() -> serde_json::Value
+                where
+                    Self: 'static,
+                {
+                    Self::try_json_schema()
+                        .expect("FastMCP JSON Schema generation exceeds generation limits")
+                }
+
+                /// Generates a standalone schema with bounded local definitions.
+                pub fn try_json_schema() -> std::result::Result<
+                    serde_json::Value,
+                    fastmcp_protocol::schema::SchemaGenerationError,
+                >
+                where
+                    Self: 'static,
+                {
+                    let mut context = fastmcp_protocol::schema::SchemaGenerator::new();
+                    let root = context.subschema_for::<Self>();
+                    context.finish(root)
                 }
             }
         }
@@ -6432,7 +6524,7 @@ fn generate_fields_schema(
             let deny_unknown_fields = serde_attrs.deny_unknown_fields;
             quote! {
                 {
-                    let properties: std::collections::HashMap<String, serde_json::Value> = vec![
+                    let properties: std::collections::BTreeMap<String, serde_json::Value> = vec![
                         #(#property_entries),*
                     ].into_iter().collect();
 

@@ -18,7 +18,14 @@
 use fastmcp_core::AbsoluteUri;
 use regex::Regex;
 use serde_json::Value;
-use std::{cmp::Ordering, collections::HashSet, fmt};
+use std::{
+    any::TypeId,
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+    fmt,
+    io::{self, Write},
+    marker::PhantomData,
+};
 
 /// The sole JSON Schema dialect accepted by the final core schema-admission
 /// boundary.
@@ -85,6 +92,606 @@ pub const MAX_VALIDATION_ERRORS: usize = 64;
 /// but final-schema validation still bounds the local representation before it
 /// participates in comparison or divisibility work.
 const MAX_EXACT_DECIMAL_DIGITS: usize = 4 * 1024;
+
+/// Hard ceilings for one schema-generation operation.
+///
+/// Node and byte budgets conservatively include returned schemas, retained
+/// copies, repeated references, and the completed document. Limits may be
+/// lowered with [`SchemaGenerator::with_limits`], but not raised.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaGenerationLimits {
+    /// Maximum distinct Rust types expanded in one document.
+    pub max_types: usize,
+    /// Maximum nested type expansions or JSON value levels.
+    pub max_depth: usize,
+    /// Maximum aggregate JSON value nodes generated or retained.
+    pub max_nodes: usize,
+    /// Maximum aggregate serialized JSON bytes generated or retained.
+    pub max_bytes: usize,
+}
+
+impl Default for SchemaGenerationLimits {
+    fn default() -> Self {
+        Self {
+            max_types: 128,
+            max_depth: MAX_SCHEMA_VALIDATION_DEPTH,
+            max_nodes: MAX_SCHEMA_ADMISSION_NODES,
+            max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// A bounded schema could not be generated as a complete, valid document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaGenerationError {
+    /// Too many distinct Rust types were expanded.
+    TypeLimit,
+    /// A type expansion or generated JSON tree was too deeply nested.
+    DepthLimit,
+    /// The aggregate generated and retained node budget was exceeded.
+    NodeLimit,
+    /// The aggregate generated and retained byte budget was exceeded.
+    ByteLimit,
+    /// Comparing handwritten resource snapshots exceeded the bounded work budget.
+    WorkLimit,
+    /// A handwritten root definition uses the same key as a generated definition.
+    DefinitionsCollision,
+    /// A local reference would cross its schema resource boundary.
+    ReferenceResourceBoundary,
+    /// The completed document failed the runtime schema admission rules.
+    InvalidSchema(SchemaAdmissionError),
+}
+
+impl fmt::Display for SchemaGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TypeLimit => "schema generation type limit exceeded",
+            Self::DepthLimit => "schema generation nesting limit exceeded",
+            Self::NodeLimit => "schema generation node limit exceeded",
+            Self::ByteLimit => "schema generation byte limit exceeded",
+            Self::WorkLimit => "schema generation resource comparison limit exceeded",
+            Self::DefinitionsCollision => "generated definitions conflict with root $defs",
+            Self::ReferenceResourceBoundary => "schema reference crosses a resource boundary",
+            Self::InvalidSchema(error) => return write!(formatter, "generated schema: {error}"),
+        })
+    }
+}
+
+impl std::error::Error for SchemaGenerationError {}
+
+/// The context-aware implementation emitted by `#[derive(JsonSchema)]`.
+///
+/// Nested derived types must use [`SchemaGenerator::subschema_for`] with the
+/// same context so recursive and repeated occurrences share local definitions.
+/// Exact Rust type identity requires a `'static` type instantiation. A borrowed
+/// type can use its `'static` instantiation without constructing a value.
+pub trait JsonSchemaType: 'static {
+    /// Builds this type's schema body within the current document.
+    fn schema_body(context: &mut SchemaGenerator) -> Value;
+}
+
+#[derive(Debug)]
+struct GeneratedDefinition {
+    key: String,
+    body: Option<Value>,
+    referenced: bool,
+}
+
+#[derive(Debug)]
+struct HandwrittenSchemaResource {
+    schema: Value,
+    nodes: usize,
+    bytes: usize,
+}
+
+/// Builds one bounded, self-contained schema without global or thread-local state.
+///
+/// The first occurrence of a Rust type is inlined. Later and recursive
+/// occurrences use deterministic first-discovery keys (`type_0`, `type_1`, ...).
+/// Only referenced bodies are exported in `$defs`. A limit failure is sticky:
+/// internal calls return the rejecting boolean schema, and [`Self::finish`]
+/// returns the original error instead of publishing a partial document.
+#[derive(Debug, Default)]
+pub struct SchemaGenerator {
+    limits: SchemaGenerationLimits,
+    definitions: BTreeMap<TypeId, GeneratedDefinition>,
+    handwritten_resources: Vec<HandwrittenSchemaResource>,
+    depth: usize,
+    nodes: usize,
+    bytes: usize,
+    error: Option<SchemaGenerationError>,
+}
+
+impl SchemaGenerator {
+    /// Starts an independent generation operation with the default hard limits.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts an operation with caller-supplied limits clamped to the hard ceilings.
+    #[must_use]
+    pub fn with_limits(limits: SchemaGenerationLimits) -> Self {
+        let ceilings = SchemaGenerationLimits::default();
+        Self {
+            limits: SchemaGenerationLimits {
+                max_types: limits.max_types.min(ceilings.max_types),
+                max_depth: limits.max_depth.min(ceilings.max_depth),
+                max_nodes: limits.max_nodes.min(ceilings.max_nodes),
+                max_bytes: limits.max_bytes.min(ceilings.max_bytes),
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Expands a type once, returning local references for repeated occurrences.
+    pub fn subschema_for<T: JsonSchemaType>(&mut self) -> Value {
+        if self.error.is_some() {
+            return Value::Bool(false);
+        }
+        let identity = TypeId::of::<T>();
+        if let Some(entry) = self.definitions.get_mut(&identity) {
+            entry.referenced = true;
+            let reference = format!("#/$defs/{}", entry.key);
+            let schema = serde_json::json!({"$ref": reference});
+            return if self.account(&schema, 1).is_some() {
+                schema
+            } else {
+                Value::Bool(false)
+            };
+        }
+        if self.definitions.len() >= self.limits.max_types {
+            self.error = Some(SchemaGenerationError::TypeLimit);
+            return Value::Bool(false);
+        }
+        if self.depth >= self.limits.max_depth {
+            self.error = Some(SchemaGenerationError::DepthLimit);
+            return Value::Bool(false);
+        }
+        let key = format!("type_{}", self.definitions.len());
+        self.definitions.insert(
+            identity,
+            GeneratedDefinition {
+                key,
+                body: None,
+                referenced: false,
+            },
+        );
+        self.depth += 1;
+        let body = T::schema_body(self);
+        self.depth -= 1;
+        if self.account(&body, 2).is_none() {
+            return Value::Bool(false);
+        }
+        self.definitions
+            .get_mut(&identity)
+            .expect("a generated type keeps its reserved definition")
+            .body = Some(body.clone());
+        body
+    }
+
+    /// Accounts for a nested handwritten schema returned within this operation.
+    /// Handwritten local references require their own `$id` resource boundary.
+    pub fn inline_schema(&mut self, schema: Value) -> Value {
+        // Charge the returned value before traversing it for resource markers.
+        let Some((nodes, bytes)) = self.account(&schema, 1) else {
+            return Value::Bool(false);
+        };
+        // A nested handwritten provider cannot safely carry root-relative
+        // references without its own resource boundary. Reject before macros
+        // add annotations or wrap the schema, so those transforms cannot lose
+        // the distinction between handwritten and generated references.
+        if handwritten_schema_has_unscoped_reference(&schema) {
+            self.error = Some(SchemaGenerationError::ReferenceResourceBoundary);
+            return Value::Bool(false);
+        }
+        if generated_schema_contains_resource(&schema) {
+            if self.account(&schema, 1).is_none() {
+                return Value::Bool(false);
+            }
+            self.handwritten_resources.push(HandwrittenSchemaResource {
+                schema: schema.clone(),
+                nodes,
+                bytes,
+            });
+        }
+        schema
+    }
+
+    fn account(&mut self, schema: &Value, copies: usize) -> Option<(usize, usize)> {
+        if self.error.is_some() {
+            return None;
+        }
+        let result = measure_generated_schema(schema, self.limits).and_then(|(nodes, bytes)| {
+            if nodes.saturating_mul(copies) > self.limits.max_nodes.saturating_sub(self.nodes) {
+                return Err(SchemaGenerationError::NodeLimit);
+            }
+            if bytes.saturating_mul(copies) > self.limits.max_bytes.saturating_sub(self.bytes) {
+                return Err(SchemaGenerationError::ByteLimit);
+            }
+            self.nodes += nodes * copies;
+            self.bytes += bytes * copies;
+            Ok((nodes, bytes))
+        });
+        match result {
+            Ok(size) => Some(size),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+
+    /// Completes and admits a standalone schema, or returns the first failure.
+    ///
+    /// Boolean reusable roots are wrapped in an object schema. Existing root
+    /// `$defs` are preserved unless generated definitions would collide with
+    /// them, in which case generation fails explicitly.
+    pub fn finish(mut self, mut root: Value) -> Result<Value, SchemaGenerationError> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        if root.is_boolean() {
+            root = serde_json::json!({"allOf": [root]});
+        }
+        let definitions: serde_json::Map<String, Value> = self
+            .definitions
+            .into_values()
+            .filter(|entry| entry.referenced)
+            .map(|entry| {
+                (
+                    entry.key,
+                    entry.body.expect("completed type has a schema body"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect();
+        let generated_keys: HashSet<String> = definitions.keys().cloned().collect();
+        let has_generated_definitions = !generated_keys.is_empty();
+        if has_generated_definitions {
+            let object = root.as_object_mut().ok_or_else(|| {
+                SchemaGenerationError::InvalidSchema(SchemaAdmissionError::new(
+                    "$",
+                    "schema must be a boolean or object",
+                ))
+            })?;
+            match object.get_mut("$defs") {
+                Some(Value::Object(existing)) => {
+                    if definitions.keys().any(|key| existing.contains_key(key)) {
+                        return Err(SchemaGenerationError::DefinitionsCollision);
+                    }
+                    existing.extend(definitions);
+                }
+                Some(_) => {
+                    return Err(SchemaGenerationError::InvalidSchema(
+                        SchemaAdmissionError::new(
+                            "$.$defs",
+                            "schema map keyword must be an object",
+                        ),
+                    ));
+                }
+                None => {
+                    object.insert("$defs".to_owned(), Value::Object(definitions));
+                }
+            }
+        }
+        // Completion includes caller-assembled roots, such as multi-argument tools.
+        let (nodes, bytes) = measure_generated_schema(&root, self.limits)?;
+        if nodes > self.limits.max_nodes.saturating_sub(self.nodes) {
+            return Err(SchemaGenerationError::NodeLimit);
+        }
+        if bytes > self.limits.max_bytes.saturating_sub(self.bytes) {
+            return Err(SchemaGenerationError::ByteLimit);
+        }
+        if has_generated_definitions || !self.handwritten_resources.is_empty() {
+            let mut comparison_budget = (self.limits.max_nodes * 16, self.limits.max_bytes * 16);
+            check_generated_reference_resources(
+                &root,
+                false,
+                true,
+                &generated_keys,
+                &self.handwritten_resources,
+                &mut comparison_budget,
+            )?;
+        }
+        admit_final_schema(root)
+            .map(|admitted| admitted.schema)
+            .map_err(SchemaGenerationError::InvalidSchema)
+    }
+}
+
+fn measure_generated_schema(
+    schema: &Value,
+    limits: SchemaGenerationLimits,
+) -> Result<(usize, usize), SchemaGenerationError> {
+    fn count(
+        value: &Value,
+        depth: usize,
+        nodes: &mut usize,
+        limits: SchemaGenerationLimits,
+    ) -> Result<(), SchemaGenerationError> {
+        if depth >= limits.max_depth {
+            return Err(SchemaGenerationError::DepthLimit);
+        }
+        if *nodes >= limits.max_nodes {
+            return Err(SchemaGenerationError::NodeLimit);
+        }
+        *nodes += 1;
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    count(value, depth + 1, nodes, limits)?;
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    if key.len() > limits.max_bytes {
+                        return Err(SchemaGenerationError::ByteLimit);
+                    }
+                    count(value, depth + 1, nodes, limits)?;
+                }
+            }
+            Value::String(value) if value.len() > limits.max_bytes => {
+                return Err(SchemaGenerationError::ByteLimit);
+            }
+            Value::Number(value) if value.as_str().len() > limits.max_bytes => {
+                return Err(SchemaGenerationError::ByteLimit);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    struct ByteCounter {
+        remaining: usize,
+    }
+    impl Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(io::Error::other("schema byte limit"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut nodes = 0;
+    count(schema, 0, &mut nodes, limits)?;
+    let mut counter = ByteCounter {
+        remaining: limits.max_bytes,
+    };
+    serde_json::to_writer(&mut counter, schema).map_err(|_| SchemaGenerationError::ByteLimit)?;
+    Ok((nodes, limits.max_bytes - counter.remaining))
+}
+
+fn generated_schema_contains_resource(schema: &Value) -> bool {
+    match schema {
+        Value::Object(values) => {
+            values.contains_key("$id") || values.values().any(generated_schema_contains_resource)
+        }
+        Value::Array(values) => values.iter().any(generated_schema_contains_resource),
+        _ => false,
+    }
+}
+
+fn handwritten_schema_has_unscoped_reference(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if object.contains_key("$id") {
+        return false;
+    }
+    if ["$ref", "$dynamicRef"].iter().any(|keyword| {
+        object
+            .get(*keyword)
+            .and_then(Value::as_str)
+            .is_some_and(|reference| reference.is_empty() || reference.starts_with('#'))
+    }) {
+        return true;
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if object
+            .get(keyword)
+            .and_then(Value::as_object)
+            .is_some_and(|children| {
+                children
+                    .values()
+                    .any(handwritten_schema_has_unscoped_reference)
+            })
+        {
+            return true;
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if object
+            .get(keyword)
+            .is_some_and(handwritten_schema_has_unscoped_reference)
+        {
+            return true;
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if object
+            .get(keyword)
+            .and_then(Value::as_array)
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .any(handwritten_schema_has_unscoped_reference)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_handwritten_schema(schema: &serde_json::Map<String, Value>, snapshot: &Value) -> bool {
+    let Some(snapshot) = snapshot.as_object() else {
+        return false;
+    };
+    // Field documentation can replace top-level descriptive annotations.
+    // All reference, resource, assertion, and nested schema members stay exact.
+    let retained = |key: &str| !matches!(key, "description" | "default");
+    schema.keys().filter(|key| retained(key)).count()
+        == snapshot.keys().filter(|key| retained(key)).count()
+        && schema
+            .iter()
+            .filter(|(key, _)| retained(key))
+            .all(|(key, value)| snapshot.get(key) == Some(value))
+}
+
+fn check_generated_reference_resources(
+    schema: &Value,
+    nested_resource: bool,
+    root: bool,
+    definitions: &HashSet<String>,
+    handwritten: &[HandwrittenSchemaResource],
+    comparison_budget: &mut (usize, usize),
+) -> Result<(), SchemaGenerationError> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    for snapshot in handwritten {
+        if snapshot.nodes > comparison_budget.0 || snapshot.bytes > comparison_budget.1 {
+            return Err(SchemaGenerationError::WorkLimit);
+        }
+        comparison_budget.0 -= snapshot.nodes;
+        comparison_budget.1 -= snapshot.bytes;
+        if matches_handwritten_schema(object, &snapshot.schema) {
+            // Preserve unchanged handwritten resources as opaque subtrees. The
+            // final admission still verifies all their local references.
+            return Ok(());
+        }
+    }
+    let nested_resource = nested_resource || (!root && object.contains_key("$id"));
+    if nested_resource
+        && object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            .is_some_and(|key| definitions.contains(key))
+    {
+        return Err(SchemaGenerationError::ReferenceResourceBoundary);
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get(keyword).and_then(Value::as_object) {
+            for child in children.values() {
+                check_generated_reference_resources(
+                    child,
+                    nested_resource,
+                    false,
+                    definitions,
+                    handwritten,
+                    comparison_budget,
+                )?;
+            }
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if let Some(child) = object.get(keyword) {
+            check_generated_reference_resources(
+                child,
+                nested_resource,
+                false,
+                definitions,
+                handwritten,
+                comparison_budget,
+            )?;
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(children) = object.get(keyword).and_then(Value::as_array) {
+            for child in children {
+                check_generated_reference_resources(
+                    child,
+                    nested_resource,
+                    false,
+                    definitions,
+                    handwritten,
+                    comparison_budget,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Autoref dispatch adapter used by generated code for custom field types.
+#[derive(Debug)]
+pub struct SchemaTypeDispatch<T>(PhantomData<T>);
+
+impl<T> SchemaTypeDispatch<T> {
+    /// Constructs a dispatch adapter without constructing the Rust type.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T> Default for SchemaTypeDispatch<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Selects a context-aware derived implementation or a handwritten fallback.
+pub trait DispatchSchema {
+    /// Resolves a schema within the caller's current generation operation.
+    fn schema(self, context: &mut SchemaGenerator, fallback: impl FnOnce() -> Value) -> Value;
+}
+
+impl<T: JsonSchemaType> DispatchSchema for &SchemaTypeDispatch<T> {
+    fn schema(self, context: &mut SchemaGenerator, _fallback: impl FnOnce() -> Value) -> Value {
+        context.subschema_for::<T>()
+    }
+}
+
+impl<T> DispatchSchema for &&SchemaTypeDispatch<T> {
+    fn schema(self, context: &mut SchemaGenerator, fallback: impl FnOnce() -> Value) -> Value {
+        if context.error.is_some() {
+            Value::Bool(false)
+        } else {
+            context.inline_schema(fallback())
+        }
+    }
+}
 
 /// Error returned when JSON Schema validation fails.
 #[derive(Debug, Clone)]
@@ -4345,6 +4952,405 @@ fn validate_exact_number(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct GeneratedText;
+
+    impl JsonSchemaType for GeneratedText {
+        fn schema_body(_context: &mut SchemaGenerator) -> Value {
+            json!({"type": "string"})
+        }
+    }
+
+    struct GeneratedPair;
+
+    impl JsonSchemaType for GeneratedPair {
+        fn schema_body(context: &mut SchemaGenerator) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "left": context.subschema_for::<GeneratedText>(),
+                    "right": context.subschema_for::<GeneratedText>()
+                },
+                "required": ["left", "right"]
+            })
+        }
+    }
+
+    struct GeneratedNode;
+
+    impl JsonSchemaType for GeneratedNode {
+        fn schema_body(context: &mut SchemaGenerator) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"},
+                    "next": {"anyOf": [{"type": "null"}, context.subschema_for::<Self>()]}
+                },
+                "required": ["value", "next"]
+            })
+        }
+    }
+
+    fn generate_test_schema<T: JsonSchemaType>(
+        limits: SchemaGenerationLimits,
+    ) -> Result<Value, SchemaGenerationError> {
+        let mut context = SchemaGenerator::with_limits(limits);
+        let root = context.subschema_for::<T>();
+        context.finish(root)
+    }
+
+    #[test]
+    fn schema_generation_reuses_only_referenced_types_and_is_deterministic() {
+        let schema = generate_test_schema::<GeneratedPair>(SchemaGenerationLimits::default())
+            .expect("repeated type generates a complete schema");
+        assert_eq!(schema["properties"]["left"], json!({"type": "string"}));
+        assert_eq!(
+            schema["properties"]["right"],
+            json!({"$ref": "#/$defs/type_1"})
+        );
+        assert_eq!(schema["$defs"], json!({"type_1": {"type": "string"}}));
+        assert_eq!(
+            schema,
+            generate_test_schema::<GeneratedPair>(SchemaGenerationLimits::default())
+                .expect("a separate operation has identical output")
+        );
+        let admitted = admit_final_schema(schema).expect("generated schema admits");
+        assert!(
+            admitted
+                .validate(&json!({"left": "one", "right": "two"}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"left": "one", "right": 2}))
+                .is_err()
+        );
+
+        let single = generate_test_schema::<GeneratedText>(SchemaGenerationLimits::default())
+            .expect("single type generates");
+        assert_eq!(single, json!({"type": "string"}));
+    }
+
+    #[test]
+    fn schema_generation_recursive_root_is_complete_and_enforces_nested_types() {
+        let schema = generate_test_schema::<GeneratedNode>(SchemaGenerationLimits::default())
+            .expect("recursive root terminates with a definition");
+        assert_eq!(
+            schema["properties"]["next"]["anyOf"][1],
+            json!({"$ref": "#/$defs/type_0"})
+        );
+        assert_eq!(
+            schema["$defs"]["type_0"]["properties"],
+            schema["properties"]
+        );
+        assert!(schema["$defs"]["type_0"].get("$defs").is_none());
+        let admitted = admit_final_schema(schema).expect("recursive references resolve");
+        assert!(
+            admitted
+                .validate(&json!({"value": 1, "next": {"value": 2, "next": null}}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"value": 1, "next": {"value": "2", "next": null}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_generation_type_and_depth_limits_have_exact_boundaries() {
+        struct Wrapper;
+        impl JsonSchemaType for Wrapper {
+            fn schema_body(context: &mut SchemaGenerator) -> Value {
+                context.subschema_for::<GeneratedText>()
+            }
+        }
+        let mut limits = SchemaGenerationLimits {
+            max_types: 2,
+            max_depth: 2,
+            ..SchemaGenerationLimits::default()
+        };
+        assert_eq!(
+            generate_test_schema::<Wrapper>(limits),
+            Ok(json!({"type": "string"}))
+        );
+        limits.max_types = 1;
+        assert_eq!(
+            generate_test_schema::<Wrapper>(limits),
+            Err(SchemaGenerationError::TypeLimit)
+        );
+        limits.max_types = 2;
+        limits.max_depth = 1;
+        assert_eq!(
+            generate_test_schema::<Wrapper>(limits),
+            Err(SchemaGenerationError::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn schema_generation_retained_and_completed_node_byte_budgets_are_enforced() {
+        let body = json!({"type": "string"});
+        // The returned body, its retained copy, and the completed output each
+        // contain two JSON nodes and the same serialized byte count.
+        let limits = SchemaGenerationLimits {
+            max_nodes: 6,
+            max_bytes: serde_json::to_vec(&body).expect("serialize fixture").len() * 3,
+            ..SchemaGenerationLimits::default()
+        };
+        assert_eq!(generate_test_schema::<GeneratedText>(limits), Ok(body));
+        assert_eq!(
+            generate_test_schema::<GeneratedText>(SchemaGenerationLimits {
+                max_nodes: limits.max_nodes - 1,
+                ..limits
+            }),
+            Err(SchemaGenerationError::NodeLimit)
+        );
+        assert_eq!(
+            generate_test_schema::<GeneratedText>(SchemaGenerationLimits {
+                max_bytes: limits.max_bytes - 1,
+                ..limits
+            }),
+            Err(SchemaGenerationError::ByteLimit)
+        );
+    }
+
+    #[test]
+    fn schema_generation_counts_escaped_bytes_and_bounds_caller_assembled_roots() {
+        let root = json!({"const": "\n\"\\\u{0000}"});
+        let limits = SchemaGenerationLimits {
+            max_bytes: serde_json::to_vec(&root)
+                .expect("serialize escaped fixture")
+                .len(),
+            ..SchemaGenerationLimits::default()
+        };
+        assert_eq!(
+            SchemaGenerator::with_limits(limits).finish(root.clone()),
+            Ok(root.clone())
+        );
+        assert_eq!(
+            SchemaGenerator::with_limits(SchemaGenerationLimits {
+                max_bytes: limits.max_bytes - 1,
+                ..limits
+            })
+            .finish(root),
+            Err(SchemaGenerationError::ByteLimit)
+        );
+        let root = json!({"allOf": [{}]});
+        assert!(
+            SchemaGenerator::with_limits(SchemaGenerationLimits {
+                max_depth: 3,
+                ..SchemaGenerationLimits::default()
+            })
+            .finish(root.clone())
+            .is_ok()
+        );
+        assert_eq!(
+            SchemaGenerator::with_limits(SchemaGenerationLimits {
+                max_depth: 2,
+                ..SchemaGenerationLimits::default()
+            })
+            .finish(root),
+            Err(SchemaGenerationError::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn schema_generation_autoref_dispatch_prefers_derived_and_preserves_handwritten_types() {
+        struct Handwritten;
+        impl Handwritten {
+            fn json_schema() -> Value {
+                json!({"type": "boolean"})
+            }
+        }
+        let mut context = SchemaGenerator::new();
+        let derived = (&SchemaTypeDispatch::<GeneratedText>::new()).schema(&mut context, || {
+            panic!("derived dispatch must not run the handwritten fallback")
+        });
+        let handwritten = (&SchemaTypeDispatch::<Handwritten>::new())
+            .schema(&mut context, Handwritten::json_schema);
+        assert_eq!(derived, json!({"type": "string"}));
+        assert_eq!(handwritten, json!({"type": "boolean"}));
+        let schema = context
+            .finish(json!({"anyOf": [derived, handwritten]}))
+            .expect("mixed providers generate");
+        let admitted = admit_final_schema(schema).expect("mixed provider schema admits");
+        assert!(admitted.validate(&json!(true)).is_ok());
+        assert!(admitted.validate(&json!(1)).is_err());
+
+        let mut failed = SchemaGenerator::with_limits(SchemaGenerationLimits {
+            max_types: 0,
+            ..SchemaGenerationLimits::default()
+        });
+        assert_eq!(failed.subschema_for::<GeneratedText>(), Value::Bool(false));
+        assert_eq!(
+            (&SchemaTypeDispatch::<Handwritten>::new()).schema(&mut failed, || panic!(
+                "sticky failure must not invoke another provider"
+            )),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            failed.finish(json!({})),
+            Err(SchemaGenerationError::TypeLimit)
+        );
+    }
+
+    #[test]
+    fn schema_generation_preserves_handwritten_definitions_and_rejects_root_collisions() {
+        let handwritten = json!({"$defs": {"label": {"type": "string"}}, "$ref": "#/$defs/label"});
+        assert_eq!(
+            SchemaGenerator::new().finish(handwritten.clone()),
+            Ok(handwritten)
+        );
+        let mut context = SchemaGenerator::new();
+        let mut root = context.subschema_for::<GeneratedPair>();
+        root["$defs"] = json!({"label": {"type": "string"}});
+        let merged = context
+            .finish(root)
+            .expect("disjoint handwritten definitions are retained");
+        assert_eq!(
+            merged["$defs"],
+            json!({
+                "label": {"type": "string"}, "type_1": {"type": "string"}
+            })
+        );
+        let mut context = SchemaGenerator::new();
+        let mut root = context.subschema_for::<GeneratedPair>();
+        root["$defs"] = json!({"type_1": {"type": "boolean"}});
+        assert_eq!(
+            context.finish(root),
+            Err(SchemaGenerationError::DefinitionsCollision)
+        );
+        assert!(matches!(
+            SchemaGenerator::new().finish(json!({"$ref": "#/$defs/missing"})),
+            Err(SchemaGenerationError::InvalidSchema(_))
+        ));
+        assert_eq!(
+            SchemaGenerator::new().finish(Value::Bool(false)),
+            Ok(json!({"allOf": [false]}))
+        );
+    }
+
+    #[test]
+    fn schema_generation_does_not_confuse_handwritten_resources_with_generated_references() {
+        let handwritten = json!({
+            "type": "object",
+            "properties": {"choice": {
+                "$id": "https://example.test/choice",
+                "$defs": {"type_0": {"type": "string"}},
+                "$ref": "#/$defs/type_0"
+            }}
+        });
+        assert_eq!(
+            SchemaGenerator::new().finish(handwritten.clone()),
+            Ok(handwritten)
+        );
+
+        let mut context = SchemaGenerator::new();
+        let first = context.subschema_for::<GeneratedText>();
+        let reused = context.subschema_for::<GeneratedText>();
+        let root = json!({"type": "object", "properties": {
+            "first": first,
+            "reused": {"$id": "https://example.test/nested", "allOf": [reused]}
+        }});
+        assert_eq!(
+            context.finish(root),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
+
+        let manual_resource = json!({
+            "$id": "https://example.test/manual",
+            "$defs": {"type_0": {"type": "boolean"}}, "$ref": "#/$defs/type_0"
+        });
+        let mut context = SchemaGenerator::new();
+        let first = context.subschema_for::<GeneratedText>();
+        let reused = context.subschema_for::<GeneratedText>();
+        let mut manual = context.inline_schema(manual_resource.clone());
+        manual["description"] = json!("Documented custom field");
+        let root = context
+            .finish(json!({"type": "object", "properties": {
+                "first": first, "reused": reused, "manual": manual
+            }}))
+            .expect("own-resource handwritten type_0 remains distinct from generated type_0");
+        assert_eq!(root["properties"]["manual"]["$id"], manual_resource["$id"]);
+        assert_eq!(
+            root["properties"]["manual"]["$defs"],
+            manual_resource["$defs"]
+        );
+        assert_eq!(
+            root["properties"]["manual"]["description"],
+            json!("Documented custom field")
+        );
+        let admitted = admit_final_schema(root).expect("mixed resources admit");
+        assert!(
+            admitted
+                .validate(&json!({"first": "x", "reused": "y", "manual": true}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"first": "x", "reused": "y", "manual": "true"}))
+                .is_err()
+        );
+
+        let mut unscoped = manual_resource;
+        unscoped
+            .as_object_mut()
+            .expect("object fixture")
+            .remove("$id");
+        let mut context = SchemaGenerator::new();
+        let first = context.subschema_for::<GeneratedText>();
+        let reused = context.subschema_for::<GeneratedText>();
+        let manual = context.inline_schema(unscoped);
+        assert_eq!(manual, Value::Bool(false));
+        assert_eq!(
+            context.finish(json!({"type": "object", "properties": {
+                "first": first, "reused": reused, "manual": manual
+            }})),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
+    }
+
+    #[test]
+    fn schema_generation_uses_exact_identity_for_same_named_local_types() {
+        let mut context = SchemaGenerator::new();
+        let text = {
+            struct SameName;
+            impl JsonSchemaType for SameName {
+                fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                    json!({"type": "string"})
+                }
+            }
+            context.subschema_for::<SameName>()
+        };
+        let integer = {
+            struct SameName;
+            impl JsonSchemaType for SameName {
+                fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                    json!({"type": "integer"})
+                }
+            }
+            context.subschema_for::<SameName>()
+        };
+        assert_eq!(text, json!({"type": "string"}));
+        assert_eq!(integer, json!({"type": "integer"}));
+        let root = context
+            .finish(json!({"type": "object", "properties": {
+                "text": text, "integer": integer
+            }}))
+            .expect("distinct local Rust types retain distinct schemas");
+        assert!(root.get("$defs").is_none());
+        let admitted = admit_final_schema(root).expect("exact identity schema admits");
+        assert!(
+            admitted
+                .validate(&json!({"text": "one", "integer": 1}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"text": "one", "integer": "one"}))
+                .is_err()
+        );
+    }
 
     fn sch_01_a_schema() -> Value {
         json!({
