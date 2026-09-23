@@ -429,7 +429,7 @@ mod tests {
         let bytes = original.encode(&binding(1), limits).unwrap();
         let decoded = Manifest::decode(&bytes, &binding(1), limits).unwrap();
         assert_eq!(decoded.generation, 1);
-        assert!(decoded.records == original.records);
+        assert_eq!(decoded.records, original.records);
         let empty = Manifest { generation: 2, records: BTreeMap::new() };
         let decoded = Manifest::decode(&empty.encode(&binding(1), limits).unwrap(), &binding(1), limits).unwrap();
         assert_eq!(decoded.generation, 2);
