@@ -91,8 +91,8 @@ impl ClientCredentialsTasksClient {
         &self, cx: &Cx, current: &TaskResumeBinding, record: &TaskResumeRecord,
         discovery_id: RequestId, request_id: RequestId,
     ) -> Result<ClientCredentialsTaskResumeReconciliation, ClientCredentialsTaskResumeError> {
-        self.reconcile_task_resume_with_cancellation(cx, &McpRequestCancellation::new(),
-            current, record, discovery_id, request_id).await
+        Box::pin(self.reconcile_task_resume_with_cancellation(cx, &McpRequestCancellation::new(),
+            current, record, discovery_id, request_id)).await
     }
 
     /// Drop/cancellation releases the owned response; storage is never changed.
@@ -108,7 +108,7 @@ impl ClientCredentialsTasksClient {
         check_run(self, cx, cancellation, call_deadline)?;
         let retention_deadline = resume_read_deadline(cx, current, record, self.client.resource().as_str())?;
         let deadline = call_deadline.min(retention_deadline);
-        let observed = active(cx, deadline, &self.client.inner.closed, cancellation, None, async {
+        let observed = Box::pin(active(cx, deadline, &self.client.inner.closed, cancellation, None, async {
             Ok(async {
                 let mut call = self.request_with_cancellation(cx, cancellation, discovery_id, request_id,
                     ManagedTaskRequest::Get(record.task_id().clone())).await?;
@@ -117,7 +117,7 @@ impl ClientCredentialsTasksClient {
                 };
                 Ok::<_, ClientCredentialsTasksError>(snapshot.task)
             }.await)
-        }).await;
+        })).await;
         check_run(self, cx, cancellation, call_deadline)?;
         if cx.now() >= retention_deadline { return Err(TaskResumeError::Unavailable.into()); }
         record.admit(cx, current)?;
@@ -160,7 +160,7 @@ pub struct ClientCredentialsTaskRestartPolicy {
 }
 impl Default for ClientCredentialsTaskRestartPolicy {
     fn default() -> Self {
-        Self { staging: TaskResumeRestartPolicy::default(), timeout: Duration::from_secs(900) }
+        Self { staging: TaskResumeRestartPolicy::default(), timeout: Duration::from_mins(15) }
     }
 }
 impl ClientCredentialsTaskRestartPolicy {
@@ -311,9 +311,9 @@ impl ClientCredentialsTaskRestart {
                 let cancellation = self.cancellation.clone();
                 let current = &self.current;
                 let outcome = &mut self.pending_outcome;
-                active(cx, self.deadline, &client.client.inner.closed, &cancellation, None, async {
-                    let observed = client.reconcile_task_resume_with_cancellation(cx, &cancellation,
-                        current, pending, discovery_id, request_id).await;
+                Box::pin(active(cx, self.deadline, &client.client.inner.closed, &cancellation, None, async {
+                    let observed = Box::pin(client.reconcile_task_resume_with_cancellation(cx, &cancellation,
+                        current, pending, discovery_id, request_id)).await;
                     let observed = match observed {
                         Ok(value) => ClientCredentialsTaskRestartOutcome::Reconciled(value),
                         Err(ClientCredentialsTaskResumeError::Resume(TaskResumeError::Unavailable)) =>
@@ -324,7 +324,7 @@ impl ClientCredentialsTaskRestart {
                     // lifetime again. Cancellation cannot erase this evidence.
                     *outcome = Some(observed);
                     Ok(Ok(()))
-                }).await??;
+                })).await??;
             }
         }
         check_run(&self.client, cx, &self.cancellation, self.deadline)?;
@@ -350,6 +350,12 @@ fn check_run(client: &ClientCredentialsTasksClient, cx: &Cx,
 pub mod lifecycle {
     use std::future::Future;
 
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "the nested #[cfg(test)] module reaches this file's own imports (Duration, \
+                  OAuthDiscoveryError) through this glob; a list computed from the non-test \
+                  unit omits them and would break the lib-test build"
+    )]
     use super::*;
     use super::super::{
         ClientCredentialsSnapshot, ClientCredentialsTaskWatch, ClientCredentialsTaskWatchPolicy,
@@ -619,7 +625,7 @@ pub mod lifecycle {
             let binding = &self.binding;
             let recovery = &mut self.recovery;
             let read = Box::pin(active(cx, deadline, &client.client.inner.closed, &cancellation, Some(binding), async {
-                Ok(recovery.next_snapshot(cx, &mut watch, Some(binding)).await)
+                Ok(Box::pin(recovery.next_snapshot(cx, &mut watch, Some(binding))).await)
             }));
             let snapshot = remote.until_acknowledged(read).await???
                 .ok_or(TaskResumeError::InvalidRecord)?;
