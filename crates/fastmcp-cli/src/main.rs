@@ -7163,7 +7163,11 @@ fn finish_inspect_cleanup<T>(
             }),
         )),
         (Err(acquisition_error), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
-            fastmcp_core::McpErrorCode::InternalError,
+            // Elect the operation's code, as `fastmcp_client`'s
+            // `combine_operation_and_cleanup` does: a cancelled inspect must
+            // stay RequestCancelled. The cleanup failure still owns the
+            // message, and the unverified flag below still fires.
+            acquisition_error.code,
             // The trusted separator bounds header-value redaction when the
             // terminal writer sanitizes again; it then escapes the newline.
             format!(
@@ -12460,6 +12464,48 @@ mod tests {
     #[test]
     fn stdio_catalog_commands_caller_runtime_planted_negative() {
         assert_stdio_catalog_commands_caller_runtime(true);
+    }
+
+    #[test]
+    fn inspect_cleanup_elects_operation_code_when_both_fail_positive() {
+        let error = finish_inspect_cleanup::<()>(
+            Err(fastmcp_core::McpError::request_cancelled()),
+            Err(fastmcp_core::McpError::internal_error("cleanup sentinel")),
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a failed operation with failed cleanup is an error");
+        assert_eq!(
+            error.code,
+            fastmcp_core::McpErrorCode::RequestCancelled,
+            "{error}"
+        );
+        assert!(fastmcp_client::is_cleanup_unverified(&error), "{error}");
+        assert!(error.message.starts_with("operation failed: "), "{error}");
+        assert!(
+            error.message.contains("\nclient cleanup also failed: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inspect_cleanup_elects_operation_code_when_both_fail_planted_negative() {
+        let error = finish_inspect_cleanup::<()>(
+            Err(fastmcp_core::McpError::invalid_params("operation sentinel")),
+            Err(fastmcp_core::McpError::internal_error("cleanup sentinel")),
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a failed operation with failed cleanup is an error");
+        assert_eq!(
+            error.code,
+            fastmcp_core::McpErrorCode::InvalidParams,
+            "{error}"
+        );
+        assert!(fastmcp_client::is_cleanup_unverified(&error), "{error}");
+        assert!(error.message.starts_with("operation failed: "), "{error}");
+        assert!(
+            error.message.contains("\nclient cleanup also failed: "),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
