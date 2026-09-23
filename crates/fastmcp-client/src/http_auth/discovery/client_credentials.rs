@@ -170,6 +170,11 @@ impl MachineAuthentication {
         }
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the PrivateKeyJwt arm, compiled on non-wasm targets with builtin-auth-server, \
+                  returns the assertion check's error; the Result is only unnecessary without it"
+    )]
     fn check(&self) -> Result<(), ClientCredentialsError> {
         match self {
             Self::Basic(_) | Self::Post(_) => Ok(()),
@@ -186,6 +191,12 @@ impl MachineAuthentication {
         }
     }
 
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "the PrivateKeyJwt arm, compiled on non-wasm targets with builtin-auth-server, \
+                  awaits the signed assertion; the function has no await only without it"
+    )]
     async fn prepare(
         &self, cx: &Cx, deadline: Time, client_id: &str,
         resource: &CanonicalHttpUrl, scopes: &[String],
