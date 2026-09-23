@@ -36,7 +36,7 @@ fn isolated_checkpoint(name: &str, case: CheckpointCase) {
                 let peer = Peer::new().await;
                 match case {
                     CheckpointCase::Restart | CheckpointCase::Recovering => restart(&peer, &cx, matches!(case, CheckpointCase::Recovering)).await,
-                    _ => refusals(&peer, &cx, case).await,
+                    _ => Box::pin(refusals(&peer, &cx, case)).await,
                 }
             });
             asupersync::time::timeout_at(cx.now().saturating_add_nanos(20_000_000_000), test)
