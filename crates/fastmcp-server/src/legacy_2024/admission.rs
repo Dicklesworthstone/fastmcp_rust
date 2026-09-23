@@ -4,6 +4,12 @@
 //! point selects exactly one handler hook after admission; both paths return
 //! through the same result validator and lifecycle commit boundary.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "the #[cfg(test)] module below reaches the parent's items (e.g. \
+              Legacy2024ServerConfig) through this glob; a list computed from the non-test unit \
+              omits them and would break the lib-test build"
+)]
 use super::*;
 
 pub(super) enum PreparedReceive {
