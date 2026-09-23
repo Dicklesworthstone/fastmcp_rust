@@ -12,6 +12,8 @@ pub mod subscriptions;
 pub mod driver;
 /// Owned Task-capable tool submission, explicit core input, and delivery evidence.
 pub mod submission;
+/// One-shot tool submission with insert-only persistence of accepted Tasks.
+pub mod creation;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -147,6 +149,18 @@ impl ClientCredentialsTasksClient {
         &self, cx: &Cx, cancellation: &McpRequestCancellation,
         discovery_id: RequestId, request_id: RequestId, request: ManagedTaskRequest,
     ) -> Result<ClientCredentialsTaskCall, ClientCredentialsTasksError> {
+        let round = self.prepare_round(discovery_id, request_id, request)?;
+        let deadline = discovery_deadline(cx, self.limits.timeout.min(self.client.inner.timeout))
+            .map_err(ClientCredentialsError::from)?;
+        self.execute_round(cx, cancellation, round, deadline).await
+    }
+
+    // Shared preflight for immediate requests and caller-owned submissions.
+    // Keep both complete wire documents with their decoder: preparation never
+    // grants authority, sends a Task preference, or acquires a credential.
+    fn prepare_round(
+        &self, discovery_id: RequestId, request_id: RequestId, request: ManagedTaskRequest,
+    ) -> Result<PreparedRound, ClientCredentialsTasksError> {
         discovery_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
         request_id.validate().map_err(|_| ManagedTasksError::InvalidRequest)?;
         if discovery_id.correlates_with(&request_id) { return Err(ManagedTasksError::InvalidRequest.into()); }
@@ -158,8 +172,16 @@ impl ClientCredentialsTasksClient {
         let params = discovery.encode_params().map_err(|_| ManagedTasksError::InvalidRequest)?
             .ok_or(ManagedTasksError::InvalidRequest)?;
         let discovery_wire = encode(self.client.resource().as_str(), "server/discover", &discovery_id, params, None, self.limits.request_bytes)?;
-        let deadline = discovery_deadline(cx, self.limits.timeout.min(self.client.inner.timeout))
-            .map_err(ClientCredentialsError::from)?;
+        Ok(PreparedRound { discovery_id, request_id, prepared, discovery, discovery_wire })
+    }
+
+    // Consume, never clone/retry, the admitted round. All callers establish one
+    // deadline before entry; token expiry can only tighten the existing bound.
+    async fn execute_round(
+        &self, cx: &Cx, cancellation: &McpRequestCancellation,
+        round: PreparedRound, deadline: Time,
+    ) -> Result<ClientCredentialsTaskCall, ClientCredentialsTasksError> {
+        let PreparedRound { discovery_id, request_id, prepared, discovery, discovery_wire } = round;
         let owner = &self.client.inner.closed;
         // The outer bound includes acquisition. Inner bounds retain the opening
         // token's expiry during both network exchanges and all response reads.
@@ -203,6 +225,13 @@ fn require_success(response: &ModernHttpResponseStream) -> Result<(), ManagedTas
 
 enum Decoder { Tool(Box<CoreRequest>), Get(TaskId), Update, Cancel }
 struct Prepared { wire: ModernHttpRequest, decoder: Decoder, progress: Option<ProgressMarker> }
+struct PreparedRound {
+    discovery_id: RequestId,
+    request_id: RequestId,
+    prepared: Prepared,
+    discovery: CoreRequest,
+    discovery_wire: ModernHttpRequest,
+}
 enum Body { Json(ModernHttpResponseStream), Sse(ModernHttpSseResponseStream) }
 
 /// Caller-owned response with typed incremental notifications and one terminal.
