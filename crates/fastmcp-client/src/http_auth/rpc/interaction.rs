@@ -928,15 +928,15 @@ mod tests {
     fn mixed_admission_checks_late_missing_capabilities_without_changing_state() {
         let original = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{}}));
         let challenge = input(&original, r#"{"resultType":"input_required","inputRequests":{"first":{"method":"roots/list"},"last":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16,"toolChoice":{"mode":"auto"}}}},"requestState":"same-state"}"#);
-        let before = serde_json::to_value(&challenge).unwrap();
+        let before = format!("{challenge:?}");
         let limits = ManagedInteractionLimits::new(ManagedCoreLimits::default(), 1, 2).unwrap();
         assert!(matches!(admit_challenge(&original, &challenge, limits, 0, 0),
             Err(ManagedInteractionError::CapabilityNotAdvertised)));
-        assert_eq!(serde_json::to_value(&challenge).unwrap(), before);
+        assert_eq!(format!("{challenge:?}"), before);
         assert_eq!(challenge.request_state(), Some("same-state"));
         let capable = request("tools/call", json!({"name":"echo"}), json!({"roots":{},"sampling":{"tools":{}}}));
         assert!(admit_challenge(&capable, &challenge, limits, 0, 0).is_ok());
-        assert_eq!(serde_json::to_value(&challenge).unwrap(), before);
+        assert_eq!(format!("{challenge:?}"), before);
     }
 
     #[test]
