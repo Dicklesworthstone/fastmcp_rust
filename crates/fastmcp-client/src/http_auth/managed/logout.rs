@@ -640,7 +640,7 @@ mod tests {
                     poll_fn(|_| {
                         polls.fetch_add(1, Ordering::SeqCst);
                         Poll::<()>::Pending
-                    }).await
+                    }).await;
                 };
                 let counter = Arc::new(WakeCount::default());
                 let waker = Waker::from(Arc::clone(&counter));
@@ -696,7 +696,7 @@ mod tests {
         let owner = Owner(Arc::clone(&dropped));
         let operation = async move {
             let _owner = owner;
-            std::future::pending::<()>().await
+            std::future::pending::<()>().await;
         };
         let counter = Arc::new(WakeCount::default());
         let waker = Waker::from(Arc::clone(&counter));
