@@ -5,6 +5,9 @@
 //! Continuations echo only the current admitted challenge under the opening
 //! credential. No automatic resolver, renewal, polling or mutation retry runs.
 
+/// Initial checkpoint persistence after explicit core-input continuations.
+pub mod persisted;
+
 use std::fmt;
 
 use asupersync::Cx;

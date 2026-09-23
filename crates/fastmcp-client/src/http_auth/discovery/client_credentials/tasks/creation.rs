@@ -9,13 +9,14 @@ use std::fmt;
 use std::future::Future;
 
 use asupersync::Cx;
+use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{FinalCoreResult, RequestId, ServerNotification};
 use fastmcp_protocol::tasks_extension::Task;
 use serde_json::Value;
 
 use super::{
-    ClientCredentialsError, ClientCredentialsTaskCall,
+    ClientCredentialsError, ClientCredentialsSnapshot, ClientCredentialsTaskCall,
     ClientCredentialsTasksClient, ClientCredentialsTasksError, ManagedTaskEvent,
     ManagedTaskRequest, ManagedTasksError, PreparedRound, active, discovery_deadline,
 };
@@ -115,6 +116,9 @@ pub struct PendingClientCredentialsTaskResult {
     persistence: TaskResumePersistenceState,
 }
 impl PendingClientCredentialsTaskResult {
+    pub(super) fn new(result: Box<FinalCoreResult>) -> Self {
+        Self { result, insert: None, persistence: TaskResumePersistenceState::NotAttempted }
+    }
     pub fn result(&self) -> &FinalCoreResult { &self.result }
     pub fn record(&self) -> Option<&TaskResumeRecord> { self.insert.as_ref().map(TaskResumeInsert::record) }
     pub fn persistence(&self) -> TaskResumePersistenceState { self.persistence }
@@ -122,7 +126,7 @@ impl PendingClientCredentialsTaskResult {
         (self.result, self.insert, self.persistence)
     }
 
-    fn capture(&mut self, cx: &Cx, current: &TaskResumeBinding, policy: TaskResumeCapturePolicy)
+    pub(super) fn capture(&mut self, cx: &Cx, current: &TaskResumeBinding, policy: TaskResumeCapturePolicy)
         -> Result<bool, TaskResumeError>
     {
         let FinalCoreResult::ToolsCallTask { result, .. } = &*self.result else { return Ok(false); };
@@ -148,6 +152,9 @@ pub struct PersistedClientCredentialsTaskResult<E> {
     warning: Option<ClientCredentialsTaskPersistenceWarning<E>>,
 }
 impl<E> PersistedClientCredentialsTaskResult<E> {
+    pub(super) fn new(pending: PendingClientCredentialsTaskResult, warning: Option<ClientCredentialsTaskPersistenceWarning<E>>) -> Self {
+        Self { pending, warning }
+    }
     pub fn result(&self) -> &FinalCoreResult { self.pending.result() }
     pub fn record(&self) -> Option<&TaskResumeRecord> { self.pending.record() }
     pub fn persistence(&self) -> TaskResumePersistenceState { self.pending.persistence() }
@@ -183,6 +190,9 @@ impl ClientCredentialsTasksClient {
     /// The result union stays intact. A core input_required reply is returned as
     /// such and is NOT automatically resumed. This owner sends one tools/call;
     /// it does not implement continuation execution or a mutation-recovery log.
+    /// For explicit core-input continuations followed by checkpoint capture,
+    /// prepare_tool_submission(...).with_initial_checkpoint(...) retains the
+    /// existing continuation engine and its cumulative limits through saving.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_tool_submission_persisted<P, F, E>(
         &self, discovery_id: RequestId, request_id: RequestId, name: String,
@@ -296,9 +306,7 @@ impl<P> PersistedClientCredentialsTaskSubmission<P> {
             ManagedTaskEvent::ToolResult(result) => {
                 // No fallible step or suspension between admission and custody.
                 self.state = ClientCredentialsTaskCreationState::Resolved;
-                self.pending = Some(PendingClientCredentialsTaskResult {
-                    result, insert: None, persistence: TaskResumePersistenceState::NotAttempted,
-                });
+                self.pending = Some(PendingClientCredentialsTaskResult::new(result));
                 let captured = self.pending.as_mut().expect("result retained above")
                     .capture(cx, &self.current, self.capture);
                 let warning = match captured {
@@ -309,7 +317,7 @@ impl<P> PersistedClientCredentialsTaskSubmission<P> {
                 let pending = self.pending.take().expect("exclusive owner retains admitted result");
                 self.finished = true;
                 Ok(Some(PersistedClientCredentialsTaskSubmissionEvent::Result(Box::new(
-                    PersistedClientCredentialsTaskResult { pending, warning },
+                    PersistedClientCredentialsTaskResult::new(pending, warning),
                 ))))
             }
             _ => Err(ManagedTasksError::InvalidResponse.into()),
@@ -321,24 +329,39 @@ impl<P> PersistedClientCredentialsTaskSubmission<P> {
     where P: FnMut(TaskResumeInsert) -> F, F: Future<Output = Result<(), E>>,
     {
         let pending = self.pending.as_mut().expect("admitted result precedes saving");
-        let insert = pending.insert.as_ref().expect("capture succeeded").clone();
-        let deadline = match insert.retention_deadline(cx, &self.current) {
-            Ok(retention) => retention.min(call.deadline),
-            Err(error) => return Some(ClientCredentialsTaskPersistenceWarning::Record(error)),
-        };
-        let state = &mut pending.persistence;
-        let persist = &mut self.persist;
-        let saved = active(cx, deadline, &call.owner, &call.cancellation, Some(&call.snapshot), async {
-            Ok(persist_insert(state, persist, insert.clone()).await)
-        }).await;
-        match saved {
-            Err(error) => return Some(ClientCredentialsTaskPersistenceWarning::Authentication(error)),
-            Ok(Err(error)) => return Some(ClientCredentialsTaskPersistenceWarning::Persistence(error)),
-            Ok(Ok(())) => {},
-        }
-        // Local expiry cannot erase the real Task or an already-admitted save.
-        insert.record().admit(cx, &self.current).err().map(ClientCredentialsTaskPersistenceWarning::Record)
+        persist_pending(pending, cx, &self.current, &mut self.persist,
+            call.deadline, &call.owner, &call.cancellation, &call.snapshot).await
     }
+}
+
+// Shared by one-shot creation and explicit core-input submissions. Neither
+// caller may reacquire authority or replace the original deadline at this point.
+// The admitted result stays in its owner's pending slot throughout the save.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn persist_pending<P, F, E>(
+    pending: &mut PendingClientCredentialsTaskResult, cx: &Cx,
+    current: &TaskResumeBinding, persist: &mut P, deadline: Time,
+    owner: &McpRequestCancellation, cancellation: &McpRequestCancellation,
+    credential: &ClientCredentialsSnapshot,
+) -> Option<ClientCredentialsTaskPersistenceWarning<E>>
+where P: FnMut(TaskResumeInsert) -> F, F: Future<Output = Result<(), E>>,
+{
+    let insert = pending.insert.as_ref().expect("capture precedes persistence").clone();
+    let deadline = match insert.retention_deadline(cx, current) {
+        Ok(retention) => retention.min(deadline),
+        Err(error) => return Some(ClientCredentialsTaskPersistenceWarning::Record(error)),
+    };
+    let state = &mut pending.persistence;
+    let saved = active(cx, deadline, owner, cancellation, Some(credential), async {
+        Ok(persist_insert(state, persist, insert.clone()).await)
+    }).await;
+    match saved {
+        Err(error) => return Some(ClientCredentialsTaskPersistenceWarning::Authentication(error)),
+        Ok(Err(error)) => return Some(ClientCredentialsTaskPersistenceWarning::Persistence(error)),
+        Ok(Ok(())) => {},
+    }
+    // Local expiry cannot erase the real Task or an already-admitted save.
+    insert.record().admit(cx, current).err().map(ClientCredentialsTaskPersistenceWarning::Record)
 }
 
 async fn persist_insert<P, F, E>(state: &mut TaskResumePersistenceState, persist: &mut P, insert: TaskResumeInsert)
