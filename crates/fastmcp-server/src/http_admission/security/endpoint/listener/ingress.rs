@@ -11,7 +11,7 @@ use asupersync::stream::StreamExt;
 use fastmcp_transport::http::{HttpResponse, HttpStatus};
 
 use super::super::super::{CorsResponseHeaders, HttpSecurityError, HttpSecurityHead, HttpSecurityPolicy};
-use crate::{BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, Http1DecodeError, Http1Response, HttpListenerShutdown, NativeHttp1Codec};
+use crate::{BytesMut, Decoder, Encoder, Framed, HTTP_ACCEPT_CANCEL_POLL, Http1DecodeError, Http1Response, HttpListenerShutdown, NativeHttp1Codec, OAuthHttpRoutes, OAuthNativeH1RouteLimits};
 
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
 const MAX_EXPECTATION_MEMBERS: usize = 16;
@@ -33,6 +33,7 @@ pub(super) struct SecuredCodec {
     inner: NativeHttp1Codec,
     policy: Arc<HttpSecurityPolicy>,
     body_limit: usize,
+    oauth_limits: Option<OAuthNativeH1RouteLimits>,
     cors: Option<CorsResponseHeaders>,
     finished: bool,
 }
@@ -40,7 +41,13 @@ pub(super) struct SecuredCodec {
 impl SecuredCodec {
     pub(super) fn new(policy: Arc<HttpSecurityPolicy>, body_limit: usize) -> Self {
         let body_limit = body_limit.min(policy.endpoint().limits().max_body_bytes());
-        Self { inner: NativeHttp1Codec::new(body_limit, None), policy, body_limit, cors: None, finished: false }
+        Self { inner: NativeHttp1Codec::new(body_limit, None), policy, body_limit, oauth_limits: None, cors: None, finished: false }
+    }
+
+    pub(super) fn with_oauth_routes(mut self, routes: Option<&OAuthHttpRoutes>) -> Self {
+        self.inner = NativeHttp1Codec::new(self.body_limit, routes);
+        self.oauth_limits = routes.map(OAuthNativeH1RouteLimits::from_routes);
+        self
     }
 
     fn refusal(&mut self, error: HttpSecurityError, source: &mut BytesMut) -> Ingress {
@@ -51,7 +58,7 @@ impl SecuredCodec {
         Ingress::Immediate(response)
     }
 
-    fn head(&self, source: &[u8], end: usize) -> Result<AdmittedHead, HttpSecurityError> {
+    fn head(&mut self, source: &[u8], end: usize) -> Result<AdmittedHead, HttpSecurityError> {
         let text = std::str::from_utf8(&source[..end]).map_err(|_| HttpSecurityError::InvalidHeader)?;
         let mut lines = text.split("\r\n");
         let line = lines.next().ok_or(HttpSecurityError::InvalidHeader)?;
@@ -89,7 +96,24 @@ impl SecuredCodec {
             let value = value.trim_matches([' ', '\t']);
             headers.push((name.to_owned(), value.to_owned()));
         }
-        let head = self.policy.admit_head(method, path, &headers)?;
+        let oauth_limit = self.oauth_limits.as_ref().and_then(|routes| routes.body_limit_for_path(path));
+        let head = match oauth_limit {
+            Some(limit) => self.policy.admit_oauth_head(method, &headers, limit == 0)?,
+            None => self.policy.admit_head(method, path, &headers)?,
+        };
+        if let HttpSecurityHead::Post(cors) = &head {
+            self.cors = Some(cors.clone());
+        }
+        if let Some(routes) = &self.oauth_limits && oauth_limit.is_some() {
+            let query = target.split_once('?').map_or("", |(_, query)| query);
+            if path == routes.authorization {
+                if query.len() > crate::oauth::MAX_OAUTH_AUTHORIZATION_QUERY_BYTES {
+                    return Err(HttpSecurityError::BodyTooLarge);
+                }
+            } else if !query.is_empty() || target.ends_with('?') {
+                return Err(HttpSecurityError::InvalidHeader);
+            }
+        }
         let length = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
             .map(|(_, value)| value);
         let encodings = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
@@ -106,14 +130,16 @@ impl SecuredCodec {
             }
             value.parse::<usize>().map_err(|_| HttpSecurityError::ContentLengthMismatch)
         }).transpose()?;
-        if !matches!(&head, HttpSecurityHead::Post(_)) {
+        if !matches!(&head, HttpSecurityHead::Post(_)) || oauth_limit == Some(0) {
             // Preflight and public metadata GET are bodyless. Never wait for a
             // claimed body, and reject already-buffered pipelining. The response
             // closes this connection, so later request data cannot dispatch.
             if length.is_some_and(|length| length != 0) || !encodings.is_empty() || source.len() != end + 4 {
                 return Err(HttpSecurityError::BodyNotAllowed);
             }
-        } else if length.is_some_and(|length| length > self.body_limit) {
+        } else if length.is_some_and(|length| length > oauth_limit.unwrap_or(self.body_limit).min(self.body_limit))
+            || (oauth_limit.is_some() && !encodings.is_empty())
+        {
             return Err(HttpSecurityError::BodyTooLarge);
         }
         let expects_continue = match continue_expectation(&headers) {
@@ -281,6 +307,62 @@ mod tests {
         };
         assert!(codec.decode(&mut source).unwrap().is_none());
         response.status.0
+    }
+
+    fn oauth_codec() -> SecuredCodec {
+        let policy = HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
+            "https://service.example", vec!["https://app.example".to_owned()],
+        ).unwrap();
+        let issuer = Arc::new(crate::oauth::OAuthServer::try_new(crate::oauth::OAuthServerConfig {
+            issuer: "https://service.example/".to_owned(), ..Default::default()
+        }).unwrap());
+        let routes = OAuthHttpRoutes::new(issuer, "https://service.example/oauth").unwrap();
+        SecuredCodec::new(Arc::new(policy), 65536).with_oauth_routes(Some(&routes))
+    }
+
+    #[test]
+    fn oauth_routes_keep_exact_methods_host_origin_and_unmodified_query() {
+        let valid = "GET /oauth/authorize?state=one%2Btwo&state=three HTTP/1.1\r\nHost: service.example\r\nOrigin: https://app.example\r\n\r\n";
+        let Some(Ingress::Request { request, cors }) = oauth_codec()
+            .decode(&mut BytesMut::from(valid.as_bytes())).unwrap() else {
+            panic!("installed issuer GET must reach the existing OAuth parameter admission")
+        };
+        assert_eq!(request.uri, "/oauth/authorize?state=one%2Btwo&state=three");
+        assert_eq!(cors.allowed_origin(), Some("https://app.example"));
+        assert!(cors.metadata_location.is_none());
+        for (wire, expected) in [
+            (valid.replace("Host: service.example", "Host: other.example"), 403),
+            (valid.replace("Origin: https://app.example", "Origin: https://attacker.example"), 403),
+            (valid.replacen("GET ", "POST ", 1), 405),
+            (valid.replace("/oauth/authorize?state=one%2Btwo&state=three", "/oauth/token"), 405),
+            (valid.replace("/oauth/authorize?state=one%2Btwo&state=three", "/oauth/authorize/"), 404),
+        ] {
+            assert_eq!(status(&mut oauth_codec(), &wire), expected);
+        }
+    }
+
+    #[test]
+    fn oauth_form_limit_and_bodyless_authorization_precede_continue_or_body_read() {
+        let limit = crate::oauth::MAX_OAUTH_FORM_BODY_BYTES;
+        let valid = format!("POST /oauth/token HTTP/1.1\r\nHost: service.example\r\nOrigin: https://app.example\r\nContent-Length: {limit}\r\nExpect: 100-continue\r\n\r\n");
+        assert!(matches!(oauth_codec().decode(&mut BytesMut::from(valid.as_bytes())).unwrap(), Some(Ingress::Continue)));
+        let oversized = valid.replace(&format!("Content-Length: {limit}"), &format!("Content-Length: {}", limit + 1));
+        let mut source = BytesMut::from(oversized.as_bytes());
+        let Some(Ingress::Immediate(response)) = oauth_codec().decode(&mut source).unwrap() else {
+            panic!("oversized issuer body must be refused before 100 Continue")
+        };
+        assert_eq!(response.status.0, 413);
+        assert_eq!(response.headers["cache-control"], "no-store");
+        assert_eq!(response.headers["access-control-allow-origin"], "https://app.example");
+        assert_eq!(status(&mut oauth_codec(), &valid.replace(
+            &format!("Content-Length: {limit}"), "Transfer-Encoding: chunked")), 413);
+        assert_eq!(status(&mut oauth_codec(),
+            "GET /oauth/authorize HTTP/1.1\r\nHost: service.example\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n"), 400);
+        assert_eq!(status(&mut oauth_codec(),
+            "POST /oauth/token?code=wrong-location HTTP/1.1\r\nHost: service.example\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n"), 400);
+        assert_eq!(status(&mut oauth_codec(),
+            "OPTIONS /oauth/token HTTP/1.1\r\nHost: service.example\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n\r\n"), 204);
     }
 
     #[test]

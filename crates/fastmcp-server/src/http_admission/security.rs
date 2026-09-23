@@ -256,6 +256,34 @@ impl HttpSecurityPolicy {
     ) -> Result<HttpSecurityHead, HttpSecurityError> {
         self.admit_route(method, path)?;
         let metadata = self.resource_metadata.as_ref().filter(|_| self.is_metadata_path(path));
+        let requested_method = if metadata.is_some() { "GET" } else { "POST" };
+        self.admit_route_head(method, headers, requested_method, metadata)
+    }
+
+    // Only the native HTTPS listener can select an installed issuer route.
+    // Its exact method and body contract come from immutable OAuthHttpRoutes;
+    // issuer requests still cross the same header, Host and Origin boundary.
+    fn admit_oauth_head(
+        &self, method: &str, headers: &[(String, String)], bodyless: bool,
+    ) -> Result<HttpSecurityHead, HttpSecurityError> {
+        let requested_method = if bodyless { "GET" } else { "POST" };
+        if method != requested_method && method != "OPTIONS" {
+            return Err(if bodyless { HttpSecurityError::MetadataMethodNotAllowed }
+                else { HttpSecurityError::MethodNotAllowed });
+        }
+        let mut admitted = self.admit_route_head(method, headers, requested_method, None)?;
+        if let HttpSecurityHead::Post(cors) = &mut admitted {
+            // An issuer error must not acquire the co-hosted MCP resource's
+            // Bearer challenge metadata.
+            cors.metadata_location = None;
+        }
+        Ok(admitted)
+    }
+
+    fn admit_route_head(
+        &self, method: &str, headers: &[(String, String)], requested_method: &str,
+        metadata: Option<&Arc<resource_metadata::PublishedResourceMetadata>>,
+    ) -> Result<HttpSecurityHead, HttpSecurityError> {
         let limits = self.endpoint.limits();
         if headers.len() > limits.max_header_count() { return Err(HttpSecurityError::HeaderLimit); }
         let mut bytes = 0_usize;
@@ -298,7 +326,6 @@ impl HttpSecurityPolicy {
             };
         }
         let origin = origin.ok_or(HttpSecurityError::InvalidPreflight)?;
-        let requested_method = if metadata.is_some() { "GET" } else { "POST" };
         if field(headers, "access-control-request-method") != Some(requested_method)
             || headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("access-control-request-private-network"))
         { return Err(HttpSecurityError::InvalidPreflight); }

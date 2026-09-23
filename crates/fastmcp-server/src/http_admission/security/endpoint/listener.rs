@@ -3,8 +3,8 @@
 //! Unlike the embedding adapter, this path owns socket admission, bounded H1
 //! decoding and response writes. Select it with `Server::bind_secured_http` or
 //! `Server::bind_secured_https`. It is modern MCP only, even in a legacy build.
-//! Hosted OAuth authorization/token routes must use a separate listener; bind
-//! refuses that combination rather than silently dropping or weakening routes.
+//! Native HTTPS may co-host explicitly configured OAuth routes at its exact
+//! public origin. Plain HTTP requires a separate issuer listener.
 //!
 //! The supplied origin policy is the single CORS authority for this listener.
 //! Its exact allowlist also configures the existing downstream request handler.
@@ -25,7 +25,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use asupersync::io::AsyncWriteExt;
 use asupersync::tls::TlsAcceptor;
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
 use super::super::HttpSecurityPolicy;
@@ -110,10 +110,20 @@ impl Server {
     /// Unsupported protocol policies, route mismatches and co-hosted OAuth routes
     /// fail before a socket is bound or any startup hook runs.
     pub async fn bind_secured_http(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+        policy: HttpSecurityPolicy,
+    ) -> McpResult<BoundSecuredHttpServer> {
+        self.bind_secured_listener(cx, addr, policy, None).await
+    }
+
+    async fn bind_secured_listener(
         mut self,
         cx: &Cx,
         addr: impl Into<String>,
         policy: HttpSecurityPolicy,
+        tls: Option<TlsAcceptor>,
     ) -> McpResult<BoundSecuredHttpServer> {
         if cx.checkpoint().is_err() { return Err(McpError::request_cancelled()); }
         if self.protocol_policy != ProtocolPolicy::ModernOnly {
@@ -122,8 +132,23 @@ impl Server {
         if self.http_config.handler_config.base_path != policy.endpoint().path() {
             return Err(McpError::invalid_request("secured HTTP policy does not match the MCP route"));
         }
-        if self.oauth_http_routes.is_some() {
-            return Err(McpError::invalid_request("secured MCP listener requires separate OAuth routes"));
+        if let Some(routes) = &self.oauth_http_routes {
+            if tls.is_none() {
+                return Err(McpError::invalid_request("secured HTTP requires separate OAuth routes; co-hosting requires native HTTPS"));
+            }
+            let issuer_base = CanonicalHttpUrl::parse(routes.public_endpoint_base())
+                .map_err(|_| McpError::invalid_request("invalid secured HTTPS OAuth endpoint"))?;
+            if issuer_base.scheme() != policy.public_origin.scheme()
+                || issuer_base.host() != policy.public_origin.host()
+                || issuer_base.effective_port() != policy.public_origin.effective_port()
+            {
+                return Err(McpError::invalid_request("secured HTTPS OAuth routes require the same configured public origin"));
+            }
+            if policy.resource_metadata_path().is_some_and(|path| routes.has_path(path)) {
+                return Err(McpError::invalid_request("secured HTTPS OAuth and resource metadata routes overlap"));
+            }
+            crate::validate_server_http_route_configuration(&self)
+                .map_err(|_| McpError::invalid_request("secured HTTPS OAuth routes overlap an installed server route"))?;
         }
         self.http_config.handler_config.allow_cors = true;
         self.http_config.handler_config.cors_origins = policy.origins.clone();
@@ -131,7 +156,7 @@ impl Server {
             .min(policy.endpoint().limits().max_body_bytes());
         let inner = self.bind_http(cx, addr).await?;
         Ok(BoundSecuredHttpServer {
-            inner, policy: Arc::new(policy), io: SecuredHttpIoLimits::default(), tls: None,
+            inner, policy: Arc::new(policy), io: SecuredHttpIoLimits::default(), tls,
         })
     }
 
@@ -152,6 +177,16 @@ impl Server {
     /// and timeout drop the owned socket; none permits a plaintext retry.
     /// HTTP origin/Host checks, Bearer admission, named scopes, SSE revalidation
     /// and request ownership use the unchanged secured HTTP pipeline.
+    ///
+    /// Explicit `oauth_http_routes` may share this listener when their public
+    /// origin matches the security policy and their paths are disjoint from
+    /// MCP and protected-resource metadata. Their existing registration,
+    /// consent, PKCE, token and revocation policies remain authoritative; the
+    /// listener applies its Host/Origin policy and endpoint-specific byte bounds
+    /// before invoking the issuer. Issuer responses are always uncacheable.
+    /// The caller must install a blocking pool for synchronous issuer policy;
+    /// missing, stopped or saturated pool admission returns HTTP 503 without
+    /// executing issuer work on the network executor.
     pub async fn bind_secured_https(
         self,
         cx: &Cx,
@@ -164,9 +199,7 @@ impl Server {
         if cx.timer_driver().is_none() {
             return Err(McpError::invalid_request("secured HTTPS requires caller-owned timers"));
         }
-        let mut bound = self.bind_secured_http(cx, addr, policy).await?;
-        bound.tls = Some(acceptor);
-        Ok(bound)
+        self.bind_secured_listener(cx, addr, policy, Some(acceptor)).await
     }
 
     /// Binds and serves the secured native listener on the caller's runtime.

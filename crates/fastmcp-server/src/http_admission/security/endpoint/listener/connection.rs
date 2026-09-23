@@ -2,11 +2,13 @@
 
 use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::sync::Notify;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_transport::{TransportError, http::{HttpRequest, HttpResponse, HttpStatus}};
 
@@ -41,7 +43,8 @@ pub(super) async fn serve(
     io: SecuredHttpIoLimits,
 ) {
     let body_limit = endpoint.server.http_config.handler_config.max_body_size;
-    let mut framed = Framed::new(stream, SecuredCodec::new(Arc::clone(&policy), body_limit));
+    let mut framed = Framed::new(stream, SecuredCodec::new(Arc::clone(&policy), body_limit)
+        .with_oauth_routes(endpoint.server.oauth_http_routes.as_ref()));
     let mut writing_continue = false;
     let read = super::ingress::receive(
         cx, &shutdown, &mut framed, io.write_timeout, &mut writing_continue,
@@ -78,6 +81,11 @@ pub(super) async fn serve(
         return;
     }
     let raw_path = request.uri.split_once('?').map_or(request.uri.as_str(), |(path, _)| path);
+    if let Some(routes) = endpoint.server.oauth_http_routes.as_ref().filter(|routes| routes.has_path(raw_path)) {
+        issuer(cx, framed.into_inner(), endpoint.clone(), sessions, shutdown,
+            routes.clone(), request, cors, io).await;
+        return;
+    }
     // Raw security fields have already passed before body allocation. Retain
     // their cardinality through the existing protocol/header mirror boundary.
     if let Err(response) = admit_modern_http_post(
@@ -181,9 +189,123 @@ async fn buffered<T: asupersync::io::AsyncWrite + Unpin>(
     cx: &Cx, shutdown: &HttpListenerShutdown, framed: &mut Framed<T, NativeHttp1Codec>,
     mut response: HttpResponse, cors: Option<&CorsResponseHeaders>, io: SecuredHttpIoLimits,
 ) {
+    if response.status.0 >= 400 {
+        response = response.with_header("cache-control", "no-store");
+    }
     if let Some(cors) = cors { cors.apply_to(&mut response); }
     let _ = asupersync::time::timeout(cx.now(), io.write_timeout,
         send_h1_response(cx, shutdown, framed, response)).await;
+}
+
+#[derive(Default)]
+struct IssuerCompletion {
+    done: AtomicBool,
+    changed: Notify,
+}
+
+struct IssuerCompletionGuard(Arc<IssuerCompletion>);
+
+impl Drop for IssuerCompletionGuard {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Release);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0.changed.notify_waiters()));
+    }
+}
+
+// The completion guard is last: Rust drops the captured issuer, raw request,
+// context, cancellation and capacity permit before waking the async owner.
+// Calling run consumes this whole object, including when pool submission drops
+// an uninvoked closure, so capture splitting cannot publish completion early.
+struct IssuerWork {
+    routes: crate::OAuthHttpRoutes,
+    request: asupersync::http::h1::Request,
+    cx: Cx,
+    cancellation: McpRequestCancellation,
+    _permit: crate::BlockingDispatchPermit,
+    _completion: IssuerCompletionGuard,
+}
+
+impl IssuerWork {
+    fn run(self, sender: asupersync::channel::oneshot::Sender<HttpResponse>) {
+        if self.cx.checkpoint().is_err() || self.cancellation.is_cancel_requested() { return; }
+        let _current = Cx::set_current(Some(self.cx.clone()));
+        let _lane = fastmcp_core::runtime::enter_blocking_lane();
+        let (path, query) = self.request.uri.split_once('?')
+            .map_or((self.request.uri.as_str(), ""), |(path, query)| (path, query));
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::dispatch_oauth_h1_request(&self.routes, &self.request, path, query)
+        })).unwrap_or_else(|_| HttpResponse::internal_error());
+        if self.cx.checkpoint().is_ok() && !self.cancellation.is_cancel_requested() {
+            let _ = sender.send_blocking(response);
+        }
+    }
+}
+
+// The issuer keeps its own client/consent/PKCE/token policy. It never enters
+// MCP routing, bearer verification or protected-resource scope authorization.
+// Admission has already preserved raw query and header cardinality and bounded
+// the exact issuer route before accepting the request body.
+#[allow(clippy::too_many_arguments)]
+async fn issuer(
+    cx: &Cx, stream: ConnectionIo, endpoint: Arc<ServerHttpEndpoint>,
+    sessions: LiveModernHttpSessionRegistry, shutdown: HttpListenerShutdown,
+    routes: crate::OAuthHttpRoutes, request: asupersync::http::h1::Request,
+    cors: CorsResponseHeaders, io: SecuredHttpIoLimits,
+) {
+    let unavailable = || HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+        .with_header("cache-control", "no-store");
+    let Some(pool) = cx.blocking_pool_handle() else {
+        let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+        buffered(cx, &shutdown, &mut framed, unavailable(), Some(&cors), io).await;
+        return;
+    };
+    let Some(permit) = crate::try_reserve_blocking_dispatch() else {
+        let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+        buffered(cx, &shutdown, &mut framed, unavailable(), Some(&cors), io).await;
+        return;
+    };
+    let cancellation = McpRequestCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<HttpResponse>();
+    let task = cx.spawn(move |worker_cx| async move {
+        let (result_sender, mut result_receiver) = asupersync::channel::oneshot::channel();
+        let completion = Arc::new(IssuerCompletion::default());
+        let work = IssuerWork {
+            routes, request, cx: worker_cx.clone(), cancellation: worker_cancellation,
+            _permit: permit, _completion: IssuerCompletionGuard(Arc::clone(&completion)),
+        };
+        // Raw pool submission refuses without invoking the closure. The permit
+        // remains with executing synchronous work even when its peer disappears.
+        let pool_task = crate::BlockingTaskGuard(pool.spawn(move || work.run(result_sender)));
+        let response = result_receiver.recv(&worker_cx).await;
+        if worker_cx.is_cancel_requested() { pool_task.0.cancel(); }
+        completion.changed.wait_until(|| completion.done.load(Ordering::Acquire)).await;
+        if worker_cx.checkpoint().is_ok() {
+            let response = response.unwrap_or_else(|_| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE));
+            let _ = sender.send_blocking(response.with_header("cache-control", "no-store"));
+        }
+    });
+    let mut dispatch = match task {
+        Ok(task) => OwnedJsonDispatch { task: Some(task), sessions, cancellation: cancellation.clone() },
+        Err(_) => {
+            let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
+            buffered(cx, &shutdown, &mut framed, unavailable(), Some(&cors), io).await;
+            return;
+        }
+    };
+    let (mut reader, writer) = stream.into_split();
+    let mut byte = [0_u8; 1];
+    let response = monitor_response_peer(&cancellation, reader.read(&mut byte), async {
+        let response = receiver.recv(cx).await;
+        if cx.checkpoint().is_err() { return Err(()); }
+        Ok(response.unwrap_or_else(|_| unavailable()))
+    }).await;
+    let Ok(mut response) = response else { return; };
+    if !dispatch.finish(cx).await { response = unavailable(); }
+    drop(dispatch);
+    drop(reader);
+    let mut framed = Framed::new(writer, native_http1_codec(&endpoint));
+    buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
 }
 
 #[allow(clippy::too_many_arguments)]

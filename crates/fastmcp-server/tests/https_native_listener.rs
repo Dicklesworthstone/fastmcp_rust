@@ -47,6 +47,11 @@ use fastmcp_server::{AuthProvider, AuthRequest, HttpServerShutdown, Server, Stat
 use fastmcp_server::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
 use fastmcp_server::http_admission::security::{HttpSecurityPolicy, resource_metadata::ProtectedResourceMetadata};
 use fastmcp_server::http_admission::security::endpoint::listener::SecuredHttpIoLimits;
+use fastmcp_server::oauth::{
+    AuthorizationApprovalBackend, AuthorizationApprovalDecision, AuthorizationApprovalDisposition,
+    AuthorizationApprovalGeneration, AuthorizationApprovalRequest, OAuthHttpRoutes,
+    OAuthServer, OAuthServerConfig,
+};
 use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus};
 use serde_json::{Value, json};
 
@@ -160,10 +165,17 @@ impl Running {
         let server = Server::new("native-https", "1")
             .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
             .auth_provider(probe.clone()).tool(probe.clone()).build();
-        let bound = Box::pin(server.bind_secured_https(cx, "127.0.0.1:0", policy(), acceptor()))
-            .await.unwrap().with_io_limits(
-                SecuredHttpIoLimits::default().with_handshake_timeout(handshake).unwrap(),
-            );
+        Self::configured(cx, server, policy(), handshake).await
+    }
+
+    async fn configured(cx: &Cx, server: Server, policy: HttpSecurityPolicy, handshake: Duration) -> Self {
+        Self::with_limits(cx, server, policy,
+            SecuredHttpIoLimits::default().with_handshake_timeout(handshake).unwrap()).await
+    }
+
+    async fn with_limits(cx: &Cx, server: Server, policy: HttpSecurityPolicy, limits: SecuredHttpIoLimits) -> Self {
+        let bound = Box::pin(server.bind_secured_https(cx, "127.0.0.1:0", policy, acceptor()))
+            .await.unwrap().with_io_limits(limits);
         assert!(bound.is_https());
         let address = bound.local_addr().unwrap();
         let (sender, mut receiver) = asupersync::channel::oneshot::channel();
@@ -209,6 +221,10 @@ fn encode(request: HttpRequest) -> Vec<u8> {
 }
 
 async fn exchange(cx: &Cx, address: SocketAddr, request: HttpRequest) -> Result<Vec<u8>, String> {
+    exchange_bytes(cx, address, encode(request)).await
+}
+
+async fn exchange_bytes(cx: &Cx, address: SocketAddr, request: Vec<u8>) -> Result<Vec<u8>, String> {
     asupersync::time::timeout(cx.now(), EXCHANGE_TIMEOUT, async {
         let tcp = TcpStream::connect(address).await.map_err(|_| "TCP connect failed")?;
         let mut stream = connector(true, vec![b"http/1.1".to_vec()])
@@ -216,7 +232,7 @@ async fn exchange(cx: &Cx, address: SocketAddr, request: HttpRequest) -> Result<
         if stream.alpn_protocol() != Some(b"http/1.1".as_slice()) {
             return Err("HTTP/1.1 was not negotiated".to_owned());
         }
-        stream.write_all(&encode(request)).await.map_err(|_| "HTTPS request write failed")?;
+        stream.write_all(&request).await.map_err(|_| "HTTPS request write failed")?;
         stream.flush().await.map_err(|_| "HTTPS request flush failed")?;
         // Never half-close the request side to unblock the response: the SSE
         // writer must make progress while its own peer-read future is pending.
@@ -475,5 +491,227 @@ fn https_native_shutdown_settles_handshakes_without_waiting_for_their_timeout() 
         assert!(matches!(closed, Ok(Ok(0) | Err(_))));
         assert_eq!(probe.counts(), (0, 0));
         assert!(cx.checkpoint().is_ok());
+    });
+}
+
+// Explicit test consent policy, injected through the shipped backend trait.
+// No cfg(test) default approval or test-only issuer dispatch is exercised.
+struct TestConsent(Arc<AtomicUsize>);
+
+impl AuthorizationApprovalBackend for TestConsent {
+    fn generation(&self) -> AuthorizationApprovalGeneration {
+        AuthorizationApprovalGeneration::from_bytes([37; 32])
+    }
+
+    fn approve(&self, request: &AuthorizationApprovalRequest) -> AuthorizationApprovalDisposition {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let decision: AuthorizationApprovalDecision = request.approve(
+            "native-https-owner".to_owned(), request.scopes().to_vec(),
+            request.resource().map(str::to_owned), self.generation(),
+        ).unwrap();
+        AuthorizationApprovalDisposition::Approved(decision)
+    }
+}
+
+fn issuer_fixture() -> (Arc<OAuthServer>, Arc<AtomicUsize>, OAuthHttpRoutes) {
+    let approvals = Arc::new(AtomicUsize::new(0));
+    let issuer = Arc::new(OAuthServer::try_with_approval_backend(
+        OAuthServerConfig { issuer: "https://localhost/".to_owned(), ..Default::default() },
+        Arc::new(TestConsent(Arc::clone(&approvals))),
+    ).unwrap());
+    let routes = OAuthHttpRoutes::new(Arc::clone(&issuer), "https://localhost/oauth").unwrap();
+    (issuer, approvals, routes)
+}
+
+fn issuer_request(method: HttpMethod, path: &str, body: Vec<u8>) -> HttpRequest {
+    HttpRequest::new(method, path).with_header("host", "localhost")
+        .with_header("origin", ORIGIN)
+        .with_header("content-type", "application/x-www-form-urlencoded")
+        .with_body(body)
+}
+
+fn registration_request() -> HttpRequest {
+    issuer_request(HttpMethod::Post, "/oauth/register", serde_json::to_vec(&json!({
+        "client_name":"native HTTPS test", "application_type":"native",
+        "redirect_uris":["http://127.0.0.1:32123/callback"], "token_endpoint_auth_method":"none",
+        "grant_types":["authorization_code","refresh_token"], "response_types":["code"], "scope":"mcp",
+    })).unwrap()).with_header("content-type", "application/json")
+}
+
+fn oauth_form(fields: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields.iter().copied()).finish()
+}
+
+async fn issuer_exchange(cx: &Cx, running: &Running, request: HttpRequest) -> HttpResponse {
+    let response = decode_wire(&exchange(cx, running.address, request).await.unwrap());
+    assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
+    response
+}
+
+#[test]
+fn https_native_oauth_registration_pkce_token_refresh_and_revocation() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let (issuer, approvals, routes) = issuer_fixture();
+        let server = Server::new("native-https-issuer", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .oauth_http_routes(routes).auth_provider(probe.clone()).tool(probe.clone()).build();
+        let running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        let registration = issuer_exchange(&cx, &running, registration_request()).await;
+        assert_eq!(registration.status.0, 201);
+        assert_eq!(registration.headers["access-control-allow-origin"], ORIGIN);
+        let registration: Value = serde_json::from_slice(&registration.body).unwrap();
+        let client_id = registration["client_id"].as_str().unwrap();
+        assert!(issuer.get_client(client_id).is_some());
+        let authorization = oauth_form(&[
+            ("response_type", "code"), ("client_id", client_id),
+            ("redirect_uri", "http://127.0.0.1:32123/callback"), ("scope", "mcp"),
+            ("resource", "https://localhost/mcp"), ("state", "opaque-state"),
+            ("code_challenge", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+            ("code_challenge_method", "S256"),
+        ]);
+        let response = issuer_exchange(&cx, &running, issuer_request(HttpMethod::Get,
+            &format!("/oauth/authorize?{authorization}"), Vec::new())).await;
+        assert_eq!(response.status.0, 303);
+        let redirect = url::Url::parse(&response.headers["location"]).unwrap();
+        let parameters: std::collections::HashMap<_, _> = redirect.query_pairs().into_owned().collect();
+        assert_eq!(parameters["state"], "opaque-state");
+        assert_eq!(parameters["iss"], "https://localhost/");
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        let token_form = oauth_form(&[
+            ("grant_type", "authorization_code"), ("client_id", client_id),
+            ("redirect_uri", "http://127.0.0.1:32123/callback"), ("resource", "https://localhost/mcp"),
+            ("code", &parameters["code"]), ("code_verifier", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+        ]);
+        let token_request = issuer_request(HttpMethod::Post, "/oauth/token", token_form.into_bytes());
+        let token_response = issuer_exchange(&cx, &running, token_request.clone()).await;
+        assert_eq!(token_response.status.0, 200);
+        let token: Value = serde_json::from_slice(&token_response.body).unwrap();
+        let access = issuer.validate_access_token(token["access_token"].as_str().unwrap()).unwrap();
+        assert_eq!(access.subject.as_deref(), Some("native-https-owner"));
+        assert_eq!(access.resource.as_deref(), Some("https://localhost/mcp"));
+        let replay = issuer_exchange(&cx, &running, token_request).await;
+        assert_eq!(replay.status.0, 400, "one-use code must remain one-use on the TLS route");
+        let refresh = oauth_form(&[("grant_type", "refresh_token"), ("client_id", client_id),
+            ("resource", "https://localhost/mcp"), ("refresh_token", token["refresh_token"].as_str().unwrap())]);
+        let refreshed = issuer_exchange(&cx, &running,
+            issuer_request(HttpMethod::Post, "/oauth/token", refresh.into_bytes())).await;
+        assert_eq!(refreshed.status.0, 200);
+        let refreshed: Value = serde_json::from_slice(&refreshed.body).unwrap();
+        let access = refreshed["access_token"].as_str().unwrap();
+        assert!(issuer.validate_access_token(access).is_some());
+        let revoke = oauth_form(&[("client_id", client_id), ("token", access)]);
+        let revoked = issuer_exchange(&cx, &running,
+            issuer_request(HttpMethod::Post, "/oauth/revoke", revoke.into_bytes())).await;
+        assert_eq!(revoked.status.0, 200);
+        assert!(issuer.validate_access_token(access).is_none());
+        assert_eq!(probe.counts(), (0, 0), "issuer routes never invoke MCP authentication or tools");
+        success(&decode_wire(&exchange(&cx, running.address, request(false)).await.unwrap()), false);
+        running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn https_native_oauth_origin_host_method_and_body_refusals_preserve_issuer_state() {
+    run(|cx| async move {
+        let probe = Probe::new();
+        let (issuer, approvals, routes) = issuer_fixture();
+        let server = Server::new("native-https-issuer", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+            .oauth_http_routes(routes).auth_provider(probe.clone()).tool(probe.clone()).build();
+        let running = Running::configured(&cx, server, policy(), Duration::from_secs(10)).await;
+        assert_eq!(issuer_exchange(&cx, &running, registration_request()).await.status.0, 201);
+        let before = issuer.list_clients().len();
+        let mut wrong_method = registration_request();
+        wrong_method.method = HttpMethod::Get;
+        let over_limit = vec![b' '; fastmcp_protocol::MAX_CLIENT_REGISTRATION_BYTES + 1];
+        for (request, expected) in [
+            (registration_request().with_header("origin", "https://attacker.example"), 403),
+            (registration_request().with_header("host", "attacker.example"), 403),
+            (wrong_method, 405),
+            (registration_request().with_body(over_limit), 413),
+        ] {
+            let response = issuer_exchange(&cx, &running, request).await;
+            assert_eq!(response.status.0, expected);
+            assert_eq!(issuer.list_clients().len(), before);
+            assert_eq!(approvals.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.counts(), (0, 0));
+        }
+        assert_eq!(issuer_exchange(&cx, &running, registration_request()).await.status.0, 201);
+        assert_eq!(issuer.list_clients().len(), before + 1);
+        running.stop(&cx).await;
+    });
+}
+
+#[test]
+fn https_native_oauth_requires_native_tls_matching_origin_and_disjoint_routes() {
+    run(|cx| async move {
+        let (_, _, routes) = issuer_fixture();
+        let server = || Server::new("native-https-issuer", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().oauth_http_routes(routes.clone()).build();
+        assert!(Box::pin(server().bind_secured_http(&cx, "127.0.0.1:0", policy())).await.is_err());
+        let wrong_origin = HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
+            "https://other.example", Vec::new(),
+        ).unwrap();
+        assert!(Box::pin(server().bind_secured_https(&cx, "127.0.0.1:0", wrong_origin, acceptor())).await.is_err());
+        let mut configuration = fastmcp_server::HttpServerConfig::default();
+        configuration.handler_config.base_path = "/oauth/token".to_owned();
+        let overlap = Server::new("native-https-issuer", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().oauth_http_routes(routes)
+            .http_config(configuration).build();
+        let overlap_policy = HttpSecurityPolicy::new(
+            HttpEndpointConfig::new("/oauth/token", HttpAdmissionLimits::new(32, 8192, 65536).unwrap()).unwrap(),
+            "https://localhost", Vec::new(),
+        ).unwrap();
+        assert!(Box::pin(overlap.bind_secured_https(&cx, "127.0.0.1:0", overlap_policy, acceptor())).await.is_err());
+    });
+}
+
+#[test]
+fn https_native_oauth_missing_or_rejected_pool_never_mutates_issuer_state() {
+    run(|cx| async move {
+        let stopped_pool = asupersync::runtime::BlockingPool::new(0, 1);
+        stopped_pool.shutdown();
+        for pool in [None, Some(stopped_pool.handle())] {
+            let (issuer, approvals, routes) = issuer_fixture();
+            let server = Server::new("native-https-issuer", "1")
+                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().oauth_http_routes(routes).build();
+            let unpooled = cx.clone().with_blocking_pool_handle(pool);
+            let running = Running::configured(&unpooled, server, policy(), Duration::from_secs(10)).await;
+            let response = issuer_exchange(&cx, &running, registration_request()).await;
+            assert_eq!(response.status.0, 503);
+            assert_eq!(response.headers["access-control-allow-origin"], ORIGIN);
+            assert!(!response.headers.contains_key("www-authenticate"));
+            assert!(issuer.list_clients().is_empty());
+            assert_eq!(approvals.load(Ordering::SeqCst), 0);
+            running.stop(&cx).await;
+        }
+        assert!(stopped_pool.shutdown_and_wait(Duration::from_secs(1)));
+    });
+}
+
+#[test]
+fn https_native_oauth_pipelining_and_incomplete_body_fail_uncacheably_before_dispatch() {
+    run(|cx| async move {
+        let (issuer, approvals, routes) = issuer_fixture();
+        let server = Server::new("native-https-issuer", "1")
+            .protocol_policy(ProtocolPolicy::ModernOnly).unwrap().oauth_http_routes(routes).build();
+        let running = Running::with_limits(&cx, server, policy(),
+            SecuredHttpIoLimits::new(Duration::from_millis(500), Duration::from_secs(3)).unwrap()).await;
+        assert_eq!(issuer_exchange(&cx, &running, registration_request()).await.status.0, 201);
+        let before = issuer.list_clients().len();
+        let mut pipelined = encode(registration_request());
+        pipelined.extend_from_slice(b"GET /oauth/authorize HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let incomplete = b"POST /oauth/register HTTP/1.1\r\nHost: localhost\r\nOrigin: https://browser.example\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\n{".to_vec();
+        for (request, expected) in [(pipelined, 400), (incomplete, 408)] {
+            let response = decode_wire(&exchange_bytes(&cx, running.address, request).await.unwrap());
+            assert_eq!(response.status.0, expected);
+            assert_eq!(response.headers["cache-control"], "no-store");
+            assert_eq!(issuer.list_clients().len(), before);
+            assert_eq!(approvals.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(issuer_exchange(&cx, &running, registration_request()).await.status.0, 201);
+        running.stop(&cx).await;
     });
 }
