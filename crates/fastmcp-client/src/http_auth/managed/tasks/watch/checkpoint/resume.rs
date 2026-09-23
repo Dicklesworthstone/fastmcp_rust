@@ -26,7 +26,7 @@ pub mod client;
 
 /// Hard ceiling for one encoded checkpoint, independent of store capacity.
 pub const MAX_TASK_RESUME_RECORD_BYTES: usize = 256 * 1024;
-const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+const MAX_RETENTION: Duration = Duration::from_hours(168);
 const RECORD_MAGIC: &[u8; 8] = b"FMTRSM01";
 
 /// Opaque, domain-separated lookup identity. These bytes confer no authority.
@@ -423,7 +423,7 @@ mod tests {
         let original = record();
         let bytes = original.encode().unwrap();
         let decoded = TaskResumeRecord::decode(&bytes).unwrap();
-        assert!(decoded == original);
+        assert_eq!(decoded, original);
         assert_eq!(decoded.task_id().as_str(), "opaque / ID");
         assert_eq!(decoded.key(), original.key());
         assert!(!bytes.windows(6).any(|part| part == b"SECRET"));
@@ -468,6 +468,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::inconsistent_digit_grouping,
+        reason = "each expected value is grouped as <whole seconds>_<nanoseconds in threes>, so \
+                  172800_ and 86400_ read directly as the 2-day and 1-day spans this test is about"
+    )]
     fn timestamp_instants_use_offsets_and_nanoseconds_not_lexical_order() {
         let instant = |text| timestamp_nanos(&TaskTimestamp::parse(text).unwrap()).unwrap();
         assert_eq!(instant("1970-01-01T00:00:00Z"), 0);
