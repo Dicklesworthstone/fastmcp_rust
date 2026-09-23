@@ -118,6 +118,15 @@ fn protocol_authentication_cancellation_and_redirect_errors_are_not_recovery_sig
     assert!(recoverable_transport_failure(&ManagedCoreError::Session(OAuthSessionError::Http(ModernHttpExecutorError::Transport(
         ClientError::HttpError(HttpError::Io(std::io::ErrorKind::UnexpectedEof.into()))
     )))));
+    // The executor now reports that same pre-head disconnect, once a request byte was sent, as
+    // DispatchUncertain. Recovery treats it exactly as it treated the Transport form; only the IO kinds
+    // qualify, so a non-IO inner error stays unrecoverable.
+    assert!(recoverable_transport_failure(&ManagedCoreError::Session(OAuthSessionError::Http(ModernHttpExecutorError::DispatchUncertain(
+        ClientError::HttpError(HttpError::Io(std::io::ErrorKind::UnexpectedEof.into()))
+    )))));
+    assert!(!recoverable_transport_failure(&ManagedCoreError::Session(OAuthSessionError::Http(ModernHttpExecutorError::DispatchUncertain(
+        ClientError::HttpError(HttpError::BadHeader)
+    )))));
 }
 
 #[test]
